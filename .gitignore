@@ -1,0 +1,6 @@
+/target
+/data
+/service/data
+/.idea
+/work
+/semantic_search/benches/data/

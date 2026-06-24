@@ -1,0 +1,9 @@
+# Build output — already in .gitignore but explicit here for clarity
+target/
+
+# Large generated/binary data files — not useful to read
+service/embedding_support/clusters.json
+semantic_search/test_data/
+
+# Lock file — auto-managed by cargo, don't read or edit
+Cargo.lock
