@@ -1,0 +1,12 @@
+{
+  "namespace": "jobs",
+  "key_type": "u64",
+  "attributes": [
+    { "name": "jobTitle", "attr_type": "str" }
+  ],
+  "indices": [
+    { "field": "agency", "index_type": "str" }
+  ],
+  "semantic_search_enabled": true,
+  "embedding_fields": ["jobTitle"]
+}

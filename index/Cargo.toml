@@ -1,0 +1,21 @@
+[package]
+name = "index"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9"
+parking_lot = "0.12"
+rkyv = { version = "0.8", features = ["bytecheck", "unaligned"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+rand = "0.9"
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench_predicate"
+harness = false

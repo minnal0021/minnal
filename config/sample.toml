@@ -1,0 +1,243 @@
+# minnal_doc_store_api.toml — sample configuration
+#
+# This file is a superset of minnal.toml.  Every field has a built-in default,
+# so you only need to specify the values you want to override.
+#
+# Start the server with:
+#   minnal_doc_store_api /path/to/this/file.toml
+#   MINNAL_CONFIG_FILE=/path/to/this/file.toml minnal_doc_store_api
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# [storage] — file-system paths
+# ---------------------------------------------------------------------------
+[storage]
+
+# Directory where the minnal_db data files are written.
+db_path = "./data/db"
+
+# Directory where per-store JSON schema files are persisted.
+# One file per namespace, e.g. schemas/users.json.
+schema_dir = "./data/schemas"
+
+# Directory where rolling log files are written.
+log_dir = "./data/log"
+
+# ---------------------------------------------------------------------------
+# [logging] — log verbosity
+# ---------------------------------------------------------------------------
+[logging]
+
+# Minimum log level when RUST_LOG is not set in the environment.
+# RUST_LOG always takes precedence over this setting.
+# Accepted values: "error", "warn", "info", "debug", "trace"
+level = "info"
+
+# ---------------------------------------------------------------------------
+# [api] — HTTP server settings
+# ---------------------------------------------------------------------------
+[api]
+
+# Address and port the REST API binds to.
+# Use "127.0.0.1:8080" to restrict to localhost only.
+listen_addr = "0.0.0.0:8080"
+
+# ---------------------------------------------------------------------------
+# [memtable] — in-memory write buffer
+# ---------------------------------------------------------------------------
+[memtable]
+
+# Maximum number of entries (including tombstones) the skip-list memtable
+# will hold before flushing to disk.
+max_capacity = 100_000
+
+# ---------------------------------------------------------------------------
+# [sharding] — value-log and LSM sharding
+# ---------------------------------------------------------------------------
+[sharding]
+
+# Number of independent shards for the value log and LSM tree.
+# Higher values reduce lock contention under concurrent write workloads.
+# Must be a power of two; changing this after data exists is not supported.
+num_buckets = 8
+
+# ---------------------------------------------------------------------------
+# [lsm] — LSM-tree compaction
+# ---------------------------------------------------------------------------
+[lsm]
+
+# Trigger a compaction when the memtable reaches this percentage of
+# max_capacity (0–100).  Lower values compact more aggressively at the cost
+# of more frequent background I/O.
+compaction_threshold_percent = 95
+
+# ---------------------------------------------------------------------------
+# [sync] — write-path durability vs. throughput trade-off
+# ---------------------------------------------------------------------------
+[sync]
+
+# How many put/delete operations to batch before flushing the value log
+# and marking WAL entries as persisted.
+#
+#   1     → flush on every write  (maximum durability, lowest throughput)
+#   1000  → flush every 1 000 writes (good balance — the default)
+#   0     → only flush on close or GC (maximum throughput, least durability)
+#
+# The WAL itself is fsynced after every append regardless of this setting,
+# so crash recovery is always possible.
+records_per_sync = 1_000
+
+# ---------------------------------------------------------------------------
+# [thresholds] — GC trigger thresholds
+# ---------------------------------------------------------------------------
+[thresholds]
+
+# Start a value-log GC cycle when the percentage of wasted space (dead records)
+# in any shard exceeds this value (0.0–100.0).
+value_log_waste_threshold = 30.0
+
+# Compact a field-index bitmap store at checkpoint when this percentage of its
+# value region is dead space (0.0–100.0). The bitmap store is append-only, so
+# each indexed-document write leaves a stale copy of that field-value's bitmap
+# behind; compaction reclaims it. Lower = reclaim sooner (more compaction work),
+# higher = let more dead space accumulate first. Default 50.
+index_blob_waste_threshold = 50.0
+
+# ---------------------------------------------------------------------------
+# [scheduled_tasks] — background worker intervals
+# ---------------------------------------------------------------------------
+[scheduled_tasks]
+
+# How often (seconds) the value-log garbage collector runs.
+value_log_gc_interval_secs = 60
+
+# How often (seconds) the WAL garbage collector runs.
+wal_gc_interval_secs = 60
+
+# How often (seconds) the LSM compaction worker checks for pending work.
+lsm_compaction_interval_secs = 60
+
+# How often (seconds) the TTL expiry worker scans for expired keys.
+ttl_cleanup_interval_secs = 3_600
+
+# ---------------------------------------------------------------------------
+# [wal] — Write-Ahead Log
+# ---------------------------------------------------------------------------
+[wal]
+
+# Maximum size of a single WAL segment file in bytes before a new segment
+# is created.  Default: 64 MiB.
+segment_size_bytes = 67_108_864   # 64 MiB
+
+# ---------------------------------------------------------------------------
+# [value_log] — value-log page size
+# ---------------------------------------------------------------------------
+[value_log]
+
+# Size of each page within the value log in bytes.
+# Larger pages improve sequential read throughput; smaller pages reduce
+# space amplification for small values.  Default: 64 MiB.
+page_size_bytes = 67_108_864   # 64 MiB
+
+# Re-verify each value's CRC32 checksum on every read.
+# Values always carry a CRC on disk; this controls whether reads re-check it.
+# Enabling catches silent corruption before a value is served, but adds a full
+# CRC pass over the value to the read hot path (measurable for large values).
+# SSTable-level checksums are always verified regardless of this setting.
+# Default: false (latency first).
+verify_checksums_on_read = false
+
+# ---------------------------------------------------------------------------
+# [vector_index] — async vector-index background worker settings
+# ---------------------------------------------------------------------------
+[vector_index]
+
+# Seconds to sleep after a pass that contained at least one embedding failure,
+# before re-scanning the queue.  Lower values retry faster; higher values give
+# the embedding service more time to recover.  Default: 2.
+retry_wait_secs = 5
+
+# Maximum number of embedding attempts per queue entry.  Once an entry reaches
+# this limit it is skipped on every subsequent pass and left in the queue for
+# inspection and manual removal via:
+#   DELETE /admin/vector-queue/namespace/{ns}/doc/{doc_id_hex}
+# Default: 5.
+max_retries = 5
+
+# Maximum number of concurrent embedding calls the worker keeps in flight at
+# once.  Entries from different namespaces are interleaved (round-robin) before
+# being fed into this concurrency pool, so no single namespace starves others.
+# Default: 4.
+concurrency = 4
+
+# ---------------------------------------------------------------------------
+# [semantic_search] — vector quantisation settings
+# ---------------------------------------------------------------------------
+[semantic_search]
+
+# Number of bits used for the dense (multi-bit) quantisation of each embedding dimension.
+# Applies to the second-pass re-ranking after the sparse first pass.
+# Higher values improve recall at the cost of more memory and CPU.  Must be greater than 1.
+#
+#   4   → very compact, lower recall
+#   8   → good balance between size and accuracy (default)
+#
+number_of_bits_for_dense_quantisation = 8
+
+# Path to the IVF cluster centroids file.
+# In the Docker image the file is copied to the container root at build time.
+# For local development use: service/embedding_support/qwen/clusters.json
+cluster_path = "./clusters.json"
+
+# Base URL of the embedding service.
+# Requests are sent to {url}/embedding/document and {url}/embedding/query as a
+# batch POST: body {"payloads": [str, ...], "dimensions": N} -> {"embeddings": [[f32], ...]}.
+# Chunking/tokenisation happens in minnal, not the service.
+# Default: http://localhost:8001
+embedding_service_url = "http://192.168.10.155:8001"
+#embedding_service_url = "http://192.168.1.182:8001"
+
+# Embedding model to use.  Must match a name in [[semantic_search.supported_models]].
+# Default: qwen
+# model = "qwen"
+
+# Number of IVF clusters to probe during the sparse first-pass search (single-bit vectors).
+# Higher = better recall, slower queries.  Default: 128.
+n_probes = 128
+
+# Number of candidates to retain after the first-pass sparse (single-bit) vector search
+# before re-scoring with the dense multi-bit index.  Default: 1000.
+first_pass_sparse_search_top_k = 1000
+
+# Window size (sentences/tokens per chunk) for the sliding-window chunked embedding call.
+# Each chunk is independently assigned to its nearest IVF cluster and quantised as 1-bit.
+# Default: 4.
+window_size = 4
+
+# How far the window advances between consecutive chunks.
+# A sliding_size smaller than window_size produces overlapping chunks.  Default: 2.
+sliding_size = 2
+
+# Time-to-live (seconds) for cached query embeddings in the system-wide
+# `system_qemb_cache` namespace. After this duration a cached entry is evicted by
+# the TTL worker. Clear the cache explicitly (DELETE /admin/indices/vector/query-cache)
+# after changing window_size/sliding_size rather than waiting for this to expire.
+# Default: 86400 (1 day).
+# query_embedding_cache_ttl_secs = 86400
+
+# ---------------------------------------------------------------------------
+# [[semantic_search.supported_models]] — enabled embedding models
+#
+# Each entry declares one embedding model this instance may serve.  The server
+# validates at startup that the cluster file for every listed model exists at
+#   service/embedding_support/{name}/clusters.json
+#
+# Fields:
+#   name      — model identifier (case-insensitive); currently only "qwen"
+#               is supported.
+#   dimension — embedding dimensionality the model produces (u16).
+# ---------------------------------------------------------------------------
+
+[[semantic_search.supported_models]]
+name = "qwen"
+dimension = 768

@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "minnal_db",
+    "index",
+    "minnal_doc_store",
+    "minnal_doc_store_api",
+    "semantic_search",
+    "tools",
+]
+default-members = [
+    "minnal_db",
+    "index",
+    "minnal_doc_store",
+    "minnal_doc_store_api",
+    "semantic_search",
+    "tools",
+]
+resolver = "2"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+strip = "symbols"
+# Deliberate fail-fast: a panic means an invariant was violated (e.g. corrupt
+# in-memory state mid-operation). Aborting and recovering cleanly from the WAL
+# is safer than unwinding through a half-updated structure and continuing to
+# serve — especially since parking_lot locks do not poison, so an unwinding
+# panic could silently leave protected state inconsistent. The tradeoff is that
+# a panic in any one HTTP handler takes down the whole server process rather
+# than failing just that request; production paths therefore return `Result`
+# instead of panicking. Do not switch to "unwind" without revisiting that.
+panic = "abort"

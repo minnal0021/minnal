@@ -1,0 +1,30 @@
+[package]
+name = "minnal_doc_store"
+version = "0.1.0"
+edition = "2024"
+description = "Document store built on minnal_db"
+default-run = "doc_store_demo"
+
+[lib]
+name = "minnal_doc_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "doc_store_demo"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+json_dotpath = "1.1"
+thiserror = { version = "2" }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+minnal_db = { path = "../minnal_db" }
+semantic_search = { path = "../semantic_search" }
+
+[dev-dependencies]
+tempfile = { version = "3" }

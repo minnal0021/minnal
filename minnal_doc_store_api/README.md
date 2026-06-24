@@ -1,0 +1,1509 @@
+# minnal doc store
+
+A lightweight embedded document and key-value store with a REST API, built on top of [minnal_db](../minnal_db).
+
+**Document stores** (`/stores`) — JSON objects stored by a typed primary key, with optional field-level indices and semantic search.
+
+**KV stores** (`/kv-stores`) — schema-lite namespaces for raw typed key-value data, with optional semantic search on string values.
+
+---
+
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Concepts](#concepts)
+  - [Namespace](#namespace)
+  - [Key types](#key-types)
+  - [Indices](#indices)
+  - [Attributes](#attributes)
+  - [Semantic search (async vector indexing)](#semantic-search-async-vector-indexing)
+  - [KV store](#kv-store-concept)
+- [REST API reference](#rest-api-reference)
+  - [Quick reference](#quick-reference)
+  - [Store lifecycle](#store-lifecycle)
+  - [Index management](#index-management)
+  - [Document CRUD](#document-crud)
+  - [Queries](#queries)
+  - [KV store lifecycle](#kv-store-lifecycle)
+  - [KV CRUD](#kv-crud)
+  - [KV range scan](#kv-range-scan)
+  - [KV prefix scan](#kv-prefix-scan)
+  - [KV semantic search](#kv-semantic-search)
+  - [Admin Stores API](#admin-stores-api)
+  - [Admin Storage API](#admin-storage-api)
+  - [Admin Indices API](#admin-indices-api)
+- [Predicate syntax](#predicate-syntax)
+- [Error responses](#error-responses)
+- [Bulk loading data](#bulk-loading-data)
+- [On-disk layout](#on-disk-layout)
+
+---
+
+## Quick start
+
+### 1 — Build
+
+```bash
+cargo build --release -p minnal_doc_store_api
+```
+
+The binary is at `target/release/minnal_doc_store_api`.
+
+### 2 — Start the server
+
+Run with built-in defaults (data stored under `./data/`):
+
+```bash
+./target/release/minnal_doc_store_api
+```
+
+Or point it at a config file:
+
+```bash
+./target/release/minnal_doc_store_api /path/to/config.toml
+```
+
+The server listens on `0.0.0.0:8080` by default.
+
+### 3 — Create a store
+
+```bash
+curl -s -X POST http://localhost:8080/stores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "users",
+    "key_type": "uuid",
+    "attributes": [],
+    "indices": [
+      {"field": "status", "index_type": "str"},
+      {"field": "age",    "index_type": "int"}
+    ]
+  }'
+# → 201 Created
+```
+
+### 4 — Write a document
+
+```bash
+curl -s -X PUT \
+  "http://localhost:8080/stores/users/docs/550e8400-e29b-41d4-a716-446655440000" \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Alice", "status": "active", "age": 30}'
+# → 204 No Content
+```
+
+### 5 — Read it back
+
+```bash
+curl -s \
+  "http://localhost:8080/stores/users/docs/550e8400-e29b-41d4-a716-446655440000"
+# → {"name":"Alice","status":"active","age":30}
+```
+
+### 6 — Query by index
+
+```bash
+curl -s -X POST http://localhost:8080/stores/users/query \
+  -H 'Content-Type: application/json' \
+  -d '{"predicate": "status = \"active\" AND age >= 18"}'
+# → [{"id":"550e8400-...","doc":{"name":"Alice","status":"active","age":30}}]
+```
+
+---
+
+## Configuration
+
+All settings have built-in defaults so no config file is required to get started.
+
+```toml
+# minnal_doc_store_api.toml
+
+[storage]
+db_path    = "./data/db"       # where minnal_db stores its files
+schema_dir = "./data/schemas"  # where per-store schema JSON files live
+
+[api]
+listen_addr = "0.0.0.0:8080"
+
+# ── tuning (optional) ──────────────────────────────────────────────────────
+
+[sync]
+records_per_sync = 1000        # flush WAL after this many writes
+
+[scheduled_tasks]
+value_log_gc_interval_secs   = 60
+wal_gc_interval_secs         = 60
+lsm_compaction_interval_secs = 60
+ttl_cleanup_interval_secs    = 3600
+
+[thresholds]
+value_log_waste_threshold = 30.0   # GC when >30 % of value-log is stale
+
+[memtable]
+max_capacity = 100000          # skip-list capacity (entries)
+
+[sharding]
+num_buckets = 8                # value-log shards
+
+[wal]
+segment_size_bytes = 67108864  # 64 MiB per WAL segment
+
+[value_log]
+page_size_bytes = 67108864     # 64 MiB per value-log page
+
+[vector_index]
+retry_wait_secs = 2            # seconds to wait before retrying after an embedding failure
+max_retries     = 5            # max attempts per queue entry before it needs manual removal
+concurrency     = 4            # max concurrent embedding calls in flight
+```
+
+The config file path is resolved in this order:
+1. First CLI argument: `minnal_doc_store_api /path/to/config.toml`
+2. `MINNAL_CONFIG_FILE` environment variable
+3. Built-in defaults (no file needed)
+
+---
+
+## Concepts
+
+A handful of terms recur throughout the API. This section defines them once — namespaces, key types, indices, attributes, and the schema-lite KV store — so the endpoint reference that follows can stay terse.
+
+### Namespace
+
+Each logical document store is called a **namespace**. A namespace:
+
+- Has a unique name made up of ASCII letters, digits, `_`, or `-`
+- Stores any number of JSON documents, each identified by a typed primary key
+- Has its own schema, indices, and on-disk storage
+
+Multiple namespaces can coexist in the same server instance.
+
+### Key types
+
+The primary key type is chosen at store creation and cannot be changed.
+
+| `key_type` | Description | URL format |
+|-----------|-------------|------------|
+| `uuid`    | 128-bit UUID | `550e8400-e29b-41d4-a716-446655440000` |
+| `u64`     | Unsigned 64-bit integer | `42` |
+| `u128`    | Unsigned 128-bit integer | `340282366920938463463374607431768211455` |
+
+Keys are stored in big-endian byte order so that numeric range scans return results in ascending order.
+
+### Indices
+
+Indices enable fast predicate queries (no full collection scan). Each index:
+
+- Covers a single top-level JSON field
+- Has a value type: `str`, `int`, or `bool`
+- Is built as a [RoaringBitmap](https://roaringbitmap.org/) field index under the hood
+
+**Limits:** up to **5 indices** per namespace.
+
+Adding an index to a store that already has documents triggers a **background rebuild**. The API returns `202 Accepted` immediately; the index is live for new writes straight away and historical documents are back-filled asynchronously. Use the [progress endpoint](#get-adminindicesprogress) to monitor the rebuild.
+
+Rebuilds are **restartable** — if the server shuts down mid-rebuild, it automatically resumes from the last checkpoint on the next startup.
+
+### Attributes
+
+Non-indexed fields can be declared as **attributes** in the schema. Attributes:
+
+- Are not indexed and do not support predicate queries
+- Can be added, removed, or type-updated at any time via `PATCH /stores/{ns}/schema`
+- Serve as schema documentation and allow future type-checking
+
+You cannot amend an indexed field's declaration directly — drop the index first, amend, then re-add if needed.
+
+### Semantic search (async vector indexing)
+
+When a store has `semantic_search_enabled = true`, embedding happens **asynchronously** and never blocks a write:
+
+1. A `PUT`/upsert writes the document (or KV value) first, then enqueues a pending-embed marker in a durable system queue as a separate write. The request returns immediately — it does not contact the embedding service.
+2. A background worker drains the queue: it calls the embedding service, writes the quantised `VectorIndex` to the companion namespaces (`{ns}_sparse_vector`, `{ns}_dense_vector`, `{ns}_sparse_vector_meta`), then removes the queue entry. The worker is idempotent and retries failures with back-off (`[vector_index]` config); the vector index is **eventually consistent** with the store.
+
+**Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
+
+**Reconciliation.** Because the document write and the queue enqueue are two separate writes, a crash between them could leave a document written but not queued; likewise the quantised vector payloads are written with `put_no_wal`, so a crash before the memtable flush can drop a just-indexed vector (or flush one half and lose the other). Reconciliation heals both: across every semantic-search-enabled namespace it re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry. "Complete" means **both** the sparse-meta and dense entries are present — a document with only one half is a partially committed index and is re-enqueued so the re-embed regenerates the missing half. This mirrors how field indices self-heal via WAL replay, but routes the recovered work into the async queue. It runs **automatically as a background task on store startup**, and on demand via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) (e.g. to re-run after the startup pass logs a failure). A cheap count short-circuit (nothing queued **and** both the sparse-meta and dense key counts already cover the live-key count) skips namespaces that are already fully covered, so a clean run is inexpensive. To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
+
+Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup.
+
+### KV store concept
+
+A **KV store** is a schema-lite namespace managed under `/kv-stores`. Unlike a document store it has:
+
+- No field indices and no predicate queries
+- Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
+- Optional semantic search when `value_type = str`
+
+KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished by its `key_type` value on disk (`"str"`/`"int"` vs `"uuid"`/`"u64"`/`"u128"`).
+
+**Key types:**
+
+| `key_type` | URL path segment | Storage |
+|-----------|-----------------|---------|
+| `str` | any UTF-8 string | raw UTF-8 bytes |
+| `int` | decimal integer | big-endian `i64` (ordered scans work correctly) |
+
+**Value types:**
+
+| `value_type` | JSON body | Bytes |
+|-------------|-----------|-------|
+| `str` | JSON string | UTF-8 |
+| `int` | JSON integer | little-endian `i64` |
+| `f32` | JSON number | little-endian `f32` |
+| `vec_f32` | JSON array of numbers | packed little-endian `f32` array |
+
+---
+
+## REST API reference
+
+All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. The endpoints fall into two families — `/stores/*` for document stores and `/kv-stores/*` for KV stores — plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
+
+### Quick reference
+
+**Document stores:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `POST` | `/stores` | `201` | Create a document store with schema |
+| `GET` | `/stores` | `200` | List all document stores |
+| `DELETE` | `/stores/{ns}` | `204` | Drop a document store and all its data |
+| `GET` | `/stores/{ns}/schema` | `200` | Fetch the current schema |
+| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute |
+| `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
+| `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
+| `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
+| `DELETE` | `/stores/{ns}/indices/{field}` | `202` | Drop a field index (background cleanup) |
+| `PUT` | `/stores/{ns}/docs/{id}` | `204` | Upsert a document |
+| `GET` | `/stores/{ns}/docs/{id}` | `200` | Retrieve a document by primary key |
+| `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
+| `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
+| `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
+
+**KV stores:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `POST` | `/kv-stores` | `201` | Create a KV store |
+| `GET` | `/kv-stores` | `200` | List all KV stores |
+| `DELETE` | `/kv-stores/{ns}` | `204` | Drop a KV store and all its data |
+| `GET` | `/kv-stores/{ns}/schema` | `200` | Fetch the current KV-store schema |
+| `PUT` | `/kv-stores/{ns}/kv/{key}` | `204` | Set a value |
+| `GET` | `/kv-stores/{ns}/kv/{key}` | `200` | Get a value by key |
+| `DELETE` | `/kv-stores/{ns}/kv/{key}` | `204` | Delete a key |
+| `GET` | `/kv-stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
+| `GET` | `/kv-stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
+| `POST` | `/kv-stores/{ns}/semantic-search` | `200` | ANN search (`value_type = str` only) |
+
+**Schema export / import (admin):**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a doc-store schema as a JSON attachment |
+| `POST` | `/admin/stores/import` | `201` | Create a doc store from an exported schema |
+| `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
+| `GET` | `/admin/kv-stores/{ns}/schema/export` | `200` | Download a KV-store schema as a JSON attachment |
+| `POST` | `/admin/kv-stores/import` | `201` | Create a KV store from an exported schema |
+
+---
+
+### Store lifecycle
+
+These endpoints create, list, inspect, and drop document stores, and amend their non-indexed attributes. A store must exist before any document can be written to it.
+
+#### `GET /stores`
+
+List all stores.
+
+```bash
+curl http://localhost:8080/stores
+```
+
+```json
+[
+  {
+    "namespace": "users",
+    "key_type": "uuid",
+    "attributes": [],
+    "indices": [
+      {"field": "status", "index_type": "str"},
+      {"field": "age",    "index_type": "int"}
+    ]
+  }
+]
+```
+
+---
+
+#### `POST /stores`
+
+Create a new store.
+
+**Request body:**
+
+| Field        | Type             | Required | Description                          |
+|-------------|-----------------|----------|--------------------------------------|
+| `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
+| `key_type`   | `uuid`/`u64`/`u128` | yes  | Primary key type                     |
+| `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
+| `attributes` | array            | no       | Non-indexed field declarations       |
+
+**Index spec:**
+
+```json
+{"field": "status", "index_type": "str"}
+```
+
+`index_type` must be `str`, `int`, or `bool`.
+
+**Attribute definition:**
+
+```json
+{"name": "email", "attr_type": "str", "description": "user email address"}
+```
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/stores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "orders",
+    "key_type": "u64",
+    "indices": [
+      {"field": "state",      "index_type": "str"},
+      {"field": "amount_usd", "index_type": "int"},
+      {"field": "paid",       "index_type": "bool"}
+    ],
+    "attributes": [
+      {"name": "customer_id", "attr_type": "str"}
+    ]
+  }'
+# → 201 Created
+```
+
+---
+
+#### `DELETE /stores/{ns}`
+
+Permanently delete a store and all its documents, indices, and schema.
+
+```bash
+curl -X DELETE http://localhost:8080/stores/orders
+# → 204 No Content
+```
+
+---
+
+#### `GET /stores/{ns}/schema`
+
+Fetch the current schema for a namespace.
+
+```bash
+curl http://localhost:8080/stores/users/schema
+```
+
+```json
+{
+  "namespace": "users",
+  "key_type": "uuid",
+  "indices": [
+    {"field": "status", "index_type": "str"},
+    {"field": "age",    "index_type": "int"}
+  ],
+  "attributes": [
+    {"name": "email", "attr_type": "str", "description": "contact email"}
+  ],
+  "semantic_search_enabled": false,
+  "embedding_fields": []
+}
+```
+
+Returns `404 Not Found` if the namespace does not exist.
+
+---
+
+#### `PATCH /stores/{ns}/schema`
+
+Amend the schema. Cannot be used to change indexed fields — drop the index first.
+
+**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries and the `{ns}_sparse_vector`, `{ns}_dense_vector`, `{ns}_sparse_vector_meta` companion namespaces) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
+
+**Add an attribute:**
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "add_attribute", "name": "email", "attr_type": "str", "description": "contact email"}'
+# → 204 No Content
+```
+
+**Update an attribute:**
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "update_attribute", "name": "email", "attr_type": "str", "description": "primary email"}'
+# → 204 No Content
+```
+
+**Remove an attribute:**
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "remove_attribute", "name": "email"}'
+# → 204 No Content
+```
+
+| `op` value           | Required fields          |
+|---------------------|--------------------------|
+| `add_attribute`      | `name`, `attr_type`      |
+| `update_attribute`   | `name`, `attr_type`      |
+| `remove_attribute`   | `name`                   |
+
+All ops accept an optional `"description"` string.
+
+---
+
+### Index management
+
+These endpoints add and drop the secondary indices that make predicate queries fast, including the vector index that powers semantic search. Adding or dropping an index on a store that already holds documents runs as a background job and returns `202 Accepted`; monitor it through the [admin progress endpoints](#admin-indices-api).
+
+#### `GET /stores/{ns}/indices`
+
+List all active or recently completed field-index builds and the vector campaign status (if any) for the namespace.
+
+```bash
+curl http://localhost:8080/stores/users/indices
+```
+
+Returns an array of `IndexBuildSnapshot` objects. Use `GET /admin/indices/{ns}/progress` for the live monitoring view including queue depth.
+
+---
+
+#### `POST /stores/{ns}/indices`
+
+Add a new field index. If the store already has documents the rebuild runs in the background.
+
+```bash
+curl -X POST http://localhost:8080/stores/users/indices \
+  -H 'Content-Type: application/json' \
+  -d '{"field": "country", "index_type": "str"}'
+# → 202 Accepted
+```
+
+Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Monitor progress via `GET /admin/indices/{ns}/progress`.
+
+---
+
+#### `DELETE /stores/{ns}/indices/vector`
+
+Disable semantic search and drop all vector index data for the namespace. The schema is updated synchronously before the background cleanup runs, preventing new embeddings from being enqueued during cleanup. Returns `202 Accepted`.
+
+```bash
+curl -X DELETE http://localhost:8080/stores/users/indices/vector
+# → 202 Accepted
+```
+
+Returns `409 Conflict` if a vector cleanup or reindex campaign is already in progress. Returns `422 Unprocessable Entity` if semantic search is not enabled for the namespace.
+
+---
+
+#### `DELETE /stores/{ns}/indices/{field}`
+
+Drop a field index. The bitmap files are deleted in a background task; the field is demoted to a plain attribute in the schema. Returns `202 Accepted`.
+
+```bash
+curl -X DELETE http://localhost:8080/stores/users/indices/country
+# → 202 Accepted
+```
+
+Returns `409 Conflict` if an attribute index operation is already active for this namespace.
+
+---
+
+### Document CRUD
+
+All document endpoints accept the `{id}` path segment formatted according to the store's `key_type`:
+
+| `key_type` | Example path segment |
+|-----------|----------------------|
+| `uuid`    | `550e8400-e29b-41d4-a716-446655440000` |
+| `u64`     | `42` |
+| `u128`    | `99999999999999999999` |
+
+---
+
+#### `PUT /stores/{ns}/docs/{id}`
+
+Insert or replace a document (upsert).
+
+```bash
+curl -X PUT "http://localhost:8080/stores/users/docs/1" \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Bob", "status": "inactive", "age": 25}'
+# → 204 No Content
+```
+
+---
+
+#### `GET /stores/{ns}/docs/{id}`
+
+Retrieve a document by its primary key.
+
+```bash
+curl "http://localhost:8080/stores/users/docs/1"
+# → {"name":"Bob","status":"inactive","age":25}
+```
+
+Returns `404 Not Found` if no document with that ID exists.
+
+---
+
+#### `DELETE /stores/{ns}/docs/{id}`
+
+Delete a document. No-op if the document does not exist.
+
+```bash
+curl -X DELETE "http://localhost:8080/stores/users/docs/1"
+# → 204 No Content
+```
+
+---
+
+### Queries
+
+There are two ways to retrieve documents beyond a single primary-key lookup: a **range scan** that walks documents in key order, and an **index predicate query** that returns the documents matching a boolean expression over indexed fields. (Semantic similarity search is documented separately, under the KV and store sections.)
+
+#### `GET /stores/{ns}/docs?start=&end=`
+
+Range scan over documents in primary-key order. **Cursor-paginated** — each page
+resolves only its own documents from the value log, so memory stays bounded
+regardless of how many keys match.
+
+| Parameter | Required | Description                                     |
+|-----------|----------|-------------------------------------------------|
+| `start`   | yes      | First key to include (inclusive)                |
+| `end`     | no       | Last key to include (exclusive). Omit for open-ended scan |
+| `limit`   | no       | Max documents per page (default: 20)            |
+| `cursor`  | no       | Opaque token from a prior page's `next_cursor`; omit for the first page |
+
+```bash
+# u64 store — first page of documents with IDs 10 through 99
+curl "http://localhost:8080/stores/orders/docs?start=10&end=100&limit=2"
+```
+
+```bash
+# uuid store — scan from a given UUID to the end of the collection
+curl "http://localhost:8080/stores/users/docs?start=00000000-0000-0000-0000-000000000000"
+```
+
+Response — a page of `{id, doc}` pairs ordered by key, plus `next_cursor`
+(`null` when the scan is exhausted). To fetch the next page, pass the returned
+`next_cursor` back as `cursor`:
+
+```json
+{
+  "results": [
+    {"id": 10, "doc": {"state": "shipped", "amount_usd": 50, "paid": true}},
+    {"id": 11, "doc": {"state": "pending", "amount_usd": 20, "paid": false}}
+  ],
+  "next_cursor": "000000000000000c"
+}
+```
+
+---
+
+#### `POST /stores/{ns}/query`
+
+Query documents using an index predicate. Only indexed fields may appear in the predicate.
+
+Offset-paginated (the bitmap index gives an exact `total` and random page access). Query params `page_no` / `page_size` (defaults 1 / 20) override the same-named body fields; `limit` is accepted as an alias for `page_size` (`page_size` wins if both are given).
+
+```bash
+curl -X POST "http://localhost:8080/stores/orders/query?limit=5" \
+  -H 'Content-Type: application/json' \
+  -d '{"predicate": "state = \"shipped\" AND paid = true"}'
+```
+
+Response — `{id, doc}` pairs plus the pagination envelope:
+
+```json
+{
+  "results": [
+    {"id": 10, "doc": {"state": "shipped", "amount_usd": 50, "paid": true}}
+  ],
+  "page_no": 1,
+  "page_size": 5,
+  "total": 1
+}
+```
+
+---
+
+### KV store lifecycle
+
+The KV-store endpoints mirror the document-store lifecycle, but for schema-lite namespaces under `/kv-stores`: create, list, inspect, and drop. A KV store fixes its key and value types at creation and has no field indices — see the [KV store concept](#kv-store-concept) for the available type combinations.
+
+#### `GET /kv-stores`
+
+List all KV stores.
+
+```bash
+curl http://localhost:8080/kv-stores
+```
+
+```json
+[
+  {
+    "namespace": "session-cache",
+    "key_type": "str",
+    "value_type": "str",
+    "semantic_search_enabled": false
+  }
+]
+```
+
+---
+
+#### `POST /kv-stores`
+
+Create a new KV store.
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `namespace` | string | yes | Unique name (`[a-zA-Z0-9_-]+`) |
+| `key_type` | `str` / `int` | yes | Key type |
+| `value_type` | `str` / `int` / `f32` / `vec_f32` | yes | Value type |
+| `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str` and a cluster index at startup) |
+
+```bash
+curl -X POST http://localhost:8080/kv-stores \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": "session-cache", "key_type": "str", "value_type": "str"}'
+# → 201 Created
+
+# With semantic search
+curl -X POST http://localhost:8080/kv-stores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "product-descriptions",
+    "key_type": "str",
+    "value_type": "str",
+    "semantic_search_enabled": true
+  }'
+# → 201 Created
+```
+
+Returns `409 Conflict` if a store with that namespace already exists (doc or KV).
+
+---
+
+#### `DELETE /kv-stores/{ns}`
+
+Permanently delete a KV store. Irreversible.
+
+```bash
+curl -X DELETE http://localhost:8080/kv-stores/session-cache
+# → 204 No Content
+```
+
+---
+
+#### `GET /kv-stores/{ns}/schema`
+
+Fetch the current schema for a KV store as JSON.
+
+```bash
+curl http://localhost:8080/kv-stores/session-cache/schema
+```
+
+```json
+{
+  "namespace": "session-cache",
+  "ns_id": 7,
+  "key_type": "str",
+  "value_type": "str",
+  "semantic_search_enabled": false
+}
+```
+
+Returns `404 Not Found` if the namespace does not exist as a KV store. To download the schema as a file (e.g. for backup or migration to another deployment), use [`GET /admin/kv-stores/{ns}/schema/export`](#get-adminkv-storesnsschemaexport).
+
+---
+
+### KV CRUD
+
+All KV endpoints use `{key}` as a URL path segment. The segment is interpreted according to the store's `key_type`:
+
+| `key_type` | Example path segment |
+|-----------|----------------------|
+| `str` | `user-42`, `hello world` (URL-encode spaces) |
+| `int` | `42`, `-100` |
+
+The request / response body is a raw JSON value matching `value_type`:
+
+| `value_type` | Example body |
+|-------------|-------------|
+| `str` | `"hello"` |
+| `int` | `42` |
+| `f32` | `3.14` |
+| `vec_f32` | `[1.0, -0.5, 0.25]` |
+
+---
+
+#### `PUT /kv-stores/{ns}/kv/{key}`
+
+Insert or replace a value (upsert). When `semantic_search_enabled = true` the value text is enqueued for async embedding — the request returns immediately and the vector index is updated in the background.
+
+```bash
+curl -X PUT http://localhost:8080/kv-stores/session-cache/kv/user-42 \
+  -H 'Content-Type: application/json' \
+  -d '"eyJhbGciOiJIUzI1NiJ9..."'
+# → 204 No Content
+
+# vec_f32 example
+curl -X PUT http://localhost:8080/kv-stores/embeddings/kv/doc-1 \
+  -H 'Content-Type: application/json' \
+  -d '[0.12, -0.45, 0.89]'
+# → 204 No Content
+```
+
+---
+
+#### `GET /kv-stores/{ns}/kv/{key}`
+
+Retrieve a value by key. Returns the value as a JSON body.
+
+```bash
+curl http://localhost:8080/kv-stores/session-cache/kv/user-42
+# → "eyJhbGciOiJIUzI1NiJ9..."
+```
+
+Returns `404 Not Found` if the key does not exist.
+
+---
+
+#### `DELETE /kv-stores/{ns}/kv/{key}`
+
+Delete a key. No-op if the key does not exist. Also removes the companion vector index entry when semantic search is enabled.
+
+```bash
+curl -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
+# → 204 No Content
+```
+
+---
+
+### KV range scan
+
+`GET /kv-stores/{ns}/kv?start=&end=`
+
+Scan all entries whose key falls in `[start, end)`, returned in ascending key
+order. **Cursor-paginated** — each page resolves only its own values, so memory
+stays bounded regardless of how many keys match.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `start` | yes | First key to include (inclusive). Format matches the store's `key_type`: a plain string for `str`, a decimal integer for `int`. |
+| `end` | no | Last key to include (exclusive). Omit for an open-ended scan to the last key. |
+| `limit` | no | Max entries per page (default: 20) |
+| `cursor` | no | Opaque token from a prior page's `next_cursor`; omit for the first page. |
+
+```bash
+# str key store — scan all sessions for users with IDs "user-10" through "user-20"
+curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-10&end=user-21"
+
+# int key store — fetch entries with keys 100 through 199
+curl "http://localhost:8080/kv-stores/counters/kv?start=100&end=200"
+
+# first page of 50, then follow next_cursor for the next page
+curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50"
+curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50&cursor=757365722d3530"
+```
+
+Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
+(`null` when the scan is exhausted). Pass it back as `cursor` for the next page:
+
+```json
+{
+  "results": [
+    {"key": "user-10", "value": "eyJhbGciOiJIUzI1NiJ9..."},
+    {"key": "user-11", "value": "eyJhbGciOiJIUzI1NiJ9..."}
+  ],
+  "next_cursor": "757365722d3132"
+}
+```
+
+`key` is rendered as a JSON string for `key_type = str` and a JSON number for `key_type = int`. `value` matches the store's `value_type`.
+
+---
+
+### KV prefix scan
+
+`GET /kv-stores/{ns}/kv/prefix?prefix=`
+
+Scan all entries whose key starts with `prefix`. Most useful for `key_type = str` stores where keys share a common string prefix (e.g. `"user-"` to find all user entries).
+
+For `key_type = int`, `prefix` is parsed as a decimal integer and serialised as a big-endian 8-byte value — this matches only the exact key and is rarely more useful than a point lookup; use range scan for numeric key ranges instead.
+
+Results are returned in ascending key order. **Cursor-paginated** like the range
+scan — each page resolves only its own values.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prefix` | yes | Key prefix. Plain UTF-8 string for `key_type = str`; decimal integer for `key_type = int`. |
+| `limit` | no | Max entries per page (default: 20) |
+| `cursor` | no | Opaque token from a prior page's `next_cursor`; omit for the first page. |
+
+```bash
+# Find all session-cache entries whose key starts with "user-"
+curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-"
+
+# Paginate through a large prefix result set via next_cursor
+curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100"
+curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100&cursor=757365722d393939"
+```
+
+Response — same format as range scan:
+
+```json
+{
+  "results": [
+    {"key": "user-10",  "value": "eyJhbGciOiJIUzI1NiJ9..."},
+    {"key": "user-42",  "value": "eyJhbGciOiJIUzI1NiJ9..."},
+    {"key": "user-999", "value": "eyJhbGciOiJIUzI1NiJ9..."}
+  ],
+  "next_cursor": null
+}
+```
+
+---
+
+### KV semantic search
+
+`POST /kv-stores/{ns}/semantic-search`
+
+Requires `semantic_search_enabled = true` and `value_type = str` on the KV store. The stored string values are used as the text that was embedded at write time.
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | yes | Query text to embed and search |
+| `top_k` | integer | no | Maximum number of candidates to return (default: all in probed clusters) |
+| `page_size` | integer | no | Page size (default: 20). Also accepts `limit` as an alias (query param); `page_size` wins if both are given. |
+| `page_no` | integer | no | 1-based page number (default: 1) |
+
+```bash
+curl -X POST http://localhost:8080/kv-stores/product-descriptions/semantic-search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "key": "sku-1042",
+      "dot_product": 0.93,
+      "error_bound": 0.02,
+      "cluster_id": 7,
+      "is_primary": true,
+      "value": "Ultra-light trail runner with waterproof membrane"
+    }
+  ],
+  "page_no": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `key` | The key, serialised as a JSON string or number according to `key_type` |
+| `dot_product` | Estimated cosine similarity (higher = more similar) |
+| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
+| `cluster_id` | IVF cluster this entry was indexed under |
+| `is_primary` | `true` if the entry's cluster is the closest cluster to the query |
+| `value` | The stored value, or `null` if the key no longer exists |
+
+---
+
+### Admin Stores API
+
+Schema export / import for backup and for migrating a namespace definition between deployments. The exported file is the schema only — it does **not** include documents or values. Importing creates an empty store; reload the data separately (e.g. via the [bulk loader](#bulk-loading-data) or the CRUD endpoints).
+
+#### `GET /admin/stores/{ns}/schema/export`
+
+Download a doc-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-schema.json"`).
+
+```bash
+curl -OJ http://localhost:8080/admin/stores/users/schema/export
+# → writes users-schema.json
+```
+
+Returns `404 Not Found` if the namespace does not exist as a doc store.
+
+---
+
+#### `POST /admin/stores/import`
+
+Create a doc store from a previously exported schema. The internal `ns_id` is stripped and reassigned, so an exported schema can be imported into a fresh deployment. Equivalent to `POST /stores` with the schema body.
+
+```bash
+curl -X POST http://localhost:8080/admin/stores/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @users-schema.json
+# → 201 Created
+```
+
+Returns `409 Conflict` if a store with that namespace already exists.
+
+---
+
+#### `GET /admin/kv-stores/{ns}/schema/export`
+
+Download a KV-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-kv-schema.json"`).
+
+```bash
+curl -OJ http://localhost:8080/admin/kv-stores/session-cache/schema/export
+# → writes session-cache-kv-schema.json
+```
+
+Returns `404 Not Found` if the namespace does not exist as a KV store.
+
+---
+
+#### `POST /admin/kv-stores/import`
+
+Create a KV store from a previously exported schema. The internal `ns_id` is stripped and reassigned. Equivalent to `POST /kv-stores` with the schema body.
+
+```bash
+curl -X POST http://localhost:8080/admin/kv-stores/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @session-cache-kv-schema.json
+# → 201 Created
+```
+
+Returns `409 Conflict` if a store with that namespace already exists.
+
+---
+
+#### `GET /admin/stores/{ns}/row-count`
+
+Number of documents in a doc-store namespace.
+
+```bash
+curl http://localhost:8080/admin/stores/users/row-count
+```
+
+```json
+{ "namespace": "users", "count": 1280 }
+```
+
+---
+
+### Admin Storage API
+
+Storage diagnostics and engine operations. Not intended for application traffic.
+
+#### Quick reference
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/admin/storage/health` | `200` | Liveness probe — uptime in seconds |
+| `GET` | `/admin/storage/stats` | `200` | Engine-wide value-log statistics |
+| `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
+| `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
+| `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
+| `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
+| `GET` | `/admin/storage/kv-namespaces` | `200` | All engine KV namespaces, annotated by role |
+| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one doc store namespace |
+| `GET` | `/admin/storage/kv-stores/{ns}/kv-meta` | `200` | KV-layer metrics for one KV store namespace |
+| `GET` | `/admin/storage/system/stores` | `200` | List system-namespace KV and doc stores |
+| `GET` | `/admin/storage/system/stores/{ns}/meta` | `200` | Full metadata for one system KV store |
+| `GET` | `/admin/storage/index-waste` | `200` | Per-field field-index bitmap/keymap waste + compaction threshold |
+| `POST` | `/admin/storage/gc` | `200` | Trigger value-log GC across all namespaces |
+| `POST` | `/admin/storage/gc/wal` | `200` | Trigger WAL GC |
+| `POST` | `/admin/storage/compact` | `204` | Trigger LSM compaction across all namespaces |
+| `POST` | `/admin/storage/index-checkpoint` | `200` | Flush + compact field indexes (and row maps) across all namespaces |
+
+---
+
+#### `GET /admin/storage/health`
+
+```bash
+curl http://localhost:8080/admin/storage/health
+# → {"status":"ok","uptime_s":3601}
+```
+
+---
+
+#### `POST /admin/storage/gc`
+
+Trigger value-log GC immediately across all namespaces. Returns per-namespace results.
+
+```bash
+curl -X POST http://localhost:8080/admin/storage/gc
+```
+```json
+{
+  "namespaces_collected": 3,
+  "results": [
+    {"namespace": "products", "bytes_reclaimed": 1048576, "bytes_live": 5242880}
+  ]
+}
+```
+
+---
+
+#### `POST /admin/storage/compact`
+
+Trigger LSM compaction across all namespaces.
+
+```bash
+curl -X POST http://localhost:8080/admin/storage/compact
+# → 204 No Content
+```
+
+---
+
+#### `GET /admin/storage/index-waste`
+
+Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows with per-document churn; the **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
+
+```bash
+curl http://localhost:8080/admin/storage/index-waste
+```
+```json
+{
+  "threshold": 0.5,
+  "namespaces": [
+    {
+      "namespace": "users",
+      "ns_id": 3,
+      "fields": [
+        {
+          "field_id": 0,
+          "field_name": "status",
+          "field_type": "Str",
+          "bitmap_waste_ratio": 0.12,
+          "keymap_waste_ratio": 0.0,
+          "over_threshold": false,
+          "distinct_count": 5
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+#### `POST /admin/storage/index-checkpoint`
+
+Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (default every 15 min) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
+
+This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem. Returns the number of active field indexes checkpointed.
+
+```bash
+curl -X POST http://localhost:8080/admin/storage/index-checkpoint
+```
+```json
+{ "fields_checkpointed": 4 }
+```
+
+---
+
+### Admin Indices API
+
+Index monitoring and bulk operations. All write operations that touch index data return `202 Accepted` and run in the background. Only one attribute-index operation and one vector-index operation may be active per namespace at a time.
+
+#### Quick reference
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
+| `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
+| `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
+| `POST` | `/admin/indices/vector/reconcile` | `200` | Re-enqueue docs missing a vector index (all namespaces) |
+| `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
+| `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
+| `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
+| `POST` | `/admin/indices/{ns}/vector/reindex-all` | `202` | Re-enqueue all docs for embedding |
+| `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
+| `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
+| `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
+| `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
+| `GET` | `/admin/indices/{ns}/vector/queue/{doc_id}` | `200` | Look up one queue entry |
+| `DELETE` | `/admin/indices/{ns}/vector/queue/{doc_id}` | `204` | Remove one queue entry |
+| `POST` | `/admin/indices/{ns}/vector/queue/{doc_id}/retry` | `200` | Reset retry count for one exhausted entry |
+
+---
+
+#### `GET /admin/indices/progress`
+
+All active or recently completed index builds across every namespace, grouped into field (attribute) builds and vector-index progress.
+
+```bash
+curl http://localhost:8080/admin/indices/progress
+```
+```json
+{
+  "attribute_builds": [
+    {
+      "kind": "Attribute",
+      "id": {"Field": {"namespace": "users", "field": "country"}},
+      "status": "Running",
+      "total": 50000,
+      "indexed": 12340,
+      "failed": 0,
+      "started_at_ms": 1746789000000,
+      "updated_at_ms": 1746789010000,
+      "completed_at_ms": null,
+      "last_error": null
+    }
+  ],
+  "vector_progress": [
+    {
+      "namespace": "products",
+      "indexed_approx": 970,
+      "pending": 30,
+      "exhausted": 0,
+      "progress_pct": 97.0
+    }
+  ]
+}
+```
+
+`progress_pct = indexed_approx / (indexed_approx + pending) * 100`. Exhausted entries are excluded from the denominator.
+
+Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace.
+
+---
+
+#### `POST /admin/indices/vector/reconcile`
+
+Forward vector-index reconciliation across **every** semantic-search-enabled namespace. Re-enqueues any document that has neither a *complete* committed vector index (both the sparse-meta and dense halves) nor a pending queue entry — the write-then-enqueue crash window and the `put_no_wal` vector-write window (a crash before the memtable flush drops a just-indexed vector, or flushes one half and loses the other; a partially committed index counts as not-indexed and is re-enqueued). The async worker then embeds and indexes the re-enqueued documents in the background. A cheap count short-circuit skips namespaces already fully covered, so a clean run is inexpensive. The same pass runs automatically as a background task on store startup; this endpoint re-runs it on demand (e.g. after the startup pass logs a failure). Returns `200` with `{ "reenqueued": N }`.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/vector/reconcile
+```
+```json
+{ "reenqueued": 3 }
+```
+
+To force a full rebuild of a single namespace regardless of current index state, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all) instead.
+
+---
+
+#### `GET /admin/indices/vector/queue/summary`
+
+Queue depth and lag, grouped by namespace. Each entry is classified as *actionable* (worker will process it), *retrying* (failed at least once, still within retry budget), or *exhausted* (budget spent — needs manual reset or removal).
+
+```bash
+curl http://localhost:8080/admin/indices/vector/queue/summary
+```
+```json
+{
+  "max_retries_configured": 5,
+  "total_pending": 49,
+  "total_actionable": 47,
+  "total_retrying": 5,
+  "total_exhausted": 2,
+  "by_namespace": [
+    {"namespace": "products", "pending": 30, "actionable": 30, "retrying": 1, "exhausted": 0}
+  ]
+}
+```
+
+---
+
+#### `GET /admin/indices/vector/queue/retried`
+
+All queue entries with `retry_count > 0` across every namespace, paginated.
+
+```bash
+curl "http://localhost:8080/admin/indices/vector/queue/retried?page_no=1&page_size=20"
+```
+```json
+{
+  "total": 2,
+  "page_no": 1,
+  "page_size": 20,
+  "entries": [
+    {
+      "namespace": "products",
+      "doc_id_hex": "550e8400e29b41d4",
+      "doc_id_str": null,
+      "retry_count": 3,
+      "last_error": "embedding service timeout",
+      "text_preview": "ultra-light trail runner with waterproof membrane…"
+    }
+  ]
+}
+```
+
+`doc_id_str` is set when the doc-id bytes are printable ASCII; `null` otherwise. `text_preview` is capped at 120 characters.
+
+---
+
+#### `POST /admin/indices/{ns}/attribute/reindex-all`
+
+Drop every field index for `{ns}` and rebuild them all from scratch. Returns `202 Accepted`; progress is visible via `GET /admin/indices/{ns}/progress`.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/users/attribute/reindex-all
+# → 202 Accepted
+```
+
+Returns `409` when an attribute operation is already active for `{ns}`. Returns `422` when the namespace has no indices to rebuild.
+
+---
+
+#### `DELETE /admin/indices/{ns}/attribute/drop-all`
+
+Drop every field index for `{ns}` without rebuilding. Returns `202 Accepted`.
+
+```bash
+curl -X DELETE http://localhost:8080/admin/indices/users/attribute/drop-all
+# → 202 Accepted
+```
+
+Returns `409` when an attribute operation is already active. Returns `422` when the namespace has no indices.
+
+---
+
+#### `POST /admin/indices/{ns}/vector/reindex-all`
+
+Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build). Returns `202 Accepted`.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
+# → 202 Accepted
+```
+
+Returns `409` when a campaign or cleanup is already running. Returns `422` when semantic search is not enabled.
+
+---
+
+#### `POST /admin/indices/{ns}/vector/reindex-failed`
+
+Reset `retry_count` to zero for every exhausted queue entry in `{ns}`, making them actionable again. Returns `200` with `{ "retried": N }`.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-failed
+# → {"retried": 3}
+```
+
+---
+
+#### `DELETE /admin/indices/{ns}/vector/drop-all`
+
+Disable semantic search and clear all vector index data: queue entries and the `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion namespaces. The schema is updated synchronously before the background cleanup runs. Returns `202 Accepted`.
+
+```bash
+curl -X DELETE http://localhost:8080/admin/indices/products/vector/drop-all
+# → 202 Accepted
+```
+
+Returns `409` when a cleanup or campaign is already running. Returns `422` when semantic search is not enabled.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/queue`
+
+All pending queue entries for one namespace, paginated.
+
+```bash
+curl "http://localhost:8080/admin/indices/products/vector/queue?page_no=1&page_size=20"
+```
+
+Returns the same `{total, page_no, page_size, entries}` shape as `/admin/indices/vector/queue/retried`.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/queue/{doc_id_hex}`
+
+Look up one queue entry by its hex-encoded doc-id.
+
+```bash
+curl http://localhost:8080/admin/indices/products/vector/queue/550e8400e29b41d4
+```
+
+Returns `400` for invalid hex. Returns `404` if not found.
+
+---
+
+#### `DELETE /admin/indices/{ns}/vector/queue/{doc_id_hex}`
+
+Remove one queue entry manually. Use for entries that are exhausted and should not be retried.
+
+```bash
+curl -X DELETE \
+  http://localhost:8080/admin/indices/products/vector/queue/550e8400e29b41d4
+# → 204 No Content
+```
+
+Returns `400` for invalid hex. Returns `404` if not found.
+
+---
+
+#### `POST /admin/indices/{ns}/vector/queue/{doc_id_hex}/retry`
+
+Reset the retry count for one exhausted entry, making it actionable again.
+
+```bash
+curl -X POST \
+  http://localhost:8080/admin/indices/products/vector/queue/550e8400e29b41d4/retry
+```
+
+Returns `422` if the entry has not yet exhausted its retry budget.
+
+---
+
+## Predicate syntax
+
+Predicates reference indexed field names. Operators and examples:
+
+| Operator   | Example                          | Applicable types   |
+|-----------|----------------------------------|--------------------|
+| `=`        | `status = "active"`              | str, int, bool     |
+| `!=`       | `status != "deleted"`            | str, int, bool     |
+| `<`        | `age < 18`                       | int                |
+| `<=`       | `age <= 65`                      | int                |
+| `>`        | `amount_usd > 100`               | int                |
+| `>=`       | `age >= 18`                      | int                |
+| `AND`      | `status = "active" AND age >= 18` | —                 |
+| `OR`       | `status = "active" OR status = "trial"` | —          |
+| `NOT`      | `NOT paid = false`               | —                  |
+
+String values must be quoted with `"`. Boolean values are `true` or `false` (unquoted).
+
+**Examples:**
+
+```
+# Single condition
+status = "active"
+
+# Compound condition
+status = "active" AND age >= 18 AND verified = true
+
+# OR condition
+country = "US" OR country = "CA"
+
+# Negation
+NOT status = "deleted"
+```
+
+---
+
+## Error responses
+
+All errors return JSON with an `"error"` key:
+
+```json
+{"error": "doc store 'orders' not found"}
+```
+
+| HTTP status | When                                                     |
+|-------------|----------------------------------------------------------|
+| `400`       | Invalid ID / key format, bad schema, type mismatch, malformed request |
+| `404`       | Namespace, document, or KV key not found                 |
+| `409`       | Store already exists, field already indexed, build in progress, attribute/vector operation already active for namespace |
+| `422`       | Semantic search requested but not enabled / cluster index not loaded; no indices to rebuild; entry not yet exhausted |
+| `500`       | Internal database error                                  |
+
+---
+
+## Bulk loading data
+
+Use the `bulk_load` tool from the `tools` crate (binary `minnal_tools`) to bulk-load a [JSONL](https://jsonlines.org/) file (one JSON object per line) into a store. The loader streams each line to the running server over the REST API, so **the server must already be up**. By default the namespace must already exist; pass `--schema <schema.json>` to import the schema first.
+
+### Build
+
+```bash
+cargo build --release -p tools
+# binary: target/release/minnal_tools
+```
+
+### Usage
+
+```
+minnal_tools bulk_load [--no-wal] [--schema <schema.json>] <url> <namespace> <id_field> <data.jsonl>
+```
+
+| Argument     | Description                                                  |
+|-------------|--------------------------------------------------------------|
+| `url`        | Base URL of the running doc store REST API (e.g. `http://localhost:8080`) |
+| `namespace`  | Name of the target doc store                                |
+| `id_field`   | JSON field name whose value becomes the document ID          |
+| `data.jsonl` | Path to the JSONL file                                       |
+
+| Flag                | Description                                                  |
+|---------------------|-------------------------------------------------------------|
+| `--schema <file>`   | Import the schema (`POST /admin/stores/import`) before loading. An existing store is reused, so re-runs are safe. The schema's `namespace` must match the `namespace` argument. Without this flag the namespace must already exist. |
+| `--no-wal`          | Append `?skip_wal=true` to each write for maximum throughput. Data written this way is **unrecoverable on a crash** — only use when re-running the load is acceptable (e.g. an initial import from a source of truth). |
+
+The tool first calls `GET /stores` to confirm the namespace exists and resolve its `key_type` (after importing the schema if `--schema` was given), then `PUT`s each document. The `id_field` value is parsed according to the store's `key_type` — UUID string for `uuid`, integer (number or numeric string) for `u64`/`u128`. The id field is **not** removed from the stored document.
+
+### Example
+
+Given `users.jsonl`:
+
+```jsonl
+{"id": "550e8400-e29b-41d4-a716-446655440001", "name": "Alice", "status": "active", "age": 30}
+{"id": "550e8400-e29b-41d4-a716-446655440002", "name": "Bob",   "status": "inactive", "age": 25}
+```
+
+Load (with the server running at `http://localhost:8080`):
+
+```bash
+./target/release/minnal_tools bulk_load http://localhost:8080 users id users.jsonl
+```
+
+Output:
+
+```
+namespace 'users' found  key_type=Uuid
+id_field='id'
+  1000 documents loaded…
+done  loaded=2  skipped=0  total=2  elapsed=0.05s
+```
+
+Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT` are skipped with a warning and counted in `skipped`; valid lines continue to be processed. When there are any failures, the offending lines and their reasons are written to a sibling `<data>.errors` file.
+
+---
+
+## On-disk layout
+
+```
+{db_path}/
+  ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
+    wal/                      ← write-ahead log segments (64 MiB each)
+    lsm/                      ← LSM tree (sorted key files)
+    value_log/                ← value blobs (sharded)
+  ns_{namespace}_sparse_vector/      ← companion store: 1-bit sliding-window chunk embeddings, keyed by [cluster_id ‖ doc_id] (pass-1 ANN)
+  ns_{namespace}_dense_vector/       ← companion store: multi-bit whole-doc embeddings, keyed by doc_id (pass-2 re-rank)
+  ns_{namespace}_sparse_vector_meta/ ← companion store: per-doc cluster membership, used only by delete/upsert cleanup
+  index/
+    {ns_id}/
+      {field_id}/             ← doc stores only — KV stores have no field indices
+        blobs.keys            ← RoaringBitmap key file (mmap hash table)
+        blobs.vals            ← RoaringBitmap blob data
+        keymap.idx            ← field-value → slot mapping
+        checkpoint            ← WAL offset at last index flush
+        build_progress.json   ← index rebuild progress (created on add_index)
+
+{schema_dir}/
+  {namespace}.json            ← schema for each store (doc or KV — distinguished by key_type value)
+```
+
+Schema files are written atomically (tmp-then-rename). Doc schemas use `key_type` values `"uuid"`, `"u64"`, or `"u128"`; KV schemas use `"str"` or `"int"`. Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.
