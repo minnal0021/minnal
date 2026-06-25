@@ -14,6 +14,7 @@ use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::wal::{Wal, WalEntry, WalEntryStatus, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
+use crate::store::gc_journal::fsync_dir;
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
 use crate::store::lsm::lsm_tree::LsmFlushObserver;
 use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
@@ -27,6 +28,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Atomically and durably persist `bytes` to `path`.
+///
+/// This is the single path through which `WalMetadata` reaches disk. It writes
+/// to a sibling temp file, `sync_all`s it (so its contents are on stable
+/// storage), renames it over the target, then fsyncs the parent directory so
+/// the rename — the directory entry that makes the new contents visible — also
+/// survives a crash. A bare `write` + `rename` (the previous code) leaves both
+/// the temp contents and the rename in the page cache, so a power loss could
+/// resurrect stale or truncated metadata.
+fn atomic_write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
 
 // ── WAL persistence observer ───────────────────────────────────────────
 
@@ -108,13 +133,11 @@ impl WalPersistObserver {
                     Vec::new()
                 }
             };
-            if !bytes.is_empty() {
-                let tmp = self.wal_metadata_path.with_extension("tmp");
-                let write_result = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.wal_metadata_path));
-                if let Err(e) = write_result {
-                    warn!("[WAL] Failed to write WAL metadata: {:?}", e);
-                    had_error = true;
-                }
+            if !bytes.is_empty()
+                && let Err(e) = atomic_write_durable(&self.wal_metadata_path, &bytes)
+            {
+                warn!("[WAL] Failed to write WAL metadata: {:?}", e);
+                had_error = true;
             }
         }
 
@@ -171,8 +194,7 @@ impl WalPersistObserver {
             wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_add(updated);
             match wal_metadata.to_file_bytes() {
                 Ok(bytes) if !bytes.is_empty() => {
-                    let tmp = self.wal_metadata_path.with_extension("tmp");
-                    if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.wal_metadata_path)) {
+                    if let Err(e) = atomic_write_durable(&self.wal_metadata_path, &bytes) {
                         warn!("[WAL] Failed to write WAL metadata after namespace drop: {:?}", e);
                     }
                 }
@@ -1261,9 +1283,7 @@ impl Database {
     fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
-        let tmp = self.wal_metadata_path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.wal_metadata_path)?;
+        atomic_write_durable(&self.wal_metadata_path, &bytes)?;
         Ok(())
     }
 
