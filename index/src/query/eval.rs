@@ -38,6 +38,22 @@ pub type SchemaMap = HashMap<String, FieldId>;
 /// # Returns
 /// A [`RoaringBitmap`] of row IDs that satisfy the query.  An empty bitmap
 /// means no rows matched (not an error).
+///
+/// # `NOT` semantics (document-store, *not* SQL)
+///
+/// `NOT` is evaluated over a **universe scoped to the fields the inner
+/// expression references**, not over every row in the namespace. So
+/// `NOT status = 'active'` returns rows that **have a `status` value** that is
+/// not `'active'` — a row with **no `status` field at all is excluded**. This
+/// matches a schemaless document store (a missing field is "no value", not
+/// "a value that differs"), and differs from SQL, where `NOT (status =
+/// 'active')` over a `NULL` is unknown/excluded but a missing column is a schema
+/// error rather than a per-row condition. The universe is the union of the
+/// bitmaps of exactly the fields named inside the `NOT` (so `NOT (a = 1 AND
+/// b = 2)` is complemented against rows having an `a` **or** a `b` value).
+/// There is currently no `EXISTS(field)` / `MISSING(field)` operator to select
+/// rows by field presence; build one on top if you need "match rows lacking a
+/// field".
 pub fn parse_and_evaluate<F>(input: &str, schema: &SchemaMap, get_index: &F) -> Result<RoaringBitmap, QueryError>
 where
     F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
@@ -658,6 +674,25 @@ mod tests {
     }
 
     // ── NOT universe tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn not_excludes_rows_missing_the_field_documented_contract() {
+        // Contract (document-store, not SQL — see parse_and_evaluate rustdoc):
+        // `NOT status = 'x'` matches rows that HAVE a status value other than 'x';
+        // rows with no status field are excluded. Rows 1 and 2 have a status;
+        // row 3 has none. NOT status = 'a' ⇒ {2} only (NOT {1}, and row 3 dropped
+        // for lacking the field), never {2, 3}.
+        let status_idx = make_str_index(&[("a", 1), ("b", 2)]);
+        let other_idx = make_int_index(&[(7, 3)]); // row 3 has only `other`, no status
+        let s = schema(&[("status", 0), ("other", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&status_idx)),
+            1 => Some(Arc::clone(&other_idx)),
+            _ => None,
+        };
+        let bm = parse_and_evaluate("NOT status = 'a'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![2], "row 3 (no status) must be excluded");
+    }
 
     #[test]
     fn test_not_universe_scoped_to_referenced_field() {
