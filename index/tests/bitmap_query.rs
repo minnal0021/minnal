@@ -112,15 +112,64 @@ fn flip_noop_on_empty_or_reversed_range() {
 }
 
 #[test]
-fn flip_only_touches_existing_containers() {
+fn flip_is_scoped_to_range() {
     // Values 1,2 are in container 0; value 0x2_0000 is in container 2.
-    // Flipping [0, 0x1_0000) only covers container 0 — container 2 unchanged.
+    // Flipping [0, 0x1_0000) covers all of container 0 (and only container 0):
+    // 1 and 2 are cleared, every other value in [0, 0xFFFF] is set, and
+    // container 2 (out of range) is untouched.
     let mut bm: RoaringBitmap = [1u128, 2, 0x2_0000].into_iter().collect();
     bm.flip(0, 0x1_0000);
-    // 1 and 2 are now absent; 0x2_0000 untouched
     assert!(!bm.contains(1));
     assert!(!bm.contains(2));
+    // Previously-absent in-range bits are now set (standard complement).
+    assert!(bm.contains(0));
+    assert!(bm.contains(3));
+    assert!(bm.contains(0xFFFF));
+    // Out-of-range container is left alone.
     assert!(bm.contains(0x2_0000));
+    // Container 0 now holds all 65536 values except 1 and 2.
+    assert_eq!(bm.cardinality(), (65536 - 2) + 1);
+}
+
+#[test]
+fn flip_empty_bitmap_sets_full_range() {
+    // Standard complement: flipping an empty bitmap over [0, 10) yields {0..=9}.
+    let mut bm = RoaringBitmap::new();
+    bm.flip(0, 10);
+    let vals: Vec<u128> = bm.iter().collect();
+    assert_eq!(vals, (0u128..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn flip_creates_missing_container() {
+    // {1} lives in container 0; flipping a sub-range of the *absent* container 1
+    // must materialise it and set those bits.
+    let mut bm: RoaringBitmap = [1u128].into_iter().collect();
+    bm.flip(0x1_0000, 0x1_0003); // container 1, values 65536..=65538
+    assert!(bm.contains(1)); // container 0 untouched
+    assert!(bm.contains(0x1_0000));
+    assert!(bm.contains(0x1_0001));
+    assert!(bm.contains(0x1_0002));
+    assert!(!bm.contains(0x1_0003));
+    assert_eq!(bm.cardinality(), 4);
+}
+
+#[test]
+fn flip_spans_existing_and_missing_containers() {
+    // Container 0 = {1,2} exists; container 1 is missing. Flip [0, 0x2_0000)
+    // covers both: container 0 fully complemented, container 1 fully created.
+    let mut bm: RoaringBitmap = [1u128, 2].into_iter().collect();
+    bm.flip(0, 0x2_0000);
+    // Container 0: everything except 1 and 2.
+    assert!(!bm.contains(1));
+    assert!(!bm.contains(2));
+    assert!(bm.contains(0));
+    assert!(bm.contains(0xFFFF));
+    // Container 1: fully set (was missing).
+    assert!(bm.contains(0x1_0000));
+    assert!(bm.contains(0x1_FFFF));
+    assert_eq!(bm.num_containers(), 2);
+    assert_eq!(bm.cardinality(), (65536 - 2) + 65536);
 }
 
 // ── range_and ────────────────────────────────────────────────────────────────
