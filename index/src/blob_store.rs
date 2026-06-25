@@ -187,6 +187,20 @@ fn validate_open(key: &[u8], val_len: usize) -> io::Result<()> {
     Ok(())
 }
 
+// ── Length narrowing ───────────────────────────────────────────────────────────
+
+/// Narrow a byte length to the `u32` the on-disk slot/entry headers use,
+/// panicking with a clear message rather than silently truncating.
+///
+/// The store formats record blob/key lengths as `u32`, so a value at or beyond
+/// 4 GiB cannot be represented. That is pathological (a single index blob or key
+/// that large), but a silent `as u32` truncation would write a wrong length and
+/// corrupt the store on the next read — so fail loudly instead. Shared by
+/// [`BlobStore`], `ContainerStore`, and `RowMap`.
+pub(crate) fn u32_len(len: usize, what: &str) -> u32 {
+    u32::try_from(len).unwrap_or_else(|_| panic!("{what} length {len} exceeds the u32 on-disk limit ({})", u32::MAX))
+}
+
 // ── Hash ──────────────────────────────────────────────────────────────────────
 
 fn hash_key(key: u128) -> usize {
@@ -527,7 +541,7 @@ impl BlobStore {
                 state: STATE_OCCUPIED,
                 key,
                 offset: aligned_offset as u64,
-                len: blob.len() as u32,
+                len: u32_len(blob.len(), "blob"),
             },
         );
 
@@ -802,6 +816,21 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u32_len_accepts_in_range_lengths() {
+        assert_eq!(u32_len(0, "blob"), 0);
+        assert_eq!(u32_len(1234, "blob"), 1234);
+        // The boundary (exactly u32::MAX) is representable.
+        assert_eq!(u32_len(u32::MAX as usize, "blob"), u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the u32 on-disk limit")]
+    fn u32_len_panics_instead_of_truncating() {
+        // One past the limit — checked as a plain integer, so no 4 GiB allocation.
+        let _ = u32_len(u32::MAX as usize + 1, "blob");
+    }
 
     #[test]
     fn insert_get_roundtrip() {

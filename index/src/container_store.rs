@@ -492,7 +492,7 @@ impl ContainerStore {
                 state: STATE_OCCUPIED,
                 key,
                 offset: aligned_offset as u64,
-                len: blob.len() as u32,
+                len: crate::blob_store::u32_len(blob.len(), "container blob"),
                 card: new_card,
             },
         );

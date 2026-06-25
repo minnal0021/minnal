@@ -265,6 +265,11 @@ impl RowMap {
     }
 
     /// Resolve a dense ID back to its key bytes.
+    ///
+    /// IDs are `u64` internally (dense, monotonic from 0 — `next_id` cannot
+    /// realistically reach `u64::MAX`) but surfaced as `u128` for API uniformity
+    /// with the rest of the index. A `u128` beyond `u64::MAX` therefore was never
+    /// allocated here: `try_from` yields `None` rather than truncating the id.
     pub fn key_for(&self, id: u128) -> Option<Vec<u8>> {
         let id = u64::try_from(id).ok()?;
         if id >= self.next_id {
@@ -289,7 +294,7 @@ impl RowMap {
     fn insert_at(&mut self, slot_idx: usize, key: &[u8], hash: u64) -> u128 {
         let id = self.next_id;
         let key_off = self.keybytes_pos as u64;
-        let key_len = key.len() as u32;
+        let key_len = crate::blob_store::u32_len(key.len(), "row key");
 
         // Append the key bytes.
         self.keybytes
