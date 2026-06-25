@@ -352,4 +352,25 @@ mod tests {
         idx.bitmaps.upsert(slot, &1u32.to_le_bytes());
         assert!(idx.load_bitmap(slot).is_empty());
     }
+
+    #[test]
+    fn load_bitmap_returns_empty_on_corrupt_rkyv_payload() {
+        // The recoverable path the checked-deserialization fix protects: a blob
+        // with *valid framing* but an invalid rkyv payload. Under the old
+        // `access_unchecked` this was UB/panic inside load_bitmap; with checked
+        // access it surfaces an error that load_bitmap swallows into an empty
+        // bitmap. Framing = [count=1][16B key][blob_len=32][32 garbage bytes].
+        let mut idx = FieldIndex::<i64>::new();
+        idx.insert(7, 1);
+        let slot = idx.slot_id_for(&7).unwrap();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&0u128.to_le_bytes());
+        blob.extend_from_slice(&32u32.to_le_bytes());
+        blob.extend_from_slice(&[0xFFu8; 32]);
+        idx.bitmaps.upsert(slot, &blob);
+
+        assert!(idx.load_bitmap(slot).is_empty());
+    }
 }

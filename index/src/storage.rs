@@ -1,4 +1,4 @@
-use rkyv::api::high::HighDeserializer;
+use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize, rancor};
@@ -44,9 +44,15 @@ where
 }
 
 /// Deserialize a [`RoaringBitmap`] from bytes written by [`serialize`].
+///
+/// Each container blob is accessed with **checked** rkyv validation
+/// ([`rkyv::access`]) so a corrupt or malicious on-disk blob is reported as a
+/// [`StorageError`] rather than triggering a panic or undefined behaviour — see
+/// `FieldIndex::load_bitmap`, which treats this failure as recoverable.
 pub fn deserialize(bytes: &[u8]) -> Result<RoaringBitmap, StorageError>
 where
-    <Container as Archive>::Archived: Deserialize<Container, HighDeserializer<rancor::Error>>,
+    <Container as Archive>::Archived:
+        Deserialize<Container, HighDeserializer<rancor::Error>> + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
 {
     let mut bm = RoaringBitmap::new();
     let mut pos = 0usize;
@@ -76,10 +82,11 @@ where
         let blob = &bytes[pos..pos + blob_len];
         pos += blob_len;
 
-        // SAFETY: `blob` was written by our own `serialize` using the same rkyv
-        // version and feature set. The `unaligned` feature makes all archived
-        // primitives 1-byte aligned, so no AlignedVec copy is needed.
-        let archived = unsafe { rkyv::access_unchecked::<rkyv::Archived<Container>>(blob) };
+        // Checked access: validate the archive's structure before reading it, so
+        // a corrupt blob yields a `StorageError` instead of UB. The `unaligned`
+        // rkyv feature makes archived primitives 1-byte aligned, so the raw
+        // `blob` slice is sufficiently aligned and no AlignedVec copy is needed.
+        let archived = rkyv::access::<rkyv::Archived<Container>, rancor::Error>(blob).map_err(StorageError::from)?;
         let container: Container = rkyv::deserialize::<Container, rancor::Error>(archived).map_err(StorageError::from)?;
 
         bm.store.upsert(key, &container);
@@ -131,8 +138,8 @@ mod tests {
 
     // ── Truncation handling ──────────────────────────────────────────────
     //
-    // These exercise the length-framing checks that run *before* the unsafe
-    // `access_unchecked`, so they are safe to feed crafted byte buffers.
+    // These exercise the length-framing checks that run *before* the rkyv
+    // access, so they fail fast on the framing without reaching deserialization.
 
     #[test]
     fn deserialize_empty_input_errors() {
@@ -170,5 +177,47 @@ mod tests {
         bytes.extend_from_slice(&[0xAB, 0xCD]);
         let err = deserialize(&bytes).unwrap_err();
         assert!(err.to_string().contains("blob data"), "got: {err}");
+    }
+
+    // ── Corrupt rkyv payload with *valid* framing ─────────────────────────
+    //
+    // These pass the length-framing checks and reach the rkyv access. With the
+    // previous `access_unchecked` they were undefined behaviour / a likely
+    // panic; with checked `rkyv::access` they must return a `StorageError`.
+
+    /// A real blob whose rkyv payload bytes are corrupted in place (framing left
+    /// intact) must be rejected, not deserialized into garbage or UB.
+    #[test]
+    fn deserialize_corrupt_rkyv_payload_with_valid_framing_errors() {
+        let mut bm = RoaringBitmap::new();
+        for i in 0..300u128 {
+            bm.insert(i); // a non-trivial container with an internal Vec/pointer
+        }
+        let mut bytes = serialize(&bm).expect("serialize");
+
+        // Layout: [4B count][16B key][4B blob_len][blob …] — corrupt the blob.
+        let blob_start = 4 + 16 + 4;
+        assert!(bytes.len() > blob_start, "expected a non-empty blob");
+        for b in &mut bytes[blob_start..] {
+            *b ^= 0xFF; // flip every payload byte → relative pointer/len now out of bounds
+        }
+
+        let err = deserialize(&bytes).expect_err("corrupt rkyv payload must error, not panic");
+        assert!(err.to_string().contains("bitmap storage error"), "got: {err}");
+    }
+
+    /// Valid framing wrapping an all-`0xFF` garbage blob (definitely not a valid
+    /// archive) must also be rejected gracefully.
+    #[test]
+    fn deserialize_garbage_blob_with_valid_framing_errors() {
+        let garbage = [0xFFu8; 32];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&0u128.to_le_bytes()); // key
+        bytes.extend_from_slice(&(garbage.len() as u32).to_le_bytes()); // blob_len matches
+        bytes.extend_from_slice(&garbage);
+
+        // Must not panic; returns a controlled error.
+        assert!(deserialize(&bytes).is_err());
     }
 }
