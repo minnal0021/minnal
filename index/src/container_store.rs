@@ -135,6 +135,68 @@ fn write_slot(data: &mut [u8], i: usize, s: &Slot) {
     data[b + 40..b + 48].fill(0);
 }
 
+// ── Open-time validation ───────────────────────────────────────────────────────
+
+fn invalid(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("container store: {msg}"))
+}
+
+/// Validate a just-opened store's on-disk images before any read trusts them.
+///
+/// Guards the hot path against corrupt/wrong files: a zero `capacity` would
+/// divide by zero in the hash modulo, a `capacity` larger than the key file
+/// slices out of bounds, and a slot whose `offset+len` runs past the value
+/// region reads arbitrary bytes. Every failure is a controlled
+/// [`io::ErrorKind::InvalidData`], never a panic.
+fn validate_open(key: &[u8], val_len: usize) -> io::Result<()> {
+    if key.len() < HEADER_SIZE {
+        return Err(invalid("key file smaller than header"));
+    }
+    let magic = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    if magic != MAGIC {
+        return Err(invalid(format!("bad magic {magic:#018x} (not a minnal container store)")));
+    }
+    let version = u32::from_le_bytes(key[8..12].try_into().unwrap());
+    if version != VERSION {
+        return Err(invalid(format!("unsupported on-disk version {version} (expected {VERSION})")));
+    }
+    let hdr = read_header(key);
+    if hdr.capacity == 0 || !hdr.capacity.is_power_of_two() {
+        return Err(invalid(format!("capacity {} is not a non-zero power of two", hdr.capacity)));
+    }
+    let need = hdr
+        .capacity
+        .checked_mul(SLOT_SIZE as u64)
+        .and_then(|s| s.checked_add(HEADER_SIZE as u64))
+        .ok_or_else(|| invalid("capacity overflows key-file size"))?;
+    if (key.len() as u64) < need {
+        return Err(invalid(format!(
+            "key file {} bytes too small for capacity {} (need {need})",
+            key.len(),
+            hdr.capacity
+        )));
+    }
+    if hdr.value_write_pos > val_len as u64 {
+        return Err(invalid(format!(
+            "value_write_pos {} beyond value file ({val_len} bytes)",
+            hdr.value_write_pos
+        )));
+    }
+    for i in 0..hdr.capacity as usize {
+        let s = read_slot(key, i);
+        if s.state == STATE_OCCUPIED {
+            let end = s.offset.checked_add(s.len as u64).ok_or_else(|| invalid("slot offset+len overflows"))?;
+            if end > hdr.value_write_pos {
+                return Err(invalid(format!(
+                    "slot {i} blob [{}, {end}) extends past value_write_pos {}",
+                    s.offset, hdr.value_write_pos
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Hash ──────────────────────────────────────────────────────────────────────
 
 fn hash_key(key: u128) -> usize {
@@ -273,6 +335,7 @@ impl ContainerStore {
     pub fn open(dir: &Path) -> io::Result<Self> {
         let key = GrowableMmap::open_file(&dir.join("containers.keys"))?;
         let val = GrowableMmap::open_file(&dir.join("containers.vals"))?;
+        validate_open(key.as_slice(), val.as_slice().len())?;
         Ok(Self { key, val })
     }
 
@@ -648,5 +711,106 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, 100);
         assert_eq!(entries[1].0, 200);
+    }
+
+    // ── Header / bounds validation on open ──────────────────────────────────
+
+    fn seed(dir: &Path) {
+        let mut store = ContainerStore::create(dir).unwrap();
+        store.upsert(1, &make_array(&[1, 2, 3]));
+        store.upsert(2, &make_array(&[4, 5]));
+        store.flush().unwrap();
+    }
+
+    fn assert_invalid(dir: &Path) {
+        match ContainerStore::open(dir) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "expected InvalidData, got: {e}"),
+            Ok(_) => panic!("expected open() to reject corrupt store"),
+        }
+    }
+
+    #[test]
+    fn persistent_roundtrip_still_opens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let store = ContainerStore::open(dir.path()).unwrap();
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.get(1).unwrap().to_values(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        key[0] ^= 0xFF;
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_unsupported_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        key[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_truncated_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        std::fs::write(dir.path().join("containers.keys"), [0u8; HEADER_SIZE - 1]).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_zero_capacity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        key[16..24].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_capacity_larger_than_key_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        key[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_value_write_pos_past_value_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let val_len = std::fs::metadata(dir.path().join("containers.vals")).unwrap().len();
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        key[48..56].copy_from_slice(&(val_len + 1).to_le_bytes());
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_slot_blob_past_value_region() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("containers.keys")).unwrap();
+        let vwp = u64::from_le_bytes(key[48..56].try_into().unwrap());
+        for i in 0..INITIAL_CAPACITY {
+            let b = slot_byte_offset(i);
+            if key[b] == STATE_OCCUPIED {
+                key[b + 24..b + 32].copy_from_slice(&(vwp + 1).to_le_bytes());
+                break;
+            }
+        }
+        std::fs::write(dir.path().join("containers.keys"), &key).unwrap();
+        assert_invalid(dir.path());
     }
 }
