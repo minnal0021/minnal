@@ -274,6 +274,18 @@ impl DynFieldIndex {
         }
     }
 
+    /// Whether any bitmap blob has failed to load or store since this index was
+    /// opened — i.e. a query may have silently dropped rows. The owner should
+    /// rebuild this field from the WAL when this is `true`. Latches once set.
+    /// See [`FieldIndex::corruption_detected`].
+    pub fn corruption_detected(&self) -> bool {
+        match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.corruption_detected(),
+            DynFieldIndexInner::Int(fi) => fi.corruption_detected(),
+            DynFieldIndexInner::Str(fi) => fi.corruption_detected(),
+        }
+    }
+
     /// Record that `row_id` has `value` for this field.
     ///
     /// If this is the first row for `value`, the new slot is also written to

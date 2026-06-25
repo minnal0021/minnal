@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::RoaringBitmap;
 use crate::blob_store::BlobStore;
@@ -42,6 +43,14 @@ pub struct FieldIndex<V: Ord + Clone> {
     ordering: BTreeMap<V, u128>,
     bitmaps: BlobStore,
     next_slot: u128,
+    /// Latches `true` the first time a bitmap blob fails to **deserialise** on
+    /// read or **serialise** on write. The query/mutation methods stay infallible
+    /// (a failed read serves an empty bitmap, a failed write leaves the prior
+    /// blob untouched), but this flag makes the corruption observable so the
+    /// owner can distinguish "no rows matched" from "index data failed to load"
+    /// and rebuild the field from the WAL. Never auto-cleared; reset only by
+    /// rebuilding the index. See [`corruption_detected`](Self::corruption_detected).
+    corrupted: AtomicBool,
 }
 
 impl<V: Ord + Clone> FieldIndex<V> {
@@ -51,6 +60,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
             ordering: BTreeMap::new(),
             bitmaps: BlobStore::new_anon(),
             next_slot: 0,
+            corrupted: AtomicBool::new(false),
         }
     }
 
@@ -64,7 +74,19 @@ impl<V: Ord + Clone> FieldIndex<V> {
             ordering,
             bitmaps,
             next_slot,
+            corrupted: AtomicBool::new(false),
         }
+    }
+
+    /// Whether any bitmap blob has failed to load or store since this index was
+    /// opened.
+    ///
+    /// A `true` here means at least one query may have silently returned fewer
+    /// rows than it should (a corrupt blob is served as empty) or a write was
+    /// dropped — the index is **derived**, so the owner should rebuild this
+    /// field from the WAL rather than trust further results. Latches once set.
+    pub fn corruption_detected(&self) -> bool {
+        self.corrupted.load(Ordering::Relaxed)
     }
 
     /// Record that `row_id` has `value` for this field.
@@ -273,20 +295,46 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     fn load_bitmap(&self, slot_id: u128) -> RoaringBitmap {
         match self.bitmaps.get(slot_id) {
+            // A *missing* slot is a normal empty bitmap, not corruption.
+            None => RoaringBitmap::new(),
             Some(bytes) => match storage::deserialize(&bytes) {
                 Ok(bm) => bm,
                 Err(e) => {
-                    tracing::warn!(slot = slot_id, error = %e, "load_bitmap: deserialization failed, returning empty");
+                    // The blob exists but won't deserialise: serve empty (so the
+                    // query/mutation stays infallible) but latch the corruption
+                    // flag so the owner can rebuild instead of trusting a result
+                    // that silently dropped this value's rows.
+                    self.corrupted.store(true, Ordering::Relaxed);
+                    tracing::error!(
+                        slot = slot_id,
+                        error = %e,
+                        "load_bitmap: bitmap blob failed to deserialize; serving empty and flagging the index corrupt (rebuild this field from the WAL)"
+                    );
                     RoaringBitmap::new()
                 }
             },
-            None => RoaringBitmap::new(),
         }
     }
 
     fn store_bitmap(&mut self, slot_id: u128, bm: &RoaringBitmap) {
-        let bytes = storage::serialize(bm).unwrap_or_default();
-        self.bitmaps.upsert(slot_id, &bytes);
+        match storage::serialize(bm) {
+            Ok(bytes) => {
+                self.bitmaps.upsert(slot_id, &bytes);
+            }
+            Err(e) => {
+                // Serialising a valid bitmap is effectively infallible, so this is
+                // a genuine "should never happen". Do NOT write empty bytes (the
+                // old `unwrap_or_default()` behaviour) — that would silently drop
+                // every row under this value. Leave the prior blob intact and flag
+                // the corruption for the owner to repair from the WAL.
+                self.corrupted.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    slot = slot_id,
+                    error = %e,
+                    "store_bitmap: bitmap failed to serialize; keeping the prior blob and flagging the index corrupt"
+                );
+            }
+        }
     }
 }
 
@@ -425,6 +473,15 @@ mod tests {
     }
 
     #[test]
+    fn healthy_index_reports_no_corruption() {
+        let mut idx = FieldIndex::<i64>::new();
+        idx.insert(7, 1);
+        idx.insert(8, 2);
+        assert_eq!(idx.evaluate(&Predicate::Eq(7)).iter().collect::<Vec<_>>(), vec![1]);
+        assert!(!idx.corruption_detected(), "normal load/store must not flag corruption");
+    }
+
+    #[test]
     fn load_bitmap_returns_empty_on_corrupt_blob() {
         let mut idx = FieldIndex::<i64>::new();
         idx.insert(7, 1);
@@ -434,6 +491,16 @@ mod tests {
         // back to an empty bitmap instead of propagating an error.
         idx.bitmaps.upsert(slot, &1u32.to_le_bytes());
         assert!(idx.load_bitmap(slot).is_empty());
+        // …but the failure is now observable rather than silent.
+        assert!(idx.corruption_detected(), "a failed bitmap load must latch the corruption flag");
+    }
+
+    #[test]
+    fn missing_slot_is_not_treated_as_corruption() {
+        // A slot with no blob at all is a legitimate empty bitmap, not corruption.
+        let idx = FieldIndex::<i64>::new();
+        assert!(idx.evaluate(&Predicate::Eq(123)).is_empty());
+        assert!(!idx.corruption_detected());
     }
 
     #[test]
@@ -455,5 +522,6 @@ mod tests {
         idx.bitmaps.upsert(slot, &blob);
 
         assert!(idx.load_bitmap(slot).is_empty());
+        assert!(idx.corruption_detected(), "an invalid rkyv payload must latch the corruption flag");
     }
 }
