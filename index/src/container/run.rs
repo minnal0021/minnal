@@ -325,7 +325,10 @@ impl Default for RunContainer {
 pub struct RunIter<'a> {
     runs: &'a [Run],
     run_idx: usize,
-    current: u16,
+    /// Next value to yield within the current run, widened to `u32` so a run
+    /// ending at `u16::MAX` can advance one past it (65536) without wrapping
+    /// back to 0 — which, with a `u16` cursor, re-entered the run endlessly.
+    current: u32,
     initialized: bool,
 }
 
@@ -336,7 +339,7 @@ impl Iterator for RunIter<'_> {
         if !self.initialized {
             self.initialized = true;
             if self.run_idx < self.runs.len() {
-                self.current = self.runs[self.run_idx].start;
+                self.current = self.runs[self.run_idx].start as u32;
             }
         }
         loop {
@@ -344,14 +347,14 @@ impl Iterator for RunIter<'_> {
                 return None;
             }
             let run = &self.runs[self.run_idx];
-            if self.current <= run.end() {
-                let val = self.current;
-                self.current = self.current.wrapping_add(1);
+            if self.current <= run.end() as u32 {
+                let val = self.current as u16;
+                self.current += 1;
                 return Some(val);
             }
             self.run_idx += 1;
             if self.run_idx < self.runs.len() {
-                self.current = self.runs[self.run_idx].start;
+                self.current = self.runs[self.run_idx].start as u32;
             }
         }
     }
@@ -459,6 +462,52 @@ mod tests {
         let c = RunContainer::from_sorted_values(&[1, 2, 3, 10, 11]);
         let collected: Vec<u16> = c.iter().collect();
         assert_eq!(collected, vec![1, 2, 3, 10, 11]);
+    }
+
+    // Regression: a run ending at u16::MAX must terminate. The old u16 cursor
+    // wrapped 65535 -> 0 after yielding the last value, and since 0 <= end the
+    // iterator re-entered the run forever.
+    #[test]
+    fn iter_run_ending_at_u16_max() {
+        let c = RunContainer::from_sorted_values(&[65534, 65535]);
+        let collected: Vec<u16> = c.iter().collect();
+        assert_eq!(collected, vec![65534, 65535]);
+    }
+
+    #[test]
+    fn iter_single_value_u16_max() {
+        let c = RunContainer::from_sorted_values(&[65535]);
+        let collected: Vec<u16> = c.iter().collect();
+        assert_eq!(collected, vec![65535]);
+    }
+
+    #[test]
+    fn iter_full_range_run() {
+        // A single run spanning the whole u16 domain (start=0, end=65535).
+        let vals: Vec<u16> = (0..=u16::MAX).collect();
+        let c = RunContainer::from_sorted_values(&vals);
+        assert_eq!(c.num_runs(), 1);
+        let collected: Vec<u16> = c.iter().collect();
+        assert_eq!(collected.len(), 65536);
+        assert_eq!(collected, vals);
+    }
+
+    #[test]
+    fn iter_run_at_max_preceded_by_other_run() {
+        // Two runs, the trailing one ending at u16::MAX: the iterator must
+        // finish the first run, advance, finish the second, then stop.
+        let c = RunContainer::from_sorted_values(&[1, 2, 65534, 65535]);
+        assert_eq!(c.num_runs(), 2);
+        let collected: Vec<u16> = c.iter().collect();
+        assert_eq!(collected, vec![1, 2, 65534, 65535]);
+    }
+
+    #[test]
+    fn iter_matches_to_values_with_max() {
+        // iter() and to_values() must agree even at the u16::MAX boundary.
+        let c = RunContainer::from_sorted_values(&[0, 1, 100, 65534, 65535]);
+        let via_iter: Vec<u16> = c.iter().collect();
+        assert_eq!(via_iter, c.to_values());
     }
 
     #[test]
