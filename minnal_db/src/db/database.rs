@@ -3142,6 +3142,78 @@ mod tests {
         db.shutdown().unwrap();
     }
 
+    /// Coordinator-level companion to
+    /// [`test_recovery_reconstructs_wal_tail_past_stale_metadata`]: rather than
+    /// hand-crafting the WAL, it drives the **real** `Database::put` write path so
+    /// it catches counter/short-circuit regressions in `Database::open` +
+    /// `recover_from_wal` + `Wal::recover_tail` — e.g. a stale `total_entries`
+    /// that wrongly trips the `persisted >= total` short-circuit, or a tail fold
+    /// that miscounts `total`/`segment_total` and so under- or over-replays.
+    ///
+    /// Scenario (the "crash just after a metadata flush" window):
+    ///   1. open Db, `put` key A,
+    ///   2. flush WAL metadata so the durable snapshot covers only A,
+    ///   3. `put` key B — fsynced into the WAL, but its in-memory metadata bump
+    ///      never reaches disk (no further flush, `records_per_sync = 1000` so the
+    ///      write path never auto-syncs/persists for two puts),
+    ///   4. abandon the Db **without** shutdown via `mem::forget`, faithfully
+    ///      simulating a crash: the in-memory metadata that knows about B and the
+    ///      unflushed memtable holding A and B are both lost, leaving both keys
+    ///      only in the WAL. (A plain `drop` would run `Database::drop`, which does
+    ///      a *clean* flush — memtable→SSTable plus metadata — making B durable and
+    ///      defeating the test.)
+    ///   5. restore the stale (A-only) metadata on disk,
+    ///   6. reopen and assert BOTH A and B are recovered.
+    #[test]
+    fn test_recovery_from_stale_metadata_via_real_write_path() {
+        let dir = TempDir::new().unwrap();
+        let wal_meta_path = dir.path().join("wal_metadata");
+
+        let stale_metadata: Vec<u8>;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            db.put(b"A", b"va").unwrap();
+
+            // The on-disk metadata as it stood at the last flush before the crash:
+            // its tail/total cover only A.
+            db.flush_wal_metadata_internal().unwrap();
+            stale_metadata = std::fs::read(&wal_meta_path).unwrap();
+
+            // B is durable in the WAL (every put fsyncs it) but its metadata bump
+            // lives only in memory — exactly the post-flush window.
+            db.put(b"B", b"vb").unwrap();
+
+            // Abandon without shutdown to simulate a crash: `mem::forget` skips
+            // `Database::drop`, which would otherwise cleanly flush the memtable
+            // and metadata (persisting B and defeating the test). The leaked
+            // handles are released at process exit; everything durable (the WAL)
+            // is already fsynced.
+            std::mem::forget(db);
+        }
+
+        // Force the on-disk metadata back to the A-only snapshot, simulating the
+        // crash landing after A's flush but before B's would have been recorded.
+        // (Belt-and-suspenders: nothing should have rewritten it, but this makes
+        // the staleness explicit regardless of write-path sync timing.)
+        std::fs::write(&wal_meta_path, &stale_metadata).unwrap();
+
+        // Reopen: recover_tail must notice the durable WAL extends past the stale
+        // tail, fold B into total/segment counters, and recover_from_wal must
+        // replay both A (lost from the memtable) and B (past the stale tail).
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(
+            db.get(b"A").unwrap(),
+            Some(b"va".to_vec()),
+            "A lived only in the WAL and must be replayed"
+        );
+        assert_eq!(
+            db.get(b"B").unwrap(),
+            Some(b"vb".to_vec()),
+            "B was appended after the last metadata flush; recover_tail must fold it in and replay it"
+        );
+        db.shutdown().unwrap();
+    }
+
     /// Item 3: `apply_with_retry` rides out transient apply failures and stops
     /// as soon as one attempt succeeds.
     #[test]
