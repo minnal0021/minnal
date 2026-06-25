@@ -492,6 +492,31 @@ mod tests {
     }
 
     #[test]
+    fn and_binds_tighter_than_or_changes_result_set() {
+        // `a = 1 OR b = 2 AND c = 3` must evaluate as `a = 1 OR (b = 2 AND c = 3)`.
+        // Row 1 matches a=1 only; row 2 matches b=2 AND c=3; row 3 matches b=2
+        // but not c=3. Correct precedence ⇒ {1, 2}. The old equal-precedence
+        // grouping `(a = 1 OR b = 2) AND c = 3` would instead yield {2}.
+        let a = make_int_index(&[(1, 1), (9, 2), (9, 3)]);
+        let b = make_int_index(&[(9, 1), (2, 2), (2, 3)]);
+        let c = make_int_index(&[(9, 1), (3, 2), (9, 3)]);
+        let s = schema(&[("a", 0), ("b", 1), ("c", 2)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&a)),
+            1 => Some(Arc::clone(&b)),
+            2 => Some(Arc::clone(&c)),
+            _ => None,
+        };
+
+        let bm = parse_and_evaluate("a = 1 OR b = 2 AND c = 3", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![1, 2]);
+
+        // Explicit parentheses still force the other grouping → {2}.
+        let bm = parse_and_evaluate("(a = 1 OR b = 2) AND c = 3", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![2]);
+    }
+
+    #[test]
     fn test_unknown_field_error() {
         let s: SchemaMap = HashMap::new();
         let get_index = |_: u32| None;

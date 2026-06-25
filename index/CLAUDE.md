@@ -77,6 +77,8 @@ RECOVERY (on open)                                         [index + minnal_db]
 
 The string DSL is used by `minnal_doc_store` to accept structured query strings from the REST API. Example: `age > 30 AND status = "active"`. The lexer/parser produce a `RawExpr`; the evaluator runs it against the live field indexes (resolved by name through a `SchemaMap` + `get_index` closure).
 
+**Operator precedence is the conventional boolean ordering: `NOT` > `AND` > `OR`** (`NOT` binds tightest, `OR` loosest). So `a = 1 OR b = 2 AND c = 3` means `a = 1 OR (b = 2 AND c = 3)`, and `NOT a = 1 AND b = 2` means `(NOT a = 1) AND b = 2`. `AND` and `OR` are each left-associative; use parentheses to override grouping. (The evaluator validates the **whole** AST before evaluating, and AND short-circuits only after validation — see `query/eval.rs`.)
+
 ## Persistence
 
 Index snapshots are written to the database directory alongside the LSM/value-log data. `IndexCheckpointWorker` in `minnal_db` drives periodic snapshots; on open, `minnal_db` replays any un-checkpointed WAL entries to bring the index back in sync.
