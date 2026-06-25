@@ -15,6 +15,37 @@
 //! [`BlobStore`] under a `keymap/` subdirectory.  Each entry maps
 //! `slot_id (u128) → serialised value bytes`, so individual inserts and
 //! removes are immediately durable without rewriting the entire keymap.
+//!
+//! # Crash atomicity — DynFieldIndex is NOT independently crash-atomic
+//!
+//! A [`DynFieldIndex`] spans **two** separate [`BlobStore`]s — the bitmap store
+//! (`slot_id → RoaringBitmap`) and the keymap store (`slot_id → value bytes`) —
+//! and there is **no index-level marker tying them to one logical point**.
+//! [`flush`] flushes the bitmap store and then the keymap store as two distinct
+//! `msync`s, so a crash *between* them leaves the two stores at different
+//! versions (a "skew"): e.g. a slot's bitmap is on disk but its keymap entry is
+//! not, or vice-versa. Each store on its own is still structurally valid (they
+//! pass [`BlobStore::open`]'s header/bounds checks) — they simply disagree.
+//!
+//! This is **by design**: the field index is a *derived, reconstructable*
+//! structure, so consistency is the **owner's** responsibility, not the index
+//! crate's. In `minnal_db`, `run_index_checkpoint` flushes both stores and only
+//! *then* records the WAL offset (`IndexManager::checkpoint_fields`) as the
+//! single atomic marker. A crash mid-flush leaves that offset at the previous
+//! checkpoint, so on open `minnal_db` replays every WAL entry since then on top
+//! of the loaded index, re-applying the affected inserts/removes in their
+//! original order and reconciling any skew. A skewed reopen never panics or
+//! reads out of bounds — at worst a torn value queries empty (or leaves an
+//! orphaned slot reclaimed by a later [`compact`]) until replay heals it.
+//!
+//! **Standalone users must provide their own reconciliation** (e.g. an external
+//! log to replay, or a wrapping checkpoint marker). Do not assume that opening a
+//! `DynFieldIndex` after a crash, with no replay, yields a self-consistent
+//! bitmap/keymap pair. An index-level marker is intentionally **not** provided
+//! here because it would duplicate the owner's WAL-offset checkpoint; add one
+//! only if a genuine standalone-crash-atomic use case appears.
+//!
+//! [`compact`]: BlobStore::compact
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -150,6 +181,12 @@ impl DynFieldIndex {
     }
 
     /// Flush both the bitmap and keymap mmap stores to disk.
+    ///
+    /// The bitmap store is flushed first, then the keymap store, as **two
+    /// independent `msync`s with no marker between them** — so a crash in
+    /// between leaves the two stores skewed. This call is *not* crash-atomic on
+    /// its own; the owner heals skew by replaying its log from the last
+    /// checkpoint offset. See the module-level *Crash atomicity* section.
     ///
     /// The `dir` parameter is retained for API compatibility but is no longer
     /// used — all state is already in the mmap stores opened at construction.
@@ -713,5 +750,99 @@ mod tests {
             }
             _ => unreachable!("expected Str index"),
         }
+    }
+
+    // ── Bitmap/keymap skew (crash mid-flush) ────────────────────────────────
+    //
+    // flush() msyncs the bitmap store then the keymap store as two separate
+    // steps with no marker between them, so a crash in between leaves the two
+    // stores at different logical points. These tests reproduce that skew by
+    // rolling one store's files back to an earlier snapshot (each snapshot is
+    // itself a valid flushed state) and assert that reopening is non-fatal and
+    // that re-applying the op — as the owner's WAL replay would — reconciles it.
+    // See the module-level *Crash atomicity* docs.
+
+    fn query_int_eq(idx: &DynFieldIndex, v: i64) -> Vec<u128> {
+        match &idx.inner {
+            DynFieldIndexInner::Int(fi) => fi.evaluate(&Predicate::Eq(v)).iter().collect(),
+            _ => unreachable!("expected Int index"),
+        }
+    }
+
+    #[test]
+    fn skew_keymap_lags_bitmap_is_nonfatal_and_reconcilable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keymap = dir.path().join("keymap");
+
+        // Durable state knowing only value 100 (slot 0).
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(100), 0).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let ks_keys = std::fs::read(keymap.join("blobs.keys")).unwrap();
+        let ks_vals = std::fs::read(keymap.join("blobs.vals")).unwrap();
+
+        // Add value 200 (slot 1) and flush both stores durably.
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(200), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+
+        // Roll the KEYMAP back: the bitmap store still has slot 1's bitmap, but
+        // the keymap no longer maps slot 1 → 200 — exactly the state a crash
+        // after the bitmap flush but before the keymap flush leaves behind.
+        std::fs::write(keymap.join("blobs.keys"), &ks_keys).unwrap();
+        std::fs::write(keymap.join("blobs.vals"), &ks_vals).unwrap();
+
+        // Reopen: must not panic. The intact value survives; the torn value's
+        // bitmap is orphaned (no keymap entry) so it queries empty.
+        let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 100), vec![0], "intact value survives the skew");
+        assert_eq!(query_int_eq(&idx, 200), Vec::<u128>::new(), "torn value's keymap entry was lost");
+
+        // Owner reconciliation: replaying the same insert restores consistency.
+        idx.insert(&IndexValue::Int(200), 1).unwrap();
+        idx.flush(dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
+    }
+
+    #[test]
+    fn skew_bitmap_lags_keymap_is_nonfatal_and_reconcilable() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Durable state knowing only value 100 (slot 0).
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(100), 0).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let bm_keys = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let bm_vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+
+        // Add value 200 (slot 1) and flush both stores durably.
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(200), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+
+        // Roll the BITMAP store back: the keymap still maps slot 1 → 200, but the
+        // bitmap store lacks slot 1's bitmap — the reverse skew (crash after the
+        // keymap flush but before the bitmap flush).
+        std::fs::write(dir.path().join("blobs.keys"), &bm_keys).unwrap();
+        std::fs::write(dir.path().join("blobs.vals"), &bm_vals).unwrap();
+
+        // Reopen: must not panic. Value 200 is known to the ordering but its
+        // bitmap is missing, so it queries empty rather than crashing.
+        let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 100), vec![0], "intact value survives the skew");
+        assert_eq!(query_int_eq(&idx, 200), Vec::<u128>::new(), "torn value's bitmap is missing");
+
+        // Re-applying the insert (WAL replay) restores the missing bitmap bit.
+        idx.insert(&IndexValue::Int(200), 1).unwrap();
+        idx.flush(dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
     }
 }
