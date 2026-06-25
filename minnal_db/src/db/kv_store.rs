@@ -534,11 +534,21 @@ impl KVStore {
     fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
         let mut next_version = 1u32;
+        // Capture the prior value's bytes so field-index updates can be O(1)
+        // (targeted at the old value's bucket) instead of scanning every bucket.
+        // Only worth a value-log read when the namespace actually has indexes.
+        let want_old_for_index = !self.namespace_index.read().is_empty();
+        let mut old_value: Option<Vec<u8>> = None;
+        let mut key_existed = false;
         if let Some(existing) = self.lsm.get(key)?
             && let Some(existing_ptr) = decode_sharded_pointer(existing)
         {
+            key_existed = true;
             if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
                 next_version = meta.version.saturating_add(1);
+            }
+            if want_old_for_index {
+                old_value = self.value_log.read_value(existing_ptr).ok();
             }
             let _ = self.value_log.update_record_meta(existing_ptr, None, Some(true), Some(epoch));
         }
@@ -561,12 +571,21 @@ impl KVStore {
         drop(_bucket_guard);
 
         // Update in-memory field indices
-        self.update_indices_on_put(key, value);
+        self.update_indices_on_put(key, value, old_value.as_deref(), key_existed);
 
         Ok(())
     }
 
-    fn update_indices_on_put(&self, key: &[u8], value: &[u8]) {
+    /// Update field indices for a put.
+    ///
+    /// `old_value` is the document's *prior* stored bytes when this put replaced
+    /// an existing key (`None` for a fresh insert, or when the prior bytes could
+    /// not be read). Supplying it lets each field do an `O(1)` targeted update
+    /// (move the row from its old value's bucket to the new one) instead of the
+    /// `O(distinct values)` scan `remove_all_for_row` performs — a big win for
+    /// high-cardinality fields. When the prior bytes are unavailable on a replace
+    /// we fall back to the scan so the row never lingers in a stale bucket.
+    fn update_indices_on_put(&self, key: &[u8], value: &[u8], old_value: Option<&[u8]>, key_existed: bool) {
         let row_id = self.resolve_row_id_alloc(key);
         let ns_index = self.namespace_index.read();
         if ns_index.is_empty() {
@@ -575,17 +594,29 @@ impl KVStore {
         for entry in ns_index.iter() {
             let new_val = (entry.extractor)(value);
             let mut idx = entry.index.write();
-            match new_val {
-                // Scalar update: `set` clears the row from any prior value bucket
-                // and inserts the new one in a single call, preserving the
-                // one-value-per-row invariant.
-                Some(v) => {
-                    if let Err(e) = idx.set(&v, row_id) {
-                        warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
-                    }
+            let result = match (key_existed, old_value) {
+                // Replace with the prior bytes in hand → O(1) targeted update.
+                (true, Some(ov)) => {
+                    let old_val = (entry.extractor)(ov);
+                    idx.update(old_val.as_ref(), new_val.as_ref(), row_id)
                 }
-                // Field is now absent from the document → drop the row entirely.
-                None => idx.remove_all_for_row(row_id),
+                // Fresh insert: the row is in no bucket yet, so skip the scan.
+                (false, _) => match &new_val {
+                    Some(v) => idx.insert(v, row_id),
+                    None => Ok(()),
+                },
+                // Replace but prior bytes unreadable: scan to clear the old bucket,
+                // then insert the new value, preserving one-value-per-row.
+                (true, None) => match &new_val {
+                    Some(v) => idx.set(v, row_id),
+                    None => {
+                        idx.remove_all_for_row(row_id);
+                        Ok(())
+                    }
+                },
+            };
+            if let Err(e) = result {
+                warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
             }
         }
     }
@@ -708,9 +739,17 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
+        // Read the prior value (under the bucket lock, so GC can't relocate it)
+        // so index removal can target the old value's bucket instead of scanning
+        // every bucket. Only when the namespace has indexes to update.
+        let want_old_for_index = !self.namespace_index.read().is_empty();
+        let mut old_value: Option<Vec<u8>> = None;
         if let Some(existing) = self.lsm.get(key)?
             && let Some(existing_ptr) = decode_sharded_pointer(existing)
         {
+            if want_old_for_index {
+                old_value = self.value_log.read_value(existing_ptr).ok();
+            }
             let _ = self
                 .value_log
                 .update_record_meta(existing_ptr, Some(true), None, Some(current_epoch_millis()));
@@ -719,12 +758,18 @@ impl KVStore {
         drop(_bucket_guard);
 
         // Remove row from all field indices
-        self.update_indices_on_delete(key);
+        self.update_indices_on_delete(key, old_value.as_deref());
 
         Ok(())
     }
 
-    fn update_indices_on_delete(&self, key: &[u8]) {
+    /// Remove a deleted key's row from the field indices.
+    ///
+    /// With the deleted document's prior bytes (`old_value`) in hand, each field
+    /// removes the row from just its old value's bucket — `O(1)` instead of the
+    /// `O(distinct values)` scan. Falls back to the scan only when those bytes
+    /// could not be read, so a row never lingers in a stale bucket.
+    fn update_indices_on_delete(&self, key: &[u8], old_value: Option<&[u8]>) {
         let ns_index = self.namespace_index.read();
         if ns_index.is_empty() {
             return;
@@ -734,7 +779,18 @@ impl KVStore {
             return;
         };
         for entry in ns_index.iter() {
-            entry.index.write().remove_all_for_row(row_id);
+            let mut idx = entry.index.write();
+            match old_value {
+                // Targeted: the row is under the old value's bucket (if any).
+                Some(ov) => {
+                    if let Some(old_val) = (entry.extractor)(ov) {
+                        idx.remove(&old_val, row_id);
+                    }
+                    // Field absent in the old doc → row was never indexed for it.
+                }
+                // Prior bytes unavailable → scan to be safe.
+                None => idx.remove_all_for_row(row_id),
+            }
         }
     }
 

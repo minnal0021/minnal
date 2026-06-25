@@ -206,10 +206,16 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// append-only bitmap store. For a scalar field the common case touches a
     /// single bucket, so the write-back cost is one bitmap.
     ///
-    /// The scan still *loads* each bucket to test membership; making this O(1)
-    /// would need a `row → slot` reverse index, deliberately not kept — it would
-    /// double the per-write index mutations and its own append-only churn for a
-    /// structure that is already rebuilt from the WAL on recovery.
+    /// The scan still *loads* each bucket to test membership — `O(distinct
+    /// values)`. **When the caller knows the row's old value** (the document
+    /// layer always does, from the prior document), prefer the `O(1)` targeted
+    /// path — [`remove(old, row)`](Self::remove), or `DynFieldIndex::update` /
+    /// `DynFieldIndex::remove` — which touches only the affected bucket. This
+    /// full scan is the fallback for when the old value is unknown. A persistent
+    /// `row → slot` reverse index is **deliberately not kept** (it would double
+    /// the per-write index mutations and add its own append-only churn for a
+    /// structure already rebuilt from the WAL on recovery); supplying the old
+    /// value gives the same `O(1)` without that cost.
     pub fn remove_all_for_row(&mut self, row_id: u128) -> Vec<u128> {
         // Collect slot IDs and which values to drop before any mutation to
         // satisfy the borrow checker (can't borrow ordering immutably and

@@ -3321,6 +3321,51 @@ mod tests {
         db.shutdown().unwrap();
     }
 
+    /// Regression for the O(1) targeted field-index update/delete (item 13): a
+    /// document update must move its row from the old value's bucket to the new
+    /// one (the prior value must stop matching), and a delete must remove it —
+    /// driven by the prior document bytes read in the put/delete path, not a
+    /// full bucket scan.
+    #[test]
+    fn test_field_index_targeted_update_and_delete() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().len(), 2);
+
+        // Update doc:1's status active -> archived. The targeted update must move
+        // the row, so it no longer matches "active" and now matches "archived".
+        db.put(b"doc:1", br#"{"status":"archived"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        // Updating to the same value is a no-op and keeps the row queryable.
+        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
+
+        // Delete doc:2 → it must leave the "active" bucket.
+        db.delete(b"doc:2").unwrap();
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        db.shutdown().unwrap();
+    }
+
     /// Deactivating a field index and deleting its on-disk directory must not
     /// cause shutdown to fail with ENOENT when run_index_checkpoint is called.
     #[test]

@@ -396,6 +396,38 @@ impl DynFieldIndex {
         self.insert(value, row_id)
     }
 
+    /// Targeted scalar update when the caller knows `row_id`'s **previous** value
+    /// for this field: move the row from `old`'s bucket to `new`'s.
+    ///
+    /// This is `O(1)` — it touches at most the two affected buckets — unlike
+    /// [`set`](Self::set) / [`remove_all_for_row`](Self::remove_all_for_row),
+    /// which scan **every** value bucket to find the row (`O(distinct values)`,
+    /// painful for high-cardinality fields). The document layer already has the
+    /// old document, so it can supply `old` and avoid the scan.
+    ///
+    /// Cases: `old == new` is a no-op (value unchanged); `old = Some, new = None`
+    /// removes the row (field gone); `old = None, new = Some` is a plain insert
+    /// (first time / fresh row); `old = None, new = None` is a no-op. Use this
+    /// only when `old` is **known correct** — if it is stale the row would be
+    /// left in its real old bucket; callers that can't be sure should fall back
+    /// to [`set`](Self::set) / [`remove_all_for_row`](Self::remove_all_for_row).
+    ///
+    /// # Errors
+    /// Type mismatch from the `new` insert (same as [`insert`](Self::insert));
+    /// the `old` removal has already happened when this returns `Err`.
+    pub fn update(&mut self, old: Option<&IndexValue>, new: Option<&IndexValue>, row_id: u128) -> Result<(), String> {
+        if old == new {
+            return Ok(());
+        }
+        if let Some(o) = old {
+            self.remove(o, row_id);
+        }
+        match new {
+            Some(n) => self.insert(n, row_id),
+            None => Ok(()),
+        }
+    }
+
     /// Remove `row_id` from the bucket for `value`.
     ///
     /// If the value's bitmap becomes empty, the keymap entry is also removed
@@ -581,6 +613,49 @@ mod tests {
         assert_eq!(query_int_eq(&idx, 7), vec![1], "row now matches its new value");
         assert!(query_int_eq(&idx, 42).is_empty(), "row no longer matches its old value");
         assert_eq!(idx.distinct_count(), 1, "no stale value bucket left behind");
+    }
+
+    #[test]
+    fn update_moves_row_between_buckets_without_scanning() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        // Many distinct values so the row's value is unrelated to bucket count;
+        // update must hit only the old + new buckets.
+        for v in 0..100i64 {
+            idx.insert(&IndexValue::Int(v), v as u128).unwrap();
+        }
+        // Row 5 currently has value 5; move it to a brand-new value 1000.
+        idx.update(Some(&IndexValue::Int(5)), Some(&IndexValue::Int(1000)), 5).unwrap();
+        assert_eq!(query_int_eq(&idx, 1000), vec![5]);
+        assert!(query_int_eq(&idx, 5).is_empty(), "old value no longer matches the row");
+        // Untouched rows are intact.
+        assert_eq!(query_int_eq(&idx, 50), vec![50]);
+    }
+
+    #[test]
+    fn update_unchanged_value_is_a_noop() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.insert(&IndexValue::Int(7), 1).unwrap();
+        let before = idx.distinct_count();
+        // old == new ⇒ nothing changes, no bucket churn.
+        idx.update(Some(&IndexValue::Int(7)), Some(&IndexValue::Int(7)), 1).unwrap();
+        assert_eq!(query_int_eq(&idx, 7), vec![1]);
+        assert_eq!(idx.distinct_count(), before);
+    }
+
+    #[test]
+    fn update_none_to_some_is_a_fresh_insert() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.update(None, Some(&IndexValue::Int(9)), 1).unwrap();
+        assert_eq!(query_int_eq(&idx, 9), vec![1]);
+    }
+
+    #[test]
+    fn update_some_to_none_removes_the_row() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.insert(&IndexValue::Int(9), 1).unwrap();
+        idx.update(Some(&IndexValue::Int(9)), None, 1).unwrap();
+        assert!(query_int_eq(&idx, 9).is_empty());
+        assert_eq!(idx.distinct_count(), 0, "emptied value bucket is dropped");
     }
 
     #[test]
