@@ -333,8 +333,14 @@ impl DynFieldIndex {
     ///
     /// # Errors
     /// Returns an error string on type mismatch (runtime type of `value` does
-    /// not match the variant this index was created with).
+    /// not match the variant this index was created with), or when the value is
+    /// too large to index — the keymap stores the serialised value with a `u32`
+    /// length, so a value at or beyond 4 GiB is **rejected with a clean error**
+    /// rather than truncated/corrupted deep in the store. (Only a `Str` value can
+    /// reach the limit; `Bool`/`Int` are 1/8 bytes.) The caller can log and skip
+    /// the field; the document itself is unaffected.
     pub fn insert(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
+        check_value_size(value, u32::MAX as usize)?;
         match (&mut self.inner, value) {
             (DynFieldIndexInner::Bool(idx), IndexValue::Bool(v)) => {
                 let prev = idx.next_slot();
@@ -521,6 +527,27 @@ impl DynFieldIndex {
 //   Str  → raw UTF-8 bytes
 
 #[inline]
+/// Byte length the value occupies in the keymap store (its serialised form).
+fn value_blob_len(value: &IndexValue) -> usize {
+    match value {
+        IndexValue::Bool(_) => 1,
+        IndexValue::Int(_) => 8,
+        IndexValue::Str(s) => s.len(),
+    }
+}
+
+/// Reject an indexed value whose serialised form exceeds `max_bytes` (the keymap
+/// store's `u32` length limit in production). Returns a clean error instead of
+/// letting the length truncate to `u32` and corrupt the store. `max_bytes` is a
+/// parameter so the bound can be exercised in tests without a multi-GiB value.
+fn check_value_size(value: &IndexValue, max_bytes: usize) -> Result<(), String> {
+    let len = value_blob_len(value);
+    if len > max_bytes {
+        return Err(format!("indexed field value of {len} bytes exceeds the {max_bytes}-byte index limit"));
+    }
+    Ok(())
+}
+
 fn serialize_bool(v: bool) -> Vec<u8> {
     vec![u8::from(v)]
 }
@@ -601,6 +628,31 @@ mod tests {
         idx.insert(&IndexValue::Int(-7), 20).unwrap();
         idx.insert(&IndexValue::Int(42), 30).unwrap();
         assert_eq!(idx.distinct_count(), 2);
+    }
+
+    #[test]
+    fn check_value_size_accepts_within_limit_and_rejects_over() {
+        // Injectable limit lets us exercise the over-limit branch with a tiny
+        // string instead of a 4 GiB one.
+        assert!(check_value_size(&IndexValue::Str("ab".into()), 3).is_ok());
+        assert!(check_value_size(&IndexValue::Str("abc".into()), 3).is_ok()); // boundary
+        let err = check_value_size(&IndexValue::Str("abcd".into()), 3).unwrap_err();
+        assert!(err.contains("exceeds the 3-byte"), "got: {err}");
+        // Bool/Int are 1/8 bytes — never hit the (production-sized) limit.
+        assert!(check_value_size(&IndexValue::Bool(true), 8).is_ok());
+        assert!(check_value_size(&IndexValue::Int(-5), 8).is_ok());
+    }
+
+    #[test]
+    fn insert_normal_values_are_within_the_u32_limit() {
+        // Regression: a realistic value must pass the size guard on the real path.
+        let mut idx = DynFieldIndex::new(IndexValueType::Str);
+        assert!(idx.insert(&IndexValue::Str("active".into()), 1).is_ok());
+        assert!(idx.set(&IndexValue::Str("archived".into()), 1).is_ok());
+        assert!(
+            idx.update(None, Some(&IndexValue::Str("done".into())), 2).is_ok(),
+            "update goes through the same value-size guard"
+        );
     }
 
     #[test]
