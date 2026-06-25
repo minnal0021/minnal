@@ -123,26 +123,38 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self, start: usize) -> Result<Token, QueryError> {
         let quote = self.advance().unwrap();
-        let mut s = String::new();
+        // Accumulate raw bytes, then decode the whole literal as UTF-8 once.
+        // Scanning byte-by-byte is safe because the only structural bytes — the
+        // quote and `\` — are ASCII and so can never occur *inside* a multi-byte
+        // UTF-8 sequence; every other byte (including the bytes of a multi-byte
+        // character) is copied verbatim and reassembled by `from_utf8`. The
+        // previous `ch as char` per byte mangled non-ASCII text (e.g. Tamil,
+        // emoji, accented Latin) into unrelated Latin-1 scalar values.
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             match self.advance() {
                 None => return Err(QueryError::syntax(start, "unterminated string literal")),
                 Some(ch) if ch == quote => break,
                 Some(b'\\') => match self.advance() {
-                    Some(b'\'') => s.push('\''),
-                    Some(b'"') => s.push('"'),
-                    Some(b'n') => s.push('\n'),
-                    Some(b't') => s.push('\t'),
-                    Some(b'\\') => s.push('\\'),
+                    Some(b'\'') => buf.push(b'\''),
+                    Some(b'"') => buf.push(b'"'),
+                    Some(b'n') => buf.push(b'\n'),
+                    Some(b't') => buf.push(b'\t'),
+                    Some(b'\\') => buf.push(b'\\'),
                     Some(ch) => {
-                        s.push('\\');
-                        s.push(ch as char);
+                        // Unknown escape: keep the backslash and the byte verbatim.
+                        // If `ch` is the lead byte of a multi-byte character, its
+                        // continuation bytes follow as ordinary content below and
+                        // reassemble correctly.
+                        buf.push(b'\\');
+                        buf.push(ch);
                     }
                     None => return Err(QueryError::syntax(start, "unterminated escape sequence")),
                 },
-                Some(ch) => s.push(ch as char),
+                Some(ch) => buf.push(ch),
             }
         }
+        let s = String::from_utf8(buf).map_err(|_| QueryError::syntax(start, "string literal is not valid UTF-8"))?;
         Ok(Token::StrLit(s))
     }
 
@@ -265,5 +277,59 @@ mod tests {
         assert!(Lexer::new("a ! b").next_token().is_ok()); // 'a' is fine
         let mut lex = Lexer::new("!b");
         assert!(lex.next_token().is_err());
+    }
+
+    // ── Non-ASCII string literals ──────────────────────────────────────────
+    //
+    // The lexer must preserve multi-byte UTF-8 content exactly, so a queried
+    // string equals the stored JSON string. The previous `ch as char` per byte
+    // turned each UTF-8 byte into an unrelated Latin-1 scalar.
+
+    /// Helper: lex a single string literal and return its decoded value.
+    fn lex_one_string(src: &str) -> String {
+        match tokens(src).into_iter().next() {
+            Some(Token::StrLit(s)) => s,
+            other => panic!("expected StrLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_string_literal_tamil() {
+        // மின்னல் ("minnal" — lightning), the project's namesake.
+        assert_eq!(lex_one_string("'மின்னல்'"), "மின்னல்");
+    }
+
+    #[test]
+    fn test_string_literal_emoji() {
+        assert_eq!(lex_one_string("'⚡🌩️'"), "⚡🌩️");
+    }
+
+    #[test]
+    fn test_string_literal_accented_latin() {
+        assert_eq!(lex_one_string(r#""café Köln naïve""#), "café Köln naïve");
+    }
+
+    #[test]
+    fn test_string_literal_mixed_ascii_and_unicode() {
+        assert_eq!(lex_one_string("'name: மின்னல் ⚡'"), "name: மின்னல் ⚡");
+    }
+
+    #[test]
+    fn test_string_literal_unicode_byte_for_byte_roundtrip() {
+        // The decoded literal must be byte-identical to the source between quotes.
+        let content = "Ωμέγα — Tamil:அ Han:漢 emoji:😀";
+        let src = format!("'{content}'");
+        assert_eq!(lex_one_string(&src), content);
+    }
+
+    #[test]
+    fn test_string_literal_escape_before_unicode() {
+        // Unknown escape `\ ` then a multi-byte char: backslash kept, char intact.
+        assert_eq!(lex_one_string(r"'\மி'"), r"\மி");
+    }
+
+    #[test]
+    fn test_string_literal_known_escapes_still_work() {
+        assert_eq!(lex_one_string(r#"'a\nb\tc\'d\\e'"#), "a\nb\tc'd\\e");
     }
 }

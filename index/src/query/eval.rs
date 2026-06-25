@@ -405,6 +405,21 @@ mod tests {
     }
 
     #[test]
+    fn test_str_eq_non_ascii_unicode() {
+        // End-to-end: a non-ASCII value indexed as stored must match when queried
+        // with the same literal — broken when the lexer mangled UTF-8 byte-wise.
+        let name_idx = make_str_index(&[("மின்னல்", 1), ("lightning", 2), ("⚡", 3), ("மின்னல்", 4)]);
+        let s = schema(&[("name", 0)]);
+        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&name_idx)) } else { None };
+
+        let bm = parse_and_evaluate("name = 'மின்னல்'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![1, 4]);
+
+        let bm = parse_and_evaluate("name = '⚡'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![3]);
+    }
+
+    #[test]
     fn test_bool_eq() {
         let active_idx = make_bool_index(&[(true, 1), (false, 2), (true, 3)]);
         let s = schema(&[("active", 0)]);
