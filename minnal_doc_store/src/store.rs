@@ -28,7 +28,7 @@ use semantic_search::ClusterIndex;
 use semantic_search::service::SemanticSearchConfig;
 
 use crate::error::{DocStoreError, SchemaError};
-use crate::hex::{bytes_to_hex, hex_to_bytes};
+use crate::hex::hex_to_bytes;
 use crate::index_observer::{ChainedObserver, DiskProgress, InMemoryProgress, IndexProgressObserver};
 use crate::index_progress::{BuildStatus, now_ms};
 use crate::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
@@ -122,13 +122,6 @@ fn build_progress_path(db_path: &Path, ns_id: u32, field_id: FieldId) -> PathBuf
 fn read_disk_progress(path: &Path) -> Option<DiskBuildProgress> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-/// Atomically write `progress` to `path` (tmp-then-rename).
-fn write_disk_progress(path: &Path, progress: &DiskBuildProgress) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(progress).unwrap())?;
-    std::fs::rename(&tmp, path)
 }
 
 // ── Vector-index reindex ─────────────────────────────────────────────────────
@@ -1674,18 +1667,19 @@ impl DocStore {
             Arc::clone(&disk) as Arc<dyn IndexProgressObserver>,
         ]));
 
-        let mem_clone = Arc::clone(&mem);
         let observer_clone = Arc::clone(&observer);
+        let fail_observer = Arc::clone(&observer);
         let db_clone = Arc::clone(&self.db);
         let ns_name = namespace.to_owned();
         let field_name = spec.field.clone();
         let key_type = schema.key_type;
-        let db_path = self.db_path.clone();
 
         let task = tokio::spawn(async move {
-            let result = rebuild_index_for_namespace(db_clone, ns_id, ns_name, key_type, field_id, db_path, resume_after, observer_clone).await;
+            let result = rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
             if let Err(ref e) = result {
-                mem_clone.on_status(BuildStatus::Failed, Some(&e.to_string()));
+                // Notify the whole chain (in-memory *and* disk), so the failure
+                // is persisted, not just visible to live pollers.
+                fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
             }
             result
         });
@@ -1744,19 +1738,20 @@ impl DocStore {
                     Arc::clone(&disk_obs) as Arc<dyn IndexProgressObserver>,
                 ]));
 
-                let mem_clone = Arc::clone(&mem);
                 let observer_clone = Arc::clone(&observer);
+                let fail_observer = Arc::clone(&observer);
                 let db_clone = Arc::clone(&self.db);
                 let ns_name = schema.namespace.clone();
                 let field_name = spec.field.clone();
                 let key_type = schema.key_type;
-                let db_path = self.db_path.clone();
 
                 let task = tokio::spawn(async move {
                     let result =
-                        rebuild_index_for_namespace(db_clone, ns_id, ns_name, key_type, field_id, db_path, resume_after, observer_clone).await;
+                        rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
                     if let Err(ref e) = result {
-                        mem_clone.on_status(BuildStatus::Failed, Some(&e.to_string()));
+                        // Notify the whole chain (in-memory *and* disk), so the
+                        // failure is persisted, not just visible to live pollers.
+                        fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
                     }
                     result
                 });
@@ -2637,11 +2632,9 @@ fn successor_key(key: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)] // cohesive set of build parameters; not worth a struct
 async fn rebuild_index_for_namespace(
     db: Arc<AsyncDb>,
-    ns_id: u32,
     ns_name: String,
     key_type: KeyType,
     field_id: FieldId,
-    db_path: PathBuf,
     resume_after: Option<Vec<u8>>,
     observer: Arc<dyn IndexProgressObserver>,
 ) -> Result<(), DocStoreError> {
@@ -2673,23 +2666,15 @@ async fn rebuild_index_for_namespace(
     }
 
     info!("index build started: namespace='{}' field_id={} total={} docs", ns_name, field_id, total);
+
+    // Seed the observer with the counts from the scan, then announce Running.
+    // The observer (its `DiskProgress` link) is the single source of truth for
+    // persistence: seeding before `on_status(Running)` makes the initial
+    // in_progress record carry the real total/resume point.
+    observer.on_progress(already_done, total, false, resume_after.as_deref());
     observer.on_status(BuildStatus::Running, None);
 
-    // Write the initial in_progress record with the total count.
-    let progress_path = build_progress_path(&db_path, ns_id, field_id);
-    let _ = write_disk_progress(
-        &progress_path,
-        &DiskBuildProgress {
-            status: "in_progress".to_owned(),
-            total,
-            indexed: already_done,
-            last_key_hex: resume_after.as_ref().map(|k| bytes_to_hex(k)),
-            error: None,
-        },
-    );
-
     let mut indexed: u64 = already_done;
-    let mut last_key_hex: Option<String> = resume_after.as_ref().map(|k| bytes_to_hex(k));
 
     // ── Pass 2: rebuild, one cursor page at a time. On a resumed build the
     // cursor seeks strictly past the last processed key (the scan cursor is
@@ -2704,10 +2689,10 @@ async fn rebuild_index_for_namespace(
             // Re-put triggers the active extractors, populating the new index.
             ns.put(key.clone(), value).await?;
             indexed += 1;
-            last_key_hex = Some(bytes_to_hex(&key));
+            // The observer persists to disk on its own cadence (every `every_n`).
             observer.on_progress(indexed, total, false, Some(&key));
 
-            // Persist to disk and yield every 1 000 documents.
+            // Log progress and yield every 1 000 documents.
             if indexed.is_multiple_of(1_000) {
                 info!(
                     "index build progress: namespace='{}' field_id={} {}/{} docs ({:.1}%)",
@@ -2716,16 +2701,6 @@ async fn rebuild_index_for_namespace(
                     indexed,
                     total,
                     if total > 0 { indexed as f64 / total as f64 * 100.0 } else { 0.0 }
-                );
-                let _ = write_disk_progress(
-                    &progress_path,
-                    &DiskBuildProgress {
-                        status: "in_progress".to_owned(),
-                        total,
-                        indexed,
-                        last_key_hex: last_key_hex.clone(),
-                        error: None,
-                    },
                 );
                 tokio::task::yield_now().await;
             }
@@ -2736,17 +2711,8 @@ async fn rebuild_index_for_namespace(
         }
     }
 
-    // Mark build complete on disk.
-    let _ = write_disk_progress(
-        &progress_path,
-        &DiskBuildProgress {
-            status: "complete".to_owned(),
-            total,
-            indexed,
-            last_key_hex,
-            error: None,
-        },
-    );
+    // Mark build complete.  The observer persists the terminal record from the
+    // latest snapshot it has been fed via `on_progress`.
     observer.on_status(BuildStatus::Complete, None);
 
     info!(
