@@ -116,14 +116,24 @@ impl IndexProgressObserver for InMemoryProgress {
 // ── DiskProgress ─────────────────────────────────────────────────────────────
 
 /// Throttled disk-backed observer that atomically writes `build_progress.json`
-/// every `every_n` documents (tmp-then-rename for crash-safety).
+/// (tmp-then-rename for crash-safety).  This is the **single source of truth**
+/// for on-disk build progress — it fully replaces the ad-hoc `write_disk_progress`
+/// calls that used to be scattered through `rebuild_index_for_namespace`.
 ///
-/// Replaces the ad-hoc `write_disk_progress` calls scattered through
-/// `rebuild_index_for_namespace`.
+/// `on_progress` keeps the latest `(total, indexed, last_key)` current on every
+/// call (cheap atomics) and flushes to disk every `every_n` documents.
+/// `on_status` writes a record built from that remembered snapshot, so a
+/// terminal `complete`/`failed` record preserves the real progress instead of
+/// zeroing it.
 pub struct DiskProgress {
     pub path: PathBuf,
     /// Flush interval in documents.  Flush on every `indexed % every_n == 0`.
     pub every_n: u64,
+    /// Latest observed counters, so status/terminal writes carry the most recent
+    /// progress rather than starting from zero.
+    total: AtomicU64,
+    indexed: AtomicU64,
+    last_key_hex: std::sync::Mutex<Option<String>>,
 }
 
 impl DiskProgress {
@@ -131,6 +141,20 @@ impl DiskProgress {
         Self {
             path: path.as_ref().to_path_buf(),
             every_n,
+            total: AtomicU64::new(0),
+            indexed: AtomicU64::new(0),
+            last_key_hex: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Build a record from the latest remembered counters.
+    fn snapshot(&self, status: &str, error: Option<&str>) -> DiskBuildProgress {
+        DiskBuildProgress {
+            status: status.to_owned(),
+            total: self.total.load(Ordering::Relaxed),
+            indexed: self.indexed.load(Ordering::Relaxed),
+            last_key_hex: self.last_key_hex.lock().unwrap().clone(),
+            error: error.map(str::to_owned),
         }
     }
 
@@ -145,14 +169,13 @@ impl DiskProgress {
 
 impl IndexProgressObserver for DiskProgress {
     fn on_progress(&self, indexed: u64, total: u64, _failed: bool, last_key: Option<&[u8]>) {
+        self.total.store(total, Ordering::Relaxed);
+        self.indexed.store(indexed, Ordering::Relaxed);
+        if let Some(k) = last_key {
+            *self.last_key_hex.lock().unwrap() = Some(bytes_to_hex(k));
+        }
         if indexed.is_multiple_of(self.every_n) {
-            self.write(&DiskBuildProgress {
-                status: "in_progress".to_owned(),
-                total,
-                indexed,
-                last_key_hex: last_key.map(bytes_to_hex),
-                error: None,
-            });
+            self.write(&self.snapshot("in_progress", None));
         }
     }
 
@@ -163,12 +186,102 @@ impl IndexProgressObserver for DiskProgress {
             BuildStatus::Failed => "failed",
             BuildStatus::Pending => "pending",
         };
-        self.write(&DiskBuildProgress {
-            status: status_str.to_owned(),
-            total: 0,
-            indexed: 0,
-            last_key_hex: None,
-            error: error.map(str::to_owned),
-        });
+        self.write(&self.snapshot(status_str, error));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::DiskBuildProgress;
+    use std::sync::atomic::Ordering;
+
+    fn read_back(path: &Path) -> DiskBuildProgress {
+        let bytes = std::fs::read(path).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A terminal record must preserve the latest `(total, indexed, last_key)`
+    /// fed via `on_progress` rather than zeroing them — the bug this guards.
+    #[test]
+    fn disk_progress_terminal_preserves_latest_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("build_progress.json");
+        let disk = DiskProgress::new(&path, 1_000);
+
+        // A non-multiple of `every_n`, so no flush happens here — the terminal
+        // write must still carry these values.
+        disk.on_progress(523, 1_000, false, Some(b"row-523"));
+        disk.on_status(BuildStatus::Complete, None);
+
+        let rec = read_back(&path);
+        assert_eq!(rec.status, "complete");
+        assert_eq!(rec.total, 1_000);
+        assert_eq!(rec.indexed, 523);
+        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"row-523")));
+        assert_eq!(rec.error, None);
+    }
+
+    /// On failure the snapshot is preserved *and* the error message recorded.
+    #[test]
+    fn disk_progress_failed_preserves_snapshot_and_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("build_progress.json");
+        let disk = DiskProgress::new(&path, 1_000);
+
+        disk.on_progress(42, 100, false, Some(b"row-42"));
+        disk.on_status(BuildStatus::Failed, Some("boom"));
+
+        let rec = read_back(&path);
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.total, 100);
+        assert_eq!(rec.indexed, 42);
+        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"row-42")));
+        assert_eq!(rec.error.as_deref(), Some("boom"));
+    }
+
+    /// `on_progress` flushes on the `every_n` boundary with current counters.
+    #[test]
+    fn disk_progress_flushes_on_interval() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("build_progress.json");
+        let disk = DiskProgress::new(&path, 10);
+
+        disk.on_progress(7, 50, false, Some(b"a")); // not a multiple → no flush
+        assert!(!path.exists());
+
+        disk.on_progress(10, 50, false, Some(b"b")); // multiple → flush
+        let rec = read_back(&path);
+        assert_eq!(rec.status, "in_progress");
+        assert_eq!(rec.indexed, 10);
+        assert_eq!(rec.total, 50);
+        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"b")));
+    }
+
+    /// `ChainedObserver` must fan a terminal status out to *every* member, so a
+    /// failure reaches the disk observer and not just the in-memory one.
+    #[test]
+    fn chained_observer_fans_status_to_all_members() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("build_progress.json");
+        let mem = Arc::new(InMemoryProgress::new());
+        let disk = Arc::new(DiskProgress::new(&path, 1_000));
+        let chain = ChainedObserver(vec![
+            Arc::clone(&mem) as Arc<dyn IndexProgressObserver>,
+            Arc::clone(&disk) as Arc<dyn IndexProgressObserver>,
+        ]);
+
+        chain.on_progress(5, 10, false, Some(b"k"));
+        chain.on_status(BuildStatus::Failed, Some("nope"));
+
+        // In-memory link saw the failure.
+        assert!(mem.done.load(Ordering::Relaxed));
+        assert_eq!(mem.error.lock().unwrap().as_deref(), Some("nope"));
+
+        // Disk link persisted it with the snapshot intact.
+        let rec = read_back(&path);
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.indexed, 5);
+        assert_eq!(rec.error.as_deref(), Some("nope"));
     }
 }
