@@ -2846,6 +2846,98 @@ mod tests {
         }
     }
 
+    /// Item 13 regression: replaying an **update** (same key, changed field
+    /// value) must reconcile via the targeted O(1) path — during replay
+    /// `lsm.get` returns the replay-so-far value, so the second put moves the
+    /// row off the old value. A bug here would leave the key matching BOTH the
+    /// old and new value after recovery.
+    #[test]
+    fn test_field_index_replays_updates_after_crash() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let make_extractor = || -> ExtractorFn {
+            Arc::new(|bytes: &[u8]| {
+                let s = std::str::from_utf8(bytes).ok()?;
+                let v: serde_json::Value = serde_json::from_str(s).ok()?;
+                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+            })
+        };
+
+        let field_id;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
+
+            // Insert, then UPDATE the same key to a different value — all in the
+            // WAL, no checkpoint, so recovery must replay both writes in order.
+            db.put(b"u:1", br#"{"status":"active"}"#).unwrap();
+            db.put(b"u:1", br#"{"status":"archived"}"#).unwrap(); // update
+            db.put(b"u:2", br#"{"status":"active"}"#).unwrap();
+            // Drop without shutdown — index lives only in the WAL.
+        }
+
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
+
+            // u:1 must match ONLY its latest value after replay, not the old one.
+            assert_eq!(
+                db.query_keys(ns, "status = \"archived\"").unwrap(),
+                vec![b"u:1".to_vec()],
+                "replayed update must land u:1 under its new value"
+            );
+            assert_eq!(
+                db.query_keys(ns, "status = \"active\"").unwrap(),
+                vec![b"u:2".to_vec()],
+                "replayed update must remove u:1 from its old value (no stale bucket)"
+            );
+            db.shutdown().unwrap();
+        }
+    }
+
+    /// Item 13: a put that adds/removes the indexed field (absent↔present) must
+    /// update the index correctly via the targeted path — the row joins the new
+    /// value's bucket and leaves whatever it was in (including "nothing").
+    #[test]
+    fn test_field_index_update_field_appears_and_disappears() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        // Field absent → not indexed.
+        db.put(b"d:1", br#"{"other":1}"#).unwrap();
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
+
+        // Field appears (None → Some): row joins the "active" bucket.
+        db.put(b"d:1", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"d:1".to_vec()]);
+
+        // Field disappears (Some → None): row must leave the bucket.
+        db.put(b"d:1", br#"{"other":2}"#).unwrap();
+        assert!(
+            db.query_keys(ns, "status = \"active\"").unwrap().is_empty(),
+            "row must leave its bucket when the indexed field is removed"
+        );
+
+        db.shutdown().unwrap();
+    }
+
     #[test]
     fn test_ops_metrics_counters_move() {
         let dir = TempDir::new().unwrap();
