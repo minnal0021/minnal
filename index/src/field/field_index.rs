@@ -285,6 +285,14 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.bitmaps.waste_ratio()
     }
 
+    /// `(logical, live)` bytes of the bitmap value region: total bytes ever
+    /// appended vs. what survives compaction. The gap is reclaimable dead space
+    /// from the append-only whole-bitmap rewrites — large for low-cardinality
+    /// fields. See [`BlobStore::logical_bytes`] / [`BlobStore::live_bytes`].
+    pub fn bitmap_blob_bytes(&self) -> (u64, u64) {
+        (self.bitmaps.logical_bytes(), self.bitmaps.live_bytes())
+    }
+
     /// Compact the bitmap value region, reclaiming dead space left by the
     /// per-insert whole-bitmap rewrites. See [`BlobStore::compact`].
     pub fn compact_bitmaps(&mut self) -> std::io::Result<u64> {

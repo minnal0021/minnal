@@ -367,6 +367,24 @@ impl BlobStore {
         self.header().count as usize
     }
 
+    /// Total bytes ever appended to the value region (`value_write_pos`) — i.e.
+    /// live blobs **plus** the stale copies left by the append-only `upsert`. This
+    /// is the figure that balloons for low-cardinality fields (a value rewritten
+    /// per document leaves one dead copy each time) until [`compact`] reclaims it.
+    ///
+    /// [`compact`]: BlobStore::compact
+    pub fn logical_bytes(&self) -> u64 {
+        self.header().value_write_pos
+    }
+
+    /// Bytes the value region would occupy after [`compact`] — the live blobs
+    /// only. `logical_bytes() - live_bytes()` is the reclaimable dead space.
+    ///
+    /// [`compact`]: BlobStore::compact
+    pub fn live_bytes(&self) -> u64 {
+        self.compacted_value_bytes()
+    }
+
     /// Size the value region would shrink to if compacted now: each live blob's
     /// length rounded up to `VALUE_ALIGNMENT` (matching [`compact`]'s layout).
     ///

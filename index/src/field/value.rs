@@ -77,6 +77,24 @@ pub enum IndexValueType {
 
 // ── DynFieldIndex ──────────────────────────────────────────────────────────
 
+/// On-disk blob growth/waste metrics for one field index, returned by
+/// [`DynFieldIndex::blob_stats`]. `*_logical_bytes` is everything ever appended
+/// (live + stale); `*_live_bytes` is what survives compaction; the difference is
+/// reclaimable dead space. `*_waste_ratio` is `dead / logical`. The bitmap store
+/// is the one that balloons under low-cardinality write amplification; track it
+/// to guardrail against runaway disk use between compactions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexBlobStats {
+    /// Number of distinct values currently indexed.
+    pub distinct_values: usize,
+    pub bitmap_logical_bytes: u64,
+    pub bitmap_live_bytes: u64,
+    pub bitmap_waste_ratio: f64,
+    pub keymap_logical_bytes: u64,
+    pub keymap_live_bytes: u64,
+    pub keymap_waste_ratio: f64,
+}
+
 /// Inner (private) typed storage — one variant per supported value type.
 pub(crate) enum DynFieldIndexInner {
     Bool(FieldIndex<bool>),
@@ -223,6 +241,28 @@ impl DynFieldIndex {
     /// removed entries' bytes accumulate as dead space until compacted.
     pub fn keymap_waste_ratio(&self) -> f64 {
         self.keymap_store.as_ref().map_or(0.0, |ks| ks.waste_ratio())
+    }
+
+    /// Snapshot of this field's on-disk blob growth and reclaimable waste, for
+    /// monitoring the append-only write amplification (worst for low-cardinality
+    /// fields — see `index/CLAUDE.md`). Cheap: reads cached header fields and
+    /// scans live slots, no blob deserialisation.
+    pub fn blob_stats(&self) -> IndexBlobStats {
+        let (bitmap_logical_bytes, bitmap_live_bytes) = match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.bitmap_blob_bytes(),
+            DynFieldIndexInner::Int(fi) => fi.bitmap_blob_bytes(),
+            DynFieldIndexInner::Str(fi) => fi.bitmap_blob_bytes(),
+        };
+        let (keymap_logical_bytes, keymap_live_bytes) = self.keymap_store.as_ref().map_or((0, 0), |ks| (ks.logical_bytes(), ks.live_bytes()));
+        IndexBlobStats {
+            distinct_values: self.distinct_count(),
+            bitmap_logical_bytes,
+            bitmap_live_bytes,
+            bitmap_waste_ratio: self.bitmap_waste_ratio(),
+            keymap_logical_bytes,
+            keymap_live_bytes,
+            keymap_waste_ratio: self.keymap_waste_ratio(),
+        }
     }
 
     /// Compact the bitmap store and/or the keymap store whose waste ratio
@@ -642,6 +682,36 @@ mod tests {
         }
         let idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 2);
+    }
+
+    #[test]
+    fn blob_stats_surfaces_low_cardinality_bloat_and_compaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
+        // Worst case for append-only write amplification: a single value (true)
+        // over many rows. Every insert re-appends the whole (growing) bitmap, so
+        // logical bytes balloon while the live footprint stays one small bitmap.
+        for row in 0..2_000u128 {
+            idx.insert(&IndexValue::Bool(true), row).unwrap();
+        }
+
+        let before = idx.blob_stats();
+        assert_eq!(before.distinct_values, 1);
+        assert!(
+            before.bitmap_logical_bytes > before.bitmap_live_bytes.saturating_mul(4),
+            "append-only rewrites must bloat logical >> live: {before:?}"
+        );
+        assert!(before.bitmap_waste_ratio > 0.5, "waste should be high under bloat: {before:?}");
+
+        // Compaction reclaims the dead space the metric reported.
+        idx.maybe_compact(0.0).unwrap();
+        let after = idx.blob_stats();
+        assert!(
+            after.bitmap_logical_bytes <= before.bitmap_logical_bytes / 2,
+            "compaction must shrink logical bytes: before={before:?} after={after:?}"
+        );
+        assert!(after.bitmap_waste_ratio < 0.1, "waste reads ≈0 after compaction: {after:?}");
+        assert_eq!(after.distinct_values, 1, "live data is unchanged by compaction");
     }
 
     #[test]

@@ -919,6 +919,19 @@ impl Database {
         })
     }
 
+    /// On-disk blob growth/waste metrics for an active field index — the bitmap
+    /// and keymap store sizes (logical vs. live bytes) and waste ratios. Use this
+    /// to monitor the append-only write amplification that low-cardinality fields
+    /// suffer (a value rewritten per document leaves a stale blob copy each time),
+    /// e.g. to alert before disk fills between compactions.
+    ///
+    /// Returns `None` when the field is not active.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        let store = self.get_store(namespace_id).ok()?;
+        let ns_index = store.namespace_index.read();
+        ns_index.get(field_id).map(|e| e.index.read().blob_stats())
+    }
+
     /// The configured field-index compaction threshold as a fraction
     /// (`0.0..1.0`) — a store is compacted at the next checkpoint once its waste
     /// ratio reaches this. Mirrors the clamp applied in `run_index_checkpoint`.
@@ -1972,11 +1985,31 @@ impl IndexCheckpointTarget for Database {
                     // bitmap store OR the keymap store has crossed the compaction
                     // threshold (the keymap accumulates dead space under
                     // distinct-value churn).
-                    let over_threshold = {
+                    let (over_threshold, stats) = {
                         let idx = entry.index.read();
                         idx.flush(&field_path).map_err(KVError::Io)?;
-                        idx.bitmap_waste_ratio() >= waste_threshold || idx.keymap_waste_ratio() >= waste_threshold
+                        let stats = idx.blob_stats();
+                        let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
+                        (over, stats)
                     };
+                    // Guardrail: low-cardinality fields suffer append-only write
+                    // amplification — a value rewritten per document leaves a stale
+                    // bitmap copy each time (see index/CLAUDE.md). The compaction
+                    // below reclaims it, but warn when a field's bitmap blob has
+                    // grown large with a small live footprint so operators can spot
+                    // runaway growth between checkpoints.
+                    const LARGE_BITMAP_LOGICAL_BYTES: u64 = 64 * 1024 * 1024;
+                    if stats.bitmap_logical_bytes >= LARGE_BITMAP_LOGICAL_BYTES && stats.bitmap_waste_ratio >= 0.5 {
+                        warn!(
+                            "[IndexCheckpoint] ns={ns_id} field={field_id}: bitmap blob logical={} MiB live={} MiB \
+                             waste={:.0}% across {} distinct value(s) — append-only write amplification (likely a \
+                             low-cardinality, high-churn field); compaction will reclaim it now, but review the field's update rate",
+                            stats.bitmap_logical_bytes / (1024 * 1024),
+                            stats.bitmap_live_bytes / (1024 * 1024),
+                            stats.bitmap_waste_ratio * 100.0,
+                            stats.distinct_values,
+                        );
+                    }
                     if over_threshold {
                         let mut idx = entry.index.write();
                         if idx.maybe_compact(waste_threshold).map_err(KVError::Io)? {

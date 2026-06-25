@@ -10,6 +10,6 @@ pub mod storage;
 pub mod sync;
 
 pub use bitmap::RoaringBitmap;
-pub use field::{DynFieldIndex, FieldId, FieldIndex, IndexValue, IndexValueType, Predicate};
+pub use field::{DynFieldIndex, FieldId, FieldIndex, IndexBlobStats, IndexValue, IndexValueType, Predicate};
 pub use rowmap::RowMap;
 pub use sync::SharedRoaringBitmap;
