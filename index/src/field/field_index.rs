@@ -20,6 +20,23 @@ use super::predicate::Predicate;
 /// Because the bitmap data lives in the `BlobStore` (off-heap for file-backed
 /// stores), there is no inherent cardinality cap from a memory-pressure
 /// perspective.
+///
+/// # This index is multi-valued; the scalar invariant is **caller-enforced**
+///
+/// `FieldIndex` is an inverted `value → rows` index, so a single `row_id` may
+/// appear under **several** values at once — [`insert`](Self::insert) adds the
+/// row to one value's bucket and never touches the others. That is correct and
+/// intended for genuinely multi-valued fields (e.g. a `tags` array).
+///
+/// For a **scalar** field (one value per row), "a row is in at most one bucket"
+/// is an invariant the **caller** must maintain — `insert` does *not* enforce
+/// it. Updating a scalar field with a bare `insert` *adds* a second value
+/// rather than replacing the old one, which then makes `Eq` / `Ne` / range /
+/// `In` report the row under both values. Use [`set`](Self::set) for scalar
+/// updates: it clears the row from every bucket and then inserts the new value
+/// in one call, so callers cannot forget the clear step. (`minnal_db`'s index
+/// hook does exactly this.) A reverse `row → slot` map is deliberately *not*
+/// kept — see [`remove_all_for_row`](Self::remove_all_for_row).
 #[derive(Debug)]
 pub struct FieldIndex<V: Ord + Clone> {
     ordering: BTreeMap<V, u128>,
@@ -52,7 +69,10 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     /// Record that `row_id` has `value` for this field.
     ///
-    /// Inserting the same `(value, row_id)` pair twice is idempotent.
+    /// Inserting the same `(value, row_id)` pair twice is idempotent. This adds
+    /// the row to `value`'s bucket **without** removing it from any other value
+    /// it may already be under — see the type-level docs. For a scalar field,
+    /// prefer [`set`](Self::set), which replaces rather than accumulates.
     pub fn insert(&mut self, value: V, row_id: u128) {
         let slot_id = *self.ordering.entry(value).or_insert_with(|| {
             let id = self.next_slot;
@@ -62,6 +82,25 @@ impl<V: Ord + Clone> FieldIndex<V> {
         let mut bm = self.load_bitmap(slot_id);
         bm.insert(row_id);
         self.store_bitmap(slot_id, &bm);
+    }
+
+    /// Scalar update: make `value` the **only** value `row_id` holds for this
+    /// field.
+    ///
+    /// Equivalent to [`remove_all_for_row`](Self::remove_all_for_row) followed
+    /// by [`insert`](Self::insert): the row is cleared from every bucket it
+    /// currently occupies and then inserted under `value`, so afterwards it
+    /// appears under exactly one value (the scalar invariant). Returns the slot
+    /// IDs of any buckets that became empty during the clear (so a `DynFieldIndex`
+    /// can purge the matching keymap entries).
+    ///
+    /// This is the safe single-call API for single-valued fields; use it instead
+    /// of remembering to clear before each `insert`. For genuinely multi-valued
+    /// fields, call [`insert`](Self::insert) directly.
+    pub fn set(&mut self, value: V, row_id: u128) -> Vec<u128> {
+        let removed = self.remove_all_for_row(row_id);
+        self.insert(value, row_id);
+        removed
     }
 
     /// Remove `row_id` from the entry for `value`.
@@ -136,13 +175,19 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Returns the slot IDs of value entries whose bitmaps became empty and
     /// were removed from the index.
     ///
-    /// A row appears in at most one bucket per field, so only the bucket that
-    /// actually contained `row_id` is written back — buckets that did not
-    /// contain it are left untouched. This is load-bearing for high-cardinality
-    /// fields: the alternative (re-serialising and appending *every* bucket on
-    /// each update/delete) is O(distinct) write amplification against the
-    /// append-only bitmap store. The scan still loads each bucket to test
-    /// membership; eliminating that would need a row→bucket reverse index.
+    /// Correct for both scalar and multi-valued use: it scans **all** buckets
+    /// and writes back **every** bucket that actually contained `row_id` (so a
+    /// multi-valued row is removed from all of them). Buckets that did not
+    /// contain it are left untouched — this is load-bearing for high-cardinality
+    /// fields, since re-serialising and appending *every* bucket on each
+    /// update/delete would be O(distinct) write amplification against the
+    /// append-only bitmap store. For a scalar field the common case touches a
+    /// single bucket, so the write-back cost is one bitmap.
+    ///
+    /// The scan still *loads* each bucket to test membership; making this O(1)
+    /// would need a `row → slot` reverse index, deliberately not kept — it would
+    /// double the per-write index mutations and its own append-only churn for a
+    /// structure that is already rebuilt from the WAL on recovery.
     pub fn remove_all_for_row(&mut self, row_id: u128) -> Vec<u128> {
         // Collect slot IDs and which values to drop before any mutation to
         // satisfy the borrow checker (can't borrow ordering immutably and
@@ -287,6 +332,44 @@ mod tests {
         assert!(idx.contains_value(&1i64));
         assert_eq!(idx.evaluate(&Predicate::Eq(1)).iter().collect::<Vec<_>>(), vec![200]);
         assert_eq!(idx.distinct_count(), 1);
+    }
+
+    #[test]
+    fn insert_is_multivalued_a_row_can_be_under_several_values() {
+        // Documented contract: insert() accumulates — a bare insert of a second
+        // value puts the row under BOTH (correct for multi-valued fields, and the
+        // footgun for scalar callers who forget to clear first).
+        let mut idx = FieldIndex::<i64>::new();
+        idx.insert(1, 100);
+        idx.insert(2, 100); // second value for the same row, no clear
+        assert_eq!(idx.evaluate(&Predicate::Eq(1)).iter().collect::<Vec<_>>(), vec![100]);
+        assert_eq!(idx.evaluate(&Predicate::Eq(2)).iter().collect::<Vec<_>>(), vec![100]);
+    }
+
+    #[test]
+    fn set_enforces_one_value_per_row() {
+        // set() is the scalar API: it replaces rather than accumulates.
+        let mut idx = FieldIndex::<i64>::new();
+        idx.set(1, 100);
+        assert_eq!(idx.evaluate(&Predicate::Eq(1)).iter().collect::<Vec<_>>(), vec![100]);
+
+        // Updating row 100 to value 2 removes it from value 1.
+        let emptied = idx.set(2, 100);
+        assert_eq!(idx.evaluate(&Predicate::Eq(2)).iter().collect::<Vec<_>>(), vec![100]);
+        assert!(idx.evaluate(&Predicate::Eq(1)).is_empty(), "old value no longer matches the row");
+        assert_eq!(emptied.len(), 1, "value 1's bucket emptied and is reported");
+        assert_eq!(idx.distinct_count(), 1, "row 100 is under exactly one value");
+    }
+
+    #[test]
+    fn set_leaves_other_rows_under_the_same_value_intact() {
+        let mut idx = FieldIndex::<i64>::new();
+        idx.set(7, 1);
+        idx.set(7, 2); // two rows share value 7
+        // Re-pointing row 1 to value 9 must not disturb row 2's membership in 7.
+        idx.set(9, 1);
+        assert_eq!(idx.evaluate(&Predicate::Eq(7)).iter().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(idx.evaluate(&Predicate::Eq(9)).iter().collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]

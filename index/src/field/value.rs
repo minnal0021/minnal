@@ -325,6 +325,25 @@ impl DynFieldIndex {
         Ok(())
     }
 
+    /// Scalar update: make `value` the **only** value `row_id` holds for this
+    /// field, clearing it from every other bucket first.
+    ///
+    /// This is the safe single-call API for single-valued fields: it is
+    /// [`remove_all_for_row`](Self::remove_all_for_row) followed by
+    /// [`insert`](Self::insert), so the row ends up under exactly one value and
+    /// the caller cannot forget the clear step that a bare `insert` requires.
+    /// For genuinely multi-valued fields call [`insert`](Self::insert) directly.
+    ///
+    /// # Errors
+    /// Returns the same type-mismatch error as [`insert`](Self::insert). The row
+    /// has already been cleared from all buckets when this returns `Err`, so a
+    /// type mismatch leaves the field with no value for the row (matching the
+    /// clear-then-insert order callers used before this method existed).
+    pub fn set(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
+        self.remove_all_for_row(row_id);
+        self.insert(value, row_id)
+    }
+
     /// Remove `row_id` from the bucket for `value`.
     ///
     /// If the value's bitmap becomes empty, the keymap entry is also removed
@@ -498,6 +517,35 @@ mod tests {
         idx.insert(&IndexValue::Int(-7), 20).unwrap();
         idx.insert(&IndexValue::Int(42), 30).unwrap();
         assert_eq!(idx.distinct_count(), 2);
+    }
+
+    #[test]
+    fn set_replaces_scalar_value_through_public_api() {
+        // The scalar-update contract via the type-erased API: set() makes the
+        // given value the row's only value for the field.
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.set(&IndexValue::Int(42), 1).unwrap();
+        idx.set(&IndexValue::Int(7), 1).unwrap(); // update row 1: 42 -> 7
+        assert_eq!(query_int_eq(&idx, 7), vec![1], "row now matches its new value");
+        assert!(query_int_eq(&idx, 42).is_empty(), "row no longer matches its old value");
+        assert_eq!(idx.distinct_count(), 1, "no stale value bucket left behind");
+    }
+
+    #[test]
+    fn set_update_survives_reopen_with_keymap() {
+        // A scalar update through set() must persist correctly: the emptied old
+        // value's keymap entry is purged and the new one is durable across reopen.
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.set(&IndexValue::Int(42), 1).unwrap();
+            idx.set(&IndexValue::Int(7), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 7), vec![1]);
+        assert!(query_int_eq(&idx, 42).is_empty());
+        assert_eq!(idx.distinct_count(), 1);
     }
 
     #[test]

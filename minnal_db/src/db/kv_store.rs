@@ -575,11 +575,17 @@ impl KVStore {
         for entry in ns_index.iter() {
             let new_val = (entry.extractor)(value);
             let mut idx = entry.index.write();
-            idx.remove_all_for_row(row_id);
-            if let Some(v) = new_val
-                && let Err(e) = idx.insert(&v, row_id)
-            {
-                warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
+            match new_val {
+                // Scalar update: `set` clears the row from any prior value bucket
+                // and inserts the new one in a single call, preserving the
+                // one-value-per-row invariant.
+                Some(v) => {
+                    if let Err(e) = idx.set(&v, row_id) {
+                        warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
+                    }
+                }
+                // Field is now absent from the document → drop the row entirely.
+                None => idx.remove_all_for_row(row_id),
             }
         }
     }
