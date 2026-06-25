@@ -604,6 +604,7 @@ impl Database {
 
     pub fn put_ns(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, value)?;
 
         // Step 1: Write to shared WAL.
         // Allocate the sequence number *inside* the WAL lock so the global
@@ -655,6 +656,7 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, value)?;
         crate::db::metrics::Metrics::bump(&self.metrics.no_wal_puts);
         let kv_store = self.get_store(namespace_id)?;
         kv_store.put_to_storage(key, value)
@@ -668,6 +670,7 @@ impl Database {
 
     pub fn delete_ns(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, &[])?; // delete carries only a key
 
         // Step 1: Write DELETE to shared WAL.
         // Allocate the sequence inside the WAL lock so sequence order == WAL
@@ -1264,6 +1267,37 @@ impl Database {
     fn check_closed(&self) -> Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(KVError::DatabaseClosed);
+        }
+        Ok(())
+    }
+
+    /// Reject a write whose key/value cannot be represented by the on-disk
+    /// formats, with a clean [`KVError::WriteTooLarge`] instead of silently
+    /// truncating a length deep in the store.
+    ///
+    /// Several persisted lengths are `u32`: the value record's `value_len`, the
+    /// row-ID map's `key_len`, and the whole write is framed as one `u32`-sized
+    /// WAL entry (key + value + op-name + rkyv overhead). A single combined check
+    /// — `key + value + headroom ≤ u32::MAX` — covers all three (key alone and
+    /// value alone are subsets of the entry). The headroom bounds the per-entry
+    /// framing. Enforced at the write boundary so nothing reaches the WAL,
+    /// value-log, LSM, row-ID map, or field indexes before validation.
+    fn check_write_size(key: &[u8], value: &[u8]) -> Result<()> {
+        // Generous headroom for WAL-entry framing (short op-name + rkyv) and the
+        // value-record header — far larger than any of those.
+        const HEADROOM: u64 = 64 * 1024;
+        const LIMIT: u64 = u32::MAX as u64 - HEADROOM;
+        Self::check_total_len(key.len(), value.len(), LIMIT)
+    }
+
+    /// Inner of [`check_write_size`] with the limit as a parameter so both
+    /// branches are testable without allocating a multi-GiB key/value.
+    fn check_total_len(key_len: usize, value_len: usize, limit: u64) -> Result<()> {
+        let total = key_len as u64 + value_len as u64;
+        if total > limit {
+            return Err(KVError::WriteTooLarge(format!(
+                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit (lengths are stored as u32)"
+            )));
         }
         Ok(())
     }
@@ -2844,6 +2878,30 @@ mod tests {
 
             db.shutdown().unwrap();
         }
+    }
+
+    #[test]
+    fn check_total_len_rejects_over_limit() {
+        // Within / at the limit → Ok; over → WriteTooLarge. Tiny limit so the
+        // over-limit branch needs no multi-GiB allocation.
+        assert!(Database::check_total_len(5, 5, 12).is_ok());
+        assert!(Database::check_total_len(7, 5, 12).is_ok()); // exactly at limit
+        match Database::check_total_len(8, 5, 12) {
+            Err(KVError::WriteTooLarge(m)) => assert!(m.contains("exceeds the 12-byte"), "got: {m}"),
+            other => panic!("expected WriteTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_and_delete_accept_normal_sized_keys_and_values() {
+        // Regression: the size guard must not reject ordinary writes.
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        db.put(b"k", &vec![0u8; 4096]).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(vec![0u8; 4096]));
+        db.delete(b"k").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), None);
+        db.shutdown().unwrap();
     }
 
     /// Item 13 regression: replaying an **update** (same key, changed field
