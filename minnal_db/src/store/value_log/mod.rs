@@ -70,9 +70,10 @@ pub struct ValueRecordMeta {
 }
 
 /// CRC32 of a value record's payload bytes. Stored in the record header and
-/// re-verified on every value read to catch silent on-disk corruption (bit
-/// rot, torn writes) that the structural checks (segment-id / length bounds)
-/// would otherwise miss.
+/// re-verified on each value read **when `verify_checksums_on_read` is enabled**
+/// (off by default for latency; see `DbConfig::verify_checksums_on_read`) to
+/// catch silent on-disk corruption (bit rot, torn writes) that the structural
+/// checks (segment-id / length bounds) would otherwise miss.
 fn value_checksum(value: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(value);

@@ -1938,9 +1938,7 @@ impl KVStore {
     pub fn flush_metadata(&self) -> Result<()> {
         let metadata = self.metadata.read();
         let bytes = metadata.to_file_bytes()?;
-        let tmp = self.metadata_path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.metadata_path)?;
+        crate::support::write_atomic_durable(&self.metadata_path, &bytes)?;
         Ok(())
     }
 

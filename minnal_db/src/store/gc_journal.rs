@@ -29,12 +29,8 @@ const GC_JOURNAL_MAGIC: [u8; 4] = *b"GCJN";
 const GC_JOURNAL_VERSION: u32 = 1;
 const GC_JOURNAL_HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + bucket + checksum + num_entries
 
-/// fsync a directory so that a create/rename/unlink of one of its entries is
-/// durable (the file's own `sync_all` only persists its *contents*, not the
-/// directory entry that makes it visible after a crash).
-pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
+// Re-exported from `support` so all directory-fsync callers share one impl.
+pub use crate::support::fsync_dir;
 
 /// A single entry in the GC journal: maps a key to its new value-log pointer.
 #[derive(Debug, Clone)]
