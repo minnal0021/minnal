@@ -1,10 +1,10 @@
 //! Memory-mapped two-file blob store.
 //!
 //! Stores a `u128 → raw-bytes` map in two memory-mapped regions, using the
-//! same on-disk layout as [`ContainerStore`] but with arbitrary byte blobs as
-//! values instead of rkyv-serialised [`Container`] objects.
+//! same on-disk layout as `ContainerStore` but with arbitrary byte blobs as
+//! values instead of rkyv-serialised `Container` objects.
 //!
-//! Used by [`FieldIndex`] to hold per-distinct-value [`RoaringBitmap`] data
+//! Used by `FieldIndex` to hold per-distinct-value `RoaringBitmap` data
 //! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
 //! index.
 //!

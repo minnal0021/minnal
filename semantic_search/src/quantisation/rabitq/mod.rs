@@ -1,6 +1,26 @@
+//! RaBitQ residual quantisation (encode side).
+//!
+//! Implements the single-bit and multi-bit RaBitQ quantisers that compress the
+//! residual `embedding − centroid` and produce the scalar correction coefficients
+//! (`addition_factor`, `scaling_factor`, `error_bound`) used by the distance
+//! estimators. The numeric constants below come from the RaBitQ papers and their
+//! reference implementation, not from a derivation in this crate:
+//!
+//! - **RaBitQ** (1-bit): J. Gao, C. Long, *"RaBitQ: Quantizing High-Dimensional
+//!   Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor
+//!   Search"*, SIGMOD 2024 (arXiv:2405.12497).
+//! - **Extended RaBitQ** (multi-bit): J. Gao et al., *"Practical and Asymptotically
+//!   Optimal Quantization of High-Dimensional Vectors … for ANN Search"*
+//!   (arXiv:2409.09913).
+//!
+//! Treat the constants as tuned for the supported bit-width range
+//! ([`MIN_MULTI_BIT_QUANTISATION_BITS`]..=[`MAX_MULTI_BIT_QUANTISATION_BITS`]); they
+//! trade reconstruction accuracy against the error-bound tightness and should not be
+//! changed without consulting the papers and re-checking recall.
+
 pub(crate) mod quantisation_support;
 
-use crate::cluster::{Cluster, find_closest_cluster_id};
+use crate::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
 use log::debug;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
@@ -12,9 +32,54 @@ use crate::index::vector_index::VectorIndex;
 use crate::quantisation::rabitq::quantisation_support::{IndexCalculationData, Quantisation, calculate_error_bound};
 use crate::vector_math::binary_quantize;
 
+/// Small positive nudge added before truncating a scaled magnitude to an integer
+/// code (`(rescale·value + EPS) as i32`). The magnitudes quantised here are
+/// non-negative and `as i32` truncates toward zero, so a value that floating-point-
+/// represents *just below* an integer (e.g. 3.0 stored as 2.9999998) would lose a
+/// level; `EPS` biases it back across the boundary. This is a float-truncation guard,
+/// not a recall/precision tuning knob — leave it alone unless the cast changes.
 const EPS: f32 = 1e-5;
+
+/// Headroom added above the largest representable code when sizing the rescale-factor
+/// search range: `rescale_factor_end = (2^bits − 1 + NO_ENUMERATIONS) / max|residual_i|`.
+/// The `2^bits − 1` term is the top quantisation level; `NO_ENUMERATIONS` lets
+/// [`best_rescale_factor`]'s search enumerate a handful of rescale factors that push
+/// individual dimensions just past that nominal max before clamping, which the RaBitQ
+/// reference implementation found improves the reconstruction inner product. Empirical
+/// constant from that reference impl, not derived here.
 const NO_ENUMERATIONS: u32 = 10;
+
+/// Smallest magnitude allowed for a denominator in the multi-bit index-calculation
+/// ratios. Values nearer zero are clamped to this (sign-preserving) so the
+/// `addition_factor` and error-bound ratios stay finite — mirrors the single-bit
+/// `ip_obar_o_safe` clamp. The genuinely-zero-residual case is handled separately
+/// by a centroid-only fallback before these ratios are computed.
+const DENOM_EPSILON: f32 = 1e-10;
+/// Lower bound of the rescale-factor search, as a fraction of the upper bound:
+/// `rescale_factor_start = rescale_factor_end · START[bits]`. Indexed by the number of
+/// **magnitude** bits passed to [`best_rescale_factor`] (the multi-bit path passes
+/// `number_of_bits − 1`, since the sign bit is handled separately). Empirically-tuned
+/// starting points from the extended-RaBitQ reference implementation that narrow the
+/// search to a good region per bit-width.
+///
+/// The length (9 → indices `0..=8`) is what ties this table to the supported bit-width
+/// range: it admits magnitude-bit counts up to 8, i.e. `number_of_bits` up to 9.
+/// [`MAX_MULTI_BIT_QUANTISATION_BITS`] = 8 caps real usage at `START[7]`, leaving
+/// `START[0]`/`START[8]` as unreached headroom; `number_of_bits ≥ 10` would index past
+/// the end (guarded against by the assert in `quantise_using_multi_bits`). Supporting a
+/// wider bit-width means extending this table *and* lifting that cap together.
 const START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
+
+/// Smallest bit-width handled by the multi-bit (dense) RaBitQ path. One bit is the
+/// separate single-bit path, so multi-bit starts at 2.
+pub const MIN_MULTI_BIT_QUANTISATION_BITS: usize = 2;
+
+/// Largest supported multi-bit width. Each quantised value is packed into a single
+/// `u8`, and the largest code is `2^bits − 1`, so `bits > 8` would silently truncate
+/// (and `bits ≥ 10` indexes the 9-entry `START` table out of bounds). Exposed so the
+/// config layer can reject an out-of-range `number_of_bits_for_dense_quantisation`
+/// at startup instead of panicking/corrupting at index time.
+pub const MAX_MULTI_BIT_QUANTISATION_BITS: usize = 8;
 
 struct ExtraBitsQuantisation {
     extra_bits_quantised_embedding: Vec<i32>,
@@ -53,10 +118,21 @@ impl Ord for QueueItem {
     }
 }
 
-pub fn index_embedding(cluster_map: &HashMap<u32, Cluster>, embeddings: &[f32], style: crate::index::vector_index::QuantisationStyle) -> VectorIndex {
+/// Quantise `embeddings` against its nearest cluster centroid.
+///
+/// Returns [`ClusterIndexError::EmptyClusterMap`] if `cluster_map` is empty —
+/// `find_closest_cluster_id` yields the `u32::MAX` sentinel with no clusters to
+/// pick from, which is a configuration error, not a panic. Startup validation
+/// ([`ClusterIndex::load`](crate::cluster::ClusterIndex::load)) normally rules
+/// this out, so this is a defence-in-depth guard for direct callers.
+pub fn index_embedding(
+    cluster_map: &HashMap<u32, Cluster>,
+    embeddings: &[f32],
+    style: crate::index::vector_index::QuantisationStyle,
+) -> Result<VectorIndex, ClusterIndexError> {
     let closest_cluster_id = find_closest_cluster_id(cluster_map, embeddings);
-    let cluster = cluster_map.get(&closest_cluster_id).unwrap();
-    index_embedding_to_cluster(embeddings, cluster, style)
+    let cluster = cluster_map.get(&closest_cluster_id).ok_or(ClusterIndexError::EmptyClusterMap)?;
+    Ok(index_embedding_to_cluster(embeddings, cluster, style))
 }
 
 pub fn index_embedding_to_cluster(embedding: &[f32], cluster: &Cluster, style: crate::index::vector_index::QuantisationStyle) -> VectorIndex {
@@ -262,11 +338,25 @@ fn get_index_calculation_data(
     let l2_sqr_distance_to_centroid = SpatialSimilarity::dot(residual_vector_data_to_centroid, residual_vector_data_to_centroid).unwrap() as f32;
     let l2_norm_distance_to_centroid = l2_sqr_distance_to_centroid.sqrt();
 
+    // The DENOMINATOR of the addition_factor residual-projection term and of the
+    // error bound. For a genuine (non-zero) residual the quantised code tracks the
+    // residual direction, so this is ≈ ‖projection‖ > 0; clamp away from zero
+    // (preserving sign) so those ratios stay finite in numerical edge cases. The
+    // all-zero-residual case never reaches here — it short-circuits to a centroid-only
+    // representation in `quantise_using_multi_bits`.
     let ip_residual_shifted_code = SpatialSimilarity::dot(&shifted_quantization_vector, residual_vector_data_to_centroid).unwrap() as f32;
-    let mut ip_centroid_shifted_code = SpatialSimilarity::dot(centroid, &shifted_quantization_vector).unwrap() as f32;
-    if ip_centroid_shifted_code == 0.0 {
-        ip_centroid_shifted_code = f32::INFINITY; // Avoid division by zero
-    }
+    let ip_residual_shifted_code = if ip_residual_shifted_code.abs() < DENOM_EPSILON {
+        DENOM_EPSILON.copysign(ip_residual_shifted_code)
+    } else {
+        ip_residual_shifted_code
+    };
+
+    // A NUMERATOR factor of the addition_factor term (l2_sqr · ip_centroid / ip_residual),
+    // NOT a denominator. A value of 0 is valid — it simply makes the residual-projection
+    // term vanish, leaving a finite addition_factor. (The previous code forced this to
+    // INFINITY "to avoid division by zero", which divided nothing and instead poisoned
+    // addition_factor to ±∞ — removed.)
+    let ip_centroid_shifted_code = SpatialSimilarity::dot(centroid, &shifted_quantization_vector).unwrap() as f32;
 
     let dot_product_residual_centroid = SpatialSimilarity::dot(residual_vector_data_to_centroid, centroid).unwrap() as f32;
 
@@ -311,6 +401,12 @@ fn quantise_using_single_bit(embedding: &[f32], centroid: &[f32]) -> Quantisatio
     let scaling_factor = residual_norm / (ip_obar_o_safe * (dim as f32).sqrt());
 
     // f_error = ‖r‖ · √((1 − ⟨o_bar,o⟩²) / ⟨o_bar,o⟩²) · ε₀ / √(D−1)
+    //
+    // ε₀ is RaBitQ's error-bound confidence multiplier: the paper bounds the
+    // dot-product estimation error with high probability as ε₀ times the expression
+    // above, where ε₀ sets the confidence level (larger ε₀ ⇒ looser but safer bound).
+    // 1.9 is the value used by the RaBitQ reference implementation. The same constant
+    // appears as `EPSILON` in `quantisation_support.rs` for the multi-bit error bound.
     const EPSILON_0: f32 = 1.9;
     let obar_o_sq = ip_obar_o * ip_obar_o;
     let error_bound = if dim > 1 {
@@ -329,11 +425,39 @@ fn quantise_using_single_bit(embedding: &[f32], centroid: &[f32]) -> Quantisatio
 }
 
 fn quantise_using_multi_bits(embedding: &[f32], centroid: &[f32], number_of_bits_for_quantisation: usize) -> Quantisation {
-    assert!(number_of_bits_for_quantisation > 1);
+    // Last-line guard: the config layer validates this range at startup, but a
+    // bad value here would otherwise index `START` out of bounds (bits ≥ 10) or
+    // truncate the u8-packed code (bits > 8). Fail with a clear message instead.
+    assert!(
+        (MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS).contains(&number_of_bits_for_quantisation),
+        "multi-bit quantisation supports {MIN_MULTI_BIT_QUANTISATION_BITS}..={MAX_MULTI_BIT_QUANTISATION_BITS} bits, got {number_of_bits_for_quantisation}",
+    );
 
     let dimension = embedding.len();
 
     let residual_vector_data_to_centroid: Vec<f32> = embedding.iter().zip(centroid.iter()).map(|(e, c)| e - c).collect();
+
+    // Degenerate case: `embedding == centroid` (e.g. a doc indexed at its own
+    // cluster centroid) makes the residual all-zeros. The normal path would then
+    // compute `r/‖r‖` (0/0 → NaN) and `‖r‖²·⟨c,s⟩ / ⟨r,s⟩` (… / 0 → NaN/inf), and
+    // store NaN `addition_factor`/`error_bound` that poison search scoring/sorting.
+    // The document vector *is* the centroid, so represent it exactly: a zero
+    // residual contributes nothing. With `scaling_factor = 0` the multi-bit
+    // estimator collapses to `score = 1 − (−⟨q,c⟩ + 1) = ⟨q,c⟩ = ⟨q,doc⟩`, the
+    // true similarity. The NaN check also absorbs a NaN norm from pathological input.
+    let residual_norm_sq: f32 = residual_vector_data_to_centroid.iter().map(|&x| x * x).sum();
+    if residual_norm_sq == 0.0 || residual_norm_sq.is_nan() {
+        // The "centred zero" code: quantised value whose `centroid_bias` shift maps
+        // to 0 (see `get_index_calculation_data`). Harmless since scaling_factor = 0.
+        let zero_residual_code = (1u32 << (number_of_bits_for_quantisation - 1)) as u8;
+        return Quantisation {
+            quantised_embedding: vec![zero_residual_code; dimension],
+            addition_factor: 1.0,
+            scaling_factor: 0.0,
+            error_bound: 0.0,
+        };
+    }
+
     let total_quantised_embedding = quantise_multi_bits(&residual_vector_data_to_centroid, number_of_bits_for_quantisation);
     let index_calculation_data = get_index_calculation_data(
         dimension,
@@ -478,6 +602,146 @@ mod tests {
         assert_eq!(quantisation.quantised_embedding, [1, 0, 1, 0, 0, 1, 1, 1]);
     }
 
+    // ── Zero-residual (embedding == centroid) degenerate handling ────────────
+    //
+    // A doc whose embedding exactly equals its cluster centroid has an all-zero
+    // residual. The normal multi-bit path divides by ‖r‖ and by ⟨r, shifted⟩,
+    // both zero, producing NaN/inf addition_factor/error_bound. These assert the
+    // explicit fallback stores finite, search-safe factors instead.
+
+    #[test]
+    fn test_quantise_multi_bit_zero_residual_is_finite() {
+        let centroid: Vec<f32> = vec![-0.49333, 1.22333, 0.54333, -0.12345, 0.67890, -0.98765, 0.43210, -0.54321];
+        // embedding == centroid → residual is all zeros.
+        let quantisation = quantise(&centroid, &centroid, 8);
+
+        assert!(
+            quantisation.addition_factor.is_finite(),
+            "addition_factor must be finite, got {}",
+            quantisation.addition_factor
+        );
+        assert!(
+            quantisation.scaling_factor.is_finite(),
+            "scaling_factor must be finite, got {}",
+            quantisation.scaling_factor
+        );
+        assert!(
+            quantisation.error_bound.is_finite(),
+            "error_bound must be finite, got {}",
+            quantisation.error_bound
+        );
+        // Centroid-only representation: zero residual contributes nothing.
+        assert_eq!(quantisation.addition_factor, 1.0);
+        assert_eq!(quantisation.scaling_factor, 0.0);
+        assert_eq!(quantisation.error_bound, 0.0);
+        assert_eq!(quantisation.quantised_embedding.len(), centroid.len());
+    }
+
+    #[test]
+    fn test_quantise_multi_bit_zero_residual_scores_as_centroid_dot() {
+        use crate::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator};
+        use crate::index::vector_index::{QuantisationStyle, VectorIndex};
+
+        let centroid: Vec<f32> = (0..16).map(|i| (i as f32 * 0.13).sin()).collect();
+        let n_bits = 8;
+        let q = quantise(&centroid, &centroid, n_bits);
+
+        // Build a VectorIndex from the degenerate quantisation and score a query.
+        let packed = crate::quantisation::rabitq::quantisation_support::pack_bytes(&q.quantised_embedding);
+        let vi = VectorIndex::new(
+            3,
+            QuantisationStyle::MultiBit { number_of_bits: n_bits },
+            q.addition_factor,
+            q.scaling_factor,
+            q.error_bound,
+            packed,
+        );
+        let query: Vec<f32> = (0..16).map(|i| (i as f32 * 0.21 + 0.4).cos()).collect();
+        let estimator = MultiBitQuanDotProductEstimator::new(3, &query, &centroid, n_bits);
+        let score = estimator.estimate_distance(&query, &vi);
+
+        // With scaling_factor = 0 and addition_factor = 1, the estimate collapses to
+        // ⟨q, centroid⟩ — the true similarity, since the doc vector *is* the centroid.
+        let centroid_dot: f32 = simsimd::SpatialSimilarity::dot(&query, &centroid).unwrap() as f32;
+        assert!(score.is_finite(), "score must be finite, got {score}");
+        assert_relative_eq!(score, centroid_dot, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn test_index_embedding_to_cluster_zero_residual_is_finite() {
+        use crate::index::vector_index::QuantisationStyle;
+        let centroid: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        // embedding exactly equals the centroid.
+        let cluster = Cluster::new(5, centroid.clone());
+        let result = index_embedding_to_cluster(&centroid, &cluster, QuantisationStyle::MultiBit { number_of_bits: 8 });
+
+        assert_eq!(result.cluster_id, 5);
+        assert!(result.addition_factor.is_finite() && result.scaling_factor.is_finite() && result.error_bound.is_finite());
+        assert!(!result.packed_vector.is_empty());
+    }
+
+    // ── ip_centroid_shifted_code == 0 (orthogonal centroid) ──────────────────
+    //
+    // An all-zero centroid with a non-zero embedding makes
+    // ⟨centroid, shifted_code⟩ == 0. That term is a *numerator* factor of
+    // addition_factor, so the correct result is finite (the residual-projection term
+    // vanishes). The old code substituted INFINITY there "to avoid division by zero",
+    // which poisoned addition_factor to ±∞. The residual is non-zero, so this does NOT
+    // take the zero-residual centroid-only fallback — it exercises the real branch.
+
+    #[test]
+    fn test_quantise_multi_bit_zero_ip_centroid_is_finite() {
+        let centroid = vec![0.0f32; 16]; // ⟨centroid, anything⟩ == 0
+        let embedding: Vec<f32> = (0..16).map(|i| (i as f32 * 0.3).sin() + 0.4).collect();
+        // Residual = embedding − 0 = embedding (non-zero) → not the zero-residual path.
+        let q = quantise(&embedding, &centroid, 8);
+
+        assert!(q.addition_factor.is_finite(), "addition_factor must be finite, got {}", q.addition_factor);
+        assert!(q.scaling_factor.is_finite(), "scaling_factor must be finite, got {}", q.scaling_factor);
+        assert!(q.error_bound.is_finite(), "error_bound must be finite, got {}", q.error_bound);
+        // With ⟨c, shifted⟩ = 0 and ⟨r, c⟩ = 0, addition_factor reduces to exactly 1.0.
+        assert_relative_eq!(q.addition_factor, 1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_quantise_multi_bit_orthogonal_centroid_is_finite() {
+        // A non-zero centroid orthogonal to the residual direction: centroid along
+        // dim 0, embedding only on dims 1.. so the residual has no dim-0 component.
+        // ⟨residual, centroid⟩ = 0 and ⟨centroid, shifted_code⟩ = 0 (shifted_code
+        // tracks the residual, which is zero on dim 0).
+        let mut centroid = vec![0.0f32; 16];
+        centroid[0] = 1.0;
+        let mut embedding = vec![0.0f32; 16];
+        embedding[0] = 1.0; // matches centroid on dim 0 → residual is 0 there
+        for (i, e) in embedding.iter_mut().enumerate().skip(1) {
+            *e = (i as f32 * 0.2).cos();
+        }
+        let q = quantise(&embedding, &centroid, 8);
+        assert!(q.addition_factor.is_finite() && q.scaling_factor.is_finite() && q.error_bound.is_finite());
+    }
+
+    #[test]
+    fn quantise_accepts_full_supported_multi_bit_range() {
+        let centroid: Vec<f32> = (0..16).map(|i| (i as f32 * 0.07).cos()).collect();
+        let embedding: Vec<f32> = (0..16).map(|i| (i as f32 * 0.07 + 0.3).cos()).collect();
+        for bits in MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS {
+            let q = quantise(&embedding, &centroid, bits);
+            assert!(
+                q.addition_factor.is_finite() && q.scaling_factor.is_finite() && q.error_bound.is_finite(),
+                "bits={bits}"
+            );
+            // Every packed code must fit the u8 storage (largest is 2^bits − 1).
+            assert!(q.quantised_embedding.iter().all(|&c| (c as usize) < (1 << bits)), "bits={bits}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multi-bit quantisation supports")]
+    fn quantise_panics_on_bit_width_above_max() {
+        let v = vec![0.1f32, 0.2, 0.3, 0.4];
+        let _ = quantise(&v, &[0.0, 0.0, 0.0, 0.0], MAX_MULTI_BIT_QUANTISATION_BITS + 1);
+    }
+
     fn real_centroid() -> Vec<f32> {
         load_vec_f32(include_str!("../../../test_data/rabitq_real_centroid.json"))
     }
@@ -582,7 +846,18 @@ mod tests {
         cluster_map.insert(2, cluster2);
 
         let embedding = vec![0.9f32; 16];
-        let result = index_embedding(&cluster_map, &embedding, QuantisationStyle::MultiBit { number_of_bits: 4 });
+        let result = index_embedding(&cluster_map, &embedding, QuantisationStyle::MultiBit { number_of_bits: 4 }).unwrap();
         assert_eq!(result.cluster_id, 2);
+    }
+
+    #[test]
+    fn test_index_embedding_empty_cluster_map_errors_not_panics() {
+        use crate::index::vector_index::QuantisationStyle;
+        // With no clusters, find_closest_cluster_id yields the u32::MAX sentinel
+        // and the map lookup misses — must surface a clean error, never an unwrap panic.
+        let cluster_map: HashMap<u32, Cluster> = HashMap::new();
+        let embedding = vec![0.5f32; 16];
+        let result = index_embedding(&cluster_map, &embedding, QuantisationStyle::MultiBit { number_of_bits: 8 });
+        assert!(matches!(result, Err(ClusterIndexError::EmptyClusterMap)));
     }
 }

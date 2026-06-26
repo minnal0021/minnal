@@ -96,9 +96,15 @@ unsafe fn packed_ip_avx2(packed: &[u64], q: &[f32], dim: usize) -> f32 {
         let mut acc2 = _mm256_setzero_ps();
         let mut acc3 = _mm256_setzero_ps();
 
-        // Process 4 bytes (32 dims) per outer iteration.
+        // Process 4 bytes (32 dims) per outer iteration. A group's last lane
+        // (`off = 3`) does a 256-bit load of q[base+24 .. base+32), so a group is
+        // only in-bounds when the full 32 dims exist: `(g+1)*32 <= dim`. Counting
+        // groups as `dim / 32` (floor) — NOT `ceil(dim/8) / 4`, which rounds a
+        // final partial 32-dim group up to "full" and reads past `q` for dims like
+        // 25..31, 57..63, 89..95 (e.g. dim=31 would load q[24..32) over a 31-len q).
+        // The scalar tail below handles every remaining sub-32 dim safely.
         let total_bytes = dim.div_ceil(8);
-        let full_groups = (total_bytes / 4).min(packed.len() * 2);
+        let full_groups = (dim / 32).min(packed.len() * 2);
 
         for g in 0..full_groups {
             let base = g * 32;
@@ -516,9 +522,15 @@ mod tests {
         sum
     }
 
+    // Dims that exercise a partial final 32-/64-dim group — the AVX2 single-bit
+    // OOB-read regression (groups counted as ceil(dim/8)/4 instead of dim/32).
+    // 25,57,89 sit in [n*32+1, n*32+8]; 31,63,95 are one short of a full group;
+    // 33 is one past. With q.len() == dim, the old code read q[dim] here.
+    const PARTIAL_GROUP_DIMS: [usize; 7] = [25, 31, 33, 57, 63, 89, 95];
+
     #[test]
     fn scalar_matches_reference() {
-        for dim in [1, 7, 64, 65, 128, 256, 768] {
+        for dim in [1, 7, 64, 65, 128, 256, 768].into_iter().chain(PARTIAL_GROUP_DIMS) {
             let (packed, query) = make_packed_and_query(dim, dim as u64 * 31 + 7);
             let got = packed_ip_scalar(&packed, &query, dim);
             let expected = reference_packed_ip(&packed, &query, dim);
@@ -528,7 +540,7 @@ mod tests {
 
     #[test]
     fn best_matches_reference() {
-        for dim in [1, 7, 64, 65, 128, 256, 768] {
+        for dim in [1, 7, 64, 65, 128, 256, 768].into_iter().chain(PARTIAL_GROUP_DIMS) {
             let (packed, query) = make_packed_and_query(dim, dim as u64 * 17 + 3);
             let got = packed_ip_best(&packed, &query, dim);
             let expected = reference_packed_ip(&packed, &query, dim);
@@ -542,7 +554,7 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        for dim in [8, 32, 64, 128, 256, 768] {
+        for dim in [8, 32, 64, 128, 256, 768].into_iter().chain(PARTIAL_GROUP_DIMS) {
             let (packed, query) = make_packed_and_query(dim, dim as u64 * 13 + 5);
             let got = unsafe { packed_ip_avx2(&packed, &query, dim) };
             let expected = reference_packed_ip(&packed, &query, dim);
@@ -556,7 +568,7 @@ mod tests {
         if !is_x86_feature_detected!("avx512f") {
             return;
         }
-        for dim in [16, 64, 128, 256, 768] {
+        for dim in [16, 64, 128, 256, 768].into_iter().chain(PARTIAL_GROUP_DIMS) {
             let (packed, query) = make_packed_and_query(dim, dim as u64 * 19 + 11);
             let got = unsafe { packed_ip_avx512(&packed, &query, dim) };
             let expected = reference_packed_ip(&packed, &query, dim);

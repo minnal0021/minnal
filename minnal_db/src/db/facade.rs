@@ -413,7 +413,7 @@ impl Db {
 
     /// Register a custom row-ID function (and optionally its inverse) for a namespace.
     ///
-    /// Call this before [`activate_field_index`] so WAL replay uses consistent row IDs.
+    /// Call this before `activate_field_index` so WAL replay uses consistent row IDs.
     /// Providing `row_to_key_fn` enables O(|hits|) query resolution with zero memory overhead.
     ///
     /// See [`Database::set_row_id_fn`][crate::db::database::Database::set_row_id_fn]
@@ -443,7 +443,7 @@ impl Db {
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
-    /// so callers do not need to re-call [`register_index_field`] after a restart.
+    /// so callers do not need to re-call `register_index_field` after a restart.
     pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::db::namespace::FieldMeta> {
         self.inner.list_index_fields(namespace_id)
     }
@@ -475,7 +475,7 @@ impl Db {
     /// matching keys together with the full match count.
     ///
     /// Prefer this over `query_index` when serving a paginated API — with a
-    /// registered [`RowToKeyFn`] only `offset + limit` keys need to be resolved.
+    /// registered `RowToKeyFn` only `offset + limit` keys need to be resolved.
     ///
     /// [`query_index`]: Db::query_index
     pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
@@ -1267,7 +1267,7 @@ impl AsyncDb {
 
     /// Register a custom row-ID function (and optionally its inverse) for a namespace.
     ///
-    /// Call this before [`activate_field_index`] so WAL replay uses consistent row IDs.
+    /// Call this before `activate_field_index` so WAL replay uses consistent row IDs.
     /// Providing `row_to_key_fn` enables O(|hits|) query resolution with zero memory overhead.
     ///
     /// See [`Database::set_row_id_fn`][crate::db::database::Database::set_row_id_fn]
@@ -1287,7 +1287,7 @@ impl AsyncDb {
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
-    /// so callers do not need to re-call [`register_index_field`] after a restart.
+    /// so callers do not need to re-call `register_index_field` after a restart.
     pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::db::namespace::FieldMeta> {
         self.inner.inner.list_index_fields(namespace_id)
     }

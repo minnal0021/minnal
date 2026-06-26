@@ -15,7 +15,7 @@ use super::parser::{Op, RawExpr, RawValue};
 
 /// Maps a field name to its `FieldId` within a namespace.
 ///
-/// Build this from [`NamespaceSchema::list_fields`] on the `minnal_db` side:
+/// Build this from `NamespaceSchema::list_fields` on the `minnal_db` side:
 ///
 /// ```ignore
 /// let schema_map: SchemaMap = registry

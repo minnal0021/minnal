@@ -312,7 +312,7 @@ async fn activate_indices(db: &AsyncDb, ns_id: u32, schema: &DocStoreSchema) -> 
 ///
 /// When present, writes to namespaces with `semantic_search_enabled = true`
 /// enqueue a pending embedding job instead of calling the embedding service
-/// inline.  A background [`VecIndexWorker`] processes the queue
+/// inline.  A background `VecIndexWorker` processes the queue
 /// asynchronously, making the write path independent of embedding service
 /// availability.
 ///
@@ -457,7 +457,7 @@ impl DocStore {
     /// - `put` / `kv_put` on semantic-search-enabled namespaces enqueue a
     ///   pending embedding job (atomic, WAL-backed) instead of calling the
     ///   embedding service inline.
-    /// - A [`VecIndexWorker`] drains the queue in the background using the
+    /// - A `VecIndexWorker` drains the queue in the background using the
     ///   parameters from [`with_vector_index_config`] (or built-in defaults).
     /// - `search_semantic` / `kv_search_semantic` still embed query text
     ///   synchronously (low count, TTL-cached).
@@ -1181,7 +1181,7 @@ impl DocStore {
     /// When semantic search is configured and the namespace has
     /// `semantic_search_enabled = true`, the KV value is written first, then a
     /// pending embedding queue entry is enqueued.  The background
-    /// [`VecIndexWorker`] processes the queue asynchronously — the vector index
+    /// `VecIndexWorker` processes the queue asynchronously — the vector index
     /// is eventually consistent with the KV store.  A crash between the two
     /// writes leaves the value un-indexed until reconciliation re-enqueues it.
     pub async fn kv_put(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value) -> Result<(), DocStoreError> {
@@ -1746,8 +1746,7 @@ impl DocStore {
                 let key_type = schema.key_type;
 
                 let task = tokio::spawn(async move {
-                    let result =
-                        rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
+                    let result = rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
                     if let Err(ref e) = result {
                         // Notify the whole chain (in-memory *and* disk), so the
                         // failure is persisted, not just visible to live pollers.
@@ -1917,7 +1916,7 @@ impl DocStore {
     /// When semantic search is configured and the namespace has
     /// `semantic_search_enabled = true`, the document is written first, then a
     /// pending embedding queue entry is enqueued.  The background
-    /// [`VecIndexWorker`] processes the queue entry asynchronously — the vector
+    /// `VecIndexWorker` processes the queue entry asynchronously — the vector
     /// index is eventually consistent with the document store.  A crash between
     /// the two writes leaves the document un-indexed until reconciliation
     /// re-enqueues it.

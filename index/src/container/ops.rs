@@ -48,7 +48,7 @@ pub fn array_and_run(array: &ArrayContainer, run: &RunContainer) -> ArrayContain
 }
 
 /// OR: Array ∪ Run → merge values, build best container.
-/// Returns as a sorted Vec<u16> — caller wraps into the right container type.
+/// Returns as a sorted `Vec<u16>` — caller wraps into the right container type.
 pub fn array_or_run_values(array: &ArrayContainer, run: &RunContainer) -> Vec<u16> {
     let mut result = Vec::with_capacity(array.cardinality() + run.cardinality());
     let mut ai = array.iter().peekable();

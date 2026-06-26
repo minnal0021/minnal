@@ -174,7 +174,7 @@ impl RunContainer {
         self.runs.last().map(|r| r.end())
     }
 
-    /// Expand all runs into a sorted Vec<u16>.
+    /// Expand all runs into a sorted `Vec<u16>`.
     pub fn to_values(&self) -> Vec<u16> {
         let mut result = Vec::with_capacity(self.cardinality);
         for run in &self.runs {

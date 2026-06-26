@@ -152,10 +152,10 @@ impl BitsetContainer {
         self.cardinality < BITSET_TO_ARRAY_THRESHOLD
     }
 
-    /// Extract all set bits as a sorted Vec<u16>.
+    /// Extract all set bits as a sorted `Vec<u16>`.
     ///
     /// Dispatches to the AVX-512 + byte lookup table path for dense bitsets
-    /// (cardinality >= [`DENSE_EXTRACT_THRESHOLD`]); falls back to scalar otherwise.
+    /// (cardinality >= `DENSE_EXTRACT_THRESHOLD`); falls back to scalar otherwise.
     pub fn to_values(&self) -> Vec<u16> {
         extract_bitset_to_values(&self.bits.0, self.cardinality)
     }

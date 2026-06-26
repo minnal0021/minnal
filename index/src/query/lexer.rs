@@ -174,10 +174,13 @@ impl<'a> Lexer<'a> {
             return Err(QueryError::syntax(start, "expected digit after '-'"));
         }
 
-        let n: i64 = digits
+        // Parse the sign together with the digits so i64::MIN (whose magnitude
+        // exceeds i64::MAX) round-trips: negating a positive parse would overflow.
+        let literal = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
+        let n: i64 = literal
             .parse()
             .map_err(|_| QueryError::syntax(start, "integer literal out of i64 range"))?;
-        Ok(Token::IntLit(if neg { -n } else { n }))
+        Ok(Token::IntLit(n))
     }
 
     fn lex_ident(&mut self) -> Result<Token, QueryError> {
@@ -253,6 +256,14 @@ mod tests {
     #[test]
     fn test_negative_integer() {
         assert_eq!(tokens("-42")[0], Token::IntLit(-42));
+    }
+
+    #[test]
+    fn test_i64_bounds() {
+        // i64::MIN's magnitude exceeds i64::MAX, so the sign must be parsed with
+        // the digits rather than negating a positive parse.
+        assert_eq!(tokens("-9223372036854775808")[0], Token::IntLit(i64::MIN));
+        assert_eq!(tokens("9223372036854775807")[0], Token::IntLit(i64::MAX));
     }
 
     #[test]

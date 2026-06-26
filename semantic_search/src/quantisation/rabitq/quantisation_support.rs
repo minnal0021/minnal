@@ -1,5 +1,11 @@
 use simsimd::SpatialSimilarity;
 
+/// RaBitQ's error-bound confidence multiplier ε₀ for the **multi-bit** path: the
+/// estimated dot product deviates from the true value by at most `EPSILON ·
+/// l2_norm_distance_to_centroid · √error` with high probability, where ε₀ sets the
+/// confidence level (larger ⇒ looser but safer bound). 1.9 is the value used by the
+/// RaBitQ reference implementation. Identical to `EPSILON_0` in the single-bit path
+/// (`quantisation/rabitq/mod.rs`). See the RaBitQ papers referenced in that module.
 const EPSILON: f32 = 1.9;
 
 pub struct Quantisation {

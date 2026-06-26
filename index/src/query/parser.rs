@@ -278,6 +278,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_preserves_multibyte_utf8_string_literal() {
+        // The lexer decodes a UTF-8 string literal; the parser must carry the
+        // multi-byte payload through to RawValue::Str byte-for-byte (Tamil +
+        // emoji), not just ASCII. Regression for the StrLit → RawValue::Str hand-off.
+        let expr = parse("name = 'மின்னல் ⚡'").unwrap();
+        assert_eq!(
+            expr,
+            RawExpr::Predicate {
+                field: "name".into(),
+                op: Op::Eq,
+                value: RawValue::Str("மின்னல் ⚡".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_preserves_multibyte_utf8_in_list() {
+        // UTF-8 must also survive the IN-list path, which builds RawValue::List.
+        let expr = parse("city IN ('東京', 'Köln')").unwrap();
+        assert_eq!(
+            expr,
+            RawExpr::Predicate {
+                field: "city".into(),
+                op: Op::In,
+                value: RawValue::List(vec![RawValue::Str("東京".into()), RawValue::Str("Köln".into())]),
+            }
+        );
+    }
+
+    #[test]
     fn parse_and_expression_produces_and_node() {
         let expr = parse("age > 18 AND active = true").unwrap();
         assert!(matches!(expr, RawExpr::And(_, _)));

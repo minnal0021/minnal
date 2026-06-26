@@ -14,7 +14,7 @@ use super::predicate::Predicate;
 /// - `ordering`: an in-memory `BTreeMap<V, u128>` mapping each distinct field
 ///   value to a stable slot ID. This is small (keys only, no bitmap data) and
 ///   provides the sorted iteration needed for range predicates.
-/// - `bitmaps`: a [`BlobStore`] mapping slot IDs to serialised [`RoaringBitmap`]
+/// - `bitmaps`: a `BlobStore` mapping slot IDs to serialised [`RoaringBitmap`]
 ///   data. This can be backed by anonymous mmaps (for transient / test use) or
 ///   by persistent files under the field's on-disk directory.
 ///
@@ -278,7 +278,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.next_slot
     }
 
-    /// Flush the underlying [`BlobStore`] mmap to disk.
+    /// Flush the underlying `BlobStore` mmap to disk.
     ///
     /// No-op for anonymous (transient) stores.
     pub fn flush(&self) -> std::io::Result<()> {
@@ -286,7 +286,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
     }
 
     /// Fraction (`0.0..1.0`) of the bitmap value region that is reclaimable
-    /// dead space. See [`BlobStore::waste_ratio`].
+    /// dead space. See `BlobStore::waste_ratio`.
     pub fn bitmap_waste_ratio(&self) -> f64 {
         self.bitmaps.waste_ratio()
     }
@@ -294,13 +294,13 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// `(logical, live)` bytes of the bitmap value region: total bytes ever
     /// appended vs. what survives compaction. The gap is reclaimable dead space
     /// from the append-only whole-bitmap rewrites — large for low-cardinality
-    /// fields. See [`BlobStore::logical_bytes`] / [`BlobStore::live_bytes`].
+    /// fields. See `BlobStore::logical_bytes` / `BlobStore::live_bytes`.
     pub fn bitmap_blob_bytes(&self) -> (u64, u64) {
         (self.bitmaps.logical_bytes(), self.bitmaps.live_bytes())
     }
 
     /// Compact the bitmap value region, reclaiming dead space left by the
-    /// per-insert whole-bitmap rewrites. See [`BlobStore::compact`].
+    /// per-insert whole-bitmap rewrites. See `BlobStore::compact`.
     pub fn compact_bitmaps(&mut self) -> std::io::Result<u64> {
         self.bitmaps.compact()
     }

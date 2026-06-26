@@ -116,7 +116,7 @@ pub type RowToKeyFn = Arc<dyn Fn(u128) -> Vec<u8> + Send + Sync>;
 
 /// One registered field index within a namespace.
 pub struct IndexEntry {
-    /// Stable field identifier matching the one stored in [`NamespaceSchema`].
+    /// Stable field identifier matching the one stored in `NamespaceSchema`.
     pub field_id: FieldId,
     /// Extracts the field value from raw document bytes.
     pub extractor: ExtractorFn,

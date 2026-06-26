@@ -789,7 +789,7 @@ impl Database {
     /// 1. **Persist the registry deletion first.** From this point the namespace
     ///    is logically gone, and all of its on-disk files *and* WAL entries are
     ///    unreferenced. Recovery skips WAL entries whose namespace is absent from
-    ///    the registry (see [`recover_from_wal`](Self::recover_from_wal)), so the
+    ///    the registry (see `recover_from_wal`), so the
     ///    later steps can fail or only partially complete without ever
     ///    resurrecting the deleted namespace's data.
     /// 2. **Flush, shut down, and drop the KVStore** so every file handle is
@@ -860,7 +860,7 @@ impl Database {
     /// The field name must be unique within the namespace.
     ///
     /// The `value_type` is stored in the schema and validated when
-    /// [`activate_field_index`] is called, so type mismatches are caught at
+    /// `activate_field_index` is called, so type mismatches are caught at
     /// activation time rather than at query time.
     pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
         let field_id = self.registry.write().register_schema_field(namespace_id, field_name, value_type)?;
@@ -899,7 +899,7 @@ impl Database {
     /// Return the number of distinct indexed values for a field.
     ///
     /// Returns `None` when the field is not active (not yet registered via
-    /// [`activate_field_index`]).
+    /// `activate_field_index`).
     pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
@@ -952,7 +952,7 @@ impl Database {
     ///
     /// # Arguments
     /// * `namespace_id` – the namespace the field belongs to
-    /// * `field_id`     – the [`FieldId`] returned by [`register_index_field`]
+    /// * `field_id`     – the [`FieldId`] returned by `register_index_field`
     /// * `value_type`   – runtime type for the index entries
     /// * `extractor`    – closure that extracts a typed value from raw document bytes
     pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
@@ -1104,7 +1104,7 @@ impl Database {
     ///    derived row ID (`key_to_row_id`) appears in the bitmap.
     ///
     /// # Limitations
-    /// Only fields activated via [`activate_field_index`] are queryable.
+    /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Serialization`]
     /// wrapping a [`index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
@@ -1171,7 +1171,7 @@ impl Database {
     /// `limit` keys starting from `offset` in iteration order.
     ///
     /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// - With a registered [`RowToKeyFn`]: O(offset + limit) key resolutions.
+    /// - With a registered `RowToKeyFn`: O(offset + limit) key resolutions.
     /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
     ///
     /// [`query_keys`]: Self::query_keys

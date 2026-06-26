@@ -8,24 +8,24 @@
 //!
 //! [`DynFieldIndex`] provides a uniform mutation interface over the
 //! mmap-backed [`FieldIndex`] variants.  Persistence is handled directly by
-//! the underlying [`BlobStore`] mmap files; use [`open`] / [`flush`] to
+//! the underlying `BlobStore` mmap files; use `open` / `flush` to
 //! open or flush a file-backed index.
 //!
 //! The value→slot-id mapping (the "keymap") is persisted in a second
-//! [`BlobStore`] under a `keymap/` subdirectory.  Each entry maps
+//! `BlobStore` under a `keymap/` subdirectory.  Each entry maps
 //! `slot_id (u128) → serialised value bytes`, so individual inserts and
 //! removes are immediately durable without rewriting the entire keymap.
 //!
 //! # Crash atomicity — DynFieldIndex is NOT independently crash-atomic
 //!
-//! A [`DynFieldIndex`] spans **two** separate [`BlobStore`]s — the bitmap store
+//! A [`DynFieldIndex`] spans **two** separate `BlobStore`s — the bitmap store
 //! (`slot_id → RoaringBitmap`) and the keymap store (`slot_id → value bytes`) —
 //! and there is **no index-level marker tying them to one logical point**.
-//! [`flush`] flushes the bitmap store and then the keymap store as two distinct
+//! `flush` flushes the bitmap store and then the keymap store as two distinct
 //! `msync`s, so a crash *between* them leaves the two stores at different
 //! versions (a "skew"): e.g. a slot's bitmap is on disk but its keymap entry is
 //! not, or vice-versa. Each store on its own is still structurally valid (they
-//! pass [`BlobStore::open`]'s header/bounds checks) — they simply disagree.
+//! pass `BlobStore::open`'s header/bounds checks) — they simply disagree.
 //!
 //! This is **by design**: the field index is a *derived, reconstructable*
 //! structure, so consistency is the **owner's** responsibility, not the index
@@ -36,7 +36,7 @@
 //! of the loaded index, re-applying the affected inserts/removes in their
 //! original order and reconciling any skew. A skewed reopen never panics or
 //! reads out of bounds — at worst a torn value queries empty (or leaves an
-//! orphaned slot reclaimed by a later [`compact`]) until replay heals it.
+//! orphaned slot reclaimed by a later `compact`) until replay heals it.
 //!
 //! **Standalone users must provide their own reconciliation** (e.g. an external
 //! log to replay, or a wrapping checkpoint marker). Do not assume that opening a
@@ -45,7 +45,6 @@
 //! here because it would duplicate the owner's WAL-offset checkpoint; add one
 //! only if a genuine standalone-crash-atomic use case appears.
 //!
-//! [`compact`]: BlobStore::compact
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -102,7 +101,7 @@ pub(crate) enum DynFieldIndexInner {
     Str(FieldIndex<String>),
 }
 
-/// Type-erased field index backed by mmap [`BlobStore`] instances.
+/// Type-erased field index backed by mmap `BlobStore` instances.
 ///
 /// Two stores are involved:
 /// - **bitmap store** (`blobs.keys` / `blobs.vals`) — holds the per-value
@@ -111,9 +110,9 @@ pub(crate) enum DynFieldIndexInner {
 ///   `slot_id` to the serialised field value so the `BTreeMap<V, u128>`
 ///   ordering can be rebuilt on open.
 ///
-/// For ephemeral (test) use, create with [`new`] — no keymap store is
-/// allocated.  For persistent use, open the index directory with [`open`]
-/// and flush changes with [`flush`].
+/// For ephemeral (test) use, create with `new` — no keymap store is
+/// allocated.  For persistent use, open the index directory with `open`
+/// and flush changes with `flush`.
 pub struct DynFieldIndex {
     pub(crate) inner: DynFieldIndexInner,
     /// Mmap-backed keymap store: `slot_id → serialised V`.
@@ -135,7 +134,7 @@ impl DynFieldIndex {
     /// Open (or create) a file-backed index in `dir`.
     ///
     /// The keymap is persisted in a `keymap/` subdirectory as an mmap-backed
-    /// [`BlobStore`].  On open the entries are iterated to rebuild the
+    /// `BlobStore`.  On open the entries are iterated to rebuild the
     /// in-memory `BTreeMap` ordering.
     pub fn open(value_type: IndexValueType, dir: &Path) -> std::io::Result<Self> {
         let bitmaps = if BlobStore::exists(dir) {

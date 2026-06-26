@@ -62,7 +62,7 @@ pub struct FieldMeta {
     pub field_name: String,
     /// The value type this field was registered with.
     ///
-    /// [`activate_field_index`] validates that the caller-supplied type matches
+    /// `activate_field_index` validates that the caller-supplied type matches
     /// this so mismatches are caught at activation time rather than at query time.
     pub field_type: IndexValueType,
 }

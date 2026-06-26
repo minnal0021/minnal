@@ -80,7 +80,7 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
     ///   `est_ip = f_rescale · (2·ip − sum_q)`  where `ip = Σ_{b_i=1} q_i`
     ///
     /// Dispatches to the best available SIMD backend (AVX-512F → AVX2 → NEON → scalar)
-    /// via [`crate::simd::packed_ip_best`].
+    /// via `crate::simd::packed_ip_best`.
     fn estimate_distance(&self, query_embedding: &[f32], vector_index: &VectorIndex) -> f32 {
         let dim = query_embedding.len();
         let ip = crate::simd::packed_ip_best(&vector_index.packed_vector, query_embedding, dim);

@@ -348,7 +348,7 @@ impl KVStore {
     /// After this call every key passed through the index write path is
     /// assigned the row ID returned by `row_id_fn` instead of the default
     /// Murmur3 hash.  Providing `row_to_key_fn` (the inverse) also enables
-    /// O(|hits|) query resolution in [`Database::query_keys`] — the inverse
+    /// O(|hits|) query resolution in `Database::query_keys` — the inverse
     /// reconstructs each matching key directly from its row ID, requiring
     /// zero extra memory and no maintenance on writes.
     ///
@@ -632,7 +632,7 @@ impl KVStore {
     ///
     /// Reads are lock-free on the common path. Concurrent GC mutates two
     /// structures the read depends on — the value-log file (swapped under the
-    /// bucket lock, bumping the bucket [`generation`](crate::store::value_log::ValueLog::generation))
+    /// bucket lock, bumping the bucket `generation`)
     /// and the LSM's SSTable files (swapped during L0→L1 compaction). Either can
     /// momentarily make a freshly-read pointer inconsistent with the file it is
     /// read from, surfacing as a transient error or a stale value.
@@ -641,7 +641,7 @@ impl KVStore {
     /// before and after the pointer+value read and only trust a clean success
     /// when the generation is unchanged. Any error, or a generation change, is
     /// treated as a transient race and retried. After
-    /// [`MAX_GENERATION_READ_ATTEMPTS`] we fall back to a read that holds the
+    /// `MAX_GENERATION_READ_ATTEMPTS` we fall back to a read that holds the
     /// bucket lock (excluding value-log GC) — the authoritative path that
     /// guarantees forward progress and surfaces genuine corruption.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -973,7 +973,7 @@ impl KVStore {
     /// Missing keys and I/O errors both produce `None`.
     pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
         // Bracket the resolve-then-read against GC file swaps (see
-        // [`read_generation_stable`](Self::read_generation_stable)); the inner read
+        // `read_generation_stable`); the inner read
         // is infallible, so the wrapper only ever errors from the lock fallback,
         // which we treat as "all missing" to preserve the infallible signature.
         let (mut results, retry) = self
@@ -1089,7 +1089,7 @@ impl KVStore {
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
     /// LSM scan + value reads (here in `scan_prefixes_batch_inner`) must stay inside
-    /// [`read_generation_stable`](Self::read_generation_stable).
+    /// `read_generation_stable`.
     pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<PrefixBatchResult> {
         let (mut result, retry) = self.read_generation_stable(|| self.scan_prefixes_batch_inner(prefix_ids))?;
         // Re-resolve keys dropped to a transient GC race via the single-key path
@@ -1248,7 +1248,7 @@ impl KVStore {
     /// `lsm.get()` re-lookup — then values are read in parallel per bucket.
     ///
     /// INVARIANT: the LSM scan, the file-handle capture, and the value reads MUST all
-    /// stay inside the [`read_generation_stable`](Self::read_generation_stable)
+    /// stay inside the `read_generation_stable`
     /// closure. Resolving a pointer outside the bracket reopens the wrong-file window
     /// closed in 420ac8e — the LSM scan's own snapshot does not protect against
     /// value-log GC.
@@ -1271,7 +1271,7 @@ impl KVStore {
     /// `lsm.get()` that the old `range_keys` + `collect_kv_pairs` path performed.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside [`read_generation_stable`](Self::read_generation_stable).
+    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_range_batch(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<KeyValue>> {
         let (mut pairs, retry) = self.read_generation_stable(|| {
             let key_pointers = self.lsm.range_pointers_bounded(start, end, usize::MAX)?;
@@ -1295,7 +1295,7 @@ impl KVStore {
     /// page's keys (not the whole tail of the keyspace) are resolved.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside [`read_generation_stable`](Self::read_generation_stable).
+    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
         let start = cursor.unwrap_or(&[]);
         let ((mut pairs, retry), next_cursor) = self.read_generation_stable(|| {

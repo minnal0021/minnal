@@ -44,6 +44,23 @@ impl Neighbour {
 }
 impl Cluster {
     pub fn euclidean_distance(&self, other: &[f32]) -> f32 {
+        // A dimension mismatch makes `l2sq` return `None`, which we mask to
+        // `f64::MAX` ("infinitely far") so the caller never panics — but a masked
+        // distance silently corrupts nearest-cluster selection (every cluster ties
+        // at MAX, so `find_closest_cluster_id` can return `u32::MAX`). That must
+        // never happen in production: `ClusterIndex::load_with_dim` validates the
+        // centroids against `embedding_dim`, and the embedding service validates
+        // every returned vector against the same dim, so the two operands are
+        // guaranteed equal-length. The assert turns any remaining mismatch into a
+        // loud dev-time failure instead of a silent wrong answer.
+        debug_assert_eq!(
+            self.centroid.len(),
+            other.len(),
+            "euclidean_distance dimension mismatch (centroid {} vs operand {}); \
+             load_with_dim and the embed boundary should make this impossible",
+            self.centroid.len(),
+            other.len(),
+        );
         f32::l2sq(&self.centroid, other).unwrap_or(f64::MAX) as f32
     }
 
@@ -52,25 +69,129 @@ impl Cluster {
     }
 }
 
+/// Errors raised when validating a freshly-loaded cluster index.
+///
+/// These are all "the centroid file is unusable" conditions caught at load time,
+/// before any query or document can hit a dimension mismatch deep in the search
+/// path (where it would surface as a `u32::MAX` cluster id and a downstream
+/// `unwrap` panic).
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterIndexError {
+    /// The file parsed but yielded no clusters.
+    #[error("cluster file contains no clusters")]
+    Empty,
+    /// An embedding could not be assigned because the cluster map is empty.
+    /// Startup validation ([`ClusterIndex::load`]) normally prevents this; it is
+    /// the runtime guard for callers that pass an empty map directly.
+    #[error("cannot assign embedding: the cluster index is empty")]
+    EmptyClusterMap,
+    /// A centroid vector had zero dimensions.
+    #[error("cluster {cluster_id} has an empty centroid vector")]
+    EmptyCentroid { cluster_id: u32 },
+    /// The same `cluster_id` appeared on more than one line.
+    #[error("duplicate cluster_id {cluster_id} in cluster file")]
+    DuplicateClusterId { cluster_id: u32 },
+    /// Centroids are not all the same length.
+    #[error("cluster {cluster_id} centroid has dimension {found}, but other centroids have {expected} (centroids must be uniform)")]
+    InconsistentDimension { cluster_id: u32, expected: usize, found: usize },
+    /// Centroids are uniform but do not match the configured `embedding_dim`.
+    #[error("centroid dimension {found} does not match the configured embedding_dim {expected}")]
+    DimensionMismatch { expected: usize, found: usize },
+}
+
+/// Validate a centroid map and return the (uniform) centroid dimension.
+///
+/// Rejects an empty map, any empty centroid, and centroids of mixed length. When
+/// `expected_dim` is `Some`, also rejects a uniform dimension that disagrees with
+/// it. Duplicate cluster IDs are caught earlier, in [`read_clusters_from_file`].
+fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>) -> Result<usize, ClusterIndexError> {
+    let mut dim: Option<usize> = None;
+    for (&cluster_id, centroid) in map {
+        if centroid.is_empty() {
+            return Err(ClusterIndexError::EmptyCentroid { cluster_id });
+        }
+        match dim {
+            None => dim = Some(centroid.len()),
+            Some(d) if d != centroid.len() => {
+                return Err(ClusterIndexError::InconsistentDimension {
+                    cluster_id,
+                    expected: d,
+                    found: centroid.len(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    let dim = dim.ok_or(ClusterIndexError::Empty)?;
+    if let Some(expected) = expected_dim
+        && dim != expected
+    {
+        return Err(ClusterIndexError::DimensionMismatch { expected, found: dim });
+    }
+    Ok(dim)
+}
+
 /// A fully built cluster index: the centroid map and the pre-computed
 /// neighbour graph, loaded once at startup and shared read-only across
 /// all requests.
+#[derive(Debug)]
 pub struct ClusterIndex {
     /// All clusters keyed by their ID.
     pub clusters: HashMap<u32, Cluster>,
     /// Pre-computed nearest-neighbour graph, keyed by cluster ID.
     pub neighbours: HashMap<u32, Vec<Neighbour>>,
+    /// The uniform centroid dimension, validated at load time. Every query and
+    /// document embedding compared against these centroids must share it.
+    dim: usize,
 }
 
 impl ClusterIndex {
-    /// Load clusters from `cluster_file_path` and build the neighbour graph.
+    /// Load clusters from `cluster_file_path` and build the neighbour graph,
+    /// validating only the file's internal consistency.
     ///
-    /// Returns an error if the file cannot be read or parsed.
+    /// Rejects an empty file, empty centroids, duplicate cluster IDs, and
+    /// centroids of mixed dimension. Use [`load_with_dim`](Self::load_with_dim) to
+    /// additionally pin the centroid dimension to a configured `embedding_dim`.
+    ///
+    /// Returns an error if the file cannot be read, parsed, or fails validation.
     pub fn load(cluster_file_path: &str, max_neighbours: usize) -> Result<Self, Box<dyn Error>> {
+        Self::load_inner(cluster_file_path, max_neighbours, None)
+    }
+
+    /// Like [`load`](Self::load), but also rejects a cluster file whose (uniform)
+    /// centroid dimension does not equal `embedding_dim`.
+    ///
+    /// This is the entry point the server uses: catching a centroid/embedding
+    /// dimension mismatch here disables semantic search with a clear error at
+    /// startup, instead of letting it surface as a `u32::MAX` nearest-cluster id
+    /// and a downstream `unwrap` panic on the first document insert or query.
+    pub fn load_with_dim(cluster_file_path: &str, max_neighbours: usize, embedding_dim: usize) -> Result<Self, Box<dyn Error>> {
+        Self::load_inner(cluster_file_path, max_neighbours, Some(embedding_dim))
+    }
+
+    fn load_inner(cluster_file_path: &str, max_neighbours: usize, expected_dim: Option<usize>) -> Result<Self, Box<dyn Error>> {
         let centroid_map = read_clusters_from_file(cluster_file_path)?;
+        let dim = validate_centroids(&centroid_map, expected_dim)?;
         let clusters: HashMap<u32, Cluster> = centroid_map.into_iter().map(|(id, centroid)| (id, Cluster::new(id, centroid))).collect();
         let neighbours = build_neighbours_graph(&clusters, max_neighbours);
-        Ok(Self { clusters, neighbours })
+        Ok(Self { clusters, neighbours, dim })
+    }
+
+    /// Build an index directly from in-memory clusters, computing the neighbour
+    /// graph and inferring the dimension from the first centroid (`0` if empty).
+    ///
+    /// For callers that already hold centroids in memory rather than a file. The
+    /// per-centroid validation done by [`load`](Self::load) is the file path's
+    /// concern; in-memory callers are trusted to pass uniform centroids.
+    pub fn from_clusters(clusters: HashMap<u32, Cluster>, max_neighbours: usize) -> Self {
+        let dim = clusters.values().next().map(|c| c.centroid.len()).unwrap_or(0);
+        let neighbours = build_neighbours_graph(&clusters, max_neighbours);
+        Self { clusters, neighbours, dim }
+    }
+
+    /// The uniform centroid dimension every embedding must match.
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 }
 
@@ -87,7 +208,11 @@ pub fn read_clusters_from_file(cluster_file_path: &str) -> Result<HashMap<u32, V
         let v: serde_json::Value = serde_json::from_str(&line)?;
         let id = v["cluster_id"].as_u64().ok_or("missing cluster_id")? as u32;
         let centroid: Vec<f32> = serde_json::from_value(v["centroid"].clone())?;
-        map.insert(id, centroid);
+        // Detect duplicates here: the map would otherwise silently keep only the
+        // last centroid for a repeated cluster_id.
+        if map.insert(id, centroid).is_some() {
+            return Err(Box::new(ClusterIndexError::DuplicateClusterId { cluster_id: id }));
+        }
     }
 
     info!("Read {} clusters from file: {}", map.len(), cluster_file_path);
@@ -306,5 +431,110 @@ mod tests {
         let clusters = HashMap::new();
         let ids = find_top_n_cluster_ids(&clusters, &[1.0, 0.0], 5);
         assert!(ids.is_empty(), "must return empty vec when cluster map is empty");
+    }
+
+    // ── Centroid validation (ClusterIndexError) ──────────────────────────────
+
+    /// Write the given lines to a temp file and return it (kept alive by caller).
+    fn cluster_file(lines: &[&str]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(tmp, "{line}").unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn validate_centroids_accepts_uniform_and_returns_dim() {
+        let mut map = HashMap::new();
+        map.insert(1, vec![0.1, 0.2, 0.3]);
+        map.insert(2, vec![0.4, 0.5, 0.6]);
+        assert_eq!(validate_centroids(&map, None).unwrap(), 3);
+        assert_eq!(validate_centroids(&map, Some(3)).unwrap(), 3);
+    }
+
+    #[test]
+    fn validate_centroids_rejects_empty_map() {
+        let map: HashMap<u32, Vec<f32>> = HashMap::new();
+        assert!(matches!(validate_centroids(&map, None), Err(ClusterIndexError::Empty)));
+    }
+
+    #[test]
+    fn validate_centroids_rejects_empty_centroid() {
+        let mut map = HashMap::new();
+        map.insert(7, Vec::<f32>::new());
+        assert!(matches!(
+            validate_centroids(&map, None),
+            Err(ClusterIndexError::EmptyCentroid { cluster_id: 7 })
+        ));
+    }
+
+    #[test]
+    fn validate_centroids_rejects_mixed_dimensions() {
+        let mut map = HashMap::new();
+        map.insert(1, vec![0.1, 0.2, 0.3]);
+        map.insert(2, vec![0.4, 0.5]); // shorter
+        assert!(matches!(
+            validate_centroids(&map, None),
+            Err(ClusterIndexError::InconsistentDimension { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_centroids_rejects_dim_mismatch_against_expected() {
+        let mut map = HashMap::new();
+        map.insert(1, vec![0.1, 0.2, 0.3]);
+        assert!(matches!(
+            validate_centroids(&map, Some(768)),
+            Err(ClusterIndexError::DimensionMismatch { expected: 768, found: 3 })
+        ));
+    }
+
+    #[test]
+    fn read_clusters_rejects_duplicate_cluster_id() {
+        let tmp = cluster_file(&[
+            r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#,
+            r#"{"cluster_id":1,"centroid":[0.4,0.5,0.6]}"#,
+        ]);
+        let err = read_clusters_from_file(tmp.path().to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("duplicate cluster_id 1"), "got: {err}");
+    }
+
+    #[test]
+    fn load_validates_internal_consistency() {
+        let tmp = cluster_file(&[
+            r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#,
+            r#"{"cluster_id":2,"centroid":[0.4,0.5,0.6]}"#,
+        ]);
+        let idx = ClusterIndex::load(tmp.path().to_str().unwrap(), 1).unwrap();
+        assert_eq!(idx.clusters.len(), 2);
+        assert_eq!(idx.dim(), 3);
+    }
+
+    #[test]
+    fn load_rejects_mixed_dimension_file() {
+        let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#, r#"{"cluster_id":2,"centroid":[0.4,0.5]}"#]);
+        assert!(ClusterIndex::load(tmp.path().to_str().unwrap(), 1).is_err());
+    }
+
+    #[test]
+    fn load_with_dim_accepts_matching_dim() {
+        let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#]);
+        let idx = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 1, 3).unwrap();
+        assert_eq!(idx.dim(), 3);
+    }
+
+    #[test]
+    fn load_with_dim_rejects_mismatched_dim() {
+        let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#]);
+        let err = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 1, 768).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_empty_file() {
+        let tmp = cluster_file(&[]);
+        assert!(ClusterIndex::load(tmp.path().to_str().unwrap(), 1).is_err());
     }
 }

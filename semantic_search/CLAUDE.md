@@ -68,6 +68,10 @@ Requests use a **batch interface** (chunking happens in minnal, not the service)
 
 A whole-text ("single") embedding is just a one-element `payloads` array; chunked embeddings send one payload per sliding-window chunk. The `{model}` path segment from the old API is gone (the model is fixed server-side). Default base URL: `http://localhost:8001`.
 
+### Startup probe & the model-pinning gap (operational, not enforced)
+
+`check_embedding_service` (called once at startup, non-fatal) does more than ping `/healthcheck`: it embeds a fixed probe payload through **both** the document and query endpoints and validates the returned **dimension** against `embedding_dim` (a service on a different dimension fails the probe instead of degrading search silently), then soft-warns if the probe vector is not unit-norm. **What it cannot validate is the model itself** — the service exposes no model family/version metadata, so a *wrong model with the same dimension* passes every check while the bundled cluster centroids are for a different embedding distribution (silently degraded recall). **Model pinning is therefore an operational guarantee, not an enforced one:** deployment must ensure `[[semantic_search.supported_models]]` / `cluster_path` match the model the service actually serves. If the service later exposes a model/version endpoint, enforce it here.
+
 ## Cluster centroids
 
 Pre-built centroids are at `service/embedding_support/qwen/clusters.json`. Set `semantic_search.cluster_path` in config to point at this file. The file is ~784 KB of JSON — do not read it; it is data, not code.
