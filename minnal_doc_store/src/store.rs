@@ -1909,6 +1909,19 @@ impl DocStore {
         self.db.field_index_waste(ns_id, fm.field_id)
     }
 
+    /// On-disk blob growth/waste metrics for a field's append-only index stores
+    /// (bitmap + keymap logical vs. live bytes, waste ratios, distinct-value
+    /// count), or `None` if the field is not currently active. Surfaces the
+    /// absolute blob *growth* between compactions that the waste *ratio* alone
+    /// hides — worst for low-cardinality, high-churn fields.
+    pub fn field_index_blob_stats(&self, namespace: &str, field: &str) -> Option<minnal_db::IndexBlobStats> {
+        let schema = self.load_schema(namespace).ok()?;
+        let ns_id = schema.ns_id?;
+        let fields = self.db.list_index_fields(ns_id);
+        let fm = fields.iter().find(|f| f.field_name == field)?;
+        self.db.field_index_blob_stats(ns_id, fm.field_id)
+    }
+
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).
     pub fn index_blob_waste_threshold(&self) -> f64 {
         self.db.index_blob_waste_threshold()

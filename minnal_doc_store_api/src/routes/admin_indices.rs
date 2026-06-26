@@ -8,6 +8,7 @@
 //! GET    /admin/indices/{ns}/progress                     → per-namespace index progress
 //! POST   /admin/indices/{ns}/attribute/reindex-all        → drop + rebuild all field indices (202)
 //! DELETE /admin/indices/{ns}/attribute/drop-all           → drop all field indices (202)
+//! GET    /admin/indices/{ns}/{field}/blob-stats           → one field's on-disk blob growth/waste (404 if not active)
 //! POST   /admin/indices/{ns}/vector/reindex-all           → re-enqueue all docs for embedding (202)
 //! POST   /admin/indices/{ns}/vector/reindex-failed        → reset exhausted queue entries (200)
 //! DELETE /admin/indices/{ns}/vector/drop-all              → clear all vector index data (202)
@@ -263,6 +264,61 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
     });
 
     Ok(StatusCode::ACCEPTED)
+}
+
+// ── GET /admin/indices/{ns}/{field}/blob-stats ────────────────────────────────
+
+/// One field index's on-disk blob growth/waste, with the compaction threshold.
+#[derive(Serialize)]
+pub struct FieldBlobStatsResponse {
+    namespace: String,
+    field: String,
+    /// Compaction threshold as a fraction (`0.0..1.0`): a store is compacted at
+    /// the next index checkpoint once its waste reaches this.
+    waste_threshold: f64,
+    /// True if the bitmap or keymap store has reached `waste_threshold`.
+    over_threshold: bool,
+    #[serde(flatten)]
+    stats: minnal_db::IndexBlobStats,
+}
+
+/// `GET /admin/indices/{ns}/{field}/blob-stats` — on-disk blob growth for one
+/// field index: bitmap and keymap **logical** bytes (everything ever appended =
+/// live + stale) vs. **live** bytes (what survives compaction), their waste
+/// ratios, and the distinct-value count, alongside the compaction threshold.
+///
+/// Complements the fleet-wide [`GET /admin/storage/index-waste`](super::admin_storage::index_waste),
+/// which reports only waste *ratios*: this surfaces the absolute blob *growth*
+/// between compactions that a ratio hides — worst for low-cardinality, high-churn
+/// fields under the append-only whole-bitmap rewrite. A large, high-waste
+/// `bitmap_logical_bytes` is the signal to force a
+/// [`POST /admin/storage/index-checkpoint`](super::admin_storage::trigger_index_checkpoint).
+///
+/// Returns `404 Not Found` when the field has no active index (unknown field, or
+/// still building).
+pub async fn field_blob_stats(
+    State(state): State<AppState>,
+    Path((ns, field)): Path<(String, String)>,
+) -> Result<Json<FieldBlobStatsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.field_index_blob_stats(&ns, &field) {
+        Some(stats) => {
+            let waste_threshold = state.store.index_blob_waste_threshold();
+            let over_threshold = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
+            Ok(Json(FieldBlobStatsResponse {
+                namespace: ns,
+                field,
+                waste_threshold,
+                over_threshold,
+                stats,
+            }))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no active field index '{field}' in namespace '{ns}' (unknown field, or still building)")
+            })),
+        )),
+    }
 }
 
 // ── Vector index operations ───────────────────────────────────────────────────

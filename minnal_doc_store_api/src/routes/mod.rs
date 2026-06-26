@@ -79,6 +79,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/{ns}/progress", get(admin_indices::progress_ns))
         .route("/admin/indices/{ns}/attribute/reindex-all", post(admin_indices::attribute_reindex_all))
         .route("/admin/indices/{ns}/attribute/drop-all", delete(admin_indices::attribute_drop_all))
+        .route("/admin/indices/{ns}/{field}/blob-stats", get(admin_indices::field_blob_stats))
         .route("/admin/indices/{ns}/vector/reindex-all", post(admin_indices::vector_reindex_all))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))
         .route("/admin/indices/{ns}/vector/drop-all", delete(admin_indices::vector_drop_all))

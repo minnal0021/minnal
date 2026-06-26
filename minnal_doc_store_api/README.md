@@ -1079,6 +1079,8 @@ curl -X POST http://localhost:8080/admin/storage/compact
 
 Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows with per-document churn; the **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
 
+This is the fleet-wide view of waste *ratios*; for the absolute on-disk byte *growth* of a single field (logical vs. live bytes) — which a ratio alone hides — use [`GET /admin/indices/{ns}/{field}/blob-stats`](#get-adminindicesnsfieldblob-stats).
+
 ```bash
 curl http://localhost:8080/admin/storage/index-waste
 ```
@@ -1138,6 +1140,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
 | `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
+| `GET` | `/admin/indices/{ns}/{field}/blob-stats` | `200` | One field index's on-disk blob growth/waste (`404` if not active) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-all` | `202` | Re-enqueue all docs for embedding |
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
@@ -1294,6 +1297,35 @@ curl -X DELETE http://localhost:8080/admin/indices/users/attribute/drop-all
 ```
 
 Returns `409` when an attribute operation is already active. Returns `422` when the namespace has no indices.
+
+---
+
+#### `GET /admin/indices/{ns}/{field}/blob-stats`
+
+On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole on every document write) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
+
+Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of low-cardinality, high-churn fields (e.g. a boolean over many documents), whose bitmap blob can balloon to many times its live footprint. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
+
+```bash
+curl http://localhost:8080/admin/indices/users/status/blob-stats
+```
+```json
+{
+  "namespace": "users",
+  "field": "status",
+  "waste_threshold": 0.5,
+  "over_threshold": true,
+  "distinct_values": 2,
+  "bitmap_logical_bytes": 104857600,
+  "bitmap_live_bytes": 8192,
+  "bitmap_waste_ratio": 0.99,
+  "keymap_logical_bytes": 256,
+  "keymap_live_bytes": 256,
+  "keymap_waste_ratio": 0.0
+}
+```
+
+Returns `404` when `{field}` has no active index in `{ns}` (unknown field, or still building).
 
 ---
 

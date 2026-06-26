@@ -82,7 +82,7 @@ pub enum IndexValueType {
 /// reclaimable dead space. `*_waste_ratio` is `dead / logical`. The bitmap store
 /// is the one that balloons under low-cardinality write amplification; track it
 /// to guardrail against runaway disk use between compactions.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct IndexBlobStats {
     /// Number of distinct values currently indexed.
     pub distinct_values: usize,

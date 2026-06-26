@@ -460,6 +460,14 @@ impl Db {
         self.inner.field_index_waste(namespace_id, field_id)
     }
 
+    /// On-disk blob growth/waste metrics for a field — bitmap and keymap store
+    /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
+    /// is not currently active. Use it to monitor the append-only write
+    /// amplification that low-cardinality fields suffer.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        self.inner.field_index_blob_stats(namespace_id, field_id)
+    }
+
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).
     pub fn index_blob_waste_threshold(&self) -> f64 {
         self.inner.index_blob_waste_threshold()
@@ -1302,6 +1310,14 @@ impl AsyncDb {
     /// or `None` if the field is not currently active.
     pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
         self.inner.inner.field_index_waste(namespace_id, field_id)
+    }
+
+    /// On-disk blob growth/waste metrics for a field — bitmap and keymap store
+    /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
+    /// is not currently active. Use it to monitor the append-only write
+    /// amplification that low-cardinality fields suffer.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        self.inner.inner.field_index_blob_stats(namespace_id, field_id)
     }
 
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).

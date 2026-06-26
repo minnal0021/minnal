@@ -103,6 +103,10 @@ pub use index::IndexValueType;
 /// A typed field value extracted from a document by an extractor closure.
 pub use index::IndexValue;
 
+/// On-disk blob growth/waste metrics for one field index (logical vs. live
+/// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
+pub use index::IndexBlobStats;
+
 /// Unique identifier for a registered field within a namespace.
 pub use db::namespace::FieldId;
 /// Metadata for a registered field: id, name, and value type.
