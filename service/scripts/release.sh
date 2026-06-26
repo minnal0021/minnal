@@ -185,8 +185,8 @@ cat > "${BIN_DIR}/run_tool.sh" << 'EOF'
 #   ./run_tool.sh <tool> [tool-args...]
 #
 # Examples:
-#   ./run_tool.sh bulk_load --schema jobs-schema.json http://localhost:8080 jobs jobId jobs.jsonl
-#   ./run_tool.sh bulk_load http://localhost:8080 profiles id profiles.jsonl
+#   ./run_tool.sh bulk_load --schema jobs-mini-schema.json http://localhost:8080 jobs jobId jobs-mini.jsonl
+#   ./run_tool.sh bulk_load --kv --schema job-content-kv-schema.json http://localhost:8080 job-content key value job-content-kv.jsonl
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -195,11 +195,12 @@ if [[ $# -lt 1 ]]; then
     echo "usage: $0 <tool> [args...]" >&2
     echo "" >&2
     echo "tools:" >&2
-    echo "  bulk_load    load a JSONL file into a doc store, optionally importing its schema first" >&2
+    echo "  bulk_load    load a JSONL file into a doc store (default) or KV store (--kv)," >&2
+    echo "               optionally importing its schema first" >&2
     echo "" >&2
     echo "examples:" >&2
-    echo "  $0 bulk_load --schema jobs-schema.json http://localhost:8080 jobs jobId jobs.jsonl" >&2
-    echo "  $0 bulk_load http://localhost:8080 profiles id profiles.jsonl" >&2
+    echo "  $0 bulk_load --schema jobs-mini-schema.json http://localhost:8080 jobs jobId jobs-mini.jsonl" >&2
+    echo "  $0 bulk_load --kv --schema job-content-kv-schema.json http://localhost:8080 job-content key value job-content-kv.jsonl" >&2
     exit 1
 fi
 
@@ -236,6 +237,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "Stop the server:        ./work/bin/stop.sh"
 echo "Start the server:       ./work/bin/start.sh"
-echo "Import + load data:     ./work/bin/run_tool.sh bulk_load --schema <schema.json> <url> <namespace> <id_field> <data.jsonl>"
-echo "Load into a store:      ./work/bin/run_tool.sh bulk_load <url> <namespace> <id_field> <data.jsonl>"
+echo "Import + load docs:     ./work/bin/run_tool.sh bulk_load --schema <schema.json> <url> <namespace> <id_field> <data.jsonl>"
+echo "Load into a doc store:  ./work/bin/run_tool.sh bulk_load <url> <namespace> <id_field> <data.jsonl>"
+echo "Import + load KV data:  ./work/bin/run_tool.sh bulk_load --kv --schema <schema.json> <url> <namespace> <key_field> <value_field> <data.jsonl>"
+echo "Load into a KV store:   ./work/bin/run_tool.sh bulk_load --kv <url> <namespace> <key_field> <value_field> <data.jsonl>"
 echo "Test embeddings:        ./work/bin/test_embedding.sh"

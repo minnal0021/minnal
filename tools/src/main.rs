@@ -10,13 +10,16 @@
 //!
 //! | Tool        | Description                                                          |
 //! |-------------|----------------------------------------------------------------------|
-//! | `bulk_load` | Load a JSONL file into a doc store, optionally importing its schema first |
+//! | `bulk_load` | Load a JSONL file into a doc store (default) or KV store (`--kv`), optionally importing its schema first |
 //!
 //! # Example
 //!
 //! ```text
-//! # Import a schema, then load into the new store
-//! minnal_tools bulk_load --schema jobs-schema.json http://localhost:8080 jobs jobId jobs.jsonl
+//! # Import a doc-store schema, then load into the new store
+//! minnal_tools bulk_load --schema jobs-mini-schema.json http://localhost:8080 jobs jobId jobs-mini.jsonl
+//!
+//! # Import a KV-store schema, then load key/value pairs (--kv)
+//! minnal_tools bulk_load --kv --schema job-content-kv-schema.json http://localhost:8080 job-content key value job-content-kv.jsonl
 //!
 //! # Load into a store that already exists
 //! minnal_tools bulk_load http://localhost:8080 profiles id profiles.jsonl
@@ -29,7 +32,8 @@ fn usage() -> ! {
         "usage: minnal_tools <tool> [args...]\n",
         "\n",
         "tools:\n",
-        "  bulk_load    load a JSONL file into a doc store, optionally importing its schema first\n",
+        "  bulk_load    load a JSONL file into a doc store (default) or KV store (--kv),\n",
+        "               optionally importing its schema first\n",
         "\n",
         "run 'minnal_tools <tool>' with no further arguments for tool-specific help",
     ));

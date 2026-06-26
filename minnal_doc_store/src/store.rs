@@ -1223,26 +1223,46 @@ impl DocStore {
     /// is eventually consistent with the KV store.  A crash between the two
     /// writes leaves the value un-indexed until reconciliation re-enqueues it.
     pub async fn kv_put(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value) -> Result<(), DocStoreError> {
+        self.kv_put_inner(namespace, key, value, false).await
+    }
+
+    /// Insert or replace a value in a KV namespace, **bypassing the WAL**.
+    ///
+    /// Identical to [`kv_put`](Self::kv_put) except the value write skips the WAL
+    /// for maximum throughput.  Data written this way is unrecoverable on a crash
+    /// — only use during bulk loading where re-running the load is acceptable.
+    /// The embed marker (when semantic search is enabled) is still enqueued
+    /// through the WAL, matching the document-store `put_no_wal` behaviour.
+    pub async fn kv_put_no_wal(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value) -> Result<(), DocStoreError> {
+        self.kv_put_inner(namespace, key, value, true).await
+    }
+
+    /// Shared body for [`kv_put`](Self::kv_put) and
+    /// [`kv_put_no_wal`](Self::kv_put_no_wal); `skip_wal` selects the value-write
+    /// durability path.
+    async fn kv_put_inner(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value, skip_wal: bool) -> Result<(), DocStoreError> {
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key(key)?;
         let value_bytes = schema.value_type.serialize_value(value)?;
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+
+        if skip_wal {
+            ns.put_no_wal(key_bytes.clone(), value_bytes).await?;
+        } else {
+            ns.put(key_bytes.clone(), value_bytes).await?;
+        }
 
         if let Some(notify) = &self.notify
             && schema.is_semantic_search_enabled()
             && let Some(text) = value.as_str()
             && !text.is_empty()
         {
-            // Write the value first, then enqueue the embed marker as a separate
-            // single op (no cross-namespace atomicity needed — see kv_put docs).
-            let ns = self.db.namespace(namespace.to_owned()).await?;
-            ns.put(key_bytes.clone(), value_bytes).await?;
+            // Enqueue the embed marker as a separate single op (no cross-namespace
+            // atomicity needed — see kv_put docs).
             vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
             notify.notify_one();
-            return Ok(());
         }
 
-        let ns = self.db.namespace(namespace.to_owned()).await?;
-        ns.put(key_bytes, value_bytes).await?;
         Ok(())
     }
 
@@ -4002,6 +4022,23 @@ mod tests {
         let key = serde_json::json!("hello");
         let val = serde_json::json!("world");
         store.kv_put("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap();
+        assert_eq!(got, Some(val));
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_no_wal_get_round_trip() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let key = serde_json::json!("hello");
+        let val = serde_json::json!("world");
+        // The no-WAL path must be readable in-process exactly like the WAL path;
+        // only crash-durability differs.
+        store.kv_put_no_wal("ns", &key, &val).await.unwrap();
 
         let got = store.kv_get("ns", &key).await.unwrap();
         assert_eq!(got, Some(val));

@@ -273,7 +273,7 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **Schema amendments** | Non-indexed attributes can be added, updated, or removed at any time without downtime. |
 | **Three doc key types** | `uuid`, `u64`, `u128` — stored big-endian so range scans return ascending order. |
 | **KV store** | Schema-lite namespaces (`/kv-stores`) for raw key-value data. Key types: `str`, `int`. Value types: `str`, `int`, `f32`, `vec_f32`. Range scan and prefix scan exposed via REST. Same durability guarantees as doc stores; no field indices. |
-| **JSONL bulk loader** | `minnal_tools bulk_load` streams arbitrarily large JSONL files into a namespace via the REST API, optionally importing the store's schema first (`--schema`). |
+| **JSONL bulk loader** | `minnal_tools bulk_load` streams arbitrarily large JSONL files into a namespace via the REST API — document stores by default, KV stores with `--kv` — optionally importing the store's schema first (`--schema`). |
 | **Self-contained core** | Storage, field indexing, vector quantisation, ANN search, and the server all run in a single Rust process. The **one** external dependency is the embedding service — and only when semantic search is enabled: embedding *generation* is delegated to an HTTP endpoint, while quantisation and search stay in-process. KV and document storage, field indexing, and predicate queries need nothing external. |
 
 ---
@@ -436,7 +436,7 @@ A document store is described by a **schema**: a key type, zero or more attribut
 ./work/bin/start.sh
 ```
 
-The `-s` flag stages [`tools/sample_data/`](tools/sample_data) into `./work/sample_data/`, including the two files this quickstart uses: `jobs-mini-schema.json` and `jobs-mini.jsonl` (ten rows).
+The `-s` flag stages [`tools/sample_data/`](tools/sample_data) into `./work/sample_data/`, including the two files this quickstart uses: `jobs-mini-schema.json` and `jobs-mini.jsonl` (ten rows). It also stages a KV-store sample — `job-content-kv-schema.json` and `job-content-kv.jsonl` (twenty long job descriptions) — used by the [KV Store](#kv-store) bulk-load example.
 
 **2. Look at the schema**
 
@@ -839,23 +839,38 @@ curl -s -X DELETE http://localhost:8080/kv-stores/session-cache
 | `f32` | JSON number: `3.14` |
 | `vec_f32` | JSON array of numbers: `[1.0, -0.5, 0.25]` |
 
+To populate a KV store from a JSONL file in one step, use `bulk_load --kv` — the
+release bundles a sample str→str store (`job-content-kv-schema.json` +
+`job-content-kv.jsonl`, 20 long job descriptions keyed by job id). See
+[Bulk Loading](#bulk-loading) below.
+
 ### Bulk Loading
 
-The `minnal_tools bulk_load` command streams a JSONL file line by line and PUTs
-each document via the REST API. By default the namespace must already exist; pass
-`--schema <schema.json>` to import the schema first (`POST /admin/stores/import`),
-which turns it into a one-step "fresh server → populated store" load:
+A single `minnal_tools bulk_load` command streams a JSONL file line by line and
+PUTs each row via the REST API. It loads a **document store** by default; pass
+`--kv` to load a **KV store** instead. By default the namespace must already
+exist; pass `--schema <schema.json>` to import the schema first, which turns it
+into a one-step "fresh server → populated store" load:
 
-| Invocation                | Creates the store? | Use when |
-|---------------------------|--------------------|----------|
-| `bulk_load --schema …`    | Yes — imports the schema first, then loads | Going from a fresh server to a populated store in one step |
-| `bulk_load` (no `--schema`) | No — the namespace must already exist | Adding more rows to a store you created earlier |
+| Invocation                      | Imports via | Creates the store? | Use when |
+|---------------------------------|-------------|--------------------|----------|
+| `bulk_load --schema …`          | `POST /admin/stores/import`    | Yes — imports the schema first, then loads | Fresh server → populated doc store in one step |
+| `bulk_load` (no `--schema`)     | —           | No — the namespace must already exist | Adding more rows to a doc store you created earlier |
+| `bulk_load --kv --schema …`     | `POST /admin/kv-stores/import` | Yes — imports the schema first, then loads | Fresh server → populated KV store in one step |
+| `bulk_load --kv` (no `--schema`) | —          | No — the namespace must already exist | Adding more rows to a KV store you created earlier |
+
+When `--schema` is given, the tool validates that the schema's `key_type` matches
+the selected store kind — e.g. passing `--kv` with a document schema (`u64` /
+`u128` / `uuid`) fails fast with a clear message, and vice versa.
+
+**Document stores** (default) — each line becomes one document; `id_field` names
+the field holding the document ID:
 
 ```bash
 # Import <schema.json> first, then load <data.jsonl>. Re-runs are safe — an
 # existing store is reused. The schema's namespace must match <namespace>.
 ./work/bin/run_tool.sh bulk_load --schema <schema.json> <url> <namespace> <id_field> <data.jsonl>
-./work/bin/run_tool.sh bulk_load --schema ./work/jobs-schema.json http://localhost:8080 jobs jobId ./work/jobs.jsonl
+./work/bin/run_tool.sh bulk_load --schema ./work/sample_data/jobs-mini-schema.json http://localhost:8080 jobs jobId ./work/sample_data/jobs-mini.jsonl
 
 # Load <data.jsonl> into an existing <namespace>.
 ./work/bin/run_tool.sh bulk_load <url> <namespace> <id_field> <data.jsonl>
@@ -865,12 +880,33 @@ which turns it into a one-step "fresh server → populated store" load:
 cargo run -p tools -- bulk_load http://localhost:8080 profiles id profiles.jsonl
 ```
 
-Each line in the JSONL file must be a valid JSON object. The `id_field` value
-is parsed according to the namespace's `key_type` (`u64`, `u128`, or `uuid`).
-Lines with missing or unparseable IDs are skipped and counted in `skipped`;
-failures are also written to a sibling `<data>.errors` file. Pass `--no-wal`
-(before the URL) for maximum throughput when re-running the load is acceptable —
-data written that way is unrecoverable on a crash.
+The `id_field` value is parsed according to the namespace's `key_type` (`u64`,
+`u128`, or `uuid`).
+
+**KV stores** (`--kv`) — each line supplies a key and a value via separate
+fields; `key_field` and `value_field` name them. The value is sent verbatim and
+validated against the namespace's `value_type`:
+
+```bash
+# Import <schema.json> first, then load <data.jsonl>. The bundled sample is a
+# str→str KV store of 20 long job-description blobs keyed by job id.
+./work/bin/run_tool.sh bulk_load --kv --schema <schema.json> <url> <namespace> <key_field> <value_field> <data.jsonl>
+./work/bin/run_tool.sh bulk_load --kv --schema ./work/sample_data/job-content-kv-schema.json \
+  http://localhost:8080 job-content key value ./work/sample_data/job-content-kv.jsonl
+
+# Load <data.jsonl> into an existing KV <namespace>.
+./work/bin/run_tool.sh bulk_load --kv <url> <namespace> <key_field> <value_field> <data.jsonl>
+./work/bin/run_tool.sh bulk_load --kv http://localhost:8080 job-content key value ./work/sample_data/job-content-kv.jsonl
+```
+
+The `key_field` value is parsed according to the namespace's `key_type` (`str` or
+`int`).
+
+For both store kinds each line must be a valid JSON object, and rows with missing
+or unparseable keys/IDs are skipped, counted in `skipped`, and written to a
+sibling `<data>.errors` file. Pass `--no-wal` (before the positional arguments)
+for maximum throughput when re-running the load is acceptable — data written that
+way is unrecoverable on a crash. `--no-wal` works for both document and KV stores.
 
 See [Quickstart](#quickstart-create-a-document-store-and-bulk-load-it) for a
 complete `bulk_load` walkthrough with a sample schema and rows.
