@@ -108,13 +108,11 @@ impl WalPersistObserver {
                     Vec::new()
                 }
             };
-            if !bytes.is_empty() {
-                let tmp = self.wal_metadata_path.with_extension("tmp");
-                let write_result = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.wal_metadata_path));
-                if let Err(e) = write_result {
-                    warn!("[WAL] Failed to write WAL metadata: {:?}", e);
-                    had_error = true;
-                }
+            if !bytes.is_empty()
+                && let Err(e) = crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)
+            {
+                warn!("[WAL] Failed to write WAL metadata: {:?}", e);
+                had_error = true;
             }
         }
 
@@ -171,8 +169,7 @@ impl WalPersistObserver {
             wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_add(updated);
             match wal_metadata.to_file_bytes() {
                 Ok(bytes) if !bytes.is_empty() => {
-                    let tmp = self.wal_metadata_path.with_extension("tmp");
-                    if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.wal_metadata_path)) {
+                    if let Err(e) = crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes) {
                         warn!("[WAL] Failed to write WAL metadata after namespace drop: {:?}", e);
                     }
                 }
@@ -607,6 +604,7 @@ impl Database {
 
     pub fn put_ns(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, value)?;
 
         // Step 1: Write to shared WAL.
         // Allocate the sequence number *inside* the WAL lock so the global
@@ -658,6 +656,7 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, value)?;
         crate::db::metrics::Metrics::bump(&self.metrics.no_wal_puts);
         let kv_store = self.get_store(namespace_id)?;
         kv_store.put_to_storage(key, value)
@@ -671,6 +670,7 @@ impl Database {
 
     pub fn delete_ns(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
+        Self::check_write_size(key, &[])?; // delete carries only a key
 
         // Step 1: Write DELETE to shared WAL.
         // Allocate the sequence inside the WAL lock so sequence order == WAL
@@ -789,7 +789,7 @@ impl Database {
     /// 1. **Persist the registry deletion first.** From this point the namespace
     ///    is logically gone, and all of its on-disk files *and* WAL entries are
     ///    unreferenced. Recovery skips WAL entries whose namespace is absent from
-    ///    the registry (see [`recover_from_wal`](Self::recover_from_wal)), so the
+    ///    the registry (see `recover_from_wal`), so the
     ///    later steps can fail or only partially complete without ever
     ///    resurrecting the deleted namespace's data.
     /// 2. **Flush, shut down, and drop the KVStore** so every file handle is
@@ -860,7 +860,7 @@ impl Database {
     /// The field name must be unique within the namespace.
     ///
     /// The `value_type` is stored in the schema and validated when
-    /// [`activate_field_index`] is called, so type mismatches are caught at
+    /// `activate_field_index` is called, so type mismatches are caught at
     /// activation time rather than at query time.
     pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
         let field_id = self.registry.write().register_schema_field(namespace_id, field_name, value_type)?;
@@ -899,7 +899,7 @@ impl Database {
     /// Return the number of distinct indexed values for a field.
     ///
     /// Returns `None` when the field is not active (not yet registered via
-    /// [`activate_field_index`]).
+    /// `activate_field_index`).
     pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
@@ -922,6 +922,19 @@ impl Database {
         })
     }
 
+    /// On-disk blob growth/waste metrics for an active field index — the bitmap
+    /// and keymap store sizes (logical vs. live bytes) and waste ratios. Use this
+    /// to monitor the append-only write amplification that low-cardinality fields
+    /// suffer (a value rewritten per document leaves a stale blob copy each time),
+    /// e.g. to alert before disk fills between compactions.
+    ///
+    /// Returns `None` when the field is not active.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        let store = self.get_store(namespace_id).ok()?;
+        let ns_index = store.namespace_index.read();
+        ns_index.get(field_id).map(|e| e.index.read().blob_stats())
+    }
+
     /// The configured field-index compaction threshold as a fraction
     /// (`0.0..1.0`) — a store is compacted at the next checkpoint once its waste
     /// ratio reaches this. Mirrors the clamp applied in `run_index_checkpoint`.
@@ -939,7 +952,7 @@ impl Database {
     ///
     /// # Arguments
     /// * `namespace_id` – the namespace the field belongs to
-    /// * `field_id`     – the [`FieldId`] returned by [`register_index_field`]
+    /// * `field_id`     – the [`FieldId`] returned by `register_index_field`
     /// * `value_type`   – runtime type for the index entries
     /// * `extractor`    – closure that extracts a typed value from raw document bytes
     pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
@@ -1091,7 +1104,7 @@ impl Database {
     ///    derived row ID (`key_to_row_id`) appears in the bitmap.
     ///
     /// # Limitations
-    /// Only fields activated via [`activate_field_index`] are queryable.
+    /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Serialization`]
     /// wrapping a [`index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
@@ -1158,7 +1171,7 @@ impl Database {
     /// `limit` keys starting from `offset` in iteration order.
     ///
     /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// - With a registered [`RowToKeyFn`]: O(offset + limit) key resolutions.
+    /// - With a registered `RowToKeyFn`: O(offset + limit) key resolutions.
     /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
     ///
     /// [`query_keys`]: Self::query_keys
@@ -1258,12 +1271,41 @@ impl Database {
         Ok(())
     }
 
+    /// Reject a write whose key/value cannot be represented by the on-disk
+    /// formats, with a clean [`KVError::WriteTooLarge`] instead of silently
+    /// truncating a length deep in the store.
+    ///
+    /// Several persisted lengths are `u32`: the value record's `value_len`, the
+    /// row-ID map's `key_len`, and the whole write is framed as one `u32`-sized
+    /// WAL entry (key + value + op-name + rkyv overhead). A single combined check
+    /// — `key + value + headroom ≤ u32::MAX` — covers all three (key alone and
+    /// value alone are subsets of the entry). The headroom bounds the per-entry
+    /// framing. Enforced at the write boundary so nothing reaches the WAL,
+    /// value-log, LSM, row-ID map, or field indexes before validation.
+    fn check_write_size(key: &[u8], value: &[u8]) -> Result<()> {
+        // Generous headroom for WAL-entry framing (short op-name + rkyv) and the
+        // value-record header — far larger than any of those.
+        const HEADROOM: u64 = 64 * 1024;
+        const LIMIT: u64 = u32::MAX as u64 - HEADROOM;
+        Self::check_total_len(key.len(), value.len(), LIMIT)
+    }
+
+    /// Inner of [`check_write_size`] with the limit as a parameter so both
+    /// branches are testable without allocating a multi-GiB key/value.
+    fn check_total_len(key_len: usize, value_len: usize, limit: u64) -> Result<()> {
+        let total = key_len as u64 + value_len as u64;
+        if total > limit {
+            return Err(KVError::WriteTooLarge(format!(
+                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit (lengths are stored as u32)"
+            )));
+        }
+        Ok(())
+    }
+
     fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
-        let tmp = self.wal_metadata_path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.wal_metadata_path)?;
+        crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
         Ok(())
     }
 
@@ -1977,11 +2019,31 @@ impl IndexCheckpointTarget for Database {
                     // bitmap store OR the keymap store has crossed the compaction
                     // threshold (the keymap accumulates dead space under
                     // distinct-value churn).
-                    let over_threshold = {
+                    let (over_threshold, stats) = {
                         let idx = entry.index.read();
                         idx.flush(&field_path).map_err(KVError::Io)?;
-                        idx.bitmap_waste_ratio() >= waste_threshold || idx.keymap_waste_ratio() >= waste_threshold
+                        let stats = idx.blob_stats();
+                        let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
+                        (over, stats)
                     };
+                    // Guardrail: low-cardinality fields suffer append-only write
+                    // amplification — a value rewritten per document leaves a stale
+                    // bitmap copy each time (see index/CLAUDE.md). The compaction
+                    // below reclaims it, but warn when a field's bitmap blob has
+                    // grown large with a small live footprint so operators can spot
+                    // runaway growth between checkpoints.
+                    const LARGE_BITMAP_LOGICAL_BYTES: u64 = 64 * 1024 * 1024;
+                    if stats.bitmap_logical_bytes >= LARGE_BITMAP_LOGICAL_BYTES && stats.bitmap_waste_ratio >= 0.5 {
+                        warn!(
+                            "[IndexCheckpoint] ns={ns_id} field={field_id}: bitmap blob logical={} MiB live={} MiB \
+                             waste={:.0}% across {} distinct value(s) — append-only write amplification (likely a \
+                             low-cardinality, high-churn field); compaction will reclaim it now, but review the field's update rate",
+                            stats.bitmap_logical_bytes / (1024 * 1024),
+                            stats.bitmap_live_bytes / (1024 * 1024),
+                            stats.bitmap_waste_ratio * 100.0,
+                            stats.distinct_values,
+                        );
+                    }
                     if over_threshold {
                         let mut idx = entry.index.write();
                         if idx.maybe_compact(waste_threshold).map_err(KVError::Io)? {
@@ -2819,6 +2881,122 @@ mod tests {
     }
 
     #[test]
+    fn check_total_len_rejects_over_limit() {
+        // Within / at the limit → Ok; over → WriteTooLarge. Tiny limit so the
+        // over-limit branch needs no multi-GiB allocation.
+        assert!(Database::check_total_len(5, 5, 12).is_ok());
+        assert!(Database::check_total_len(7, 5, 12).is_ok()); // exactly at limit
+        match Database::check_total_len(8, 5, 12) {
+            Err(KVError::WriteTooLarge(m)) => assert!(m.contains("exceeds the 12-byte"), "got: {m}"),
+            other => panic!("expected WriteTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_and_delete_accept_normal_sized_keys_and_values() {
+        // Regression: the size guard must not reject ordinary writes.
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        db.put(b"k", &vec![0u8; 4096]).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(vec![0u8; 4096]));
+        db.delete(b"k").unwrap();
+        assert_eq!(db.get(b"k").unwrap(), None);
+        db.shutdown().unwrap();
+    }
+
+    /// Item 13 regression: replaying an **update** (same key, changed field
+    /// value) must reconcile via the targeted O(1) path — during replay
+    /// `lsm.get` returns the replay-so-far value, so the second put moves the
+    /// row off the old value. A bug here would leave the key matching BOTH the
+    /// old and new value after recovery.
+    #[test]
+    fn test_field_index_replays_updates_after_crash() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let make_extractor = || -> ExtractorFn {
+            Arc::new(|bytes: &[u8]| {
+                let s = std::str::from_utf8(bytes).ok()?;
+                let v: serde_json::Value = serde_json::from_str(s).ok()?;
+                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+            })
+        };
+
+        let field_id;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
+
+            // Insert, then UPDATE the same key to a different value — all in the
+            // WAL, no checkpoint, so recovery must replay both writes in order.
+            db.put(b"u:1", br#"{"status":"active"}"#).unwrap();
+            db.put(b"u:1", br#"{"status":"archived"}"#).unwrap(); // update
+            db.put(b"u:2", br#"{"status":"active"}"#).unwrap();
+            // Drop without shutdown — index lives only in the WAL.
+        }
+
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
+
+            // u:1 must match ONLY its latest value after replay, not the old one.
+            assert_eq!(
+                db.query_keys(ns, "status = \"archived\"").unwrap(),
+                vec![b"u:1".to_vec()],
+                "replayed update must land u:1 under its new value"
+            );
+            assert_eq!(
+                db.query_keys(ns, "status = \"active\"").unwrap(),
+                vec![b"u:2".to_vec()],
+                "replayed update must remove u:1 from its old value (no stale bucket)"
+            );
+            db.shutdown().unwrap();
+        }
+    }
+
+    /// Item 13: a put that adds/removes the indexed field (absent↔present) must
+    /// update the index correctly via the targeted path — the row joins the new
+    /// value's bucket and leaves whatever it was in (including "nothing").
+    #[test]
+    fn test_field_index_update_field_appears_and_disappears() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        // Field absent → not indexed.
+        db.put(b"d:1", br#"{"other":1}"#).unwrap();
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
+
+        // Field appears (None → Some): row joins the "active" bucket.
+        db.put(b"d:1", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"d:1".to_vec()]);
+
+        // Field disappears (Some → None): row must leave the bucket.
+        db.put(b"d:1", br#"{"other":2}"#).unwrap();
+        assert!(
+            db.query_keys(ns, "status = \"active\"").unwrap().is_empty(),
+            "row must leave its bucket when the indexed field is removed"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
     fn test_ops_metrics_counters_move() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -3147,6 +3325,78 @@ mod tests {
         db.shutdown().unwrap();
     }
 
+    /// Coordinator-level companion to
+    /// [`test_recovery_reconstructs_wal_tail_past_stale_metadata`]: rather than
+    /// hand-crafting the WAL, it drives the **real** `Database::put` write path so
+    /// it catches counter/short-circuit regressions in `Database::open` +
+    /// `recover_from_wal` + `Wal::recover_tail` — e.g. a stale `total_entries`
+    /// that wrongly trips the `persisted >= total` short-circuit, or a tail fold
+    /// that miscounts `total`/`segment_total` and so under- or over-replays.
+    ///
+    /// Scenario (the "crash just after a metadata flush" window):
+    ///   1. open Db, `put` key A,
+    ///   2. flush WAL metadata so the durable snapshot covers only A,
+    ///   3. `put` key B — fsynced into the WAL, but its in-memory metadata bump
+    ///      never reaches disk (no further flush, `records_per_sync = 1000` so the
+    ///      write path never auto-syncs/persists for two puts),
+    ///   4. abandon the Db **without** shutdown via `mem::forget`, faithfully
+    ///      simulating a crash: the in-memory metadata that knows about B and the
+    ///      unflushed memtable holding A and B are both lost, leaving both keys
+    ///      only in the WAL. (A plain `drop` would run `Database::drop`, which does
+    ///      a *clean* flush — memtable→SSTable plus metadata — making B durable and
+    ///      defeating the test.)
+    ///   5. restore the stale (A-only) metadata on disk,
+    ///   6. reopen and assert BOTH A and B are recovered.
+    #[test]
+    fn test_recovery_from_stale_metadata_via_real_write_path() {
+        let dir = TempDir::new().unwrap();
+        let wal_meta_path = dir.path().join("wal_metadata");
+
+        let stale_metadata: Vec<u8>;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            db.put(b"A", b"va").unwrap();
+
+            // The on-disk metadata as it stood at the last flush before the crash:
+            // its tail/total cover only A.
+            db.flush_wal_metadata_internal().unwrap();
+            stale_metadata = std::fs::read(&wal_meta_path).unwrap();
+
+            // B is durable in the WAL (every put fsyncs it) but its metadata bump
+            // lives only in memory — exactly the post-flush window.
+            db.put(b"B", b"vb").unwrap();
+
+            // Abandon without shutdown to simulate a crash: `mem::forget` skips
+            // `Database::drop`, which would otherwise cleanly flush the memtable
+            // and metadata (persisting B and defeating the test). The leaked
+            // handles are released at process exit; everything durable (the WAL)
+            // is already fsynced.
+            std::mem::forget(db);
+        }
+
+        // Force the on-disk metadata back to the A-only snapshot, simulating the
+        // crash landing after A's flush but before B's would have been recorded.
+        // (Belt-and-suspenders: nothing should have rewritten it, but this makes
+        // the staleness explicit regardless of write-path sync timing.)
+        std::fs::write(&wal_meta_path, &stale_metadata).unwrap();
+
+        // Reopen: recover_tail must notice the durable WAL extends past the stale
+        // tail, fold B into total/segment counters, and recover_from_wal must
+        // replay both A (lost from the memtable) and B (past the stale tail).
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(
+            db.get(b"A").unwrap(),
+            Some(b"va".to_vec()),
+            "A lived only in the WAL and must be replayed"
+        );
+        assert_eq!(
+            db.get(b"B").unwrap(),
+            Some(b"vb".to_vec()),
+            "B was appended after the last metadata flush; recover_tail must fold it in and replay it"
+        );
+        db.shutdown().unwrap();
+    }
+
     /// Item 3: `apply_with_retry` rides out transient apply failures and stops
     /// as soon as one attempt succeeds.
     #[test]
@@ -3217,6 +3467,51 @@ mod tests {
             err.to_string().contains("unknown field"),
             "expected UnknownField error after deactivation, got: {err}"
         );
+
+        db.shutdown().unwrap();
+    }
+
+    /// Regression for the O(1) targeted field-index update/delete (item 13): a
+    /// document update must move its row from the old value's bucket to the new
+    /// one (the prior value must stop matching), and a delete must remove it —
+    /// driven by the prior document bytes read in the put/delete path, not a
+    /// full bucket scan.
+    #[test]
+    fn test_field_index_targeted_update_and_delete() {
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().len(), 2);
+
+        // Update doc:1's status active -> archived. The targeted update must move
+        // the row, so it no longer matches "active" and now matches "archived".
+        db.put(b"doc:1", br#"{"status":"archived"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        // Updating to the same value is a no-op and keeps the row queryable.
+        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
+
+        // Delete doc:2 → it must leave the "active" bucket.
+        db.delete(b"doc:2").unwrap();
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
 
         db.shutdown().unwrap();
     }

@@ -98,7 +98,15 @@ pub trait VectorKvStore {
 ///
 /// Returns `None` when the bytes cannot be deserialized or the list is empty.
 pub fn score_rkyv_bytes<E: DistanceEstimator>(bytes: &[u8], query_embedding: &[f32], estimator: &E) -> Option<(f32, f32)> {
-    let list = VectorIndex::list_from_bytes(bytes).ok()?;
+    let list = match VectorIndex::list_from_bytes(bytes) {
+        Ok(list) => list,
+        Err(e) => {
+            // Corruption, not "no match": surface it instead of silently dropping
+            // the entry, so a degraded index is distinguishable from an empty one.
+            log::warn!("vector index entry failed to deserialize ({} bytes): {e}; skipping", bytes.len());
+            return None;
+        }
+    };
     list.iter()
         .map(|vi| (vi.estimated_distance(query_embedding, estimator), vi.error_bound))
         .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))

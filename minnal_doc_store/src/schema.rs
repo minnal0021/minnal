@@ -225,7 +225,7 @@ pub enum IndexType {
 /// The technology backing an index: a RoaringBitmap field index or a vector ANN index.
 ///
 /// Serialises as `"attribute"` / `"vector"` in JSON so REST API responses are
-/// self-describing without requiring callers to parse [`IndexId`] internals.
+/// self-describing without requiring callers to parse `IndexId` internals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexKind {
@@ -274,11 +274,11 @@ pub struct IndexSpec {
     pub index_type: IndexType,
 }
 
-/// A single schema change applied by [`DocStore::amend`].
+/// A single schema change applied by `DocStore::amend`.
 ///
 /// Only **non-indexed** attributes may be amended.  Attempting to remove or
 /// update an attribute that is currently indexed returns
-/// [`DocStoreError::AttributeIsIndexed`].
+/// `DocStoreError::AttributeIsIndexed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaAmendment {
     /// Add a new non-indexed attribute.  Fails if the name already exists in
@@ -308,7 +308,7 @@ pub enum SchemaAmendment {
 ///
 /// One `DocStoreSchema` maps to exactly one namespace in the underlying
 /// `minnal_db`.  The `ns_id` is `None` until the store is created via
-/// [`DocStore::create`], after which it is persisted in the schema JSON so
+/// `DocStore::create`, after which it is persisted in the schema JSON so
 /// that drop operations can locate and clean up index directories.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocStoreSchema {
@@ -328,7 +328,7 @@ pub struct DocStoreSchema {
     ///
     /// When `true`, `embedding_fields` must be non-empty.  Both conditions
     /// together are required before a vector index KV store is set up by
-    /// [`DocStore::create`].
+    /// `DocStore::create`.
     #[serde(default)]
     pub semantic_search_enabled: bool,
     /// The top-level JSON fields whose string values are concatenated and

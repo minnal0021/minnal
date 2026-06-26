@@ -1,8 +1,8 @@
 //! Index Manager
 //!
 //! Manages the on-disk index directory structure and checkpoint file I/O.
-//! Field metadata (names, types, etc.) lives in [`NamespaceSchema`] inside
-//! the [`NamespaceRegistry`]; this module is only concerned with paths and
+//! Field metadata (names, types, etc.) lives in `NamespaceSchema` inside
+//! the `NamespaceRegistry`; this module is only concerned with paths and
 //! the checkpoint marker files used for crash recovery.
 //!
 //! Directory layout:
@@ -28,7 +28,7 @@ use crate::db::namespace::FieldId;
 /// Manages the on-disk index directory structure and checkpoint files.
 ///
 /// This struct holds no field registry state — that lives in
-/// [`NamespaceSchema`] inside [`NamespaceRegistry`].
+/// `NamespaceSchema` inside `NamespaceRegistry`.
 pub struct IndexManager {
     /// Root index directory: `{db_path}/index/`
     pub index_base_path: PathBuf,
@@ -100,7 +100,7 @@ impl IndexManager {
     /// state.
     ///
     /// The list of fields to checkpoint is supplied by the caller (typically
-    /// obtained from [`NamespaceRegistry::all_indexed_fields`]).
+    /// obtained from `NamespaceRegistry::all_indexed_fields`).
     pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(u32, FieldId)]) -> Result<()> {
         use std::io::Write;
         for &(namespace_id, field_id) in fields {

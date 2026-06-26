@@ -59,7 +59,7 @@ impl IndexBuildManager {
         Self::default()
     }
 
-    /// Insert a field-index build handle from [`DocStore::add_index`].
+    /// Insert a field-index build handle from `DocStore::add_index`.
     ///
     /// Clones the `Arc<InMemoryProgress>` out of the handle before spawning a
     /// wrapper task so that the progress closure can read live counters without

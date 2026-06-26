@@ -13,7 +13,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use semantic_search::{
-    cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file},
+    cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids, read_clusters_from_file},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
     index::vector_index::{QuantisationStyle, VectorIndex},
     index_embedding_to_cluster,
@@ -190,7 +190,41 @@ fn bench_second_pass(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Top-n cluster selection: select_nth vs full sort ──────────────────────────
+
+/// The old O(C log C) implementation: sort every cluster, then truncate to n.
+/// Kept here as the baseline to compare against the current select_nth-based
+/// `find_top_n_cluster_ids`.
+fn full_sort_top_n(cluster_map: &HashMap<u32, Cluster>, embedding: &[f32], n: usize) -> Vec<u32> {
+    let mut distances: Vec<(u32, f32)> = cluster_map.values().map(|c| (c.cluster_id, c.euclidean_distance(embedding))).collect();
+    distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+    distances.truncate(n);
+    distances.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Compares the current selection-based `find_top_n_cluster_ids` against the old
+/// full-sort baseline over the real cluster file, at a few `n_probes` values. This
+/// is the Pass-1 cluster-probing cost, paid once per query chunk.
+fn bench_top_n_cluster_selection(c: &mut Criterion) {
+    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+    let query = load_or_generate_embeddings().query;
+    let count = cluster_map.len();
+
+    let mut group = c.benchmark_group("top_n_cluster_selection");
+    for &n in &[8usize, 32, 128] {
+        group.bench_with_input(BenchmarkId::new("select_nth", n), &n, |b, &n| {
+            b.iter(|| black_box(find_top_n_cluster_ids(black_box(&cluster_map), black_box(&query), n)));
+        });
+        group.bench_with_input(BenchmarkId::new("full_sort", n), &n, |b, &n| {
+            b.iter(|| black_box(full_sort_top_n(black_box(&cluster_map), black_box(&query), n)));
+        });
+    }
+    group.finish();
+    eprintln!("top_n_cluster_selection: benchmarked over {count} clusters");
+}
+
 // ── Criterion wiring ──────────────────────────────────────────────────────────
 
-criterion_group!(distance_estimation, bench_first_pass, bench_second_pass);
+criterion_group!(distance_estimation, bench_first_pass, bench_second_pass, bench_top_n_cluster_selection);
 criterion_main!(distance_estimation);

@@ -348,7 +348,7 @@ impl KVStore {
     /// After this call every key passed through the index write path is
     /// assigned the row ID returned by `row_id_fn` instead of the default
     /// Murmur3 hash.  Providing `row_to_key_fn` (the inverse) also enables
-    /// O(|hits|) query resolution in [`Database::query_keys`] — the inverse
+    /// O(|hits|) query resolution in `Database::query_keys` — the inverse
     /// reconstructs each matching key directly from its row ID, requiring
     /// zero extra memory and no maintenance on writes.
     ///
@@ -534,11 +534,21 @@ impl KVStore {
     fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
         let mut next_version = 1u32;
+        // Capture the prior value's bytes so field-index updates can be O(1)
+        // (targeted at the old value's bucket) instead of scanning every bucket.
+        // Only worth a value-log read when the namespace actually has indexes.
+        let want_old_for_index = !self.namespace_index.read().is_empty();
+        let mut old_value: Option<Vec<u8>> = None;
+        let mut key_existed = false;
         if let Some(existing) = self.lsm.get(key)?
             && let Some(existing_ptr) = decode_sharded_pointer(existing)
         {
+            key_existed = true;
             if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
                 next_version = meta.version.saturating_add(1);
+            }
+            if want_old_for_index {
+                old_value = self.value_log.read_value(existing_ptr).ok();
             }
             let _ = self.value_log.update_record_meta(existing_ptr, None, Some(true), Some(epoch));
         }
@@ -561,12 +571,21 @@ impl KVStore {
         drop(_bucket_guard);
 
         // Update in-memory field indices
-        self.update_indices_on_put(key, value);
+        self.update_indices_on_put(key, value, old_value.as_deref(), key_existed);
 
         Ok(())
     }
 
-    fn update_indices_on_put(&self, key: &[u8], value: &[u8]) {
+    /// Update field indices for a put.
+    ///
+    /// `old_value` is the document's *prior* stored bytes when this put replaced
+    /// an existing key (`None` for a fresh insert, or when the prior bytes could
+    /// not be read). Supplying it lets each field do an `O(1)` targeted update
+    /// (move the row from its old value's bucket to the new one) instead of the
+    /// `O(distinct values)` scan `remove_all_for_row` performs — a big win for
+    /// high-cardinality fields. When the prior bytes are unavailable on a replace
+    /// we fall back to the scan so the row never lingers in a stale bucket.
+    fn update_indices_on_put(&self, key: &[u8], value: &[u8], old_value: Option<&[u8]>, key_existed: bool) {
         let row_id = self.resolve_row_id_alloc(key);
         let ns_index = self.namespace_index.read();
         if ns_index.is_empty() {
@@ -575,10 +594,28 @@ impl KVStore {
         for entry in ns_index.iter() {
             let new_val = (entry.extractor)(value);
             let mut idx = entry.index.write();
-            idx.remove_all_for_row(row_id);
-            if let Some(v) = new_val
-                && let Err(e) = idx.insert(&v, row_id)
-            {
+            let result = match (key_existed, old_value) {
+                // Replace with the prior bytes in hand → O(1) targeted update.
+                (true, Some(ov)) => {
+                    let old_val = (entry.extractor)(ov);
+                    idx.update(old_val.as_ref(), new_val.as_ref(), row_id)
+                }
+                // Fresh insert: the row is in no bucket yet, so skip the scan.
+                (false, _) => match &new_val {
+                    Some(v) => idx.insert(v, row_id),
+                    None => Ok(()),
+                },
+                // Replace but prior bytes unreadable: scan to clear the old bucket,
+                // then insert the new value, preserving one-value-per-row.
+                (true, None) => match &new_val {
+                    Some(v) => idx.set(v, row_id),
+                    None => {
+                        idx.remove_all_for_row(row_id);
+                        Ok(())
+                    }
+                },
+            };
+            if let Err(e) = result {
                 warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
             }
         }
@@ -595,7 +632,7 @@ impl KVStore {
     ///
     /// Reads are lock-free on the common path. Concurrent GC mutates two
     /// structures the read depends on — the value-log file (swapped under the
-    /// bucket lock, bumping the bucket [`generation`](crate::store::value_log::ValueLog::generation))
+    /// bucket lock, bumping the bucket `generation`)
     /// and the LSM's SSTable files (swapped during L0→L1 compaction). Either can
     /// momentarily make a freshly-read pointer inconsistent with the file it is
     /// read from, surfacing as a transient error or a stale value.
@@ -604,7 +641,7 @@ impl KVStore {
     /// before and after the pointer+value read and only trust a clean success
     /// when the generation is unchanged. Any error, or a generation change, is
     /// treated as a transient race and retried. After
-    /// [`MAX_GENERATION_READ_ATTEMPTS`] we fall back to a read that holds the
+    /// `MAX_GENERATION_READ_ATTEMPTS` we fall back to a read that holds the
     /// bucket lock (excluding value-log GC) — the authoritative path that
     /// guarantees forward progress and surfaces genuine corruption.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -702,9 +739,17 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
+        // Read the prior value (under the bucket lock, so GC can't relocate it)
+        // so index removal can target the old value's bucket instead of scanning
+        // every bucket. Only when the namespace has indexes to update.
+        let want_old_for_index = !self.namespace_index.read().is_empty();
+        let mut old_value: Option<Vec<u8>> = None;
         if let Some(existing) = self.lsm.get(key)?
             && let Some(existing_ptr) = decode_sharded_pointer(existing)
         {
+            if want_old_for_index {
+                old_value = self.value_log.read_value(existing_ptr).ok();
+            }
             let _ = self
                 .value_log
                 .update_record_meta(existing_ptr, Some(true), None, Some(current_epoch_millis()));
@@ -713,12 +758,18 @@ impl KVStore {
         drop(_bucket_guard);
 
         // Remove row from all field indices
-        self.update_indices_on_delete(key);
+        self.update_indices_on_delete(key, old_value.as_deref());
 
         Ok(())
     }
 
-    fn update_indices_on_delete(&self, key: &[u8]) {
+    /// Remove a deleted key's row from the field indices.
+    ///
+    /// With the deleted document's prior bytes (`old_value`) in hand, each field
+    /// removes the row from just its old value's bucket — `O(1)` instead of the
+    /// `O(distinct values)` scan. Falls back to the scan only when those bytes
+    /// could not be read, so a row never lingers in a stale bucket.
+    fn update_indices_on_delete(&self, key: &[u8], old_value: Option<&[u8]>) {
         let ns_index = self.namespace_index.read();
         if ns_index.is_empty() {
             return;
@@ -728,7 +779,18 @@ impl KVStore {
             return;
         };
         for entry in ns_index.iter() {
-            entry.index.write().remove_all_for_row(row_id);
+            let mut idx = entry.index.write();
+            match old_value {
+                // Targeted: the row is under the old value's bucket (if any).
+                Some(ov) => {
+                    if let Some(old_val) = (entry.extractor)(ov) {
+                        idx.remove(&old_val, row_id);
+                    }
+                    // Field absent in the old doc → row was never indexed for it.
+                }
+                // Prior bytes unavailable → scan to be safe.
+                None => idx.remove_all_for_row(row_id),
+            }
         }
     }
 
@@ -911,7 +973,7 @@ impl KVStore {
     /// Missing keys and I/O errors both produce `None`.
     pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
         // Bracket the resolve-then-read against GC file swaps (see
-        // [`read_generation_stable`](Self::read_generation_stable)); the inner read
+        // `read_generation_stable`); the inner read
         // is infallible, so the wrapper only ever errors from the lock fallback,
         // which we treat as "all missing" to preserve the infallible signature.
         let (mut results, retry) = self
@@ -1027,7 +1089,7 @@ impl KVStore {
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
     /// LSM scan + value reads (here in `scan_prefixes_batch_inner`) must stay inside
-    /// [`read_generation_stable`](Self::read_generation_stable).
+    /// `read_generation_stable`.
     pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<PrefixBatchResult> {
         let (mut result, retry) = self.read_generation_stable(|| self.scan_prefixes_batch_inner(prefix_ids))?;
         // Re-resolve keys dropped to a transient GC race via the single-key path
@@ -1186,7 +1248,7 @@ impl KVStore {
     /// `lsm.get()` re-lookup — then values are read in parallel per bucket.
     ///
     /// INVARIANT: the LSM scan, the file-handle capture, and the value reads MUST all
-    /// stay inside the [`read_generation_stable`](Self::read_generation_stable)
+    /// stay inside the `read_generation_stable`
     /// closure. Resolving a pointer outside the bracket reopens the wrong-file window
     /// closed in 420ac8e — the LSM scan's own snapshot does not protect against
     /// value-log GC.
@@ -1209,7 +1271,7 @@ impl KVStore {
     /// `lsm.get()` that the old `range_keys` + `collect_kv_pairs` path performed.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside [`read_generation_stable`](Self::read_generation_stable).
+    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_range_batch(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<KeyValue>> {
         let (mut pairs, retry) = self.read_generation_stable(|| {
             let key_pointers = self.lsm.range_pointers_bounded(start, end, usize::MAX)?;
@@ -1233,7 +1295,7 @@ impl KVStore {
     /// page's keys (not the whole tail of the keyspace) are resolved.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside [`read_generation_stable`](Self::read_generation_stable).
+    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
         let start = cursor.unwrap_or(&[]);
         let ((mut pairs, retry), next_cursor) = self.read_generation_stable(|| {
@@ -1938,9 +2000,7 @@ impl KVStore {
     pub fn flush_metadata(&self) -> Result<()> {
         let metadata = self.metadata.read();
         let bytes = metadata.to_file_bytes()?;
-        let tmp = self.metadata_path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.metadata_path)?;
+        crate::support::write_atomic_durable(&self.metadata_path, &bytes)?;
         Ok(())
     }
 

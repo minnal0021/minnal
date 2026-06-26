@@ -16,7 +16,7 @@ use semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-/// Shared application state passed to every handler via axum's [`State`] extractor.
+/// Shared application state passed to every handler via axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
     /// The underlying document store.
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_index_opt = {
         let path = semantic_cfg.cluster_path.to_string_lossy();
         info!(path = %path, "loading cluster index");
-        match ClusterIndex::load(&path, semantic_cfg.n_probes) {
+        match ClusterIndex::load_with_dim(&path, semantic_cfg.embedding_dim) {
             Ok(idx) => {
                 info!(
                     clusters = idx.clusters.len(),
@@ -152,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sliding_size: semantic_cfg.sliding_size,
             first_pass_sparse_search_top_k: semantic_cfg.first_pass_sparse_search_top_k,
             query_embedding_cache_ttl: semantic_cfg.query_embedding_cache_ttl,
+            embedding_request_timeout: semantic_cfg.embedding_request_timeout,
+            embedding_connect_timeout: semantic_cfg.embedding_connect_timeout,
         };
 
         // Probe the embedding service so operators get an early warning if it

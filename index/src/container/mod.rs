@@ -133,7 +133,7 @@ impl Container {
         }
     }
 
-    /// Collect values into a Vec<u16>.
+    /// Collect values into a `Vec<u16>`.
     pub fn to_values(&self) -> Vec<u16> {
         match self {
             Container::Array(a) => a.values().to_vec(),

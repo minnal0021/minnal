@@ -413,9 +413,13 @@ async fn demo_restart(db_path: &str, schema_dir: &str) -> Result<()> {
 /// (relative to the workspace root) and configures the embedding service at
 /// `http://localhost:8000/embeddings`.
 async fn open_store_with_semantic_search(db_path: &str, schema_dir: &str) -> Result<DocStore> {
-    // Load the IVF cluster index bundled with the repo.
-    let cluster_index = ClusterIndex::load("service/embedding_support/qwen/clusters.json", 5)
-        .map_err(|e| DocStoreError::EmbeddingFailed(format!("cluster load failed: {e}")))?;
+    // Load the IVF cluster index bundled with the repo, pinning the centroid
+    // dimension to the embedding dim the demo config uses.
+    let cluster_index = ClusterIndex::load_with_dim(
+        "service/embedding_support/qwen/clusters.json",
+        SemanticSearchConfig::default().embedding_dim,
+    )
+    .map_err(|e| DocStoreError::EmbeddingFailed(format!("cluster load failed: {e}")))?;
 
     let store = DocStore::open(db_path, schema_dir).await?;
 

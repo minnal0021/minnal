@@ -159,6 +159,26 @@ impl RowMap {
         let keybytes = GrowableMmap::open_file(&dir.join(KEYBYTES_FILE))?;
         let idarray = GrowableMmap::open_file(&dir.join(IDARRAY_FILE))?;
 
+        // Validate the marker against the backing files before trusting it: the
+        // id array must hold `next_id` entries, and `keybytes_pos` must lie within
+        // the key-bytes file. Otherwise the rebuild below would slice out of
+        // bounds (panic) on a corrupt/mismatched sidecar.
+        let need_idarray = next_id
+            .checked_mul(ID_ENTRY_SIZE as u64)
+            .ok_or_else(|| invalid("next_id overflows id-array size"))?;
+        if need_idarray > idarray.as_slice().len() as u64 {
+            return Err(invalid(format!(
+                "id array {} bytes too small for next_id {next_id} (need {need_idarray})",
+                idarray.as_slice().len()
+            )));
+        }
+        if keybytes_pos > keybytes.as_slice().len() {
+            return Err(invalid(format!(
+                "keybytes_pos {keybytes_pos} beyond key-bytes file ({} bytes)",
+                keybytes.as_slice().len()
+            )));
+        }
+
         // Size the slot table for next_id entries at < 0.7 load, power-of-two.
         let mut cap = INITIAL_SLOT_CAP;
         while (next_id as usize) * 10 >= cap * 7 {
@@ -179,6 +199,15 @@ impl RowMap {
         // Rebuild the hash table from the durable id array.
         for id in 0..next_id {
             let (off, len) = me.id_entry(id);
+            // Each entry's key bytes must lie within the committed key region.
+            let end = off
+                .checked_add(len as u64)
+                .ok_or_else(|| invalid("id-array entry offset+len overflows"))?;
+            if end > keybytes_pos as u64 {
+                return Err(invalid(format!(
+                    "id {id} key bytes [{off}, {end}) extend past keybytes_pos {keybytes_pos}"
+                )));
+            }
             let key = me.keybytes.as_slice()[off as usize..off as usize + len as usize].to_vec();
             let hash = hash_bytes(&key);
             let idx = me.find_empty(&key, hash);
@@ -236,6 +265,11 @@ impl RowMap {
     }
 
     /// Resolve a dense ID back to its key bytes.
+    ///
+    /// IDs are `u64` internally (dense, monotonic from 0 — `next_id` cannot
+    /// realistically reach `u64::MAX`) but surfaced as `u128` for API uniformity
+    /// with the rest of the index. A `u128` beyond `u64::MAX` therefore was never
+    /// allocated here: `try_from` yields `None` rather than truncating the id.
     pub fn key_for(&self, id: u128) -> Option<Vec<u8>> {
         let id = u64::try_from(id).ok()?;
         if id >= self.next_id {
@@ -260,7 +294,7 @@ impl RowMap {
     fn insert_at(&mut self, slot_idx: usize, key: &[u8], hash: u64) -> u128 {
         let id = self.next_id;
         let key_off = self.keybytes_pos as u64;
-        let key_len = key.len() as u32;
+        let key_len = crate::blob_store::u32_len(key.len(), "row key");
 
         // Append the key bytes.
         self.keybytes
@@ -367,16 +401,36 @@ enum Probe {
 
 // ── Marker I/O ──────────────────────────────────────────────────────────────────
 
-/// Read `(next_id, keybytes_pos)` from the marker, or `None` if it is missing or
-/// unreadable (treated as a fresh map).
+fn invalid(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("row map: {msg}"))
+}
+
+/// Read `(next_id, keybytes_pos)` from the marker.
+///
+/// Returns `None` only when the marker file is **absent** (a never-checkpointed
+/// map → start fresh). A marker that is present but corrupt — truncated, wrong
+/// magic, or an unsupported version — is rejected with
+/// [`io::ErrorKind::InvalidData`] rather than silently treated as fresh: a fresh
+/// start would reset `next_id` to 0 and reissue dense IDs that existing field-
+/// index bitmaps already use, corrupting the index. The marker is written via
+/// tmp+rename+fsync, so a present marker is always whole — a malformed one means
+/// real corruption.
 fn read_marker(path: &Path) -> io::Result<Option<(u64, usize)>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if bytes.len() < MARKER_SIZE || u64::from_le_bytes(bytes[0..8].try_into().unwrap()) != MARKER_MAGIC {
-        return Ok(None);
+    if bytes.len() < MARKER_SIZE {
+        return Err(invalid(format!("marker truncated ({} bytes, need {MARKER_SIZE})", bytes.len())));
+    }
+    let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    if magic != MARKER_MAGIC {
+        return Err(invalid(format!("bad marker magic {magic:#018x}")));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != MARKER_VERSION {
+        return Err(invalid(format!("unsupported marker version {version} (expected {MARKER_VERSION})")));
     }
     let next_id = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let keybytes_pos = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
@@ -498,5 +552,82 @@ mod tests {
         let mut rm = RowMap::open(dir.path()).unwrap();
         assert!(rm.is_empty());
         assert_eq!(rm.get_or_alloc(b"first"), 0);
+    }
+
+    // ── Marker / bounds validation on open ──────────────────────────────────
+    //
+    // A present-but-corrupt marker must be rejected with InvalidData rather than
+    // silently treated as fresh (which would reset next_id and reissue IDs that
+    // existing bitmaps already use) or panic with an out-of-bounds slice.
+
+    fn seed(dir: &Path) {
+        let mut rm = RowMap::create(dir).unwrap();
+        rm.get_or_alloc(b"alpha");
+        rm.get_or_alloc(b"beta");
+        rm.flush(0).unwrap();
+    }
+
+    fn corrupt_marker(dir: &Path, f: impl FnOnce(&mut [u8])) {
+        let p = dir.join(MARKER_FILE);
+        let mut b = std::fs::read(&p).unwrap();
+        f(&mut b);
+        std::fs::write(&p, &b).unwrap();
+    }
+
+    fn assert_invalid(dir: &Path) {
+        match RowMap::open(dir) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "expected InvalidData, got: {e}"),
+            Ok(_) => panic!("expected open() to reject corrupt marker"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_bad_marker_magic() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        corrupt_marker(dir.path(), |b| b[0] ^= 0xFF);
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_unsupported_marker_version() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        corrupt_marker(dir.path(), |b| b[8..12].copy_from_slice(&(MARKER_VERSION + 1).to_le_bytes()));
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_truncated_marker() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        std::fs::write(dir.path().join(MARKER_FILE), [0u8; MARKER_SIZE - 1]).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_next_id_larger_than_id_array() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        // next_id far beyond what the id-array file can hold.
+        corrupt_marker(dir.path(), |b| b[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes()));
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_keybytes_pos_past_file() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        corrupt_marker(dir.path(), |b| b[24..32].copy_from_slice(&(1u64 << 40).to_le_bytes()));
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_id_entry_past_keybytes_pos() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path());
+        // Shrink keybytes_pos so the first id's key bytes fall outside it.
+        corrupt_marker(dir.path(), |b| b[24..32].copy_from_slice(&1u64.to_le_bytes()));
+        assert_invalid(dir.path());
     }
 }

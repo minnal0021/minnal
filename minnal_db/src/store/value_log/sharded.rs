@@ -8,7 +8,6 @@ use super::{PAGE_SIZE_BYTES, PageGarbageStats, ValueLocation, ValueLog, ValueLog
 use crate::support;
 use parking_lot::{Mutex, RwLock};
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -452,25 +451,20 @@ impl ShardedValueLog {
 
     /// Flush metadata for all buckets.
     ///
-    /// Each bucket's metadata is written crash-atomically: the bytes go to a
-    /// temp file that is fsynced, then renamed over the live file. The rename
-    /// is atomic, so a crash mid-write can never leave a torn/partial metadata
-    /// file — the reader sees either the previous complete version or the new
-    /// one. (A corrupt file would otherwise force a full reset to
-    /// `ValueLogMetadata::new()` on open; see `open`.)
+    /// Each bucket's metadata is written crash-atomically via
+    /// [`write_atomic_durable`](crate::support::write_atomic_durable): the bytes
+    /// go to a fsynced temp file that is renamed over the live file, and the
+    /// parent directory is fsynced so the rename itself is durable. A crash
+    /// mid-write can never leave a torn/partial metadata file — the reader sees
+    /// either the previous complete version or the new one. (A corrupt file
+    /// would otherwise force a full reset to `ValueLogMetadata::new()` on open;
+    /// see `open`.)
     pub fn flush_all_metadata(&self) -> Result<()> {
         for bucket in 0u32..self.num_buckets as u32 {
             let metadata = self.metadata[bucket as usize].read();
             let bytes = metadata.to_file_bytes().map_err(ShardedValueLogError::ValueLogError)?;
             let metadata_path = self.base_path.join(format!("value_log_{}.metadata", bucket));
-            let tmp_path = metadata_path.with_extension("metadata.tmp");
-
-            let mut tmp = File::create(&tmp_path)?;
-            tmp.write_all(&bytes)?;
-            tmp.sync_all()?;
-            drop(tmp);
-
-            std::fs::rename(&tmp_path, &metadata_path)?;
+            crate::support::write_atomic_durable(&metadata_path, &bytes)?;
         }
         Ok(())
     }

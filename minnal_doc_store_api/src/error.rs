@@ -60,6 +60,10 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::KvValueTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr) => StatusCode::BAD_REQUEST,
 
+            // A key/value too large for the storage format's u32 length fields is
+            // user-actionable: report 413 rather than a generic 500.
+            DocStoreError::Db(minnal_db::KVError::WriteTooLarge(_)) => StatusCode::PAYLOAD_TOO_LARGE,
+
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

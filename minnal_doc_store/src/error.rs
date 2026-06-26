@@ -109,7 +109,7 @@ pub enum DocStoreError {
     #[error("attribute '{field}' in namespace '{namespace}' is used by an index — drop the index first")]
     AttributeIsIndexed { namespace: String, field: String },
 
-    /// The `ns_id` is missing from the schema — store was not created via [`DocStore::create`].
+    /// The `ns_id` is missing from the schema — store was not created via `DocStore::create`.
     #[error("namespace '{namespace}' has no stored ID — was the doc store created via DocStore::create?")]
     MissingNsId { namespace: String },
 

@@ -1,7 +1,50 @@
 use mm3h::Murmur3Hasher;
 use std::hash::Hasher;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod simd_support;
+
+/// fsync a directory so that a create/rename/unlink of one of its entries is
+/// durable. A file's own `sync_all` only persists its *contents*, not the
+/// directory entry that makes those contents visible by name after a crash.
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically and durably replace the file at `path` with `bytes`.
+///
+/// The single helper every metadata writer should funnel through. In order:
+/// 1. write `bytes` to a unique sibling temp file,
+/// 2. `sync_all` the temp file (its contents reach stable storage),
+/// 3. `rename` it over `path` (an atomic replace),
+/// 4. fsync the parent directory (so the rename itself survives a crash).
+///
+/// The temp filename carries a process- and call-unique suffix, so concurrent
+/// writers targeting the same `path` never collide on the temp file — a shared
+/// temp name would let the second writer's `rename` fail with `ENOENT` after
+/// the first already moved it.
+///
+/// A bare `write` + `rename` (without the two fsyncs) leaves both the temp
+/// contents and the rename sitting in the page cache, so a power loss could
+/// resurrect stale or truncated data even after the call returned `Ok`.
+pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
 
 /// Default bucket count used by both the LSM tree and the sharded value log.
 /// All bucket-routing logic in the codebase must use a single bucket count so

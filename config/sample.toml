@@ -225,6 +225,16 @@ sliding_size = 2
 # Default: 86400 (1 day).
 # query_embedding_cache_ttl_secs = 86400
 
+# Overall timeout (seconds) for a single embedding-service HTTP request
+# (connect + send + receive). Caps how long an indexing or search call can block
+# on a slow or hanging embedding service. Default: 30.
+# embedding_request_timeout_secs = 30
+
+# Timeout (seconds) for just the TCP connect phase to the embedding service.
+# Fails fast when the host is unreachable. Should be shorter than
+# embedding_request_timeout_secs (the overall cap). Default: 10.
+# embedding_connect_timeout_secs = 10
+
 # ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — enabled embedding models
 #

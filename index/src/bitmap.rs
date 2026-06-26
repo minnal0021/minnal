@@ -8,6 +8,13 @@ use crate::container::array::ArrayContainer;
 use crate::container::bitset::BitsetContainer;
 use crate::container_store::ContainerStore;
 
+/// Upper bound on the number of 16-bit high-key blocks (containers) a single
+/// [`RoaringBitmap::flip`] may span. Complementing a range materialises one
+/// container per high-key it covers, so an unbounded range over the `u128`
+/// keyspace would allocate boundlessly. ~1M containers covers up to ~64 Gi
+/// values — far beyond any dense row-ID space — so exceeding it signals misuse.
+pub const MAX_FLIP_CONTAINER_SPAN: u128 = 1 << 20;
+
 /// Decompose a u128 key into a high key (upper 112 bits) and low value (lower 16 bits).
 #[inline]
 pub fn decompose(key: u128) -> (u128, u16) {
@@ -295,6 +302,20 @@ impl RoaringBitmap {
     // ── Flip ────────────────────────────────────────────────────────
 
     /// Complement bits in the half-open range [`lo`, `hi`) in place.
+    ///
+    /// Standard Roaring complement semantics: every value in the range that is
+    /// present is cleared, and every value that is **absent is set** — including
+    /// across containers that do not yet exist, which are materialised as
+    /// needed. Flipping an empty bitmap over `[0, 10)` therefore yields
+    /// `{0,…,9}`, not an empty bitmap.
+    ///
+    /// Cost scales with the range *width*: one container (up to 8 KiB) is
+    /// materialised per 16-bit high-key block the range spans, since the set
+    /// bits have to be stored. Because the keyspace is `u128`, complementing an
+    /// unbounded range would try to allocate astronomically many containers, so
+    /// a span wider than [`MAX_FLIP_CONTAINER_SPAN`] high-key blocks is rejected
+    /// with a panic — that is a misuse of the API (the dense row-ID space a
+    /// caller would legitimately flip is far smaller).
     pub fn flip(&mut self, lo: u128, hi: u128) {
         if lo >= hi {
             return;
@@ -302,18 +323,26 @@ impl RoaringBitmap {
         let (lo_high, lo_low) = decompose(lo);
         let (hi_high, hi_low) = decompose(hi - 1);
 
-        let keys: Vec<u128> = self.store.sorted_keys().into_iter().filter(|&k| k >= lo_high && k <= hi_high).collect();
+        // hi > lo ⇒ hi-1 ≥ lo ⇒ hi_high ≥ lo_high, so the span is ≥ 1.
+        let span = hi_high - lo_high + 1;
+        assert!(
+            span <= MAX_FLIP_CONTAINER_SPAN,
+            "RoaringBitmap::flip range [{lo}, {hi}) spans {span} containers (> {MAX_FLIP_CONTAINER_SPAN}); \
+             complementing such a wide range over the u128 keyspace is unsupported"
+        );
 
-        for key in keys {
-            if let Some(mut container) = self.store.get(key) {
-                let range_lo = if key == lo_high { lo_low } else { 0 };
-                let range_hi = if key == hi_high { hi_low } else { u16::MAX };
-                container.flip_range(range_lo, range_hi);
-                if container.is_empty() {
-                    self.store.remove_key(key);
-                } else {
-                    self.store.upsert(key, &container);
-                }
+        // Visit *every* high-key block in the span, not just the populated ones:
+        // a block with no container still has all-absent bits that the flip must
+        // set. `..=` over u128 is overflow-safe even when hi_high == u128::MAX.
+        for high in lo_high..=hi_high {
+            let range_lo = if high == lo_high { lo_low } else { 0 };
+            let range_hi = if high == hi_high { hi_low } else { u16::MAX };
+            let mut container = self.store.get(high).unwrap_or_else(Container::new_array);
+            container.flip_range(range_lo, range_hi);
+            if container.is_empty() {
+                self.store.remove_key(high);
+            } else {
+                self.store.upsert(high, &container);
             }
         }
     }
@@ -797,6 +826,36 @@ mod tests {
         bm2.flip(10, 50);
         bm2.flip(10, 50);
         assert_eq!(bm, bm2);
+    }
+
+    #[test]
+    fn flip_empty_over_range_sets_all() {
+        // Standard complement semantics: an empty bitmap flipped over [0, 10)
+        // becomes {0..=9} (previously a no-op — the bug this fixes).
+        let mut bm = RoaringBitmap::new();
+        bm.flip(0, 10);
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), (0u128..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn flip_twice_is_identity_across_missing_container() {
+        // The flipped range crosses a container that does not exist up front;
+        // flipping it twice must still round-trip to the original.
+        let bm: RoaringBitmap = [1u128, 2].into_iter().collect();
+        let mut bm2 = bm.clone();
+        bm2.flip(0, 0x2_0000); // materialises container 1 (and complements container 0)
+        bm2.flip(0, 0x2_0000);
+        assert_eq!(bm, bm2);
+        assert_eq!(bm2.num_containers(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "spans")]
+    fn flip_panics_on_pathologically_wide_range() {
+        // A span past MAX_FLIP_CONTAINER_SPAN is API misuse over the u128 space.
+        let mut bm = RoaringBitmap::new();
+        let hi = (MAX_FLIP_CONTAINER_SPAN + 1) << 16; // that many high-key blocks
+        bm.flip(0, hi);
     }
 
     #[test]

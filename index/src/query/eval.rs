@@ -15,7 +15,7 @@ use super::parser::{Op, RawExpr, RawValue};
 
 /// Maps a field name to its `FieldId` within a namespace.
 ///
-/// Build this from [`NamespaceSchema::list_fields`] on the `minnal_db` side:
+/// Build this from `NamespaceSchema::list_fields` on the `minnal_db` side:
 ///
 /// ```ignore
 /// let schema_map: SchemaMap = registry
@@ -38,6 +38,22 @@ pub type SchemaMap = HashMap<String, FieldId>;
 /// # Returns
 /// A [`RoaringBitmap`] of row IDs that satisfy the query.  An empty bitmap
 /// means no rows matched (not an error).
+///
+/// # `NOT` semantics (document-store, *not* SQL)
+///
+/// `NOT` is evaluated over a **universe scoped to the fields the inner
+/// expression references**, not over every row in the namespace. So
+/// `NOT status = 'active'` returns rows that **have a `status` value** that is
+/// not `'active'` — a row with **no `status` field at all is excluded**. This
+/// matches a schemaless document store (a missing field is "no value", not
+/// "a value that differs"), and differs from SQL, where `NOT (status =
+/// 'active')` over a `NULL` is unknown/excluded but a missing column is a schema
+/// error rather than a per-row condition. The universe is the union of the
+/// bitmaps of exactly the fields named inside the `NOT` (so `NOT (a = 1 AND
+/// b = 2)` is complemented against rows having an `a` **or** a `b` value).
+/// There is currently no `EXISTS(field)` / `MISSING(field)` operator to select
+/// rows by field presence; build one on top if you need "match rows lacking a
+/// field".
 pub fn parse_and_evaluate<F>(input: &str, schema: &SchemaMap, get_index: &F) -> Result<RoaringBitmap, QueryError>
 where
     F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
@@ -50,29 +66,48 @@ where
 ///
 /// Use this when you want to parse once and evaluate multiple times, or when
 /// you build the expression tree programmatically.
+///
+/// The **entire** AST is validated (every field known and active, every value
+/// type- and op-compatible) *before* any bitmap evaluation runs. This makes
+/// query validity independent of the data: an invalid predicate is reported as
+/// a [`QueryError`] even if an AND short-circuits on an empty left operand, so a
+/// typo / inactive field / type mismatch can never be silently hidden behind an
+/// empty result.
 pub fn evaluate<F>(expr: &RawExpr, schema: &SchemaMap, get_index: &F) -> Result<RoaringBitmap, QueryError>
+where
+    F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
+{
+    validate(expr, schema, get_index)?;
+    eval_expr(expr, schema, get_index)
+}
+
+/// Recursive evaluation worker. Assumes [`validate`] has already accepted the
+/// whole AST, so the AND short-circuit below cannot hide an invalid operand.
+fn eval_expr<F>(expr: &RawExpr, schema: &SchemaMap, get_index: &F) -> Result<RoaringBitmap, QueryError>
 where
     F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
 {
     match expr {
         RawExpr::And(left, right) => {
-            let l = evaluate(left, schema, get_index)?;
+            let l = eval_expr(left, schema, get_index)?;
             if l.is_empty() {
-                // Short-circuit: AND with empty is always empty
+                // Short-circuit: AND with empty is always empty. Safe to skip the
+                // right operand's *evaluation* because the full AST was already
+                // validated up front, so a bad right operand has already errored.
                 return Ok(l);
             }
-            let r = evaluate(right, schema, get_index)?;
+            let r = eval_expr(right, schema, get_index)?;
             Ok(l.and(&r))
         }
 
         RawExpr::Or(left, right) => {
-            let l = evaluate(left, schema, get_index)?;
-            let r = evaluate(right, schema, get_index)?;
+            let l = eval_expr(left, schema, get_index)?;
+            let r = eval_expr(right, schema, get_index)?;
             Ok(l.or(&r))
         }
 
         RawExpr::Not(inner) => {
-            let inner_bm = evaluate(inner, schema, get_index)?;
+            let inner_bm = eval_expr(inner, schema, get_index)?;
             // Universe = OR of bitmaps only for fields referenced by the inner
             // expression.  Rows that have no value for any of those fields are
             // not candidates for NOT, which matches document-store semantics:
@@ -90,6 +125,44 @@ where
         }
 
         RawExpr::Predicate { field, op, value } => eval_predicate(field, op, value, schema, get_index),
+    }
+}
+
+// ── Validation pass ────────────────────────────────────────────────────────
+
+/// Walk the whole AST and check that every predicate is well-formed against the
+/// schema and live indices — field known ([`QueryError::UnknownField`]), field
+/// active ([`QueryError::InactiveField`]), value type-compatible
+/// ([`QueryError::TypeMismatch`]) and op supported
+/// ([`QueryError::UnsupportedOp`]) — **without** evaluating any bitmaps. Runs
+/// once before [`eval_expr`] so short-circuiting can never hide an invalid leaf.
+fn validate<F>(expr: &RawExpr, schema: &SchemaMap, get_index: &F) -> Result<(), QueryError>
+where
+    F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
+{
+    match expr {
+        RawExpr::And(left, right) | RawExpr::Or(left, right) => {
+            validate(left, schema, get_index)?;
+            validate(right, schema, get_index)
+        }
+        RawExpr::Not(inner) => validate(inner, schema, get_index),
+        RawExpr::Predicate { field, op, value } => validate_predicate(field, op, value, schema, get_index),
+    }
+}
+
+fn validate_predicate<F>(field: &str, op: &Op, raw_value: &RawValue, schema: &SchemaMap, get_index: &F) -> Result<(), QueryError>
+where
+    F: Fn(FieldId) -> Option<Arc<RwLock<DynFieldIndex>>>,
+{
+    let &field_id = schema.get(field).ok_or_else(|| QueryError::UnknownField { name: field.to_string() })?;
+    let idx_lock = get_index(field_id).ok_or_else(|| QueryError::InactiveField { field: field.to_string() })?;
+    let idx = idx_lock.read();
+    // Build the typed predicate to surface any type/op error, then discard it —
+    // the same builders `eval_dyn` uses, so validation can never drift from it.
+    match &idx.inner {
+        DynFieldIndexInner::Bool(_) => build_bool_predicate(op, raw_value, field).map(|_| ()),
+        DynFieldIndexInner::Int(_) => build_int_predicate(op, raw_value, field).map(|_| ()),
+        DynFieldIndexInner::Str(_) => build_str_predicate(op, raw_value, field).map(|_| ()),
     }
 }
 
@@ -130,36 +203,36 @@ where
 
 fn eval_dyn(idx: &DynFieldIndex, field: &str, op: &Op, raw: &RawValue) -> Result<RoaringBitmap, QueryError> {
     match &idx.inner {
-        DynFieldIndexInner::Bool(inner) => {
-            if *op == Op::In {
-                let vals = coerce_bool_list(raw, field)?;
-                Ok(inner.evaluate(&Predicate::In(vals)))
-            } else {
-                let v = coerce_bool(raw, field)?;
-                let pred = build_bool_pred(op, v, field)?;
-                Ok(inner.evaluate(&pred))
-            }
-        }
-        DynFieldIndexInner::Int(inner) => {
-            if *op == Op::In {
-                let vals = coerce_int_list(raw, field)?;
-                Ok(inner.evaluate(&Predicate::In(vals)))
-            } else {
-                let v = coerce_int(raw, field)?;
-                let pred = build_int_pred(op, v, field)?;
-                Ok(inner.evaluate(&pred))
-            }
-        }
-        DynFieldIndexInner::Str(inner) => {
-            if *op == Op::In {
-                let vals = coerce_str_list(raw, field)?;
-                Ok(inner.evaluate(&Predicate::In(vals)))
-            } else {
-                let v = coerce_str(raw, field)?;
-                let pred = build_str_pred(op, v, field)?;
-                Ok(inner.evaluate(&pred))
-            }
-        }
+        DynFieldIndexInner::Bool(inner) => Ok(inner.evaluate(&build_bool_predicate(op, raw, field)?)),
+        DynFieldIndexInner::Int(inner) => Ok(inner.evaluate(&build_int_predicate(op, raw, field)?)),
+        DynFieldIndexInner::Str(inner) => Ok(inner.evaluate(&build_str_predicate(op, raw, field)?)),
+    }
+}
+
+/// Build a typed `bool` predicate from the raw op/value, dispatching `IN` to a
+/// list coercion and everything else to a scalar coercion. Shared by `eval_dyn`
+/// (which evaluates the predicate) and `validate_predicate` (which discards it).
+fn build_bool_predicate(op: &Op, raw: &RawValue, field: &str) -> Result<Predicate<bool>, QueryError> {
+    if *op == Op::In {
+        Ok(Predicate::In(coerce_bool_list(raw, field)?))
+    } else {
+        build_bool_pred(op, coerce_bool(raw, field)?, field)
+    }
+}
+
+fn build_int_predicate(op: &Op, raw: &RawValue, field: &str) -> Result<Predicate<i64>, QueryError> {
+    if *op == Op::In {
+        Ok(Predicate::In(coerce_int_list(raw, field)?))
+    } else {
+        build_int_pred(op, coerce_int(raw, field)?, field)
+    }
+}
+
+fn build_str_predicate(op: &Op, raw: &RawValue, field: &str) -> Result<Predicate<String>, QueryError> {
+    if *op == Op::In {
+        Ok(Predicate::In(coerce_str_list(raw, field)?))
+    } else {
+        build_str_pred(op, coerce_str(raw, field)?, field)
     }
 }
 
@@ -348,6 +421,21 @@ mod tests {
     }
 
     #[test]
+    fn test_str_eq_non_ascii_unicode() {
+        // End-to-end: a non-ASCII value indexed as stored must match when queried
+        // with the same literal — broken when the lexer mangled UTF-8 byte-wise.
+        let name_idx = make_str_index(&[("மின்னல்", 1), ("lightning", 2), ("⚡", 3), ("மின்னல்", 4)]);
+        let s = schema(&[("name", 0)]);
+        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&name_idx)) } else { None };
+
+        let bm = parse_and_evaluate("name = 'மின்னல்'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![1, 4]);
+
+        let bm = parse_and_evaluate("name = '⚡'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![3]);
+    }
+
+    #[test]
     fn test_bool_eq() {
         let active_idx = make_bool_index(&[(true, 1), (false, 2), (true, 3)]);
         let s = schema(&[("active", 0)]);
@@ -420,6 +508,31 @@ mod tests {
     }
 
     #[test]
+    fn and_binds_tighter_than_or_changes_result_set() {
+        // `a = 1 OR b = 2 AND c = 3` must evaluate as `a = 1 OR (b = 2 AND c = 3)`.
+        // Row 1 matches a=1 only; row 2 matches b=2 AND c=3; row 3 matches b=2
+        // but not c=3. Correct precedence ⇒ {1, 2}. The old equal-precedence
+        // grouping `(a = 1 OR b = 2) AND c = 3` would instead yield {2}.
+        let a = make_int_index(&[(1, 1), (9, 2), (9, 3)]);
+        let b = make_int_index(&[(9, 1), (2, 2), (2, 3)]);
+        let c = make_int_index(&[(9, 1), (3, 2), (9, 3)]);
+        let s = schema(&[("a", 0), ("b", 1), ("c", 2)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&a)),
+            1 => Some(Arc::clone(&b)),
+            2 => Some(Arc::clone(&c)),
+            _ => None,
+        };
+
+        let bm = parse_and_evaluate("a = 1 OR b = 2 AND c = 3", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![1, 2]);
+
+        // Explicit parentheses still force the other grouping → {2}.
+        let bm = parse_and_evaluate("(a = 1 OR b = 2) AND c = 3", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![2]);
+    }
+
+    #[test]
     fn test_unknown_field_error() {
         let s: SchemaMap = HashMap::new();
         let get_index = |_: u32| None;
@@ -455,15 +568,93 @@ mod tests {
     }
 
     #[test]
-    fn test_and_short_circuits_on_empty() {
-        // left side is empty → right side should not be evaluated
-        // We verify this doesn't panic even if right field has no index
+    fn test_and_short_circuit_returns_empty_for_valid_query() {
+        // A fully-valid query whose left operand matches nothing still returns an
+        // empty bitmap (the AND short-circuit), without erroring.
         let age_idx = make_int_index(&[(99, 1)]);
+        let active_idx = make_bool_index(&[(true, 1)]);
+        let s = schema(&[("age", 0), ("active", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&age_idx)),
+            1 => Some(Arc::clone(&active_idx)),
+            _ => None,
+        };
+        // age = 5 matches nothing; right operand is valid → Ok(empty).
+        let bm = parse_and_evaluate("age = 5 AND active = true", &s, &get_index).unwrap();
+        assert!(bm.is_empty());
+    }
+
+    // ── Validation runs over the whole AST, regardless of short-circuiting ──────
+    //
+    // Even when the left operand of an AND matches nothing (so the right operand's
+    // bitmap is never computed), an invalid right operand must still error — query
+    // validity is data-independent. Regression for the AND short-circuit that used
+    // to hide unknown/inactive/type-invalid/unsupported right-hand predicates.
+
+    #[test]
+    fn test_and_empty_left_still_errors_on_unknown_right_field() {
+        let age_idx = make_int_index(&[(99, 1)]);
+        let s = schema(&[("age", 0)]); // `missing` is not in the schema
+        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        // age = 5 is empty, but `missing` is an unknown field → UnknownField.
+        let err = parse_and_evaluate("age = 5 AND missing = 1", &s, &get_index).unwrap_err();
+        assert!(matches!(err, QueryError::UnknownField { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_and_empty_left_still_errors_on_inactive_right_field() {
+        let age_idx = make_int_index(&[(99, 1)]);
+        // `status` is a known field but has no active index.
         let s = schema(&[("age", 0), ("status", 1)]);
         let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
-        // age = 5 returns empty; if AND short-circuits, status lookup is skipped
-        let bm = parse_and_evaluate("age = 5 AND status = 'x'", &s, &get_index).unwrap();
-        assert!(bm.is_empty());
+        let err = parse_and_evaluate("age = 5 AND status = 'x'", &s, &get_index).unwrap_err();
+        assert!(matches!(err, QueryError::InactiveField { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_and_empty_left_still_errors_on_type_mismatch_right() {
+        let age_idx = make_int_index(&[(99, 1)]);
+        let label_idx = make_str_index(&[("a", 1)]);
+        let s = schema(&[("age", 0), ("label", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&age_idx)),
+            1 => Some(Arc::clone(&label_idx)),
+            _ => None,
+        };
+        // age = 5 is empty; `label` is a string field but the value is an int.
+        let err = parse_and_evaluate("age = 5 AND label = 1", &s, &get_index).unwrap_err();
+        assert!(matches!(err, QueryError::TypeMismatch { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_and_empty_left_still_errors_on_unsupported_op_right() {
+        let age_idx = make_int_index(&[(99, 1)]);
+        let active_idx = make_bool_index(&[(true, 1)]);
+        let s = schema(&[("age", 0), ("active", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&age_idx)),
+            1 => Some(Arc::clone(&active_idx)),
+            _ => None,
+        };
+        // age = 5 is empty; `active > true` is an unsupported op on a bool field.
+        let err = parse_and_evaluate("age = 5 AND active > true", &s, &get_index).unwrap_err();
+        assert!(matches!(err, QueryError::UnsupportedOp { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_nested_and_empty_left_still_errors_on_deep_invalid_right() {
+        // Short-circuit also must not hide an invalid predicate nested deeper in
+        // the right subtree: age = 5 AND (active = true AND missing = 1).
+        let age_idx = make_int_index(&[(99, 1)]);
+        let active_idx = make_bool_index(&[(true, 1)]);
+        let s = schema(&[("age", 0), ("active", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&age_idx)),
+            1 => Some(Arc::clone(&active_idx)),
+            _ => None,
+        };
+        let err = parse_and_evaluate("age = 5 AND (active = true AND missing = 1)", &s, &get_index).unwrap_err();
+        assert!(matches!(err, QueryError::UnknownField { .. }), "got: {err:?}");
     }
 
     #[test]
@@ -483,6 +674,25 @@ mod tests {
     }
 
     // ── NOT universe tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn not_excludes_rows_missing_the_field_documented_contract() {
+        // Contract (document-store, not SQL — see parse_and_evaluate rustdoc):
+        // `NOT status = 'x'` matches rows that HAVE a status value other than 'x';
+        // rows with no status field are excluded. Rows 1 and 2 have a status;
+        // row 3 has none. NOT status = 'a' ⇒ {2} only (NOT {1}, and row 3 dropped
+        // for lacking the field), never {2, 3}.
+        let status_idx = make_str_index(&[("a", 1), ("b", 2)]);
+        let other_idx = make_int_index(&[(7, 3)]); // row 3 has only `other`, no status
+        let s = schema(&[("status", 0), ("other", 1)]);
+        let get_index = |id: u32| match id {
+            0 => Some(Arc::clone(&status_idx)),
+            1 => Some(Arc::clone(&other_idx)),
+            _ => None,
+        };
+        let bm = parse_and_evaluate("NOT status = 'a'", &s, &get_index).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![2], "row 3 (no status) must be excluded");
+    }
 
     #[test]
     fn test_not_universe_scoped_to_referenced_field() {

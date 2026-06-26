@@ -62,7 +62,7 @@ pub struct FieldMeta {
     pub field_name: String,
     /// The value type this field was registered with.
     ///
-    /// [`activate_field_index`] validates that the caller-supplied type matches
+    /// `activate_field_index` validates that the caller-supplied type matches
     /// this so mismatches are caught at activation time rather than at query time.
     pub field_type: IndexValueType,
 }
@@ -473,9 +473,7 @@ impl NamespaceRegistry {
         let json =
             serde_json::to_string_pretty(&config).map_err(|e| KVError::Serialization(format!("Failed to serialize namespace config: {}", e)))?;
 
-        let tmp_path = config_path.with_extension("tmp");
-        fs::write(&tmp_path, json.as_bytes())?;
-        fs::rename(&tmp_path, &config_path)?;
+        crate::support::write_atomic_durable(&config_path, json.as_bytes())?;
 
         Ok(())
     }
@@ -511,10 +509,8 @@ impl NamespaceRegistry {
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&payload);
 
-        let tmp_path = self.path.with_extension("tmp");
-        fs::write(&tmp_path, &out).map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to write namespace registry: {}", e))))?;
-        fs::rename(&tmp_path, &self.path)
-            .map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to rename namespace registry: {}", e))))?;
+        crate::support::write_atomic_durable(&self.path, &out)
+            .map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to persist namespace registry: {}", e))))?;
 
         Ok(())
     }

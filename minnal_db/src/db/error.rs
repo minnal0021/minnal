@@ -26,6 +26,8 @@ pub enum KVError {
     CorruptedLog,
     #[error("Database is closed")]
     DatabaseClosed,
+    #[error("write too large: {0}")]
+    WriteTooLarge(String),
 }
 
 pub type Result<T> = std::result::Result<T, KVError>;

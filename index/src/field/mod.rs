@@ -39,4 +39,4 @@ pub mod value;
 
 pub use field_index::FieldIndex;
 pub use predicate::Predicate;
-pub use value::{DynFieldIndex, IndexValue, IndexValueType};
+pub use value::{DynFieldIndex, IndexBlobStats, IndexValue, IndexValueType};

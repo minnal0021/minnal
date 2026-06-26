@@ -112,15 +112,137 @@ fn flip_noop_on_empty_or_reversed_range() {
 }
 
 #[test]
-fn flip_only_touches_existing_containers() {
+fn flip_is_scoped_to_range() {
     // Values 1,2 are in container 0; value 0x2_0000 is in container 2.
-    // Flipping [0, 0x1_0000) only covers container 0 — container 2 unchanged.
+    // Flipping [0, 0x1_0000) covers all of container 0 (and only container 0):
+    // 1 and 2 are cleared, every other value in [0, 0xFFFF] is set, and
+    // container 2 (out of range) is untouched.
     let mut bm: RoaringBitmap = [1u128, 2, 0x2_0000].into_iter().collect();
     bm.flip(0, 0x1_0000);
-    // 1 and 2 are now absent; 0x2_0000 untouched
     assert!(!bm.contains(1));
     assert!(!bm.contains(2));
+    // Previously-absent in-range bits are now set (standard complement).
+    assert!(bm.contains(0));
+    assert!(bm.contains(3));
+    assert!(bm.contains(0xFFFF));
+    // Out-of-range container is left alone.
     assert!(bm.contains(0x2_0000));
+    // Container 0 now holds all 65536 values except 1 and 2.
+    assert_eq!(bm.cardinality(), (65536 - 2) + 1);
+}
+
+#[test]
+fn flip_empty_bitmap_sets_full_range() {
+    // Standard complement: flipping an empty bitmap over [0, 10) yields {0..=9}.
+    let mut bm = RoaringBitmap::new();
+    bm.flip(0, 10);
+    let vals: Vec<u128> = bm.iter().collect();
+    assert_eq!(vals, (0u128..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn flip_creates_missing_container() {
+    // {1} lives in container 0; flipping a sub-range of the *absent* container 1
+    // must materialise it and set those bits.
+    let mut bm: RoaringBitmap = [1u128].into_iter().collect();
+    bm.flip(0x1_0000, 0x1_0003); // container 1, values 65536..=65538
+    assert!(bm.contains(1)); // container 0 untouched
+    assert!(bm.contains(0x1_0000));
+    assert!(bm.contains(0x1_0001));
+    assert!(bm.contains(0x1_0002));
+    assert!(!bm.contains(0x1_0003));
+    assert_eq!(bm.cardinality(), 4);
+}
+
+#[test]
+fn flip_spans_existing_and_missing_containers() {
+    // Container 0 = {1,2} exists; container 1 is missing. Flip [0, 0x2_0000)
+    // covers both: container 0 fully complemented, container 1 fully created.
+    let mut bm: RoaringBitmap = [1u128, 2].into_iter().collect();
+    bm.flip(0, 0x2_0000);
+    // Container 0: everything except 1 and 2.
+    assert!(!bm.contains(1));
+    assert!(!bm.contains(2));
+    assert!(bm.contains(0));
+    assert!(bm.contains(0xFFFF));
+    // Container 1: fully set (was missing).
+    assert!(bm.contains(0x1_0000));
+    assert!(bm.contains(0x1_FFFF));
+    assert_eq!(bm.num_containers(), 2);
+    assert_eq!(bm.cardinality(), (65536 - 2) + 65536);
+}
+
+#[test]
+fn flip_interior_subrange_is_half_open_and_leaves_neighbors() {
+    // {10,12,20} flip [12,15): half-open ⇒ 12 cleared, 13 & 14 set, 15 NOT set.
+    // 10 and 20 are outside the range and must be untouched.
+    let mut bm: RoaringBitmap = [10u128, 12, 20].into_iter().collect();
+    bm.flip(12, 15);
+    assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![10, 13, 14, 20]);
+}
+
+#[test]
+fn flip_partial_clips_on_both_ends_across_three_containers() {
+    // Range starts inside container 0, spans all of container 1, and ends inside
+    // container 2 — the only shape that exercises a low clip on the first block
+    // AND a high clip on the last block together with a full middle block.
+    let mut bm: RoaringBitmap = [0xFFFEu128, 0x1_0005, 0x2_0001].into_iter().collect();
+    bm.flip(0xFFFF, 0x2_0002); // [container0 bit 0xFFFF .. container2 bits 0,1]
+
+    // Container 0: 0xFFFE below `lo` ⇒ untouched; 0xFFFF was absent ⇒ now set.
+    assert!(bm.contains(0xFFFE));
+    assert!(bm.contains(0xFFFF));
+    // Container 1: fully in range. 0x1_0005 present ⇒ cleared; absent bits set.
+    assert!(!bm.contains(0x1_0005));
+    assert!(bm.contains(0x1_0000));
+    assert!(bm.contains(0x1_FFFF));
+    // Container 2: 0x2_0000 absent ⇒ set; 0x2_0001 present ⇒ cleared;
+    // 0x2_0002 is the exclusive `hi` ⇒ stays absent.
+    assert!(bm.contains(0x2_0000));
+    assert!(!bm.contains(0x2_0001));
+    assert!(!bm.contains(0x2_0002));
+}
+
+#[test]
+fn flip_matches_independent_complement_reference() {
+    // Differential test: flip() must equal the symmetric difference of the
+    // initial set with [lo, hi), built independently via direct inserts (never
+    // via flip). Ranges are kept *narrow* but anchored at and around container
+    // boundaries (0xFFFF/0x1_0000 and 0x1_FFFF/0x2_0000), so every combination
+    // of low clip, high clip, half-open end, and boundary crossing is checked
+    // exhaustively. (Whole-container fills are covered by the cardinality
+    // assertions in the tests above; bit-by-bit fills here would be quadratic.)
+    let initial: Vec<u128> = vec![0, 5, 0xFFFE, 0xFFFF, 0x1_0000, 0x1_0001, 0x1_FFFF, 0x2_0000, 0x2_0001];
+    // Anchors adjacent to container boundaries; widths stay small so each range
+    // touches at most two containers with only a few values. `0x5_0000` lands in
+    // an empty container so the missing-container creation path (the original
+    // bug) is exercised here too — under the old only-existing-containers code
+    // those ranges produced nothing and this assertion would fail.
+    let anchors: [u128; 7] = [0, 0xFFFD, 0xFFFF, 0x1_0000, 0x1_FFFE, 0x2_0000, 0x5_0000];
+
+    for &lo in &anchors {
+        for width in 1u128..=6 {
+            let hi = lo + width;
+            let mut bm: RoaringBitmap = initial.iter().copied().collect();
+            bm.flip(lo, hi);
+
+            // Build the expected complement independently of flip().
+            let in_range: std::collections::BTreeSet<u128> = initial.iter().copied().filter(|&v| (lo..hi).contains(&v)).collect();
+            let mut expected = RoaringBitmap::new();
+            for &v in &initial {
+                if !(lo..hi).contains(&v) {
+                    expected.insert(v); // outside range ⇒ unchanged
+                }
+            }
+            for v in lo..hi {
+                if !in_range.contains(&v) {
+                    expected.insert(v); // inside range and was absent ⇒ now set
+                }
+            }
+
+            assert_eq!(bm, expected, "flip([{lo}, {hi})) mismatch");
+        }
+    }
 }
 
 // ── range_and ────────────────────────────────────────────────────────────────

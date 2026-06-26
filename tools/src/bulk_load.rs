@@ -382,7 +382,7 @@ async fn load_jsonl(
     Ok(())
 }
 
-/// Like [`extract_id_str`] but appends the error message to `errors` when it
+/// Like `extract_id_str` but appends the error message to `errors` when it
 /// returns `None`, so callers don't have to duplicate the collection logic.
 fn extract_id_str_collecting(
     doc: &Value,

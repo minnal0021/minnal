@@ -8,13 +8,43 @@
 //!
 //! [`DynFieldIndex`] provides a uniform mutation interface over the
 //! mmap-backed [`FieldIndex`] variants.  Persistence is handled directly by
-//! the underlying [`BlobStore`] mmap files; use [`open`] / [`flush`] to
+//! the underlying `BlobStore` mmap files; use `open` / `flush` to
 //! open or flush a file-backed index.
 //!
 //! The value→slot-id mapping (the "keymap") is persisted in a second
-//! [`BlobStore`] under a `keymap/` subdirectory.  Each entry maps
+//! `BlobStore` under a `keymap/` subdirectory.  Each entry maps
 //! `slot_id (u128) → serialised value bytes`, so individual inserts and
 //! removes are immediately durable without rewriting the entire keymap.
+//!
+//! # Crash atomicity — DynFieldIndex is NOT independently crash-atomic
+//!
+//! A [`DynFieldIndex`] spans **two** separate `BlobStore`s — the bitmap store
+//! (`slot_id → RoaringBitmap`) and the keymap store (`slot_id → value bytes`) —
+//! and there is **no index-level marker tying them to one logical point**.
+//! `flush` flushes the bitmap store and then the keymap store as two distinct
+//! `msync`s, so a crash *between* them leaves the two stores at different
+//! versions (a "skew"): e.g. a slot's bitmap is on disk but its keymap entry is
+//! not, or vice-versa. Each store on its own is still structurally valid (they
+//! pass `BlobStore::open`'s header/bounds checks) — they simply disagree.
+//!
+//! This is **by design**: the field index is a *derived, reconstructable*
+//! structure, so consistency is the **owner's** responsibility, not the index
+//! crate's. In `minnal_db`, `run_index_checkpoint` flushes both stores and only
+//! *then* records the WAL offset (`IndexManager::checkpoint_fields`) as the
+//! single atomic marker. A crash mid-flush leaves that offset at the previous
+//! checkpoint, so on open `minnal_db` replays every WAL entry since then on top
+//! of the loaded index, re-applying the affected inserts/removes in their
+//! original order and reconciling any skew. A skewed reopen never panics or
+//! reads out of bounds — at worst a torn value queries empty (or leaves an
+//! orphaned slot reclaimed by a later `compact`) until replay heals it.
+//!
+//! **Standalone users must provide their own reconciliation** (e.g. an external
+//! log to replay, or a wrapping checkpoint marker). Do not assume that opening a
+//! `DynFieldIndex` after a crash, with no replay, yields a self-consistent
+//! bitmap/keymap pair. An index-level marker is intentionally **not** provided
+//! here because it would duplicate the owner's WAL-offset checkpoint; add one
+//! only if a genuine standalone-crash-atomic use case appears.
+//!
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -46,6 +76,24 @@ pub enum IndexValueType {
 
 // ── DynFieldIndex ──────────────────────────────────────────────────────────
 
+/// On-disk blob growth/waste metrics for one field index, returned by
+/// [`DynFieldIndex::blob_stats`]. `*_logical_bytes` is everything ever appended
+/// (live + stale); `*_live_bytes` is what survives compaction; the difference is
+/// reclaimable dead space. `*_waste_ratio` is `dead / logical`. The bitmap store
+/// is the one that balloons under low-cardinality write amplification; track it
+/// to guardrail against runaway disk use between compactions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexBlobStats {
+    /// Number of distinct values currently indexed.
+    pub distinct_values: usize,
+    pub bitmap_logical_bytes: u64,
+    pub bitmap_live_bytes: u64,
+    pub bitmap_waste_ratio: f64,
+    pub keymap_logical_bytes: u64,
+    pub keymap_live_bytes: u64,
+    pub keymap_waste_ratio: f64,
+}
+
 /// Inner (private) typed storage — one variant per supported value type.
 pub(crate) enum DynFieldIndexInner {
     Bool(FieldIndex<bool>),
@@ -53,7 +101,7 @@ pub(crate) enum DynFieldIndexInner {
     Str(FieldIndex<String>),
 }
 
-/// Type-erased field index backed by mmap [`BlobStore`] instances.
+/// Type-erased field index backed by mmap `BlobStore` instances.
 ///
 /// Two stores are involved:
 /// - **bitmap store** (`blobs.keys` / `blobs.vals`) — holds the per-value
@@ -62,9 +110,9 @@ pub(crate) enum DynFieldIndexInner {
 ///   `slot_id` to the serialised field value so the `BTreeMap<V, u128>`
 ///   ordering can be rebuilt on open.
 ///
-/// For ephemeral (test) use, create with [`new`] — no keymap store is
-/// allocated.  For persistent use, open the index directory with [`open`]
-/// and flush changes with [`flush`].
+/// For ephemeral (test) use, create with `new` — no keymap store is
+/// allocated.  For persistent use, open the index directory with `open`
+/// and flush changes with `flush`.
 pub struct DynFieldIndex {
     pub(crate) inner: DynFieldIndexInner,
     /// Mmap-backed keymap store: `slot_id → serialised V`.
@@ -86,7 +134,7 @@ impl DynFieldIndex {
     /// Open (or create) a file-backed index in `dir`.
     ///
     /// The keymap is persisted in a `keymap/` subdirectory as an mmap-backed
-    /// [`BlobStore`].  On open the entries are iterated to rebuild the
+    /// `BlobStore`.  On open the entries are iterated to rebuild the
     /// in-memory `BTreeMap` ordering.
     pub fn open(value_type: IndexValueType, dir: &Path) -> std::io::Result<Self> {
         let bitmaps = if BlobStore::exists(dir) {
@@ -151,6 +199,12 @@ impl DynFieldIndex {
 
     /// Flush both the bitmap and keymap mmap stores to disk.
     ///
+    /// The bitmap store is flushed first, then the keymap store, as **two
+    /// independent `msync`s with no marker between them** — so a crash in
+    /// between leaves the two stores skewed. This call is *not* crash-atomic on
+    /// its own; the owner heals skew by replaying its log from the last
+    /// checkpoint offset. See the module-level *Crash atomicity* section.
+    ///
     /// The `dir` parameter is retained for API compatibility but is no longer
     /// used — all state is already in the mmap stores opened at construction.
     pub fn flush(&self, dir: &Path) -> std::io::Result<()> {
@@ -186,6 +240,28 @@ impl DynFieldIndex {
     /// removed entries' bytes accumulate as dead space until compacted.
     pub fn keymap_waste_ratio(&self) -> f64 {
         self.keymap_store.as_ref().map_or(0.0, |ks| ks.waste_ratio())
+    }
+
+    /// Snapshot of this field's on-disk blob growth and reclaimable waste, for
+    /// monitoring the append-only write amplification (worst for low-cardinality
+    /// fields — see `index/CLAUDE.md`). Cheap: reads cached header fields and
+    /// scans live slots, no blob deserialisation.
+    pub fn blob_stats(&self) -> IndexBlobStats {
+        let (bitmap_logical_bytes, bitmap_live_bytes) = match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.bitmap_blob_bytes(),
+            DynFieldIndexInner::Int(fi) => fi.bitmap_blob_bytes(),
+            DynFieldIndexInner::Str(fi) => fi.bitmap_blob_bytes(),
+        };
+        let (keymap_logical_bytes, keymap_live_bytes) = self.keymap_store.as_ref().map_or((0, 0), |ks| (ks.logical_bytes(), ks.live_bytes()));
+        IndexBlobStats {
+            distinct_values: self.distinct_count(),
+            bitmap_logical_bytes,
+            bitmap_live_bytes,
+            bitmap_waste_ratio: self.bitmap_waste_ratio(),
+            keymap_logical_bytes,
+            keymap_live_bytes,
+            keymap_waste_ratio: self.keymap_waste_ratio(),
+        }
     }
 
     /// Compact the bitmap store and/or the keymap store whose waste ratio
@@ -237,6 +313,18 @@ impl DynFieldIndex {
         }
     }
 
+    /// Whether any bitmap blob has failed to load or store since this index was
+    /// opened — i.e. a query may have silently dropped rows. The owner should
+    /// rebuild this field from the WAL when this is `true`. Latches once set.
+    /// See [`FieldIndex::corruption_detected`].
+    pub fn corruption_detected(&self) -> bool {
+        match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.corruption_detected(),
+            DynFieldIndexInner::Int(fi) => fi.corruption_detected(),
+            DynFieldIndexInner::Str(fi) => fi.corruption_detected(),
+        }
+    }
+
     /// Record that `row_id` has `value` for this field.
     ///
     /// If this is the first row for `value`, the new slot is also written to
@@ -244,8 +332,14 @@ impl DynFieldIndex {
     ///
     /// # Errors
     /// Returns an error string on type mismatch (runtime type of `value` does
-    /// not match the variant this index was created with).
+    /// not match the variant this index was created with), or when the value is
+    /// too large to index — the keymap stores the serialised value with a `u32`
+    /// length, so a value at or beyond 4 GiB is **rejected with a clean error**
+    /// rather than truncated/corrupted deep in the store. (Only a `Str` value can
+    /// reach the limit; `Bool`/`Int` are 1/8 bytes.) The caller can log and skip
+    /// the field; the document itself is unaffected.
     pub fn insert(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
+        check_value_size(value, u32::MAX as usize)?;
         match (&mut self.inner, value) {
             (DynFieldIndexInner::Bool(idx), IndexValue::Bool(v)) => {
                 let prev = idx.next_slot();
@@ -286,6 +380,57 @@ impl DynFieldIndex {
             }
         }
         Ok(())
+    }
+
+    /// Scalar update: make `value` the **only** value `row_id` holds for this
+    /// field, clearing it from every other bucket first.
+    ///
+    /// This is the safe single-call API for single-valued fields: it is
+    /// [`remove_all_for_row`](Self::remove_all_for_row) followed by
+    /// [`insert`](Self::insert), so the row ends up under exactly one value and
+    /// the caller cannot forget the clear step that a bare `insert` requires.
+    /// For genuinely multi-valued fields call [`insert`](Self::insert) directly.
+    ///
+    /// # Errors
+    /// Returns the same type-mismatch error as [`insert`](Self::insert). The row
+    /// has already been cleared from all buckets when this returns `Err`, so a
+    /// type mismatch leaves the field with no value for the row (matching the
+    /// clear-then-insert order callers used before this method existed).
+    pub fn set(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
+        self.remove_all_for_row(row_id);
+        self.insert(value, row_id)
+    }
+
+    /// Targeted scalar update when the caller knows `row_id`'s **previous** value
+    /// for this field: move the row from `old`'s bucket to `new`'s.
+    ///
+    /// This is `O(1)` — it touches at most the two affected buckets — unlike
+    /// [`set`](Self::set) / [`remove_all_for_row`](Self::remove_all_for_row),
+    /// which scan **every** value bucket to find the row (`O(distinct values)`,
+    /// painful for high-cardinality fields). The document layer already has the
+    /// old document, so it can supply `old` and avoid the scan.
+    ///
+    /// Cases: `old == new` is a no-op (value unchanged); `old = Some, new = None`
+    /// removes the row (field gone); `old = None, new = Some` is a plain insert
+    /// (first time / fresh row); `old = None, new = None` is a no-op. Use this
+    /// only when `old` is **known correct** — if it is stale the row would be
+    /// left in its real old bucket; callers that can't be sure should fall back
+    /// to [`set`](Self::set) / [`remove_all_for_row`](Self::remove_all_for_row).
+    ///
+    /// # Errors
+    /// Type mismatch from the `new` insert (same as [`insert`](Self::insert));
+    /// the `old` removal has already happened when this returns `Err`.
+    pub fn update(&mut self, old: Option<&IndexValue>, new: Option<&IndexValue>, row_id: u128) -> Result<(), String> {
+        if old == new {
+            return Ok(());
+        }
+        if let Some(o) = old {
+            self.remove(o, row_id);
+        }
+        match new {
+            Some(n) => self.insert(n, row_id),
+            None => Ok(()),
+        }
     }
 
     /// Remove `row_id` from the bucket for `value`.
@@ -381,6 +526,27 @@ impl DynFieldIndex {
 //   Str  → raw UTF-8 bytes
 
 #[inline]
+/// Byte length the value occupies in the keymap store (its serialised form).
+fn value_blob_len(value: &IndexValue) -> usize {
+    match value {
+        IndexValue::Bool(_) => 1,
+        IndexValue::Int(_) => 8,
+        IndexValue::Str(s) => s.len(),
+    }
+}
+
+/// Reject an indexed value whose serialised form exceeds `max_bytes` (the keymap
+/// store's `u32` length limit in production). Returns a clean error instead of
+/// letting the length truncate to `u32` and corrupt the store. `max_bytes` is a
+/// parameter so the bound can be exercised in tests without a multi-GiB value.
+fn check_value_size(value: &IndexValue, max_bytes: usize) -> Result<(), String> {
+    let len = value_blob_len(value);
+    if len > max_bytes {
+        return Err(format!("indexed field value of {len} bytes exceeds the {max_bytes}-byte index limit"));
+    }
+    Ok(())
+}
+
 fn serialize_bool(v: bool) -> Vec<u8> {
     vec![u8::from(v)]
 }
@@ -461,6 +627,103 @@ mod tests {
         idx.insert(&IndexValue::Int(-7), 20).unwrap();
         idx.insert(&IndexValue::Int(42), 30).unwrap();
         assert_eq!(idx.distinct_count(), 2);
+    }
+
+    #[test]
+    fn check_value_size_accepts_within_limit_and_rejects_over() {
+        // Injectable limit lets us exercise the over-limit branch with a tiny
+        // string instead of a 4 GiB one.
+        assert!(check_value_size(&IndexValue::Str("ab".into()), 3).is_ok());
+        assert!(check_value_size(&IndexValue::Str("abc".into()), 3).is_ok()); // boundary
+        let err = check_value_size(&IndexValue::Str("abcd".into()), 3).unwrap_err();
+        assert!(err.contains("exceeds the 3-byte"), "got: {err}");
+        // Bool/Int are 1/8 bytes — never hit the (production-sized) limit.
+        assert!(check_value_size(&IndexValue::Bool(true), 8).is_ok());
+        assert!(check_value_size(&IndexValue::Int(-5), 8).is_ok());
+    }
+
+    #[test]
+    fn insert_normal_values_are_within_the_u32_limit() {
+        // Regression: a realistic value must pass the size guard on the real path.
+        let mut idx = DynFieldIndex::new(IndexValueType::Str);
+        assert!(idx.insert(&IndexValue::Str("active".into()), 1).is_ok());
+        assert!(idx.set(&IndexValue::Str("archived".into()), 1).is_ok());
+        assert!(
+            idx.update(None, Some(&IndexValue::Str("done".into())), 2).is_ok(),
+            "update goes through the same value-size guard"
+        );
+    }
+
+    #[test]
+    fn set_replaces_scalar_value_through_public_api() {
+        // The scalar-update contract via the type-erased API: set() makes the
+        // given value the row's only value for the field.
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.set(&IndexValue::Int(42), 1).unwrap();
+        idx.set(&IndexValue::Int(7), 1).unwrap(); // update row 1: 42 -> 7
+        assert_eq!(query_int_eq(&idx, 7), vec![1], "row now matches its new value");
+        assert!(query_int_eq(&idx, 42).is_empty(), "row no longer matches its old value");
+        assert_eq!(idx.distinct_count(), 1, "no stale value bucket left behind");
+    }
+
+    #[test]
+    fn update_moves_row_between_buckets_without_scanning() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        // Many distinct values so the row's value is unrelated to bucket count;
+        // update must hit only the old + new buckets.
+        for v in 0..100i64 {
+            idx.insert(&IndexValue::Int(v), v as u128).unwrap();
+        }
+        // Row 5 currently has value 5; move it to a brand-new value 1000.
+        idx.update(Some(&IndexValue::Int(5)), Some(&IndexValue::Int(1000)), 5).unwrap();
+        assert_eq!(query_int_eq(&idx, 1000), vec![5]);
+        assert!(query_int_eq(&idx, 5).is_empty(), "old value no longer matches the row");
+        // Untouched rows are intact.
+        assert_eq!(query_int_eq(&idx, 50), vec![50]);
+    }
+
+    #[test]
+    fn update_unchanged_value_is_a_noop() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.insert(&IndexValue::Int(7), 1).unwrap();
+        let before = idx.distinct_count();
+        // old == new ⇒ nothing changes, no bucket churn.
+        idx.update(Some(&IndexValue::Int(7)), Some(&IndexValue::Int(7)), 1).unwrap();
+        assert_eq!(query_int_eq(&idx, 7), vec![1]);
+        assert_eq!(idx.distinct_count(), before);
+    }
+
+    #[test]
+    fn update_none_to_some_is_a_fresh_insert() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.update(None, Some(&IndexValue::Int(9)), 1).unwrap();
+        assert_eq!(query_int_eq(&idx, 9), vec![1]);
+    }
+
+    #[test]
+    fn update_some_to_none_removes_the_row() {
+        let mut idx = DynFieldIndex::new(IndexValueType::Int);
+        idx.insert(&IndexValue::Int(9), 1).unwrap();
+        idx.update(Some(&IndexValue::Int(9)), None, 1).unwrap();
+        assert!(query_int_eq(&idx, 9).is_empty());
+        assert_eq!(idx.distinct_count(), 0, "emptied value bucket is dropped");
+    }
+
+    #[test]
+    fn set_update_survives_reopen_with_keymap() {
+        // A scalar update through set() must persist correctly: the emptied old
+        // value's keymap entry is purged and the new one is durable across reopen.
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.set(&IndexValue::Int(42), 1).unwrap();
+            idx.set(&IndexValue::Int(7), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 7), vec![1]);
+        assert!(query_int_eq(&idx, 42).is_empty());
+        assert_eq!(idx.distinct_count(), 1);
     }
 
     #[test]
@@ -545,6 +808,36 @@ mod tests {
         }
         let idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 2);
+    }
+
+    #[test]
+    fn blob_stats_surfaces_low_cardinality_bloat_and_compaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
+        // Worst case for append-only write amplification: a single value (true)
+        // over many rows. Every insert re-appends the whole (growing) bitmap, so
+        // logical bytes balloon while the live footprint stays one small bitmap.
+        for row in 0..2_000u128 {
+            idx.insert(&IndexValue::Bool(true), row).unwrap();
+        }
+
+        let before = idx.blob_stats();
+        assert_eq!(before.distinct_values, 1);
+        assert!(
+            before.bitmap_logical_bytes > before.bitmap_live_bytes.saturating_mul(4),
+            "append-only rewrites must bloat logical >> live: {before:?}"
+        );
+        assert!(before.bitmap_waste_ratio > 0.5, "waste should be high under bloat: {before:?}");
+
+        // Compaction reclaims the dead space the metric reported.
+        idx.maybe_compact(0.0).unwrap();
+        let after = idx.blob_stats();
+        assert!(
+            after.bitmap_logical_bytes <= before.bitmap_logical_bytes / 2,
+            "compaction must shrink logical bytes: before={before:?} after={after:?}"
+        );
+        assert!(after.bitmap_waste_ratio < 0.1, "waste reads ≈0 after compaction: {after:?}");
+        assert_eq!(after.distinct_values, 1, "live data is unchanged by compaction");
     }
 
     #[test]
@@ -713,5 +1006,99 @@ mod tests {
             }
             _ => unreachable!("expected Str index"),
         }
+    }
+
+    // ── Bitmap/keymap skew (crash mid-flush) ────────────────────────────────
+    //
+    // flush() msyncs the bitmap store then the keymap store as two separate
+    // steps with no marker between them, so a crash in between leaves the two
+    // stores at different logical points. These tests reproduce that skew by
+    // rolling one store's files back to an earlier snapshot (each snapshot is
+    // itself a valid flushed state) and assert that reopening is non-fatal and
+    // that re-applying the op — as the owner's WAL replay would — reconciles it.
+    // See the module-level *Crash atomicity* docs.
+
+    fn query_int_eq(idx: &DynFieldIndex, v: i64) -> Vec<u128> {
+        match &idx.inner {
+            DynFieldIndexInner::Int(fi) => fi.evaluate(&Predicate::Eq(v)).iter().collect(),
+            _ => unreachable!("expected Int index"),
+        }
+    }
+
+    #[test]
+    fn skew_keymap_lags_bitmap_is_nonfatal_and_reconcilable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keymap = dir.path().join("keymap");
+
+        // Durable state knowing only value 100 (slot 0).
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(100), 0).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let ks_keys = std::fs::read(keymap.join("blobs.keys")).unwrap();
+        let ks_vals = std::fs::read(keymap.join("blobs.vals")).unwrap();
+
+        // Add value 200 (slot 1) and flush both stores durably.
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(200), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+
+        // Roll the KEYMAP back: the bitmap store still has slot 1's bitmap, but
+        // the keymap no longer maps slot 1 → 200 — exactly the state a crash
+        // after the bitmap flush but before the keymap flush leaves behind.
+        std::fs::write(keymap.join("blobs.keys"), &ks_keys).unwrap();
+        std::fs::write(keymap.join("blobs.vals"), &ks_vals).unwrap();
+
+        // Reopen: must not panic. The intact value survives; the torn value's
+        // bitmap is orphaned (no keymap entry) so it queries empty.
+        let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 100), vec![0], "intact value survives the skew");
+        assert_eq!(query_int_eq(&idx, 200), Vec::<u128>::new(), "torn value's keymap entry was lost");
+
+        // Owner reconciliation: replaying the same insert restores consistency.
+        idx.insert(&IndexValue::Int(200), 1).unwrap();
+        idx.flush(dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
+    }
+
+    #[test]
+    fn skew_bitmap_lags_keymap_is_nonfatal_and_reconcilable() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Durable state knowing only value 100 (slot 0).
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(100), 0).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+        let bm_keys = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let bm_vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+
+        // Add value 200 (slot 1) and flush both stores durably.
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(200), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+        }
+
+        // Roll the BITMAP store back: the keymap still maps slot 1 → 200, but the
+        // bitmap store lacks slot 1's bitmap — the reverse skew (crash after the
+        // keymap flush but before the bitmap flush).
+        std::fs::write(dir.path().join("blobs.keys"), &bm_keys).unwrap();
+        std::fs::write(dir.path().join("blobs.vals"), &bm_vals).unwrap();
+
+        // Reopen: must not panic. Value 200 is known to the ordering but its
+        // bitmap is missing, so it queries empty rather than crashing.
+        let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 100), vec![0], "intact value survives the skew");
+        assert_eq!(query_int_eq(&idx, 200), Vec::<u128>::new(), "torn value's bitmap is missing");
+
+        // Re-applying the insert (WAL replay) restores the missing bitmap bit.
+        idx.insert(&IndexValue::Int(200), 1).unwrap();
+        idx.flush(dir.path()).unwrap();
+        assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
     }
 }

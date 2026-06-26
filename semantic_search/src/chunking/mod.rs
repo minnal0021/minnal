@@ -30,10 +30,12 @@
 //! with the *same* values used to index documents, or Pass-1 ColBERT MaxSim
 //! compares mismatched chunkings (see `semantic_search/CLAUDE.md`).
 //!
-//! The sentence splitter is a deterministic heuristic (a terminator `.`/`!`/`?`
-//! followed by whitespace ends a sentence). It is intentionally dependency-free
-//! and will mis-split abbreviations such as `U.S.`; the previous ML-based
-//! splitter is not reproducible without a new dependency.
+//! The sentence splitter is a deterministic, intentionally dependency-free
+//! heuristic (a terminator `.`/`!`/`?` followed by whitespace ends a sentence).
+//! It mis-handles abbreviations, spaced initials, and list markers; the previous
+//! ML-based splitter is not reproducible without a new dependency. See
+//! [`split_sentences`] for the enumerated limitations and the characterisation
+//! tests that pin each one.
 
 /// Which boundary to split raw text on before windowing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +85,32 @@ pub fn split_words(text: &str) -> Vec<String> {
 /// A run of one or more terminators (`.`, `!`, `?`) that is immediately followed
 /// by whitespace (or the end of the text) ends a sentence; the terminators stay
 /// with the sentence and the intervening whitespace is dropped. Each sentence is
-/// trimmed and empty results are discarded.
+/// trimmed and empty results are discarded. This mirrors a `split on (?<=[.!?])\s+`
+/// regex.
 ///
-/// This mirrors a `split on (?<=[.!?])\s+` regex. It does not understand
-/// abbreviations (`U.S.` splits into `U.` / `S.`).
+/// # Known limitations (intentional, dependency-free heuristic)
+///
+/// The rule is purely "terminator + whitespace", with no lexical knowledge, so it
+/// mis-handles several common constructs. The behaviour on each is pinned by the
+/// `split_sentences_*` characterisation tests; the trade-off is accepting these in
+/// exchange for being dependency-free (the previous ML splitter is not reproducible
+/// without a new dependency). Because chunking is an on-disk decision, changing the
+/// splitter requires a full re-index — see `semantic_search/CLAUDE.md`.
+///
+/// - **Abbreviations** (`U.S.`, `Inc.`, `etc.`): a dot *inside* the abbreviation is
+///   followed by a letter, so it is correctly not a boundary — but the abbreviation's
+///   *trailing* dot before a space is mis-read as a sentence end, so `"The U.S. economy"`
+///   splits after `"U.S."`.
+/// - **Spaced initials** (`J. R. R. Tolkien`): each `X.` is dot+space, so every
+///   initial is split into its own "sentence".
+/// - **Numbered/bulleted lists** (`1.`, `2.`): a list marker is digit+dot+space and
+///   reads as a sentence end, so list items fragment.
+/// - **Decimals / versions** (`3.14`, `2.0`): a dot between digits is not followed by
+///   whitespace, so these are *correctly* kept intact.
+/// - **Ellipses** (`...`): a run of terminators before whitespace is one boundary, so
+///   an ellipsis ends a sentence.
+/// - **No maximum length**: a long run with no terminator stays a single unit (and
+///   therefore a single windowed chunk).
 pub fn split_sentences(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -228,6 +252,65 @@ mod tests {
     #[test]
     fn split_sentences_single_no_terminator() {
         assert_eq!(split_sentences("just a phrase"), vec!["just a phrase"]);
+    }
+
+    // ── split_sentences: documented heuristic limitations ─────────────────────
+    //
+    // These are *characterisation* tests: they pin the current dependency-free
+    // heuristic's behaviour on the hard cases (abbreviations, initials, decimals,
+    // ellipses, list markers, long sentences) so the trade-off is explicit and a
+    // change is caught. They assert what the splitter *does*, not what an ideal
+    // sentence segmenter would do — see the `split_sentences` doc comment.
+
+    #[test]
+    fn split_sentences_abbreviation_without_internal_space_ends_sentence() {
+        // "U.S." has no whitespace after the first dot (followed by `S`), so that
+        // dot is not a boundary — the abbreviation stays intact. But the trailing
+        // "S." IS followed by whitespace, so it is (mis)treated as a sentence end:
+        // "The U.S. economy grew." splits after the abbreviation.
+        assert_eq!(split_sentences("The U.S. economy grew."), vec!["The U.S.", "economy grew."],);
+    }
+
+    #[test]
+    fn split_sentences_spaced_initials_split_per_initial() {
+        // With a space after each dot, every initial looks like a sentence end.
+        assert_eq!(split_sentences("J. R. R. Tolkien wrote it."), vec!["J.", "R.", "R.", "Tolkien wrote it."],);
+    }
+
+    #[test]
+    fn split_sentences_decimal_and_version_stay_intact() {
+        // Dots inside numbers are followed by digits, not whitespace — not boundaries.
+        assert_eq!(
+            split_sentences("Version 2.0 ships at 3.30 today."),
+            vec!["Version 2.0 ships at 3.30 today."]
+        );
+    }
+
+    #[test]
+    fn split_sentences_ellipsis_ends_a_sentence() {
+        // A run of terminators ("...") followed by whitespace is one boundary.
+        assert_eq!(split_sentences("Wait... what happened?"), vec!["Wait...", "what happened?"]);
+    }
+
+    #[test]
+    fn split_sentences_numbered_list_markers_split() {
+        // "1." / "2." are a digit + dot + space — each marker is read as a sentence
+        // end, so numbered lists fragment: the marker attaches to the *preceding*
+        // text and the item text attaches to the *next* marker.
+        assert_eq!(
+            split_sentences("Steps: 1. Mix flour 2. Add water 3. Bake"),
+            vec!["Steps: 1.", "Mix flour 2.", "Add water 3.", "Bake"],
+        );
+    }
+
+    #[test]
+    fn split_sentences_no_maximum_length() {
+        // There is no max-sentence cap: a long run with no terminator is one unit.
+        // (Windowing happens over whole sentences, so an unusually long sentence
+        // yields one large chunk.)
+        let long = "word ".repeat(200);
+        let long = long.trim();
+        assert_eq!(split_sentences(long), vec![long.to_string()]);
     }
 
     // ── sliding_windows ───────────────────────────────────────────────────────

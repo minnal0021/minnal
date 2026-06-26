@@ -45,10 +45,17 @@ pub enum RawValue {
 
 /// A parsed (but not yet evaluated) query expression.
 ///
+/// Operator precedence is the conventional boolean ordering — `NOT` binds
+/// tightest, then `AND`, then `OR` binds loosest — so an unparenthesised
+/// `a = 1 OR b = 2 AND c = 3` parses as `a = 1 OR (b = 2 AND c = 3)`, and
+/// `NOT a = 1 AND b = 2` as `(NOT a = 1) AND b = 2`. `AND` and `OR` are each
+/// left-associative; parentheses override grouping.
+///
 /// ```text
-/// query    = expr EOF
-/// expr     = term ( ("AND" | "OR") term )*
-/// term     = "NOT" term | "(" expr ")" | predicate
+/// query     = or_expr EOF
+/// or_expr   = and_expr ( "OR" and_expr )*      // OR binds loosest
+/// and_expr  = term ( "AND" term )*             // AND binds tighter than OR
+/// term      = "NOT" term | "(" or_expr ")" | predicate   // NOT binds tightest
 /// predicate = FIELD OP VALUE
 /// OP        = "=" | "!=" | "<" | "<=" | ">" | ">=" | "IN"
 /// VALUE     = string | integer | bool | "(" value_list ")"
@@ -104,26 +111,36 @@ impl<'a> Parser<'a> {
 
     // ── Grammar rules ──────────────────────────────────────────────────
 
-    /// expr = term ( ("AND" | "OR") term )*
-    ///
-    /// AND and OR have the same precedence; left-associative.  Parentheses
-    /// override grouping.
+    /// expr = or_expr  (entry point; OR is the loosest-binding operator)
     fn parse_expr(&mut self) -> Result<RawExpr, QueryError> {
+        self.parse_or()
+    }
+
+    /// or_expr = and_expr ( "OR" and_expr )*
+    ///
+    /// `OR` has the lowest precedence and is left-associative, so each operand
+    /// is a full `AND` chain — `a AND b OR c AND d` groups as
+    /// `(a AND b) OR (c AND d)`.
+    fn parse_or(&mut self) -> Result<RawExpr, QueryError> {
+        let mut left = self.parse_and()?;
+        while self.current == Token::Or {
+            self.advance()?;
+            let right = self.parse_and()?;
+            left = RawExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// and_expr = term ( "AND" term )*
+    ///
+    /// `AND` binds tighter than `OR` and is left-associative. Parentheses (via
+    /// `parse_term`) override grouping.
+    fn parse_and(&mut self) -> Result<RawExpr, QueryError> {
         let mut left = self.parse_term()?;
-        loop {
-            match &self.current {
-                Token::And => {
-                    self.advance()?;
-                    let right = self.parse_term()?;
-                    left = RawExpr::And(Box::new(left), Box::new(right));
-                }
-                Token::Or => {
-                    self.advance()?;
-                    let right = self.parse_term()?;
-                    left = RawExpr::Or(Box::new(left), Box::new(right));
-                }
-                _ => break,
-            }
+        while self.current == Token::And {
+            self.advance()?;
+            let right = self.parse_term()?;
+            left = RawExpr::And(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -261,6 +278,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_preserves_multibyte_utf8_string_literal() {
+        // The lexer decodes a UTF-8 string literal; the parser must carry the
+        // multi-byte payload through to RawValue::Str byte-for-byte (Tamil +
+        // emoji), not just ASCII. Regression for the StrLit → RawValue::Str hand-off.
+        let expr = parse("name = 'மின்னல் ⚡'").unwrap();
+        assert_eq!(
+            expr,
+            RawExpr::Predicate {
+                field: "name".into(),
+                op: Op::Eq,
+                value: RawValue::Str("மின்னல் ⚡".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_preserves_multibyte_utf8_in_list() {
+        // UTF-8 must also survive the IN-list path, which builds RawValue::List.
+        let expr = parse("city IN ('東京', 'Köln')").unwrap();
+        assert_eq!(
+            expr,
+            RawExpr::Predicate {
+                field: "city".into(),
+                op: Op::In,
+                value: RawValue::List(vec![RawValue::Str("東京".into()), RawValue::Str("Köln".into())]),
+            }
+        );
+    }
+
+    #[test]
     fn parse_and_expression_produces_and_node() {
         let expr = parse("age > 18 AND active = true").unwrap();
         assert!(matches!(expr, RawExpr::And(_, _)));
@@ -375,5 +422,86 @@ mod tests {
         } else {
             panic!("expected And at top level");
         }
+    }
+
+    // ── Operator precedence: NOT > AND > OR ─────────────────────────────────
+
+    fn pred(field: &str, n: i64) -> RawExpr {
+        RawExpr::Predicate {
+            field: field.into(),
+            op: Op::Eq,
+            value: RawValue::Int(n),
+        }
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or_on_the_right() {
+        // a = 1 OR b = 2 AND c = 3  ==>  a = 1 OR (b = 2 AND c = 3)
+        let expr = parse("a = 1 OR b = 2 AND c = 3").unwrap();
+        let expected = RawExpr::Or(
+            Box::new(pred("a", 1)),
+            Box::new(RawExpr::And(Box::new(pred("b", 2)), Box::new(pred("c", 3)))),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or_on_the_left() {
+        // a = 1 AND b = 2 OR c = 3  ==>  (a = 1 AND b = 2) OR c = 3
+        let expr = parse("a = 1 AND b = 2 OR c = 3").unwrap();
+        let expected = RawExpr::Or(
+            Box::new(RawExpr::And(Box::new(pred("a", 1)), Box::new(pred("b", 2)))),
+            Box::new(pred("c", 3)),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn and_chains_group_under_each_or_operand() {
+        // a=1 AND b=2 OR c=3 AND d=4  ==>  (a AND b) OR (c AND d)
+        let expr = parse("a = 1 AND b = 2 OR c = 3 AND d = 4").unwrap();
+        let expected = RawExpr::Or(
+            Box::new(RawExpr::And(Box::new(pred("a", 1)), Box::new(pred("b", 2)))),
+            Box::new(RawExpr::And(Box::new(pred("c", 3)), Box::new(pred("d", 4)))),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn or_is_left_associative() {
+        // a = 1 OR b = 2 OR c = 3  ==>  ((a OR b) OR c)
+        let expr = parse("a = 1 OR b = 2 OR c = 3").unwrap();
+        let expected = RawExpr::Or(
+            Box::new(RawExpr::Or(Box::new(pred("a", 1)), Box::new(pred("b", 2)))),
+            Box::new(pred("c", 3)),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and() {
+        // NOT a = 1 AND b = 2  ==>  (NOT a = 1) AND b = 2
+        let expr = parse("NOT a = 1 AND b = 2").unwrap();
+        let expected = RawExpr::And(Box::new(RawExpr::Not(Box::new(pred("a", 1)))), Box::new(pred("b", 2)));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn not_binds_tighter_than_or() {
+        // NOT a = 1 OR b = 2  ==>  (NOT a = 1) OR b = 2
+        let expr = parse("NOT a = 1 OR b = 2").unwrap();
+        let expected = RawExpr::Or(Box::new(RawExpr::Not(Box::new(pred("a", 1)))), Box::new(pred("b", 2)));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn parens_override_precedence() {
+        // (a = 1 OR b = 2) AND c = 3  ==>  (a OR b) AND c  — explicit grouping wins
+        let expr = parse("(a = 1 OR b = 2) AND c = 3").unwrap();
+        let expected = RawExpr::And(
+            Box::new(RawExpr::Or(Box::new(pred("a", 1)), Box::new(pred("b", 2)))),
+            Box::new(pred("c", 3)),
+        );
+        assert_eq!(expr, expected);
     }
 }

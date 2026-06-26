@@ -133,7 +133,26 @@ impl DocStoreApiConfig {
         let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
         let config: Self = toml::from_str(&content).map_err(|e| format!("cannot parse '{}': {e}", path.display()))?;
         config.validate_supported_models()?;
+        config.validate_semantic_search()?;
         Ok(config)
+    }
+
+    /// Validate the `[semantic_search]` knobs that have hard implementation limits.
+    ///
+    /// `number_of_bits_for_dense_quantisation` feeds RaBitQ multi-bit quantisation,
+    /// which only supports a bounded range: each quantised code is packed into a
+    /// `u8` and an out-of-range width panics (or silently truncates) deep in the
+    /// indexing path. Reject it at startup instead.
+    fn validate_semantic_search(&self) -> Result<(), String> {
+        use semantic_search::quantisation::rabitq::{MAX_MULTI_BIT_QUANTISATION_BITS, MIN_MULTI_BIT_QUANTISATION_BITS};
+        let bits = self.semantic_search.number_of_bits_for_dense_quantisation;
+        if !(MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS).contains(&bits) {
+            return Err(format!(
+                "semantic_search.number_of_bits_for_dense_quantisation must be in \
+                 {MIN_MULTI_BIT_QUANTISATION_BITS}..={MAX_MULTI_BIT_QUANTISATION_BITS}, got {bits}"
+            ));
+        }
+        Ok(())
     }
 
     /// Check that every entry in `semantic_search.supported_models`:
@@ -522,7 +541,8 @@ pub struct SemanticSearchSection {
     /// Number of bits used to quantise each embedding dimension.
     ///
     /// Higher values give better recall at the cost of more memory and CPU.
-    /// Must be greater than 1.  Default: 8.
+    /// Must be in `2..=8` (validated at startup); each quantised code is packed
+    /// into a `u8`, so wider widths cannot be represented.  Default: 8.
     #[serde(default = "default_number_of_bits_for_dense_quantisation")]
     pub number_of_bits_for_dense_quantisation: usize,
 
@@ -589,6 +609,18 @@ pub struct SemanticSearchSection {
     /// evicted by the TTL worker. Default: 86400 (1 day).
     #[serde(default = "default_query_embedding_cache_ttl_secs")]
     pub query_embedding_cache_ttl_secs: u64,
+
+    /// Overall timeout, in seconds, for a single embedding-service HTTP request
+    /// (connect + send + receive). Caps how long indexing/search can block on a
+    /// slow or hanging service. Default: 30.
+    #[serde(default = "default_embedding_request_timeout_secs")]
+    pub embedding_request_timeout_secs: u64,
+
+    /// Timeout, in seconds, for just the TCP connect phase to the embedding
+    /// service. Fails fast when the host is unreachable. Should be shorter than
+    /// `embedding_request_timeout_secs` (the overall cap). Default: 10.
+    #[serde(default = "default_embedding_connect_timeout_secs")]
+    pub embedding_connect_timeout_secs: u64,
 }
 
 impl Default for SemanticSearchSection {
@@ -606,6 +638,8 @@ impl Default for SemanticSearchSection {
             window_size: default_window_size(),
             sliding_size: default_sliding_size(),
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
+            embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
+            embedding_connect_timeout_secs: default_embedding_connect_timeout_secs(),
         }
     }
 }
@@ -639,6 +673,12 @@ fn default_sliding_size() -> usize {
 }
 fn default_query_embedding_cache_ttl_secs() -> u64 {
     86_400
+}
+fn default_embedding_request_timeout_secs() -> u64 {
+    30
+}
+fn default_embedding_connect_timeout_secs() -> u64 {
+    10
 }
 
 // ── Resolved semantic-search config ──────────────────────────────────────────
@@ -682,6 +722,12 @@ pub struct ResolvedSemanticSearchConfig {
 
     /// Time-to-live for cached query embeddings in the system-wide cache.
     pub query_embedding_cache_ttl: std::time::Duration,
+
+    /// Overall timeout for a single embedding-service HTTP request.
+    pub embedding_request_timeout: std::time::Duration,
+
+    /// Timeout for just the TCP connect phase to the embedding service.
+    pub embedding_connect_timeout: std::time::Duration,
 }
 
 impl SemanticSearchSection {
@@ -704,6 +750,59 @@ impl SemanticSearchSection {
             sliding_size: self.sliding_size,
             first_pass_sparse_search_top_k: self.first_pass_sparse_search_top_k,
             query_embedding_cache_ttl: std::time::Duration::from_secs(self.query_embedding_cache_ttl_secs),
+            embedding_request_timeout: std::time::Duration::from_secs(self.embedding_request_timeout_secs),
+            embedding_connect_timeout: std::time::Duration::from_secs(self.embedding_connect_timeout_secs),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_bits(bits: usize) -> DocStoreApiConfig {
+        let mut cfg = DocStoreApiConfig::default();
+        cfg.semantic_search.number_of_bits_for_dense_quantisation = bits;
+        cfg
+    }
+
+    #[test]
+    fn validate_semantic_search_accepts_supported_bit_widths() {
+        for bits in 2..=8 {
+            assert!(config_with_bits(bits).validate_semantic_search().is_ok(), "bits={bits} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_semantic_search_rejects_out_of_range_bit_widths() {
+        // 0/1 are below the multi-bit range (1 is the single-bit path); 9 silently
+        // truncates the u8 code; 10+ would index the START table out of bounds.
+        for bits in [0usize, 1, 9, 10, 64] {
+            let err = config_with_bits(bits).validate_semantic_search().unwrap_err();
+            assert!(
+                err.contains("number_of_bits_for_dense_quantisation"),
+                "bits={bits} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_bit_width_is_valid() {
+        let cfg = DocStoreApiConfig::default();
+        assert_eq!(cfg.semantic_search.number_of_bits_for_dense_quantisation, 8);
+        assert!(cfg.validate_semantic_search().is_ok());
+    }
+
+    #[test]
+    fn resolve_carries_embedding_timeouts() {
+        // Defaults: request 30s, connect 10s. resolve must surface both as Durations,
+        // with connect shorter than the overall request cap.
+        let section = SemanticSearchSection::default();
+        assert_eq!(section.embedding_request_timeout_secs, 30);
+        assert_eq!(section.embedding_connect_timeout_secs, 10);
+        let resolved = section.resolve(Path::new("/tmp/db"));
+        assert_eq!(resolved.embedding_request_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(resolved.embedding_connect_timeout, std::time::Duration::from_secs(10));
+        assert!(resolved.embedding_connect_timeout < resolved.embedding_request_timeout);
     }
 }

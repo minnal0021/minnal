@@ -109,8 +109,8 @@ All quantised entries share the same `VectorIndex` struct:
 The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
 
 - A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
-- A pre-computed **neighbour graph** maps each cluster to its k-nearest neighbouring clusters (built in-memory at startup, not persisted).
-- During the first-pass search, the top-`n_probes` clusters across all query embeddings are probed — the union set is scanned once.
+- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid and returns the `n_probes` nearest (using `select_nth_unstable` to select the top-`n_probes` in ~O(C) rather than a full O(C log C) sort). The union of these sets across all query embeddings is scanned once.
+- **There is deliberately no neighbour graph / approximate cluster traversal.** At the cluster counts in use (hundreds), the exhaustive scan is microseconds and returns the *exact* nearest clusters, so a graph-based approximation would trade recall for no speed-up — the per-centroid distance computation dominates regardless. A sparse neighbour graph would only pay off at much larger cluster counts; revisit it (behind a config flag, with recall/latency benchmarking) only if the cluster file grows by orders of magnitude.
 
 Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
 
@@ -344,7 +344,7 @@ All parameters are under `[semantic_search]` in the TOML config:
 | RaBitQ quantisation (encode + decode) | `semantic_search/src/embedding/quantisation/rabitq/mod.rs` |
 | `VectorIndex` struct + `VectorKvStore` trait | `semantic_search/src/embedding/index/vector_index.rs` |
 | Distance estimators (SingleBit, MultiBit) | `semantic_search/src/embedding/index/distance_estimator.rs` |
-| Cluster index + neighbour graph | `semantic_search/src/embedding/cluster/mod.rs` |
+| Cluster index (centroids) + exact top-`n_probes` probing | `semantic_search/src/embedding/cluster/mod.rs` |
 | Composite key encoding (cluster ‖ doc_id) | `semantic_search/src/embedding/index/composite_key.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_doc_store/src/vector_kv.rs` |
 | Async vector-index background worker | `minnal_doc_store/src/vec_index_worker.rs` |

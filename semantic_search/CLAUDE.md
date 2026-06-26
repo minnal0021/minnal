@@ -41,7 +41,7 @@ A third namespace, `{ns}_sparse_vector_meta`, records which clusters each docume
 
 **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
 1. Use the sparse query chunk embeddings (or fetch from the `system_qemb_cache` TTL namespace).
-2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks.
+2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks. This is an **exact, exhaustive** scan — `find_top_n_cluster_ids` computes the distance to *every* centroid and selects the `n_probes` nearest (`select_nth_unstable`, ~O(C)). There is **no neighbour graph / approximate traversal**: at the cluster counts in use the exact scan is microseconds and the per-centroid distance dominates, so a graph approximation would cost recall for no speed-up (revisit only at far larger, sparse cluster counts).
 3. `scan_sparse_cluster(cluster_id)` for each probed cluster in parallel.
 4. Apply the optional `doc_filter` (RoaringBitmap predicate) — skip non-matching docs.
 5. Score with `SingleBitQuanDotProductEstimator` using **ColBERT MaxSim**:
@@ -67,6 +67,10 @@ Requests use a **batch interface** (chunking happens in minnal, not the service)
 - `GET {base_url}/healthcheck`
 
 A whole-text ("single") embedding is just a one-element `payloads` array; chunked embeddings send one payload per sliding-window chunk. The `{model}` path segment from the old API is gone (the model is fixed server-side). Default base URL: `http://localhost:8001`.
+
+### Startup probe & the model-pinning gap (operational, not enforced)
+
+`check_embedding_service` (called once at startup, non-fatal) does more than ping `/healthcheck`: it embeds a fixed probe payload through **both** the document and query endpoints and validates the returned **dimension** against `embedding_dim` (a service on a different dimension fails the probe instead of degrading search silently), then soft-warns if the probe vector is not unit-norm. **What it cannot validate is the model itself** — the service exposes no model family/version metadata, so a *wrong model with the same dimension* passes every check while the bundled cluster centroids are for a different embedding distribution (silently degraded recall). **Model pinning is therefore an operational guarantee, not an enforced one:** deployment must ensure `[[semantic_search.supported_models]]` / `cluster_path` match the model the service actually serves. If the service later exposes a model/version endpoint, enforce it here.
 
 ## Cluster centroids
 

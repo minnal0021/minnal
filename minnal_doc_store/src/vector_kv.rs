@@ -1434,4 +1434,30 @@ mod query_embedding_cache_tests {
         // Clearing an already-empty cache is a no-op that reports zero.
         assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
     }
+
+    /// The cache is keyed by query text **only** — it carries no chunk-config
+    /// version, so a change to `window_size` / `sliding_size` does not invalidate
+    /// it automatically (the documented limitation; remediation is an explicit
+    /// `clear_cached_query_embeddings` + corpus re-index, or TTL expiry). This pins
+    /// the remediation half: once the same query is re-embedded under the new
+    /// chunking, the fresh entry overwrites the stale one (different chunk count).
+    #[tokio::test]
+    async fn test_cache_reembed_overwrites_with_new_chunking() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        let dense = vec![1.0f32, 0.0];
+
+        // Old chunking: 2 sparse chunks.
+        let old_sparse = vec![vec![0.1f32, 0.2], vec![0.3f32, 0.4]];
+        put_cached_query_embedding(&db, "q", &dense, &old_sparse, TEST_TTL).await;
+        let (_, cached) = get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap();
+        assert_eq!(cached.len(), 2, "stale chunking is served until re-embedded (keyed by text only)");
+
+        // New chunking for the SAME query text (e.g. after a window_size change +
+        // re-embed): 4 sparse chunks. The fresh put overwrites the stale entry.
+        let new_sparse = vec![vec![0.1f32, 0.2], vec![0.3f32, 0.4], vec![0.5f32, 0.6], vec![0.7f32, 0.8]];
+        put_cached_query_embedding(&db, "q", &dense, &new_sparse, TEST_TTL).await;
+        let (_, cached) = get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap();
+        assert_eq!(cached, new_sparse, "re-embedding the same query must overwrite with the new chunking");
+    }
 }

@@ -29,12 +29,8 @@ const GC_JOURNAL_MAGIC: [u8; 4] = *b"GCJN";
 const GC_JOURNAL_VERSION: u32 = 1;
 const GC_JOURNAL_HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + bucket + checksum + num_entries
 
-/// fsync a directory so that a create/rename/unlink of one of its entries is
-/// durable (the file's own `sync_all` only persists its *contents*, not the
-/// directory entry that makes it visible after a crash).
-pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
+// Re-exported from `support` so all directory-fsync callers share one impl.
+pub use crate::support::fsync_dir;
 
 /// A single entry in the GC journal: maps a key to its new value-log pointer.
 #[derive(Debug, Clone)]
@@ -54,7 +50,13 @@ impl GCJournal {
         base_path.join(format!("gc_journal_{}.bin", bucket))
     }
 
-    /// Write a journal file for the given bucket. The file is fsynced before returning.
+    /// Write a journal file for the given bucket. Both the file **and** the
+    /// containing directory are fsynced before returning, so the journal's
+    /// directory entry survives a crash on its own — callers must not rely on a
+    /// later marker write to make the journal durable (the commit marker is
+    /// written right after and also fsyncs the dir, but that is a separate,
+    /// non-load-bearing redundancy: keeping journal durability self-contained
+    /// means a recovery that sees a committed marker can always read the journal).
     pub fn write(
         base_path: &Path,
         bucket: u32,
@@ -87,6 +89,11 @@ impl GCJournal {
         file.write_all(&(entries.len() as u32).to_le_bytes())?;
         file.write_all(&payload)?;
         file.sync_all()?;
+        drop(file);
+        // fsync the directory so the journal's *name* (not just its contents) is
+        // durable — a create only adds a dirent, which the file's own sync_all
+        // does not persist.
+        fsync_dir(base_path)?;
 
         Ok(path)
     }
@@ -162,11 +169,16 @@ impl GCJournal {
         Some((bucket, entries))
     }
 
-    /// Delete the journal file for a given bucket.
+    /// Delete the journal file for a given bucket (idempotent), fsyncing the
+    /// directory so the unlink is durable — symmetric with
+    /// [`delete_commit_marker`](Self::delete_commit_marker). A non-durable
+    /// unlink is not a correctness bug (a journal whose marker is gone is
+    /// discarded, never replayed, by recovery) but persisting it keeps the
+    /// directory free of orphaned journals after a crash.
     pub fn delete(base_path: &Path, bucket: u32) -> std::io::Result<()> {
         let path = Self::journal_path(base_path, bucket);
         match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => fsync_dir(base_path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
