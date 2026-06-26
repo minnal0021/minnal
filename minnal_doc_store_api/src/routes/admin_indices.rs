@@ -461,6 +461,20 @@ pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<J
     Ok(Json(serde_json::json!({ "cleared": cleared })))
 }
 
+// ── GET /admin/indices/vector/corruption-metrics ──────────────────────────────
+
+/// `GET /admin/indices/vector/corruption-metrics` — cumulative counts of vector
+/// entries skipped during search because their bytes failed to deserialize.
+///
+/// Process-wide, monotonically increasing since startup (sample twice for a rate).
+/// A non-zero/rising value means stored vectors are corrupt and queries are
+/// silently degraded — run the validating reconcile
+/// ([`POST /admin/indices/vector/reconcile`](vector_reconcile)) to re-embed the
+/// affected documents. Split by pass (`sparse` = Pass 1, `dense` = Pass 2).
+pub async fn vector_corruption_metrics() -> Json<semantic_search::metrics::VectorMetricsSnapshot> {
+    Json(semantic_search::metrics::snapshot())
+}
+
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────
 
 /// `POST /admin/indices/vector/reconcile` — **validating** vector-index reconciliation.

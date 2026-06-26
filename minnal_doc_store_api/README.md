@@ -1133,6 +1133,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
 | `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
 | `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
+| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Cumulative counts of vector entries skipped during search due to corrupt bytes |
 | `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
@@ -1186,6 +1187,21 @@ curl http://localhost:8080/admin/indices/progress
 `progress_pct = indexed_approx / (indexed_approx + pending) * 100`. Exhausted entries are excluded from the denominator.
 
 Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace.
+
+---
+
+#### `GET /admin/indices/vector/corruption-metrics`
+
+Cumulative counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug). Process-wide and monotonically increasing since startup — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`.
+
+A rising value means stored vectors are corrupt and queries are silently degraded; run the validating [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) to re-embed the affected documents.
+
+```bash
+curl http://localhost:8080/admin/indices/vector/corruption-metrics
+```
+```json
+{ "sparse_corrupt_skipped": 0, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 0 }
+```
 
 ---
 

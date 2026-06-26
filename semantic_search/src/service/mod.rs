@@ -389,6 +389,7 @@ where
                     Err(e) => {
                         // Corrupt sparse entry: skip it, but make it visible so a degraded
                         // index is distinguishable from "no semantic match".
+                        crate::metrics::record_sparse_corrupt_skipped();
                         warn!(
                             "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
                             doc_id_hex(doc_id),
@@ -490,6 +491,7 @@ where
                 Err(e) => {
                     // Corrupt dense entry: skip it, but log it so index corruption is
                     // not mistaken for a candidate simply scoring poorly in pass 2.
+                    crate::metrics::record_dense_corrupt_skipped();
                     warn!(
                         "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
                         doc_id_hex(doc_id),
@@ -1288,6 +1290,8 @@ mod tests {
             ..Default::default()
         };
 
+        // Corruption counters are process-global, so compare deltas with `>=`.
+        let before = crate::metrics::snapshot();
         let results = search(
             &config,
             &cluster_index,
@@ -1298,6 +1302,17 @@ mod tests {
             None,
         )
         .await;
+        let after = crate::metrics::snapshot();
+
+        // The corrupt sparse and corrupt dense skips each bumped their counter.
+        assert!(
+            after.sparse_corrupt_skipped >= before.sparse_corrupt_skipped + 1,
+            "corrupt sparse skip must increment the metric",
+        );
+        assert!(
+            after.dense_corrupt_skipped >= before.dense_corrupt_skipped + 1,
+            "corrupt dense skip must increment the metric",
+        );
 
         // The valid doc survives; neither corrupt entry crashes the search or appears.
         let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();

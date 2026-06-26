@@ -73,6 +73,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/vector/queue/summary", get(admin_indices::vector_queue_summary))
         .route("/admin/indices/vector/queue/retried", get(admin_indices::vector_queue_retried))
         .route("/admin/indices/vector/query-cache", delete(admin_indices::vector_query_cache_clear))
+        .route("/admin/indices/vector/corruption-metrics", get(admin_indices::vector_corruption_metrics))
         .route("/admin/indices/vector/reconcile", post(admin_indices::vector_reconcile))
         // Admin / indices — per-namespace monitoring & operations
         .route("/admin/indices/{ns}/progress", get(admin_indices::progress_ns))
