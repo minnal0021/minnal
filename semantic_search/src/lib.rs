@@ -1,6 +1,7 @@
 pub mod chunking;
 pub mod cluster;
 pub mod index;
+pub mod metrics;
 pub mod quantisation;
 pub mod service;
 pub(crate) mod simd;

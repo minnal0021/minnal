@@ -340,6 +340,48 @@ pub async fn has_complete_vector_index(db: &AsyncDb, namespace: &str, doc_id_byt
     Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
 }
 
+/// Like [`has_complete_vector_index`], but also verifies the committed bytes
+/// **deserialize** — catching entries that are present but corrupt, which the
+/// presence-only check counts as indexed.
+///
+/// Reads and deserializes the sparse-meta, every sparse composite entry, and the
+/// dense entry for `doc_id_bytes`. Returns `false` if any is missing, undecodable,
+/// or fails [`VectorIndex::list_from_bytes`], so the *validating* reconcile pass
+/// re-enqueues the document (a re-embed regenerates both halves idempotently).
+///
+/// Substantially more expensive than [`has_complete_vector_index`] — it value-reads
+/// and deserializes per entry rather than checking key presence — so only the
+/// on-demand validating reconcile (`reconcile_all_vector_indexes(.., check_bytes=true)`)
+/// uses it; the cheap startup pass keeps the presence check.
+pub async fn has_valid_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<bool, DocStoreError> {
+    // Sparse meta: present and decodable into cluster IDs.
+    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? else {
+        return Ok(false);
+    };
+    let Some(cluster_ids) = decode_sparse_meta(&meta_bytes) else {
+        return Ok(false);
+    };
+
+    // Each sparse composite entry: present and deserializes.
+    let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
+    for cluster_id in &cluster_ids {
+        let Some(bytes) = sparse_ns.get(composite_key::encode(*cluster_id, doc_id_bytes)).await? else {
+            return Ok(false);
+        };
+        if VectorIndex::list_from_bytes(&bytes).is_err() {
+            return Ok(false);
+        }
+    }
+
+    // Dense: present and deserializes.
+    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
+    let Some(dense_bytes) = dense_ns.get(doc_id_bytes.to_vec()).await? else {
+        return Ok(false);
+    };
+    Ok(VectorIndex::list_from_bytes(&dense_bytes).is_ok())
+}
+
 // ── KV-backed VectorKvStore ───────────────────────────────────────────────────
 
 /// A [`VectorKvStore`] implementation backed directly by minnal_db namespaces.

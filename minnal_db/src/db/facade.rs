@@ -13,7 +13,7 @@ use crate::db::database::Database;
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
-use crate::db::namespace::FieldId;
+use crate::db::namespace::{FieldId, FieldReindexOutcome};
 use crate::db::namespace_index::ExtractorFn;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
@@ -458,6 +458,21 @@ impl Db {
     /// or `None` if the field is not currently active.
     pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
         self.inner.field_index_waste(namespace_id, field_id)
+    }
+
+    /// On-disk blob growth/waste metrics for a field — bitmap and keymap store
+    /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
+    /// is not currently active. Use it to monitor the append-only write
+    /// amplification that low-cardinality fields suffer.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        self.inner.field_index_blob_stats(namespace_id, field_id)
+    }
+
+    /// Reindex a single field for a single key, re-deriving its value from the
+    /// key's current stored bytes using the same logic as the put path. Touches
+    /// only the named field. See [`crate::FieldReindexOutcome`].
+    pub fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        self.inner.reindex_field(namespace_id, field_id, key)
     }
 
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).
@@ -1302,6 +1317,24 @@ impl AsyncDb {
     /// or `None` if the field is not currently active.
     pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
         self.inner.inner.field_index_waste(namespace_id, field_id)
+    }
+
+    /// On-disk blob growth/waste metrics for a field — bitmap and keymap store
+    /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
+    /// is not currently active. Use it to monitor the append-only write
+    /// amplification that low-cardinality fields suffer.
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+        self.inner.inner.field_index_blob_stats(namespace_id, field_id)
+    }
+
+    /// Reindex a single field for a single key, re-deriving its value from the
+    /// key's current stored bytes using the same logic as the put path. Touches
+    /// only the named field. See [`crate::FieldReindexOutcome`].
+    pub async fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: Vec<u8>) -> Result<FieldReindexOutcome> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.reindex_field(namespace_id, field_id, &key))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).

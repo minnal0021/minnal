@@ -621,6 +621,44 @@ impl KVStore {
         }
     }
 
+    /// Reindex a single field for a single key: re-derive the field value from
+    /// the key's *current* stored bytes and rewrite its entry in that field's
+    /// index, using the same extractor + `DynFieldIndex` ops as the put path
+    /// (clear the row's old buckets, then insert the freshly-extracted value).
+    ///
+    /// This touches only the named field — it does not rewrite the stored value,
+    /// re-run other fields' extractors, or trigger any vector re-embedding. Use
+    /// it to repair a single document's entry in one field index.
+    ///
+    /// Returns [`FieldReindexOutcome`]: `Reindexed` on success, `KeyNotFound`
+    /// when the key has no value, `FieldNotActive` when `field_id` has no live
+    /// index in this namespace.
+    pub fn reindex_field(&self, field_id: crate::db::namespace::FieldId, key: &[u8]) -> Result<crate::db::namespace::FieldReindexOutcome> {
+        use crate::db::namespace::FieldReindexOutcome;
+
+        let value = match self.get(key)? {
+            Some(v) => v,
+            None => return Ok(FieldReindexOutcome::KeyNotFound),
+        };
+
+        let ns_index = self.namespace_index.read();
+        let Some(entry) = ns_index.get(field_id) else {
+            return Ok(FieldReindexOutcome::FieldNotActive);
+        };
+
+        // Same row-ID resolution and per-field ops as `update_indices_on_put`'s
+        // replace-without-prior-bytes branch: `set` clears the row's existing
+        // buckets (preserving one-value-per-row) and inserts the new value.
+        let row_id = self.resolve_row_id_alloc(key);
+        let new_val = (entry.extractor)(&value);
+        let mut idx = entry.index.write();
+        match &new_val {
+            Some(v) => idx.set(v, row_id).map_err(|e| KVError::Io(std::io::Error::other(e)))?,
+            None => idx.remove_all_for_row(row_id),
+        }
+        Ok(FieldReindexOutcome::Reindexed)
+    }
+
     /// Maximum number of generation-stable read attempts before falling back to
     /// a lock-serialised read. A read only loops when a GC file swap lands in
     /// the exact window between sampling the LSM pointer and the value, so in

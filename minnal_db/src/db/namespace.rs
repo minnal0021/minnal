@@ -67,6 +67,20 @@ pub struct FieldMeta {
     pub field_type: IndexValueType,
 }
 
+/// Outcome of a targeted single-field reindex ([`crate::Db::reindex_field`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldReindexOutcome {
+    /// The field index entry for the key was re-derived from its current value
+    /// and rewritten.
+    Reindexed,
+    /// The key has no stored value (absent or deleted), so there was nothing to
+    /// index.
+    KeyNotFound,
+    /// No active index exists for the given field id in the namespace (it was
+    /// never registered, or is not currently activated — e.g. still building).
+    FieldNotActive,
+}
+
 /// Schema of a single namespace: the in-memory map of indexed fields.
 ///
 /// Loaded from `config.json` on startup when present, so field definitions

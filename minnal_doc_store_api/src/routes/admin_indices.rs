@@ -8,7 +8,10 @@
 //! GET    /admin/indices/{ns}/progress                     → per-namespace index progress
 //! POST   /admin/indices/{ns}/attribute/reindex-all        → drop + rebuild all field indices (202)
 //! DELETE /admin/indices/{ns}/attribute/drop-all           → drop all field indices (202)
+//! POST   /admin/indices/{ns}/attribute/{field}/reindex/{doc_id} → reindex one doc in one field index (200)
+//! GET    /admin/indices/{ns}/{field}/blob-stats           → one field's on-disk blob growth/waste (404 if not active)
 //! POST   /admin/indices/{ns}/vector/reindex-all           → re-enqueue all docs for embedding (202)
+//! POST   /admin/indices/{ns}/vector/reindex/{doc_id}      → re-enqueue one doc for embedding (doc + kv) (200)
 //! POST   /admin/indices/{ns}/vector/reindex-failed        → reset exhausted queue entries (200)
 //! DELETE /admin/indices/{ns}/vector/drop-all              → clear all vector index data (202)
 //! GET    /admin/indices/{ns}/vector/queue                 → all queue entries for namespace
@@ -28,11 +31,11 @@ use axum::{
 };
 use minnal_doc_store::hex::hex_to_bytes;
 use minnal_doc_store::index_progress::IndexBuildSnapshot;
-use minnal_doc_store::{DocStoreError, Page, Pagination, QueueEntry};
+use minnal_doc_store::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::{AppState, routes::stores::reload_schema};
+use crate::{AppState, id::parse_doc_id, routes::stores::reload_schema};
 
 // ── Progress — unified view ───────────────────────────────────────────────────
 
@@ -265,6 +268,110 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
     Ok(StatusCode::ACCEPTED)
 }
 
+// ── GET /admin/indices/{ns}/{field}/blob-stats ────────────────────────────────
+
+/// One field index's on-disk blob growth/waste, with the compaction threshold.
+#[derive(Serialize)]
+pub struct FieldBlobStatsResponse {
+    namespace: String,
+    field: String,
+    /// Compaction threshold as a fraction (`0.0..1.0`): a store is compacted at
+    /// the next index checkpoint once its waste reaches this.
+    waste_threshold: f64,
+    /// True if the bitmap or keymap store has reached `waste_threshold`.
+    over_threshold: bool,
+    #[serde(flatten)]
+    stats: minnal_db::IndexBlobStats,
+}
+
+/// `GET /admin/indices/{ns}/{field}/blob-stats` — on-disk blob growth for one
+/// field index: bitmap and keymap **logical** bytes (everything ever appended =
+/// live + stale) vs. **live** bytes (what survives compaction), their waste
+/// ratios, and the distinct-value count, alongside the compaction threshold.
+///
+/// Complements the fleet-wide [`GET /admin/storage/index-waste`](super::admin_storage::index_waste),
+/// which reports only waste *ratios*: this surfaces the absolute blob *growth*
+/// between compactions that a ratio hides — worst for low-cardinality, high-churn
+/// fields under the append-only whole-bitmap rewrite. A large, high-waste
+/// `bitmap_logical_bytes` is the signal to force a
+/// [`POST /admin/storage/index-checkpoint`](super::admin_storage::trigger_index_checkpoint).
+///
+/// Returns `404 Not Found` when the field has no active index (unknown field, or
+/// still building).
+pub async fn field_blob_stats(
+    State(state): State<AppState>,
+    Path((ns, field)): Path<(String, String)>,
+) -> Result<Json<FieldBlobStatsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.field_index_blob_stats(&ns, &field) {
+        Some(stats) => {
+            let waste_threshold = state.store.index_blob_waste_threshold();
+            let over_threshold = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
+            Ok(Json(FieldBlobStatsResponse {
+                namespace: ns,
+                field,
+                waste_threshold,
+                over_threshold,
+                stats,
+            }))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no active field index '{field}' in namespace '{ns}' (unknown field, or still building)")
+            })),
+        )),
+    }
+}
+
+// ── POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id} ────────────────
+
+/// `POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id}` — reindex a
+/// **single document's** entry in **one** field index. Re-derives the field value
+/// from the document's current stored bytes using the same logic as the write
+/// path (clear the row's old buckets, re-extract, insert); only the named field
+/// is touched — the document is not rewritten and no other field or vector index
+/// is affected. Runs synchronously (it is O(1)) and returns `200`.
+///
+/// Doc-store namespaces only — field indices do not exist on KV stores. `404`
+/// when the namespace, document, or indexed field is unknown; `409` when the
+/// field index exists but is not yet active (still building).
+pub async fn attribute_reindex_doc(
+    State(state): State<AppState>,
+    Path((ns, field, doc_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    let key_type = {
+        let schemas = state.schemas.read().await;
+        match schemas.get(&ns).map(|s| s.key_type) {
+            Some(kt) => kt,
+            None => return Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        }
+    };
+    let id =
+        parse_doc_id(&doc_id, key_type).map_err(|_| err(StatusCode::BAD_REQUEST, format!("invalid document id '{doc_id}' for namespace '{ns}'")))?;
+
+    match state.store.reindex_doc_field(&ns, id, &field).await {
+        Ok(minnal_db::FieldReindexOutcome::Reindexed) => {
+            info!(namespace = %ns, field = %field, doc_id = %doc_id, "field reindex (single doc) complete");
+            Ok(Json(
+                serde_json::json!({ "status": "reindexed", "namespace": ns, "field": field, "doc_id": doc_id }),
+            ))
+        }
+        Ok(minnal_db::FieldReindexOutcome::KeyNotFound) => Err(err(StatusCode::NOT_FOUND, format!("document '{doc_id}' not found in '{ns}'"))),
+        Ok(minnal_db::FieldReindexOutcome::FieldNotActive) => Err(err(
+            StatusCode::CONFLICT,
+            format!("field index '{field}' in '{ns}' is registered but not active (still building?)"),
+        )),
+        Err(DocStoreError::IndexNotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("'{field}' is not an indexed field of '{ns}'"))),
+        Err(DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        Err(e) => {
+            error!(namespace = %ns, field = %field, doc_id = %doc_id, error = %e, "field reindex (single doc) failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
 // ── Vector index operations ───────────────────────────────────────────────────
 
 /// `DELETE /admin/indices/{ns}/vector/drop-all`
@@ -411,6 +518,62 @@ pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<St
     Ok(StatusCode::ACCEPTED)
 }
 
+// ── POST /admin/indices/{ns}/vector/reindex/{doc_id} ──────────────────────────
+
+/// `POST /admin/indices/{ns}/vector/reindex/{doc_id}` — re-enqueue a **single**
+/// document for vector (re-)embedding, the same enqueue the write path and
+/// `vector/reindex-all` use, scoped to one document. The async worker embeds and
+/// indexes it on its next pass, so this returns `200` immediately (not `202` — the
+/// enqueue itself is synchronous and durable).
+///
+/// Works for both document stores and semantic-search KV stores; for a KV store
+/// `{doc_id}` is the key string. The JSON `status` is `enqueued`, `not_found`
+/// (no such document), or `skipped_empty_text` (the document has no embedding
+/// text). `422` when the namespace is not semantic-search-enabled; `404` when it
+/// does not exist.
+pub async fn vector_reindex_doc(
+    State(state): State<AppState>,
+    Path((ns, doc_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    // KV namespace? (mirrors vector_reindex_all's doc-vs-kv split).
+    let is_kv = state.kv_schemas.read().await.contains_key(&ns);
+
+    let outcome = if is_kv {
+        // KV key is the raw {doc_id} string; the store encodes it per key_type.
+        state.store.kv_reindex_doc_vector(&ns, &doc_id).await
+    } else {
+        let key_type = {
+            let schemas = state.schemas.read().await;
+            match schemas.get(&ns).map(|s| s.key_type) {
+                Some(kt) => kt,
+                None => return Err(err(StatusCode::NOT_FOUND, format!("namespace '{ns}' not found"))),
+            }
+        };
+        let id = parse_doc_id(&doc_id, key_type)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, format!("invalid document id '{doc_id}' for namespace '{ns}'")))?;
+        state.store.reindex_doc_vector(&ns, id).await
+    };
+
+    match outcome {
+        Ok(VectorReindexOutcome::Enqueued) => {
+            info!(namespace = %ns, doc_id = %doc_id, "vector reindex (single doc) enqueued");
+            Ok(Json(serde_json::json!({ "status": "enqueued", "namespace": ns, "doc_id": doc_id })))
+        }
+        Ok(VectorReindexOutcome::NotFound) => Err(err(StatusCode::NOT_FOUND, format!("document '{doc_id}' not found in '{ns}'"))),
+        Ok(VectorReindexOutcome::SkippedEmptyText) => Ok(Json(
+            serde_json::json!({ "status": "skipped_empty_text", "namespace": ns, "doc_id": doc_id }),
+        )),
+        Err(e @ DocStoreError::SemanticSearchNotEnabled { .. }) => Err(err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
+        Err(e @ DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
+        Err(e) => {
+            error!(namespace = %ns, doc_id = %doc_id, error = %e, "vector reindex (single doc) failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
 /// `POST /admin/indices/{ns}/vector/reindex-failed`
 ///
 /// Resets `retry_count` to zero for every exhausted queue entry in `{ns}`,
@@ -461,28 +624,72 @@ pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<J
     Ok(Json(serde_json::json!({ "cleared": cleared })))
 }
 
+// ── GET /admin/indices/vector/corruption-metrics ──────────────────────────────
+
+/// `GET /admin/indices/vector/corruption-metrics` — cumulative counts of vector
+/// entries skipped during search because their bytes failed to deserialize.
+///
+/// Process-wide, monotonically increasing since startup (sample twice for a rate).
+/// A non-zero/rising value means stored vectors are corrupt and queries are
+/// silently degraded — run the validating reconcile
+/// ([`POST /admin/indices/vector/reconcile`](vector_reconcile)) to re-embed the
+/// affected documents. Split by pass (`sparse` = Pass 1, `dense` = Pass 2).
+pub async fn vector_corruption_metrics() -> Json<semantic_search::metrics::VectorMetricsSnapshot> {
+    Json(semantic_search::metrics::snapshot())
+}
+
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────
 
-/// `POST /admin/indices/vector/reconcile` — forward vector-index reconciliation.
+/// `POST /admin/indices/vector/reconcile` — **validating** vector-index reconciliation.
 ///
-/// Scans every semantic-search-enabled namespace and re-enqueues any document
-/// that has neither a *complete* committed vector index (both the sparse-meta
-/// and dense halves) nor a pending queue entry — the `put`/`kv_put` crash window
-/// (document durably written, embed-enqueue lost to a crash) and the `put_no_wal`
-/// vector-write window (a crash before the memtable flush drops a just-indexed
-/// vector, or flushes one half and loses the other). A cheap count short-circuit
-/// skips namespaces already fully covered, so a clean run is inexpensive. The
-/// async worker drains the re-enqueued entries in the background. Returns `200`
-/// with `{ "reenqueued": N }`.
+/// Scans every semantic-search-enabled namespace and re-enqueues any document whose
+/// committed vector index is missing a half **or present-but-corrupt** (the bytes
+/// fail to deserialize), as well as documents with no pending queue entry left by a
+/// crash. Unlike the cheap presence-only pass that runs at startup, this **validates
+/// the bytes** — so it reads and deserializes every entry and cannot use the count
+/// short-circuit, making it a full value-reading scan.
 ///
-/// The same pass runs automatically as a background task on store startup; this
-/// endpoint lets an operator re-run it on demand — e.g. if the startup pass
-/// logged a failure.
-pub async fn vector_reconcile(State(state): State<AppState>) -> Json<serde_json::Value> {
-    info!("vector reconcile — re-enqueuing documents missing a vector index");
-    let reenqueued = state.store.reconcile_vector_indexes().await;
-    info!(reenqueued, "vector reconcile complete");
-    Json(serde_json::json!({ "reenqueued": reenqueued }))
+/// Because that scan can take a long time on a large corpus, this **returns
+/// immediately with `202 Accepted`** and runs the pass in the **background**; the
+/// re-enqueued count and any per-namespace failures are written to the log
+/// (`info!` on completion, `warn!`/`error!` on failure). Overlapping runs are
+/// rejected with `409 Conflict` so expensive scans cannot stack.
+///
+/// A presence-only reconcile still runs automatically on store startup.
+pub async fn vector_reconcile(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use std::sync::atomic::Ordering;
+
+    // Reject overlapping runs — a validating reconcile is a full value-reading scan.
+    if state
+        .vec_reconcile_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "a vector reconcile is already running" })),
+        ));
+    }
+
+    info!("vector reconcile (validating) accepted — running in background");
+    let store = Arc::clone(&state.store);
+    let running = Arc::clone(&state.vec_reconcile_running);
+    tokio::spawn(async move {
+        // Clear the running flag however the task exits (including a panic), so a
+        // failure can never wedge the endpoint into a permanent 409.
+        struct ResetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetOnDrop(running);
+
+        let reenqueued = store.validate_and_reconcile_vector_indexes().await;
+        info!(reenqueued, "vector reconcile (validating) complete");
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ── Vector queue monitoring ───────────────────────────────────────────────────

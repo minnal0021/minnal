@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! GET    /kv-stores/{ns}/kv/{key}                → get value by key
-//! PUT    /kv-stores/{ns}/kv/{key}                → set value (JSON body = value)
+//! PUT    /kv-stores/{ns}/kv/{key}[?skip_wal=]    → set value (JSON body = value)
 //! DELETE /kv-stores/{ns}/kv/{key}                → delete key
 //! GET    /kv-stores/{ns}/kv?start=&end=          → range scan (end optional)
 //! GET    /kv-stores/{ns}/kv/prefix?prefix=       → prefix scan
@@ -53,16 +53,35 @@ pub async fn get_kv(State(state): State<AppState>, Path((ns, key)): Path<(String
 pub async fn put_kv(
     State(state): State<AppState>,
     Path((ns, key)): Path<(String, String)>,
+    Query(params): Query<KvPutParams>,
     Json(value): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, AppError> {
-    debug!(namespace = %ns, key = %key, "kv put");
+    debug!(namespace = %ns, key = %key, skip_wal = params.skip_wal, "kv put");
     let key_json = key_to_json(&state, &ns, &key).await?;
-    state
-        .store
-        .kv_put(&ns, &key_json, &value)
-        .await
-        .map_err(|e| AppError::from(e).with_ns(&ns))?;
+    if params.skip_wal {
+        state
+            .store
+            .kv_put_no_wal(&ns, &key_json, &value)
+            .await
+            .map_err(|e| AppError::from(e).with_ns(&ns))?;
+    } else {
+        state
+            .store
+            .kv_put(&ns, &key_json, &value)
+            .await
+            .map_err(|e| AppError::from(e).with_ns(&ns))?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query parameters accepted by the KV PUT endpoint.
+#[derive(Deserialize)]
+pub struct KvPutParams {
+    /// When `true`, the write bypasses the WAL for maximum throughput.
+    /// Data written this way is unrecoverable on a crash — only use during
+    /// bulk loading where re-running the load is acceptable.
+    #[serde(default)]
+    skip_wal: bool,
 }
 
 // ── DELETE /kv-stores/{ns}/kv/{key} ──────────────────────────────────────────

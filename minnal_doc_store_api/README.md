@@ -224,7 +224,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 **Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
 
-**Reconciliation.** Because the document write and the queue enqueue are two separate writes, a crash between them could leave a document written but not queued; likewise the quantised vector payloads are written with `put_no_wal`, so a crash before the memtable flush can drop a just-indexed vector (or flush one half and lose the other). Reconciliation heals both: across every semantic-search-enabled namespace it re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry. "Complete" means **both** the sparse-meta and dense entries are present — a document with only one half is a partially committed index and is re-enqueued so the re-embed regenerates the missing half. This mirrors how field indices self-heal via WAL replay, but routes the recovered work into the async queue. It runs **automatically as a background task on store startup**, and on demand via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) (e.g. to re-run after the startup pass logs a failure). A cheap count short-circuit (nothing queued **and** both the sparse-meta and dense key counts already cover the live-key count) skips namespaces that are already fully covered, so a clean run is inexpensive. To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
+**Reconciliation.** Because the document write and the queue enqueue are two separate writes, a crash between them could leave a document written but not queued; likewise the quantised vector payloads are written with `put_no_wal`, so a crash before the memtable flush can drop a just-indexed vector (or flush one half and lose the other). Reconciliation heals both: across every semantic-search-enabled namespace it re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry. "Complete" means **both** the sparse-meta and dense entries are present — a document with only one half is a partially committed index and is re-enqueued so the re-embed regenerates the missing half. This mirrors how field indices self-heal via WAL replay, but routes the recovered work into the async queue. It runs **automatically as a background task on store startup** (presence-only: a cheap count short-circuit — nothing queued **and** both the sparse-meta and dense key counts already cover the live-key count — skips namespaces already fully covered, so a clean boot is inexpensive). The on-demand [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) endpoint runs a stronger **validating** variant that *also* re-enqueues documents whose committed bytes are present but **fail to deserialize** (corruption the presence check cannot see) — it deserializes every entry and skips the short-circuit, so it is a full scan that runs in the background (`202 Accepted`). To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
 
 Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup.
 
@@ -1079,6 +1079,8 @@ curl -X POST http://localhost:8080/admin/storage/compact
 
 Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows with per-document churn; the **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
 
+This is the fleet-wide view of waste *ratios*; for the absolute on-disk byte *growth* of a single field (logical vs. live bytes) — which a ratio alone hides — use [`GET /admin/indices/{ns}/{field}/blob-stats`](#get-adminindicesnsfieldblob-stats).
+
 ```bash
 curl http://localhost:8080/admin/storage/index-waste
 ```
@@ -1133,11 +1135,15 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
 | `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
 | `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
-| `POST` | `/admin/indices/vector/reconcile` | `200` | Re-enqueue docs missing a vector index (all namespaces) |
+| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Cumulative counts of vector entries skipped during search due to corrupt bytes |
+| `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
 | `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
+| `POST` | `/admin/indices/{ns}/attribute/{field}/reindex/{doc_id}` | `200` | Reindex one document in one field index (doc stores) |
+| `GET` | `/admin/indices/{ns}/{field}/blob-stats` | `200` | One field index's on-disk blob growth/waste (`404` if not active) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-all` | `202` | Re-enqueue all docs for embedding |
+| `POST` | `/admin/indices/{ns}/vector/reindex/{doc_id}` | `200` | Re-enqueue one document for embedding (doc + KV stores) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
@@ -1189,18 +1195,33 @@ Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace
 
 ---
 
-#### `POST /admin/indices/vector/reconcile`
+#### `GET /admin/indices/vector/corruption-metrics`
 
-Forward vector-index reconciliation across **every** semantic-search-enabled namespace. Re-enqueues any document that has neither a *complete* committed vector index (both the sparse-meta and dense halves) nor a pending queue entry — the write-then-enqueue crash window and the `put_no_wal` vector-write window (a crash before the memtable flush drops a just-indexed vector, or flushes one half and loses the other; a partially committed index counts as not-indexed and is re-enqueued). The async worker then embeds and indexes the re-enqueued documents in the background. A cheap count short-circuit skips namespaces already fully covered, so a clean run is inexpensive. The same pass runs automatically as a background task on store startup; this endpoint re-runs it on demand (e.g. after the startup pass logs a failure). Returns `200` with `{ "reenqueued": N }`.
+Cumulative counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug). Process-wide and monotonically increasing since startup — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`.
+
+A rising value means stored vectors are corrupt and queries are silently degraded; run the validating [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) to re-embed the affected documents.
 
 ```bash
-curl -X POST http://localhost:8080/admin/indices/vector/reconcile
+curl http://localhost:8080/admin/indices/vector/corruption-metrics
 ```
 ```json
-{ "reenqueued": 3 }
+{ "sparse_corrupt_skipped": 0, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 0 }
 ```
 
-To force a full rebuild of a single namespace regardless of current index state, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all) instead.
+---
+
+#### `POST /admin/indices/vector/reconcile`
+
+**Validating** vector-index reconciliation across **every** semantic-search-enabled namespace. Re-enqueues any document whose committed vector index is missing a half (the sparse-meta or dense entry) **or is present but corrupt** — i.e. the stored bytes fail to deserialize — as well as documents left un-enqueued by the write-then-enqueue crash window. Unlike the cheap presence-only pass that runs at startup, this **deserializes every entry**, so it cannot use the count short-circuit and performs a full value-reading scan.
+
+Because that scan can take a long time on a large corpus, the endpoint **returns `202 Accepted` immediately and runs the pass in the background.** The re-enqueued count and any per-namespace failures are written to the server log (`info!` on completion, `warn!`/`error!` on failure); the async worker then embeds and indexes the re-enqueued documents. Overlapping runs are rejected with **`409 Conflict`** so the expensive scan cannot stack. A presence-only reconcile still runs automatically on startup.
+
+```bash
+curl -i -X POST http://localhost:8080/admin/indices/vector/reconcile
+# HTTP/1.1 202 Accepted    (or 409 if one is already running)
+```
+
+Watch the server log for `vector reconcile (validating) complete` and the re-enqueued count. To force a full rebuild of a single namespace regardless of current index state, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all) instead.
 
 ---
 
@@ -1281,6 +1302,52 @@ Returns `409` when an attribute operation is already active. Returns `422` when 
 
 ---
 
+#### `POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id}`
+
+Reindex a **single document's** entry in **one** field index. The field value is re-derived from the document's *current* stored bytes using the same logic as the write path (clear the row's old buckets, re-extract via the field's extractor, insert), so it repairs a single stale or missing index entry without rewriting the document. Only the named field is touched — no other field index is rebuilt and no vector re-embedding is triggered. The operation is O(1) and runs synchronously, returning `200`.
+
+Document stores only — field indices do not exist on KV stores. `{doc_id}` is parsed in the namespace's key format (the same format as `GET /stores/{ns}/docs/{id}`).
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/users/status/reindex/42
+```
+```json
+{ "status": "reindexed", "namespace": "users", "field": "status", "doc_id": "42" }
+```
+
+Returns `404` when the namespace is unknown, `{field}` is not an indexed field of it, or no document with `{doc_id}` exists. Returns `409` when the field index is registered but not yet active (still building). Returns `400` when `{doc_id}` is not valid for the namespace's key type.
+
+---
+
+#### `GET /admin/indices/{ns}/{field}/blob-stats`
+
+On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole on every document write) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
+
+Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of low-cardinality, high-churn fields (e.g. a boolean over many documents), whose bitmap blob can balloon to many times its live footprint. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
+
+```bash
+curl http://localhost:8080/admin/indices/users/status/blob-stats
+```
+```json
+{
+  "namespace": "users",
+  "field": "status",
+  "waste_threshold": 0.5,
+  "over_threshold": true,
+  "distinct_values": 2,
+  "bitmap_logical_bytes": 104857600,
+  "bitmap_live_bytes": 8192,
+  "bitmap_waste_ratio": 0.99,
+  "keymap_logical_bytes": 256,
+  "keymap_live_bytes": 256,
+  "keymap_waste_ratio": 0.0
+}
+```
+
+Returns `404` when `{field}` has no active index in `{ns}` (unknown field, or still building).
+
+---
+
 #### `POST /admin/indices/{ns}/vector/reindex-all`
 
 Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build). Returns `202 Accepted`.
@@ -1291,6 +1358,27 @@ curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
 ```
 
 Returns `409` when a campaign or cleanup is already running. Returns `422` when semantic search is not enabled.
+
+---
+
+#### `POST /admin/indices/{ns}/vector/reindex/{doc_id}`
+
+Re-enqueue a **single** document for vector (re-)embedding — the same enqueue the write path and `vector/reindex-all` use, scoped to one document. The async worker embeds and indexes it on its next pass, so this returns `200` immediately (not `202`: the enqueue itself is synchronous and durable, only the embedding is deferred).
+
+Works for both document stores and semantic-search KV stores (the namespace kind is detected automatically); for a KV store `{doc_id}` is the key string, otherwise it is parsed in the namespace's key format. The JSON `status` is:
+
+- `enqueued` — the document was queued for embedding.
+- `not_found` — no document with that id exists.
+- `skipped_empty_text` — the document produced no embedding text, so nothing was queued.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/reindex/sku-123
+```
+```json
+{ "status": "enqueued", "namespace": "products", "doc_id": "sku-123" }
+```
+
+Returns `422` when the namespace is not semantic-search-enabled, `404` when it does not exist, and `400` when `{doc_id}` is not valid for the namespace's key type.
 
 ---
 
