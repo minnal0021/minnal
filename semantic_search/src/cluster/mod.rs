@@ -255,10 +255,25 @@ pub fn find_closest_cluster_id(clusters: &HashMap<u32, Cluster>, embedding: &[f3
 /// Return the IDs of the `n` clusters closest to `embedding`, sorted by ascending distance.
 ///
 /// When `n` exceeds the number of clusters, all cluster IDs are returned.
+///
+/// For `n < cluster_count` this selects the `n` nearest with
+/// [`select_nth_unstable_by`](slice::select_nth_unstable_by) (introselect, ~O(C))
+/// and sorts only those `n` (O(n log n)), rather than fully sorting all `C` clusters
+/// (O(C log C)). The result is identical — the `n` closest in ascending distance —
+/// but the cost stays close to linear in the cluster count as the cluster file grows
+/// (it is called once per query chunk).
 pub fn find_top_n_cluster_ids(clusters: &HashMap<u32, Cluster>, embedding: &[f32], n: usize) -> Vec<u32> {
     let mut distances: Vec<(u32, f32)> = clusters.values().map(|c| (c.cluster_id, c.euclidean_distance(embedding))).collect();
-    distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-    distances.truncate(n);
+    let by_distance = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1);
+
+    // Partition the n smallest into [0..n) in linear time, then drop the rest so the
+    // final sort only orders n elements. Skipped when n >= len (we return all anyway,
+    // and select_nth_unstable_by would panic on an out-of-range index).
+    if n < distances.len() {
+        distances.select_nth_unstable_by(n, by_distance);
+        distances.truncate(n);
+    }
+    distances.sort_unstable_by(by_distance);
     distances.into_iter().map(|(id, _)| id).collect()
 }
 
@@ -431,6 +446,40 @@ mod tests {
         let clusters = HashMap::new();
         let ids = find_top_n_cluster_ids(&clusters, &[1.0, 0.0], 5);
         assert!(ids.is_empty(), "must return empty vec when cluster map is empty");
+    }
+
+    #[test]
+    fn test_find_top_n_cluster_ids_n_zero_returns_empty() {
+        let mut clusters = HashMap::new();
+        clusters.insert(1, Cluster::new(1, vec![1.0, 0.0]));
+        clusters.insert(2, Cluster::new(2, vec![0.0, 1.0]));
+        assert!(find_top_n_cluster_ids(&clusters, &[1.0, 0.0], 0).is_empty());
+    }
+
+    #[test]
+    fn test_find_top_n_cluster_ids_matches_full_sort_reference() {
+        // The select_nth-based path must produce exactly the same result as a full
+        // sort + truncate, across every n from 0..=count and a few beyond. Distances
+        // are made distinct (per-dim values) so there is no tie ambiguity.
+        let mut clusters = HashMap::new();
+        for id in 0..32u32 {
+            // Distinct 4-D centroids → distinct distances from the query below.
+            let c = vec![id as f32 * 0.1, (id as f32 * 0.03).sin(), (id as f32).cos(), id as f32 * -0.02];
+            clusters.insert(id, Cluster::new(id, c));
+        }
+        let query = vec![0.5f32, -0.2, 0.7, 0.1];
+
+        // Reference: full sort by ascending distance, then take n.
+        let reference = |n: usize| -> Vec<u32> {
+            let mut d: Vec<(u32, f32)> = clusters.values().map(|c| (c.cluster_id, c.euclidean_distance(&query))).collect();
+            d.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            d.truncate(n);
+            d.into_iter().map(|(id, _)| id).collect()
+        };
+
+        for n in 0..=clusters.len() + 3 {
+            assert_eq!(find_top_n_cluster_ids(&clusters, &query, n), reference(n), "mismatch at n={n}");
+        }
     }
 
     // ── Centroid validation (ClusterIndexError) ──────────────────────────────
