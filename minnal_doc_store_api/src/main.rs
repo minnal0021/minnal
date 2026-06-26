@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_index_opt = {
         let path = semantic_cfg.cluster_path.to_string_lossy();
         info!(path = %path, "loading cluster index");
-        match ClusterIndex::load_with_dim(&path, semantic_cfg.n_probes, semantic_cfg.embedding_dim) {
+        match ClusterIndex::load_with_dim(&path, semantic_cfg.embedding_dim) {
             Ok(idx) => {
                 info!(
                     clusters = idx.clusters.len(),

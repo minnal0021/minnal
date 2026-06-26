@@ -7,41 +7,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
-pub struct Neighbour {
-    pub cluster_id: u32,
-    pub distance: f32,
-}
-
-#[derive(Debug, Clone)]
 pub struct Cluster {
     pub cluster_id: u32,
     pub centroid: Vec<f32>,
 }
 
-impl Neighbour {
-    pub fn new(cluster_id: u32, distance: f32) -> Neighbour {
-        Neighbour { cluster_id, distance }
-    }
-
-    pub fn sort_by_distance(neighbours: &[Neighbour]) -> Vec<Neighbour> {
-        let mut sorted_neighbours = neighbours.to_vec();
-        sorted_neighbours.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        sorted_neighbours
-    }
-
-    pub fn find_closest_neighbours(neighbours: &[Neighbour], maximum_neighbours: usize) -> Vec<Neighbour> {
-        let mut closest_neighbours: Vec<Neighbour> = Vec::with_capacity(maximum_neighbours);
-
-        for neighbour in Neighbour::sort_by_distance(neighbours) {
-            if closest_neighbours.len() == maximum_neighbours {
-                break;
-            }
-            closest_neighbours.push(neighbour);
-        }
-
-        closest_neighbours
-    }
-}
 impl Cluster {
     pub fn euclidean_distance(&self, other: &[f32]) -> f32 {
         // A dimension mismatch makes `l2sq` return `None`, which we mask to
@@ -131,31 +101,36 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
     Ok(dim)
 }
 
-/// A fully built cluster index: the centroid map and the pre-computed
-/// neighbour graph, loaded once at startup and shared read-only across
-/// all requests.
+/// The set of IVF cluster centroids, loaded once at startup and shared read-only
+/// across all requests.
+///
+/// Clusters are probed by **exact** nearest-centroid distance: for each query
+/// embedding, [`find_top_n_cluster_ids`] computes the distance to every centroid and
+/// returns the `n_probes` nearest (see [`crate::service::search`]). There is
+/// deliberately **no precomputed neighbour graph** — at the cluster counts in use the
+/// exhaustive scan is cheap (microseconds) and yields the *exact* nearest clusters, so
+/// an approximate graph traversal would trade recall for no speed-up. A neighbour graph
+/// would only pay off at much larger, sparse cluster counts; revisit it then.
 #[derive(Debug)]
 pub struct ClusterIndex {
     /// All clusters keyed by their ID.
     pub clusters: HashMap<u32, Cluster>,
-    /// Pre-computed nearest-neighbour graph, keyed by cluster ID.
-    pub neighbours: HashMap<u32, Vec<Neighbour>>,
     /// The uniform centroid dimension, validated at load time. Every query and
     /// document embedding compared against these centroids must share it.
     dim: usize,
 }
 
 impl ClusterIndex {
-    /// Load clusters from `cluster_file_path` and build the neighbour graph,
-    /// validating only the file's internal consistency.
+    /// Load clusters from `cluster_file_path`, validating only the file's internal
+    /// consistency.
     ///
     /// Rejects an empty file, empty centroids, duplicate cluster IDs, and
     /// centroids of mixed dimension. Use [`load_with_dim`](Self::load_with_dim) to
     /// additionally pin the centroid dimension to a configured `embedding_dim`.
     ///
     /// Returns an error if the file cannot be read, parsed, or fails validation.
-    pub fn load(cluster_file_path: &str, max_neighbours: usize) -> Result<Self, Box<dyn Error>> {
-        Self::load_inner(cluster_file_path, max_neighbours, None)
+    pub fn load(cluster_file_path: &str) -> Result<Self, Box<dyn Error>> {
+        Self::load_inner(cluster_file_path, None)
     }
 
     /// Like [`load`](Self::load), but also rejects a cluster file whose (uniform)
@@ -165,28 +140,26 @@ impl ClusterIndex {
     /// dimension mismatch here disables semantic search with a clear error at
     /// startup, instead of letting it surface as a `u32::MAX` nearest-cluster id
     /// and a downstream `unwrap` panic on the first document insert or query.
-    pub fn load_with_dim(cluster_file_path: &str, max_neighbours: usize, embedding_dim: usize) -> Result<Self, Box<dyn Error>> {
-        Self::load_inner(cluster_file_path, max_neighbours, Some(embedding_dim))
+    pub fn load_with_dim(cluster_file_path: &str, embedding_dim: usize) -> Result<Self, Box<dyn Error>> {
+        Self::load_inner(cluster_file_path, Some(embedding_dim))
     }
 
-    fn load_inner(cluster_file_path: &str, max_neighbours: usize, expected_dim: Option<usize>) -> Result<Self, Box<dyn Error>> {
+    fn load_inner(cluster_file_path: &str, expected_dim: Option<usize>) -> Result<Self, Box<dyn Error>> {
         let centroid_map = read_clusters_from_file(cluster_file_path)?;
         let dim = validate_centroids(&centroid_map, expected_dim)?;
         let clusters: HashMap<u32, Cluster> = centroid_map.into_iter().map(|(id, centroid)| (id, Cluster::new(id, centroid))).collect();
-        let neighbours = build_neighbours_graph(&clusters, max_neighbours);
-        Ok(Self { clusters, neighbours, dim })
+        Ok(Self { clusters, dim })
     }
 
-    /// Build an index directly from in-memory clusters, computing the neighbour
-    /// graph and inferring the dimension from the first centroid (`0` if empty).
+    /// Build an index directly from in-memory clusters, inferring the dimension
+    /// from the first centroid (`0` if empty).
     ///
     /// For callers that already hold centroids in memory rather than a file. The
     /// per-centroid validation done by [`load`](Self::load) is the file path's
     /// concern; in-memory callers are trusted to pass uniform centroids.
-    pub fn from_clusters(clusters: HashMap<u32, Cluster>, max_neighbours: usize) -> Self {
+    pub fn from_clusters(clusters: HashMap<u32, Cluster>) -> Self {
         let dim = clusters.values().next().map(|c| c.centroid.len()).unwrap_or(0);
-        let neighbours = build_neighbours_graph(&clusters, max_neighbours);
-        Self { clusters, neighbours, dim }
+        Self { clusters, dim }
     }
 
     /// The uniform centroid dimension every embedding must match.
@@ -218,24 +191,6 @@ pub fn read_clusters_from_file(cluster_file_path: &str) -> Result<HashMap<u32, V
     info!("Read {} clusters from file: {}", map.len(), cluster_file_path);
 
     Ok(map)
-}
-
-pub fn build_neighbours_graph(clusters: &HashMap<u32, Cluster>, max_neighbours: usize) -> HashMap<u32, Vec<Neighbour>> {
-    let mut neighbours_map: HashMap<u32, Vec<Neighbour>> = HashMap::new();
-    for cluster in clusters {
-        let mut neighbours: Vec<Neighbour> = Vec::with_capacity(max_neighbours);
-        for c in clusters {
-            if cluster.1.cluster_id != c.1.cluster_id {
-                let distance = f32::l2sq(&cluster.1.centroid, &c.1.centroid).unwrap_or(f64::MAX) as f32;
-                neighbours.push(Neighbour::new(c.1.cluster_id, distance));
-            }
-        }
-
-        let capped_neighbours = Neighbour::find_closest_neighbours(&neighbours, max_neighbours);
-        neighbours_map.insert(cluster.1.cluster_id, capped_neighbours);
-    }
-
-    neighbours_map
 }
 
 pub fn find_closest_cluster_id(clusters: &HashMap<u32, Cluster>, embedding: &[f32]) -> u32 {
@@ -303,70 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_neighbours_graph() {
-        let cluster1 = Cluster::new(1, vec![-1.2, 2.23, 3.12]);
-        let cluster2 = Cluster::new(2, vec![4.23, -2.98, 3.12]);
-        let cluster3 = Cluster::new(3, vec![-7.0, 8.1, 9.2]);
-        let mut clusters: HashMap<u32, Cluster> = HashMap::new();
-        clusters.insert(1, cluster1);
-        clusters.insert(2, cluster2);
-        clusters.insert(3, cluster3);
-
-        let neighbours_map: HashMap<u32, Vec<Neighbour>> = build_neighbours_graph(&clusters, 2);
-        assert_eq!(neighbours_map.len(), 3);
-
-        for (cluster_id, neighbours) in neighbours_map.iter() {
-            assert_eq!(neighbours.len(), 2);
-            neighbours.iter().for_each(|neighbour| assert_ne!(neighbour.cluster_id, *cluster_id));
-            neighbours.iter().for_each(|neighbour| assert_ne!(neighbour.distance, 0.0));
-
-            let neighbour1 = neighbours.first().unwrap();
-            let neighbour2 = neighbours.get(1).unwrap();
-
-            assert!(neighbour1.distance < neighbour2.distance);
-        }
-    }
-
-    #[test]
-    fn test_neighbour_sort_by_distance() {
-        let neighbour1 = Neighbour::new(1, 0.1);
-        let neighbour2 = Neighbour::new(2, 0.2);
-        let neighbour3 = Neighbour::new(3, 0.3);
-        let neighbour4 = Neighbour::new(4, 0.4);
-        let neighbour5 = Neighbour::new(5, 0.5);
-        let mut neighbours = vec![neighbour5, neighbour4, neighbour3, neighbour2, neighbour1];
-        neighbours = Neighbour::sort_by_distance(&neighbours);
-        assert_eq!(neighbours.len(), 5);
-        assert_eq!(neighbours.first().unwrap().distance, 0.1);
-        assert_eq!(neighbours.get(1).unwrap().distance, 0.2);
-        assert_eq!(neighbours.get(2).unwrap().distance, 0.3);
-        assert_eq!(neighbours.get(3).unwrap().distance, 0.4);
-        assert_eq!(neighbours.get(4).unwrap().distance, 0.5);
-    }
-
-    #[test]
-    fn test_find_closest_neighbours() {
-        let neighbour1 = Neighbour::new(1, 0.1);
-        let neighbour2 = Neighbour::new(2, 0.2);
-        let neighbour3 = Neighbour::new(3, 0.3);
-        let neighbour4 = Neighbour::new(4, 0.4);
-        let neighbour5 = Neighbour::new(5, 0.5);
-        let neighbours = vec![neighbour5, neighbour4, neighbour3, neighbour2, neighbour1];
-        let closest_neighbours = Neighbour::find_closest_neighbours(&neighbours, 3);
-        assert_eq!(closest_neighbours.len(), 3);
-        assert_eq!(closest_neighbours.first().unwrap().cluster_id, 1);
-        assert_eq!(closest_neighbours.get(1).unwrap().cluster_id, 2);
-        assert_eq!(closest_neighbours.get(2).unwrap().cluster_id, 3);
-    }
-
-    #[test]
-    fn test_create_neighbour() {
-        let neighbour = Neighbour::new(42, 0.75);
-        assert_eq!(neighbour.cluster_id, 42);
-        assert_eq!(neighbour.distance, 0.75);
-    }
-
-    #[test]
     fn test_cluster_euclidean_distance() {
         let cluster = Cluster::new(1, vec![0.0, 0.0, 0.0]);
         let other = vec![1.0, 0.0, 0.0];
@@ -379,15 +270,6 @@ mod tests {
         let cluster = Cluster::new(1, vec![1.0, 2.0, 3.0]);
         let distance = cluster.euclidean_distance(&[1.0, 2.0, 3.0]);
         assert_eq!(distance, 0.0);
-    }
-
-    #[test]
-    fn test_find_closest_neighbours_fewer_than_max() {
-        let neighbours = vec![Neighbour::new(1, 0.5), Neighbour::new(2, 0.2)];
-        let closest = Neighbour::find_closest_neighbours(&neighbours, 10);
-        assert_eq!(closest.len(), 2);
-        assert_eq!(closest.first().unwrap().cluster_id, 2);
-        assert_eq!(closest.get(1).unwrap().cluster_id, 1);
     }
 
     #[test]
@@ -556,7 +438,7 @@ mod tests {
             r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#,
             r#"{"cluster_id":2,"centroid":[0.4,0.5,0.6]}"#,
         ]);
-        let idx = ClusterIndex::load(tmp.path().to_str().unwrap(), 1).unwrap();
+        let idx = ClusterIndex::load(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(idx.clusters.len(), 2);
         assert_eq!(idx.dim(), 3);
     }
@@ -564,26 +446,26 @@ mod tests {
     #[test]
     fn load_rejects_mixed_dimension_file() {
         let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#, r#"{"cluster_id":2,"centroid":[0.4,0.5]}"#]);
-        assert!(ClusterIndex::load(tmp.path().to_str().unwrap(), 1).is_err());
+        assert!(ClusterIndex::load(tmp.path().to_str().unwrap()).is_err());
     }
 
     #[test]
     fn load_with_dim_accepts_matching_dim() {
         let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#]);
-        let idx = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 1, 3).unwrap();
+        let idx = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 3).unwrap();
         assert_eq!(idx.dim(), 3);
     }
 
     #[test]
     fn load_with_dim_rejects_mismatched_dim() {
         let tmp = cluster_file(&[r#"{"cluster_id":1,"centroid":[0.1,0.2,0.3]}"#]);
-        let err = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 1, 768).unwrap_err();
+        let err = ClusterIndex::load_with_dim(tmp.path().to_str().unwrap(), 768).unwrap_err();
         assert!(err.to_string().contains("does not match"), "got: {err}");
     }
 
     #[test]
     fn load_rejects_empty_file() {
         let tmp = cluster_file(&[]);
-        assert!(ClusterIndex::load(tmp.path().to_str().unwrap(), 1).is_err());
+        assert!(ClusterIndex::load(tmp.path().to_str().unwrap()).is_err());
     }
 }

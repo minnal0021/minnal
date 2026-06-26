@@ -41,7 +41,7 @@ A third namespace, `{ns}_sparse_vector_meta`, records which clusters each docume
 
 **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
 1. Use the sparse query chunk embeddings (or fetch from the `system_qemb_cache` TTL namespace).
-2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks.
+2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks. This is an **exact, exhaustive** scan — `find_top_n_cluster_ids` computes the distance to *every* centroid and selects the `n_probes` nearest (`select_nth_unstable`, ~O(C)). There is **no neighbour graph / approximate traversal**: at the cluster counts in use the exact scan is microseconds and the per-centroid distance dominates, so a graph approximation would cost recall for no speed-up (revisit only at far larger, sparse cluster counts).
 3. `scan_sparse_cluster(cluster_id)` for each probed cluster in parallel.
 4. Apply the optional `doc_filter` (RoaringBitmap predicate) — skip non-matching docs.
 5. Score with `SingleBitQuanDotProductEstimator` using **ColBERT MaxSim**:

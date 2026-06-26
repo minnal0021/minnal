@@ -742,7 +742,7 @@ mod tests {
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let n_bits = 8;
 
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found — run from the workspace root");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found — run from the workspace root");
 
         // ── Load pre-saved real embeddings from fixture files ─────────────────
         #[derive(serde::Deserialize)]
@@ -858,7 +858,7 @@ mod tests {
         use crate::quantisation::rabitq;
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -890,7 +890,7 @@ mod tests {
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -918,7 +918,7 @@ mod tests {
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -950,7 +950,7 @@ mod tests {
         use crate::quantisation::rabitq;
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -994,7 +994,7 @@ mod tests {
         use crate::quantisation::rabitq;
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1028,7 +1028,7 @@ mod tests {
         use crate::quantisation::rabitq;
 
         let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path, 5).expect("cluster index not found");
+        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1071,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_returns_empty_with_no_query_embeddings() {
         let config = SemanticSearchConfig::default();
-        let cluster_index = crate::cluster::ClusterIndex::from_clusters(Default::default(), 0);
+        let cluster_index = crate::cluster::ClusterIndex::from_clusters(Default::default());
         let results = search(&config, &cluster_index, &[], &[], &EmptyKvStore, None::<fn(&[u8]) -> bool>, None).await;
         assert!(results.is_empty());
     }
@@ -1238,7 +1238,7 @@ mod tests {
             .iter()
             .map(|&(id, c)| (id, crate::cluster::Cluster::new(id, c.to_vec())))
             .collect();
-        crate::cluster::ClusterIndex::from_clusters(clusters, 0)
+        crate::cluster::ClusterIndex::from_clusters(clusters)
     }
 
     /// Documents excluded by the filter must not appear in results.

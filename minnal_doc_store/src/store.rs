@@ -320,7 +320,7 @@ async fn activate_indices(db: &AsyncDb, ns_id: u32, schema: &DocStoreSchema) -> 
 pub struct SemanticSearchContext {
     /// Embedding service configuration (URL, model, dimensions).
     pub config: SemanticSearchConfig,
-    /// Pre-built IVF cluster index (centroids + neighbour graph).
+    /// IVF cluster centroids, probed by exact nearest-centroid distance.
     pub cluster_index: Arc<ClusterIndex>,
 }
 

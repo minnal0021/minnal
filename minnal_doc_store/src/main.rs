@@ -417,7 +417,6 @@ async fn open_store_with_semantic_search(db_path: &str, schema_dir: &str) -> Res
     // dimension to the embedding dim the demo config uses.
     let cluster_index = ClusterIndex::load_with_dim(
         "service/embedding_support/qwen/clusters.json",
-        5,
         SemanticSearchConfig::default().embedding_dim,
     )
     .map_err(|e| DocStoreError::EmbeddingFailed(format!("cluster load failed: {e}")))?;
