@@ -8,8 +8,10 @@
 //! GET    /admin/indices/{ns}/progress                     → per-namespace index progress
 //! POST   /admin/indices/{ns}/attribute/reindex-all        → drop + rebuild all field indices (202)
 //! DELETE /admin/indices/{ns}/attribute/drop-all           → drop all field indices (202)
+//! POST   /admin/indices/{ns}/attribute/{field}/reindex/{doc_id} → reindex one doc in one field index (200)
 //! GET    /admin/indices/{ns}/{field}/blob-stats           → one field's on-disk blob growth/waste (404 if not active)
 //! POST   /admin/indices/{ns}/vector/reindex-all           → re-enqueue all docs for embedding (202)
+//! POST   /admin/indices/{ns}/vector/reindex/{doc_id}      → re-enqueue one doc for embedding (doc + kv) (200)
 //! POST   /admin/indices/{ns}/vector/reindex-failed        → reset exhausted queue entries (200)
 //! DELETE /admin/indices/{ns}/vector/drop-all              → clear all vector index data (202)
 //! GET    /admin/indices/{ns}/vector/queue                 → all queue entries for namespace
@@ -29,11 +31,11 @@ use axum::{
 };
 use minnal_doc_store::hex::hex_to_bytes;
 use minnal_doc_store::index_progress::IndexBuildSnapshot;
-use minnal_doc_store::{DocStoreError, Page, Pagination, QueueEntry};
+use minnal_doc_store::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::{AppState, routes::stores::reload_schema};
+use crate::{AppState, id::parse_doc_id, routes::stores::reload_schema};
 
 // ── Progress — unified view ───────────────────────────────────────────────────
 
@@ -321,6 +323,55 @@ pub async fn field_blob_stats(
     }
 }
 
+// ── POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id} ────────────────
+
+/// `POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id}` — reindex a
+/// **single document's** entry in **one** field index. Re-derives the field value
+/// from the document's current stored bytes using the same logic as the write
+/// path (clear the row's old buckets, re-extract, insert); only the named field
+/// is touched — the document is not rewritten and no other field or vector index
+/// is affected. Runs synchronously (it is O(1)) and returns `200`.
+///
+/// Doc-store namespaces only — field indices do not exist on KV stores. `404`
+/// when the namespace, document, or indexed field is unknown; `409` when the
+/// field index exists but is not yet active (still building).
+pub async fn attribute_reindex_doc(
+    State(state): State<AppState>,
+    Path((ns, field, doc_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    let key_type = {
+        let schemas = state.schemas.read().await;
+        match schemas.get(&ns).map(|s| s.key_type) {
+            Some(kt) => kt,
+            None => return Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        }
+    };
+    let id =
+        parse_doc_id(&doc_id, key_type).map_err(|_| err(StatusCode::BAD_REQUEST, format!("invalid document id '{doc_id}' for namespace '{ns}'")))?;
+
+    match state.store.reindex_doc_field(&ns, id, &field).await {
+        Ok(minnal_db::FieldReindexOutcome::Reindexed) => {
+            info!(namespace = %ns, field = %field, doc_id = %doc_id, "field reindex (single doc) complete");
+            Ok(Json(
+                serde_json::json!({ "status": "reindexed", "namespace": ns, "field": field, "doc_id": doc_id }),
+            ))
+        }
+        Ok(minnal_db::FieldReindexOutcome::KeyNotFound) => Err(err(StatusCode::NOT_FOUND, format!("document '{doc_id}' not found in '{ns}'"))),
+        Ok(minnal_db::FieldReindexOutcome::FieldNotActive) => Err(err(
+            StatusCode::CONFLICT,
+            format!("field index '{field}' in '{ns}' is registered but not active (still building?)"),
+        )),
+        Err(DocStoreError::IndexNotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("'{field}' is not an indexed field of '{ns}'"))),
+        Err(DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        Err(e) => {
+            error!(namespace = %ns, field = %field, doc_id = %doc_id, error = %e, "field reindex (single doc) failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
 // ── Vector index operations ───────────────────────────────────────────────────
 
 /// `DELETE /admin/indices/{ns}/vector/drop-all`
@@ -465,6 +516,62 @@ pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<St
     }
 
     Ok(StatusCode::ACCEPTED)
+}
+
+// ── POST /admin/indices/{ns}/vector/reindex/{doc_id} ──────────────────────────
+
+/// `POST /admin/indices/{ns}/vector/reindex/{doc_id}` — re-enqueue a **single**
+/// document for vector (re-)embedding, the same enqueue the write path and
+/// `vector/reindex-all` use, scoped to one document. The async worker embeds and
+/// indexes it on its next pass, so this returns `200` immediately (not `202` — the
+/// enqueue itself is synchronous and durable).
+///
+/// Works for both document stores and semantic-search KV stores; for a KV store
+/// `{doc_id}` is the key string. The JSON `status` is `enqueued`, `not_found`
+/// (no such document), or `skipped_empty_text` (the document has no embedding
+/// text). `422` when the namespace is not semantic-search-enabled; `404` when it
+/// does not exist.
+pub async fn vector_reindex_doc(
+    State(state): State<AppState>,
+    Path((ns, doc_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    // KV namespace? (mirrors vector_reindex_all's doc-vs-kv split).
+    let is_kv = state.kv_schemas.read().await.contains_key(&ns);
+
+    let outcome = if is_kv {
+        // KV key is the raw {doc_id} string; the store encodes it per key_type.
+        state.store.kv_reindex_doc_vector(&ns, &doc_id).await
+    } else {
+        let key_type = {
+            let schemas = state.schemas.read().await;
+            match schemas.get(&ns).map(|s| s.key_type) {
+                Some(kt) => kt,
+                None => return Err(err(StatusCode::NOT_FOUND, format!("namespace '{ns}' not found"))),
+            }
+        };
+        let id = parse_doc_id(&doc_id, key_type)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, format!("invalid document id '{doc_id}' for namespace '{ns}'")))?;
+        state.store.reindex_doc_vector(&ns, id).await
+    };
+
+    match outcome {
+        Ok(VectorReindexOutcome::Enqueued) => {
+            info!(namespace = %ns, doc_id = %doc_id, "vector reindex (single doc) enqueued");
+            Ok(Json(serde_json::json!({ "status": "enqueued", "namespace": ns, "doc_id": doc_id })))
+        }
+        Ok(VectorReindexOutcome::NotFound) => Err(err(StatusCode::NOT_FOUND, format!("document '{doc_id}' not found in '{ns}'"))),
+        Ok(VectorReindexOutcome::SkippedEmptyText) => Ok(Json(
+            serde_json::json!({ "status": "skipped_empty_text", "namespace": ns, "doc_id": doc_id }),
+        )),
+        Err(e @ DocStoreError::SemanticSearchNotEnabled { .. }) => Err(err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
+        Err(e @ DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
+        Err(e) => {
+            error!(namespace = %ns, doc_id = %doc_id, error = %e, "vector reindex (single doc) failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
 }
 
 /// `POST /admin/indices/{ns}/vector/reindex-failed`

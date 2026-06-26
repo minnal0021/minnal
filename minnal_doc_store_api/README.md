@@ -1140,8 +1140,10 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
 | `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
+| `POST` | `/admin/indices/{ns}/attribute/{field}/reindex/{doc_id}` | `200` | Reindex one document in one field index (doc stores) |
 | `GET` | `/admin/indices/{ns}/{field}/blob-stats` | `200` | One field index's on-disk blob growth/waste (`404` if not active) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-all` | `202` | Re-enqueue all docs for embedding |
+| `POST` | `/admin/indices/{ns}/vector/reindex/{doc_id}` | `200` | Re-enqueue one document for embedding (doc + KV stores) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
@@ -1300,6 +1302,23 @@ Returns `409` when an attribute operation is already active. Returns `422` when 
 
 ---
 
+#### `POST /admin/indices/{ns}/attribute/{field}/reindex/{doc_id}`
+
+Reindex a **single document's** entry in **one** field index. The field value is re-derived from the document's *current* stored bytes using the same logic as the write path (clear the row's old buckets, re-extract via the field's extractor, insert), so it repairs a single stale or missing index entry without rewriting the document. Only the named field is touched — no other field index is rebuilt and no vector re-embedding is triggered. The operation is O(1) and runs synchronously, returning `200`.
+
+Document stores only — field indices do not exist on KV stores. `{doc_id}` is parsed in the namespace's key format (the same format as `GET /stores/{ns}/docs/{id}`).
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/users/status/reindex/42
+```
+```json
+{ "status": "reindexed", "namespace": "users", "field": "status", "doc_id": "42" }
+```
+
+Returns `404` when the namespace is unknown, `{field}` is not an indexed field of it, or no document with `{doc_id}` exists. Returns `409` when the field index is registered but not yet active (still building). Returns `400` when `{doc_id}` is not valid for the namespace's key type.
+
+---
+
 #### `GET /admin/indices/{ns}/{field}/blob-stats`
 
 On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole on every document write) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
@@ -1339,6 +1358,27 @@ curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
 ```
 
 Returns `409` when a campaign or cleanup is already running. Returns `422` when semantic search is not enabled.
+
+---
+
+#### `POST /admin/indices/{ns}/vector/reindex/{doc_id}`
+
+Re-enqueue a **single** document for vector (re-)embedding — the same enqueue the write path and `vector/reindex-all` use, scoped to one document. The async worker embeds and indexes it on its next pass, so this returns `200` immediately (not `202`: the enqueue itself is synchronous and durable, only the embedding is deferred).
+
+Works for both document stores and semantic-search KV stores (the namespace kind is detected automatically); for a KV store `{doc_id}` is the key string, otherwise it is parsed in the namespace's key format. The JSON `status` is:
+
+- `enqueued` — the document was queued for embedding.
+- `not_found` — no document with that id exists.
+- `skipped_empty_text` — the document produced no embedding text, so nothing was queued.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/reindex/sku-123
+```
+```json
+{ "status": "enqueued", "namespace": "products", "doc_id": "sku-123" }
+```
+
+Returns `422` when the namespace is not semantic-search-enabled, `404` when it does not exist, and `400` when `{doc_id}` is not valid for the namespace's key type.
 
 ---
 

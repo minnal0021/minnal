@@ -326,6 +326,18 @@ pub struct SemanticSearchContext {
 
 // ── ReindexStats ─────────────────────────────────────────────────────────────
 
+/// Outcome of a single-document vector reindex
+/// ([`DocStore::reindex_doc_vector`] / [`DocStore::kv_reindex_doc_vector`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorReindexOutcome {
+    /// The document was (re-)enqueued for embedding.
+    Enqueued,
+    /// No document/value exists for the given id.
+    NotFound,
+    /// The document produced no embedding text, so nothing was enqueued.
+    SkippedEmptyText,
+}
+
 /// Result of a [`DocStore::index_all`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct ReindexStats {
@@ -1920,6 +1932,92 @@ impl DocStore {
         let fields = self.db.list_index_fields(ns_id);
         let fm = fields.iter().find(|f| f.field_name == field)?;
         self.db.field_index_blob_stats(ns_id, fm.field_id)
+    }
+
+    /// Reindex a single document's entry in one field index, re-deriving the
+    /// field value from the document's current stored bytes using the same logic
+    /// as the write path (clear the row's old buckets, re-extract, insert). Only
+    /// the named field is touched — the document is not rewritten and no other
+    /// field or vector index is affected.
+    ///
+    /// Returns the [`minnal_db::FieldReindexOutcome`]. Errors with
+    /// [`DocStoreError::IndexNotFound`] when `field` is not an indexed field of
+    /// the namespace.
+    pub async fn reindex_doc_field(&self, namespace: &str, id: DocId, field: &str) -> Result<minnal_db::FieldReindexOutcome, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let fields = self.db.list_index_fields(ns_id);
+        let fm = fields
+            .iter()
+            .find(|f| f.field_name == field)
+            .ok_or_else(|| DocStoreError::IndexNotFound {
+                namespace: namespace.to_owned(),
+                field: field.to_owned(),
+            })?;
+        Ok(self.db.reindex_field(ns_id, fm.field_id, id.to_bytes()).await?)
+    }
+
+    /// Re-enqueue a single document for vector (re-)embedding — the same enqueue
+    /// the write path and [`index_all`](DocStore::index_all) use, scoped to one
+    /// document. The async worker picks it up on its next pass.
+    ///
+    /// Errors with [`DocStoreError::SemanticSearchNotEnabled`] when the namespace
+    /// is not semantic-search-enabled.
+    pub async fn reindex_doc_vector(&self, namespace: &str, id: DocId) -> Result<VectorReindexOutcome, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        if !schema.is_semantic_search_enabled() {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
+        let key = id.to_bytes();
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let value = match ns.get(key.clone()).await? {
+            Some(v) => v,
+            None => return Ok(VectorReindexOutcome::NotFound),
+        };
+        let doc: serde_json::Value = serde_json::from_slice(&value).map_err(|e| DocStoreError::InvalidId(e.to_string()))?;
+        let text = build_embedding_text(&doc, &schema.embedding_fields);
+        if text.is_empty() {
+            return Ok(VectorReindexOutcome::SkippedEmptyText);
+        }
+        vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
+        Ok(VectorReindexOutcome::Enqueued)
+    }
+
+    /// Re-enqueue a single KV entry for vector (re-)embedding — the KV-store
+    /// counterpart of [`reindex_doc_vector`](DocStore::reindex_doc_vector). The
+    /// KV value (a string) is the embedding text.
+    ///
+    /// Errors with [`DocStoreError::SemanticSearchNotEnabled`] when the namespace
+    /// is not semantic-search-enabled.
+    pub async fn kv_reindex_doc_vector(&self, namespace: &str, raw_key: &str) -> Result<VectorReindexOutcome, DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        if !schema.is_semantic_search_enabled() {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
+        let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let value = match ns.get(key_bytes.clone()).await? {
+            Some(v) => v,
+            None => return Ok(VectorReindexOutcome::NotFound),
+        };
+        let text = match std::str::from_utf8(&value) {
+            Ok(t) if !t.is_empty() => t,
+            _ => return Ok(VectorReindexOutcome::SkippedEmptyText),
+        };
+        vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
+        Ok(VectorReindexOutcome::Enqueued)
     }
 
     /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).
@@ -4539,6 +4637,58 @@ mod tests {
         let reconciled = store.reconcile_vector_indexes().await;
         assert_eq!(reconciled, 3, "all three missing docs must be re-enqueued");
         assert_eq!(store.pending_vector_index_count().await, 3);
+    }
+
+    /// A single-document vector reindex enqueues exactly that document, reports
+    /// `NotFound` for a missing id, and rejects a non-semantic namespace.
+    #[tokio::test]
+    async fn test_reindex_doc_vector_enqueues_single_doc() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        // No SemanticSearchContext attached, so put() does not enqueue.
+        for i in 1u64..=3 {
+            store
+                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.pending_vector_index_count().await, 0);
+
+        // Reindex just doc 2 → exactly one enqueue.
+        assert_eq!(
+            store.reindex_doc_vector("sem", DocId::U64(2)).await.unwrap(),
+            VectorReindexOutcome::Enqueued
+        );
+        assert_eq!(store.pending_vector_index_count().await, 1);
+
+        // A missing document reports NotFound and enqueues nothing more.
+        assert_eq!(
+            store.reindex_doc_vector("sem", DocId::U64(99)).await.unwrap(),
+            VectorReindexOutcome::NotFound
+        );
+        assert_eq!(store.pending_vector_index_count().await, 1);
+
+        // A namespace without semantic search is rejected.
+        store
+            .create(DocStoreSchema {
+                namespace: "plain".to_owned(),
+                ns_id: None,
+                key_type: KeyType::U64,
+                attributes: vec![],
+                indices: vec![],
+                semantic_search_enabled: false,
+                embedding_fields: vec![],
+            })
+            .await
+            .unwrap();
+        store.put("plain", DocId::U64(1), serde_json::json!({"title": "x"})).await.unwrap();
+        assert!(matches!(
+            store.reindex_doc_vector("plain", DocId::U64(1)).await,
+            Err(DocStoreError::SemanticSearchNotEnabled { .. })
+        ));
     }
 
     /// Reconciliation must skip documents that already have a pending queue

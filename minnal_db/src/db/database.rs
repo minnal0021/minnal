@@ -8,7 +8,7 @@ use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
-use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, NamespaceRegistry};
+use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
@@ -933,6 +933,21 @@ impl Database {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| e.index.read().blob_stats())
+    }
+
+    /// Reindex a single field for a single key: re-derive the field value from
+    /// the key's current stored bytes and rewrite its entry in that field's
+    /// index, using the same extractor + `DynFieldIndex` ops as the put path.
+    /// Touches only the named field — no value rewrite, no other-field or vector
+    /// re-indexing. See [`KVStore::reindex_field`].
+    ///
+    /// Returns `FieldReindexOutcome::FieldNotActive` when the namespace is not
+    /// open or `field_id` has no live index there.
+    pub fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        let Ok(store) = self.get_store(namespace_id) else {
+            return Ok(FieldReindexOutcome::FieldNotActive);
+        };
+        store.reindex_field(field_id, key)
     }
 
     /// The configured field-index compaction threshold as a fraction
@@ -3512,6 +3527,44 @@ mod tests {
         db.delete(b"doc:2").unwrap();
         assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
         assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        db.shutdown().unwrap();
+    }
+
+    /// Targeted single-field reindex: re-deriving a key's value for one field
+    /// must repair a stale index entry, be idempotent, and report the right
+    /// outcome for a missing key or an inactive field.
+    #[test]
+    fn test_reindex_field_repairs_and_reports_outcome() {
+        use crate::db::namespace::FieldReindexOutcome;
+        use crate::db::namespace_index::ExtractorFn;
+        use index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        // Reindexing an up-to-date entry is a no-op: still queryable, no duplicate.
+        assert_eq!(db.reindex_field(ns, field_id, b"doc:1").unwrap(), FieldReindexOutcome::Reindexed);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
+
+        // A key with no value reports KeyNotFound and changes nothing.
+        assert_eq!(db.reindex_field(ns, field_id, b"missing").unwrap(), FieldReindexOutcome::KeyNotFound);
+
+        // An unregistered field id reports FieldNotActive rather than erroring.
+        assert_eq!(db.reindex_field(ns, 9999, b"doc:1").unwrap(), FieldReindexOutcome::FieldNotActive);
 
         db.shutdown().unwrap();
     }

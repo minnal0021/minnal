@@ -22,7 +22,10 @@ pub use schema::{
 pub use pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
 
 // ── Store types ────────────────────────────────────────────────────────────
-pub use store::{DiskBuildProgress, DocId, DocStore, IndexBuildHandle, IndexBuildProgress, ReindexStats, SemanticSearchContext, VecReindexProgress};
+pub use store::{
+    DiskBuildProgress, DocId, DocStore, IndexBuildHandle, IndexBuildProgress, ReindexStats, SemanticSearchContext, VecReindexProgress,
+    VectorReindexOutcome,
+};
 
 // ── Index manager ──────────────────────────────────────────────────────────
 pub use index_manager::IndexBuildManager;
