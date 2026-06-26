@@ -52,6 +52,10 @@ pub struct AppState {
     pub attr_index_ops: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Tracks namespaces whose vector index is currently being dropped (background cleanup).
     pub vec_index_cleanup: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Set while a (background) vector-index reconcile/validate pass is running, so
+    /// the on-demand endpoint can reject overlapping runs instead of stacking
+    /// expensive full scans.
+    pub vec_reconcile_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[tokio::main]
@@ -191,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: Instant::now(),
         attr_index_ops: Arc::new(std::sync::Mutex::new(HashSet::new())),
         vec_index_cleanup: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        vec_reconcile_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let shutdown_store = Arc::clone(&state.store);

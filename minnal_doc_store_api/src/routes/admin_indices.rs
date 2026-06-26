@@ -463,26 +463,56 @@ pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<J
 
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────
 
-/// `POST /admin/indices/vector/reconcile` — forward vector-index reconciliation.
+/// `POST /admin/indices/vector/reconcile` — **validating** vector-index reconciliation.
 ///
-/// Scans every semantic-search-enabled namespace and re-enqueues any document
-/// that has neither a *complete* committed vector index (both the sparse-meta
-/// and dense halves) nor a pending queue entry — the `put`/`kv_put` crash window
-/// (document durably written, embed-enqueue lost to a crash) and the `put_no_wal`
-/// vector-write window (a crash before the memtable flush drops a just-indexed
-/// vector, or flushes one half and loses the other). A cheap count short-circuit
-/// skips namespaces already fully covered, so a clean run is inexpensive. The
-/// async worker drains the re-enqueued entries in the background. Returns `200`
-/// with `{ "reenqueued": N }`.
+/// Scans every semantic-search-enabled namespace and re-enqueues any document whose
+/// committed vector index is missing a half **or present-but-corrupt** (the bytes
+/// fail to deserialize), as well as documents with no pending queue entry left by a
+/// crash. Unlike the cheap presence-only pass that runs at startup, this **validates
+/// the bytes** — so it reads and deserializes every entry and cannot use the count
+/// short-circuit, making it a full value-reading scan.
 ///
-/// The same pass runs automatically as a background task on store startup; this
-/// endpoint lets an operator re-run it on demand — e.g. if the startup pass
-/// logged a failure.
-pub async fn vector_reconcile(State(state): State<AppState>) -> Json<serde_json::Value> {
-    info!("vector reconcile — re-enqueuing documents missing a vector index");
-    let reenqueued = state.store.reconcile_vector_indexes().await;
-    info!(reenqueued, "vector reconcile complete");
-    Json(serde_json::json!({ "reenqueued": reenqueued }))
+/// Because that scan can take a long time on a large corpus, this **returns
+/// immediately with `202 Accepted`** and runs the pass in the **background**; the
+/// re-enqueued count and any per-namespace failures are written to the log
+/// (`info!` on completion, `warn!`/`error!` on failure). Overlapping runs are
+/// rejected with `409 Conflict` so expensive scans cannot stack.
+///
+/// A presence-only reconcile still runs automatically on store startup.
+pub async fn vector_reconcile(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use std::sync::atomic::Ordering;
+
+    // Reject overlapping runs — a validating reconcile is a full value-reading scan.
+    if state
+        .vec_reconcile_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "a vector reconcile is already running" })),
+        ));
+    }
+
+    info!("vector reconcile (validating) accepted — running in background");
+    let store = Arc::clone(&state.store);
+    let running = Arc::clone(&state.vec_reconcile_running);
+    tokio::spawn(async move {
+        // Clear the running flag however the task exits (including a panic), so a
+        // failure can never wedge the endpoint into a permanent 409.
+        struct ResetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetOnDrop(running);
+
+        let reenqueued = store.validate_and_reconcile_vector_indexes().await;
+        info!(reenqueued, "vector reconcile (validating) complete");
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ── Vector queue monitoring ───────────────────────────────────────────────────
