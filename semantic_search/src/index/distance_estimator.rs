@@ -34,8 +34,14 @@ impl MultiBitQuanDotProductEstimator {
     }
 
     /// Build an estimator for one cluster, reusing the pre-computed `scaled_query_sum`.
+    ///
+    /// `query_embedding` and `centroid` must have the same dimension; the dot product
+    /// below would otherwise fail. `search()` validates the query dimension against
+    /// `cluster_index.dim()` up front, so callers on that path never hit it.
     pub fn with_scaled_query_sum(cluster_id: u32, query_embedding: &[f32], centroid: &[f32], scaled_query_sum: f32) -> Self {
-        let query_to_centroid_dot_product = simsimd::SpatialSimilarity::dot(query_embedding, centroid).unwrap() as f32;
+        let query_to_centroid_dot_product = simsimd::SpatialSimilarity::dot(query_embedding, centroid)
+            .expect("MultiBit estimator: query/centroid dimension mismatch (search() validates query dim against cluster_index.dim())")
+            as f32;
         MultiBitQuanDotProductEstimator(DotProductEstimatorState {
             cluster_id,
             query_to_centroid_dot_product,
@@ -50,8 +56,12 @@ impl MultiBitQuanDotProductEstimator {
 }
 
 impl SingleBitQuanDotProductEstimator {
+    /// `query_embedding` and `centroid` must share a dimension (see the MultiBit
+    /// constructor); `search()` guarantees this on the search path.
     pub fn new(cluster_id: u32, query_embedding: &[f32], centroid: &[f32]) -> Self {
-        let query_to_centroid_dot_product = simsimd::SpatialSimilarity::dot(query_embedding, centroid).unwrap() as f32;
+        let query_to_centroid_dot_product = simsimd::SpatialSimilarity::dot(query_embedding, centroid)
+            .expect("SingleBit estimator: query/centroid dimension mismatch (search() validates query dim against cluster_index.dim())")
+            as f32;
         let sum_q: f32 = query_embedding.iter().sum();
 
         SingleBitQuanDotProductEstimator(DotProductEstimatorState {

@@ -312,6 +312,17 @@ where
         return vec![];
     }
 
+    // Validate the query dimension once at the search-setup boundary. Every query
+    // embedding is dotted with a centroid in the per-cluster estimator constructors,
+    // which panic on a length mismatch — a wrong-dimension query is a misconfiguration
+    // (or a stale cluster file), not data, so return no results with a warning rather
+    // than crashing the search worker deep in a parallel loop.
+    let expected_dim = cluster_index.dim();
+    if query_dense_embedding.len() != expected_dim || query_sparse_embeddings.iter().any(|q| q.len() != expected_dim) {
+        warn!("semantic search query embedding dimension does not match centroid dimension {expected_dim}; returning no results");
+        return vec![];
+    }
+
     let top_k_limit = top_k.unwrap_or(config.top_k_results);
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
@@ -1065,12 +1076,42 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// A query whose embedding dimension does not match the centroids must return no
+    /// results (with a warning) at the search-setup boundary — never panic in the
+    /// per-cluster estimator constructors' query·centroid dot product.
+    #[tokio::test]
+    async fn test_search_wrong_query_dimension_returns_empty_not_panic() {
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]); // dim 4
+        let mut store = MockVectorKvStore::new();
+        store.add_sparse_entry(1, b"doc", 0.0);
+        store.add_dense_entry(1, b"doc", 0.1);
+        let config = SemanticSearchConfig {
+            n_probes: 1,
+            ..Default::default()
+        };
+
+        // 3-D query against 4-D centroids — would panic in the estimator dot product.
+        let results = search(
+            &config,
+            &cluster_index,
+            &[vec![1.0f32, 0.0, 0.0]],
+            &[1.0f32, 0.0, 0.0],
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await;
+        assert!(results.is_empty(), "mismatched query dimension must yield no results, not a panic");
+    }
+
     #[tokio::test]
     async fn test_search_returns_empty_with_multiple_query_embeddings_and_empty_store() {
         let config = SemanticSearchConfig::default();
-        let cluster_index = crate::cluster::ClusterIndex::from_clusters(Default::default(), 0);
-        let embeddings = vec![vec![0.0f32; 4], vec![0.0f32; 4]];
-        let dense = vec![0.0f32; 4];
+        // 4-D clusters so the query dimension matches and the search exercises the
+        // empty-store path rather than short-circuiting on the dimension guard.
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
+        let embeddings = vec![vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0f32, 1.0, 0.0, 0.0]];
+        let dense = vec![1.0f32, 0.0, 0.0, 0.0];
         let results = search(
             &config,
             &cluster_index,
