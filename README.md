@@ -16,6 +16,8 @@ Minnal is a layered, embedded document database written in Rust. It combines a h
 
 > **Platform support:** Linux and macOS only. Windows is not supported — the storage engine relies on Unix positional I/O (`pread`/`pwrite`) and the server requires POSIX signals.
 
+> **Companion UI:** [minnal0021/minnal_ui](https://github.com/minnal0021/minnal_ui) is a lightweight web UI that can be used to drive the minnal doc store.
+
 ---
 
 ## Table of Contents
