@@ -438,10 +438,14 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(name, schema)| {
             let ns_id = schema.ns_id.unwrap_or(0);
             let indexed_fields = if let Some(id) = schema.ns_id {
+                // Filter to the schema's current indices — the db registry retains
+                // dropped fields (for field_id reuse), which must not show here.
+                let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
                 state
                     .store
                     .list_index_fields(id)
                     .into_iter()
+                    .filter(|m| active.contains(m.field_name.as_str()))
                     .map(|m| FieldInfo::from_meta(m, &state.store, name))
                     .collect()
             } else {
@@ -860,10 +864,15 @@ pub async fn index_waste(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .filter_map(|(name, schema)| {
             let ns_id = schema.ns_id?;
+            // The db registry retains dropped fields (for field_id reuse), so use
+            // the schema's current `indices` as the source of truth for which
+            // indexes are still active — otherwise a dropped index lingers here.
+            let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
             let fields = state
                 .store
                 .list_index_fields(ns_id)
                 .into_iter()
+                .filter(|m| active.contains(m.field_name.as_str()))
                 .map(|m| {
                     let waste = state.store.field_index_waste(name, &m.field_name);
                     FieldWasteInfo {

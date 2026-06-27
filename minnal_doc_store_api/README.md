@@ -458,13 +458,47 @@ curl -X PATCH http://localhost:8080/stores/users/schema \
 # → 204 No Content
 ```
 
-| `op` value           | Required fields          |
-|---------------------|--------------------------|
-| `add_attribute`      | `name`, `attr_type`      |
-| `update_attribute`   | `name`, `attr_type`      |
-| `remove_attribute`   | `name`                   |
+**Add an embedding attribute (enable the vector index):** declares a `str`
+attribute that feeds the namespace's vector index and turns on semantic search.
 
-All ops accept an optional `"description"` string.
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "add_embedding_attribute", "name": "bio", "description": "embedded text"}'
+# → 204 No Content
+```
+
+A namespace has **at most one vector index**. Once semantic search is enabled,
+this op returns **`409 Conflict`** (`SemanticSearchAlreadyEnabled`) — drop the
+vector index first (`DELETE /stores/{ns}/indices/vector`) before re-adding.
+
+**Enable the vector index over multiple fields:** `add_embedding_attribute` only
+adds one field. To create a multi-field vector index after the store exists, use
+`enable_vector_index` with the full field list in a single call (valid only when
+no vector index is present):
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "enable_vector_index", "fields": ["bio", "headline"]}'
+# → 204 No Content
+```
+
+So the post-create workflow to **change which fields are embedded** is: drop the
+vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
+`enable_vector_index` with the new field set. Like `add_embedding_attribute`, it
+returns `409` if a vector index already exists, and `400` if `fields` is empty,
+contains duplicates, or names an existing index/attribute.
+
+| `op` value                | Required fields          |
+|---------------------------|--------------------------|
+| `add_attribute`           | `name`, `attr_type`      |
+| `update_attribute`        | `name`, `attr_type`      |
+| `remove_attribute`        | `name`                   |
+| `add_embedding_attribute` | `name`                   |
+| `enable_vector_index`     | `fields` (non-empty)     |
+
+All ops except `enable_vector_index` accept an optional `"description"` string.
 
 ---
 
@@ -495,7 +529,7 @@ curl -X POST http://localhost:8080/stores/users/indices \
 # → 202 Accepted
 ```
 
-Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Monitor progress via `GET /admin/indices/{ns}/progress`.
+Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Returns `400 Bad Request` (`TooManyIndices`) if the namespace is already at the **5-index limit** — the cap is enforced here, not just at create/import time. Monitor progress via `GET /admin/indices/{ns}/progress`.
 
 ---
 

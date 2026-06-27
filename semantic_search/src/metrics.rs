@@ -83,6 +83,13 @@ impl VectorMetricsSnapshot {
     }
 }
 
+/// Drop a namespace's corruption counters — e.g. when its vector index is
+/// dropped, so a later `snapshot`/`snapshot_all` no longer reports the removed
+/// index. A no-op if the namespace has no recorded counters.
+pub fn reset(namespace: &str) {
+    METRICS.write().expect("vector metrics lock poisoned").remove(namespace);
+}
+
 /// Snapshot the corruption counters for one `namespace`. Returns all-zero for a
 /// namespace that has never recorded a corruption.
 pub fn snapshot(namespace: &str) -> VectorMetricsSnapshot {

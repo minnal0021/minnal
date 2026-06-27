@@ -1560,29 +1560,24 @@ impl DocStore {
         info!("drop_vector_index_data: clearing embedding queue for namespace='{namespace}'");
         self.delete_all_queue_entries(namespace).await?;
 
-        let sparse_meta_ns = vector_kv::sparse_vectors_meta_ns(namespace);
-        if let Ok(ns) = self.db.namespace(sparse_meta_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
+        // Remove the companion vector namespaces outright (reclaiming their
+        // storage) rather than just emptying their entries — otherwise the empty
+        // namespaces linger in /admin/storage/kv-namespaces as orphaned
+        // "companion" stores after the index is dropped.
+        for companion in [
+            vector_kv::sparse_vectors_meta_ns(namespace),
+            vector_kv::sparse_vectors_ns(namespace),
+            vector_kv::dense_vectors_ns(namespace),
+        ] {
+            if let Err(e) = self.db.remove_namespace(companion.clone()).await {
+                // Best-effort: a missing companion is fine (nothing was indexed).
+                debug!("drop_vector_index_data: removing companion '{companion}' for '{namespace}': {e}");
             }
         }
 
-        let sparse_ns = vector_kv::sparse_vectors_ns(namespace);
-        if let Ok(ns) = self.db.namespace(sparse_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
-            }
-        }
-
-        let dense_ns = vector_kv::dense_vectors_ns(namespace);
-        if let Ok(ns) = self.db.namespace(dense_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
-            }
-        }
+        // Clear the in-memory corruption counters so a dropped index stops
+        // showing up in /admin/indices/vector/corruption-metrics.
+        semantic_search::metrics::reset(namespace);
 
         if let Ok(schema) = self.load_schema(namespace)
             && let Some(ns_id) = schema.ns_id
@@ -1672,6 +1667,17 @@ impl DocStore {
                 namespace: namespace.to_owned(),
                 field: spec.field.clone(),
             });
+        }
+
+        // Enforce the per-namespace index cap here too: `schema.save()` below does
+        // not validate (only `validate_and_save` does), so without this check
+        // `add_index` could push the namespace past MAX_INDICES one field at a
+        // time even though create/import reject it.
+        if schema.indices.len() >= crate::schema::MAX_INDICES {
+            return Err(DocStoreError::Schema(SchemaError::TooManyIndices {
+                count: schema.indices.len() + 1,
+                max: crate::schema::MAX_INDICES,
+            }));
         }
 
         // Guard against a second caller racing in while a background build is
@@ -2790,6 +2796,10 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
         std::fs::remove_file(schema_path)?;
     }
 
+    // Drop any in-memory vector corruption counters for this namespace so a
+    // dropped store stops appearing in /admin/indices/vector/corruption-metrics.
+    semantic_search::metrics::reset(namespace);
+
     Ok(())
 }
 
@@ -3433,6 +3443,47 @@ mod tests {
     }
 
     // ── Drop / add index ────────────────────────────────────────────────────
+
+    /// `add_index` must enforce the per-namespace `MAX_INDICES` cap incrementally,
+    /// not just at create/import time (`schema.save()` does not validate).
+    #[tokio::test]
+    async fn test_add_index_enforces_max_indices() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Start at the cap with MAX_INDICES indices.
+        let indices = (0..crate::schema::MAX_INDICES)
+            .map(|i| IndexSpec {
+                field: format!("f{i}"),
+                index_type: IndexType::Int,
+            })
+            .collect();
+        store.create(make_schema("ns", indices)).await.unwrap();
+
+        // One more must be rejected (not silently accepted past the cap).
+        let result = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "one_too_many".to_owned(),
+                    index_type: IndexType::Int,
+                },
+            )
+            .await;
+        match result {
+            Err(DocStoreError::Schema(crate::error::SchemaError::TooManyIndices { max, .. })) => {
+                assert_eq!(max, crate::schema::MAX_INDICES);
+            }
+            Ok(_) => panic!("expected TooManyIndices, got Ok"),
+            Err(e) => panic!("expected TooManyIndices, got {e:?}"),
+        }
+
+        // And the rejected field must not have been registered/persisted.
+        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        assert_eq!(loaded.indices.len(), crate::schema::MAX_INDICES);
+        assert!(!loaded.indices.iter().any(|s| s.field == "one_too_many"));
+    }
 
     #[tokio::test]
     async fn test_drop_index_demotes_to_attribute() {

@@ -298,10 +298,20 @@ pub enum SchemaAmendment {
         description: Option<String>,
     },
     /// Add a new `str` attribute and register it as an embedding field for
-    /// semantic search.  Sets `semantic_search_enabled = true` if not already
-    /// set.  Fails if the name already exists in `attributes`, `indices`, or
-    /// `embedding_fields`.
+    /// semantic search.  Sets `semantic_search_enabled = true`.  Fails if the
+    /// name already exists in `attributes` or `indices`, or if a vector index is
+    /// already present (drop it first — a namespace has at most one).
     AddEmbeddingAttribute { name: String, description: Option<String> },
+    /// Enable the namespace's (single) vector index over **one or more**
+    /// embedding fields in a single call.  Each name is declared as a `str`
+    /// attribute and registered as an embedding field, and
+    /// `semantic_search_enabled` is set.  Fails if a vector index is already
+    /// present (drop it first), if `fields` is empty, or if any name conflicts
+    /// with an existing index/attribute or is duplicated within the list.
+    ///
+    /// This is the post-create way to (re)create a multi-field vector index:
+    /// `DELETE /stores/{ns}/indices/vector` then enable with the full field set.
+    EnableVectorIndex { fields: Vec<String> },
 }
 
 /// Schema definition for a single document store instance.
@@ -519,6 +529,15 @@ impl DocStoreSchema {
                 }
             }
             SchemaAmendment::AddEmbeddingAttribute { name, description } => {
+                // A namespace has at most one vector index. Adding an embedding
+                // attribute is how the vector index is created; once it exists,
+                // reject further adds — the caller must drop the vector index
+                // first (which also clears its backing data).
+                if self.semantic_search_enabled {
+                    return Err(SchemaError::SemanticSearchAlreadyEnabled {
+                        namespace: self.namespace.clone(),
+                    });
+                }
                 if name.is_empty() {
                     return Err(SchemaError::EmptyAttributeName);
                 }
@@ -537,6 +556,44 @@ impl DocStoreSchema {
                     description,
                 });
                 self.embedding_fields.push(name);
+                self.semantic_search_enabled = true;
+                Ok(())
+            }
+            SchemaAmendment::EnableVectorIndex { fields } => {
+                // One vector index per namespace — reject if already present.
+                if self.semantic_search_enabled {
+                    return Err(SchemaError::SemanticSearchAlreadyEnabled {
+                        namespace: self.namespace.clone(),
+                    });
+                }
+                if fields.is_empty() {
+                    return Err(SchemaError::SemanticSearchMissingField);
+                }
+                // Validate every field up front so a bad entry leaves the schema
+                // untouched (no partial application).
+                let mut seen = std::collections::HashSet::new();
+                for name in &fields {
+                    if name.is_empty() {
+                        return Err(SchemaError::SemanticSearchMissingField);
+                    }
+                    if !seen.insert(name.as_str()) {
+                        return Err(SchemaError::DuplicateFieldName { field: name.clone() });
+                    }
+                    if indexed.contains(name.as_str()) {
+                        return Err(SchemaError::EmbeddingFieldConflict { field: name.clone() });
+                    }
+                    if self.attributes.iter().any(|a| &a.name == name) {
+                        return Err(SchemaError::DuplicateFieldName { field: name.clone() });
+                    }
+                }
+                for name in fields {
+                    self.attributes.push(AttributeDef {
+                        name: name.clone(),
+                        attr_type: AttributeType::Str,
+                        description: None,
+                    });
+                    self.embedding_fields.push(name);
+                }
                 self.semantic_search_enabled = true;
                 Ok(())
             }
@@ -1163,42 +1220,87 @@ mod tests {
         ));
     }
 
+    /// A namespace has at most one vector index: once an embedding attribute has
+    /// enabled semantic search, adding another is rejected (drop the vector index
+    /// first). The caller may instead declare multiple embedding fields up front
+    /// at create time.
     #[test]
-    fn amendment_add_embedding_attribute_duplicate_embedding_field_rejected() {
-        let mut s = valid_schema();
-        s.apply_amendment(SchemaAmendment::AddEmbeddingAttribute {
-            name: "body".to_owned(),
-            description: None,
-        })
-        .unwrap();
-        // Adding the same name again should be rejected via embedding_fields check
-        let result = s.apply_amendment(SchemaAmendment::AddEmbeddingAttribute {
-            name: "body".to_owned(),
-            description: None,
-        });
-        assert!(matches!(
-            result,
-            Err(SchemaError::DuplicateFieldName { field }) if field == "body"
-        ));
-    }
-
-    #[test]
-    fn amendment_add_multiple_embedding_attributes() {
+    fn amendment_add_embedding_attribute_rejected_when_already_enabled() {
         let mut s = valid_schema();
         s.apply_amendment(SchemaAmendment::AddEmbeddingAttribute {
             name: "title".to_owned(),
             description: None,
         })
         .unwrap();
-        s.apply_amendment(SchemaAmendment::AddEmbeddingAttribute {
+        assert!(s.semantic_search_enabled);
+
+        let result = s.apply_amendment(SchemaAmendment::AddEmbeddingAttribute {
             name: "body".to_owned(),
             description: None,
+        });
+        assert!(
+            matches!(result, Err(SchemaError::SemanticSearchAlreadyEnabled { .. })),
+            "second embedding add must be rejected, got {result:?}"
+        );
+        // The rejected field left no trace.
+        assert_eq!(s.embedding_fields, vec!["title"]);
+        assert!(!s.attributes.iter().any(|a| a.name == "body"));
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_multi_field() {
+        let mut s = valid_schema();
+        s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["title".to_owned(), "body".to_owned()],
         })
         .unwrap();
-        assert_eq!(s.embedding_fields, vec!["title", "body"]);
-        assert_eq!(s.attributes.len(), 2);
         assert!(s.semantic_search_enabled);
+        assert_eq!(s.embedding_fields, vec!["title", "body"]);
+        assert!(s.attributes.iter().any(|a| a.name == "title" && a.attr_type == AttributeType::Str));
+        assert!(s.attributes.iter().any(|a| a.name == "body"));
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_rejected_when_already_enabled() {
+        let mut s = valid_schema();
+        s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["title".to_owned()],
+        })
+        .unwrap();
+        let result = s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["body".to_owned()],
+        });
+        assert!(matches!(result, Err(SchemaError::SemanticSearchAlreadyEnabled { .. })));
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_empty_fields_rejected() {
+        let mut s = valid_schema();
+        let result = s.apply_amendment(SchemaAmendment::EnableVectorIndex { fields: vec![] });
+        assert!(matches!(result, Err(SchemaError::SemanticSearchMissingField)));
+        assert!(!s.semantic_search_enabled);
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_duplicate_in_list_rejected() {
+        let mut s = valid_schema();
+        let result = s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["dup".to_owned(), "dup".to_owned()],
+        });
+        assert!(matches!(result, Err(SchemaError::DuplicateFieldName { field }) if field == "dup"));
+        // Nothing applied on failure.
+        assert!(!s.semantic_search_enabled);
+        assert!(s.embedding_fields.is_empty());
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_conflict_with_index_field_rejected() {
+        let mut s = valid_schema(); // has an index on "status"
+        let result = s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["status".to_owned()],
+        });
+        assert!(matches!(result, Err(SchemaError::EmbeddingFieldConflict { field }) if field == "status"));
     }
 
     // ── validate_doc tests ────────────────────────────────────────────────────

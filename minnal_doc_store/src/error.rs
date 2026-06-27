@@ -43,6 +43,9 @@ pub enum SchemaError {
     #[error("embedding field '{field}' conflicts with an existing index field name")]
     EmbeddingFieldConflict { field: String },
 
+    #[error("namespace '{namespace}' already has a vector index — drop it before adding another")]
+    SemanticSearchAlreadyEnabled { namespace: String },
+
     #[error("embedding field '{field}' must be declared as a string (Str) attribute")]
     EmbeddingFieldNotString { field: String },
 

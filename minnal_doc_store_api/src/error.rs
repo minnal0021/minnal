@@ -46,7 +46,8 @@ impl IntoResponse for AppError {
             | DocStoreError::AttributeIsIndexed { .. }
             | DocStoreError::VecReindexInProgress { .. }
             | DocStoreError::VecIndexCleanupInProgress { .. }
-            | DocStoreError::AttrIndexOpInProgress { .. } => StatusCode::CONFLICT,
+            | DocStoreError::AttrIndexOpInProgress { .. }
+            | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. }) => StatusCode::CONFLICT,
 
             DocStoreError::InvalidId(_)
             | DocStoreError::Schema(SchemaError::InvalidNamespace)
@@ -56,6 +57,9 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::DuplicateFieldName { .. })
             | DocStoreError::Schema(SchemaError::AttributeIsIndexed { .. })
             | DocStoreError::Schema(SchemaError::AttributeNotFound { .. })
+            | DocStoreError::Schema(SchemaError::SemanticSearchMissingField)
+            | DocStoreError::Schema(SchemaError::EmbeddingFieldConflict { .. })
+            | DocStoreError::Schema(SchemaError::EmbeddingFieldNotString { .. })
             | DocStoreError::Schema(SchemaError::KvKeyTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::KvValueTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr) => StatusCode::BAD_REQUEST,

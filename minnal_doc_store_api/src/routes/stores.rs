@@ -95,6 +95,9 @@ pub(crate) enum AmendRequest {
         name: String,
         description: Option<String>,
     },
+    EnableVectorIndex {
+        fields: Vec<String>,
+    },
 }
 
 impl From<AmendRequest> for SchemaAmendment {
@@ -120,6 +123,7 @@ impl From<AmendRequest> for SchemaAmendment {
                 description,
             },
             AmendRequest::AddEmbeddingAttribute { name, description } => SchemaAmendment::AddEmbeddingAttribute { name, description },
+            AmendRequest::EnableVectorIndex { fields } => SchemaAmendment::EnableVectorIndex { fields },
         }
     }
 }
@@ -131,12 +135,11 @@ pub async fn amend_schema(
 ) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "amending schema");
 
-    // Adding an embedding attribute requires semantic search infrastructure.
-    if let AmendRequest::AddEmbeddingAttribute { .. } = &req
-        && state.cluster_index.is_none()
-    {
+    // Enabling the vector index (single- or multi-field) requires semantic
+    // search infrastructure.
+    if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) && state.cluster_index.is_none() {
         return Err(DocStoreError::EmbeddingFailed(
-            "cannot add embedding attribute: cluster index is not loaded \
+            "cannot enable the vector index: cluster index is not loaded \
                  (check semantic_search.cluster_path in config)"
                 .into(),
         )
