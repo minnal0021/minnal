@@ -381,14 +381,21 @@ impl BlobStore {
         self.header().count as usize
     }
 
-    /// Total bytes ever appended to the value region (`value_write_pos`) — i.e.
-    /// live blobs **plus** the stale copies left by the append-only `upsert`. This
-    /// is the figure that balloons for low-cardinality fields (a value rewritten
-    /// per document leaves one dead copy each time) until [`compact`] reclaims it.
+    /// Total bytes occupied by the value region — i.e. live blobs **plus** the
+    /// stale copies left by the append-only `upsert`. This is the figure that
+    /// balloons for low-cardinality fields (a value rewritten per document leaves
+    /// one dead copy each time) until [`compact`] reclaims it.
+    ///
+    /// Reported on the same `VALUE_ALIGNMENT` convention as [`live_bytes`]: the
+    /// write cursor (`value_write_pos`) is end-unpadded after the last blob, but
+    /// `live_bytes` rounds every blob up to alignment, so the raw cursor can read
+    /// *below* `live_bytes` for a freshly written store. Rounding the cursor up to
+    /// alignment keeps the documented invariant `logical_bytes ≥ live_bytes`.
     ///
     /// [`compact`]: BlobStore::compact
+    /// [`live_bytes`]: BlobStore::live_bytes
     pub fn logical_bytes(&self) -> u64 {
-        self.header().value_write_pos
+        align_up(self.header().value_write_pos as usize, VALUE_ALIGNMENT) as u64
     }
 
     /// Bytes the value region would occupy after [`compact`] — the live blobs
@@ -423,7 +430,11 @@ impl BlobStore {
     ///
     /// [`compact`]: BlobStore::compact
     pub fn waste_ratio(&self) -> f64 {
-        let total = self.header().value_write_pos;
+        // Use the alignment-rounded total so it shares a convention with
+        // `compacted_value_bytes` (which pads every blob); otherwise the trailing
+        // pad of the last blob makes `compacted` exceed `total` for a freshly
+        // written store and the subtraction would underflow to a spurious 0.
+        let total = self.logical_bytes();
         if total == 0 {
             return 0.0;
         }
@@ -883,6 +894,37 @@ mod tests {
             let got = store.get(i * 0x1_0000).unwrap();
             assert_eq!(got, format!("value_{}", i).as_bytes());
         }
+    }
+
+    #[test]
+    fn logical_bytes_never_below_live_bytes_for_unaligned_blob() {
+        // Regression: a fresh single blob whose length is not a VALUE_ALIGNMENT
+        // multiple used to report logical_bytes (raw write cursor, end-unpadded)
+        // below live_bytes (every blob rounded up to alignment), inverting the
+        // documented `logical ≥ live` invariant (the API surfaced 39 B < 48 B).
+        let mut store = BlobStore::new_anon();
+        let blob = vec![0xab_u8; 39]; // 39 is not a multiple of VALUE_ALIGNMENT (16)
+        store.upsert(7, &blob);
+
+        let logical = store.logical_bytes();
+        let live = store.live_bytes();
+        assert!(logical >= live, "logical_bytes ({logical}) must be ≥ live_bytes ({live})");
+        // No stale copies yet, so they should be exactly equal and waste 0.
+        assert_eq!(logical, live);
+        assert_eq!(store.waste_ratio(), 0.0);
+    }
+
+    #[test]
+    fn logical_bytes_at_least_live_bytes_with_stale_copies() {
+        // With overwrites leaving stale copies, logical (live + stale) must stay
+        // ≥ live regardless of blob alignment.
+        let mut store = BlobStore::new_anon();
+        store.upsert(1, &[1u8; 39]);
+        store.upsert(1, &[2u8; 17]); // overwrite → first copy is now stale
+        store.upsert(2, &[3u8; 5]);
+
+        assert!(store.logical_bytes() >= store.live_bytes());
+        assert!(store.waste_ratio() > 0.0, "the stale 39-byte copy should register as waste");
     }
 
     #[test]
