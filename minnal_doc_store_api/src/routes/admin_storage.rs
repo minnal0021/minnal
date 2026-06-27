@@ -18,7 +18,7 @@
 //! POST /admin/storage/gc                              → trigger value-log GC across all namespaces
 //! POST /admin/storage/gc/wal                          → trigger WAL GC
 //! POST /admin/storage/compact                         → trigger LSM compaction
-//! POST /admin/storage/index-checkpoint                → flush + compact field indexes (and row maps)
+//! POST /admin/storage/index-checkpoint                → flush + compact field indexes (and row maps) — runs in background (202)
 //! ```
 
 use std::collections::HashMap;
@@ -769,20 +769,50 @@ pub async fn trigger_compact(State(state): State<AppState>) -> Result<StatusCode
 /// Force an index checkpoint: flush every namespace's dense row map and all
 /// active field indexes to disk, compacting any field-index bitmap store whose
 /// waste exceeds `thresholds.index_blob_waste_threshold`. This is the same pass
-/// the periodic worker and clean shutdown run. Responds with the number of
-/// active field indexes checkpointed.
-pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    info!("index checkpoint triggered manually");
-    match state.store.checkpoint_index().await {
-        Ok(fields_checkpointed) => {
-            info!(fields_checkpointed, "index checkpoint complete");
-            Ok(Json(serde_json::json!({ "fields_checkpointed": fields_checkpointed })))
-        }
-        Err(e) => {
-            error!(error = %e, "index checkpoint failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))
-        }
+/// the periodic worker and clean shutdown run.
+///
+/// Because the compaction can take a long time on a large/wasted index (each
+/// over-threshold field is rebuilt under its own write lock), this **returns
+/// immediately with `202 Accepted`** and runs the pass in the **background**; the
+/// checkpointed-field count is written to the log (`info!` on completion,
+/// `error!` on failure). Overlapping runs are rejected with `409 Conflict` so
+/// expensive flush/compaction passes cannot stack.
+pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use std::sync::atomic::Ordering;
+
+    // Reject overlapping runs — a checkpoint can be a full flush + compaction.
+    if state
+        .index_checkpoint_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "an index checkpoint is already running" })),
+        ));
     }
+
+    info!("index checkpoint accepted — running in background");
+    let store = std::sync::Arc::clone(&state.store);
+    let running = std::sync::Arc::clone(&state.index_checkpoint_running);
+    tokio::spawn(async move {
+        // Clear the running flag however the task exits (including a panic), so a
+        // failure can never wedge the endpoint into a permanent 409.
+        struct ResetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetOnDrop(running);
+
+        match store.checkpoint_index().await {
+            Ok(fields_checkpointed) => info!(fields_checkpointed, "index checkpoint complete"),
+            Err(e) => error!(error = %e, "index checkpoint failed"),
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ── Index waste ────────────────────────────────────────────────────────────────

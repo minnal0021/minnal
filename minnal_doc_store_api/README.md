@@ -1033,7 +1033,7 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `POST` | `/admin/storage/gc` | `200` | Trigger value-log GC across all namespaces |
 | `POST` | `/admin/storage/gc/wal` | `200` | Trigger WAL GC |
 | `POST` | `/admin/storage/compact` | `204` | Trigger LSM compaction across all namespaces |
-| `POST` | `/admin/storage/index-checkpoint` | `200` | Flush + compact field indexes (and row maps) across all namespaces |
+| `POST` | `/admin/storage/index-checkpoint` | `202` | Flush + compact field indexes (and row maps) across all namespaces — runs in background; `409` if one is already running |
 
 ---
 
@@ -1113,13 +1113,19 @@ curl http://localhost:8080/admin/storage/index-waste
 
 Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (default every 15 min) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
 
-This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem. Returns the number of active field indexes checkpointed.
+This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem.
+
+Because the flush + compaction can take a long time on a large/wasted index, this **returns `202 Accepted` immediately and runs the pass in the background**; the checkpointed-field count is written to the server log on completion (and any failure is logged there too). If a checkpoint is already running, the request is rejected with `409 Conflict` so passes cannot stack.
 
 ```bash
-curl -X POST http://localhost:8080/admin/storage/index-checkpoint
+curl -i -X POST http://localhost:8080/admin/storage/index-checkpoint
+```
+```text
+HTTP/1.1 202 Accepted
 ```
 ```json
-{ "fields_checkpointed": 4 }
+// 409 Conflict when one is already running
+{ "error": "an index checkpoint is already running" }
 ```
 
 ---
