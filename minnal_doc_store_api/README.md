@@ -1042,7 +1042,7 @@ value. There are two distinct kinds:
 | `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
 | `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
 | `GET /admin/storage/value-log/{ns}/pages` | Value-log per page | **Yes** |
-| `GET /admin/storage/index-waste` | Field-index dead space | **Yes** |
+| `GET /admin/storage/index-waste` | Field-index dead space | **Yes** (derived from on-disk state, not a stored counter) |
 | `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
 | `GET /admin/storage/kv-namespaces` | Engine KV namespaces | **Yes** |
 | `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
@@ -1161,13 +1161,23 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 
 **`GET /admin/storage/index-waste`** — field-index dead space:
 
+> **Derived, not a stored counter.** The waste ratios are **not** persisted
+> figures — they are computed on demand from the field-index blob store
+> (`waste_ratio = (logical_bytes − live_bytes) / logical_bytes`, where both inputs
+> come from the on-disk `blobs.keys` header + slot table). Because those files are
+> persisted, a restart reproduces the **identical** value (it "survives restart"),
+> but unlike the ops-metrics counters there is no accumulated history: the ratio
+> always reflects *current* dead space and reads back to ≈0 right after a
+> compaction. `distinct_count` is likewise derived from the field's in-memory
+> value→slot map, which is rebuilt from persisted state on open.
+
 | Field | Meaning |
 |-------|---------|
 | `threshold` | Compaction threshold (fraction `0.0..1.0`) — config, not on-disk state |
-| `namespaces[].fields[].bitmap_waste_ratio` | Reclaimable fraction of the bitmap blob store (`null` if field still building) |
-| `namespaces[].fields[].keymap_waste_ratio` | Reclaimable fraction of the keymap blob store |
+| `namespaces[].fields[].bitmap_waste_ratio` | Reclaimable fraction of the bitmap blob store — *derived from on-disk state* (`null` if field still building) |
+| `namespaces[].fields[].keymap_waste_ratio` | Reclaimable fraction of the keymap blob store — *derived from on-disk state* |
 | `namespaces[].fields[].over_threshold` | True if either store has reached the threshold (compacted next checkpoint) |
-| `namespaces[].fields[].distinct_count` | Distinct indexed values for the field |
+| `namespaces[].fields[].distinct_count` | Distinct indexed values for the field — *derived from the rebuilt-on-open value map* |
 
 The listing endpoints — `GET /admin/storage/namespaces`, `/kv-namespaces`,
 `/stores/{ns}/kv-meta`, `/kv-stores/{ns}/kv-meta`, `/system/stores`, and
