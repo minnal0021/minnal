@@ -295,8 +295,10 @@ fn doc_id_hex(doc_id: &[u8]) -> String {
     s
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn search<K, F>(
     config: &SemanticSearchConfig,
+    namespace: &str,
     cluster_index: &ClusterIndex,
     query_sparse_embeddings: &[Vec<f32>],
     query_dense_embedding: &[f32],
@@ -389,7 +391,7 @@ where
                     Err(e) => {
                         // Corrupt sparse entry: skip it, but make it visible so a degraded
                         // index is distinguishable from "no semantic match".
-                        crate::metrics::record_sparse_corrupt_skipped();
+                        crate::metrics::record_sparse_corrupt_skipped(namespace);
                         warn!(
                             "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
                             doc_id_hex(doc_id),
@@ -491,7 +493,7 @@ where
                 Err(e) => {
                     // Corrupt dense entry: skip it, but log it so index corruption is
                     // not mistaken for a candidate simply scoring poorly in pass 2.
-                    crate::metrics::record_dense_corrupt_skipped();
+                    crate::metrics::record_dense_corrupt_skipped(namespace);
                     warn!(
                         "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
                         doc_id_hex(doc_id),
@@ -1074,7 +1076,17 @@ mod tests {
     async fn test_search_returns_empty_with_no_query_embeddings() {
         let config = SemanticSearchConfig::default();
         let cluster_index = crate::cluster::ClusterIndex::from_clusters(Default::default());
-        let results = search(&config, &cluster_index, &[], &[], &EmptyKvStore, None::<fn(&[u8]) -> bool>, None).await;
+        let results = search(
+            &config,
+            "test_ns",
+            &cluster_index,
+            &[],
+            &[],
+            &EmptyKvStore,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await;
         assert!(results.is_empty());
     }
 
@@ -1095,6 +1107,7 @@ mod tests {
         // 3-D query against 4-D centroids — would panic in the estimator dot product.
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0],
@@ -1116,6 +1129,7 @@ mod tests {
         let dense = vec![1.0f32, 0.0, 0.0, 0.0];
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &embeddings,
             &dense,
@@ -1259,6 +1273,7 @@ mod tests {
         // Filter rejects every document.
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1290,10 +1305,13 @@ mod tests {
             ..Default::default()
         };
 
-        // Corruption counters are process-global, so compare deltas with `>=`.
-        let before = crate::metrics::snapshot();
+        // Corruption counters are per-namespace and process-global; use a test-
+        // unique namespace and compare deltas with `>=`.
+        let ns = "corrupt_metrics_test_ns";
+        let before = crate::metrics::snapshot(ns);
         let results = search(
             &config,
+            ns,
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1302,15 +1320,15 @@ mod tests {
             None,
         )
         .await;
-        let after = crate::metrics::snapshot();
+        let after = crate::metrics::snapshot(ns);
 
         // The corrupt sparse and corrupt dense skips each bumped their counter.
         assert!(
-            after.sparse_corrupt_skipped >= before.sparse_corrupt_skipped + 1,
+            after.sparse_corrupt_skipped > before.sparse_corrupt_skipped,
             "corrupt sparse skip must increment the metric",
         );
         assert!(
-            after.dense_corrupt_skipped >= before.dense_corrupt_skipped + 1,
+            after.dense_corrupt_skipped > before.dense_corrupt_skipped,
             "corrupt dense skip must increment the metric",
         );
 
@@ -1340,6 +1358,7 @@ mod tests {
         };
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1381,6 +1400,7 @@ mod tests {
         };
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1421,6 +1441,7 @@ mod tests {
         };
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1460,6 +1481,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1495,6 +1517,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0f32, 1.0, 0.0, 0.0]],
             &[1.0f32, 1.0, 0.0, 0.0],
@@ -1526,6 +1549,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1562,6 +1586,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1600,6 +1625,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1632,6 +1658,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1709,6 +1736,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0f32, 1.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1769,6 +1797,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0f32, 1.0, 0.0, 0.0]],
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1809,6 +1838,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]], // single query token
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1878,6 +1908,7 @@ mod tests {
 
         let results = search(
             &config,
+            "test_ns",
             &cluster_index,
             &[vec![1.0f32, 0.0, 0.0, 0.0]], // single query token
             &[1.0f32, 0.0, 0.0, 0.0],
@@ -1929,7 +1960,17 @@ mod tests {
         let q = vec![1.0f32, 0.0, 0.0, 0.0];
         let query_embeddings = vec![q.clone(), q.clone(), q.clone()];
 
-        let results = search(&config, &cluster_index, &query_embeddings, &q, &store, None::<fn(&[u8]) -> bool>, None).await;
+        let results = search(
+            &config,
+            "test_ns",
+            &cluster_index,
+            &query_embeddings,
+            &q,
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await;
 
         // Both pass sparse (top_k=2) and both have dense entries.
         // Final ordering is by dense score (equal), so both appear.

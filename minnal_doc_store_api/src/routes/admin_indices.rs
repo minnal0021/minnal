@@ -5,7 +5,9 @@
 //! GET    /admin/indices/vector/queue/summary              → global queue depth / lag
 //! GET    /admin/indices/vector/queue/retried              → globally retried entries (all namespaces)
 //! DELETE /admin/indices/vector/query-cache                → clear the system-wide query embedding cache
+//! GET    /admin/indices/vector/corruption-metrics         → corrupt-skip counts per namespace (all namespaces)
 //! GET    /admin/indices/{ns}/progress                     → per-namespace index progress
+//! GET    /admin/indices/{ns}/vector/corruption-metrics    → corrupt-skip counts for one namespace
 //! POST   /admin/indices/{ns}/attribute/reindex-all        → drop + rebuild all field indices (202)
 //! DELETE /admin/indices/{ns}/attribute/drop-all           → drop all field indices (202)
 //! POST   /admin/indices/{ns}/attribute/{field}/reindex/{doc_id} → reindex one doc in one field index (200)
@@ -627,15 +629,28 @@ pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<J
 // ── GET /admin/indices/vector/corruption-metrics ──────────────────────────────
 
 /// `GET /admin/indices/vector/corruption-metrics` — cumulative counts of vector
-/// entries skipped during search because their bytes failed to deserialize.
+/// entries skipped during search because their bytes failed to deserialize,
+/// **broken down per namespace** (a namespace that has never recorded a
+/// corruption is omitted; an empty object means none have).
 ///
-/// Process-wide, monotonically increasing since startup (sample twice for a rate).
-/// A non-zero/rising value means stored vectors are corrupt and queries are
-/// silently degraded — run the validating reconcile
-/// ([`POST /admin/indices/vector/reconcile`](vector_reconcile)) to re-embed the
-/// affected documents. Split by pass (`sparse` = Pass 1, `dense` = Pass 2).
-pub async fn vector_corruption_metrics() -> Json<semantic_search::metrics::VectorMetricsSnapshot> {
-    Json(semantic_search::metrics::snapshot())
+/// Counters are in-memory and monotonically increasing since startup (sample
+/// twice for a rate), reset on restart. A non-zero/rising value means stored
+/// vectors are corrupt and queries are silently degraded — run the validating
+/// reconcile ([`POST /admin/indices/vector/reconcile`](vector_reconcile)) to
+/// re-embed the affected documents. Split by pass (`sparse` = Pass 1, `dense` =
+/// Pass 2). For a single namespace use
+/// [`GET /admin/indices/{ns}/vector/corruption-metrics`](vector_corruption_metrics_ns).
+pub async fn vector_corruption_metrics() -> Json<std::collections::BTreeMap<String, semantic_search::metrics::VectorMetricsSnapshot>> {
+    Json(semantic_search::metrics::snapshot_all())
+}
+
+// ── GET /admin/indices/{ns}/vector/corruption-metrics ─────────────────────────
+
+/// `GET /admin/indices/{ns}/vector/corruption-metrics` — corruption counts for a
+/// single namespace (all-zero if the namespace has never recorded a corruption).
+/// See [`vector_corruption_metrics`] for the cross-namespace view and semantics.
+pub async fn vector_corruption_metrics_ns(Path(ns): Path<String>) -> Json<semantic_search::metrics::VectorMetricsSnapshot> {
+    Json(semantic_search::metrics::snapshot(&ns))
 }
 
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────

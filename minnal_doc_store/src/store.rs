@@ -1418,6 +1418,7 @@ impl DocStore {
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,
@@ -2236,6 +2237,7 @@ impl DocStore {
 
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,
@@ -2298,6 +2300,7 @@ impl DocStore {
 
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,

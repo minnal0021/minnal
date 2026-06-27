@@ -77,6 +77,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/vector/reconcile", post(admin_indices::vector_reconcile))
         // Admin / indices — per-namespace monitoring & operations
         .route("/admin/indices/{ns}/progress", get(admin_indices::progress_ns))
+        .route(
+            "/admin/indices/{ns}/vector/corruption-metrics",
+            get(admin_indices::vector_corruption_metrics_ns),
+        )
         .route("/admin/indices/{ns}/attribute/reindex-all", post(admin_indices::attribute_reindex_all))
         .route("/admin/indices/{ns}/attribute/drop-all", delete(admin_indices::attribute_drop_all))
         .route(

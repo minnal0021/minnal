@@ -1141,7 +1141,8 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
 | `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
 | `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
-| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Cumulative counts of vector entries skipped during search due to corrupt bytes |
+| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Per-namespace counts of vector entries skipped during search due to corrupt bytes (all namespaces) |
+| `GET` | `/admin/indices/{ns}/vector/corruption-metrics` | `200` | Corrupt-skip counts for a single namespace |
 | `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
@@ -1203,7 +1204,7 @@ Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace
 
 #### `GET /admin/indices/vector/corruption-metrics`
 
-Cumulative counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug). Process-wide and monotonically increasing since startup — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`.
+Counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug), **broken down per namespace**. In-memory and monotonically increasing since startup (reset on restart) — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`. A namespace that has never recorded a corruption is omitted; an empty object means none have.
 
 A rising value means stored vectors are corrupt and queries are silently degraded; run the validating [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) to re-embed the affected documents.
 
@@ -1211,7 +1212,22 @@ A rising value means stored vectors are corrupt and queries are silently degrade
 curl http://localhost:8080/admin/indices/vector/corruption-metrics
 ```
 ```json
-{ "sparse_corrupt_skipped": 0, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 0 }
+{
+  "products": { "sparse_corrupt_skipped": 2, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 2 }
+}
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/corruption-metrics`
+
+The same corrupt-skip counts for a single namespace `{ns}`. Returns all-zero if the namespace has never recorded a corruption.
+
+```bash
+curl http://localhost:8080/admin/indices/products/vector/corruption-metrics
+```
+```json
+{ "sparse_corrupt_skipped": 2, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 2 }
 ```
 
 ---
