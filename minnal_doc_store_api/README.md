@@ -31,6 +31,7 @@ A lightweight embedded document and key-value store with a REST API, built on to
   - [KV prefix scan](#kv-prefix-scan)
   - [KV semantic search](#kv-semantic-search)
   - [Admin Stores API](#admin-stores-api)
+  - [Operational & Storage Metrics](#operational--storage-metrics)
   - [Admin Storage API](#admin-storage-api)
   - [Admin Indices API](#admin-indices-api)
 - [Predicate syntax](#predicate-syntax)
@@ -1010,6 +1011,174 @@ curl http://localhost:8080/admin/stores/users/row-count
 
 ---
 
+### Operational & Storage Metrics
+
+This is a consolidated reference for everything reported by the metrics/diagnostic
+endpoints under `/admin/storage`, with a **"survives restart?"** column for each
+value. There are two distinct kinds:
+
+- **Operational metrics** (`GET /admin/storage/ops-metrics`) — engine-wide runtime
+  counters of *what the engine is doing* (throughput, read-path efficiency,
+  compaction/GC activity). They are in-memory `AtomicU64`s created fresh in
+  `Database::open`, so they are **not persisted** — every restart starts them at
+  zero. Cumulative since process start; sample twice to compute a rate.
+- **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
+  snapshots of *how big the engine is* and *how much dead space it holds*. These
+  are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
+  metadata, index blob stores) on every request, so a restart does not reset them
+  — they reflect whatever is durably on disk.
+
+**"Survives restart?" legend:** **No** = in-memory only, zero at process start.
+**Yes** = read/derived from persisted on-disk state, so unaffected by a restart.
+
+#### Endpoint overview
+
+| Endpoint | Kind | Survives restart? |
+|----------|------|-------------------|
+| `GET /admin/storage/ops-metrics` | Runtime counters | **No** (see startup-repopulation note) |
+| `GET /admin/storage/health` | Liveness / uptime | `uptime_s` **No**; `status` n/a |
+| `GET /admin/storage/stats` | Value-log aggregate | **Yes** |
+| `GET /admin/storage/wal` | WAL metadata | **Yes** |
+| `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
+| `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
+| `GET /admin/storage/value-log/{ns}/pages` | Value-log per page | **Yes** |
+| `GET /admin/storage/index-waste` | Field-index dead space | **Yes** |
+| `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
+| `GET /admin/storage/kv-namespaces` | Engine KV namespaces | **Yes** |
+| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
+| `GET /admin/storage/kv-stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
+| `GET /admin/storage/system/stores` | System namespaces | **Yes** |
+| `GET /admin/storage/system/stores/{ns}/meta` | One system store | **Yes** (except `in_memory.*`) |
+
+#### Operational metrics — `GET /admin/storage/ops-metrics`
+
+All counters below are **in-memory and reset to zero on restart**. They are grouped
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`, plus a
+top-level `uptime_s`.
+
+| Field | Group | Meaning | Survives restart? |
+|-------|-------|---------|-------------------|
+| `uptime_s` | (top) | Seconds since the server process started | **No** |
+| `reads` | reads | User-facing point reads (`GET` by key) | **No** |
+| `read_hits` | reads | Reads that found a live value | **No** |
+| `read_misses` | reads | Reads that found nothing (absent/tombstoned) | **No** |
+| `read_hit_ratio` | reads | `read_hits / reads` (derived) | **No** |
+| `scans` | reads | Multi-key scans (range/prefix) executed | **No** |
+| `scan_rows` | reads | Total rows returned across all scans | **No** |
+| `lookups` | lsm_lookups | LSM point lookups (≥ `reads` — also counts GC-validation reads and WAL-replay probes) | **No** |
+| `fast_path_hits` | lsm_lookups | Lookups served by the active-memtable fast path (no lower-layer scan) | **No** |
+| `fast_path_hit_ratio` | lsm_lookups | `fast_path_hits / lookups` (derived) | **No** |
+| `l0_probes` | lsm_lookups | Lookups that scanned at least one L0 SSTable | **No** |
+| `l1_probes` | lsm_lookups | Lookups that scanned the L1 SSTable (not bloom-rejected) | **No** |
+| `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
+| `puts` | writes | WAL-backed upserts applied | **No** |
+| `deletes` | writes | WAL-backed deletes applied | **No** |
+| `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads) | **No** |
+| `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
+| `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
+| `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
+| `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
+| `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
+| `compaction_bytes_merged` | compaction | Total bytes merged during compactions | **No** |
+| `compaction_duration_ms` | compaction | Cumulative time spent compacting (ms) | **No** |
+| `vlog_gc_runs` | gc | Value-log GC passes run | **No** |
+| `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
+| `wal_gc_runs` | gc | WAL GC passes run | **No** |
+| `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+
+> **Startup-repopulation note.** Although these counters start at zero, they are
+> wired in *before* recovery, so the work the engine does on the way up bumps some
+> of them before any user request arrives — they are **regenerated, not persisted**.
+> In particular WAL replay does one `lsm.get` per replayed entry (bumping
+> `lookups`), and startup vector-index reconciliation re-enqueues missing docs via
+> the normal write path (bumping `puts` / `wal_fsyncs` / `wal_bytes_appended`). So
+> a non-zero reading right after a restart is expected and reflects startup
+> activity, not pre-restart totals — `lookups` in particular jumps with the size of
+> the WAL replay. Vector-search corruption counters
+> ([`/admin/indices/vector/corruption-metrics`](#get-adminindicesvectorcorruption-metrics))
+> follow the same in-memory, reset-on-restart model.
+
+#### Storage metrics — field reference
+
+All fields below are **recomputed from on-disk state on every request** (survives
+restart = **Yes**), except the explicitly-flagged in-memory ones.
+
+**`GET /admin/storage/stats`** — engine-wide value-log aggregate:
+
+| Field | Meaning |
+|-------|---------|
+| `head`, `tail` | Value-log logical start/end offsets |
+| `garbage_bytes` | Reclaimable dead bytes across the value log |
+| `waste_ratio_pct` | Dead / total written (%) |
+| `free_space_ratio_pct` | Free fraction of the allocated region (%) |
+| `total_gc_runs` | Value-log GC passes ever run (persisted in metadata) |
+| `total_bytes_reclaimed` | Bytes ever reclaimed by value-log GC (persisted) |
+| `live_bytes` | Live (non-garbage) bytes |
+
+**`GET /admin/storage/wal`** — WAL metadata:
+
+| Field | Meaning |
+|-------|---------|
+| `head`, `tail` | WAL byte offsets of the live window |
+| `total_entries` | Entries currently tracked |
+| `persisted_entries` | Entries already applied + persisted |
+| `pending_entries` | `total − persisted` (replayed on next open) |
+| `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
+| `base_segment_id` | Absolute id the per-segment counters start at (lower segments trimmed) |
+| `live_segments` | Tracked segments still carrying entries |
+| `last_sequence` | Highest write sequence the WAL has observed |
+| `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+
+**`GET /admin/storage/lsm`** — per-namespace LSM manifest:
+
+| Field | Meaning | Survives restart? |
+|-------|---------|-------------------|
+| `manifest_version`, `created_at_ms` | Manifest version + creation time | **Yes** |
+| `level_count`, `total_entries`, `total_size_bytes` | Levels, key count, on-disk SSTable bytes | **Yes** |
+| `levels[].buckets[].files[]` | Per-file `{path, created_at_ms, entry_count, size_bytes}` | **Yes** |
+| `in_memory.memtable_entries` | Live active-memtable entry count | **No** |
+| `in_memory.read_only_entries` / `read_only_count` | Sealed (read-only) memtable entries / count | **No** |
+| `in_memory.compaction_in_progress` | Whether a compaction is running now | **No** |
+
+**`GET /admin/storage/value-log`** — per-namespace, per-shard utilisation:
+
+| Field | Meaning |
+|-------|---------|
+| `total_live_bytes`, `total_garbage_bytes`, `waste_ratio_pct`, `total_physical_bytes` | Namespace rollups across shards |
+| `shards[].bucket`, `head`, `tail` | Shard id and offsets |
+| `shards[].live_bytes`, `garbage_bytes`, `waste_ratio_pct` | Per-shard utilisation |
+| `shards[].total_gc_runs`, `total_bytes_reclaimed` | Per-shard GC activity (persisted) |
+| `shards[].physical_bytes` | Blocks actually allocated on disk (`st_blocks`; excludes sparse holes) |
+| `shards[].logical_bytes` | File length including sparse holes (≥ `physical_bytes`) |
+
+**`GET /admin/storage/value-log/{ns}/pages`** — per-page garbage breakdown:
+
+| Field | Meaning |
+|-------|---------|
+| `shards[].pages[].page_offset` | Page start offset within the shard |
+| `live_bytes`, `garbage_bytes`, `garbage_ratio_pct` | Per-page live/dead bytes and ratio |
+| `total_records`, `garbage_records` | Records on the page, and how many are garbage |
+
+**`GET /admin/storage/index-waste`** — field-index dead space:
+
+| Field | Meaning |
+|-------|---------|
+| `threshold` | Compaction threshold (fraction `0.0..1.0`) — config, not on-disk state |
+| `namespaces[].fields[].bitmap_waste_ratio` | Reclaimable fraction of the bitmap blob store (`null` if field still building) |
+| `namespaces[].fields[].keymap_waste_ratio` | Reclaimable fraction of the keymap blob store |
+| `namespaces[].fields[].over_threshold` | True if either store has reached the threshold (compacted next checkpoint) |
+| `namespaces[].fields[].distinct_count` | Distinct indexed values for the field |
+
+The listing endpoints — `GET /admin/storage/namespaces`, `/kv-namespaces`,
+`/stores/{ns}/kv-meta`, `/kv-stores/{ns}/kv-meta`, `/system/stores`, and
+`/system/stores/{ns}/meta` — return registry/schema descriptors (names, `ns_id`,
+key/value types, `semantic_search_enabled`, TTL config, indexed fields) plus, where
+relevant, the same LSM/value-log blocks documented above. All are derived from the
+persisted registry + on-disk state and so **survive restart** (their nested
+`in_memory.*` LSM blocks, when present, are the only **No** values).
+
+---
+
 ### Admin Storage API
 
 Storage diagnostics and engine operations. Not intended for application traffic.
@@ -1020,9 +1189,11 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 |--------|------|----------|---------|
 | `GET` | `/admin/storage/health` | `200` | Liveness probe — uptime in seconds |
 | `GET` | `/admin/storage/stats` | `200` | Engine-wide value-log statistics |
+| `GET` | `/admin/storage/ops-metrics` | `200` | Engine-wide operational counters since startup (reads/writes/lookups/compaction/GC) |
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
+| `GET` | `/admin/storage/value-log/{ns}/pages` | `200` | Per-page garbage breakdown for one namespace |
 | `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
 | `GET` | `/admin/storage/kv-namespaces` | `200` | All engine KV namespaces, annotated by role |
 | `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one doc store namespace |

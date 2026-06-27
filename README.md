@@ -746,7 +746,7 @@ curl http://localhost:8080/admin/storage/index-waste
 curl -X POST http://localhost:8080/admin/storage/index-checkpoint
 ```
 
-For the full admin API reference see [`minnal_doc_store_api/README.md`](minnal_doc_store_api/README.md).
+For the full admin API reference see [`minnal_doc_store_api/README.md`](minnal_doc_store_api/README.md). For a consolidated table of every metric these endpoints report — with explanations and whether each value survives a restart — see [Operational & Storage Metrics](minnal_doc_store_api/README.md#operational--storage-metrics).
 
 ### Index Management
 
