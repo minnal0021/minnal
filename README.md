@@ -12,7 +12,12 @@ Unless required by applicable law or agreed to in writing, software distributed 
 
 **minnal** (மின்னல்) means *lightning* in Tamil.
 
-Minnal is a layered, embedded document database written in Rust. It combines a high-performance LSM + value-log key-value engine with a JSON document layer, RoaringBitmap field indexing, and quantised approximate nearest-neighbour semantic search — all exposed through a REST API.
+Minnal is a layered document database written in Rust. It combines a high-performance LSM + value-log key-value engine with a JSON document layer, RoaringBitmap field indexing, and quantised approximate nearest-neighbour semantic search.
+
+It works in **two ways**, from the same engine:
+
+- **Embedded** — link `minnal_db` (and the upper layers) directly into your Rust application and call the API in-process, with no server or network hop. See [Embedded Use](#embedded-use-minnal_db-as-a-library).
+- **Server (REST)** — run `minnal_doc_store_api` to expose the same stores over an HTTP REST API for any client or language. See [Start the Server](#start-the-server).
 
 > **Platform support:** Linux and macOS only. Windows is not supported — the storage engine relies on Unix positional I/O (`pread`/`pwrite`) and the server requires POSIX signals.
 
@@ -76,6 +81,8 @@ minnal_doc_store_api   ← Axum HTTP server
     │
     └── embedding service  ← external HTTP service (e.g. E5, Instructor)
 ```
+
+The diagram shows the **server** deployment. For **embedded** use, drop the top `minnal_doc_store_api` box and call `minnal_doc_store` (or `minnal_db` directly) in-process — everything below the REST boundary is the same code either way.
 
 Each namespace (logical store) maintains its own KV storage, field indices, and a companion vector store for quantised embeddings.
 
