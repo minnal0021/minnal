@@ -64,7 +64,7 @@ It works in **two ways**, from the same engine:
 
 ## Overview
 
-Minnal is designed for use cases that need fast key-value storage, structured predicate queries on JSON fields, *and* semantic (embedding-based) similarity search — in a single embedded process. The only piece that lives outside the process is the embedding service, and only when semantic search is enabled (it generates embeddings; quantisation, indexing, and search all run in-process).
+Minnal is designed for use cases that need fast key-value storage, structured predicate queries on JSON fields, *and* semantic (embedding-based) similarity search — in a single embedded process. The only piece that lives outside the process is the embedding service, and only when semantic search is enabled — it generates the vector embeddings for documents (at index time) and for queries (at search time) that semantic search relies on. Everything else — quantisation, indexing, and the ANN search itself — runs in-process.
 
 A typical deployment looks like this:
 
