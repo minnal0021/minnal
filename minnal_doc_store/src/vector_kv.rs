@@ -75,6 +75,13 @@ pub fn dense_vectors_ns(namespace: &str) -> String {
 /// The namespace is TTL-enabled; the expiry duration is supplied by the caller
 /// (configurable via `[semantic_search] query_embedding_cache_ttl_secs`), so
 /// stale embeddings are evicted automatically.
+///
+/// **Durability:** all writes to this namespace (cache populate and clear) use
+/// the **no-WAL** path (`put_no_wal` / `delete_no_wal`). The cache is
+/// best-effort and fully regenerable — every entry can be recomputed by calling
+/// the embedding service — so paying a per-write WAL fsync would add query
+/// latency for no durability benefit. A crash that drops un-flushed cache writes
+/// just produces future cache misses.
 const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
 
 // ── Query embedding cache ─────────────────────────────────────────────────────
@@ -125,7 +132,11 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &
     let mut list = Vec::with_capacity(1 + sparse.len());
     list.push(dense.to_vec());
     list.extend_from_slice(sparse);
-    let _ = cache_ns.put(query_text.as_bytes().to_vec(), f32_vec_list_to_bytes(&list)).await;
+    // No-WAL: the cache is best-effort, TTL-bounded and fully regenerable by
+    // re-calling the embedding service on a miss, so a WAL fsync per populate
+    // would be pure query-path latency with no durability benefit. A crash that
+    // drops the entry simply turns into a future cache miss.
+    let _ = cache_ns.put_no_wal(query_text.as_bytes().to_vec(), f32_vec_list_to_bytes(&list)).await;
 }
 
 /// Delete every entry from the system-wide query-embedding cache.
@@ -145,7 +156,9 @@ pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Resul
     let keys = cache_ns.keys().await.map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
     let mut deleted = 0usize;
     for key in keys {
-        cache_ns.delete(key).await.map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+        // No-WAL: matches the no-WAL populate path. A lost clear-delete just
+        // leaves a regenerable entry that the TTL worker evicts anyway.
+        cache_ns.delete_no_wal(key).await.map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
         deleted += 1;
     }
     Ok(deleted)
@@ -1475,6 +1488,30 @@ mod query_embedding_cache_tests {
 
         // Clearing an already-empty cache is a no-op that reports zero.
         assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
+    }
+
+    /// The cache must stay off the WAL: populating and clearing it should drive
+    /// the *no-WAL* counters and add no WAL fsync to the query path. This pins
+    /// the latency-motivated durability choice for the TTL cache namespace.
+    #[tokio::test]
+    async fn test_cache_writes_bypass_wal() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+
+        // Baseline after namespace setup, so we only measure the cache writes.
+        let before = db.ops_metrics();
+
+        put_cached_query_embedding(&db, "q1", &[1.0f32, 0.0], &[], TEST_TTL).await;
+        put_cached_query_embedding(&db, "q2", &[0.0f32, 1.0], &[], TEST_TTL).await;
+        let cleared = clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap();
+        assert_eq!(cleared, 2);
+
+        let after = db.ops_metrics();
+        assert_eq!(after.no_wal_puts - before.no_wal_puts, 2, "two cache populates use put_no_wal");
+        assert_eq!(after.no_wal_deletes - before.no_wal_deletes, 2, "two cache clears use delete_no_wal");
+        assert_eq!(after.puts - before.puts, 0, "no WAL-backed puts from the cache");
+        assert_eq!(after.deletes - before.deletes, 0, "no WAL-backed deletes from the cache");
+        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 0, "cache writes add no WAL fsync");
     }
 
     /// The cache is keyed by query text **only** — it carries no chunk-config

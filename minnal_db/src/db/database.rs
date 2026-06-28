@@ -662,6 +662,24 @@ impl Database {
         kv_store.put_to_storage(key, value)
     }
 
+    /// Delete a key **without** appending to the WAL.
+    ///
+    /// The no-WAL counterpart of [`Self::delete_ns`]: it skips the WAL append
+    /// and its fsync, so a lost delete is unrecoverable if the process crashes
+    /// before the tombstone is flushed. Only safe for derived/regenerable data
+    /// where a missed delete self-heals — e.g. a TTL cache, where a surviving
+    /// stale entry expires on its own. See [`Self::put_ns_no_wal`] for the
+    /// write-side trade-off. The delete still allocates from the global
+    /// sequence counter (via `delete_from_storage`), so it resolves against
+    /// concurrent same-key writes highest-sequence-wins like any other write.
+    pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+        self.check_closed()?;
+        Self::check_write_size(key, &[])?;
+        crate::db::metrics::Metrics::bump(&self.metrics.no_wal_deletes);
+        let kv_store = self.get_store(namespace_id)?;
+        kv_store.delete_from_storage(key)
+    }
+
     pub fn get_ns(&self, namespace_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_closed()?;
         let kv_store = self.get_store(namespace_id)?;

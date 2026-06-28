@@ -1453,6 +1453,17 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Delete a key without WAL — see [`Database::delete_ns_no_wal`] for the
+    /// crash-safety trade-off. The no-WAL counterpart of [`Self::put_no_wal`],
+    /// intended for derived/regenerable data such as TTL caches.
+    pub async fn delete_no_wal(&self, key: Vec<u8>) -> Result<()> {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.delete_ns_no_wal(ns_id, &key))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn iter(&self) -> Result<Vec<KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))
@@ -1787,6 +1798,34 @@ mod tests {
 
         // Default namespace should not see it
         assert_eq!(db.get(b"e1".to_vec()).await.unwrap(), None);
+
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_namespace_no_wal_crud() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let ns = db.namespace("cache".to_string()).await.unwrap();
+
+        // No-WAL write is readable like any other write.
+        ns.put_no_wal(b"q1".to_vec(), b"emb1".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q1".to_vec()).await.unwrap(), Some(b"emb1".to_vec()));
+
+        // No-WAL delete removes it.
+        ns.delete_no_wal(b"q1".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q1".to_vec()).await.unwrap(), None);
+
+        // No-WAL delete tombstones a key written *with* the WAL too.
+        ns.put(b"q2".to_vec(), b"emb2".to_vec()).await.unwrap();
+        ns.delete_no_wal(b"q2".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q2".to_vec()).await.unwrap(), None);
+
+        // The no-WAL paths bump their own counters and skip the WAL fsync path:
+        // one WAL-backed put (q2) accounts for the only wal_fsync from these ops.
+        let m = db.ops_metrics();
+        assert_eq!(m.no_wal_puts, 1, "one put_no_wal");
+        assert_eq!(m.no_wal_deletes, 2, "two delete_no_wal calls");
 
         db.shutdown().await.unwrap();
     }

@@ -43,6 +43,7 @@ pub struct Metrics {
     pub puts: AtomicU64,
     pub deletes: AtomicU64,
     pub no_wal_puts: AtomicU64,
+    pub no_wal_deletes: AtomicU64,
     pub wal_bytes_appended: AtomicU64,
     /// WAL fsyncs (one per WAL-backed write — durability cost).
     pub wal_fsyncs: AtomicU64,
@@ -108,6 +109,7 @@ impl Metrics {
             puts: g(&self.puts),
             deletes: g(&self.deletes),
             no_wal_puts: g(&self.no_wal_puts),
+            no_wal_deletes: g(&self.no_wal_deletes),
             wal_bytes_appended: g(&self.wal_bytes_appended),
             wal_fsyncs: g(&self.wal_fsyncs),
             apply_failures: g(&self.apply_failures),
@@ -140,6 +142,7 @@ pub struct MetricsSnapshot {
     pub puts: u64,
     pub deletes: u64,
     pub no_wal_puts: u64,
+    pub no_wal_deletes: u64,
     pub wal_bytes_appended: u64,
     pub wal_fsyncs: u64,
     pub apply_failures: u64,
