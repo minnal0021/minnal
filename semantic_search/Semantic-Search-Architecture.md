@@ -211,6 +211,8 @@ Three companion KVStore namespaces per semantic-search-enabled store (`vector_kv
 
 Query embeddings are cached in a system-wide TTL namespace `system_qemb_cache` shared across all doc-store namespaces. Keys are raw UTF-8 query strings; values are packed big-endian `f32` vectors. The TTL is **configurable** via `[semantic_search] query_embedding_cache_ttl_secs` and **defaults to 1 day** (86400 s) — once it elapses, stale entries are evicted automatically by the TTL worker. Cache misses fall back to the embedding service transparently.
 
+**Durability — no-WAL on all CRUD.** Every write to this namespace is no-WAL: both populating an entry on a cache miss (`put_no_wal`) and clearing the cache (`delete_no_wal`). Unlike the vector-payload cleanup deletes (§ above), which stay WAL-backed because a lost delete would orphan an index entry, the cache is TTL-bounded and fully regenerable — a dropped populate or a lost clear-delete just produces a future cache miss that re-fetches from the embedding service. Keeping it off the WAL removes a per-populate fsync from the query hot path (the latency motivation for caching in the first place).
+
 ---
 
 ## 7. Async Write Path & Durability
