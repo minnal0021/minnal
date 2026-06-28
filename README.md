@@ -193,6 +193,43 @@ GET  {base_url}/healthcheck
 
 A whole-text embedding is a one-element `payloads` array; chunked embeddings send one payload per sliding-window chunk. Configure the base URL and model via `[semantic_search]` in the TOML config (defaults: `http://localhost:8001`, model `qwen`).
 
+#### Adding a New Embedding Model
+
+The set of models is **data-driven** — no code change or recompile is required. A model is defined entirely by (a) a cluster-centroid file on disk and (b) a config entry that names it. Adding one (assuming an external embedding service that serves it) is:
+
+1. **Generate the cluster centroids offline.** Run k-means (or any IVF clustering) over a representative corpus *embedded with the new model*. The number of centroids is the IVF cluster count (more clusters → finer partitioning, the trade-off knob against `n_probes`). Every centroid vector must have the model's embedding dimension.
+
+2. **Write them as a JSONL file** — one JSON object per line (not a JSON array), each with a unique `cluster_id` and its `centroid` vector:
+
+   ```jsonl
+   {"cluster_id": 0, "centroid": [0.0123, -0.0456, 0.0789, ...]}
+   {"cluster_id": 1, "centroid": [-0.0021,  0.0095, 0.0310, ...]}
+   {"cluster_id": 2, "centroid": [ 0.0440, -0.0177, 0.0002, ...]}
+   ```
+
+   Rules enforced at startup: every centroid must be the **same, non-zero dimension**, that dimension must match the `dimension` declared in config, `cluster_id`s must be **unique**, and no centroid may be empty. A malformed file is rejected at boot, not at first query.
+
+3. **Place the file** at `service/embedding_support/{model}/clusters.json`, where `{model}` is the lower-cased model name (e.g. `service/embedding_support/e5/clusters.json`).
+
+4. **Declare the model** in the TOML config and select it as active:
+
+   ```toml
+   [semantic_search]
+   model         = "e5"        # active model (must match an entry below; case-insensitive)
+   embedding_dim = 1024        # must equal the centroid dimension
+   cluster_path  = "service/embedding_support/e5/clusters.json"
+
+   [[semantic_search.supported_models]]
+   name      = "e5"            # → service/embedding_support/e5/clusters.json
+   dimension = 1024            # must equal the centroid dimension
+   ```
+
+   At startup the server validates that each declared model's cluster file exists and that its centroids match the declared `dimension`, and — when the list is non-empty — that the active `model` is one of the declared entries.
+
+5. **Point the embedding service at the model** so `/embedding/document` and `/embedding/query` return vectors of the matching dimension. The model name is *not* sent to the service (the URL has no model segment); which concrete model produces the embeddings is the service's own concern. minnal uses the name only to pick the cluster file and dimension.
+
+6. **Re-index affected namespaces.** Existing vectors were quantised against the previous model's centroids/dimension and are not comparable. Since secondary indices are reconstructable, re-embed each namespace you want searchable under the new model with `POST /admin/indices/{ns}/vector/reindex-all` — it re-enqueues every document for embedding (a fresh full build) and returns `202 Accepted`. For a clean slate first (recommended when the dimension changes), clear the old vectors with `DELETE /admin/indices/{ns}/vector/drop-all` before re-indexing.
+
 For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`semantic_search/Semantic-Search-Architecture.md`](semantic_search/Semantic-Search-Architecture.md).
 
 ### Layer 4 — minnal\_doc\_store (Document Store + KV Store)

@@ -44,52 +44,70 @@ use serde::Deserialize;
 
 // ── Supported embedding models ────────────────────────────────────────────────
 
-/// A recognised embedding model that minnal can index and search over.
-///
-/// Each variant encodes the model's canonical embedding dimension so callers
-/// don't have to thread that number through separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SupportedModel {
-    Qwen,
-}
-
-impl SupportedModel {
-    /// The embedding dimensionality produced by this model.
-    pub fn dimension(&self) -> u16 {
-        match self {
-            SupportedModel::Qwen => 768,
-        }
-    }
-
-    /// Lower-case identifier used as the sub-directory name under
-    /// `service/embedding_support/`.
-    pub fn dir_name(&self) -> &str {
-        match self {
-            SupportedModel::Qwen => "qwen",
-        }
-    }
-
-    /// Resolve from the name string recorded in the TOML config.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name.to_lowercase().as_str() {
-            "qwen" => Some(SupportedModel::Qwen),
-            _ => None,
-        }
-    }
-}
+/// Directory under which each model's cluster centroid file lives, one
+/// sub-directory per model: `service/embedding_support/{name}/clusters.json`.
+const EMBEDDING_SUPPORT_DIR: &str = "service/embedding_support";
 
 /// One entry in the `[[semantic_search.supported_models]]` TOML array.
 ///
-/// Each entry declares that a particular model is available and records the
-/// embedding dimension that must match what the embedding service returns.
+/// Each entry declares that a particular embedding model is available to this
+/// instance and records the dimensionality it produces. The model set is fully
+/// **data-driven**: any `name` is accepted as long as its cluster centroid file
+/// is present at `service/embedding_support/{name}/clusters.json` and the
+/// centroids match the declared `dimension` — there is no hard-coded list of
+/// recognised models.
+///
+/// The name is purely internal: minnal never sends it to the embedding service
+/// (requests always go to `{url}/embedding/document` and `.../query` with no
+/// model segment). It only selects which cluster file and embedding dimension
+/// this instance uses.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportedModelEntry {
-    /// Model identifier — must match a known [`SupportedModel`] variant
-    /// (case-insensitive).  The corresponding cluster file is expected at
-    /// `service/embedding_support/{name}/clusters.json`.
+    /// Model identifier. The corresponding cluster file is expected at
+    /// `service/embedding_support/{name}/clusters.json` (the name is lower-cased
+    /// to form the directory, so the lookup is case-insensitive).
     pub name: String,
-    /// Embedding dimensionality produced by this model.
+    /// Embedding dimensionality produced by this model. Must be non-zero and
+    /// must equal the dimension of the centroids in the cluster file (validated
+    /// at startup).
     pub dimension: u16,
+}
+
+impl SupportedModelEntry {
+    /// Lower-cased identifier used as the sub-directory name under
+    /// `service/embedding_support/`.
+    pub fn dir_name(&self) -> String {
+        self.name.to_lowercase()
+    }
+
+    /// Path to this model's cluster centroid file, rooted at `support_dir`
+    /// (`{support_dir}/{name}/clusters.json`).
+    pub fn cluster_file_path(&self, support_dir: &Path) -> PathBuf {
+        support_dir.join(self.dir_name()).join("clusters.json")
+    }
+
+    /// Validate this entry against cluster files rooted at `support_dir`.
+    ///
+    /// Checks the name is non-empty and the dimension is non-zero, then loads
+    /// the cluster file — which confirms it exists, is well-formed, and that its
+    /// centroids match the declared `dimension`.
+    fn validate(&self, support_dir: &Path) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("supported_models: an entry has an empty name".to_string());
+        }
+        if self.dimension == 0 {
+            return Err(format!("supported_models: '{}' declares a zero dimension", self.name));
+        }
+
+        let cluster_file = self.cluster_file_path(support_dir);
+        let cluster_path = cluster_file
+            .to_str()
+            .ok_or_else(|| format!("supported_models: cluster file path for '{}' is not valid UTF-8", self.name))?;
+
+        semantic_search::ClusterIndex::load_with_dim(cluster_path, self.dimension as usize)
+            .map_err(|e| format!("supported_models: cluster file for '{}' (expected at '{}') is unusable: {e}", self.name, cluster_path))?;
+        Ok(())
+    }
 }
 
 // ── Top-level config ──────────────────────────────────────────────────────────
@@ -156,34 +174,48 @@ impl DocStoreApiConfig {
     }
 
     /// Check that every entry in `semantic_search.supported_models`:
-    /// - has a recognised model name,
-    /// - declares the correct canonical dimension for that model, and
-    /// - has a cluster file present at
+    /// - has a non-empty `name`,
+    /// - declares a non-zero `dimension`, and
+    /// - has a usable cluster file at
     ///   `service/embedding_support/{name}/clusters.json` (relative to the
-    ///   current working directory).
+    ///   current working directory) whose centroids match the declared
+    ///   `dimension`.
+    ///
+    /// The model set is **data-driven**: any name is accepted provided its
+    /// cluster file exists and is consistent. Loading the file via
+    /// [`ClusterIndex::load_with_dim`](semantic_search::ClusterIndex::load_with_dim)
+    /// validates existence, well-formedness, and centroid dimension in one step
+    /// — the replacement for the old hard-coded canonical-dimension check.
+    ///
+    /// Finally, when the list is non-empty, the active `semantic_search.model`
+    /// must name one of the declared entries (case-insensitive). An empty list
+    /// disables that cross-check.
     fn validate_supported_models(&self) -> Result<(), String> {
         for entry in &self.semantic_search.supported_models {
-            let model =
-                SupportedModel::from_name(&entry.name).ok_or_else(|| format!("supported_models: '{}' is not a recognised model name", entry.name))?;
+            entry.validate(Path::new(EMBEDDING_SUPPORT_DIR))?;
+        }
+        self.validate_active_model_listed()
+    }
 
-            if entry.dimension != model.dimension() {
-                return Err(format!(
-                    "supported_models: dimension {} declared for '{}' does not match \
-                     the canonical dimension {} for that model",
-                    entry.dimension,
-                    entry.name,
-                    model.dimension(),
-                ));
-            }
-
-            let cluster_file = PathBuf::from("service/embedding_support").join(model.dir_name()).join("clusters.json");
-            if !cluster_file.exists() {
-                return Err(format!(
-                    "supported_models: cluster file for '{}' not found at '{}'",
-                    entry.name,
-                    cluster_file.display()
-                ));
-            }
+    /// When `supported_models` is non-empty, the active `semantic_search.model`
+    /// must name one of the declared entries (matched case-insensitively,
+    /// mirroring the lower-cased cluster-file directory).
+    ///
+    /// An empty list disables the check — there is nothing declared to match
+    /// against, which keeps configs that omit the list (including the built-in
+    /// default) valid.
+    fn validate_active_model_listed(&self) -> Result<(), String> {
+        let models = &self.semantic_search.supported_models;
+        if models.is_empty() {
+            return Ok(());
+        }
+        let active = self.semantic_search.model.to_lowercase();
+        if !models.iter().any(|m| m.name.to_lowercase() == active) {
+            return Err(format!(
+                "semantic_search.model '{}' is not listed in supported_models (declared: {})",
+                self.semantic_search.model,
+                models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "),
+            ));
         }
         Ok(())
     }
@@ -576,8 +608,9 @@ pub struct SemanticSearchSection {
     #[serde(default = "default_embedding_service_url")]
     pub embedding_service_url: String,
 
-    /// Embedding model to use.  Must match a [`SupportedModel`] name.
-    /// Default: `"qwen"`.
+    /// Embedding model to use.  Selects which cluster file and embedding
+    /// dimension this instance uses; should name one of the
+    /// [`supported_models`](Self::supported_models) entries.  Default: `"qwen"`.
     #[serde(default = "default_model")]
     pub model: String,
 
@@ -587,10 +620,11 @@ pub struct SemanticSearchSection {
 
     /// Embedding models this instance is configured to serve.
     ///
-    /// Each entry must have a recognised `name` and the `dimension` it
-    /// produces.  On startup the server validates that the corresponding
-    /// cluster file (`service/embedding_support/{name}/clusters.json`) exists
-    /// on disk.
+    /// Each entry declares a `name` and the `dimension` it produces.  The set is
+    /// data-driven — any name is accepted.  On startup the server validates that
+    /// the corresponding cluster file
+    /// (`service/embedding_support/{name}/clusters.json`) exists and that its
+    /// centroids match the declared `dimension`.
     #[serde(default)]
     pub supported_models: Vec<SupportedModelEntry>,
 
@@ -791,6 +825,88 @@ mod tests {
         let cfg = DocStoreApiConfig::default();
         assert_eq!(cfg.semantic_search.number_of_bits_for_dense_quantisation, 8);
         assert!(cfg.validate_semantic_search().is_ok());
+    }
+
+    /// Create a unique temp directory and write a `{model}/clusters.json` with
+    /// `n` centroids of dimension `dim` (JSONL, one object per line). Returns the
+    /// support-dir root the entry validates against.
+    fn write_cluster_file(model: &str, dim: usize, n: usize) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let unique = format!("minnal_cfg_test_{}_{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let support_dir = std::env::temp_dir().join(unique);
+        let model_dir = support_dir.join(model.to_lowercase());
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let mut body = String::new();
+        for id in 0..n {
+            let centroid: Vec<f32> = (0..dim).map(|j| (id + j) as f32).collect();
+            body.push_str(&serde_json::json!({ "cluster_id": id, "centroid": centroid }).to_string());
+            body.push('\n');
+        }
+        std::fs::write(model_dir.join("clusters.json"), body).unwrap();
+        support_dir
+    }
+
+    #[test]
+    fn validate_accepts_any_model_name_with_a_matching_cluster_file() {
+        // Data-driven: a name that is NOT "qwen" is accepted as long as its
+        // cluster file exists and the centroid dimension matches.
+        let support_dir = write_cluster_file("brandnew", 1024, 3);
+        let entry = SupportedModelEntry { name: "BrandNew".to_string(), dimension: 1024 };
+        assert!(entry.validate(&support_dir).is_ok());
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn validate_rejects_dimension_mismatch() {
+        let support_dir = write_cluster_file("modelx", 768, 2);
+        let err = SupportedModelEntry { name: "modelx".to_string(), dimension: 512 }
+            .validate(&support_dir)
+            .unwrap_err();
+        assert!(err.contains("modelx"), "got: {err}");
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn validate_rejects_missing_cluster_file() {
+        let support_dir = std::env::temp_dir().join(format!("minnal_cfg_missing_{}", std::process::id()));
+        let err = SupportedModelEntry { name: "ghost".to_string(), dimension: 768 }
+            .validate(&support_dir)
+            .unwrap_err();
+        assert!(err.contains("ghost"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_name_and_zero_dimension() {
+        let support_dir = std::env::temp_dir();
+        assert!(SupportedModelEntry { name: "  ".to_string(), dimension: 768 }.validate(&support_dir).is_err());
+        assert!(SupportedModelEntry { name: "ok".to_string(), dimension: 0 }.validate(&support_dir).is_err());
+    }
+
+    #[test]
+    fn active_model_check_skipped_when_list_empty() {
+        // The built-in default: model = "qwen", supported_models = []. The
+        // cross-check is disabled, so this stays valid (no break).
+        let cfg = DocStoreApiConfig::default();
+        assert!(cfg.semantic_search.supported_models.is_empty());
+        assert!(cfg.validate_active_model_listed().is_ok());
+    }
+
+    #[test]
+    fn active_model_check_passes_when_listed_case_insensitively() {
+        let mut cfg = DocStoreApiConfig::default();
+        cfg.semantic_search.model = "Qwen".to_string();
+        cfg.semantic_search.supported_models = vec![SupportedModelEntry { name: "qwen".to_string(), dimension: 768 }];
+        assert!(cfg.validate_active_model_listed().is_ok());
+    }
+
+    #[test]
+    fn active_model_check_rejects_unlisted_model() {
+        let mut cfg = DocStoreApiConfig::default();
+        cfg.semantic_search.model = "qwen".to_string();
+        cfg.semantic_search.supported_models = vec![SupportedModelEntry { name: "other".to_string(), dimension: 768 }];
+        let err = cfg.validate_active_model_listed().unwrap_err();
+        assert!(err.contains("qwen") && err.contains("supported_models"), "got: {err}");
     }
 
     #[test]

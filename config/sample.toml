@@ -238,13 +238,16 @@ sliding_size = 2
 # ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — enabled embedding models
 #
-# Each entry declares one embedding model this instance may serve.  The server
-# validates at startup that the cluster file for every listed model exists at
+# Each entry declares one embedding model this instance may serve.  The model
+# set is data-driven: any name is accepted.  At startup the server validates
+# that the cluster file for every listed model exists at
 #   service/embedding_support/{name}/clusters.json
+# and that its centroids match the declared dimension.  To add a model, drop its
+# clusters.json under that path and add an entry here — no code change needed.
 #
 # Fields:
-#   name      — model identifier (case-insensitive); currently only "qwen"
-#               is supported.
+#   name      — model identifier (case-insensitive; lower-cased to form the
+#               cluster-file sub-directory).
 #   dimension — embedding dimensionality the model produces (u16).
 # ---------------------------------------------------------------------------
 
