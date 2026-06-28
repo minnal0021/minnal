@@ -100,7 +100,7 @@ Key design choices:
 
 | Property | Detail |
 |---|---|
-| Key storage | Skip-list memtable → sharded L0/L1 SSTables (per-bucket LSM) |
+| Key storage | Single skip-list memtable → sharded L0/L1 SSTables (per-bucket LSM) |
 | Value storage | Sharded append-only value log (configurable page size, 64 MiB default) |
 | Durability | Write-ahead log (WAL) with configurable fsync cadence |
 | Concurrency | `parking_lot` RwLock per bucket; epoch-based reclamation (`crossbeam-epoch`) |
