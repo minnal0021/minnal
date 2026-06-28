@@ -108,7 +108,7 @@ Key design choices:
 | TTL | Native per-record expiry tracked in the value log |
 | Namespaces | Logical isolation within a single DB; each namespace has its own LSM shards and value-log shards |
 | Background workers | LSM compaction, value-log GC, WAL cleanup, TTL eviction — each on its own tokio task |
-| Hashing | AVX-accelerated Murmur3 (`mm3h`) for bucket assignment |
+| Hashing | SIMD-accelerated Murmur3 (`mm3h`) for bucket assignment |
 | Prefix scan | SIMD-accelerated prefix scan across all layers — see below |
 
 The WAL is written before every mutation. On startup the engine replays any WAL segments that postdate the last LSM flush, ensuring no committed write is lost after a crash.
