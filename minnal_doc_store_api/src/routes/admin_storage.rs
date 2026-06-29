@@ -4,6 +4,8 @@
 //! GET  /admin/storage/health                          → server liveness + uptime
 //! GET  /admin/storage/stats                           → engine-wide value-log statistics
 //! GET  /admin/storage/ops-metrics                      → engine-wide operational counters (reads/writes/compaction/GC + read-path efficiency)
+//! GET  /admin/storage/ops-metrics/by-namespace         → the same counters, broken out per namespace
+//! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
 //! GET  /admin/storage/wal                             → WAL metadata snapshot
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
 //! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ physical st_blocks bytes)
@@ -34,7 +36,7 @@ use tracing::{error, info};
 
 use minnal_doc_store::{KvKeyType, KvValueType, StoreType};
 
-use crate::AppState;
+use crate::{AppState, error::AppError};
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
@@ -130,9 +132,10 @@ pub struct GcMetrics {
     wal_segments_deleted: u64,
 }
 
+/// The grouped operational-metrics body (without the engine-level `uptime_s`),
+/// reused by the engine, per-namespace, and by-namespace endpoints.
 #[derive(Serialize)]
-pub struct OpsMetricsResponse {
-    uptime_s: u64,
+pub struct OpsMetricsBody {
     reads: ReadMetrics,
     lsm_lookups: LsmLookupMetrics,
     writes: WriteMetrics,
@@ -140,19 +143,29 @@ pub struct OpsMetricsResponse {
     gc: GcMetrics,
 }
 
+#[derive(Serialize)]
+pub struct OpsMetricsResponse {
+    uptime_s: u64,
+    #[serde(flatten)]
+    body: OpsMetricsBody,
+}
+
+/// One namespace's operational metrics (engine `uptime_s` omitted; the WAL-GC
+/// counters under `gc` are engine-global and always `0` here).
+#[derive(Serialize)]
+pub struct NamespaceOpsMetrics {
+    namespace: String,
+    #[serde(flatten)]
+    body: OpsMetricsBody,
+}
+
 fn ratio(num: u64, denom: u64) -> f64 {
     if denom == 0 { 0.0 } else { num as f64 / denom as f64 }
 }
 
-/// `GET /admin/storage/ops-metrics` — engine-wide operational counters since
-/// startup (cumulative; sample twice to compute rates). Includes a few derived
-/// ratios that directly show read-path efficiency: `read_hit_ratio`,
-/// `fast_path_hit_ratio` (how often the active-memtable fast path serves a
-/// lookup), and the bloom/L0/L1 probe counts.
-pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let m = state.store.ops_metrics();
-    Json(OpsMetricsResponse {
-        uptime_s: state.started_at.elapsed().as_secs(),
+/// Build the grouped metrics body (with derived ratios) from a raw snapshot.
+fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
+    OpsMetricsBody {
         reads: ReadMetrics {
             reads: m.reads,
             read_hits: m.read_hits,
@@ -190,7 +203,44 @@ pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
             wal_gc_runs: m.wal_gc_runs,
             wal_segments_deleted: m.wal_segments_deleted,
         },
+    }
+}
+
+/// `GET /admin/storage/ops-metrics` — engine-wide operational counters since
+/// startup (cumulative; sample twice to compute rates). The engine view is the
+/// sum of every namespace's counters plus the global WAL-GC/retired totals.
+/// Includes derived read-path ratios (`read_hit_ratio`, `fast_path_hit_ratio`).
+pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let m = state.store.ops_metrics();
+    Json(OpsMetricsResponse {
+        uptime_s: state.started_at.elapsed().as_secs(),
+        body: ops_metrics_body(&m),
     })
+}
+
+/// `GET /admin/storage/stores/{ns}/ops-metrics` — operational counters for one
+/// namespace. The WAL-GC counters are engine-global and read `0` here.
+pub async fn ops_metrics_ns(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    let m = state.store.ops_metrics_for(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
+    Ok(Json(OpsMetricsResponse {
+        uptime_s: state.started_at.elapsed().as_secs(),
+        body: ops_metrics_body(&m),
+    }))
+}
+
+/// `GET /admin/storage/ops-metrics/by-namespace` — per-namespace operational
+/// counters for every live namespace (engine-global WAL-GC counters excluded).
+pub async fn ops_metrics_by_namespace(State(state): State<AppState>) -> impl IntoResponse {
+    let per_ns: Vec<NamespaceOpsMetrics> = state
+        .store
+        .ops_metrics_by_namespace()
+        .into_iter()
+        .map(|(namespace, m)| NamespaceOpsMetrics {
+            namespace,
+            body: ops_metrics_body(&m),
+        })
+        .collect();
+    Json(per_ns)
 }
 
 // ── WAL ───────────────────────────────────────────────────────────────────────

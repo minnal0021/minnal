@@ -267,6 +267,16 @@ impl Db {
         self.inner.metrics_snapshot()
     }
 
+    /// Operational metrics for a single namespace, by name.
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+        self.inner.metrics_snapshot_for(namespace)
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+        self.inner.metrics_snapshot_by_namespace()
+    }
+
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
@@ -1136,6 +1146,16 @@ impl AsyncDb {
         self.inner.ops_metrics()
     }
 
+    /// Operational metrics for a single namespace, by name.
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+        self.inner.ops_metrics_for(namespace)
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+        self.inner.ops_metrics_by_namespace()
+    }
+
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
@@ -1704,6 +1724,43 @@ mod tests {
         // List namespaces
         let ns_list = db.list_namespaces();
         assert!(ns_list.len() >= 2); // default + users
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_per_namespace_ops_metrics() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+
+        let a = db.namespace("a").unwrap();
+        a.put(b"k1", b"v").unwrap();
+        a.put(b"k2", b"v").unwrap();
+        let b = db.namespace("b").unwrap();
+        b.put(b"k1", b"v").unwrap();
+
+        // Counters are isolated per namespace.
+        assert_eq!(db.ops_metrics_for("a").unwrap().puts, 2);
+        assert_eq!(db.ops_metrics_for("b").unwrap().puts, 1);
+
+        // Engine-wide view is the sum across namespaces.
+        assert_eq!(db.ops_metrics().puts, 3);
+
+        // by-namespace map carries each namespace's own counters.
+        let by_ns: std::collections::HashMap<String, _> = db.ops_metrics_by_namespace().into_iter().collect();
+        assert_eq!(by_ns["a"].puts, 2);
+        assert_eq!(by_ns["b"].puts, 1);
+
+        // Unknown namespace is an error, not a zero snapshot.
+        assert!(db.ops_metrics_for("missing").is_err());
+
+        // Dropping a namespace folds its totals into the global accumulator, so
+        // the engine aggregate stays monotonic, but the namespace is no longer
+        // individually queryable.
+        db.remove_namespace("a").unwrap();
+        assert_eq!(db.ops_metrics().puts, 3, "engine total stays monotonic after drop");
+        assert!(db.ops_metrics_for("a").is_err(), "dropped ns is no longer queryable");
+        assert!(!db.ops_metrics_by_namespace().iter().any(|(n, _)| n == "a"));
 
         db.shutdown().unwrap();
     }

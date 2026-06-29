@@ -987,11 +987,13 @@ This is a consolidated reference for everything reported by the metrics/diagnost
 endpoints under `/admin/storage`, with a **"survives restart?"** column for each
 value. There are two distinct kinds:
 
-- **Operational metrics** (`GET /admin/storage/ops-metrics`) — engine-wide runtime
-  counters of *what the engine is doing* (throughput, read-path efficiency,
-  compaction/GC activity). They are in-memory `AtomicU64`s created fresh in
-  `Database::open`, so they are **not persisted** — every restart starts them at
-  zero. Cumulative since process start; sample twice to compute a rate.
+- **Operational metrics** (`GET /admin/storage/ops-metrics`) — runtime counters of
+  *what the engine is doing* (throughput, read-path efficiency, compaction/GC
+  activity). They are in-memory `AtomicU64`s, **not persisted** — every restart
+  starts them at zero. Cumulative since process start; sample twice to compute a
+  rate. Recorded **per namespace** and also available broken out via
+  `GET /admin/storage/ops-metrics/by-namespace` and
+  `GET /admin/storage/stores/{ns}/ops-metrics` (see below).
 - **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
   snapshots of *how big the engine is* and *how much dead space it holds*. These
   are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
@@ -1067,6 +1069,19 @@ top-level `uptime_s`.
 > the WAL replay. Vector-search corruption counters
 > ([`/admin/indices/vector/corruption-metrics`](#get-adminindicesvectorcorruption-metrics))
 > follow the same in-memory, reset-on-restart model.
+
+**Per-namespace breakdown.** Every counter is recorded per namespace; the engine
+view above is their sum plus a small global instance (the WAL-GC counters, which
+belong to the shared WAL, and a fold of every dropped namespace's final totals so
+the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
+returning the same grouped shape as the engine endpoint:
+
+- `GET /admin/storage/stores/{ns}/ops-metrics` — one namespace's counters (`404`
+  if the namespace does not exist). Its `gc.wal_gc_runs` / `gc.wal_segments_deleted`
+  are always `0` — WAL GC is engine-global and reported only by the engine endpoint.
+- `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
+  lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
+  `uptime_s`).
 
 #### Storage metrics — field reference
 
@@ -1170,6 +1185,8 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/health` | `200` | Liveness probe — uptime in seconds |
 | `GET` | `/admin/storage/stats` | `200` | Engine-wide value-log statistics |
 | `GET` | `/admin/storage/ops-metrics` | `200` | Engine-wide operational counters since startup (reads/writes/lookups/compaction/GC) |
+| `GET` | `/admin/storage/ops-metrics/by-namespace` | `200` | The same counters broken out per namespace |
+| `GET` | `/admin/storage/stores/{ns}/ops-metrics` | `200` | Operational counters for one namespace |
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |

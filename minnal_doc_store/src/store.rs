@@ -1866,6 +1866,21 @@ impl DocStore {
         self.db.ops_metrics()
     }
 
+    /// Operational metrics for a single namespace, by name.
+    ///
+    /// The only failure mode is an unknown namespace, so any underlying error is
+    /// surfaced as [`DocStoreError::NotFound`] (→ 404).
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<minnal_db::MetricsSnapshot, DocStoreError> {
+        self.db.ops_metrics_for(namespace).map_err(|_| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, minnal_db::MetricsSnapshot)> {
+        self.db.ops_metrics_by_namespace()
+    }
+
     /// Returns a snapshot of the shared WAL metadata.
     pub fn wal_metadata(&self) -> minnal_db::WalMetadata {
         self.db.wal_metadata()
