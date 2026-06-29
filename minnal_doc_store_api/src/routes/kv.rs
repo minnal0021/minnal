@@ -1,12 +1,12 @@
 //! KV store CRUD, scan, and semantic search endpoints:
 //!
 //! ```text
-//! GET    /kv-stores/{ns}/kv/{key}                → get value by key
-//! PUT    /kv-stores/{ns}/kv/{key}[?skip_wal=]    → set value (JSON body = value)
-//! DELETE /kv-stores/{ns}/kv/{key}                → delete key
-//! GET    /kv-stores/{ns}/kv?start=&end=          → range scan (end optional)
-//! GET    /kv-stores/{ns}/kv/prefix?prefix=       → prefix scan
-//! POST   /kv-stores/{ns}/semantic-search         → ANN search (value_type = str only)
+//! GET    /stores/{ns}/kv/{key}                → get value by key
+//! PUT    /stores/{ns}/kv/{key}[?skip_wal=]    → set value (JSON body = value)
+//! DELETE /stores/{ns}/kv/{key}                → delete key
+//! GET    /stores/{ns}/kv?start=&end=          → range scan (end optional)
+//! GET    /stores/{ns}/kv/prefix?prefix=       → prefix scan
+//! POST   /stores/{ns}/kv/semantic-search      → ANN search (value_type = str only)
 //! ```
 //!
 //! Keys are URL path segments:

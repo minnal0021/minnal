@@ -2,9 +2,11 @@
 
 A lightweight embedded document and key-value store with a REST API, built on top of [minnal_db](../minnal_db).
 
-**Document stores** (`/stores`) — JSON objects stored by a typed primary key, with optional field-level indices and semantic search.
+Both store kinds live under a single `/stores` path; the kind is set by a mandatory `store_type` field at creation and resolved from the schema thereafter.
 
-**KV stores** (`/kv-stores`) — schema-lite namespaces for raw typed key-value data, with optional semantic search on string values.
+**Document stores** (`store_type: "doc"`) — JSON objects stored by a typed primary key, with optional field-level indices and semantic search; data under `/stores/{ns}/docs`.
+
+**KV stores** (`store_type: "kv"`) — schema-lite namespaces for raw typed key-value data, with optional semantic search on string values; data under `/stores/{ns}/kv`.
 
 ---
 
@@ -25,7 +27,7 @@ A lightweight embedded document and key-value store with a REST API, built on to
   - [Index management](#index-management)
   - [Document CRUD](#document-crud)
   - [Queries](#queries)
-  - [KV store lifecycle](#kv-store-lifecycle)
+  - [KV store creation](#kv-store-creation)
   - [KV CRUD](#kv-crud)
   - [KV range scan](#kv-range-scan)
   - [KV prefix scan](#kv-prefix-scan)
@@ -232,7 +234,7 @@ Requires the external embedding service and a cluster index (`semantic_search.cl
 
 ### KV store concept
 
-A **KV store** is a schema-lite namespace managed under `/kv-stores`. Unlike a document store it has:
+A **KV store** is a schema-lite namespace managed under `/stores`. Unlike a document store it has:
 
 - No field indices and no predicate queries
 - Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
@@ -260,19 +262,24 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 
 ## REST API reference
 
-All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. The endpoints fall into two families — `/stores/*` for document stores and `/kv-stores/*` for KV stores — plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
+All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. Every store — document or KV — lives under a single `/stores` path. The store kind is chosen by the mandatory `store_type` (`"doc"` or `"kv"`) in the create/import payload and resolved from the stored schema thereafter; document stores additionally expose `/docs`, indices, and predicate queries, while KV stores expose `/kv`. A data operation on the wrong kind (e.g. a `/docs` call on a KV namespace) returns `409 Conflict`. Plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
 
 ### Quick reference
 
-**Document stores:**
+**Store lifecycle (both kinds):**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `POST` | `/stores` | `201` | Create a document store with schema |
-| `GET` | `/stores` | `200` | List all document stores |
-| `DELETE` | `/stores/{ns}` | `204` | Drop a document store and all its data |
-| `GET` | `/stores/{ns}/schema` | `200` | Fetch the current schema |
-| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute |
+| `POST` | `/stores` | `201` | Create a store (`store_type` in body selects doc vs KV) |
+| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type`) |
+| `DELETE` | `/stores/{ns}` | `204` | Drop a store and all its data (kind resolved from its schema) |
+| `GET` | `/stores/{ns}/schema` | `200` | Fetch a store's current schema |
+| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only) |
+
+**Document store data:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
 | `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
 | `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
 | `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
@@ -283,40 +290,34 @@ All request and response bodies are JSON, and errors are returned as `{"error": 
 | `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
 | `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
 
-**KV stores:**
+**KV store data:**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `POST` | `/kv-stores` | `201` | Create a KV store |
-| `GET` | `/kv-stores` | `200` | List all KV stores |
-| `DELETE` | `/kv-stores/{ns}` | `204` | Drop a KV store and all its data |
-| `GET` | `/kv-stores/{ns}/schema` | `200` | Fetch the current KV-store schema |
-| `PUT` | `/kv-stores/{ns}/kv/{key}` | `204` | Set a value |
-| `GET` | `/kv-stores/{ns}/kv/{key}` | `200` | Get a value by key |
-| `DELETE` | `/kv-stores/{ns}/kv/{key}` | `204` | Delete a key |
-| `GET` | `/kv-stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
-| `GET` | `/kv-stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
-| `POST` | `/kv-stores/{ns}/semantic-search` | `200` | ANN search (`value_type = str` only) |
+| `PUT` | `/stores/{ns}/kv/{key}` | `204` | Set a value |
+| `GET` | `/stores/{ns}/kv/{key}` | `200` | Get a value by key |
+| `DELETE` | `/stores/{ns}/kv/{key}` | `204` | Delete a key |
+| `GET` | `/stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
+| `GET` | `/stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
+| `POST` | `/stores/{ns}/kv/semantic-search` | `200` | ANN search (`value_type = str` only) |
 
 **Schema export / import (admin):**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a doc-store schema as a JSON attachment |
-| `POST` | `/admin/stores/import` | `201` | Create a doc store from an exported schema |
+| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a store's schema as a JSON attachment (doc or KV) |
+| `POST` | `/admin/stores/import` | `201` | Create a store from an exported schema (`store_type` selects the kind) |
 | `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
-| `GET` | `/admin/kv-stores/{ns}/schema/export` | `200` | Download a KV-store schema as a JSON attachment |
-| `POST` | `/admin/kv-stores/import` | `201` | Create a KV store from an exported schema |
 
 ---
 
 ### Store lifecycle
 
-These endpoints create, list, inspect, and drop document stores, and amend their non-indexed attributes. A store must exist before any document can be written to it.
+These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendment via `PATCH` applies to document stores only.)
 
 #### `GET /stores`
 
-List all stores.
+List all stores, document and KV. Each entry carries its `store_type` so callers can tell them apart.
 
 ```bash
 curl http://localhost:8080/stores
@@ -333,6 +334,12 @@ curl http://localhost:8080/stores
       {"field": "status", "index_type": "str"},
       {"field": "age",    "index_type": "int"}
     ]
+  },
+  {
+    "namespace": "session-cache",
+    "store_type": "kv",
+    "key_type": "str",
+    "value_type": "str"
   }
 ]
 ```
@@ -341,12 +348,15 @@ curl http://localhost:8080/stores
 
 #### `POST /stores`
 
-Create a new store.
+Create a new store. The mandatory `store_type` field selects the kind: `"doc"`
+for a document store (body fields below) or `"kv"` for a KV store (see
+[`KV store concept`](#kv-store-concept) for its `key_type`/`value_type` body).
 
-**Request body:**
+**Request body (document store, `store_type: "doc"`):**
 
 | Field        | Type             | Required | Description                          |
 |-------------|-----------------|----------|--------------------------------------|
+| `store_type` | `"doc"`          | yes      | Selects a document store             |
 | `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
 | `key_type`   | `uuid`/`u64`/`u128` | yes  | Primary key type                     |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
@@ -682,53 +692,34 @@ Response — `{id, doc}` pairs plus the pagination envelope:
 
 ---
 
-### KV store lifecycle
+### KV store creation
 
-The KV-store endpoints mirror the document-store lifecycle, but for schema-lite namespaces under `/kv-stores`: create, list, inspect, and drop. A KV store fixes its key and value types at creation and has no field indices — see the [KV store concept](#kv-store-concept) for the available type combinations.
+Listing, dropping, and fetching a KV store's schema all use the unified
+[Store lifecycle](#store-lifecycle) endpoints (`GET /stores`, `DELETE
+/stores/{ns}`, `GET /stores/{ns}/schema`) — they resolve the kind from the
+stored schema. Creating one is the same `POST /stores`, with `store_type: "kv"`.
+A KV store fixes its key and value types at creation and has no field indices —
+see the [KV store concept](#kv-store-concept) for the available type
+combinations.
 
-#### `GET /kv-stores`
-
-List all KV stores.
-
-```bash
-curl http://localhost:8080/kv-stores
-```
-
-```json
-[
-  {
-    "namespace": "session-cache",
-    "store_type": "kv",
-    "key_type": "str",
-    "value_type": "str",
-    "semantic_search_enabled": false
-  }
-]
-```
-
----
-
-#### `POST /kv-stores`
-
-Create a new KV store.
-
-**Request body:**
+**Request body (KV store, `store_type: "kv"`):**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `store_type` | `"kv"` | yes | Selects a KV store |
 | `namespace` | string | yes | Unique name (`[a-zA-Z0-9_-]+`) |
 | `key_type` | `str` / `int` | yes | Key type |
 | `value_type` | `str` / `int` / `f32` / `vec_f32` | yes | Value type |
 | `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str` and a cluster index at startup) |
 
 ```bash
-curl -X POST http://localhost:8080/kv-stores \
+curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
 # → 201 Created
 
 # With semantic search
-curl -X POST http://localhost:8080/kv-stores \
+curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "product-descriptions",
@@ -741,40 +732,6 @@ curl -X POST http://localhost:8080/kv-stores \
 ```
 
 Returns `409 Conflict` if a store with that namespace already exists (doc or KV).
-
----
-
-#### `DELETE /kv-stores/{ns}`
-
-Permanently delete a KV store. Irreversible.
-
-```bash
-curl -X DELETE http://localhost:8080/kv-stores/session-cache
-# → 204 No Content
-```
-
----
-
-#### `GET /kv-stores/{ns}/schema`
-
-Fetch the current schema for a KV store as JSON.
-
-```bash
-curl http://localhost:8080/kv-stores/session-cache/schema
-```
-
-```json
-{
-  "namespace": "session-cache",
-  "ns_id": 7,
-  "store_type": "kv",
-  "key_type": "str",
-  "value_type": "str",
-  "semantic_search_enabled": false
-}
-```
-
-Returns `404 Not Found` if the namespace does not exist as a KV store. To download the schema as a file (e.g. for backup or migration to another deployment), use [`GET /admin/kv-stores/{ns}/schema/export`](#get-adminkv-storesnsschemaexport).
 
 ---
 
@@ -798,18 +755,18 @@ The request / response body is a raw JSON value matching `value_type`:
 
 ---
 
-#### `PUT /kv-stores/{ns}/kv/{key}`
+#### `PUT /stores/{ns}/kv/{key}`
 
 Insert or replace a value (upsert). When `semantic_search_enabled = true` the value text is enqueued for async embedding — the request returns immediately and the vector index is updated in the background.
 
 ```bash
-curl -X PUT http://localhost:8080/kv-stores/session-cache/kv/user-42 \
+curl -X PUT http://localhost:8080/stores/session-cache/kv/user-42 \
   -H 'Content-Type: application/json' \
   -d '"eyJhbGciOiJIUzI1NiJ9..."'
 # → 204 No Content
 
 # vec_f32 example
-curl -X PUT http://localhost:8080/kv-stores/embeddings/kv/doc-1 \
+curl -X PUT http://localhost:8080/stores/embeddings/kv/doc-1 \
   -H 'Content-Type: application/json' \
   -d '[0.12, -0.45, 0.89]'
 # → 204 No Content
@@ -817,12 +774,12 @@ curl -X PUT http://localhost:8080/kv-stores/embeddings/kv/doc-1 \
 
 ---
 
-#### `GET /kv-stores/{ns}/kv/{key}`
+#### `GET /stores/{ns}/kv/{key}`
 
 Retrieve a value by key. Returns the value as a JSON body.
 
 ```bash
-curl http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl http://localhost:8080/stores/session-cache/kv/user-42
 # → "eyJhbGciOiJIUzI1NiJ9..."
 ```
 
@@ -830,12 +787,12 @@ Returns `404 Not Found` if the key does not exist.
 
 ---
 
-#### `DELETE /kv-stores/{ns}/kv/{key}`
+#### `DELETE /stores/{ns}/kv/{key}`
 
 Delete a key. No-op if the key does not exist. Also removes the companion vector index entry when semantic search is enabled.
 
 ```bash
-curl -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl -X DELETE http://localhost:8080/stores/session-cache/kv/user-42
 # → 204 No Content
 ```
 
@@ -843,7 +800,7 @@ curl -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
 
 ### KV range scan
 
-`GET /kv-stores/{ns}/kv?start=&end=`
+`GET /stores/{ns}/kv?start=&end=`
 
 Scan all entries whose key falls in `[start, end)`, returned in ascending key
 order. **Cursor-paginated** — each page resolves only its own values, so memory
@@ -858,14 +815,14 @@ stays bounded regardless of how many keys match.
 
 ```bash
 # str key store — scan all sessions for users with IDs "user-10" through "user-20"
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-10&end=user-21"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-10&end=user-21"
 
 # int key store — fetch entries with keys 100 through 199
-curl "http://localhost:8080/kv-stores/counters/kv?start=100&end=200"
+curl "http://localhost:8080/stores/counters/kv?start=100&end=200"
 
 # first page of 50, then follow next_cursor for the next page
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50"
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50&cursor=757365722d3530"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-&limit=50"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-&limit=50&cursor=757365722d3530"
 ```
 
 Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
@@ -887,7 +844,7 @@ Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
 
 ### KV prefix scan
 
-`GET /kv-stores/{ns}/kv/prefix?prefix=`
+`GET /stores/{ns}/kv/prefix?prefix=`
 
 Scan all entries whose key starts with `prefix`. Most useful for `key_type = str` stores where keys share a common string prefix (e.g. `"user-"` to find all user entries).
 
@@ -904,11 +861,11 @@ scan — each page resolves only its own values.
 
 ```bash
 # Find all session-cache entries whose key starts with "user-"
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-"
 
 # Paginate through a large prefix result set via next_cursor
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100"
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100&cursor=757365722d393939"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-&limit=100"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-&limit=100&cursor=757365722d393939"
 ```
 
 Response — same format as range scan:
@@ -928,7 +885,7 @@ Response — same format as range scan:
 
 ### KV semantic search
 
-`POST /kv-stores/{ns}/semantic-search`
+`POST /stores/{ns}/kv/semantic-search`
 
 Requires `semantic_search_enabled = true` and `value_type = str` on the KV store. The stored string values are used as the text that was embedded at write time.
 
@@ -942,7 +899,7 @@ Requires `semantic_search_enabled = true` and `value_type = str` on the KV store
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
 ```bash
-curl -X POST http://localhost:8080/kv-stores/product-descriptions/semantic-search \
+curl -X POST http://localhost:8080/stores/product-descriptions/kv/semantic-search \
   -H 'Content-Type: application/json' \
   -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
 ```
@@ -984,53 +941,25 @@ Schema export / import for backup and for migrating a namespace definition betwe
 
 #### `GET /admin/stores/{ns}/schema/export`
 
-Download a doc-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-schema.json"`).
+Download a store's schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-schema.json"`). Works for both kinds — the kind is resolved from the stored schema, and the exported JSON carries its `store_type`.
 
 ```bash
 curl -OJ http://localhost:8080/admin/stores/users/schema/export
 # → writes users-schema.json
 ```
 
-Returns `404 Not Found` if the namespace does not exist as a doc store.
+Returns `404 Not Found` if the namespace does not exist.
 
 ---
 
 #### `POST /admin/stores/import`
 
-Create a doc store from a previously exported schema. The internal `ns_id` is stripped and reassigned, so an exported schema can be imported into a fresh deployment. Equivalent to `POST /stores` with the schema body.
+Create a store from a previously exported schema. The payload's `store_type` selects the kind (doc or KV); the internal `ns_id` is stripped and reassigned, so an exported schema can be imported into a fresh deployment. Equivalent to `POST /stores` with the schema body.
 
 ```bash
 curl -X POST http://localhost:8080/admin/stores/import \
   -H 'Content-Type: application/json' \
   --data-binary @users-schema.json
-# → 201 Created
-```
-
-Returns `409 Conflict` if a store with that namespace already exists.
-
----
-
-#### `GET /admin/kv-stores/{ns}/schema/export`
-
-Download a KV-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-kv-schema.json"`).
-
-```bash
-curl -OJ http://localhost:8080/admin/kv-stores/session-cache/schema/export
-# → writes session-cache-kv-schema.json
-```
-
-Returns `404 Not Found` if the namespace does not exist as a KV store.
-
----
-
-#### `POST /admin/kv-stores/import`
-
-Create a KV store from a previously exported schema. The internal `ns_id` is stripped and reassigned. Equivalent to `POST /kv-stores` with the schema body.
-
-```bash
-curl -X POST http://localhost:8080/admin/kv-stores/import \
-  -H 'Content-Type: application/json' \
-  --data-binary @session-cache-kv-schema.json
 # → 201 Created
 ```
 
@@ -1087,7 +1016,7 @@ value. There are two distinct kinds:
 | `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
 | `GET /admin/storage/kv-namespaces` | Engine KV namespaces | **Yes** |
 | `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
-| `GET /admin/storage/kv-stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
+| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
 | `GET /admin/storage/system/stores` | System namespaces | **Yes** |
 | `GET /admin/storage/system/stores/{ns}/meta` | One system store | **Yes** (except `in_memory.*`) |
 
@@ -1222,7 +1151,7 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `namespaces[].fields[].distinct_count` | Distinct indexed values for the field — *derived from the rebuilt-on-open value map* |
 
 The listing endpoints — `GET /admin/storage/namespaces`, `/kv-namespaces`,
-`/stores/{ns}/kv-meta`, `/kv-stores/{ns}/kv-meta`, `/system/stores`, and
+`/stores/{ns}/kv-meta`, `/stores/{ns}/kv-meta`, `/system/stores`, and
 `/system/stores/{ns}/meta` — return registry/schema descriptors (names, `ns_id`,
 key/value types, `semantic_search_enabled`, TTL config, indexed fields) plus, where
 relevant, the same LSM/value-log blocks documented above. All are derived from the
@@ -1249,7 +1178,7 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
 | `GET` | `/admin/storage/kv-namespaces` | `200` | All engine KV namespaces, annotated by role |
 | `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one doc store namespace |
-| `GET` | `/admin/storage/kv-stores/{ns}/kv-meta` | `200` | KV-layer metrics for one KV store namespace |
+| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one KV store namespace |
 | `GET` | `/admin/storage/system/stores` | `200` | List system-namespace KV and doc stores |
 | `GET` | `/admin/storage/system/stores/{ns}/meta` | `200` | Full metadata for one system KV store |
 | `GET` | `/admin/storage/index-waste` | `200` | Per-field field-index bitmap/keymap waste + compaction threshold |

@@ -320,7 +320,7 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **Filtered semantic search** | Combine ANN scoring with an index predicate in a single request. |
 | **Schema amendments** | Non-indexed attributes can be added, updated, or removed at any time without downtime. |
 | **Three doc key types** | `uuid`, `u64`, `u128` — stored big-endian so range scans return ascending order. |
-| **KV store** | Schema-lite namespaces (`/kv-stores`) for raw key-value data. Key types: `str`, `int`. Value types: `str`, `int`, `f32`, `vec_f32`. Range scan and prefix scan exposed via REST. Same durability guarantees as doc stores; no field indices. |
+| **KV store** | Schema-lite namespaces (`store_type: "kv"`, data under `/stores/{ns}/kv`) for raw key-value data. Key types: `str`, `int`. Value types: `str`, `int`, `f32`, `vec_f32`. Range scan and prefix scan exposed via REST. Same durability guarantees as doc stores; no field indices. |
 | **JSONL bulk loader** | `minnal_tools bulk_load` streams arbitrarily large JSONL files into a namespace via the REST API — document stores by default, KV stores with `--kv` — optionally importing the store's schema first (`--schema`). |
 | **Self-contained core** | Storage, field indexing, vector quantisation, ANN search, and the server all run in a single Rust process. The **one** external dependency is the embedding service — and only when semantic search is enabled: embedding *generation* is delegated to an HTTP endpoint, while quantisation and search stay in-process. KV and document storage, field indexing, and predicate queries need nothing external. |
 
@@ -828,50 +828,50 @@ A KV store is a schema-lite namespace for raw key-value data. It has no field in
 
 ```bash
 # Create a KV store (str key → str value)
-curl -s -X POST http://localhost:8080/kv-stores \
+curl -s -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
 # → 201 Created
 
 # Create a KV store with semantic search (str key → str value, ANN enabled)
-curl -s -X POST http://localhost:8080/kv-stores \
+curl -s -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{"namespace": "product-descriptions", "store_type": "kv", "key_type": "str", "value_type": "str",
        "semantic_search_enabled": true}'
 # → 201 Created
 
-# List all KV stores
-curl -s http://localhost:8080/kv-stores
+# List all stores (doc and KV; each entry carries its store_type)
+curl -s http://localhost:8080/stores
 
 # Write a value
-curl -s -X PUT http://localhost:8080/kv-stores/session-cache/kv/user-42 \
+curl -s -X PUT http://localhost:8080/stores/session-cache/kv/user-42 \
   -H 'Content-Type: application/json' \
   -d '"eyJhbGciOiJIUzI1NiJ9..."'
 # → 204 No Content
 
 # Read a value
-curl -s http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl -s http://localhost:8080/stores/session-cache/kv/user-42
 # → "eyJhbGciOiJIUzI1NiJ9..."
 
 # Delete a key
-curl -s -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl -s -X DELETE http://localhost:8080/stores/session-cache/kv/user-42
 # → 204 No Content
 
 # Range scan — entries with keys "user-10" through "user-20" (exclusive end)
-curl -s "http://localhost:8080/kv-stores/session-cache/kv?start=user-10&end=user-21"
+curl -s "http://localhost:8080/stores/session-cache/kv?start=user-10&end=user-21"
 # → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":2}
 
 # Prefix scan — all entries whose key starts with "user-"
-curl -s "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-"
+curl -s "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-"
 # → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":3}
 
 # Semantic search (value_type = str, semantic_search_enabled = true only)
-curl -s -X POST http://localhost:8080/kv-stores/product-descriptions/semantic-search \
+curl -s -X POST http://localhost:8080/stores/product-descriptions/kv/semantic-search \
   -H 'Content-Type: application/json' \
   -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
 
 # Drop a KV store (irreversible)
-curl -s -X DELETE http://localhost:8080/kv-stores/session-cache
+curl -s -X DELETE http://localhost:8080/stores/session-cache
 # → 204 No Content
 ```
 
@@ -906,7 +906,7 @@ into a one-step "fresh server → populated store" load:
 |---------------------------------|-------------|--------------------|----------|
 | `bulk_load --schema …`          | `POST /admin/stores/import`    | Yes — imports the schema first, then loads | Fresh server → populated doc store in one step |
 | `bulk_load` (no `--schema`)     | —           | No — the namespace must already exist | Adding more rows to a doc store you created earlier |
-| `bulk_load --kv --schema …`     | `POST /admin/kv-stores/import` | Yes — imports the schema first, then loads | Fresh server → populated KV store in one step |
+| `bulk_load --kv --schema …`     | `POST /admin/stores/import` | Yes — imports the schema first, then loads | Fresh server → populated KV store in one step |
 | `bulk_load --kv` (no `--schema`) | —          | No — the namespace must already exist | Adding more rows to a KV store you created earlier |
 
 When `--schema` is given, the tool validates that the schema's `key_type` matches
