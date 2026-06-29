@@ -8,6 +8,47 @@ use crate::error::SchemaError;
 /// Maximum number of indices allowed per document store.
 pub const MAX_INDICES: usize = 5;
 
+/// The kind of store a schema describes.
+///
+/// This is the **explicit, mandatory** discriminant between the two schema
+/// families — a document store ([`DocStoreSchema`]) versus a raw key-value store
+/// ([`KvStoreSchema`]). It replaces the historical practice of inferring the kind
+/// from the (incidentally disjoint) `key_type` values, which was fragile and
+/// accidental. Every persisted schema and every create/import payload must carry
+/// a `store_type` that parses into this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreType {
+    /// A JSON document store (`DocStoreSchema`): indices, attributes, doc CRUD.
+    Doc,
+    /// A raw key-value store (`KvStoreSchema`): opaque values, no indices.
+    Kv,
+}
+
+impl StoreType {
+    /// Human-readable label for error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            StoreType::Doc => "doc",
+            StoreType::Kv => "kv",
+        }
+    }
+}
+
+/// Read just the `store_type` discriminant from a raw schema JSON document,
+/// without committing to either full schema struct.
+///
+/// Returns `None` if the JSON is unparseable or carries no parseable
+/// `store_type`. This is the authoritative way to tell a doc-store schema from a
+/// KV-store schema on disk — used by the loaders to dispatch to the right struct.
+pub(crate) fn peek_store_type(json: &str) -> Option<StoreType> {
+    #[derive(Deserialize)]
+    struct Discriminant {
+        store_type: StoreType,
+    }
+    serde_json::from_str::<Discriminant>(json).ok().map(|d| d.store_type)
+}
+
 /// The key type for document identifiers in the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,12 +92,13 @@ pub enum KvValueType {
 /// Indices and attribute declarations are not supported; use `DocStoreSchema`
 /// if you need them.
 ///
-/// On disk the JSON is distinguished from `DocStoreSchema` by the `key_type`
-/// field: KV schemas use `"str"` or `"int"`, doc schemas use `"uuid"`,
-/// `"u64"`, or `"u128"`.
+/// On disk the JSON is distinguished from `DocStoreSchema` by the mandatory
+/// [`store_type`](Self::store_type) field, which must be `"kv"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvStoreSchema {
     pub namespace: String,
+    /// Mandatory store-kind discriminant; must be [`StoreType::Kv`].
+    pub store_type: StoreType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ns_id: Option<u32>,
     pub key_type: KvKeyType,
@@ -70,6 +112,13 @@ pub struct KvStoreSchema {
 impl KvStoreSchema {
     /// Validate the schema without saving.
     pub fn validate(&self) -> Result<(), SchemaError> {
+        if self.store_type != StoreType::Kv {
+            return Err(SchemaError::WrongStoreType {
+                namespace: self.namespace.clone(),
+                expected: "kv",
+                found: "doc",
+            });
+        }
         if self.namespace.is_empty() || !self.namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
             return Err(SchemaError::InvalidNamespace);
         }
@@ -95,6 +144,9 @@ impl KvStoreSchema {
     }
 
     /// Load the KV schema for `namespace` from `schema_dir/<namespace>.json`.
+    ///
+    /// Returns [`SchemaError::WrongStoreType`] if the file on disk is a document
+    /// store rather than a KV store.
     pub fn load(schema_dir: &Path, namespace: &str) -> Result<Self, SchemaError> {
         let path = schema_dir.join(format!("{namespace}.json"));
         if !path.exists() {
@@ -103,6 +155,15 @@ impl KvStoreSchema {
             });
         }
         let json = std::fs::read_to_string(path)?;
+        if let Some(found) = peek_store_type(&json)
+            && found != StoreType::Kv
+        {
+            return Err(SchemaError::WrongStoreType {
+                namespace: namespace.to_owned(),
+                expected: "kv",
+                found: found.label(),
+            });
+        }
         serde_json::from_str(&json).map_err(SchemaError::Serialize)
     }
 }
@@ -324,6 +385,8 @@ pub enum SchemaAmendment {
 pub struct DocStoreSchema {
     /// The `minnal_db` namespace this store maps to.
     pub namespace: String,
+    /// Mandatory store-kind discriminant; must be [`StoreType::Doc`].
+    pub store_type: StoreType,
     /// The minnal_db internal namespace ID — set after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ns_id: Option<u32>,
@@ -373,6 +436,13 @@ impl DocStoreSchema {
     /// - Non-indexed attribute names must be non-empty, unique among themselves,
     ///   and must not overlap with index field names.
     pub fn validate(&self) -> Result<(), SchemaError> {
+        if self.store_type != StoreType::Doc {
+            return Err(SchemaError::WrongStoreType {
+                namespace: self.namespace.clone(),
+                expected: "doc",
+                found: "kv",
+            });
+        }
         if self.namespace.is_empty() || !self.namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
             return Err(SchemaError::InvalidNamespace);
         }
@@ -457,6 +527,9 @@ impl DocStoreSchema {
     }
 
     /// Load a schema for `namespace` from `schema_dir/<namespace>.json`.
+    ///
+    /// Returns [`SchemaError::WrongStoreType`] if the file on disk is a KV store
+    /// rather than a document store.
     pub fn load(schema_dir: &Path, namespace: &str) -> Result<Self, SchemaError> {
         let path = schema_dir.join(format!("{namespace}.json"));
         if !path.exists() {
@@ -465,6 +538,15 @@ impl DocStoreSchema {
             });
         }
         let json = std::fs::read_to_string(path)?;
+        if let Some(found) = peek_store_type(&json)
+            && found != StoreType::Doc
+        {
+            return Err(SchemaError::WrongStoreType {
+                namespace: namespace.to_owned(),
+                expected: "doc",
+                found: found.label(),
+            });
+        }
         let schema: Self = serde_json::from_str(&json)?;
         Ok(schema)
     }
@@ -702,6 +784,7 @@ mod tests {
 
     fn valid_schema() -> DocStoreSchema {
         DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "products".to_owned(),
             ns_id: None,
             key_type: KeyType::Uuid,
@@ -802,6 +885,7 @@ mod tests {
     fn all_key_types_are_valid() {
         for key_type in [KeyType::Uuid, KeyType::U64, KeyType::U128] {
             let s = DocStoreSchema {
+                store_type: StoreType::Doc,
                 namespace: "ns".to_owned(),
                 ns_id: None,
                 key_type,
@@ -817,6 +901,7 @@ mod tests {
     #[test]
     fn all_index_types_roundtrip_json() {
         let s = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "ns".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -869,6 +954,7 @@ mod tests {
     #[test]
     fn index_field_names_are_unique_across_types() {
         let s = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "ns".to_owned(),
             ns_id: None,
             key_type: KeyType::U128,
@@ -895,6 +981,7 @@ mod tests {
     #[test]
     fn zero_indices_is_valid() {
         let s = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "empty".to_owned(),
             ns_id: None,
             key_type: KeyType::Uuid,
@@ -916,6 +1003,7 @@ mod tests {
     #[test]
     fn attribute_name_conflicts_with_index_field_is_rejected() {
         let s = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "ns".to_owned(),
             ns_id: None,
             key_type: KeyType::Uuid,
@@ -1307,6 +1395,7 @@ mod tests {
 
     fn schema_with_attrs() -> DocStoreSchema {
         DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "things".to_owned(),
             ns_id: None,
             key_type: KeyType::Uuid,
@@ -1463,6 +1552,7 @@ mod tests {
 
     fn schema_with_nested_fields() -> DocStoreSchema {
         DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "nested".to_owned(),
             ns_id: None,
             key_type: KeyType::Uuid,
@@ -1537,6 +1627,7 @@ mod tests {
 
     fn valid_kv_schema() -> KvStoreSchema {
         KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: "cache".to_owned(),
             ns_id: None,
             key_type: KvKeyType::Str,
@@ -1568,6 +1659,7 @@ mod tests {
     fn kv_schema_semantic_search_on_non_str_value_rejected() {
         for vt in [KvValueType::Int, KvValueType::F32, KvValueType::VecF32] {
             let s = KvStoreSchema {
+                store_type: StoreType::Kv,
                 namespace: "ns".to_owned(),
                 ns_id: None,
                 key_type: KvKeyType::Str,
@@ -1584,6 +1676,7 @@ mod tests {
     #[test]
     fn kv_schema_semantic_search_on_str_is_valid() {
         let s = KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: "ns".to_owned(),
             ns_id: None,
             key_type: KvKeyType::Str,
@@ -1603,6 +1696,7 @@ mod tests {
     fn kv_schema_save_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let schema = KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: "tokens".to_owned(),
             ns_id: Some(7),
             key_type: KvKeyType::Int,
@@ -1621,23 +1715,63 @@ mod tests {
     }
 
     // ── On-disk type discrimination ───────────────────────────────────────────
-    // KV schemas use key_type "str"/"int"; doc schemas use "uuid"/"u64"/"u128".
-    // Neither should parse as the other's type.
+    // The authoritative discriminant is the mandatory `store_type` field; the
+    // loaders dispatch on it via `peek_store_type`, and the typed `load`/`validate`
+    // reject the wrong kind. (The key_type sets remain incidentally disjoint, but
+    // that is no longer what tells the two schemas apart.)
 
     #[test]
-    fn kv_schema_does_not_parse_as_doc_schema() {
-        let kv = valid_kv_schema();
-        let json = serde_json::to_string(&kv).unwrap();
-        // DocStoreSchema.key_type has no "str" variant → must fail
-        assert!(serde_json::from_str::<DocStoreSchema>(&json).is_err());
+    fn peek_store_type_reads_the_discriminant() {
+        assert_eq!(peek_store_type(&serde_json::to_string(&valid_schema()).unwrap()), Some(StoreType::Doc));
+        assert_eq!(peek_store_type(&serde_json::to_string(&valid_kv_schema()).unwrap()), Some(StoreType::Kv));
+        assert_eq!(peek_store_type("not json"), None);
+        assert_eq!(peek_store_type(r#"{"namespace":"x"}"#), None);
     }
 
     #[test]
-    fn doc_schema_does_not_parse_as_kv_schema() {
-        let doc = valid_schema(); // key_type = "uuid"
-        let json = serde_json::to_string(&doc).unwrap();
-        // KvStoreSchema.key_type has no "uuid" variant → must fail
-        assert!(serde_json::from_str::<KvStoreSchema>(&json).is_err());
+    fn store_type_is_mandatory_on_the_wire() {
+        // A schema JSON without store_type must fail to deserialize.
+        let json = r#"{"namespace":"x","key_type":"u64","indices":[]}"#;
+        assert!(serde_json::from_str::<DocStoreSchema>(json).is_err());
+        let json = r#"{"namespace":"x","key_type":"str","value_type":"str"}"#;
+        assert!(serde_json::from_str::<KvStoreSchema>(json).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_store_type() {
+        let mut doc = valid_schema();
+        doc.store_type = StoreType::Kv;
+        assert!(matches!(doc.validate(), Err(SchemaError::WrongStoreType { expected: "doc", .. })));
+
+        let mut kv = valid_kv_schema();
+        kv.store_type = StoreType::Doc;
+        assert!(matches!(kv.validate(), Err(SchemaError::WrongStoreType { expected: "kv", .. })));
+    }
+
+    #[test]
+    fn load_rejects_wrong_store_type() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist a doc schema, then try to load it as a KV schema (same path).
+        let doc = DocStoreSchema {
+            namespace: "shared".to_owned(),
+            ..valid_schema()
+        };
+        doc.save(dir.path()).unwrap();
+        assert!(matches!(
+            KvStoreSchema::load(dir.path(), "shared"),
+            Err(SchemaError::WrongStoreType { expected: "kv", found: "doc", .. })
+        ));
+        // ...and the reverse direction.
+        let dir2 = tempfile::tempdir().unwrap();
+        let kv = KvStoreSchema {
+            namespace: "shared".to_owned(),
+            ..valid_kv_schema()
+        };
+        kv.save(dir2.path()).unwrap();
+        assert!(matches!(
+            DocStoreSchema::load(dir2.path(), "shared"),
+            Err(SchemaError::WrongStoreType { expected: "doc", found: "kv", .. })
+        ));
     }
 
     // ── KvKeyType serialisation ───────────────────────────────────────────────

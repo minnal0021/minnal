@@ -44,7 +44,7 @@
 //! | `--schema <file>`   | Import the schema before loading (doc → `POST                |
 //! |                     | /admin/stores/import`, KV → `POST /admin/kv-stores/import`).  |
 //! |                     | The schema file's `namespace` must match the `namespace`     |
-//! |                     | argument and its `key_type` must match the selected store    |
+//! |                     | argument and its `store_type` must match the selected store  |
 //! |                     | kind.  An existing store is reused, so re-runs are safe.     |
 //! |                     | Without this flag the namespace must already exist.         |
 //! | `--no-wal`          | Bypass WAL writes for maximum throughput.  Data written     |
@@ -120,12 +120,12 @@ impl StoreKind {
         }
     }
 
-    /// Classify a schema `key_type` string into the store kind it belongs to.
+    /// Classify a schema `store_type` string into the store kind it declares.
     /// Returns `None` for an unrecognised value.
-    fn from_key_type(key_type: &str) -> Option<StoreKind> {
-        match key_type {
-            "u64" | "u128" | "uuid" => Some(StoreKind::Doc),
-            "str" | "int" => Some(StoreKind::Kv),
+    fn from_store_type(store_type: &str) -> Option<StoreKind> {
+        match store_type {
+            "doc" => Some(StoreKind::Doc),
+            "kv" => Some(StoreKind::Kv),
             _ => None,
         }
     }
@@ -188,7 +188,7 @@ fn usage() -> ! {
         "  --schema <schema.json>  import the schema before loading (an existing store\n",
         "                          is reused, so re-runs are safe); the schema's\n",
         "                          'namespace' must match the namespace argument and its\n",
-        "                          'key_type' must match the selected store kind. Without\n",
+        "                          'store_type' must match the selected store kind. Without\n",
         "                          this flag the namespace must already exist\n",
         "  --no-wal                bypass WAL writes for maximum throughput; data written\n",
         "                          this way is unrecoverable on a crash — only use when\n",
@@ -281,7 +281,7 @@ async fn run_kv(positional: Vec<&String>, schema_path: Option<PathBuf>, skip_wal
 
 /// Import a schema via the store-kind-appropriate import endpoint.  An existing
 /// store (HTTP 409 Conflict) is reused, so re-runs are safe.  The schema file's
-/// `namespace` must match `namespace`, and its `key_type` must belong to the
+/// `namespace` must match `namespace`, and its `store_type` must match the
 /// selected store kind — guarding against, e.g., a doc schema loaded with `--kv`.
 async fn import_schema(
     client: &Client,
@@ -302,13 +302,13 @@ async fn import_schema(
         return Err(format!("namespace mismatch: argument is '{namespace}' but schema declares '{schema_ns}'").into());
     }
 
-    // Validate the schema's key_type matches the selected store kind so a
+    // Validate the schema's store_type matches the selected store kind so a
     // mismatched --kv flag fails fast with a clear message.
-    let schema_key_type = schema
-        .get("key_type")
+    let schema_store_type = schema
+        .get("store_type")
         .and_then(Value::as_str)
-        .ok_or("schema file has no string 'key_type' field")?;
-    match StoreKind::from_key_type(schema_key_type) {
+        .ok_or("schema file has no string 'store_type' field (expected \"doc\" or \"kv\")")?;
+    match StoreKind::from_store_type(schema_store_type) {
         Some(schema_kind) if schema_kind == kind => {}
         Some(schema_kind) => {
             let hint = match schema_kind {
@@ -316,13 +316,13 @@ async fn import_schema(
                 StoreKind::Doc => "drop --kv to load a document store",
             };
             return Err(format!(
-                "store-kind mismatch: requested a {} but schema declares key_type '{schema_key_type}' (a {}) — {hint}",
+                "store-kind mismatch: requested a {} but schema declares store_type '{schema_store_type}' (a {}) — {hint}",
                 kind.label(),
                 schema_kind.label(),
             )
             .into());
         }
-        None => return Err(format!("schema declares an unrecognised key_type '{schema_key_type}'").into()),
+        None => return Err(format!("schema declares an unrecognised store_type '{schema_store_type}' (expected \"doc\" or \"kv\")").into()),
     }
 
     let resp = client
@@ -724,24 +724,22 @@ mod tests {
         assert!(!is_valid_uuid("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"));
     }
 
-    // ── StoreKind::from_key_type ──────────────────────────────────────────
+    // ── StoreKind::from_store_type ────────────────────────────────────────
 
     #[test]
-    fn classifies_doc_key_types() {
-        assert_eq!(StoreKind::from_key_type("u64"), Some(StoreKind::Doc));
-        assert_eq!(StoreKind::from_key_type("u128"), Some(StoreKind::Doc));
-        assert_eq!(StoreKind::from_key_type("uuid"), Some(StoreKind::Doc));
+    fn classifies_doc_store_type() {
+        assert_eq!(StoreKind::from_store_type("doc"), Some(StoreKind::Doc));
     }
 
     #[test]
-    fn classifies_kv_key_types() {
-        assert_eq!(StoreKind::from_key_type("str"), Some(StoreKind::Kv));
-        assert_eq!(StoreKind::from_key_type("int"), Some(StoreKind::Kv));
+    fn classifies_kv_store_type() {
+        assert_eq!(StoreKind::from_store_type("kv"), Some(StoreKind::Kv));
     }
 
     #[test]
-    fn rejects_unknown_key_type() {
-        assert_eq!(StoreKind::from_key_type("f64"), None);
+    fn rejects_unknown_store_type() {
+        assert_eq!(StoreKind::from_store_type("u64"), None);
+        assert_eq!(StoreKind::from_store_type("nonsense"), None);
     }
 
     // ── extract_doc_id ────────────────────────────────────────────────────

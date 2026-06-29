@@ -74,6 +74,7 @@ curl -s -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "users",
+    "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
     "indices": [
@@ -237,7 +238,7 @@ A **KV store** is a schema-lite namespace managed under `/kv-stores`. Unlike a d
 - Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
 - Optional semantic search when `value_type = str`
 
-KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished by its `key_type` value on disk (`"str"`/`"int"` vs `"uuid"`/`"u64"`/`"u128"`).
+KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished on disk by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
 
 **Key types:**
 
@@ -325,6 +326,7 @@ curl http://localhost:8080/stores
 [
   {
     "namespace": "users",
+    "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
     "indices": [
@@ -371,6 +373,7 @@ curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "orders",
+    "store_type": "doc",
     "key_type": "u64",
     "indices": [
       {"field": "state",      "index_type": "str"},
@@ -408,6 +411,7 @@ curl http://localhost:8080/stores/users/schema
 ```json
 {
   "namespace": "users",
+  "store_type": "doc",
   "key_type": "uuid",
   "indices": [
     {"field": "status", "index_type": "str"},
@@ -694,6 +698,7 @@ curl http://localhost:8080/kv-stores
 [
   {
     "namespace": "session-cache",
+    "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
     "semantic_search_enabled": false
@@ -719,7 +724,7 @@ Create a new KV store.
 ```bash
 curl -X POST http://localhost:8080/kv-stores \
   -H 'Content-Type: application/json' \
-  -d '{"namespace": "session-cache", "key_type": "str", "value_type": "str"}'
+  -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
 # → 201 Created
 
 # With semantic search
@@ -727,6 +732,7 @@ curl -X POST http://localhost:8080/kv-stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "product-descriptions",
+    "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
     "semantic_search_enabled": true
@@ -761,6 +767,7 @@ curl http://localhost:8080/kv-stores/session-cache/schema
 {
   "namespace": "session-cache",
   "ns_id": 7,
+  "store_type": "kv",
   "key_type": "str",
   "value_type": "str",
   "semantic_search_enabled": false
@@ -1829,7 +1836,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
         build_progress.json   ← index rebuild progress (created on add_index)
 
 {schema_dir}/
-  {namespace}.json            ← schema for each store (doc or KV — distinguished by key_type value)
+  {namespace}.json            ← schema for each store (doc or KV — distinguished by mandatory store_type field)
 ```
 
-Schema files are written atomically (tmp-then-rename). Doc schemas use `key_type` values `"uuid"`, `"u64"`, or `"u128"`; KV schemas use `"str"` or `"int"`. Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.
+Schema files are written atomically (tmp-then-rename). Every schema declares a mandatory `store_type` field — `"doc"` or `"kv"` — which is the authoritative on-disk discriminant between the two store kinds (doc schemas additionally use `key_type` values `"uuid"`/`"u64"`/`"u128"`, KV schemas `"str"`/`"int"`, but that is no longer what distinguishes them). Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.

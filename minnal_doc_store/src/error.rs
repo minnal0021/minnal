@@ -70,6 +70,13 @@ pub enum SchemaError {
 
     #[error("semantic search is only supported for KV stores with value_type = str")]
     KvSemanticSearchOnlyForStr,
+
+    #[error("wrong store type for namespace '{namespace}': expected {expected}, found {found}")]
+    WrongStoreType {
+        namespace: String,
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 // ── Doc-store-level errors ─────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 {
   "namespace": "job-content",
+  "store_type": "kv",
   "key_type": "str",
   "value_type": "str",
   "semantic_search_enabled": true

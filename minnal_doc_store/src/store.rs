@@ -32,7 +32,7 @@ use crate::hex::hex_to_bytes;
 use crate::index_observer::{ChainedObserver, DiskProgress, InMemoryProgress, IndexProgressObserver};
 use crate::index_progress::{BuildStatus, now_ms};
 use crate::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
-use crate::schema::{DocStoreSchema, IndexSpec, IndexType, KeyType, KvStoreSchema, SchemaAmendment};
+use crate::schema::{DocStoreSchema, IndexSpec, IndexType, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 use crate::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
 use crate::vector_kv;
 
@@ -2516,7 +2516,11 @@ fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocSt
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let json = std::fs::read_to_string(&path)?;
-            if let Ok(schema) = serde_json::from_str::<DocStoreSchema>(&json) {
+            // Dispatch on the explicit `store_type` discriminant; skip anything
+            // that isn't a doc store (or has no parseable discriminant).
+            if crate::schema::peek_store_type(&json) == Some(StoreType::Doc)
+                && let Ok(schema) = serde_json::from_str::<DocStoreSchema>(&json)
+            {
                 schemas.push(schema);
             }
         }
@@ -2536,7 +2540,11 @@ fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, Doc
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let json = std::fs::read_to_string(&path)?;
-            if let Ok(schema) = serde_json::from_str::<KvStoreSchema>(&json) {
+            // Dispatch on the explicit `store_type` discriminant; skip anything
+            // that isn't a KV store (or has no parseable discriminant).
+            if crate::schema::peek_store_type(&json) == Some(StoreType::Kv)
+                && let Ok(schema) = serde_json::from_str::<KvStoreSchema>(&json)
+            {
                 schemas.push(schema);
             }
         }
@@ -2943,6 +2951,7 @@ mod tests {
 
     fn make_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreSchema {
         DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3101,6 +3110,7 @@ mod tests {
         // Create a schema with semantic_search_enabled + embedding_fields so
         // that `is_semantic_search_enabled()` returns true.
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "sem_docs".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3302,6 +3312,7 @@ mod tests {
         let store = open_fresh(db_dir.path(), schema_dir.path()).await;
 
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "sem_range".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3963,6 +3974,7 @@ mod tests {
     fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: KvValueType) -> KvStoreSchema {
         use crate::schema::KvStoreSchema;
         KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type,
@@ -4494,6 +4506,7 @@ mod tests {
         let schema: DocStoreSchema = serde_json::from_str(
             r#"{
             "namespace": "imported",
+            "store_type": "doc",
             "key_type": "u64",
             "attributes": [],
             "indices": [],
@@ -4652,6 +4665,7 @@ mod tests {
 
         // Simulate a stale exported schema that has "agency" in both lists.
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "stale_export".to_owned(),
             ns_id: None,
             key_type: crate::schema::KeyType::U64,
@@ -4678,6 +4692,7 @@ mod tests {
     /// Helper: create a semantic-search-enabled doc schema with a `title` field.
     async fn create_semantic_schema(store: &DocStore, namespace: &str) {
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -4765,6 +4780,7 @@ mod tests {
         // A namespace without semantic search is rejected.
         store
             .create(DocStoreSchema {
+                store_type: StoreType::Doc,
                 namespace: "plain".to_owned(),
                 ns_id: None,
                 key_type: KeyType::U64,
@@ -4911,6 +4927,7 @@ mod tests {
         let store = open_fresh(db_dir.path(), schema_dir.path()).await;
 
         let schema = KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: "kv".to_owned(),
             ns_id: None,
             key_type: KvKeyType::Str,

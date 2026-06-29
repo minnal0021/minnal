@@ -260,7 +260,7 @@ A simpler, schema-lite alternative backed by the same minnal_db namespace. Each 
 - A value type: `int`, `str`, `f32`, or `vec_f32`
 - Optionally `semantic_search_enabled = true` when `value_type = str`
 
-KV stores have no field indices; field-index predicate queries belong to document stores only. Both store types support range scans and prefix scans. The two schema types share the same `schema_dir` but are distinguished on disk by their `key_type` value (`"str"`/`"int"` vs `"uuid"`/`"u64"`/`"u128"`).
+KV stores have no field indices; field-index predicate queries belong to document stores only. Both store types support range scans and prefix scans. The two schema types share the same `schema_dir` and are distinguished on disk by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
 
 Schemas are serialised as JSON and written atomically (tmp-then-rename) to a `schema_dir`.
 
@@ -493,6 +493,7 @@ The `-s` flag stages [`tools/sample_data/`](tools/sample_data) into `./work/samp
 ```json
 {
   "namespace": "jobs",
+  "store_type": "doc",
   "key_type": "u64",
   "attributes": [
     { "name": "jobTitle", "attr_type": "str" }
@@ -608,6 +609,7 @@ curl -s -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "profiles",
+    "store_type": "doc",
     "key_type": "uuid",
     "semantic_search_enabled": true,
     "embedding_fields": ["bio"],
@@ -828,13 +830,13 @@ A KV store is a schema-lite namespace for raw key-value data. It has no field in
 # Create a KV store (str key → str value)
 curl -s -X POST http://localhost:8080/kv-stores \
   -H 'Content-Type: application/json' \
-  -d '{"namespace": "session-cache", "key_type": "str", "value_type": "str"}'
+  -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
 # → 201 Created
 
 # Create a KV store with semantic search (str key → str value, ANN enabled)
 curl -s -X POST http://localhost:8080/kv-stores \
   -H 'Content-Type: application/json' \
-  -d '{"namespace": "product-descriptions", "key_type": "str", "value_type": "str",
+  -d '{"namespace": "product-descriptions", "store_type": "kv", "key_type": "str", "value_type": "str",
        "semantic_search_enabled": true}'
 # → 201 Created
 
