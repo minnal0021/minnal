@@ -8,10 +8,9 @@
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
 //! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ physical st_blocks bytes)
 //! GET  /admin/storage/value-log/{ns}/pages            → per-page garbage breakdown for one namespace (deep dive)
-//! GET  /admin/storage/namespaces                      → namespace registry with field schemas
-//! GET  /admin/storage/kv-namespaces                   → all KV namespaces open in the engine
-//! GET  /admin/storage/stores/{ns}/kv-meta             → KV monitoring for one doc store namespace
-//! GET  /admin/storage/kv-stores/{ns}/kv-meta          → KV monitoring for one user KV namespace
+//! GET  /admin/storage/namespaces                      → doc-store namespace registry with field schemas
+//! GET  /admin/storage/namespaces/physical             → every physical engine namespace (incl. companions/system), each with a role
+//! GET  /admin/storage/stores/{ns}/kv-meta             → engine storage metadata for one store (doc or KV)
 //! GET  /admin/storage/system/stores                   → list all stores in the system namespace
 //! GET  /admin/storage/system/stores/{ns}/meta         → metadata for one system KV store
 //! GET  /admin/storage/index-waste                     → per-field field-index bitmap/keymap waste + threshold
@@ -33,7 +32,7 @@ use minnal_db::{FieldMeta, LsmManifest, ValueLogMetadata};
 use serde::Serialize;
 use tracing::{error, info};
 
-use minnal_doc_store::{KvKeyType, KvValueType};
+use minnal_doc_store::{KvKeyType, KvValueType, StoreType};
 
 use crate::AppState;
 
@@ -656,7 +655,7 @@ pub struct KvNamespaceInfo {
     role: &'static str,
 }
 
-pub async fn kv_namespaces(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn physical_namespaces(State(state): State<AppState>) -> impl IntoResponse {
     let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
     let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
 
@@ -971,39 +970,6 @@ pub fn build_namespace_meta(
     (lsm_info, vlog_info, associated_stores)
 }
 
-pub async fn store_kv_meta(
-    State(state): State<AppState>,
-    Path(ns): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ns_id, semantic_search_enabled, doc_names, kv_names) = {
-        let schemas = state.schemas.read().await;
-        match schemas.get(&ns) {
-            Some(s) if s.ns_id.is_some() => {
-                let doc_names: std::collections::HashSet<String> = schemas.keys().cloned().collect();
-                let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
-                (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
-            }
-            _ => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": format!("doc store '{}' does not exist", ns) })),
-                ));
-            }
-        }
-    };
-
-    let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
-
-    Ok(Json(DocStoreKvMeta {
-        namespace: ns,
-        ns_id,
-        semantic_search_enabled,
-        lsm: lsm_info,
-        value_log: vlog_info,
-        associated_stores,
-    }))
-}
-
 #[derive(Serialize)]
 pub struct KvStoreKvMeta {
     namespace: String,
@@ -1018,46 +984,69 @@ pub struct KvStoreKvMeta {
     associated_stores: Vec<AssociatedKvStore>,
 }
 
-pub async fn kv_store_kv_meta(
+/// `GET /admin/storage/stores/{ns}/kv-meta` — engine-level (LSM + value-log)
+/// storage metadata for one store of **either** kind, plus its companion KV
+/// stores. The kind is resolved from the store's `store_type`; the KV-store
+/// response additionally carries `key_type`/`value_type`.
+pub async fn store_kv_meta(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ns_id, key_type, value_type, semantic_search_enabled, doc_store_names, kv_store_names) = {
-        let kv_schemas = state.kv_schemas.read().await;
-        match kv_schemas.get(&ns) {
-            Some(s) if s.ns_id.is_some() => {
-                let doc_store_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
-                let kv_store_names: std::collections::HashSet<String> = kv_schemas.keys().cloned().collect();
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("store '{}' does not exist", ns) })),
+        )
+    };
+
+    match state.store.store_type(&ns) {
+        Ok(StoreType::Doc) => {
+            let (ns_id, semantic_search_enabled, doc_names, kv_names) = {
+                let schemas = state.schemas.read().await;
+                let s = schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
+                let doc_names: std::collections::HashSet<String> = schemas.keys().cloned().collect();
+                let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
+                (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
+            };
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            Ok(Json(serde_json::json!(DocStoreKvMeta {
+                namespace: ns,
+                ns_id,
+                semantic_search_enabled,
+                lsm: lsm_info,
+                value_log: vlog_info,
+                associated_stores,
+            })))
+        }
+        Ok(StoreType::Kv) => {
+            let (ns_id, key_type, value_type, semantic_search_enabled, doc_names, kv_names) = {
+                let kv_schemas = state.kv_schemas.read().await;
+                let s = kv_schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
+                let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
+                let kv_names: std::collections::HashSet<String> = kv_schemas.keys().cloned().collect();
                 (
                     s.ns_id.unwrap(),
                     kv_key_type_str(s.key_type),
                     kv_value_type_str(s.value_type),
                     s.semantic_search_enabled,
-                    doc_store_names,
-                    kv_store_names,
+                    doc_names,
+                    kv_names,
                 )
-            }
-            _ => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": format!("KV store '{}' does not exist", ns) })),
-                ));
-            }
+            };
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            Ok(Json(serde_json::json!(KvStoreKvMeta {
+                namespace: ns,
+                ns_id,
+                key_type,
+                value_type,
+                semantic_search_enabled,
+                lsm: lsm_info,
+                value_log: vlog_info,
+                associated_stores,
+            })))
         }
-    };
-
-    let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_store_names, &kv_store_names);
-
-    Ok(Json(KvStoreKvMeta {
-        namespace: ns,
-        ns_id,
-        key_type,
-        value_type,
-        semantic_search_enabled,
-        lsm: lsm_info,
-        value_log: vlog_info,
-        associated_stores,
-    }))
+        Err(_) => Err(not_found()),
+    }
 }
 
 // ── Type helpers ──────────────────────────────────────────────────────────────

@@ -38,7 +38,7 @@ use crate::{
     routes::{decode_cursor, encode_cursor},
 };
 
-// ── GET /kv-stores/{ns}/kv/{key} ─────────────────────────────────────────────
+// ── GET /stores/{ns}/kv/{key} ────────────────────────────────────────────────
 
 pub async fn get_kv(State(state): State<AppState>, Path((ns, key)): Path<(String, String)>) -> Result<impl IntoResponse, AppError> {
     debug!(namespace = %ns, key = %key, "kv get");
@@ -48,7 +48,7 @@ pub async fn get_kv(State(state): State<AppState>, Path((ns, key)): Path<(String
     }
 }
 
-// ── PUT /kv-stores/{ns}/kv/{key} ─────────────────────────────────────────────
+// ── PUT /stores/{ns}/kv/{key} ────────────────────────────────────────────────
 
 pub async fn put_kv(
     State(state): State<AppState>,
@@ -84,7 +84,7 @@ pub struct KvPutParams {
     skip_wal: bool,
 }
 
-// ── DELETE /kv-stores/{ns}/kv/{key} ──────────────────────────────────────────
+// ── DELETE /stores/{ns}/kv/{key} ─────────────────────────────────────────────
 
 pub async fn delete_kv(State(state): State<AppState>, Path((ns, key)): Path<(String, String)>) -> Result<impl IntoResponse, AppError> {
     debug!(namespace = %ns, key = %key, "kv delete");
@@ -92,7 +92,7 @@ pub async fn delete_kv(State(state): State<AppState>, Path((ns, key)): Path<(Str
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── GET /kv-stores/{ns}/kv?start=&end= ───────────────────────────────────────
+// ── GET /stores/{ns}/kv?start=&end= ──────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct KvRangeParams {
@@ -127,7 +127,7 @@ pub async fn range_kv(
     })))
 }
 
-// ── GET /kv-stores/{ns}/kv/prefix?prefix= ────────────────────────────────────
+// ── GET /stores/{ns}/kv/prefix?prefix= ───────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct KvPrefixScanParams {
@@ -161,7 +161,7 @@ pub async fn prefix_scan_kv(
     })))
 }
 
-// ── POST /kv-stores/{ns}/semantic-search ─────────────────────────────────────
+// ── POST /stores/{ns}/kv/semantic-search ─────────────────────────────────────
 
 fn default_page_size() -> usize {
     20

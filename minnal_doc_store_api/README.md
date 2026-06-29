@@ -1014,9 +1014,8 @@ value. There are two distinct kinds:
 | `GET /admin/storage/value-log/{ns}/pages` | Value-log per page | **Yes** |
 | `GET /admin/storage/index-waste` | Field-index dead space | **Yes** (derived from on-disk state, not a stored counter) |
 | `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
-| `GET /admin/storage/kv-namespaces` | Engine KV namespaces | **Yes** |
-| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
-| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log | **Yes** (except `in_memory.*`) |
+| `GET /admin/storage/namespaces/physical` | Physical engine namespaces | **Yes** |
+| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log (doc or KV) | **Yes** (except `in_memory.*`) |
 | `GET /admin/storage/system/stores` | System namespaces | **Yes** |
 | `GET /admin/storage/system/stores/{ns}/meta` | One system store | **Yes** (except `in_memory.*`) |
 
@@ -1150,8 +1149,8 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `namespaces[].fields[].over_threshold` | True if either store has reached the threshold (compacted next checkpoint) |
 | `namespaces[].fields[].distinct_count` | Distinct indexed values for the field — *derived from the rebuilt-on-open value map* |
 
-The listing endpoints — `GET /admin/storage/namespaces`, `/kv-namespaces`,
-`/stores/{ns}/kv-meta`, `/stores/{ns}/kv-meta`, `/system/stores`, and
+The listing endpoints — `GET /admin/storage/namespaces`, `/namespaces/physical`,
+`/stores/{ns}/kv-meta`, `/system/stores`, and
 `/system/stores/{ns}/meta` — return registry/schema descriptors (names, `ns_id`,
 key/value types, `semantic_search_enabled`, TTL config, indexed fields) plus, where
 relevant, the same LSM/value-log blocks documented above. All are derived from the
@@ -1176,9 +1175,8 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
 | `GET` | `/admin/storage/value-log/{ns}/pages` | `200` | Per-page garbage breakdown for one namespace |
 | `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
-| `GET` | `/admin/storage/kv-namespaces` | `200` | All engine KV namespaces, annotated by role |
-| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one doc store namespace |
-| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one KV store namespace |
+| `GET` | `/admin/storage/namespaces/physical` | `200` | Every physical engine namespace, annotated by role |
+| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | Engine (LSM+value-log) metrics for one store, doc or KV |
 | `GET` | `/admin/storage/system/stores` | `200` | List system-namespace KV and doc stores |
 | `GET` | `/admin/storage/system/stores/{ns}/meta` | `200` | Full metadata for one system KV store |
 | `GET` | `/admin/storage/index-waste` | `200` | Per-field field-index bitmap/keymap waste + compaction threshold |
