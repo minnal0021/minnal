@@ -153,7 +153,9 @@ Field indices answer *exact* questions. Semantic search answers *fuzzy* ones —
 
 #### IVF Clustering
 
-The embedding space is partitioned into a fixed number of clusters. The cluster centroids are pre-computed offline (e.g. with k-means over a representative corpus) and stored as a JSONL file. At startup, minnal loads the centroids and pre-computes a nearest-neighbour graph over the clusters so that multi-probe search can be done cheaply at query time.
+The embedding space is partitioned into a fixed number of clusters. The cluster centroids are pre-computed offline (e.g. with k-means over a representative corpus) and stored as a JSONL file (one `{cluster_id, centroid}` per line). At startup, minnal loads the centroids once into a read-only index shared across all requests.
+
+This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their assigned `cluster_id`, so a query only has to scan the chunks in a handful of relevant clusters instead of the whole corpus. At query time the relevant clusters are chosen by an **exact** nearest-centroid scan — each query embedding's distance to every centroid is computed and the `n_probes` nearest are selected (introselect, ~O(C) where C is the cluster count). There is deliberately **no precomputed neighbour graph over the clusters**: at the cluster counts in use the exhaustive scan takes microseconds and yields the *exact* nearest clusters, whereas an approximate graph traversal would trade recall for no meaningful speed-up. (A neighbour graph would only pay off at much larger, sparser cluster counts.)
 
 #### Dual Quantisation at Index Time
 
