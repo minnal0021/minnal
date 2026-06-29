@@ -2481,6 +2481,20 @@ impl DocStore {
         self.schema_dir.join(format!("{namespace}.json"))
     }
 
+    /// Resolve the [`StoreType`] of an existing namespace by reading its
+    /// persisted schema's discriminant, without committing to either full schema
+    /// struct. Returns [`DocStoreError::NotFound`] if no schema exists (or it
+    /// carries no parseable `store_type`).
+    pub fn store_type(&self, namespace: &str) -> Result<StoreType, DocStoreError> {
+        let path = self.schema_path(namespace);
+        let json = std::fs::read_to_string(&path).map_err(|_| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })?;
+        crate::schema::peek_store_type(&json).ok_or_else(|| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    }
+
     fn load_schema(&self, namespace: &str) -> Result<DocStoreSchema, DocStoreError> {
         DocStoreSchema::load(&self.schema_dir, namespace).map_err(|e| match e {
             SchemaError::NotFound { namespace } => DocStoreError::NotFound { namespace },

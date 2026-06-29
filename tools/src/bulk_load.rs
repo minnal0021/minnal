@@ -41,9 +41,10 @@
 //! | Flag                | Description                                                 |
 //! |---------------------|-------------------------------------------------------------|
 //! | `--kv`              | Load a KV store instead of a document store.                |
-//! | `--schema <file>`   | Import the schema before loading (doc → `POST                |
-//! |                     | /admin/stores/import`, KV → `POST /admin/kv-stores/import`).  |
-//! |                     | The schema file's `namespace` must match the `namespace`     |
+//! | `--schema <file>`   | Import the schema before loading via `POST                   |
+//! |                     | /admin/stores/import` (the payload's `store_type` selects    |
+//! |                     | doc vs KV).  The schema file's `namespace` must match the    |
+//! |                     | `namespace`                                                  |
 //! |                     | argument and its `store_type` must match the selected store  |
 //! |                     | kind.  An existing store is reused, so re-runs are safe.     |
 //! |                     | Without this flag the namespace must already exist.         |
@@ -143,9 +144,10 @@ pub(crate) enum DocKeyType {
     Uuid,
 }
 
-/// Minimal projection of the doc-store schema returned by `GET /stores`.
+/// Minimal projection of a doc-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct DocSchema {
+    #[allow(dead_code)]
     namespace: String,
     key_type: DocKeyType,
 }
@@ -160,9 +162,10 @@ pub(crate) enum KvKeyType {
     Int,
 }
 
-/// Minimal projection of the KV-store schema returned by `GET /kv-stores`.
+/// Minimal projection of a KV-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct KvSchema {
+    #[allow(dead_code)]
     namespace: String,
     key_type: KvKeyType,
 }
@@ -270,7 +273,7 @@ async fn run_kv(positional: Vec<&String>, schema_path: Option<PathBuf>, skip_wal
     let client = Client::new();
 
     if let Some(schema_path) = &schema_path {
-        import_schema(&client, base_url, schema_path, namespace, StoreKind::Kv, "/admin/kv-stores/import").await?;
+        import_schema(&client, base_url, schema_path, namespace, StoreKind::Kv, "/admin/stores/import").await?;
     }
 
     let key_type = resolve_kv_key_type(&client, base_url, namespace).await?;
@@ -346,9 +349,27 @@ async fn import_schema(
 // ── Document store ──────────────────────────────────────────────────────────
 
 /// Resolve a doc namespace's `key_type` via `GET /stores`, erroring if the
-/// namespace does not exist.
+/// namespace does not exist or is a KV store.
+///
+/// `GET /stores` returns both doc and KV stores, so the list is parsed
+/// untyped and the matching entry deserialized into a doc projection — a KV
+/// entry (key_type `str`/`int`) fails that step with a clear message.
 async fn resolve_doc_key_type(client: &Client, base_url: &str, namespace: &str) -> Result<DocKeyType, Box<dyn std::error::Error>> {
-    let stores: Vec<DocSchema> = client
+    let stores = fetch_stores(client, base_url).await?;
+    match stores.iter().find(|s| s.get("namespace").and_then(Value::as_str) == Some(namespace)) {
+        Some(entry) => {
+            let schema: DocSchema =
+                serde_json::from_value(entry.clone()).map_err(|_| format!("namespace '{namespace}' is not a document store (drop --kv or use the KV path)"))?;
+            Ok(schema.key_type)
+        }
+        None => Err(namespace_not_found("namespace", namespace, &stores)),
+    }
+}
+
+/// `GET /stores` → the full (doc + KV) store list, parsed untyped so a mix of
+/// kinds does not break deserialization.
+async fn fetch_stores(client: &Client, base_url: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    Ok(client
         .get(format!("{base_url}/stores"))
         .send()
         .await
@@ -357,20 +378,17 @@ async fn resolve_doc_key_type(client: &Client, base_url: &str, namespace: &str) 
         .map_err(|e| format!("GET /stores failed: {e}"))?
         .json()
         .await
-        .map_err(|e| format!("cannot parse /stores response: {e}"))?;
+        .map_err(|e| format!("cannot parse /stores response: {e}"))?)
+}
 
-    stores.iter().find(|s| s.namespace == namespace).map(|s| s.key_type).ok_or_else(|| {
-        let available: Vec<&str> = stores.iter().map(|s| s.namespace.as_str()).collect();
-        format!(
-            "namespace '{namespace}' not found — available: {}",
-            if available.is_empty() {
-                "(none)".to_owned()
-            } else {
-                available.join(", ")
-            }
-        )
-        .into()
-    })
+/// Build a "namespace not found" error listing the available namespaces.
+fn namespace_not_found(label: &str, namespace: &str, stores: &[Value]) -> Box<dyn std::error::Error> {
+    let available: Vec<&str> = stores.iter().filter_map(|s| s.get("namespace").and_then(Value::as_str)).collect();
+    format!(
+        "{label} '{namespace}' not found — available: {}",
+        if available.is_empty() { "(none)".to_owned() } else { available.join(", ") }
+    )
+    .into()
 }
 
 /// Stream a JSONL file into an existing doc `namespace`, PUTting one document per
@@ -505,32 +523,20 @@ fn is_valid_uuid(s: &str) -> bool {
 
 // ── KV store ────────────────────────────────────────────────────────────────
 
-/// Resolve a KV namespace's `key_type` via `GET /kv-stores`, erroring if the
-/// namespace does not exist.
+/// Resolve a KV namespace's `key_type` via `GET /stores`, erroring if the
+/// namespace does not exist or is a document store.
+///
+/// As with [`resolve_doc_key_type`], the unified store list is parsed untyped;
+/// a doc entry (key_type `uuid`/`u64`/`u128`) fails the KV projection step.
 async fn resolve_kv_key_type(client: &Client, base_url: &str, namespace: &str) -> Result<KvKeyType, Box<dyn std::error::Error>> {
-    let stores: Vec<KvSchema> = client
-        .get(format!("{base_url}/kv-stores"))
-        .send()
-        .await
-        .map_err(|e| format!("cannot reach '{base_url}/kv-stores': {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("GET /kv-stores failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("cannot parse /kv-stores response: {e}"))?;
-
-    stores.iter().find(|s| s.namespace == namespace).map(|s| s.key_type).ok_or_else(|| {
-        let available: Vec<&str> = stores.iter().map(|s| s.namespace.as_str()).collect();
-        format!(
-            "KV namespace '{namespace}' not found — available: {}",
-            if available.is_empty() {
-                "(none)".to_owned()
-            } else {
-                available.join(", ")
-            }
-        )
-        .into()
-    })
+    let stores = fetch_stores(client, base_url).await?;
+    match stores.iter().find(|s| s.get("namespace").and_then(Value::as_str) == Some(namespace)) {
+        Some(entry) => {
+            let schema: KvSchema = serde_json::from_value(entry.clone()).map_err(|_| format!("namespace '{namespace}' is not a KV store (pass --kv only for KV stores)"))?;
+            Ok(schema.key_type)
+        }
+        None => Err(namespace_not_found("KV namespace", namespace, &stores)),
+    }
 }
 
 /// Stream a JSONL file into an existing KV `namespace`, PUTting one entry per
@@ -598,9 +604,9 @@ async fn load_kv_jsonl(
         };
 
         let put_url = if skip_wal {
-            format!("{base_url}/kv-stores/{namespace}/kv/{key_str}?skip_wal=true")
+            format!("{base_url}/stores/{namespace}/kv/{key_str}?skip_wal=true")
         } else {
-            format!("{base_url}/kv-stores/{namespace}/kv/{key_str}")
+            format!("{base_url}/stores/{namespace}/kv/{key_str}")
         };
 
         match client.put(put_url).json(value).send().await {

@@ -47,9 +47,11 @@ impl IntoResponse for AppError {
             | DocStoreError::VecReindexInProgress { .. }
             | DocStoreError::VecIndexCleanupInProgress { .. }
             | DocStoreError::AttrIndexOpInProgress { .. }
-            | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. }) => StatusCode::CONFLICT,
+            | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. })
+            | DocStoreError::Schema(SchemaError::WrongStoreType { .. }) => StatusCode::CONFLICT,
 
             DocStoreError::InvalidId(_)
+            | DocStoreError::Schema(SchemaError::Serialize(_))
             | DocStoreError::Schema(SchemaError::InvalidNamespace)
             | DocStoreError::Schema(SchemaError::TooManyIndices { .. })
             | DocStoreError::Schema(SchemaError::EmptyFieldName { .. })

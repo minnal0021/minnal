@@ -110,32 +110,26 @@ pub fn router() -> Router<AppState> {
         .route("/admin/stores/{ns}/schema/export", get(admin_stores::export_schema))
         .route("/admin/stores/import", post(admin_stores::import_schema))
         .route("/admin/stores/{ns}/row-count", get(admin_stores::row_count))
-        .route("/admin/kv-stores/{ns}/schema/export", get(admin_stores::export_kv_schema))
-        .route("/admin/kv-stores/import", post(admin_stores::import_kv_schema))
-        // ── Store lifecycle ───────────────────────────────────────────────────
+        // ── Store lifecycle (unified: doc + KV, dispatched on store_type) ──────
         .route("/stores", get(stores::list).post(stores::create))
         .route("/stores/{ns}", delete(stores::drop_store))
         .route("/stores/{ns}/schema", get(stores::get_schema).patch(stores::amend_schema))
-        // ── Index management ──────────────────────────────────────────────────
+        // ── Index management (doc stores) ─────────────────────────────────────
         .route("/stores/{ns}/indices", get(indices::list_indices).post(indices::add_index))
         .route("/stores/{ns}/indices/vector", delete(indices::drop_vector_index))
         .route("/stores/{ns}/indices/{field}", delete(indices::drop_index))
-        // ── Document CRUD ─────────────────────────────────────────────────────
+        // ── Document CRUD (doc stores) ────────────────────────────────────────
         .route("/stores/{ns}/docs/{id}", get(docs::get_doc).put(docs::put_doc).delete(docs::delete_doc))
         .route("/stores/{ns}/docs", get(docs::range_query))
         .route("/stores/{ns}/docs/prefix", get(docs::prefix_scan))
         .route("/stores/{ns}/query", post(docs::index_query))
-        // ── Semantic search ───────────────────────────────────────────────────
+        // ── Semantic search (doc stores) ──────────────────────────────────────
         .route("/stores/{ns}/semantic-search", post(semantic_search::query))
         .route("/stores/{ns}/semantic-search/filtered", post(semantic_search::query_filtered))
-        // ── KV store lifecycle ────────────────────────────────────────────────
-        .route("/kv-stores", get(stores::list_kv).post(stores::create_kv))
-        .route("/kv-stores/{ns}", delete(stores::drop_kv_store))
-        .route("/kv-stores/{ns}/schema", get(stores::get_kv_schema))
-        // ── KV CRUD ───────────────────────────────────────────────────────────
-        .route("/kv-stores/{ns}/kv/{key}", get(kv::get_kv).put(kv::put_kv).delete(kv::delete_kv))
-        .route("/kv-stores/{ns}/kv", get(kv::range_kv))
-        .route("/kv-stores/{ns}/kv/prefix", get(kv::prefix_scan_kv))
-        // ── KV semantic search ────────────────────────────────────────────────
-        .route("/kv-stores/{ns}/semantic-search", post(kv::search_kv_semantic))
+        // ── KV CRUD (KV stores) ───────────────────────────────────────────────
+        .route("/stores/{ns}/kv/{key}", get(kv::get_kv).put(kv::put_kv).delete(kv::delete_kv))
+        .route("/stores/{ns}/kv", get(kv::range_kv))
+        .route("/stores/{ns}/kv/prefix", get(kv::prefix_scan_kv))
+        // ── KV semantic search (KV stores) ────────────────────────────────────
+        .route("/stores/{ns}/kv/semantic-search", post(kv::search_kv_semantic))
 }
