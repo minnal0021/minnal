@@ -149,7 +149,7 @@ For the full design — how field attributes are created, updated, stored, and r
 
 ### Layer 3 — semantic\_search (Vector Quantisation + ANN)
 
-Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find documents that mean something similar to this query" — by comparing embedding vectors rather than literal values. The `semantic_search` crate implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up from how the space is partitioned, through how documents are quantised at write time, to how a query is resolved.
+Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint). The `semantic_search` crate implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up from how the space is partitioned, through how values are quantised at write time, to how a query is resolved.
 
 #### IVF Clustering
 
@@ -684,7 +684,7 @@ curl -s -X POST http://localhost:8080/stores/profiles/query \
 ### Semantic Search
 
 Semantic search requires:
-- The store was created with `"semantic_search_enabled": true` and `"embedding_field"` set.
+- The store was created with `"semantic_search_enabled": true` — a doc store also needs `"embedding_fields"` set; a `value_type = str` KV store embeds the stored string directly.
 - A cluster centroids file is configured and loaded at startup (`[semantic_search] cluster_path = …`).
 - An embedding service is reachable at the configured URL.
 
