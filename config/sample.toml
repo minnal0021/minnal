@@ -194,12 +194,13 @@ cluster_path = "./clusters.json"
 # batch POST: body {"payloads": [str, ...], "dimensions": N} -> {"embeddings": [[f32], ...]}.
 # Chunking/tokenisation happens in minnal, not the service.
 # Default: http://localhost:8001
-embedding_service_url = "http://192.168.10.155:8001"
-#embedding_service_url = "http://192.168.1.182:8001"
+# embedding_service_url = "http://192.168.10.155:8001"
+embedding_service_url = "http://192.168.10.101:8001"
 
 # Embedding model to use.  Must match a name in [[semantic_search.supported_models]].
-# Default: qwen
+# Default: gemma
 # model = "qwen"
+model = "gemma"
 
 # Number of IVF clusters to probe during the sparse first-pass search (single-bit vectors).
 # Higher = better recall, slower queries.  Default: 128.
@@ -252,5 +253,5 @@ sliding_size = 2
 # ---------------------------------------------------------------------------
 
 [[semantic_search.supported_models]]
-name = "qwen"
+name = "gemma"
 dimension = 768
