@@ -195,7 +195,8 @@ cluster_path = "./clusters.json"
 # Chunking/tokenisation happens in minnal, not the service.
 # Default: http://localhost:8001
 # embedding_service_url = "http://192.168.10.155:8001"
-embedding_service_url = "http://192.168.10.101:8001"
+# embedding_service_url = "http://192.168.10.101:8001"
+embedding_service_url = "http://localhost:8001"
 
 # Embedding model to use.  Must match a name in [[semantic_search.supported_models]].
 # Default: gemma
