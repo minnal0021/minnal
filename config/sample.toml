@@ -255,3 +255,7 @@ sliding_size = 2
 [[semantic_search.supported_models]]
 name = "gemma"
 dimension = 768
+
+[[semantic_search.supported_models]]
+name = "qwen"
+dimension = 768
