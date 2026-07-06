@@ -4282,6 +4282,109 @@ mod tests {
         Ok(())
     }
 
+    // ── Scan latency benchmark (memtable / L1 / L0+L1) ──────────────────────
+    //
+    // A kept, deterministic micro-benchmark for the scan paths across LSM layer
+    // states. `#[ignore]`d so it never runs in normal `cargo test`; run it on demand:
+    //
+    //   cargo test -p minnal_db --lib scan_latency_benchmark -- --ignored --nocapture
+    //
+    // It lives here (not in `benches/`) on purpose: building an exact L0+L1 state is
+    // only possible through the crate-internal `LSMTree` flush methods — the public
+    // `Db` facade only flushes to SSTables via the background worker, so a criterion
+    // bench cannot construct these states deterministically. The full scans show
+    // throughput per layer; the *selective* scans show the L1 min/max skip +
+    // sparse-index seek (a bounded slice out of a large L1 should not read the whole
+    // file), which the memtable-resident timings never exercised.
+
+    /// Insert `k:{seq:06}` for `seq` in `0..total`, all left in the active memtable.
+    fn bench_state_memtable(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        for seq in 0..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        (temp, lsm)
+    }
+
+    /// Same keys, all compacted into L1 (memtable/RO drained).
+    fn bench_state_l1(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        for seq in 0..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_and_compact_all().unwrap();
+        lsm.purge_ro_memtables_for_test();
+        (temp, lsm)
+    }
+
+    /// Same keys spread across all three layers: ~80% in L1, ~15% in an uncompacted
+    /// L0 file, ~5% left in the memtable — the realistic "recently written over a
+    /// compacted base" shape a scan must merge.
+    fn bench_state_l0_l1(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        let l1_cut = total * 80 / 100;
+        let l0_cut = total * 95 / 100;
+        for seq in 0..l1_cut {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_and_compact_all().unwrap(); // → L1
+        for seq in l1_cut..l0_cut {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_memtable_to_level0().unwrap(); // → L0 (uncompacted)
+        lsm.purge_ro_memtables_for_test();
+        for seq in l0_cut..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap(); // → memtable
+        }
+        (temp, lsm)
+    }
+
+    #[test]
+    #[ignore]
+    fn scan_latency_benchmark() {
+        use std::time::Instant;
+        let total = 5_000u64;
+
+        // Warm up, run `iters`, report median-ish average µs/call. Asserts the result
+        // count so a broken scan can't silently post a fast time.
+        fn time_it(label: &str, iters: u32, mut f: impl FnMut() -> usize, expect: usize) {
+            for _ in 0..5 {
+                assert_eq!(f(), expect);
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                assert_eq!(f(), expect);
+            }
+            let per = t.elapsed().as_nanos() as f64 / iters as f64 / 1e3;
+            eprintln!("    {label:34} {expect:>5} results  {per:>9.2} µs/call");
+        }
+
+        // A 50-key slice in the middle of the keyspace, for the selective scans.
+        let mid = total / 2;
+        let sel_start = format!("k:{mid:06}").into_bytes();
+        let sel_end = format!("k:{:06}", mid + 50).into_bytes();
+        let sel_prefix = format!("k:{:04}", mid / 100).into_bytes(); // matches k:{mid/100}XX → 100 keys
+
+        eprintln!("\n=== scan latency: {total} keys, 128-bit values, per LSM layer state ===");
+        for (state, (_temp, lsm)) in [
+            ("memtable", bench_state_memtable(total)),
+            ("L1-only", bench_state_l1(total)),
+            ("L0+L1+mem", bench_state_l0_l1(total)),
+        ] {
+            eprintln!("  [{state}]");
+            let l = &lsm;
+            time_it("prefix(k:) full", 60, || l.scan_prefix(b"k:").unwrap().len(), total as usize);
+            time_it("range(k:..) full", 60, || l.range_pointers_bounded(b"k:", Some(b"k;"), usize::MAX).unwrap().len(), total as usize);
+            let (s, e) = (&sel_start, &sel_end);
+            time_it("range selective [50]", 500, || l.range_pointers_bounded(s, Some(e), usize::MAX).unwrap().len(), 50);
+            let p = &sel_prefix;
+            time_it("prefix selective [100]", 500, || l.scan_prefix(p).unwrap().len(), 100);
+        }
+    }
+
     // ── scan_prefixes tombstone regressions ───────────────────────
 
     #[test]
