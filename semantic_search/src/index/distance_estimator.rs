@@ -72,13 +72,42 @@ impl SingleBitQuanDotProductEstimator {
     }
 }
 
+impl MultiBitQuanDotProductEstimator {
+    /// Estimate `⟨x, q⟩` from a candidate's raw parts rather than a materialised
+    /// [`VectorIndex`].
+    ///
+    /// The search hot path reads these three fields straight out of the rkyv archive
+    /// (packed words copied into a reused buffer, the two scalars via `to_native`),
+    /// so it never allocates an owned `VectorIndex` per candidate. `estimate_distance`
+    /// is the same computation over an owned entry.
+    pub fn estimate_from_parts(&self, query_embedding: &[f32], packed_vector: &[u64], addition_factor: f32, scaling_factor: f32) -> f32 {
+        let dot_product = crate::simd::multi_bit_dot_best(packed_vector, query_embedding, query_embedding.len());
+        let query_addition_factor = dot_product + self.0.scaled_query_sum;
+        let estimated_distance = -self.0.query_to_centroid_dot_product + addition_factor + (scaling_factor * query_addition_factor);
+        1.0 - estimated_distance
+    }
+}
+
 impl DistanceEstimator for MultiBitQuanDotProductEstimator {
     fn estimate_distance(&self, query_embedding: &[f32], vector_index: &VectorIndex) -> f32 {
-        let dot_product = crate::simd::multi_bit_dot_best(&vector_index.packed_vector, query_embedding, query_embedding.len());
-        let query_addition_factor = dot_product + self.0.scaled_query_sum;
-        let estimated_distance =
-            -self.0.query_to_centroid_dot_product + vector_index.addition_factor + (vector_index.scaling_factor * query_addition_factor);
-        1.0 - estimated_distance
+        self.estimate_from_parts(
+            query_embedding,
+            &vector_index.packed_vector,
+            vector_index.addition_factor,
+            vector_index.scaling_factor,
+        )
+    }
+}
+
+impl SingleBitQuanDotProductEstimator {
+    /// Estimate `⟨x, q⟩` from a candidate's raw parts rather than a materialised
+    /// [`VectorIndex`] — the SingleBit formula needs only the packed bits and the
+    /// `scaling_factor`. See [`MultiBitQuanDotProductEstimator::estimate_from_parts`]
+    /// for why the hot path avoids materialising an owned entry.
+    pub fn estimate_from_parts(&self, query_embedding: &[f32], packed_vector: &[u64], scaling_factor: f32) -> f32 {
+        let ip = crate::simd::packed_ip_best(packed_vector, query_embedding, query_embedding.len());
+        let est_residual_ip = scaling_factor * (2.0 * ip - self.0.scaled_query_sum);
+        self.0.query_to_centroid_dot_product + est_residual_ip
     }
 }
 
@@ -92,10 +121,7 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
     /// Dispatches to the best available SIMD backend (AVX-512F → AVX2 → NEON → scalar)
     /// via `crate::simd::packed_ip_best`.
     fn estimate_distance(&self, query_embedding: &[f32], vector_index: &VectorIndex) -> f32 {
-        let dim = query_embedding.len();
-        let ip = crate::simd::packed_ip_best(&vector_index.packed_vector, query_embedding, dim);
-        let est_residual_ip = vector_index.scaling_factor * (2.0 * ip - self.0.scaled_query_sum);
-        self.0.query_to_centroid_dot_product + est_residual_ip
+        self.estimate_from_parts(query_embedding, &vector_index.packed_vector, vector_index.scaling_factor)
     }
 }
 

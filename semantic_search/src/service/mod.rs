@@ -23,8 +23,8 @@ use crate::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::quantisation::rabitq;
 use std::collections::HashMap;
 
-/// `(cluster_id, [(doc_id_bytes, raw_rkyv_bytes)])` pairs assembled for a
-/// parallel scoring pass.
+/// `(cluster_id, [(doc_id_bytes, raw_rkyv_bytes)])` pairs — the fetched sparse entries
+/// moved into a flat list so the parallel MaxSim fold splits evenly over them.
 type ClusterEntryList = Vec<(u32, Vec<(Vec<u8>, Vec<u8>)>)>;
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
@@ -358,11 +358,6 @@ where
     //   S(q, d) = Σ_i  max_j ⟨q_i, d_j⟩
     // where `i` ranges over query tokens and `j` over document chunks seen so far.
     // Query tokens for which no chunk of `d` falls in a probed cluster contribute 0.
-    let cluster_scan_pairs: ClusterEntryList = probe_clusters
-        .iter()
-        .filter_map(|&id| sparse_by_cluster.get(&id).map(|entries| (id, entries.clone())))
-        .collect();
-
     let n_query = query_sparse_embeddings.len();
 
     // Fold state: doc_id → Vec<f32> where Vec[i] = running max of ⟨q_i, d_j⟩ over all
@@ -370,10 +365,18 @@ where
     // an observed-but-negative max is kept (true ColBERT MaxSim, no clipping to 0). A
     // token never matched against any probed chunk stays NEG_INFINITY and is converted to
     // 0 only at the final sum below — absence is neutral, anti-correlation is not.
+    //
+    // We consume `sparse_by_cluster` by value (into_par_iter) rather than cloning every
+    // cluster's entries into a separate list, and move each `doc_id` straight into the
+    // map key. Scoring reads each entry zero-copy from its rkyv archive (packed words
+    // copied into a per-cluster reused buffer), avoiding a per-entry owned `VectorIndex`.
+    // Move (don't clone) the fetched entries into a Vec so the parallel fold splits over
+    // a flat slice — rayon load-balances a Vec far better than a HashMap's bucket table.
+    let cluster_scan_pairs: ClusterEntryList = sparse_by_cluster.into_iter().collect();
     let maxsim_state: HashMap<Vec<u8>, Vec<f32>> = cluster_scan_pairs
-        .par_iter()
+        .into_par_iter()
         .fold(HashMap::new, |mut map, (cluster_id, entries)| {
-            let Some(cluster) = cluster_index.clusters.get(cluster_id) else {
+            let Some(cluster) = cluster_index.clusters.get(&cluster_id) else {
                 return map;
             };
             // Pre-compute one estimator per query token for this cluster.
@@ -381,14 +384,18 @@ where
             // document entries in the same cluster, so we compute them only once here.
             let estimators: Vec<SingleBitQuanDotProductEstimator> = query_sparse_embeddings
                 .iter()
-                .map(|q| SingleBitQuanDotProductEstimator::new(*cluster_id, q, &cluster.centroid))
+                .map(|q| SingleBitQuanDotProductEstimator::new(cluster_id, q, &cluster.centroid))
                 .collect();
 
+            // Reused across this cluster's chunks: copy_packed_into clears then refills it,
+            // so scoring never allocates per chunk.
+            let mut words_buf: Vec<u64> = Vec::new();
+
             for (doc_id, raw_bytes) in entries {
-                if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) {
+                if doc_filter.as_ref().is_some_and(|f| !f(&doc_id)) {
                     continue;
                 }
-                let vi_list = match VectorIndex::list_from_bytes(raw_bytes) {
+                let vi_list = match VectorIndex::access_list(&raw_bytes) {
                     Ok(list) => list,
                     Err(e) => {
                         // Corrupt sparse entry: skip it, but make it visible so a degraded
@@ -396,7 +403,7 @@ where
                         crate::metrics::record_sparse_corrupt_skipped(namespace);
                         warn!(
                             "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
-                            doc_id_hex(doc_id),
+                            doc_id_hex(&doc_id),
                             raw_bytes.len(),
                         );
                         continue;
@@ -409,27 +416,27 @@ where
                 // any other) entry here would be scored with the single-bit estimator
                 // over the wrong packed layout, yielding garbage. Reject the blob
                 // instead — a wrong style is a write-path bug or corruption, not data.
-                if let Some(bad) = vi_list.iter().find(|vi| vi.quantisation_style != QuantisationStyle::SingleBit) {
+                if let Some(bad) = vi_list.iter().map(|vi| vi.style()).find(|s| *s != QuantisationStyle::SingleBit) {
                     warn!(
-                        "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected SingleBit, found {:?}",
-                        doc_id_hex(doc_id),
-                        bad.quantisation_style,
+                        "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected SingleBit, found {bad:?}",
+                        doc_id_hex(&doc_id),
                     );
                     continue;
                 }
 
-                let per_query_maxes = map.entry(doc_id.clone()).or_insert_with(|| vec![f32::NEG_INFINITY; n_query]);
+                let per_query_maxes = map.entry(doc_id).or_insert_with(|| vec![f32::NEG_INFINITY; n_query]);
 
-                for (q_idx, (q, estimator)) in query_sparse_embeddings.iter().zip(estimators.iter()).enumerate() {
-                    // max_j ⟨q_i, d_j⟩ over all chunks of this document in the current cluster.
-                    let best_chunk_score: f32 = vi_list
-                        .iter()
-                        .map(|vi| vi.estimated_distance(q, estimator))
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    // Keep the global max across clusters — the same document may have
-                    // chunks in several probed clusters for the same query token.
-                    if best_chunk_score > per_query_maxes[q_idx] {
-                        per_query_maxes[q_idx] = best_chunk_score;
+                // Per chunk: copy its packed words once, then update every query token's
+                // running max — same result as max_j ⟨q_i, d_j⟩ per token, but the packed
+                // buffer is filled once per chunk instead of once per (token, chunk).
+                for vi in vi_list.iter() {
+                    vi.copy_packed_into(&mut words_buf);
+                    let scaling_factor = vi.scaling_factor();
+                    for (q_idx, (q, estimator)) in query_sparse_embeddings.iter().zip(estimators.iter()).enumerate() {
+                        let score = estimator.estimate_from_parts(q, &words_buf, scaling_factor);
+                        if score > per_query_maxes[q_idx] {
+                            per_query_maxes[q_idx] = score;
+                        }
                     }
                 }
             }
@@ -485,59 +492,74 @@ where
 
     // Each VectorIndex carries its own cluster_id for centroid lookup, so we
     // score each document directly against the single whole-query embedding.
+    //
+    // Entries are read zero-copy from their rkyv archive (packed words copied into a
+    // reused buffer). The dense estimator's per-cluster scalar (query·centroid) is
+    // constant for every candidate in the same cluster, so it is cached per cluster in
+    // the per-worker `est_cache` — with ~1000 candidates over ~n_probes clusters this
+    // builds ~n_probes estimators instead of one per candidate. Both pieces of reused
+    // state are per rayon worker via `map_init`; doc_ids are moved (not cloned) into the
+    // heap entries.
     let scored: Vec<HeapEntry> = dense_doc_ids
-        .par_iter()
-        .zip(dense_raw.par_iter())
-        .filter_map(|(doc_id, opt_bytes)| {
-            let raw_bytes = opt_bytes.as_ref()?;
-            let list = match VectorIndex::list_from_bytes(raw_bytes) {
-                Ok(list) => list,
-                Err(e) => {
-                    // Corrupt dense entry: skip it, but log it so index corruption is
-                    // not mistaken for a candidate simply scoring poorly in pass 2.
-                    crate::metrics::record_dense_corrupt_skipped(namespace);
+        .into_par_iter()
+        .zip(dense_raw.into_par_iter())
+        .map_init(
+            || (HashMap::<u32, MultiBitQuanDotProductEstimator>::new(), Vec::<u64>::new()),
+            |(est_cache, words_buf), (doc_id, opt_bytes)| {
+                let raw_bytes = opt_bytes?;
+                let list = match VectorIndex::access_list(&raw_bytes) {
+                    Ok(list) => list,
+                    Err(e) => {
+                        // Corrupt dense entry: skip it, but log it so index corruption is
+                        // not mistaken for a candidate simply scoring poorly in pass 2.
+                        crate::metrics::record_dense_corrupt_skipped(namespace);
+                        warn!(
+                            "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
+                            doc_id_hex(&doc_id),
+                            raw_bytes.len(),
+                        );
+                        return None;
+                    }
+                };
+                // The dense namespace stores exactly one MultiBit entry per document
+                // (embed_document emits a single whole-doc dense vector; upsert only
+                // writes a dense value when at least one MultiBit entry is present). A
+                // count other than 1 means a write-path bug, a duplicate, or corruption —
+                // skip rather than silently scoring an arbitrary `first()` and letting a
+                // stale entry shadow the correct one.
+                if list.len() != 1 {
                     warn!(
-                        "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
-                        doc_id_hex(doc_id),
-                        raw_bytes.len(),
+                        "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
+                        list.len(),
+                        doc_id_hex(&doc_id),
                     );
                     return None;
                 }
-            };
-            // The dense namespace stores exactly one MultiBit entry per document
-            // (embed_document emits a single whole-doc dense vector; upsert only
-            // writes a dense value when at least one MultiBit entry is present). A
-            // count other than 1 means a write-path bug, a duplicate, or corruption —
-            // skip rather than silently scoring an arbitrary `first()` and letting a
-            // stale entry shadow the correct one.
-            if list.len() != 1 {
-                warn!(
-                    "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
-                    list.len(),
-                    doc_id_hex(doc_id),
-                );
-                return None;
-            }
-            let vi = &list[0];
-            if vi.quantisation_style != expected_dense_style {
-                warn!(
-                    "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {:?}",
-                    doc_id_hex(doc_id),
-                    vi.quantisation_style,
-                );
-                return None;
-            }
-            let cluster = cluster_index.clusters.get(&vi.cluster_id)?;
+                let vi = &list[0];
+                let style = vi.style();
+                if style != expected_dense_style {
+                    warn!(
+                        "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
+                        doc_id_hex(&doc_id),
+                    );
+                    return None;
+                }
+                let cluster_id = vi.cluster_id();
+                let cluster = cluster_index.clusters.get(&cluster_id)?;
 
-            let estimator =
-                MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.cluster_id, query_dense_embedding, &cluster.centroid, scaled_query_sum);
-            let dot_product = vi.estimated_distance(query_dense_embedding, &estimator);
-            Some(HeapEntry {
-                dot_product,
-                error_bound: vi.error_bound,
-                document_id: doc_id.clone(),
-            })
-        })
+                let estimator = est_cache.entry(cluster_id).or_insert_with(|| {
+                    MultiBitQuanDotProductEstimator::with_scaled_query_sum(cluster_id, query_dense_embedding, &cluster.centroid, scaled_query_sum)
+                });
+                vi.copy_packed_into(words_buf);
+                let dot_product = estimator.estimate_from_parts(query_dense_embedding, words_buf, vi.addition_factor(), vi.scaling_factor());
+                Some(HeapEntry {
+                    dot_product,
+                    error_bound: vi.error_bound(),
+                    document_id: doc_id,
+                })
+            },
+        )
+        .flatten()
         .collect();
 
     // Build top-k from dense scored results.

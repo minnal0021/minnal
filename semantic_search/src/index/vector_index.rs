@@ -1,5 +1,6 @@
 use crate::index::distance_estimator::DistanceEstimator;
 use rkyv::rancor::Error as RkyvError;
+use rkyv::vec::ArchivedVec;
 use serde::{Deserialize, Serialize};
 
 /// Map from cluster ID to `(doc_id_bytes, raw_rkyv_bytes)` pairs.
@@ -196,6 +197,64 @@ impl VectorIndex {
     pub fn list_from_bytes(bytes: &[u8]) -> Result<Vec<Self>, RkyvError> {
         rkyv::from_bytes::<Vec<Self>, RkyvError>(bytes)
     }
+
+    /// Validated **zero-copy** access to a stored `VectorIndex` list.
+    ///
+    /// Unlike [`list_from_bytes`](Self::list_from_bytes), this validates the archive
+    /// (so corrupt bytes still return `Err` rather than causing UB) but does **not**
+    /// deserialize into an owned `Vec<VectorIndex>` — it returns a view into `bytes`. The
+    /// search scoring path uses this to avoid a per-candidate heap allocation: it reads
+    /// each entry's scalars via the [`ArchivedVectorIndex`] accessors and copies the
+    /// packed words into a reused buffer with
+    /// [`copy_packed_into`](ArchivedVectorIndex::copy_packed_into).
+    ///
+    /// The archived `u64` words are stored packed (1-byte aligned), so they cannot be
+    /// reinterpreted as a native `&[u64]` slice without a copy — hence the buffer.
+    pub fn access_list(bytes: &[u8]) -> Result<&ArchivedVec<ArchivedVectorIndex>, RkyvError> {
+        rkyv::access::<ArchivedVec<ArchivedVectorIndex>, RkyvError>(bytes)
+    }
+}
+
+impl ArchivedVectorIndex {
+    /// The cluster this entry was quantised against (native value).
+    pub fn cluster_id(&self) -> u32 {
+        self.cluster_id.to_native()
+    }
+
+    /// The quantisation style, converted to the owned enum (no allocation).
+    pub fn style(&self) -> QuantisationStyle {
+        match self.quantisation_style {
+            ArchivedQuantisationStyle::SingleBit => QuantisationStyle::SingleBit,
+            ArchivedQuantisationStyle::MultiBit { number_of_bits } => QuantisationStyle::MultiBit {
+                number_of_bits: number_of_bits.to_native() as usize,
+            },
+        }
+    }
+
+    /// RaBitQ addition-factor scalar (native value).
+    pub fn addition_factor(&self) -> f32 {
+        self.addition_factor.to_native()
+    }
+
+    /// RaBitQ scaling-factor scalar (native value).
+    pub fn scaling_factor(&self) -> f32 {
+        self.scaling_factor.to_native()
+    }
+
+    /// Per-document error bound (native value).
+    pub fn error_bound(&self) -> f32 {
+        self.error_bound.to_native()
+    }
+
+    /// Copy the packed quantised words into `buf` (cleared first) as native `u64`.
+    ///
+    /// The archived words are 1-byte-aligned little-endian, so scoring needs them
+    /// widened into an aligned native slice; reusing one `buf` across a cluster's
+    /// entries keeps this to a memcpy per entry with no per-entry heap allocation.
+    pub fn copy_packed_into(&self, buf: &mut Vec<u64>) {
+        buf.clear();
+        buf.extend(self.packed_vector.iter().map(|w| w.to_native()));
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +396,94 @@ mod tests {
             query_to_centroid_dot_product: 0.0,
             scaled_query_sum: 0.0,
         })
+    }
+
+    // ── Zero-copy archived access matches owned deserialize ───────────────────
+
+    /// The archived accessors (`access_list` + `ArchivedVectorIndex::*`) must read back
+    /// exactly what `list_from_bytes` deserializes — same scalars, same packed words,
+    /// same style. This underpins the search hot path scoring over archived bytes.
+    #[test]
+    fn access_list_matches_list_from_bytes() {
+        let list = vec![
+            VectorIndex::new(5, QuantisationStyle::SingleBit, 0.0, 0.031, 0.038, pack_bits(&[1u8, 0, 1, 1, 0, 0, 1, 0])),
+            VectorIndex::new(
+                9,
+                QuantisationStyle::MultiBit { number_of_bits: 8 },
+                0.99,
+                -0.0006,
+                0.0003,
+                pack_bytes(&[10u8, 200, 30, 40]),
+            ),
+        ];
+        let bytes = VectorIndex::list_to_bytes(&list);
+
+        let owned = VectorIndex::list_from_bytes(&bytes).unwrap();
+        let archived = VectorIndex::access_list(&bytes).unwrap();
+        assert_eq!(archived.len(), owned.len());
+
+        let mut buf = Vec::new();
+        for (o, a) in owned.iter().zip(archived.iter()) {
+            assert_eq!(a.cluster_id(), o.cluster_id);
+            assert_eq!(a.style(), o.quantisation_style);
+            assert_eq!(a.addition_factor(), o.addition_factor);
+            assert_eq!(a.scaling_factor(), o.scaling_factor);
+            assert_eq!(a.error_bound(), o.error_bound);
+            a.copy_packed_into(&mut buf);
+            assert_eq!(buf, o.packed_vector, "packed words must widen back to the native slice");
+        }
+    }
+
+    /// Scoring a real (non-empty packed) entry through the archived path
+    /// (`copy_packed_into` + `estimate_from_parts`) must be bit-identical to scoring the
+    /// owned entry through `estimate_distance`, for both quantisation styles.
+    #[test]
+    fn archived_scoring_matches_owned_scoring() {
+        use crate::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
+
+        let mut state = 0x51ce_9a7e_1234_5678_u64;
+        let mut next = || -> f32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as i64 as f32) / (i64::MAX as f32)
+        };
+        let dim = 768;
+        let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let centroid: Vec<f32> = (0..dim).map(|_| next()).collect();
+
+        // SingleBit
+        let sb_bits: Vec<u8> = (0..dim).map(|_| if next() >= 0.0 { 1 } else { 0 }).collect();
+        let sb = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.0, 0.031, 0.02, pack_bits(&sb_bits));
+        let sb_bytes = VectorIndex::list_to_bytes(std::slice::from_ref(&sb));
+        let sb_est = SingleBitQuanDotProductEstimator::new(1, &query, &centroid);
+        let mut buf = Vec::new();
+        VectorIndex::access_list(&sb_bytes).unwrap()[0].copy_packed_into(&mut buf);
+        let archived_sb = sb_est.estimate_from_parts(&query, &buf, sb.scaling_factor);
+        let owned_sb = sb.estimated_distance(&query, &sb_est);
+        assert_eq!(archived_sb, owned_sb, "SingleBit archived vs owned scoring must match exactly");
+
+        // MultiBit
+        let mb_codes: Vec<u8> = (0..dim).map(|_| (next().abs() * 255.0) as u8).collect();
+        let mb = VectorIndex::new(
+            2,
+            QuantisationStyle::MultiBit { number_of_bits: 8 },
+            0.99,
+            -0.0006,
+            0.0003,
+            pack_bytes(&mb_codes),
+        );
+        let mb_bytes = VectorIndex::list_to_bytes(std::slice::from_ref(&mb));
+        let mb_est = MultiBitQuanDotProductEstimator::new(2, &query, &centroid, 8);
+        VectorIndex::access_list(&mb_bytes).unwrap()[0].copy_packed_into(&mut buf);
+        let archived_mb = mb_est.estimate_from_parts(&query, &buf, mb.addition_factor, mb.scaling_factor);
+        let owned_mb = mb.estimated_distance(&query, &mb_est);
+        assert_eq!(archived_mb, owned_mb, "MultiBit archived vs owned scoring must match exactly");
+    }
+
+    #[test]
+    fn access_list_rejects_corrupt_bytes() {
+        assert!(VectorIndex::access_list(b"not valid rkyv bytes at all").is_err());
     }
 
     #[test]
