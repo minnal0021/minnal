@@ -363,6 +363,24 @@ impl Drop for L0ReadGuard {
     }
 }
 
+/// The smallest key strictly greater than every key that has `prefix` as a
+/// prefix, so a prefix scan over `P` equals a range scan over `[P, upper)`.
+///
+/// Increments the last byte that is not `0xFF` and drops the all-`0xFF` tail.
+/// Returns `None` when `prefix` is empty or all `0xFF` — there is no finite upper
+/// bound, so the caller scans to the end of the keyspace.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(upper);
+        }
+        upper.pop();
+    }
+    None
+}
+
 /// Whether `a` is a strictly-newer write sequence than `b`, using the same
 /// wraparound-aware serial-number comparison as the memtable
 /// (`SkipList::seq_is_newer_or_equal`). Resolution across layers picks the entry
@@ -1840,11 +1858,20 @@ impl LSMTree {
         // SSTables (oldest layers), buckets scanned in parallel. Each bucket
         // captures L0 before L1 internally and returns entries ordered L1 (oldest)
         // → L0 (oldest→newest) with tombstones carried as `None`.
+        //
+        // Only buckets that could hold a matching key spawn a worker: one whose L1
+        // does not overlap `[prefix, upper)` *and* has no non-obsolete L0 file has
+        // nothing to contribute. A key that races into such a bucket after this
+        // check (memtable→L0 flush, or L0→L1 merge) was already in the memtable
+        // snapshot captured above, so skipping the spawn cannot drop it.
+        let upper_owned = prefix_upper_bound(prefix);
+        let upper = upper_owned.as_deref();
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = (0u32..self.config.num_buckets as u32)
-                    .map(|bucket| s.spawn(move || self.scan_prefix_in_bucket(bucket, prefix)))
+                    .filter(|&bucket| self.bucket_has_nonobsolete_l0(bucket as usize) || self.l1_overlaps(bucket as usize, prefix, upper))
+                    .map(|bucket| s.spawn(move || self.scan_prefix_in_bucket(bucket, prefix, upper)))
                     .collect();
                 for handle in handles {
                     match handle
@@ -1887,6 +1914,80 @@ impl LSMTree {
         Ok(all_entries.into_iter().filter_map(|(key, val)| val.map(|(v, s)| (key, v, s))).collect())
     }
 
+    /// Whether this bucket's L1 file holds any key in `[start, end)`, decided from
+    /// the in-memory min/max metadata alone (no file I/O). A `false` provably means
+    /// the L1 file has no matching key, so a scan can skip reading it entirely; an
+    /// empty/absent L1 (no metadata, or `entry_count == 0`) is also `false`.
+    ///
+    /// Safe under concurrent compaction *provided the caller has already captured
+    /// this bucket's L0 read guards*: a merge marks the old L0 files obsolete only
+    /// after installing the new L1 file and updating this metadata (see
+    /// `merge_level0_to_level1`). So whatever version of the metadata a scan reads,
+    /// any key it would cause the scan to skip is either already reflected here or
+    /// still present in a captured (not-yet-obsolete) L0 file — never invisible.
+    fn l1_overlaps(&self, bucket: usize, start: &[u8], end: Option<&[u8]>) -> bool {
+        let metadata = self.sstable_metadata[bucket].read();
+        match metadata.first() {
+            Some(meta) if meta.entry_count > 0 => meta.max_key.as_slice() >= start && end.is_none_or(|e| meta.min_key.as_slice() < e),
+            _ => false,
+        }
+    }
+
+    /// Whether this bucket has any non-obsolete Level-0 file. Used only to decide
+    /// whether a scan needs to spawn a worker for the bucket at all.
+    fn bucket_has_nonobsolete_l0(&self, bucket: usize) -> bool {
+        self.level0_files[bucket].read().iter().any(|e| !e.is_obsolete())
+    }
+
+    /// Read this bucket's L1 file for keys in `[start, end)`, appending each as a
+    /// [`ScanEntry`] (tombstone carried as `None`). Entries are key-sorted, so the
+    /// scan seeks near `start` via the sparse index and stops as soon as it reaches
+    /// `end`.
+    ///
+    /// The sparse-index offset is validated against the file with `valid_scan_start`
+    /// (a concurrent compaction can swap the file under the in-memory index): a
+    /// stale hint just falls back to a full scan from 0, so it is a performance
+    /// hint, never a correctness input.
+    fn scan_l1_range_into(&self, bucket: usize, file: &File, start: &[u8], end: Option<&[u8]>, out: &mut Vec<ScanEntry>) -> Result<()> {
+        let start_offset = {
+            let index = self.sstable_indexes[bucket].read();
+            index.as_ref().map(|i| i.block_start(start)).unwrap_or(0)
+        };
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut offset = if start_offset != 0 && Self::valid_scan_start(file, start_offset, file_len, start) {
+            start_offset
+        } else {
+            0
+        };
+
+        let mut entry_bytes = Vec::new();
+        loop {
+            let mut size_buf = [0u8; 4];
+            if !Self::read_exact_at(file, &mut size_buf, &mut offset)? {
+                break;
+            }
+            let size = u32::from_le_bytes(size_buf) as usize;
+            entry_bytes.resize(size, 0);
+            Self::read_exact_at(file, &mut entry_bytes[..size], &mut offset)?;
+            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+            let key = archived.key.as_slice();
+            // Sorted order: once we reach `end`, no later key can match.
+            if end.is_some_and(|e| key >= e) {
+                break;
+            }
+            // The seeked block may begin below `start`; skip those pre-window keys.
+            if key >= start {
+                let val = if archived.tombstone {
+                    None
+                } else {
+                    Some((archived.value.to_native(), archived.seq.to_native()))
+                };
+                out.push((key.to_vec(), val));
+            }
+        }
+        Ok(())
+    }
+
     /// Scan prefix within a specific SSTable bucket using key_prefix for efficiency.
     ///
     /// Returns matching entries as `(key, Option<pointer>)` ordered **L1 (oldest)
@@ -1897,7 +1998,12 @@ impl LSMTree {
     /// the old implementation did) resurrected deleted keys and could surface a
     /// stale L1 value over an updated L0 one, because L0 holds entries — including
     /// tombstones — not yet compacted into L1.
-    fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8]) -> Result<Vec<ScanEntry>> {
+    ///
+    /// `upper` is the prefix's upper bound (`prefix_upper_bound(prefix)`): the L1
+    /// read skips a non-overlapping file via min/max and seeks via the sparse index
+    /// over `[prefix, upper)`. L0 files carry no min/max or index, so they are still
+    /// scanned in full with a prefix match.
+    fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8], upper: Option<&[u8]>) -> Result<Vec<ScanEntry>> {
         let mut results = Vec::new();
         let mut entry_bytes = Vec::new();
 
@@ -1928,31 +2034,15 @@ impl LSMTree {
                 .collect()
         };
         l0_guards.sort_by(|a, b| a.entry.created_at_ms.cmp(&b.entry.created_at_ms));
-        let level1_file = self.sstable_files[bucket as usize].read().clone();
 
-        // Search the Level 1 file (oldest layer) first.
-        let mut offset = 0u64;
-        loop {
-            let mut size_buf = [0u8; 4];
-            if !Self::read_exact_at(&level1_file, &mut size_buf, &mut offset)? {
-                break;
-            }
-
-            let size = u32::from_le_bytes(size_buf) as usize;
-            entry_bytes.resize(size, 0);
-            Self::read_exact_at(&level1_file, &mut entry_bytes[..size], &mut offset)?;
-
-            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-
-            let key_slice = archived.key.as_slice();
-            if matches_prefix(archived, key_slice) {
-                let val = if archived.tombstone {
-                    None
-                } else {
-                    Some((archived.value.to_native(), archived.seq.to_native()))
-                };
-                results.push((key_slice.to_vec(), val));
-            }
+        // Search the Level 1 file (oldest layer) first — but only if its min/max
+        // says it overlaps `[prefix, upper)`, and then seeking near `prefix` via the
+        // sparse index rather than reading from offset 0. The L0 guards are captured
+        // above, before this metadata read, so the skip is race-safe (see
+        // `l1_overlaps`). `[prefix, upper)` is exactly the keys starting with `prefix`.
+        if self.l1_overlaps(bucket as usize, prefix, upper) {
+            let level1_file = self.sstable_files[bucket as usize].read().clone();
+            self.scan_l1_range_into(bucket as usize, &level1_file, prefix, upper, &mut results)?;
         }
 
         // Then the captured Level 0 files oldest-first.
@@ -2818,50 +2908,24 @@ impl LSMTree {
         // SSTable handles captured newest-first (L0 before L1); read in merge order.
         let (l0_guards, l1_files) = self.capture_sstable_layers();
 
-        // 1. L1 SSTables (oldest layer) — all buckets read in parallel. Keys are
-        //    hash-sharded so bucket key-sets are disjoint; no cross-bucket tombstone
-        //    interactions exist.
+        // 1. L1 SSTables (oldest layer) — read in parallel, but only for buckets
+        //    whose min/max overlaps `[start, end)`; a non-overlapping (or empty) L1
+        //    contributes nothing and spawns no worker. Each worker seeks near `start`
+        //    via the sparse index and stops at `end` instead of reading the whole
+        //    file. The L0 guards are captured (above) before these metadata reads,
+        //    so the skip is race-safe (see `l1_overlaps`). Keys are hash-sharded so
+        //    bucket key-sets are disjoint; no cross-bucket tombstone interactions.
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = l1_files
                     .iter()
-                    .map(|file| {
-                        s.spawn(|| -> Result<Vec<ScanEntry>> {
-                            let file_size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                            if file_size == 0 {
-                                return Ok(Vec::new());
-                            }
-                            let mut file_buf = vec![0u8; file_size];
-                            let mut total_read = 0usize;
-                            while total_read < file_size {
-                                match file.read_at(&mut file_buf[total_read..], total_read as u64) {
-                                    Ok(0) => break,
-                                    Ok(n) => total_read += n,
-                                    Err(e) => return Err(LSMError::Io(e)),
-                                }
-                            }
-                            let file_content = &file_buf[..total_read];
+                    .enumerate()
+                    .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, end))
+                    .map(|(bucket, file)| {
+                        s.spawn(move || -> Result<Vec<ScanEntry>> {
                             let mut entries = Vec::new();
-                            let mut pos = 0usize;
-                            while pos + 4 <= file_content.len() {
-                                let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
-                                pos += 4;
-                                if pos + size > file_content.len() {
-                                    break;
-                                }
-                                let entry_slice = &file_content[pos..pos + size];
-                                pos += size;
-                                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(entry_slice)?) };
-                                if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                                    let val = if archived.tombstone {
-                                        None
-                                    } else {
-                                        Some((archived.value.to_native(), archived.seq.to_native()))
-                                    };
-                                    entries.push((archived.key.as_slice().to_vec(), val));
-                                }
-                            }
+                            self.scan_l1_range_into(bucket, file, start, end, &mut entries)?;
                             Ok(entries)
                         })
                     })
@@ -2890,12 +2954,15 @@ impl LSMTree {
         }
 
         // 2. L0 SSTables (newer than L1) — captured guards, oldest-first per bucket
-        //    so newer L0 entries shadow older ones. All buckets in parallel.
+        //    so newer L0 entries shadow older ones. Only buckets that actually hold
+        //    a captured L0 file spawn a worker (L0 has no min/max or sparse index, so
+        //    its files are still scanned in full and range-filtered).
         {
             let l0_ref = &l0_guards;
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = (0..self.config.num_buckets)
+                    .filter(|bucket| !l0_ref[*bucket].is_empty())
                     .map(|bucket| {
                         s.spawn(move || -> Result<Vec<ScanEntry>> {
                             let mut bucket_entries = Vec::new();
@@ -3976,6 +4043,117 @@ mod tests {
 
         let map: std::collections::HashMap<Vec<u8>, u128> = lsm.scan_prefix(b"p:")?.into_iter().map(|(k, v, _)| (k, v)).collect();
         assert_eq!(map.get(b"p:1".as_slice()), Some(&999), "re-inserted L0 value must win over L1 tombstone");
+        Ok(())
+    }
+
+    // ── min/max skip + sparse-index seek over real L1 SSTables ──────────────
+
+    #[test]
+    fn prefix_upper_bound_cases() {
+        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_upper_bound(b"a"), Some(b"b".to_vec()));
+        // A trailing 0xFF is dropped and the previous byte incremented.
+        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(b"ab\xff\xff"), Some(b"ac".to_vec()));
+        // No finite upper bound.
+        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
+        assert_eq!(prefix_upper_bound(b""), None);
+    }
+
+    /// Sort scan output to `(key, pointer)` for order-insensitive comparison.
+    fn kv_sorted(v: Vec<(Vec<u8>, u128, u32)>) -> Vec<(Vec<u8>, u128)> {
+        let mut r: Vec<(Vec<u8>, u128)> = v.into_iter().map(|(k, val, _)| (k, val)).collect();
+        r.sort();
+        r
+    }
+
+    #[test]
+    fn scan_over_l1_matches_reference_with_seek_and_skip() -> Result<()> {
+        // 1000 keys, all compacted into L1 (well past SAMPLE_INTERVAL per bucket, so
+        // the sparse index has multiple samples and block_start is exercised).
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let n = 1000u64;
+        for seq in 0..n {
+            lsm.insert(format!("key:{seq:06}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test(); // data lives only in L1 now
+
+        // Full prefix → every key, values intact.
+        let all = kv_sorted(lsm.scan_prefix(b"key:")?);
+        assert_eq!(all.len(), n as usize);
+        for (seq, (k, v)) in all.iter().enumerate() {
+            assert_eq!((k.clone(), *v), (format!("key:{seq:06}").into_bytes(), seq as u128));
+        }
+
+        // Middle range → sparse-index seek near start + early stop at end.
+        let mid = kv_sorted(lsm.range_pointers_bounded(b"key:000100", Some(b"key:000200"), usize::MAX)?);
+        assert_eq!(mid.len(), 100);
+        assert_eq!(mid.first().unwrap().1, 100);
+        assert_eq!(mid.last().unwrap().1, 199);
+
+        // Sub-prefix selecting a middle slice (key:000100..000199).
+        assert_eq!(kv_sorted(lsm.scan_prefix(b"key:0001")?).len(), 100);
+
+        // Ranges/prefixes that fall entirely outside [min,max] → min/max skip → empty.
+        assert!(lsm.range_pointers_bounded(b"aaa", Some(b"aab"), usize::MAX)?.is_empty());
+        assert!(lsm.range_pointers_bounded(b"zzz", None, usize::MAX)?.is_empty());
+        assert!(lsm.scan_prefix(b"nomatch:")?.is_empty());
+
+        // A bounded page still honours `limit` after the seek.
+        assert_eq!(lsm.range_pointers_bounded(b"key:", Some(b"key;"), 10)?.len(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_over_l1_suppresses_tombstone() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        for seq in 0..200u64 {
+            lsm.insert(format!("k:{seq:04}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.delete(b"k:0100")?;
+        lsm.flush_and_compact_all()?; // tombstone merged into L1
+        lsm.purge_ro_memtables_for_test();
+
+        let keys: Vec<Vec<u8>> = lsm
+            .range_pointers_bounded(b"k:0050", Some(b"k:0150"), usize::MAX)?
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        assert!(!keys.contains(&b"k:0100".to_vec()), "deleted key must be excluded after min/max seek");
+        assert_eq!(keys.len(), 99, "50..149 minus the one deleted key");
+        Ok(())
+    }
+
+    #[test]
+    fn scan_across_l0_and_l1_after_partial_flush() -> Result<()> {
+        // Some keys in L1, a newer overlapping batch in L0 (no min/max there): the
+        // scan must still merge both. Exercises the "L1 skipped/seeked, L0 always
+        // scanned" split.
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        for seq in 0..100u64 {
+            lsm.insert(format!("m:{seq:04}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?; // → L1
+        // Overwrite a slice with new values, land them in L0 only.
+        for seq in 40..60u64 {
+            lsm.insert(format!("m:{seq:04}").as_bytes(), 1000 + seq as u128)?;
+        }
+        lsm.flush_memtable_to_level0()?; // → L0
+        lsm.purge_ro_memtables_for_test();
+
+        let map: std::collections::HashMap<Vec<u8>, u128> = lsm
+            .range_pointers_bounded(b"m:", Some(b"m;"), usize::MAX)?
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect();
+        assert_eq!(map.len(), 100);
+        assert_eq!(map[b"m:0005".as_slice()], 5, "untouched L1 value");
+        assert_eq!(map[b"m:0050".as_slice()], 1050, "L0 overwrite must win over L1");
         Ok(())
     }
 
