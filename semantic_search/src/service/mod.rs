@@ -454,14 +454,15 @@ where
             a
         });
 
-    // Compute the MaxSim score: S(q, d) = Σ_i max_j ⟨q_i, d_j⟩.
-    let sparse_scores: HashMap<Vec<u8>, f32> = maxsim_state
+    // Collapse each doc's per-token maxes to its MaxSim score S(q, d) = Σ_i max_j ⟨q_i, d_j⟩
+    // straight into the ranking Vec — no intermediate score map (it would just re-hash
+    // every doc id to immediately drain back into a Vec).
+    let mut sparse_ranked: Vec<(Vec<u8>, f32)> = maxsim_state
         .into_iter()
         .map(|(doc_id, per_query_maxes)| (doc_id, maxsim_score(&per_query_maxes)))
         .collect();
 
     // Keep top first_pass_sparse_search_top_k candidates.
-    let mut sparse_ranked: Vec<(Vec<u8>, f32)> = sparse_scores.into_iter().collect();
     sparse_ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     sparse_ranked.truncate(config.first_pass_sparse_search_top_k);
 
