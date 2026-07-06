@@ -325,10 +325,14 @@ impl VectorKvStore for BenchKvStore {
     }
 }
 
-/// Build a store of `n_docs` documents: one SingleBit sparse chunk (assigned to its
-/// nearest cluster) and one MultiBit dense entry each, quantised against the real
-/// centroids — the same shape `index`/`search` see in production.
-fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize) -> BenchKvStore {
+/// Build a store of `n_docs` documents: `chunks_per_doc` SingleBit sparse chunks
+/// (each assigned to its nearest cluster) plus one MultiBit dense whole-doc entry,
+/// quantised against the real centroids — the same shape `index`/`search` see in
+/// production. A doc's chunks are grouped by cluster, so a doc appears once per
+/// cluster its chunks landed in, with the rkyv list holding just that cluster's
+/// chunks (the real `{ns}_sparse_vector` layout). `chunks_per_doc = 1` reproduces
+/// the original single-chunk store.
+fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize, chunks_per_doc: usize) -> BenchKvStore {
     // Deterministic doc embeddings, independent of the query PRNG.
     let mut s = 0xdead_beef_0bad_f00d_u64;
     let mut next_f32 = move || -> f32 {
@@ -341,25 +345,31 @@ fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize) -> Benc
     let mut sparse_data: ClusterBatchResult = HashMap::new();
     let mut dense_data: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     for d in 0..n_docs {
-        let emb: Vec<f32> = (0..DIM).map(|_| next_f32()).collect();
         let doc_id = (d as u64).to_be_bytes().to_vec();
-        let cid = find_closest_cluster_id(cluster_map, &emb);
-        let cluster = &cluster_map[&cid];
 
-        let sparse = index_embedding_to_cluster(&emb, cluster, QuantisationStyle::SingleBit);
-        sparse_data
-            .entry(cid)
-            .or_default()
-            .push((doc_id.clone(), VectorIndex::list_to_bytes(&[sparse])));
-
+        // Whole-doc dense vector (payload[0] in real indexing), assigned to its cluster.
+        let dense_emb: Vec<f32> = (0..DIM).map(|_| next_f32()).collect();
+        let dcid = find_closest_cluster_id(cluster_map, &dense_emb);
         let dense = index_embedding_to_cluster(
-            &emb,
-            cluster,
+            &dense_emb,
+            &cluster_map[&dcid],
             QuantisationStyle::MultiBit {
                 number_of_bits: N_BITS_MULTI,
             },
         );
-        dense_data.insert(doc_id, VectorIndex::list_to_bytes(&[dense]));
+        dense_data.insert(doc_id.clone(), VectorIndex::list_to_bytes(&[dense]));
+
+        // Sparse chunks grouped by their assigned cluster → one entry per (doc, cluster).
+        let mut by_cluster: HashMap<u32, Vec<VectorIndex>> = HashMap::new();
+        for _ in 0..chunks_per_doc {
+            let emb: Vec<f32> = (0..DIM).map(|_| next_f32()).collect();
+            let cid = find_closest_cluster_id(cluster_map, &emb);
+            let sparse = index_embedding_to_cluster(&emb, &cluster_map[&cid], QuantisationStyle::SingleBit);
+            by_cluster.entry(cid).or_default().push(sparse);
+        }
+        for (cid, chunks) in by_cluster {
+            sparse_data.entry(cid).or_default().push((doc_id.clone(), VectorIndex::list_to_bytes(&chunks)));
+        }
     }
     BenchKvStore { sparse_data, dense_data }
 }
@@ -376,7 +386,7 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
-    let store = build_bench_store(&cluster_map, N_DOCS);
+    let store = build_bench_store(&cluster_map, N_DOCS, 1);
     let dense_query = load_or_generate_embeddings().query;
     let config = SemanticSearchConfig::default(); // n_probes 128, top_k 1000/100
 
@@ -414,6 +424,57 @@ fn bench_end_to_end_search(c: &mut Criterion) {
         cluster_map.len(),
         config.n_probes
     );
+}
+
+// ── End-to-end vs chunks-per-doc: how much of search() is really Pass-1? ────────
+//
+// The single-chunk `end_to_end_search` under-represents Pass-1: with one sparse chunk
+// per doc, Pass-1's absolute scoring cost is tiny and Pass-2 dense re-rank dominates.
+// Real docs have several sliding-window chunks. This sweep holds T and n_docs fixed and
+// varies `chunks_per_doc`, so Pass-2 stays ~constant (it re-ranks a top_k-capped
+// candidate set, independent of chunk count) while Pass-1 scales with total chunks.
+// Reading `end_to_end(cpd) − end_to_end(1)` therefore backs out Pass-1's real cost /
+// share — the number that decides whether pruning Pass-1 (lever #2) is worth pursuing.
+fn bench_end_to_end_multichunk(c: &mut Criterion) {
+    const N_DOCS: usize = 5_000;
+    const T: usize = 4; // representative query length
+    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+    let index = ClusterIndex::from_clusters(cluster_map.clone());
+    let dense_query = load_or_generate_embeddings().query;
+    let sparse_query = synthetic_query_chunks(T);
+    let config = SemanticSearchConfig::default();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("bench: tokio runtime");
+    let no_filter: Option<fn(&[u8]) -> bool> = None;
+
+    let mut group = c.benchmark_group("end_to_end_multichunk");
+    group.measurement_time(Duration::from_secs(10));
+
+    for &cpd in &[1usize, 4, 8] {
+        let store = build_bench_store(&cluster_map, N_DOCS, cpd);
+        group.throughput(Throughput::Elements((N_DOCS * cpd) as u64)); // total sparse chunks
+        group.bench_with_input(BenchmarkId::new("chunks_per_doc", cpd), &cpd, |b, _| {
+            b.iter(|| {
+                let results = rt.block_on(search(
+                    black_box(&config),
+                    "bench_ns",
+                    black_box(&index),
+                    black_box(&sparse_query),
+                    black_box(&dense_query),
+                    black_box(&store),
+                    no_filter,
+                    None,
+                ));
+                black_box(results)
+            });
+        });
+    }
+    group.finish();
+    eprintln!("end_to_end_multichunk: {N_DOCS} docs, T={T}, {} clusters, n_probes {}", cluster_map.len(), config.n_probes);
 }
 
 // ── Pass-1 scoring isolation: dot arithmetic vs deserialize vs hashmap ─────────
@@ -604,6 +665,7 @@ criterion_group!(
     bench_top_n_cluster_selection,
     bench_coarse_assignment,
     bench_end_to_end_search,
+    bench_end_to_end_multichunk,
     bench_pass1_scoring_isolation
 );
 criterion_main!(distance_estimation);
