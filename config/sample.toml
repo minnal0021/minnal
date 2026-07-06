@@ -204,8 +204,10 @@ embedding_service_url = "http://localhost:8001"
 model = "gemma"
 
 # Number of IVF clusters to probe during the sparse first-pass search (single-bit vectors).
-# Higher = better recall, slower queries.  Default: 128.
-n_probes = 128
+# Higher = better recall, slower queries. Measured tradeoff (2000-doc real corpus, recall
+# vs exhaustive 256-cluster probe): 10 → recall@10 0.968 / recall@100 0.935; 32 → 0.986 / 0.978;
+# 64 → ~lossless. 32 recovers most of the recall lost at 10 while keeping the scan-cost win.
+n_probes = 32
 
 # Number of candidates to retain after the first-pass sparse (single-bit) vector search
 # before re-scoring with the dense multi-bit index.  Default: 1000.

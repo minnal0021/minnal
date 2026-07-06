@@ -1719,3 +1719,228 @@ mod real_kv_profile {
         }
     }
 }
+
+// ── Real-embedding recall vs n_probes ──────────────────────────────────────────
+//
+// The `real_kv_search_profile` above measures *latency* per n_probes over synthetic
+// random vectors. Random vectors cluster uniformly, so they cannot answer the recall
+// question — probing fewer clusters looks artificially cheap because no cluster is
+// preferentially relevant. This harness closes that gap: it indexes a **real** text
+// corpus through the **real** embedding service (so the IVF cluster structure reflects
+// genuine semantic content) and measures how much recall degrades as n_probes drops.
+//
+// Ground truth is the pipeline's own top-k at **exhaustive probing** (n_probes = every
+// cluster, 256 for the bundled qwen centroids). `recall@k(np) = |top_k(np) ∩ top_k(all)| / k`,
+// averaged over queries. This isolates the recall lost by *reducing n_probes* while
+// holding quantisation and re-ranking fixed — exactly the "is n_probes=10 safe?" question.
+//
+// Requires the external embedding service AND a JSONL corpus of real text (defaults to the
+// HuffPost news dump under work/, which is gitignored — override with MINNAL_RECALL_CORPUS).
+// `#[ignore]`d; run on demand from the crate root (minnal_doc_store/):
+//
+//   MINNAL_EMBED_URL=http://192.168.10.155:8001 \
+//     cargo test -p minnal_doc_store --lib real_recall_vs_nprobes --release -- --ignored --nocapture
+//
+// Env knobs (all optional): MINNAL_RECALL_CORPUS (path), MINNAL_EMBED_URL (service base),
+// MINNAL_RECALL_DOCS (corpus size, default 2000), MINNAL_RECALL_QUERIES (default 50).
+#[cfg(test)]
+mod real_recall {
+    use super::*;
+    use semantic_search::cluster::{Cluster, read_clusters_from_file};
+    use semantic_search::service::{SemanticSearchConfig, embed_document, embed_query, search};
+    use semantic_search::ClusterIndex;
+    use std::collections::{HashMap, HashSet};
+    use std::io::BufRead;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tempfile::TempDir;
+    use tokio::sync::Semaphore;
+
+    const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
+    const DEFAULT_CORPUS: &str = "../work/sample_data/sample_data_news.jsonl";
+    const NS: &str = "recall";
+    const SEARCH_TOPK: usize = 100;
+    /// n_probes to sweep, descending; the first (== cluster count) is the exhaustive ground truth.
+    const NPROBES: [usize; 5] = [256, 128, 64, 32, 10];
+    const RECALL_KS: [usize; 2] = [10, 100];
+    /// In-flight embedding requests during corpus indexing (network/GPU-bound).
+    const INDEX_CONCURRENCY: usize = 8;
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// Build one document/query text from a news record: `headline. short_description`.
+    fn record_text(v: &serde_json::Value) -> String {
+        let headline = v.get("headline").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let desc = v.get("short_description").and_then(|x| x.as_str()).unwrap_or("").trim();
+        match (headline.is_empty(), desc.is_empty()) {
+            (false, false) => format!("{headline}. {desc}"),
+            (false, true) => headline.to_string(),
+            (true, false) => desc.to_string(),
+            (true, true) => String::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn real_recall_vs_nprobes() {
+        let corpus_path = std::env::var("MINNAL_RECALL_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string());
+        let embed_url = std::env::var("MINNAL_EMBED_URL").unwrap_or_else(|_| SemanticSearchConfig::default().embedding_service_url);
+        let n_docs = env_usize("MINNAL_RECALL_DOCS", 2000);
+        let n_queries = env_usize("MINNAL_RECALL_QUERIES", 50);
+
+        // ── Load corpus (soft-skip if absent — this is an on-demand, env-gated harness) ──
+        let file = match std::fs::File::open(&corpus_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("SKIP real_recall_vs_nprobes: cannot open corpus {corpus_path}: {e}\n  set MINNAL_RECALL_CORPUS to a JSONL file with headline/short_description fields.");
+                return;
+            }
+        };
+        let mut texts: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+            .map(|v| record_text(&v))
+            .filter(|t| !t.is_empty())
+            .take(n_docs + n_queries)
+            .collect();
+        if texts.len() < n_docs + n_queries {
+            eprintln!("SKIP real_recall_vs_nprobes: corpus has {} usable records, need {} docs + {} queries", texts.len(), n_docs, n_queries);
+            return;
+        }
+        // Hold the last n_queries records out of the indexed set to use as queries.
+        let query_texts: Vec<String> = texts.split_off(n_docs);
+        let doc_texts = texts; // exactly n_docs
+
+        let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
+        let n_clusters = raw.len();
+        assert_eq!(NPROBES[0], n_clusters, "NPROBES[0] must equal the cluster count ({n_clusters}) to be exhaustive ground truth");
+        let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+        let index = Arc::new(ClusterIndex::from_clusters(cluster_map));
+
+        let base_config = Arc::new(SemanticSearchConfig {
+            embedding_service_url: embed_url.clone(),
+            ..SemanticSearchConfig::default()
+        });
+
+        eprintln!("\n=== real-embedding recall vs n_probes ===");
+        eprintln!("  service {embed_url}  |  corpus {corpus_path}");
+        eprintln!("  {n_docs} docs, {n_queries} queries, {n_clusters} clusters, top_k {SEARCH_TOPK}");
+
+        // ── Index the corpus through the real embedding service (bounded concurrency) ──
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(AsyncDb::open(dir.path().to_owned()).await.unwrap());
+        let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
+        let t_index = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for (i, text) in doc_texts.into_iter().enumerate() {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let (cfg, idx, db) = (base_config.clone(), index.clone(), db.clone());
+            set.spawn(async move {
+                let _permit = permit;
+                let doc_id = (i as u64).to_be_bytes().to_vec();
+                match embed_document(&cfg, &idx, &text).await {
+                    Ok(vis) => upsert_vectors(&db, NS, &doc_id, &vis).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+        }
+        let (mut ok, mut fail) = (0usize, 0usize);
+        let mut first_err: Option<String> = None;
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        eprintln!("  indexed {ok} docs ({fail} failed) in {:.1}s", t_index.elapsed().as_secs_f64());
+        if ok == 0 {
+            eprintln!("SKIP real_recall_vs_nprobes: every document embed failed — is the service up at {embed_url}?  first error: {:?}", first_err);
+            db.shutdown().await.unwrap();
+            return;
+        }
+
+        let store = DbVectorStore::new(&db, NS).await.unwrap();
+        let no_filter: Option<fn(&[u8]) -> bool> = None;
+
+        // ── Embed queries once; reused across every n_probes value ──
+        let mut q_embs = Vec::with_capacity(n_queries);
+        for qt in &query_texts {
+            match embed_query(&base_config, qt).await {
+                Ok(qe) if !qe.sparse.is_empty() && !qe.dense.is_empty() => q_embs.push(qe),
+                Ok(_) => {} // whitespace-only query produced no chunks; drop it
+                Err(e) => eprintln!("  query embed failed (skipping): {e}"),
+            }
+        }
+        assert!(!q_embs.is_empty(), "no queries could be embedded");
+
+        // Helper: run search for a given n_probes and return each query's ranked doc-id list.
+        async fn run_all(
+            config: &SemanticSearchConfig,
+            index: &ClusterIndex,
+            store: &DbVectorStore,
+            q_embs: &[semantic_search::service::QueryEmbeddings],
+            no_filter: Option<fn(&[u8]) -> bool>,
+        ) -> (Vec<Vec<Vec<u8>>>, Vec<f64>) {
+            let mut ranked = Vec::with_capacity(q_embs.len());
+            let mut lat_us = Vec::with_capacity(q_embs.len());
+            for qe in q_embs {
+                let t = Instant::now();
+                let r = search(config, NS, index, &qe.sparse, &qe.dense, store, no_filter, Some(SEARCH_TOPK)).await;
+                lat_us.push(t.elapsed().as_nanos() as f64 / 1e3);
+                ranked.push(r.into_iter().map(|q| q.document_id).collect());
+            }
+            (ranked, lat_us)
+        }
+
+        // ── Ground truth: exhaustive-probe top-k per query ──
+        let gt_config = SemanticSearchConfig { n_probes: NPROBES[0], ..(*base_config).clone() };
+        let (ground_truth, _) = run_all(&gt_config, &index, &store, &q_embs, no_filter).await;
+        // Pre-hash each query's GT prefix set for every reported k.
+        let gt_sets: Vec<[HashSet<Vec<u8>>; RECALL_KS.len()]> = ground_truth
+            .iter()
+            .map(|gt| std::array::from_fn(|ki| gt.iter().take(RECALL_KS[ki]).cloned().collect()))
+            .collect();
+
+        // ── Sweep ──
+        eprintln!("\n  n_probes | recall@10 | recall@100 | mean cand | median search");
+        eprintln!("  ---------+-----------+------------+-----------+---------------");
+        for &np in &NPROBES {
+            let config = SemanticSearchConfig { n_probes: np, ..(*base_config).clone() };
+            let (ranked, mut lat_us) = run_all(&config, &index, &store, &q_embs, no_filter).await;
+
+            let mut recall_sums = [0.0f64; RECALL_KS.len()];
+            let mut cand_total = 0usize;
+            for (qi, got) in ranked.iter().enumerate() {
+                cand_total += got.len();
+                for (ki, &k) in RECALL_KS.iter().enumerate() {
+                    let denom = gt_sets[qi][ki].len(); // min(k, gt_len)
+                    if denom == 0 {
+                        continue;
+                    }
+                    let hits = got.iter().take(k).filter(|id| gt_sets[qi][ki].contains(*id)).count();
+                    recall_sums[ki] += hits as f64 / denom as f64;
+                }
+            }
+            let nq = ranked.len() as f64;
+            lat_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = lat_us[lat_us.len() / 2];
+            let tag = if np == NPROBES[0] { " (GT)" } else { "" };
+            eprintln!(
+                "  {np:>4}{tag:<5}|   {:.3}   |   {:.3}    |  {:>6.1}   |  {:>8.1} µs",
+                recall_sums[0] / nq,
+                recall_sums[1] / nq,
+                cand_total as f64 / nq,
+                median,
+            );
+        }
+        eprintln!("\n  (recall = overlap with exhaustive-probe top-k; GT row is 1.000 by construction)");
+
+        db.shutdown().await.unwrap();
+    }
+}
