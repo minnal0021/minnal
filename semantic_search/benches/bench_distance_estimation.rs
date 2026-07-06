@@ -13,6 +13,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use semantic_search::{
+    ClusterIndex,
     cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids, read_clusters_from_file},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
     index::vector_index::{QuantisationStyle, VectorIndex},
@@ -224,7 +225,84 @@ fn bench_top_n_cluster_selection(c: &mut Criterion) {
     eprintln!("top_n_cluster_selection: benchmarked over {count} clusters");
 }
 
+// ── Coarse assignment: serial-HashMap (before) vs batched-matrix (after) ───────
+
+/// Generate `t` synthetic query chunks of `DIM` via a seeded XorShift64 PRNG.
+fn synthetic_query_chunks(t: usize) -> Vec<Vec<f32>> {
+    let mut s = 0x00c0_ffee_1234_5678_u64;
+    let mut next_f32 = move || -> f32 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s as i64 as f32) / (i64::MAX as f32)
+    };
+    (0..t).map(|_| (0..DIM).map(|_| next_f32()).collect()).collect()
+}
+
+/// Union the top-`n` clusters across query chunks, the way `service::search` does —
+/// so the bench measures the whole Pass-1 coarse-assignment step, not just one scan.
+fn union_dedup(per_query: Vec<Vec<u32>>) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for chunk in per_query {
+        for id in chunk {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The full Pass-1 coarse-assignment cost (`T·C·D` + union), paid once per query.
+///
+/// `serial_hashmap` is the historical path — a serial loop of `find_top_n_cluster_ids`
+/// over the scattered `HashMap<u32, Cluster>`. `batched_matrix` is the replacement —
+/// `ClusterIndex::find_top_n_cluster_ids_batch`, parallel over chunks over a contiguous
+/// centroid matrix. Both produce the same probe set; this measures the speed-up as the
+/// query grows (the `T` factor the old serial loop scaled linearly with).
+fn bench_coarse_assignment(c: &mut Criterion) {
+    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+    let count = cluster_map.len();
+    let index = ClusterIndex::from_clusters(cluster_map.clone());
+    const N_PROBES: usize = 128; // production default
+
+    let mut group = c.benchmark_group("coarse_assignment");
+    group.measurement_time(Duration::from_secs(10));
+
+    for &t in &[4usize, 40, 100] {
+        let queries = synthetic_query_chunks(t);
+        group.throughput(Throughput::Elements(t as u64));
+
+        group.bench_with_input(BenchmarkId::new("serial_hashmap", t), &t, |b, _| {
+            b.iter(|| {
+                let per_query: Vec<Vec<u32>> = queries
+                    .iter()
+                    .map(|q| find_top_n_cluster_ids(black_box(&cluster_map), black_box(q), N_PROBES))
+                    .collect();
+                black_box(union_dedup(per_query))
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("batched_matrix", t), &t, |b, _| {
+            b.iter(|| {
+                let per_query = index.find_top_n_cluster_ids_batch(black_box(&queries), N_PROBES);
+                black_box(union_dedup(per_query))
+            });
+        });
+    }
+    group.finish();
+    eprintln!("coarse_assignment: {count} clusters, dim {DIM}, n_probes {N_PROBES}");
+}
+
 // ── Criterion wiring ──────────────────────────────────────────────────────────
 
-criterion_group!(distance_estimation, bench_first_pass, bench_second_pass, bench_top_n_cluster_selection);
+criterion_group!(
+    distance_estimation,
+    bench_first_pass,
+    bench_second_pass,
+    bench_top_n_cluster_selection,
+    bench_coarse_assignment
+);
 criterion_main!(distance_estimation);

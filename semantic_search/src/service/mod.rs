@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 
 use rayon::prelude::*;
 
-use crate::cluster::{ClusterIndex, find_top_n_cluster_ids};
+use crate::cluster::ClusterIndex;
 use crate::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::quantisation::rabitq;
@@ -329,12 +329,14 @@ where
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
-    // Union of top-n_probes clusters across all query chunk embeddings.
+    // Union of top-n_probes clusters across all query chunk embeddings. The per-chunk
+    // top-n scans are batched (parallel over chunks, contiguous centroid matrix); the
+    // union/dedup below preserves first-seen order over the batched per-chunk results.
     let probe_clusters: Vec<u32> = {
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
-        for q in query_sparse_embeddings {
-            for id in find_top_n_cluster_ids(&cluster_index.clusters, q, config.n_probes) {
+        for chunk_ids in cluster_index.find_top_n_cluster_ids_batch(query_sparse_embeddings, config.n_probes) {
+            for id in chunk_ids {
                 if seen.insert(id) {
                     ids.push(id);
                 }
