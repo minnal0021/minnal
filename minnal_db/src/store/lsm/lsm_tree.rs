@@ -2369,16 +2369,21 @@ impl LSMTree {
                             let mut lookup: std::collections::HashMap<Vec<u8>, usize> = pending.iter().map(|&idx| (keys[idx].clone(), idx)).collect();
                             let mut updates: Vec<IdxEntry> = Vec::new();
 
-                            // Level 0: newest-first; remove from lookup on first hit so
-                            // the newest L0 file wins over older ones for the same key.
-                            let mut l0_entries = self.level0_entries_snapshot(bucket as u32);
-                            l0_entries.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
-                            for entry in &l0_entries {
-                                if entry.is_obsolete() || lookup.is_empty() {
-                                    continue;
+                            // Level 0: captured newest-first. The guards are held for the whole
+                            // bucket's work (through the L1 pre-filter below), so a key a stale
+                            // L1 skip would drop is still in a captured, already-scanned L0 file.
+                            let mut l0_guards: Vec<L0ReadGuard> = self
+                                .level0_entries_snapshot(bucket as u32)
+                                .iter()
+                                .filter(|e| !e.is_obsolete())
+                                .map(|e| L0ReadGuard::new(Arc::clone(e)))
+                                .collect();
+                            l0_guards.sort_by(|a, b| b.entry.created_at_ms.cmp(&a.entry.created_at_ms));
+                            for guard in &l0_guards {
+                                if lookup.is_empty() {
+                                    break;
                                 }
-                                let _guard = L0ReadGuard::new(Arc::clone(entry));
-                                let mut file = File::open(&entry.path)?;
+                                let mut file = File::open(&guard.entry.path)?;
                                 let mut entry_bytes: Vec<u8> = Vec::new();
                                 loop {
                                     let mut size_buf = [0u8; 4];
@@ -2406,6 +2411,45 @@ impl LSMTree {
 
                             if lookup.is_empty() {
                                 return Ok(updates);
+                            }
+
+                            // L1 pre-filter: drop keys that provably cannot be in this bucket's L1
+                            // file, so a bucket whose every remaining key is out of range or
+                            // bloom-negative skips the whole-file read entirely. Same exact
+                            // fast-rejects the point-lookup path uses (`lookup_level1`): min/max is
+                            // exact, a bloom negative is exact.
+                            //
+                            // Race-safety mirrors the scan paths: the L0 guards captured above are
+                            // still held, and `merge_level0_to_level1` installs the new L1 file +
+                            // metadata/bloom BEFORE marking the old L0 files obsolete. So any key
+                            // left in `lookup` that stale L1 metadata would let us skip must still
+                            // be in a captured L0 file — which we have already scanned and removed
+                            // from `lookup`. A key still in `lookup` and rejected here is therefore
+                            // absent from every layer below the memtable, so leaving it `None` is
+                            // correct.
+                            //
+                            // Conservative like `lookup_level1`: filters are applied only when the
+                            // metadata/bloom are actually present. Absent metadata (e.g. a load
+                            // failure on a non-empty file) applies no filter, so we fall through and
+                            // read rather than risk skipping a live key — the L1 read stays correct.
+                            {
+                                let min_max = {
+                                    let meta = self.sstable_metadata[bucket].read();
+                                    meta.first().filter(|m| m.entry_count > 0).map(|m| (m.min_key.clone(), m.max_key.clone()))
+                                };
+                                if let Some((min_key, max_key)) = min_max {
+                                    lookup.retain(|k, _| k.as_slice() >= min_key.as_slice() && k.as_slice() <= max_key.as_slice());
+                                }
+                                if !lookup.is_empty() {
+                                    let bloom = self.sstable_blooms[bucket].read();
+                                    if let Some(bloom) = bloom.as_ref() {
+                                        lookup.retain(|k, _| bloom.contains(k));
+                                    }
+                                }
+                                if lookup.is_empty() {
+                                    // Every remaining key is provably absent from L1 — skip the read.
+                                    return Ok(updates);
+                                }
                             }
 
                             // Level 1: single large read, then in-memory key lookup.
@@ -3887,6 +3931,51 @@ mod tests {
 
         for (i, result) in batch.iter().enumerate() {
             assert_eq!(*result, Some(i as u128 + 100), "missing key at index {i}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_multiple_l1_prefilter_skips_absent_keys() -> Result<()> {
+        // Single bucket so every key shares one L1 file with a known [min, max]; the
+        // batch mixes present keys, keys below/above the L1 range (min/max reject), and
+        // an in-range key never inserted (bloom reject / L1 miss). The L1 pre-filter
+        // must never drop a live key and must return None for every absent one.
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+
+        for i in 30u128..50 {
+            lsm.insert(format!("m{i}").as_bytes(), i)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?; // land everything in L1 (min "m30", max "m49") with a bloom + min/max
+
+        let keys = vec![
+            b"m30".to_vec(),  // present, == min
+            b"m49".to_vec(),  // present, == max
+            b"m40".to_vec(),  // present, interior
+            b"a00".to_vec(),  // absent, below min       -> min/max reject
+            b"z99".to_vec(),  // absent, above max       -> min/max reject
+            b"m300".to_vec(), // absent, inside [min,max] -> bloom reject / L1 miss
+        ];
+        let batch: Vec<Option<u128>> = lsm.get_multiple(&keys)?.into_iter().map(|o| o.map(|(p, _)| p)).collect();
+        assert_eq!(batch[0], Some(30));
+        assert_eq!(batch[1], Some(49));
+        assert_eq!(batch[2], Some(40));
+        assert_eq!(batch[3], None);
+        assert_eq!(batch[4], None);
+        assert_eq!(batch[5], None);
+
+        // A batch of only out-of-range keys exercises the full skip (no L1 read): all None.
+        let absent_only = vec![b"a00".to_vec(), b"b11".to_vec(), b"z99".to_vec()];
+        let batch2: Vec<Option<u128>> = lsm.get_multiple(&absent_only)?.into_iter().map(|o| o.map(|(p, _)| p)).collect();
+        assert!(batch2.iter().all(|r| r.is_none()));
+
+        // The pre-filtered batch path must agree with the single-key point-lookup path.
+        for k in &keys {
+            let single = lsm.get(k)?;
+            let multi = lsm.get_multiple(std::slice::from_ref(k))?[0].map(|(p, _)| p);
+            assert_eq!(single, multi, "get vs get_multiple mismatch for {:?}", String::from_utf8_lossy(k));
         }
         Ok(())
     }
