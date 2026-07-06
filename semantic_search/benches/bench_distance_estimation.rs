@@ -16,8 +16,9 @@ use semantic_search::{
     ClusterIndex,
     cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids, read_clusters_from_file},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
-    index::vector_index::{QuantisationStyle, VectorIndex},
+    index::vector_index::{ClusterBatchResult, QuantisationStyle, VectorIndex, VectorKvStore},
     index_embedding_to_cluster,
+    service::{SemanticSearchConfig, search},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -296,6 +297,125 @@ fn bench_coarse_assignment(c: &mut Criterion) {
     eprintln!("coarse_assignment: {count} clusters, dim {DIM}, n_probes {N_PROBES}");
 }
 
+// ── End-to-end search(): where does the coarse-assignment win land? ────────────
+
+/// In-memory `VectorKvStore` holding real quantised vectors, so an end-to-end
+/// `search()` bench pays realistic Pass-1 (sparse scan + MaxSim) and Pass-2 (dense
+/// re-rank) cost — not the empty-payload cost of the unit-test mock.
+struct BenchKvStore {
+    sparse_data: ClusterBatchResult,
+    dense_data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl VectorKvStore for BenchKvStore {
+    async fn scan_sparse_cluster(&self, cluster_id: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.sparse_data.get(&cluster_id).cloned().unwrap_or_default()
+    }
+    async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Option<Vec<u8>> {
+        self.dense_data.get(doc_id_bytes).cloned()
+    }
+    async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect()
+    }
+    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> ClusterBatchResult {
+        cluster_ids
+            .iter()
+            .filter_map(|id| self.sparse_data.get(id).map(|e| (*id, e.clone())))
+            .collect()
+    }
+}
+
+/// Build a store of `n_docs` documents: one SingleBit sparse chunk (assigned to its
+/// nearest cluster) and one MultiBit dense entry each, quantised against the real
+/// centroids — the same shape `index`/`search` see in production.
+fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize) -> BenchKvStore {
+    // Deterministic doc embeddings, independent of the query PRNG.
+    let mut s = 0xdead_beef_0bad_f00d_u64;
+    let mut next_f32 = move || -> f32 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s as i64 as f32) / (i64::MAX as f32)
+    };
+
+    let mut sparse_data: ClusterBatchResult = HashMap::new();
+    let mut dense_data: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for d in 0..n_docs {
+        let emb: Vec<f32> = (0..DIM).map(|_| next_f32()).collect();
+        let doc_id = (d as u64).to_be_bytes().to_vec();
+        let cid = find_closest_cluster_id(cluster_map, &emb);
+        let cluster = &cluster_map[&cid];
+
+        let sparse = index_embedding_to_cluster(&emb, cluster, QuantisationStyle::SingleBit);
+        sparse_data
+            .entry(cid)
+            .or_default()
+            .push((doc_id.clone(), VectorIndex::list_to_bytes(&[sparse])));
+
+        let dense = index_embedding_to_cluster(
+            &emb,
+            cluster,
+            QuantisationStyle::MultiBit {
+                number_of_bits: N_BITS_MULTI,
+            },
+        );
+        dense_data.insert(doc_id, VectorIndex::list_to_bytes(&[dense]));
+    }
+    BenchKvStore { sparse_data, dense_data }
+}
+
+/// Full two-pass `search()` over a realistic in-memory store, to see whether the
+/// coarse-assignment change (a Pass-1 sub-step) moves total search latency.
+///
+/// `search()` here excludes the external embedding-service round trip (it takes
+/// pre-computed query embeddings) — that network+GPU call dominates a real query and
+/// dwarfs everything measured below. Compare the `coarse_assignment` group at the same
+/// T to read off the coarse-assignment fraction of this total.
+fn bench_end_to_end_search(c: &mut Criterion) {
+    const N_DOCS: usize = 5_000;
+    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+    let index = ClusterIndex::from_clusters(cluster_map.clone());
+    let store = build_bench_store(&cluster_map, N_DOCS);
+    let dense_query = load_or_generate_embeddings().query;
+    let config = SemanticSearchConfig::default(); // n_probes 128, top_k 1000/100
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("bench: tokio runtime");
+    let no_filter: Option<fn(&[u8]) -> bool> = None;
+
+    let mut group = c.benchmark_group("end_to_end_search");
+    group.measurement_time(Duration::from_secs(10));
+
+    for &t in &[4usize, 40] {
+        let sparse_query = synthetic_query_chunks(t);
+        group.throughput(Throughput::Elements(t as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(t), &t, |b, _| {
+            b.iter(|| {
+                let results = rt.block_on(search(
+                    black_box(&config),
+                    "bench_ns",
+                    black_box(&index),
+                    black_box(&sparse_query),
+                    black_box(&dense_query),
+                    black_box(&store),
+                    no_filter,
+                    None,
+                ));
+                black_box(results)
+            });
+        });
+    }
+    group.finish();
+    eprintln!(
+        "end_to_end_search: {N_DOCS} docs, {} clusters, n_probes {}",
+        cluster_map.len(),
+        config.n_probes
+    );
+}
+
 // ── Criterion wiring ──────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -303,6 +423,7 @@ criterion_group!(
     bench_first_pass,
     bench_second_pass,
     bench_top_n_cluster_selection,
-    bench_coarse_assignment
+    bench_coarse_assignment,
+    bench_end_to_end_search
 );
 criterion_main!(distance_estimation);
