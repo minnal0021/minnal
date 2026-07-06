@@ -416,6 +416,185 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     );
 }
 
+// ── Pass-1 scoring isolation: dot arithmetic vs deserialize vs hashmap ─────────
+//
+// Decomposes the Pass-1 MaxSim inner fold (`service::search`, the loop over a probed
+// cluster's entries at `service/mod.rs`) into three CUMULATIVE layers over ONE fixed
+// candidate set, so the marginal cost of each stage is directly readable:
+//
+//   dot_arithmetic  pure `estimate_from_parts` + running-max, over pre-widened native
+//                   u64 buffers — no rkyv, no map. This is the SIMD masked-sum the
+//                   "can we short-circuit the dot product" question targets.
+//   plus_archived   + `VectorIndex::access_list` (validated zero-copy) and
+//                   `copy_packed_into` per chunk — the deserialize+widen the real
+//                   path actually pays (it does NOT own-deserialize).
+//   plus_hashmap    + accumulate into the `HashMap<doc_id, Vec<f32>>` MaxSim state,
+//                   exactly like the real fold. This layer == real Pass-1 scoring.
+//
+// Read the attribution as:
+//   dot_arithmetic                 → the dot products themselves
+//   plus_archived − dot_arithmetic → access_list + copy_packed_into (deserialize/widen)
+//   plus_hashmap  − plus_archived  → the MaxSim state map
+//
+// Throughput is set to the number of dot products (docs × chunks × tokens), so criterion
+// reports per-dot-product time — compare it against the deserialize/map deltas to decide
+// whether optimising the dot product can move Pass-1 at all.
+
+const CHUNKS_PER_DOC: usize = 4; // realistic sliding-window chunk count per doc
+const SCORING_N_DOCS: usize = 2_000;
+
+/// One pre-built candidate set, materialised in every representation the three layers
+/// need so each layer times only its own added work.
+struct ScoringInput {
+    /// L1 input: per doc, a list of `(native u64 words, scaling_factor)` chunks —
+    /// already widened, so the dot layer touches no rkyv.
+    native: Vec<Vec<(Vec<u64>, f32)>>,
+    /// L2/L3 input: per doc, `(doc_id, rkyv list blob)` — the on-disk shape the real
+    /// path scans and `access_list`es.
+    blobs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// One estimator per query token (against that token's own closest centroid) —
+    /// reused across all docs, as the real per-cluster fold reuses its estimator set.
+    estimators: Vec<SingleBitQuanDotProductEstimator>,
+    /// The `t` sparse query-token embeddings.
+    query: Vec<Vec<f32>>,
+}
+
+fn build_scoring_input(t: usize, n_docs: usize) -> ScoringInput {
+    let raw = read_clusters_from_file(CLUSTER_PATH).expect("scoring bench: failed to load clusters");
+    let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+
+    let query = synthetic_query_chunks(t);
+    let estimators: Vec<SingleBitQuanDotProductEstimator> = query
+        .iter()
+        .map(|q| {
+            let cid = find_closest_cluster_id(&cluster_map, q);
+            SingleBitQuanDotProductEstimator::new(cid, q, &cluster_map[&cid].centroid)
+        })
+        .collect();
+
+    // Doc embeddings from an independent PRNG stream (distinct seed from the query's).
+    let mut s = 0x51ce_d0c5_1234_9abc_u64;
+    let mut next_f32 = move || -> f32 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s as i64 as f32) / (i64::MAX as f32)
+    };
+
+    let mut native = Vec::with_capacity(n_docs);
+    let mut blobs = Vec::with_capacity(n_docs);
+    for d in 0..n_docs {
+        let mut chunks = Vec::with_capacity(CHUNKS_PER_DOC);
+        let mut nat = Vec::with_capacity(CHUNKS_PER_DOC);
+        for _ in 0..CHUNKS_PER_DOC {
+            let emb: Vec<f32> = (0..DIM).map(|_| next_f32()).collect();
+            let cid = find_closest_cluster_id(&cluster_map, &emb);
+            let vi = index_embedding_to_cluster(&emb, &cluster_map[&cid], QuantisationStyle::SingleBit);
+            nat.push((vi.packed_vector.clone(), vi.scaling_factor));
+            chunks.push(vi);
+        }
+        native.push(nat);
+        blobs.push(((d as u64).to_be_bytes().to_vec(), VectorIndex::list_to_bytes(&chunks)));
+    }
+
+    ScoringInput {
+        native,
+        blobs,
+        estimators,
+        query,
+    }
+}
+
+/// Collapse a doc's per-token running maxes into its MaxSim score, NEG_INFINITY → 0
+/// (a token that matched no chunk contributes 0). Mirrors `service::maxsim_score`.
+#[inline]
+fn collapse(maxes: &[f32]) -> f32 {
+    maxes.iter().map(|&m| if m == f32::NEG_INFINITY { 0.0 } else { m }).sum()
+}
+
+fn bench_pass1_scoring_isolation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pass1_scoring");
+    group.measurement_time(Duration::from_secs(10));
+
+    for &t in &[4usize, 40] {
+        let inp = build_scoring_input(t, SCORING_N_DOCS);
+        let n_dots = (SCORING_N_DOCS * CHUNKS_PER_DOC * t) as u64;
+        group.throughput(Throughput::Elements(n_dots));
+
+        // L1 — pure dot + running-max over pre-widened native buffers.
+        group.bench_with_input(BenchmarkId::new("dot_arithmetic", t), &t, |b, _| {
+            let mut maxes = vec![f32::NEG_INFINITY; t];
+            b.iter(|| {
+                let mut acc = 0.0f32;
+                for doc in &inp.native {
+                    maxes.iter_mut().for_each(|m| *m = f32::NEG_INFINITY);
+                    for (words, scaling) in doc {
+                        for (i, (q, est)) in inp.query.iter().zip(&inp.estimators).enumerate() {
+                            let sc = est.estimate_from_parts(q, words, *scaling);
+                            if sc > maxes[i] {
+                                maxes[i] = sc;
+                            }
+                        }
+                    }
+                    acc += collapse(&maxes);
+                }
+                black_box(acc)
+            });
+        });
+
+        // L2 — + access_list (zero-copy deserialize) + copy_packed_into (widen) per chunk.
+        group.bench_with_input(BenchmarkId::new("plus_archived", t), &t, |b, _| {
+            let mut words_buf: Vec<u64> = Vec::new();
+            let mut maxes = vec![f32::NEG_INFINITY; t];
+            b.iter(|| {
+                let mut acc = 0.0f32;
+                for (_doc_id, blob) in &inp.blobs {
+                    let list = VectorIndex::access_list(blob).expect("scoring bench: archive access");
+                    maxes.iter_mut().for_each(|m| *m = f32::NEG_INFINITY);
+                    for vi in list.iter() {
+                        vi.copy_packed_into(&mut words_buf);
+                        let scaling = vi.scaling_factor();
+                        for (i, (q, est)) in inp.query.iter().zip(&inp.estimators).enumerate() {
+                            let sc = est.estimate_from_parts(q, &words_buf, scaling);
+                            if sc > maxes[i] {
+                                maxes[i] = sc;
+                            }
+                        }
+                    }
+                    acc += collapse(&maxes);
+                }
+                black_box(acc)
+            });
+        });
+
+        // L3 — + the HashMap<doc_id, Vec<f32>> MaxSim state map. == real Pass-1 scoring.
+        group.bench_with_input(BenchmarkId::new("plus_hashmap", t), &t, |b, _| {
+            b.iter(|| {
+                let mut map: HashMap<&[u8], Vec<f32>> = HashMap::new();
+                let mut words_buf: Vec<u64> = Vec::new();
+                for (doc_id, blob) in &inp.blobs {
+                    let list = VectorIndex::access_list(blob).expect("scoring bench: archive access");
+                    let maxes = map.entry(doc_id.as_slice()).or_insert_with(|| vec![f32::NEG_INFINITY; t]);
+                    for vi in list.iter() {
+                        vi.copy_packed_into(&mut words_buf);
+                        let scaling = vi.scaling_factor();
+                        for (i, (q, est)) in inp.query.iter().zip(&inp.estimators).enumerate() {
+                            let sc = est.estimate_from_parts(q, &words_buf, scaling);
+                            if sc > maxes[i] {
+                                maxes[i] = sc;
+                            }
+                        }
+                    }
+                }
+                let acc: f32 = map.values().map(|v| collapse(v)).sum();
+                black_box(acc)
+            });
+        });
+    }
+    group.finish();
+    eprintln!("pass1_scoring: {SCORING_N_DOCS} docs × {CHUNKS_PER_DOC} chunks, dim {DIM}");
+}
+
 // ── Criterion wiring ──────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -424,6 +603,7 @@ criterion_group!(
     bench_second_pass,
     bench_top_n_cluster_selection,
     bench_coarse_assignment,
-    bench_end_to_end_search
+    bench_end_to_end_search,
+    bench_pass1_scoring_isolation
 );
 criterion_main!(distance_estimation);
