@@ -1600,10 +1600,15 @@ mod real_kv_profile {
         const T: usize = 4;
         const ITERS: usize = 25;
 
+        const N_PROBES: usize = 10; // clusters probed per query token (flip to compare)
+
         let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
         let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
         let index = ClusterIndex::from_clusters(cluster_map.clone());
-        let config = SemanticSearchConfig::default(); // n_probes 128, first_pass top_k 1000
+        let config = SemanticSearchConfig {
+            n_probes: N_PROBES,
+            ..SemanticSearchConfig::default() // first_pass top_k 1000
+        };
         let ns = "profile";
 
         let dense_query = synthetic_chunks(1, 0xfeed_face_cafe_dead).remove(0);
