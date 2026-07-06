@@ -1540,3 +1540,177 @@ mod query_embedding_cache_tests {
         assert_eq!(cached, new_sparse, "re-embedding the same query must overwrite with the new chunking");
     }
 }
+
+// ── Real KV-backed search() profile (phase breakdown) ──────────────────────────
+//
+// The `semantic_search` `end_to_end_multichunk` bench runs `search()` over an
+// IN-MEMORY mock `VectorKvStore` whose scan deep-clones entries. This harness runs the
+// same two-pass `search()` over a **real minnal_db-backed `DbVectorStore`** so the
+// sparse scan and dense fetch pay actual LSM + value-log (WiscKey `pread`) cost. It
+// phase-times coarse assignment, the sparse cluster scan (Pass-1 I/O), the dense batch
+// fetch (Pass-2 I/O), and the full `search()`, so we can confirm the scan/fetch share
+// vs. the ~18-20% the isolation bench attributes to the dot arithmetic.
+//
+// `#[ignore]`d — it builds a real on-disk store; run on demand:
+//   cargo test -p minnal_doc_store --lib real_kv_search_profile -- --ignored --nocapture
+//
+// Relative to the crate root (minnal_doc_store/).
+#[cfg(test)]
+mod real_kv_profile {
+    use super::*;
+    use minnal_db::AsyncDb;
+    use semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
+    use semantic_search::index::vector_index::VectorKvStore;
+    use semantic_search::service::{SemanticSearchConfig, search};
+    use semantic_search::{ClusterIndex, QuantisationStyle, index_embedding_to_cluster};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
+    const DIM: usize = 768;
+    const N_BITS_MULTI: usize = 8;
+
+    /// Deterministic XorShift64 f32 stream in [-1, 1).
+    fn prng(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as i64 as f32) / (i64::MAX as f32)
+        }
+    }
+
+    fn synthetic_chunks(t: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut next = prng(seed);
+        (0..t).map(|_| (0..DIM).map(|_| next()).collect()).collect()
+    }
+
+    /// Median of a set of durations in microseconds.
+    fn median_us(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn real_kv_search_profile() {
+        const N_DOCS: u64 = 5_000;
+        const T: usize = 4;
+        const ITERS: usize = 25;
+
+        let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
+        let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+        let index = ClusterIndex::from_clusters(cluster_map.clone());
+        let config = SemanticSearchConfig::default(); // n_probes 128, first_pass top_k 1000
+        let ns = "profile";
+
+        let dense_query = synthetic_chunks(1, 0xfeed_face_cafe_dead).remove(0);
+        let sparse_query = synthetic_chunks(T, 0x00c0_ffee_1234_5678);
+        let no_filter: Option<fn(&[u8]) -> bool> = None;
+
+        eprintln!("\n=== real KV-backed search() profile: {N_DOCS} docs, T={T}, dim {DIM}, n_probes {} ===", config.n_probes);
+
+        for &cpd in &[1usize, 4, 8] {
+            let dir = TempDir::new().unwrap();
+            let db = AsyncDb::open(dir.path().to_owned()).await.unwrap();
+
+            // Populate: one MultiBit dense whole-doc vector + `cpd` SingleBit chunks per
+            // doc, quantised against the real centroids and written through the
+            // production `upsert_vectors` path (no-WAL, groups sparse by cluster).
+            let mut emb = prng(0xdead_beef_0bad_f00d ^ cpd as u64);
+            for d in 0..N_DOCS {
+                let doc_id = d.to_be_bytes().to_vec();
+                let dense_emb: Vec<f32> = (0..DIM).map(|_| emb()).collect();
+                let dcid = find_closest_cluster_id(&cluster_map, &dense_emb);
+                let mut vis = vec![index_embedding_to_cluster(
+                    &dense_emb,
+                    &cluster_map[&dcid],
+                    QuantisationStyle::MultiBit { number_of_bits: N_BITS_MULTI },
+                )];
+                for _ in 0..cpd {
+                    let e: Vec<f32> = (0..DIM).map(|_| emb()).collect();
+                    let cid = find_closest_cluster_id(&cluster_map, &e);
+                    vis.push(index_embedding_to_cluster(&e, &cluster_map[&cid], QuantisationStyle::SingleBit));
+                }
+                upsert_vectors(&db, ns, &doc_id, &vis).await.unwrap();
+            }
+
+            let store = DbVectorStore::new(&db, ns).await.unwrap();
+
+            // The probe set the harness reuses for the standalone scan-phase timing —
+            // identical to what search() computes internally.
+            let probe_clusters: Vec<u32> = {
+                let mut seen = std::collections::HashSet::new();
+                let mut ids = Vec::new();
+                for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes) {
+                    for id in chunk_ids {
+                        if seen.insert(id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+                ids
+            };
+            // A realistic Pass-2 fetch set: first_pass top_k doc ids (bounded by N_DOCS).
+            let dense_ids: Vec<Vec<u8>> = (0..N_DOCS.min(config.first_pass_sparse_search_top_k as u64)).map(|d| d.to_be_bytes().to_vec()).collect();
+
+            // Warm the OS page cache / mmap so we measure steady-state, not first-touch.
+            for _ in 0..3 {
+                let _ = store.scan_sparse_clusters_batch(&probe_clusters).await;
+                let _ = store.get_dense_entries_batch(&dense_ids).await;
+                let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+            }
+
+            let mut coarse = Vec::with_capacity(ITERS);
+            let mut scan = Vec::with_capacity(ITERS);
+            let mut dense = Vec::with_capacity(ITERS);
+            let mut total = Vec::with_capacity(ITERS);
+            let mut result_len = 0usize;
+            let mut scanned_entries = 0usize;
+            for _ in 0..ITERS {
+                let t = Instant::now();
+                let probes = index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes);
+                let mut seen = std::collections::HashSet::new();
+                let mut pc = Vec::new();
+                for chunk_ids in probes {
+                    for id in chunk_ids {
+                        if seen.insert(id) {
+                            pc.push(id);
+                        }
+                    }
+                }
+                coarse.push(t.elapsed().as_nanos() as f64 / 1e3);
+
+                let t = Instant::now();
+                let scanned = store.scan_sparse_clusters_batch(&pc).await;
+                scan.push(t.elapsed().as_nanos() as f64 / 1e3);
+                scanned_entries = scanned.values().map(|v| v.len()).sum();
+
+                let t = Instant::now();
+                let _ = store.get_dense_entries_batch(&dense_ids).await;
+                dense.push(t.elapsed().as_nanos() as f64 / 1e3);
+
+                let t = Instant::now();
+                let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                total.push(t.elapsed().as_nanos() as f64 / 1e3);
+                result_len = results.len();
+            }
+
+            let (c, s, dd, tot) = (median_us(coarse), median_us(scan), median_us(dense), median_us(total));
+            let other = (tot - c - s - dd).max(0.0);
+            eprintln!(
+                "\n  [chunks_per_doc={cpd}]  {scanned_entries} sparse entries scanned, {result_len} results, {} dense fetched",
+                dense_ids.len()
+            );
+            eprintln!("    coarse assignment      {c:>10.1} µs   ({:>4.1}%)", 100.0 * c / tot);
+            eprintln!("    sparse scan (KV I/O)   {s:>10.1} µs   ({:>4.1}%)", 100.0 * s / tot);
+            eprintln!("    dense fetch (KV I/O)   {dd:>10.1} µs   ({:>4.1}%)", 100.0 * dd / tot);
+            eprintln!("    score + rerank + misc  {other:>10.1} µs   ({:>4.1}%)  [total − above]", 100.0 * other / tot);
+            eprintln!("    ── full search()       {tot:>10.1} µs   (100%)");
+
+            db.shutdown().await.unwrap();
+        }
+    }
+}
