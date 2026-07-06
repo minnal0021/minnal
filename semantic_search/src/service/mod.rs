@@ -70,7 +70,7 @@ pub struct SemanticSearchConfig {
     pub sliding_size: usize,
 
     /// Number of IVF clusters to probe in the first-pass sparse (single-bit) search.
-    /// Default: 128.
+    /// Default: 32.
     pub n_probes: usize,
 
     /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
@@ -103,7 +103,7 @@ impl Default for SemanticSearchConfig {
             embedding_dim: 768,
             top_k_results: 100,
             number_of_bits_for_dense_quantisation: 8,
-            n_probes: 128,
+            n_probes: 32,
             window_size: 4,
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,

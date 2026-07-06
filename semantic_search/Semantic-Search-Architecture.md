@@ -330,7 +330,7 @@ All parameters are under `[semantic_search]` in the TOML config:
 | Parameter | Default | Description |
 |---|---|---|
 | `number_of_bits_for_dense_quantisation` | `8` | Bits per dimension for MultiBit (dense) quantisation. 4 = compact, 8 = high recall. Only affects Pass 2 precision. |
-| `n_probes` | `128` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower. |
+| `n_probes` | `32` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower. |
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
 | `window_size` | `4` | Sentences/tokens per sliding-window chunk for SingleBit embeddings. |
 | `sliding_size` | `2` | Window advance step. Smaller than `window_size` → overlapping chunks. |

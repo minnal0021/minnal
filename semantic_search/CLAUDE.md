@@ -91,7 +91,7 @@ cluster_path = "service/embedding_support/qwen/clusters.json"
 # embedding_service_url = "http://localhost:8001"
 
 # Number of IVF clusters probed in Pass 1.  Higher = better recall, slower.
-# n_probes = 128
+# n_probes = 32
 
 # Candidates kept after Pass 1 before dense re-ranking.
 # first_pass_sparse_search_top_k = 1000

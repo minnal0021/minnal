@@ -267,7 +267,7 @@ fn bench_coarse_assignment(c: &mut Criterion) {
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let count = cluster_map.len();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
-    const N_PROBES: usize = 128; // production default
+    const N_PROBES: usize = 32; // production default
 
     let mut group = c.benchmark_group("coarse_assignment");
     group.measurement_time(Duration::from_secs(10));
@@ -388,7 +388,7 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let store = build_bench_store(&cluster_map, N_DOCS, 1);
     let dense_query = load_or_generate_embeddings().query;
-    let config = SemanticSearchConfig::default(); // n_probes 128, top_k 1000/100
+    let config = SemanticSearchConfig::default(); // n_probes 32, top_k 1000/100
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -589,7 +589,7 @@ cluster_path = "service/embedding_support/qwen/clusters.json"
 # Bits per dimension for the dense (multi-bit) Pass 2 quantisation. 4 = compact, 8 = high recall.
 number_of_bits_for_dense_quantisation = 8
 # IVF clusters probed in the sparse first pass (higher = better recall, slower).
-# n_probes = 128
+# n_probes = 32
 # Candidates kept after Pass 1 before dense re-ranking.
 # first_pass_sparse_search_top_k = 1000
 # Sliding-window chunk parameters for Pass 1 single-bit embeddings.

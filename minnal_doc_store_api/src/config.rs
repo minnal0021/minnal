@@ -30,7 +30,7 @@
 //! number_of_bits_for_dense_quantisation = 8
 //! # cluster_path = "service/embedding_support/qwen/clusters.json"
 //! embedding_dim = 768
-//! n_probes = 25
+//! n_probes = 32
 //! embedding_service_url = "http://192.168.1.155:8001"
 //! model = "qwen"
 //! ```
@@ -591,7 +591,7 @@ pub struct SemanticSearchSection {
 
     /// Number of IVF clusters to probe during the first-pass sparse (single-bit) search.
     ///
-    /// Higher values increase recall at the cost of query latency.  Default: 25.
+    /// Higher values increase recall at the cost of query latency.  Default: 32.
     #[serde(default = "default_n_probes")]
     pub n_probes: usize,
 
@@ -685,7 +685,7 @@ fn default_embedding_dim() -> usize {
     768
 }
 fn default_n_probes() -> usize {
-    128
+    32
 }
 fn default_first_pass_sparse_search_top_k() -> usize {
     1000
