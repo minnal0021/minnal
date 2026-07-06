@@ -1600,22 +1600,22 @@ mod real_kv_profile {
         const T: usize = 4;
         const ITERS: usize = 25;
 
-        const N_PROBES: usize = 10; // clusters probed per query token (flip to compare)
+        // Sweep n_probes to compare the tuned default (32) against the old 10 and the
+        // upstream 128. The store depends only on cpd (not n_probes), so it is built once
+        // per cpd and every n_probes value is profiled against the same on-disk data.
+        const N_PROBES_SWEEP: [usize; 3] = [10, 32, 128];
 
         let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
         let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
         let index = ClusterIndex::from_clusters(cluster_map.clone());
-        let config = SemanticSearchConfig {
-            n_probes: N_PROBES,
-            ..SemanticSearchConfig::default() // first_pass top_k 1000
-        };
+        let base_config = SemanticSearchConfig::default(); // first_pass top_k 1000
         let ns = "profile";
 
         let dense_query = synthetic_chunks(1, 0xfeed_face_cafe_dead).remove(0);
         let sparse_query = synthetic_chunks(T, 0x00c0_ffee_1234_5678);
         let no_filter: Option<fn(&[u8]) -> bool> = None;
 
-        eprintln!("\n=== real KV-backed search() profile: {N_DOCS} docs, T={T}, dim {DIM}, n_probes {} ===", config.n_probes);
+        eprintln!("\n=== real KV-backed search() profile: {N_DOCS} docs, T={T}, dim {DIM}, n_probes sweep {N_PROBES_SWEEP:?} ===");
 
         for &cpd in &[1usize, 4, 8] {
             let dir = TempDir::new().unwrap();
@@ -1644,76 +1644,86 @@ mod real_kv_profile {
 
             let store = DbVectorStore::new(&db, ns).await.unwrap();
 
-            // The probe set the harness reuses for the standalone scan-phase timing —
-            // identical to what search() computes internally.
-            let probe_clusters: Vec<u32> = {
-                let mut seen = std::collections::HashSet::new();
-                let mut ids = Vec::new();
-                for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes) {
-                    for id in chunk_ids {
-                        if seen.insert(id) {
-                            ids.push(id);
+            // Pass-2 fetch set is n_probes-independent: first_pass top_k doc ids (bounded by N_DOCS).
+            let dense_ids: Vec<Vec<u8>> =
+                (0..N_DOCS.min(base_config.first_pass_sparse_search_top_k as u64)).map(|d| d.to_be_bytes().to_vec()).collect();
+
+            eprintln!("\n  ┌─ chunks_per_doc = {cpd} ───────────────────────────────────────────");
+
+            for &n_probes in &N_PROBES_SWEEP {
+                let config = SemanticSearchConfig { n_probes, ..base_config.clone() };
+
+                // The probe set the harness reuses for the standalone scan-phase timing —
+                // identical to what search() computes internally for this n_probes.
+                let probe_clusters: Vec<u32> = {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut ids = Vec::new();
+                    for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes) {
+                        for id in chunk_ids {
+                            if seen.insert(id) {
+                                ids.push(id);
+                            }
                         }
                     }
+                    ids
+                };
+
+                // Warm the OS page cache / mmap so we measure steady-state, not first-touch.
+                for _ in 0..3 {
+                    let _ = store.scan_sparse_clusters_batch(&probe_clusters).await;
+                    let _ = store.get_dense_entries_batch(&dense_ids).await;
+                    let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
                 }
-                ids
-            };
-            // A realistic Pass-2 fetch set: first_pass top_k doc ids (bounded by N_DOCS).
-            let dense_ids: Vec<Vec<u8>> = (0..N_DOCS.min(config.first_pass_sparse_search_top_k as u64)).map(|d| d.to_be_bytes().to_vec()).collect();
 
-            // Warm the OS page cache / mmap so we measure steady-state, not first-touch.
-            for _ in 0..3 {
-                let _ = store.scan_sparse_clusters_batch(&probe_clusters).await;
-                let _ = store.get_dense_entries_batch(&dense_ids).await;
-                let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
-            }
-
-            let mut coarse = Vec::with_capacity(ITERS);
-            let mut scan = Vec::with_capacity(ITERS);
-            let mut dense = Vec::with_capacity(ITERS);
-            let mut total = Vec::with_capacity(ITERS);
-            let mut result_len = 0usize;
-            let mut scanned_entries = 0usize;
-            for _ in 0..ITERS {
-                let t = Instant::now();
-                let probes = index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes);
-                let mut seen = std::collections::HashSet::new();
-                let mut pc = Vec::new();
-                for chunk_ids in probes {
-                    for id in chunk_ids {
-                        if seen.insert(id) {
-                            pc.push(id);
+                let mut coarse = Vec::with_capacity(ITERS);
+                let mut scan = Vec::with_capacity(ITERS);
+                let mut dense = Vec::with_capacity(ITERS);
+                let mut total = Vec::with_capacity(ITERS);
+                let mut result_len = 0usize;
+                let mut scanned_entries = 0usize;
+                for _ in 0..ITERS {
+                    let t = Instant::now();
+                    let probes = index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes);
+                    let mut seen = std::collections::HashSet::new();
+                    let mut pc = Vec::new();
+                    for chunk_ids in probes {
+                        for id in chunk_ids {
+                            if seen.insert(id) {
+                                pc.push(id);
+                            }
                         }
                     }
+                    coarse.push(t.elapsed().as_nanos() as f64 / 1e3);
+
+                    let t = Instant::now();
+                    let scanned = store.scan_sparse_clusters_batch(&pc).await;
+                    scan.push(t.elapsed().as_nanos() as f64 / 1e3);
+                    scanned_entries = scanned.values().map(|v| v.len()).sum();
+
+                    let t = Instant::now();
+                    let _ = store.get_dense_entries_batch(&dense_ids).await;
+                    dense.push(t.elapsed().as_nanos() as f64 / 1e3);
+
+                    let t = Instant::now();
+                    let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                    total.push(t.elapsed().as_nanos() as f64 / 1e3);
+                    result_len = results.len();
                 }
-                coarse.push(t.elapsed().as_nanos() as f64 / 1e3);
 
-                let t = Instant::now();
-                let scanned = store.scan_sparse_clusters_batch(&pc).await;
-                scan.push(t.elapsed().as_nanos() as f64 / 1e3);
-                scanned_entries = scanned.values().map(|v| v.len()).sum();
-
-                let t = Instant::now();
-                let _ = store.get_dense_entries_batch(&dense_ids).await;
-                dense.push(t.elapsed().as_nanos() as f64 / 1e3);
-
-                let t = Instant::now();
-                let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
-                total.push(t.elapsed().as_nanos() as f64 / 1e3);
-                result_len = results.len();
+                let (c, s, dd, tot) = (median_us(coarse), median_us(scan), median_us(dense), median_us(total));
+                let other = (tot - c - s - dd).max(0.0);
+                let pass1 = c + s; // coarse cluster pick + sparse scan I/O
+                eprintln!(
+                    "  n_probes={n_probes:>3}: {} clusters, {scanned_entries} sparse entries scanned, {result_len} results",
+                    probe_clusters.len(),
+                );
+                eprintln!("     Pass-1 coarse pick     {c:>9.1} µs  ({:>4.1}%)", 100.0 * c / tot);
+                eprintln!("     Pass-1 sparse scan I/O {s:>9.1} µs  ({:>4.1}%)", 100.0 * s / tot);
+                eprintln!("       └ Pass-1 I/O total   {pass1:>9.1} µs  ({:>4.1}%)", 100.0 * pass1 / tot);
+                eprintln!("     Pass-2 dense fetch I/O {dd:>9.1} µs  ({:>4.1}%)", 100.0 * dd / tot);
+                eprintln!("     scoring: MaxSim+rerank {other:>9.1} µs  ({:>4.1}%)  [total − above]", 100.0 * other / tot);
+                eprintln!("     ── entire search()     {tot:>9.1} µs  (100%)");
             }
-
-            let (c, s, dd, tot) = (median_us(coarse), median_us(scan), median_us(dense), median_us(total));
-            let other = (tot - c - s - dd).max(0.0);
-            eprintln!(
-                "\n  [chunks_per_doc={cpd}]  {scanned_entries} sparse entries scanned, {result_len} results, {} dense fetched",
-                dense_ids.len()
-            );
-            eprintln!("    coarse assignment      {c:>10.1} µs   ({:>4.1}%)", 100.0 * c / tot);
-            eprintln!("    sparse scan (KV I/O)   {s:>10.1} µs   ({:>4.1}%)", 100.0 * s / tot);
-            eprintln!("    dense fetch (KV I/O)   {dd:>10.1} µs   ({:>4.1}%)", 100.0 * dd / tot);
-            eprintln!("    score + rerank + misc  {other:>10.1} µs   ({:>4.1}%)  [total − above]", 100.0 * other / tot);
-            eprintln!("    ── full search()       {tot:>10.1} µs   (100%)");
 
             db.shutdown().await.unwrap();
         }
