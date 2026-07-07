@@ -2810,39 +2810,47 @@ impl LSMTree {
         // newer in-range count, a safe upper bound on same-bucket deletes) and replayed over
         // L1 afterwards. See `range_pointers_bounded` for the full rationale.
         let mut newer: Vec<(Vec<u8>, bool)> = Vec::new();
-        {
-            let l0_ref = &l0_guards;
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
+
+        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
+        // range-filtered (`>= start`). L0 has no min/max or sparse index, so files are scanned
+        // in full.
+        let read_l0_bucket = |bucket: usize| -> Result<Vec<(Vec<u8>, bool)>> {
+            let mut bucket_entries = Vec::new();
+            for guard in &l0_guards[bucket] {
+                let mut file = File::open(&guard.entry.path)?;
+                let mut entry_bytes: Vec<u8> = Vec::new();
+                loop {
+                    let mut size_buf = [0u8; 4];
+                    match file.read_exact(&mut size_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(LSMError::Io(e)),
+                    }
+                    let size = u32::from_le_bytes(size_buf) as usize;
+                    entry_bytes.resize(size, 0);
+                    file.read_exact(&mut entry_bytes[..size])?;
+                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+                    if archived.key.as_slice() >= start {
+                        bucket_entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
+                    }
+                }
+            }
+            Ok(bucket_entries)
+        };
+
+        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY (L0 is small in the
+        // steady state, so a thread per bucket costs more than it saves); full/large scan →
+        // parallel read-everything. See `range_pointers_bounded`.
+        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
+        if bounded {
+            for bucket in busy_l0 {
+                newer.extend(read_l0_bucket(bucket)?);
+            }
+        } else {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
-                let handles: Vec<_> = (0..self.config.num_buckets)
-                    .filter(|bucket| !l0_ref[*bucket].is_empty())
-                    .map(|bucket| {
-                        s.spawn(move || -> Result<Vec<(Vec<u8>, bool)>> {
-                            let mut bucket_entries = Vec::new();
-                            for guard in &l0_ref[bucket] {
-                                let mut file = File::open(&guard.entry.path)?;
-                                let mut entry_bytes: Vec<u8> = Vec::new();
-                                loop {
-                                    let mut size_buf = [0u8; 4];
-                                    match file.read_exact(&mut size_buf) {
-                                        Ok(_) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                                        Err(e) => return Err(LSMError::Io(e)),
-                                    }
-                                    let size = u32::from_le_bytes(size_buf) as usize;
-                                    entry_bytes.resize(size, 0);
-                                    file.read_exact(&mut entry_bytes[..size])?;
-                                    let archived =
-                                        unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                                    if archived.key.as_slice() >= start {
-                                        bucket_entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
-                                    }
-                                }
-                            }
-                            Ok(bucket_entries)
-                        })
-                    })
-                    .collect();
+                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
                 for handle in handles {
                     match handle
                         .join()
@@ -2875,7 +2883,6 @@ impl LSMTree {
         // LIVE keys per bucket (slack sharded per bucket since only a same-bucket newer entry
         // can shadow a bucket's L1 key); full/large scan → parallel, read-everything. See
         // `range_pointers_bounded`.
-        let bounded = limit <= BOUNDED_SCAN_LIMIT;
         match bounded {
             true => {
                 let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
@@ -2998,48 +3005,47 @@ impl LSMTree {
         // entry can shadow a bucket's L1 key); (b) replay over L1 for identical
         // tombstone-suppression semantics.
         let mut newer: Vec<ScanEntry> = Vec::new();
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
 
-        // L0 (newer than L1), collected in parallel; per bucket oldest-first so newer L0
-        // entries shadow older ones. Only buckets holding a captured L0 file spawn a worker
-        // (L0 has no min/max or sparse index, so its files are scanned in full + range-filtered).
-        {
-            let l0_ref = &l0_guards;
+        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
+        // range-filtered. L0 has no min/max or sparse index, so files are scanned in full.
+        let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
+            let mut bucket_entries = Vec::new();
+            for guard in &l0_guards[bucket] {
+                let mut file = File::open(&guard.entry.path)?;
+                let mut entry_bytes: Vec<u8> = Vec::new();
+                loop {
+                    let mut size_buf = [0u8; 4];
+                    match file.read_exact(&mut size_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(LSMError::Io(e)),
+                    }
+                    let size = u32::from_le_bytes(size_buf) as usize;
+                    entry_bytes.resize(size, 0);
+                    file.read_exact(&mut entry_bytes[..size])?;
+                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+                    if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
+                        let val = if archived.tombstone { None } else { Some((archived.value.to_native(), archived.seq.to_native())) };
+                        bucket_entries.push((archived.key.as_slice().to_vec(), val));
+                    }
+                }
+            }
+            Ok(bucket_entries)
+        };
+
+        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY: L0 is small in the
+        // steady state, so spawning a thread per bucket costs more than it saves (same
+        // reasoning as the bounded L1 path below). Full/large scan → parallel read-everything.
+        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
+        if bounded {
+            for bucket in busy_l0 {
+                newer.extend(read_l0_bucket(bucket)?);
+            }
+        } else {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
-                let handles: Vec<_> = (0..self.config.num_buckets)
-                    .filter(|bucket| !l0_ref[*bucket].is_empty())
-                    .map(|bucket| {
-                        s.spawn(move || -> Result<Vec<ScanEntry>> {
-                            let mut bucket_entries = Vec::new();
-                            for guard in &l0_ref[bucket] {
-                                let mut file = File::open(&guard.entry.path)?;
-                                let mut entry_bytes: Vec<u8> = Vec::new();
-                                loop {
-                                    let mut size_buf = [0u8; 4];
-                                    match file.read_exact(&mut size_buf) {
-                                        Ok(_) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                                        Err(e) => return Err(LSMError::Io(e)),
-                                    }
-                                    let size = u32::from_le_bytes(size_buf) as usize;
-                                    entry_bytes.resize(size, 0);
-                                    file.read_exact(&mut entry_bytes[..size])?;
-                                    let archived =
-                                        unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                                    if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                                        let val = if archived.tombstone {
-                                            None
-                                        } else {
-                                            Some((archived.value.to_native(), archived.seq.to_native()))
-                                        };
-                                        bucket_entries.push((archived.key.as_slice().to_vec(), val));
-                                    }
-                                }
-                            }
-                            Ok(bucket_entries)
-                        })
-                    })
-                    .collect();
+                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
                 for handle in handles {
                     match handle
                         .join()
@@ -3078,7 +3084,6 @@ impl LSMTree {
         // path. Only a same-bucket newer entry can shadow a bucket's L1 key (keys are
         // hash-sharded), so the slack is sharded per bucket — a global `|newer|` slack would
         // over-read every bucket by the total newer count. See `get_bucket_for_key`.
-        let bounded = limit <= BOUNDED_SCAN_LIMIT;
         match bounded {
             true => {
                 let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
