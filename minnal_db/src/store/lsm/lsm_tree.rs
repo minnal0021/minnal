@@ -2871,25 +2871,28 @@ impl LSMTree {
         newer.extend(active_snapshot);
 
         // L1 SSTables (oldest layer) — only buckets whose min/max reaches `start` (range is
-        // unbounded above). Bounded page → serial, read ≤ `limit + 1 + |newer|` LIVE keys per
-        // bucket; full/large scan → parallel, read-everything. See `range_pointers_bounded`.
-        let l1_cap = if limit <= BOUNDED_SCAN_LIMIT {
-            Some(limit.saturating_add(1).saturating_add(newer.len()))
-        } else {
-            None
-        };
-        match l1_cap {
-            Some(cap) => {
+        // unbounded above). Bounded page → serial, read ≤ `limit + 1 + |newer in THIS bucket|`
+        // LIVE keys per bucket (slack sharded per bucket since only a same-bucket newer entry
+        // can shadow a bucket's L1 key); full/large scan → parallel, read-everything. See
+        // `range_pointers_bounded`.
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
+        match bounded {
+            true => {
+                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
+                for (key, _) in newer.iter() {
+                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
+                }
                 for (bucket, file) in l1_files.iter().enumerate() {
                     if !self.l1_overlaps(bucket, start, None) {
                         continue;
                     }
+                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
                     self.for_each_l1_entry_in_range(bucket, file, start, None, Some(cap), |archived| {
                         all_entries.insert(archived.key.as_slice().to_vec(), !archived.tombstone);
                     })?;
                 }
             }
-            None => {
+            false => {
                 let mut first_err: Option<LSMError> = None;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = l1_files
@@ -3069,20 +3072,24 @@ impl LSMTree {
         // captured above make the metadata read race-safe (see `l1_overlaps`). Keys are
         // hash-sharded so bucket key-sets are disjoint.
         //
-        // Bounded page: read at most `limit + 1 + |newer in range|` LIVE keys per bucket and
-        // scan buckets SERIALLY — per-bucket work is tiny, so a thread per bucket costs more
-        // than it saves. Full/large scan: keep the parallel, read-everything path.
-        let l1_cap = if limit <= BOUNDED_SCAN_LIMIT {
-            Some(limit.saturating_add(1).saturating_add(newer.len()))
-        } else {
-            None
-        };
-        match l1_cap {
-            Some(cap) => {
+        // Bounded page: read at most `limit + 1 + |newer in range in THIS bucket|` LIVE keys
+        // per bucket and scan buckets SERIALLY — per-bucket work is tiny, so a thread per
+        // bucket costs more than it saves. Full/large scan: keep the parallel, read-everything
+        // path. Only a same-bucket newer entry can shadow a bucket's L1 key (keys are
+        // hash-sharded), so the slack is sharded per bucket — a global `|newer|` slack would
+        // over-read every bucket by the total newer count. See `get_bucket_for_key`.
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
+        match bounded {
+            true => {
+                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
+                for (key, _) in newer.iter() {
+                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
+                }
                 for (bucket, file) in l1_files.iter().enumerate() {
                     if !self.l1_overlaps(bucket, start, end) {
                         continue;
                     }
+                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
                     let mut entries = Vec::new();
                     self.scan_l1_range_into(bucket, file, start, end, Some(cap), &mut entries)?;
                     for (k, v) in entries {
@@ -3090,7 +3097,7 @@ impl LSMTree {
                     }
                 }
             }
-            None => {
+            false => {
                 let mut first_err: Option<LSMError> = None;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = l1_files
@@ -4899,6 +4906,98 @@ mod tests {
         assert_eq!(keys.len(), 20, "keys page must be full despite newer tombstones");
         assert_eq!(keys[0], b"k10");
         assert_eq!(keys[19], b"k29");
+        Ok(())
+    }
+
+    /// Per-bucket slack teeth: the L1 cap is sized by each bucket's OWN newer-entry count,
+    /// not a global one spread across buckets. Here 20 tombstones all hash to a SINGLE bucket
+    /// and sit at the page head; that bucket's cap must be `limit + 1 + 20` for the page to
+    /// come back full. A bound that undercounts the clustered bucket (e.g. `|newer| /
+    /// num_buckets ≈ 2`) would read only tombstones and short the page to empty.
+    #[test]
+    fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+        let num_buckets = 8;
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+
+        // 40 keys that all hash to bucket 0 (prefix "a", so they sort ahead of everything else).
+        let mut bucket0: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0u64;
+        while bucket0.len() < 40 {
+            let k = format!("a{i:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) == 0 {
+                bucket0.push(k);
+            }
+            i += 1;
+        }
+        // Filler spread across the OTHER buckets, at higher keys (prefix "b").
+        let mut others: Vec<Vec<u8>> = Vec::new();
+        let mut j = 0u64;
+        while others.len() < 40 {
+            let k = format!("b{j:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) != 0 {
+                others.push(k);
+            }
+            j += 1;
+        }
+        for (v, k) in bucket0.iter().chain(others.iter()).enumerate() {
+            lsm.insert(k, v as u128)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?; // all live in L1
+
+        // Delete the first 20 bucket-0 keys — all in ONE bucket, all at the page head.
+        for k in &bucket0[..20] {
+            lsm.delete(k)?;
+        }
+
+        // Scan the "a" range: only bucket 0 has in-range keys, so its per-bucket cap is what
+        // gates the page. limit=15 needs the cap to reach past all 20 head tombstones.
+        let pairs = lsm.range_pointers_bounded(b"a", Some(b"b"), 15)?;
+        let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _, _)| k.clone()).collect();
+        assert_eq!(keys.len(), 15, "page must be full despite 20 clustered tombstones in one bucket; got {}", keys.len());
+        assert_eq!(keys.as_slice(), &bucket0[20..35], "page must be the first live keys after the deleted head");
+        Ok(())
+    }
+
+    /// Keys-only twin of the clustered-tombstone per-bucket-slack test.
+    #[test]
+    fn test_range_keys_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+        let num_buckets = 8;
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+
+        let mut bucket0: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0u64;
+        while bucket0.len() < 40 {
+            let k = format!("a{i:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) == 0 {
+                bucket0.push(k);
+            }
+            i += 1;
+        }
+        let mut others: Vec<Vec<u8>> = Vec::new();
+        let mut j = 0u64;
+        while others.len() < 40 {
+            let k = format!("b{j:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) != 0 {
+                others.push(k);
+            }
+            j += 1;
+        }
+        for (v, k) in bucket0.iter().chain(others.iter()).enumerate() {
+            lsm.insert(k, v as u128)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?;
+
+        for k in &bucket0[..20] {
+            lsm.delete(k)?;
+        }
+
+        let keys = lsm.range_keys_bounded(b"a", 15)?;
+        assert_eq!(keys.len(), 15, "keys page must be full despite clustered tombstones; got {}", keys.len());
+        assert_eq!(keys.as_slice(), &bucket0[20..35]);
         Ok(())
     }
 
