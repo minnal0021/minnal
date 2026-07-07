@@ -23,6 +23,8 @@ It works in **two ways**, from the same engine:
 
 > **Companion UI:** [minnal0021/minnal_ui](https://github.com/minnal0021/minnal_ui) is a lightweight web UI that can be used to drive the minnal doc store.
 
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) serves the **gemma** embedding model over HTTP — the external dependency semantic search needs. Run it to get started with the minnal doc store's semantic search, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
+
 ---
 
 ## Table of Contents
