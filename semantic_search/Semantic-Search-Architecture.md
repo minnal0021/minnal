@@ -10,13 +10,15 @@ This document describes how semantic search works end-to-end: embedding generati
 
 Minnal does **not** generate embeddings itself. It relies on an **external embedding service** and treats it as the sole source of vectors: minnal prepares payloads, the service returns embeddings, and minnal quantises and indexes them as-is.
 
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) is a reference implementation that serves the **gemma** embedding model over HTTP — the external dependency described here. Run it, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
+
 The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`. Minnal does not negotiate or version models with the service — every request goes to fixed endpoints with no model identifier in the URL or body. Choosing the concrete model, and pinning its exact version, is entirely the embedding service's responsibility, decided server-side and applied uniformly to every request.
 
 The `model` name in the config (e.g. `qwen`) is therefore *not* used to select or version a model at request time. It is only an indication of which *family* of model the deployment is built around, and within minnal it serves a single purpose: selecting the matching cluster-centroid file and embedding dimension for this instance (validated at startup against `[[semantic_search.supported_models]]`). Keeping the config name aligned with whatever the embedding service actually serves is an operational convention, not something minnal enforces against the service.
 
 ### Service interface
 
-The service exposes a **batch interface** — chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service. A whole-text embedding is just a one-element `payloads` array; chunked (sliding-window) embeddings send one payload per chunk.
+Each request carries a **`payloads` array of strings and returns one embedding per string**, so a single HTTP call can embed many strings at once. Minnal decides how many strings to send: chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service, so the service never splits a string — it embeds exactly the strings it is given. To embed a whole text, minnal sends a `payloads` array with a single string; to embed a chunked (sliding-window) document, it sends one string per chunk — all in the same request.
 
 Two `POST` endpoints, identical in request/response shape, differing only in which side of the asymmetric model they target (documents are embedded differently from queries):
 
@@ -102,6 +104,8 @@ All quantised entries share the same `VectorIndex` struct:
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
+> **TODO — random rotation not yet implemented.** The current RaBitQ implementation quantises document and query vectors directly, without the **random orthogonal rotation** (random projection) that the RaBitQ paper applies to both the stored embeddings and the query before quantisation. The rotation decorrelates dimensions and tightens the error bound, so until it lands the estimated dot products are noisier than the theoretical guarantee. Applying a shared rotation matrix to both the embedding (at index time) and the query (at search time) is outstanding work.
+
 ---
 
 ## 3. IVF Index Structure
@@ -109,8 +113,8 @@ All quantised entries share the same `VectorIndex` struct:
 The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
 
 - A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
-- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid and returns the `n_probes` nearest (using `select_nth_unstable` to select the top-`n_probes` in ~O(C) rather than a full O(C log C) sort). The union of these sets across all query embeddings is scanned once.
-- **There is deliberately no neighbour graph / approximate cluster traversal.** At the cluster counts in use (hundreds), the exhaustive scan is microseconds and returns the *exact* nearest clusters, so a graph-based approximation would trade recall for no speed-up — the per-centroid distance computation dominates regardless. A sparse neighbour graph would only pay off at much larger cluster counts; revisit it (behind a config flag, with recall/latency benchmarking) only if the cluster file grows by orders of magnitude.
+- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. The union of these sets across all query embeddings is scanned once.
+- **Coarse-assignment cost is cheap at this scale.** The cost is **T·C·D** (query chunks × centroids × dim) — the distance scan runs once per query chunk. At C≈256 that is ~50 µs at 4 chunks, ~1.1 ms at 100 chunks (`bench_distance_estimation` → `coarse_assignment`). It grows *linearly with query length*, so it is not entirely free for long, many-chunk queries on a warm query-embedding cache (where the embedding round-trip no longer hides it), but it is a small fraction of a query at realistic lengths.
 
 Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
 
@@ -210,6 +214,8 @@ Three companion KVStore namespaces per semantic-search-enabled store (`vector_kv
 ## 6. Query Embedding Cache
 
 Query embeddings are cached in a system-wide TTL namespace `system_qemb_cache` shared across all doc-store namespaces. Keys are raw UTF-8 query strings; values are packed big-endian `f32` vectors. The TTL is **configurable** via `[semantic_search] query_embedding_cache_ttl_secs` and **defaults to 1 day** (86400 s) — once it elapses, stale entries are evicted automatically by the TTL worker. Cache misses fall back to the embedding service transparently.
+
+**Durability — no-WAL on all CRUD.** Every write to this namespace is no-WAL: both populating an entry on a cache miss (`put_no_wal`) and clearing the cache (`delete_no_wal`). Unlike the vector-payload cleanup deletes (§ above), which stay WAL-backed because a lost delete would orphan an index entry, the cache is TTL-bounded and fully regenerable — a dropped populate or a lost clear-delete just produces a future cache miss that re-fetches from the embedding service. Keeping it off the WAL removes a per-populate fsync from the query hot path (the latency motivation for caching in the first place).
 
 ---
 
@@ -325,7 +331,7 @@ All parameters are under `[semantic_search]` in the TOML config:
 | Parameter | Default | Description |
 |---|---|---|
 | `number_of_bits_for_dense_quantisation` | `8` | Bits per dimension for MultiBit (dense) quantisation. 4 = compact, 8 = high recall. Only affects Pass 2 precision. |
-| `n_probes` | `128` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower. |
+| `n_probes` | `32` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower — see *Tuning & profiling* below. |
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
 | `window_size` | `4` | Sentences/tokens per sliding-window chunk for SingleBit embeddings. |
 | `sliding_size` | `2` | Window advance step. Smaller than `window_size` → overlapping chunks. |
@@ -334,18 +340,62 @@ All parameters are under `[semantic_search]` in the TOML config:
 | `top_k_results` | `100` | Maximum results returned per query (overridable per-request). |
 | `query_embedding_cache_ttl_secs` | `86400` | TTL (seconds) for cached query embeddings in `system_qemb_cache`. Default is 1 day. |
 
+### Tuning & profiling `n_probes`
+
+`n_probes` is the primary recall/latency knob. Two on-demand harnesses in
+`minnal_doc_store/src/vector_kv.rs` (both `#[ignore]`d tests, run from the
+`minnal_doc_store/` crate root) measure the two axes it trades off:
+
+- **Latency** — `real_kv_search_profile` runs the real two-pass `search()` over a real
+  `minnal_db`-backed store (synthetic vectors, but real LSM + value-log `pread` I/O) and
+  phase-times coarse cluster pick, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the
+  scoring remainder, and the whole query — sweeping `n_probes ∈ {10, 32, 128}` at several
+  chunks-per-doc. It needs no embedding service.
+  ```sh
+  cargo test -p minnal_doc_store --lib real_kv_search_profile --release -- --ignored --nocapture
+  ```
+- **Recall** — `real_recall_vs_nprobes` indexes a real text corpus through the real
+  embedding service (the production `embed_document` → `upsert_vectors` path) and reports
+  `recall@k(n_probes) = |top_k(n_probes) ∩ top_k(exhaustive)| / k`, using the pipeline's
+  own **exhaustive-probe** (all clusters) ranking as ground truth — so it isolates the
+  recall lost by *reducing* `n_probes`, holding quantisation and re-ranking fixed. Requires
+  the embedding service and a JSONL corpus; env-gated via `MINNAL_EMBED_URL`,
+  `MINNAL_RECALL_CORPUS`, `MINNAL_RECALL_DOCS`, `MINNAL_RECALL_QUERIES` (soft-skips if either
+  is absent).
+  ```sh
+  MINNAL_EMBED_URL=http://<host>:8001 \
+    cargo test -p minnal_doc_store --lib real_recall_vs_nprobes --release -- --ignored --nocapture
+  ```
+
+Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency: 5000-doc
+synthetic store, 8 chunks/doc, warm cache):
+
+| `n_probes` | recall@10 | recall@100 | entire `search()` |
+|---|---|---|---|
+| 10 | 0.968 | 0.935 | 14.5 ms |
+| **32 (default)** | **0.986** | **0.978** | **18.7 ms** |
+| 128 | 1.000 | 0.999 | 26.4 ms |
+
+`32` is the default: it recovers most of the recall lost at `10` while staying ~29% cheaper
+than `128`. The dominant lever is **Pass-1 sparse-scan I/O**, which scales roughly linearly
+with `n_probes` (entries scanned grow in step); the SIMD dot products are a minority of the
+cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
+`first_pass_sparse_search_top_k` candidate set — so its share *shrinks* as `n_probes` rises.
+
 ---
 
 ## Key Files
 
 | Component | File |
 |---|---|
-| Embedding service client + two-pass search | `semantic_search/src/embedding/service/mod.rs` |
-| RaBitQ quantisation (encode + decode) | `semantic_search/src/embedding/quantisation/rabitq/mod.rs` |
-| `VectorIndex` struct + `VectorKvStore` trait | `semantic_search/src/embedding/index/vector_index.rs` |
-| Distance estimators (SingleBit, MultiBit) | `semantic_search/src/embedding/index/distance_estimator.rs` |
-| Cluster index (centroids) + exact top-`n_probes` probing | `semantic_search/src/embedding/cluster/mod.rs` |
-| Composite key encoding (cluster ‖ doc_id) | `semantic_search/src/embedding/index/composite_key.rs` |
+| Embedding service client + two-pass search | `semantic_search/src/service/mod.rs` |
+| RaBitQ quantisation (encode + decode) | `semantic_search/src/quantisation/rabitq/mod.rs` |
+| `VectorIndex` struct + `VectorKvStore` trait | `semantic_search/src/index/vector_index.rs` |
+| Distance estimators (SingleBit, MultiBit) | `semantic_search/src/index/distance_estimator.rs` |
+| Cluster index (centroids) + exact top-`n_probes` probing | `semantic_search/src/cluster/mod.rs` |
+| Composite key encoding (cluster ‖ doc_id) | `semantic_search/src/index/composite_key.rs` |
+| Coarse-assignment micro-benchmarks | `semantic_search/benches/bench_distance_estimation.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_doc_store/src/vector_kv.rs` |
+| Latency + recall profiling harnesses (see §9) | `minnal_doc_store/src/vector_kv.rs` (ignored tests) |
 | Async vector-index background worker | `minnal_doc_store/src/vec_index_worker.rs` |
 | Document store | `minnal_doc_store/src/store.rs` |

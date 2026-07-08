@@ -35,13 +35,15 @@ A third namespace, `{ns}_sparse_vector_meta`, records which clusters each docume
 
 **Durability split (no-WAL writes, WAL-backed deletes).** All three vector **writes** — `{ns}_sparse_vector`, `{ns}_sparse_vector_meta`, `{ns}_dense_vector` — are written with `put_no_wal` (`vector_kv::upsert_vectors`): the quantised payloads are bulky and reconstructable by re-embedding, so a per-chunk WAL fsync plus a second copy in the WAL is pure overhead. A crash before the memtable flush can drop a just-indexed vector (or flush one half and lose the other); that window is healed by vector-index reconciliation, which treats a doc as indexed only when **both** the sparse-meta and dense halves are present (`has_complete_vector_index`). The cleanup **deletes** are the exception and stay **WAL-backed** — the stale-cluster deletes on upsert and the full reverse-lookup `delete_vector` (reads `{ns}_sparse_vector_meta` to delete every composite key, then the dense entry). They are tiny key-only tombstones, and unlike a lost write a lost delete is *not* self-healing: reconciliation re-enqueues only docs *missing* an index, whereas a lost delete leaves an *orphan* composite key a re-embed never revisits.
 
+The **query-embedding cache** (`system_qemb_cache`, below) is a *separate* no-WAL story: it is no-WAL for **all** CRUD — both populate (`put_no_wal`) and clear (`delete_no_wal`). The vector-cleanup "deletes stay WAL-backed" reasoning does **not** apply because the cache is TTL-bounded and fully regenerable from the embedding service, so a dropped cache write or a lost clear-delete is harmless — the stale entry just expires (or is re-fetched on the next miss). Keeping it off the WAL removes a per-populate fsync from the query hot path. This relies on the engine's `AsyncNamespace::delete_no_wal` (the no-WAL counterpart of `put_no_wal`).
+
 ### Search (two-pass ANN)
 
 `embed_query` returns both query inputs from one service call (cached together in the `system_qemb_cache` TTL namespace, dense as element 0): the **sparse** chunk embeddings (`chunk_query` → N vectors) for Pass 1, and a **dense** single whole-query embedding for Pass 2. `search()` takes both as separate arguments and returns empty if either is empty. The cache is keyed only by query text — clear it (`DELETE /admin/indices/vector/query-cache`) after changing `window_size`/`sliding_size`, or stale chunkings are served until the TTL expires (configurable via `query_embedding_cache_ttl_secs`, default 1 day).
 
 **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
 1. Use the sparse query chunk embeddings (or fetch from the `system_qemb_cache` TTL namespace).
-2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks. This is an **exact, exhaustive** scan — `find_top_n_cluster_ids` computes the distance to *every* centroid and selects the `n_probes` nearest (`select_nth_unstable`, ~O(C)). There is **no neighbour graph / approximate traversal**: at the cluster counts in use the exact scan is microseconds and the per-centroid distance dominates, so a graph approximation would cost recall for no speed-up (revisit only at far larger, sparse cluster counts).
+2. For each query chunk, find the top-`n_probes` clusters by Euclidean distance; union across all query chunks. This is an **exact, exhaustive** scan — `ClusterIndex::find_top_n_cluster_ids_batch` computes the distance to *every* centroid (over a contiguous centroid matrix) and selects the `n_probes` nearest per chunk (`select_nth_unstable`, ~O(C)). There is **no neighbour graph / approximate traversal**: coarse-assignment cost is **T·C·D** (query chunks × centroids × dim), which at C≈256 is genuinely cheap (~50 µs at 4 chunks, ~1.1 ms at 100) — small vs the rest of a query even on a warm cache. A graph is the wrong lever — approximate on the most recall-sensitive stage, marginal at a few hundred nodes, no help on the per-chunk T factor. The contiguous-matrix scan is a measured ~12% win; **parallelising the per-chunk scans was tried and reverted (~2.4× slower — the work is microseconds, so the thread pool costs more than it saves)**; a blocked GEMM is the only remaining lever and only pays at far larger C. See `Semantic-Search-Architecture.md`.
 3. `scan_sparse_cluster(cluster_id)` for each probed cluster in parallel.
 4. Apply the optional `doc_filter` (RoaringBitmap predicate) — skip non-matching docs.
 5. Score with `SingleBitQuanDotProductEstimator` using **ColBERT MaxSim**:
@@ -89,7 +91,7 @@ cluster_path = "service/embedding_support/qwen/clusters.json"
 # embedding_service_url = "http://localhost:8001"
 
 # Number of IVF clusters probed in Pass 1.  Higher = better recall, slower.
-# n_probes = 128
+# n_probes = 32
 
 # Candidates kept after Pass 1 before dense re-ranking.
 # first_pass_sparse_search_top_k = 1000

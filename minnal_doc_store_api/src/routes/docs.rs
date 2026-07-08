@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{DocStoreError, Pagination};
+use minnal_doc_store::{DocStoreError, Pagination, SchemaError, StoreType};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -28,23 +28,32 @@ use crate::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve the key type for `ns` from the schema cache, or return 404.
-async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_doc_store::KeyType, AppError> {
-    state
-        .schemas
-        .read()
-        .await
-        .get(ns)
-        .map(|s| s.key_type)
-        .ok_or_else(|| DocStoreError::NotFound { namespace: ns.to_owned() }.into())
+/// Error for a namespace absent from the doc-schema cache: a kind-mismatch
+/// (409) when it exists as a KV store, otherwise not-found (404). Since doc and
+/// KV stores now share the `/stores/{ns}` prefix, hitting a doc endpoint on a KV
+/// namespace should say so rather than masquerade as 404.
+fn doc_cache_miss(state: &AppState, ns: &str) -> AppError {
+    match state.store.store_type(ns) {
+        Ok(StoreType::Kv) => DocStoreError::Schema(SchemaError::WrongStoreType {
+            namespace: ns.to_owned(),
+            expected: "doc",
+            found: "kv",
+        })
+        .into(),
+        _ => DocStoreError::NotFound { namespace: ns.to_owned() }.into(),
+    }
 }
 
-/// Resolve `(ns_id, key_type)` for `ns` from the schema cache, or return 404.
+/// Resolve the key type for `ns` from the schema cache, or the appropriate error.
+async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_doc_store::KeyType, AppError> {
+    state.schemas.read().await.get(ns).map(|s| s.key_type).ok_or_else(|| doc_cache_miss(state, ns))
+}
+
+/// Resolve `(ns_id, key_type)` for `ns` from the schema cache, or the
+/// appropriate error.
 async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(u32, minnal_doc_store::KeyType), AppError> {
     let schemas = state.schemas.read().await;
-    let schema = schemas
-        .get(ns)
-        .ok_or_else(|| AppError::from(DocStoreError::NotFound { namespace: ns.to_owned() }))?;
+    let schema = schemas.get(ns).ok_or_else(|| doc_cache_miss(state, ns))?;
     let ns_id = schema
         .ns_id
         .ok_or_else(|| AppError::from(DocStoreError::MissingNsId { namespace: ns.to_owned() }))?;

@@ -194,16 +194,20 @@ cluster_path = "./clusters.json"
 # batch POST: body {"payloads": [str, ...], "dimensions": N} -> {"embeddings": [[f32], ...]}.
 # Chunking/tokenisation happens in minnal, not the service.
 # Default: http://localhost:8001
-embedding_service_url = "http://192.168.10.155:8001"
-#embedding_service_url = "http://192.168.1.182:8001"
+# embedding_service_url = "http://192.168.10.155:8001"
+# embedding_service_url = "http://192.168.10.101:8001"
+embedding_service_url = "http://localhost:8001"
 
 # Embedding model to use.  Must match a name in [[semantic_search.supported_models]].
-# Default: qwen
+# Default: gemma
 # model = "qwen"
+model = "gemma"
 
 # Number of IVF clusters to probe during the sparse first-pass search (single-bit vectors).
-# Higher = better recall, slower queries.  Default: 128.
-n_probes = 128
+# Higher = better recall, slower queries. Measured tradeoff (2000-doc real corpus, recall
+# vs exhaustive 256-cluster probe): 10 → recall@10 0.968 / recall@100 0.935; 32 → 0.986 / 0.978;
+# 64 → ~lossless. 32 recovers most of the recall lost at 10 while keeping the scan-cost win.
+n_probes = 32
 
 # Number of candidates to retain after the first-pass sparse (single-bit) vector search
 # before re-scoring with the dense multi-bit index.  Default: 1000.
@@ -238,15 +242,22 @@ sliding_size = 2
 # ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — enabled embedding models
 #
-# Each entry declares one embedding model this instance may serve.  The server
-# validates at startup that the cluster file for every listed model exists at
+# Each entry declares one embedding model this instance may serve.  The model
+# set is data-driven: any name is accepted.  At startup the server validates
+# that the cluster file for every listed model exists at
 #   service/embedding_support/{name}/clusters.json
+# and that its centroids match the declared dimension.  To add a model, drop its
+# clusters.json under that path and add an entry here — no code change needed.
 #
 # Fields:
-#   name      — model identifier (case-insensitive); currently only "qwen"
-#               is supported.
+#   name      — model identifier (case-insensitive; lower-cased to form the
+#               cluster-file sub-directory).
 #   dimension — embedding dimensionality the model produces (u16).
 # ---------------------------------------------------------------------------
+
+[[semantic_search.supported_models]]
+name = "gemma"
+dimension = 768
 
 [[semantic_search.supported_models]]
 name = "qwen"

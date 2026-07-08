@@ -363,6 +363,24 @@ impl Drop for L0ReadGuard {
     }
 }
 
+/// The smallest key strictly greater than every key that has `prefix` as a
+/// prefix, so a prefix scan over `P` equals a range scan over `[P, upper)`.
+///
+/// Increments the last byte that is not `0xFF` and drops the all-`0xFF` tail.
+/// Returns `None` when `prefix` is empty or all `0xFF` — there is no finite upper
+/// bound, so the caller scans to the end of the keyspace.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(upper);
+        }
+        upper.pop();
+    }
+    None
+}
+
 /// Whether `a` is a strictly-newer write sequence than `b`, using the same
 /// wraparound-aware serial-number comparison as the memtable
 /// (`SkipList::seq_is_newer_or_equal`). Resolution across layers picks the entry
@@ -1840,11 +1858,20 @@ impl LSMTree {
         // SSTables (oldest layers), buckets scanned in parallel. Each bucket
         // captures L0 before L1 internally and returns entries ordered L1 (oldest)
         // → L0 (oldest→newest) with tombstones carried as `None`.
+        //
+        // Only buckets that could hold a matching key spawn a worker: one whose L1
+        // does not overlap `[prefix, upper)` *and* has no non-obsolete L0 file has
+        // nothing to contribute. A key that races into such a bucket after this
+        // check (memtable→L0 flush, or L0→L1 merge) was already in the memtable
+        // snapshot captured above, so skipping the spawn cannot drop it.
+        let upper_owned = prefix_upper_bound(prefix);
+        let upper = upper_owned.as_deref();
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = (0u32..self.config.num_buckets as u32)
-                    .map(|bucket| s.spawn(move || self.scan_prefix_in_bucket(bucket, prefix)))
+                    .filter(|&bucket| self.bucket_has_nonobsolete_l0(bucket as usize) || self.l1_overlaps(bucket as usize, prefix, upper))
+                    .map(|bucket| s.spawn(move || self.scan_prefix_in_bucket(bucket, prefix, upper)))
                     .collect();
                 for handle in handles {
                     match handle
@@ -1887,6 +1914,118 @@ impl LSMTree {
         Ok(all_entries.into_iter().filter_map(|(key, val)| val.map(|(v, s)| (key, v, s))).collect())
     }
 
+    /// Whether this bucket's L1 file holds any key in `[start, end)`, decided from
+    /// the in-memory min/max metadata alone (no file I/O). A `false` provably means
+    /// the L1 file has no matching key, so a scan can skip reading it entirely; an
+    /// empty/absent L1 (no metadata, or `entry_count == 0`) is also `false`.
+    ///
+    /// Safe under concurrent compaction *provided the caller has already captured
+    /// this bucket's L0 read guards*: a merge marks the old L0 files obsolete only
+    /// after installing the new L1 file and updating this metadata (see
+    /// `merge_level0_to_level1`). So whatever version of the metadata a scan reads,
+    /// any key it would cause the scan to skip is either already reflected here or
+    /// still present in a captured (not-yet-obsolete) L0 file — never invisible.
+    fn l1_overlaps(&self, bucket: usize, start: &[u8], end: Option<&[u8]>) -> bool {
+        let metadata = self.sstable_metadata[bucket].read();
+        match metadata.first() {
+            Some(meta) if meta.entry_count > 0 => meta.max_key.as_slice() >= start && end.is_none_or(|e| meta.min_key.as_slice() < e),
+            _ => false,
+        }
+    }
+
+    /// Whether this bucket has any non-obsolete Level-0 file. Used only to decide
+    /// whether a scan needs to spawn a worker for the bucket at all.
+    fn bucket_has_nonobsolete_l0(&self, bucket: usize) -> bool {
+        self.level0_files[bucket].read().iter().any(|e| !e.is_obsolete())
+    }
+
+    /// Read this bucket's L1 file for keys in `[start, end)`, appending each as a
+    /// [`ScanEntry`] (tombstone carried as `None`). Entries are key-sorted, so the
+    /// scan seeks near `start` via the sparse index and stops as soon as it reaches
+    /// `end`.
+    ///
+    /// The sparse-index offset is validated against the file with `valid_scan_start`
+    /// (a concurrent compaction can swap the file under the in-memory index): a
+    /// stale hint just falls back to a full scan from 0, so it is a performance
+    /// hint, never a correctness input.
+    fn scan_l1_range_into(&self, bucket: usize, file: &File, start: &[u8], end: Option<&[u8]>, max_live: Option<usize>, out: &mut Vec<ScanEntry>) -> Result<()> {
+        self.for_each_l1_entry_in_range(bucket, file, start, end, max_live, |archived| {
+            let val = if archived.tombstone {
+                None
+            } else {
+                Some((archived.value.to_native(), archived.seq.to_native()))
+            };
+            out.push((archived.key.as_slice().to_vec(), val));
+        })
+    }
+
+    /// Visit every L1 entry whose key is in `[start, end)`, in ascending key order,
+    /// seeking near `start` via the sparse index and stopping at `end`.
+    ///
+    /// The shared L1 range primitive behind `scan_l1_range_into`, `scan_prefixes`
+    /// (once per requested prefix), and `range_keys_bounded`. `visit` receives each
+    /// archived entry (borrowed only for the call) so callers extract whatever value
+    /// shape they need — pointer+seq, pointer only, or liveness.
+    ///
+    /// The sparse-index offset is validated against the file (`valid_scan_start`): a
+    /// stale hint after a concurrent compaction falls back to a full scan, so it is a
+    /// performance hint, never a correctness input.
+    /// `max_live`, when set, stops the scan after that many **non-tombstone** entries
+    /// have been visited (tombstones are still visited but do not count). This is the
+    /// per-bucket early-stop that bounds a paginated scan: since keys are hash-sharded
+    /// (each key lives in exactly one bucket) and this file is key-sorted, a bucket's
+    /// smallest `k` live keys are enough for the caller to assemble the global smallest
+    /// `k`. Callers that need the whole range (unbounded scans) pass `None`.
+    fn for_each_l1_entry_in_range(
+        &self,
+        bucket: usize,
+        file: &File,
+        start: &[u8],
+        end: Option<&[u8]>,
+        max_live: Option<usize>,
+        mut visit: impl FnMut(&ArchivedSStableEntry),
+    ) -> Result<()> {
+        let start_offset = {
+            let index = self.sstable_indexes[bucket].read();
+            index.as_ref().map(|i| i.block_start(start)).unwrap_or(0)
+        };
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut offset = if start_offset != 0 && Self::valid_scan_start(file, start_offset, file_len, start) {
+            start_offset
+        } else {
+            0
+        };
+
+        let mut live_seen = 0usize;
+        let mut entry_bytes = Vec::new();
+        loop {
+            let mut size_buf = [0u8; 4];
+            if !Self::read_exact_at(file, &mut size_buf, &mut offset)? {
+                break;
+            }
+            let size = u32::from_le_bytes(size_buf) as usize;
+            entry_bytes.resize(size, 0);
+            Self::read_exact_at(file, &mut entry_bytes[..size], &mut offset)?;
+            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+            let key = archived.key.as_slice();
+            // Sorted order: once we reach `end`, no later key can match.
+            if end.is_some_and(|e| key >= e) {
+                break;
+            }
+            // The seeked block may begin below `start`; skip those pre-window keys.
+            if key >= start {
+                visit(archived);
+                if !archived.tombstone {
+                    live_seen += 1;
+                    if max_live.is_some_and(|m| live_seen >= m) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Scan prefix within a specific SSTable bucket using key_prefix for efficiency.
     ///
     /// Returns matching entries as `(key, Option<pointer>)` ordered **L1 (oldest)
@@ -1897,7 +2036,12 @@ impl LSMTree {
     /// the old implementation did) resurrected deleted keys and could surface a
     /// stale L1 value over an updated L0 one, because L0 holds entries — including
     /// tombstones — not yet compacted into L1.
-    fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8]) -> Result<Vec<ScanEntry>> {
+    ///
+    /// `upper` is the prefix's upper bound (`prefix_upper_bound(prefix)`): the L1
+    /// read skips a non-overlapping file via min/max and seeks via the sparse index
+    /// over `[prefix, upper)`. L0 files carry no min/max or index, so they are still
+    /// scanned in full with a prefix match.
+    fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8], upper: Option<&[u8]>) -> Result<Vec<ScanEntry>> {
         let mut results = Vec::new();
         let mut entry_bytes = Vec::new();
 
@@ -1928,31 +2072,15 @@ impl LSMTree {
                 .collect()
         };
         l0_guards.sort_by(|a, b| a.entry.created_at_ms.cmp(&b.entry.created_at_ms));
-        let level1_file = self.sstable_files[bucket as usize].read().clone();
 
-        // Search the Level 1 file (oldest layer) first.
-        let mut offset = 0u64;
-        loop {
-            let mut size_buf = [0u8; 4];
-            if !Self::read_exact_at(&level1_file, &mut size_buf, &mut offset)? {
-                break;
-            }
-
-            let size = u32::from_le_bytes(size_buf) as usize;
-            entry_bytes.resize(size, 0);
-            Self::read_exact_at(&level1_file, &mut entry_bytes[..size], &mut offset)?;
-
-            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-
-            let key_slice = archived.key.as_slice();
-            if matches_prefix(archived, key_slice) {
-                let val = if archived.tombstone {
-                    None
-                } else {
-                    Some((archived.value.to_native(), archived.seq.to_native()))
-                };
-                results.push((key_slice.to_vec(), val));
-            }
+        // Search the Level 1 file (oldest layer) first — but only if its min/max
+        // says it overlaps `[prefix, upper)`, and then seeking near `prefix` via the
+        // sparse index rather than reading from offset 0. The L0 guards are captured
+        // above, before this metadata read, so the skip is race-safe (see
+        // `l1_overlaps`). `[prefix, upper)` is exactly the keys starting with `prefix`.
+        if self.l1_overlaps(bucket as usize, prefix, upper) {
+            let level1_file = self.sstable_files[bucket as usize].read().clone();
+            self.scan_l1_range_into(bucket as usize, &level1_file, prefix, upper, None, &mut results)?;
         }
 
         // Then the captured Level 0 files oldest-first.
@@ -2035,47 +2163,38 @@ impl LSMTree {
         // order (L1 then L0). Guards in `l0_guards` pin the files until we finish.
         let (l0_guards, l1_files) = self.capture_sstable_layers();
 
-        // ── 1. L1 SSTables (oldest layer) — all buckets read in parallel ──────
+        // Each requested prefix is a 4-byte big-endian cluster id; a prefix scan
+        // over id `P` is a range over `[P, P+1)`. Sorted so per-bucket seeks are
+        // monotonic. The span `[min_id, max_id+1)` gives a cheap per-bucket overlap
+        // test (keys are hash-sharded, so a bucket's L1 spans many ids), and each
+        // bucket then seeks per requested id via the sparse index rather than
+        // reading the whole file — the win for probing a few clusters out of a
+        // large L1.
+        let mut sorted_ids: Vec<u32> = prefix_ids.iter().copied().collect();
+        sorted_ids.sort_unstable();
+        let sorted_ids = &sorted_ids;
+        let span_start = sorted_ids[0].to_be_bytes();
+        let span_end: Option<[u8; 4]> = sorted_ids[sorted_ids.len() - 1].checked_add(1).map(u32::to_be_bytes);
+        let span_end = span_end.as_ref().map(|e| e.as_slice());
+
+        // ── 1. L1 SSTables (oldest layer) — overlapping buckets read in parallel ─
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = l1_files
                     .iter()
-                    .map(|file| {
-                        s.spawn(|| -> Result<Vec<(Vec<u8>, Option<u128>)>> {
-                            let file_size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                            if file_size == 0 {
-                                return Ok(Vec::new());
-                            }
-                            let mut file_buf = vec![0u8; file_size];
-                            let mut total_read = 0usize;
-                            while total_read < file_size {
-                                match file.read_at(&mut file_buf[total_read..], total_read as u64) {
-                                    Ok(0) => break,
-                                    Ok(n) => total_read += n,
-                                    Err(e) => return Err(LSMError::Io(e)),
-                                }
-                            }
-                            let file_content = &file_buf[..total_read];
+                    .enumerate()
+                    .filter(|(bucket, _)| self.l1_overlaps(*bucket, &span_start, span_end))
+                    .map(|(bucket, file)| {
+                        s.spawn(move || -> Result<Vec<(Vec<u8>, Option<u128>)>> {
                             let mut entries = Vec::new();
-                            let mut pos = 0usize;
-                            while pos + 4 <= file_content.len() {
-                                let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
-                                pos += 4;
-                                if pos + size > file_content.len() {
-                                    break;
-                                }
-                                let entry_slice = &file_content[pos..pos + size];
-                                pos += size;
-                                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(entry_slice)?) };
-                                if archived.key.len() >= 4 {
-                                    let prefix_be = archived.key_prefix.to_native().to_be_bytes();
-                                    let prefix_id = u32::from_be_bytes(prefix_be[..4].try_into().unwrap());
-                                    if prefix_ids.contains(&prefix_id) {
-                                        let val = if archived.tombstone { None } else { Some(archived.value.to_native()) };
-                                        entries.push((archived.key.as_slice().to_vec(), val));
-                                    }
-                                }
+                            for &prefix_id in sorted_ids {
+                                let start = prefix_id.to_be_bytes();
+                                let end = prefix_id.checked_add(1).map(u32::to_be_bytes);
+                                self.for_each_l1_entry_in_range(bucket, file, &start, end.as_ref().map(|e| e.as_slice()), None, |archived| {
+                                    let val = if archived.tombstone { None } else { Some(archived.value.to_native()) };
+                                    entries.push((archived.key.as_slice().to_vec(), val));
+                                })?;
                             }
                             Ok(entries)
                         })
@@ -2105,12 +2224,14 @@ impl LSMTree {
         }
 
         // ── 2. L0 SSTables (newer than L1) — captured guards, oldest-first per
-        //    bucket so newer L0 entries overwrite older ones. All buckets parallel.
+        //    bucket so newer L0 entries overwrite older ones. Only buckets that hold
+        //    a captured L0 file spawn a worker (L0 has no min/max or sparse index).
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
                 let handles: Vec<_> = l0_guards
                     .iter()
+                    .filter(|guards| !guards.is_empty())
                     .map(|guards| {
                         s.spawn(move || -> Result<Vec<(Vec<u8>, Option<u128>)>> {
                             let mut bucket_entries = Vec::new();
@@ -2262,16 +2383,21 @@ impl LSMTree {
                             let mut lookup: std::collections::HashMap<Vec<u8>, usize> = pending.iter().map(|&idx| (keys[idx].clone(), idx)).collect();
                             let mut updates: Vec<IdxEntry> = Vec::new();
 
-                            // Level 0: newest-first; remove from lookup on first hit so
-                            // the newest L0 file wins over older ones for the same key.
-                            let mut l0_entries = self.level0_entries_snapshot(bucket as u32);
-                            l0_entries.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
-                            for entry in &l0_entries {
-                                if entry.is_obsolete() || lookup.is_empty() {
-                                    continue;
+                            // Level 0: captured newest-first. The guards are held for the whole
+                            // bucket's work (through the L1 pre-filter below), so a key a stale
+                            // L1 skip would drop is still in a captured, already-scanned L0 file.
+                            let mut l0_guards: Vec<L0ReadGuard> = self
+                                .level0_entries_snapshot(bucket as u32)
+                                .iter()
+                                .filter(|e| !e.is_obsolete())
+                                .map(|e| L0ReadGuard::new(Arc::clone(e)))
+                                .collect();
+                            l0_guards.sort_by(|a, b| b.entry.created_at_ms.cmp(&a.entry.created_at_ms));
+                            for guard in &l0_guards {
+                                if lookup.is_empty() {
+                                    break;
                                 }
-                                let _guard = L0ReadGuard::new(Arc::clone(entry));
-                                let mut file = File::open(&entry.path)?;
+                                let mut file = File::open(&guard.entry.path)?;
                                 let mut entry_bytes: Vec<u8> = Vec::new();
                                 loop {
                                     let mut size_buf = [0u8; 4];
@@ -2299,6 +2425,45 @@ impl LSMTree {
 
                             if lookup.is_empty() {
                                 return Ok(updates);
+                            }
+
+                            // L1 pre-filter: drop keys that provably cannot be in this bucket's L1
+                            // file, so a bucket whose every remaining key is out of range or
+                            // bloom-negative skips the whole-file read entirely. Same exact
+                            // fast-rejects the point-lookup path uses (`lookup_level1`): min/max is
+                            // exact, a bloom negative is exact.
+                            //
+                            // Race-safety mirrors the scan paths: the L0 guards captured above are
+                            // still held, and `merge_level0_to_level1` installs the new L1 file +
+                            // metadata/bloom BEFORE marking the old L0 files obsolete. So any key
+                            // left in `lookup` that stale L1 metadata would let us skip must still
+                            // be in a captured L0 file — which we have already scanned and removed
+                            // from `lookup`. A key still in `lookup` and rejected here is therefore
+                            // absent from every layer below the memtable, so leaving it `None` is
+                            // correct.
+                            //
+                            // Conservative like `lookup_level1`: filters are applied only when the
+                            // metadata/bloom are actually present. Absent metadata (e.g. a load
+                            // failure on a non-empty file) applies no filter, so we fall through and
+                            // read rather than risk skipping a live key — the L1 read stays correct.
+                            {
+                                let min_max = {
+                                    let meta = self.sstable_metadata[bucket].read();
+                                    meta.first().filter(|m| m.entry_count > 0).map(|m| (m.min_key.clone(), m.max_key.clone()))
+                                };
+                                if let Some((min_key, max_key)) = min_max {
+                                    lookup.retain(|k, _| k.as_slice() >= min_key.as_slice() && k.as_slice() <= max_key.as_slice());
+                                }
+                                if !lookup.is_empty() {
+                                    let bloom = self.sstable_blooms[bucket].read();
+                                    if let Some(bloom) = bloom.as_ref() {
+                                        lookup.retain(|k, _| bloom.contains(k));
+                                    }
+                                }
+                                if lookup.is_empty() {
+                                    // Every remaining key is provably absent from L1 — skip the read.
+                                    return Ok(updates);
+                                }
                             }
 
                             // Level 1: single large read, then in-memory key lookup.
@@ -2636,57 +2801,62 @@ impl LSMTree {
         // SSTable handles captured newest-first (L0 before L1); read in merge order.
         let (l0_guards, l1_files) = self.capture_sstable_layers();
 
-        // 1. L1 SSTables (oldest layer) — all buckets read in parallel.
-        {
+        // Pages ≤ this bound use the limit-bounded serial L1 path; larger scans keep the
+        // parallel read-everything path.
+        const BOUNDED_SCAN_LIMIT: usize = 10_000;
+
+        // Collect the layers NEWER than L1 (L0 oldest-first per bucket → RO → active) into
+        // one list in oldest→newest order — used to bound the L1 scan (over-read by the
+        // newer in-range count, a safe upper bound on same-bucket deletes) and replayed over
+        // L1 afterwards. See `range_pointers_bounded` for the full rationale.
+        let mut newer: Vec<(Vec<u8>, bool)> = Vec::new();
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
+
+        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
+        // range-filtered (`>= start`). L0 has no min/max or sparse index, so files are scanned
+        // in full.
+        let read_l0_bucket = |bucket: usize| -> Result<Vec<(Vec<u8>, bool)>> {
+            let mut bucket_entries = Vec::new();
+            for guard in &l0_guards[bucket] {
+                let mut file = File::open(&guard.entry.path)?;
+                let mut entry_bytes: Vec<u8> = Vec::new();
+                loop {
+                    let mut size_buf = [0u8; 4];
+                    match file.read_exact(&mut size_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(LSMError::Io(e)),
+                    }
+                    let size = u32::from_le_bytes(size_buf) as usize;
+                    entry_bytes.resize(size, 0);
+                    file.read_exact(&mut entry_bytes[..size])?;
+                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+                    if archived.key.as_slice() >= start {
+                        bucket_entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
+                    }
+                }
+            }
+            Ok(bucket_entries)
+        };
+
+        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY (L0 is small in the
+        // steady state, so a thread per bucket costs more than it saves); full/large scan →
+        // parallel read-everything. See `range_pointers_bounded`.
+        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
+        if bounded {
+            for bucket in busy_l0 {
+                newer.extend(read_l0_bucket(bucket)?);
+            }
+        } else {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
-                let handles: Vec<_> = l1_files
-                    .iter()
-                    .map(|file| {
-                        s.spawn(|| -> Result<Vec<(Vec<u8>, bool)>> {
-                            let file_size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                            if file_size == 0 {
-                                return Ok(Vec::new());
-                            }
-                            let mut file_buf = vec![0u8; file_size];
-                            let mut total_read = 0usize;
-                            while total_read < file_size {
-                                match file.read_at(&mut file_buf[total_read..], total_read as u64) {
-                                    Ok(0) => break,
-                                    Ok(n) => total_read += n,
-                                    Err(e) => return Err(LSMError::Io(e)),
-                                }
-                            }
-                            let file_content = &file_buf[..total_read];
-                            let mut entries = Vec::new();
-                            let mut pos = 0usize;
-                            while pos + 4 <= file_content.len() {
-                                let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
-                                pos += 4;
-                                if pos + size > file_content.len() {
-                                    break;
-                                }
-                                let entry_slice = &file_content[pos..pos + size];
-                                pos += size;
-                                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(entry_slice)?) };
-                                if archived.key.as_slice() >= start {
-                                    entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
-                                }
-                            }
-                            Ok(entries)
-                        })
-                    })
-                    .collect();
+                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
                 for handle in handles {
                     match handle
                         .join()
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
-                        Ok(entries) => {
-                            for (k, v) in entries {
-                                all_entries.insert(k, v);
-                            }
-                        }
+                        Ok(entries) => newer.extend(entries),
                         Err(e) => {
                             if first_err.is_none() {
                                 first_err = Some(e);
@@ -2699,75 +2869,79 @@ impl LSMTree {
                 return Err(e);
             }
         }
-
-        // 2. L0 SSTables (newer than L1) — captured guards, oldest-first per bucket
-        //    so newer L0 entries shadow older ones. All buckets in parallel.
-        {
-            let l0_ref = &l0_guards;
-            let mut first_err: Option<LSMError> = None;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = (0..self.config.num_buckets)
-                    .map(|bucket| {
-                        s.spawn(move || -> Result<Vec<(Vec<u8>, bool)>> {
-                            let mut bucket_entries = Vec::new();
-                            for guard in &l0_ref[bucket] {
-                                let mut file = File::open(&guard.entry.path)?;
-                                let mut entry_bytes: Vec<u8> = Vec::new();
-                                loop {
-                                    let mut size_buf = [0u8; 4];
-                                    match file.read_exact(&mut size_buf) {
-                                        Ok(_) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                                        Err(e) => return Err(LSMError::Io(e)),
-                                    }
-                                    let size = u32::from_le_bytes(size_buf) as usize;
-                                    entry_bytes.resize(size, 0);
-                                    file.read_exact(&mut entry_bytes[..size])?;
-                                    let archived =
-                                        unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                                    if archived.key.as_slice() >= start {
-                                        bucket_entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
-                                    }
-                                }
-                            }
-                            Ok(bucket_entries)
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    match handle
-                        .join()
-                        .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                    {
-                        Ok(entries) => {
-                            for (k, v) in entries {
-                                all_entries.insert(k, v);
-                            }
-                        }
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                        }
-                    }
-                }
-            });
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-
-        // 3. Read-only memtables oldest-first — overwrite SSTable data.
         for ro_memtable in ro_snapshot.iter() {
             for record in ro_memtable.records().iter() {
                 if record.key.as_slice() >= start {
-                    all_entries.insert(record.key.clone(), !record.tombstone);
+                    newer.push((record.key.clone(), !record.tombstone));
+                }
+            }
+        }
+        newer.extend(active_snapshot);
+
+        // L1 SSTables (oldest layer) — only buckets whose min/max reaches `start` (range is
+        // unbounded above). Bounded page → serial, read ≤ `limit + 1 + |newer in THIS bucket|`
+        // LIVE keys per bucket (slack sharded per bucket since only a same-bucket newer entry
+        // can shadow a bucket's L1 key); full/large scan → parallel, read-everything. See
+        // `range_pointers_bounded`.
+        match bounded {
+            true => {
+                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
+                for (key, _) in newer.iter() {
+                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
+                }
+                for (bucket, file) in l1_files.iter().enumerate() {
+                    if !self.l1_overlaps(bucket, start, None) {
+                        continue;
+                    }
+                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
+                    self.for_each_l1_entry_in_range(bucket, file, start, None, Some(cap), |archived| {
+                        all_entries.insert(archived.key.as_slice().to_vec(), !archived.tombstone);
+                    })?;
+                }
+            }
+            false => {
+                let mut first_err: Option<LSMError> = None;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = l1_files
+                        .iter()
+                        .enumerate()
+                        .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, None))
+                        .map(|(bucket, file)| {
+                            s.spawn(move || -> Result<Vec<(Vec<u8>, bool)>> {
+                                let mut entries = Vec::new();
+                                self.for_each_l1_entry_in_range(bucket, file, start, None, None, |archived| {
+                                    entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
+                                })?;
+                                Ok(entries)
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        match handle
+                            .join()
+                            .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
+                        {
+                            Ok(entries) => {
+                                for (k, v) in entries {
+                                    all_entries.insert(k, v);
+                                }
+                            }
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Some(e) = first_err {
+                    return Err(e);
                 }
             }
         }
 
-        // 4. Active memtable (newest layer) — overwrites everything below.
-        for (key, live) in active_snapshot {
+        // Replay the newer layers over L1 (oldest→newest).
+        for (key, live) in newer {
             all_entries.insert(key, live);
         }
 
@@ -2818,64 +2992,66 @@ impl LSMTree {
         // SSTable handles captured newest-first (L0 before L1); read in merge order.
         let (l0_guards, l1_files) = self.capture_sstable_layers();
 
-        // 1. L1 SSTables (oldest layer) — all buckets read in parallel. Keys are
-        //    hash-sharded so bucket key-sets are disjoint; no cross-bucket tombstone
-        //    interactions exist.
-        {
+        // Pages ≤ this bound use the limit-bounded serial L1 path; larger scans keep the
+        // parallel read-everything path (see the L1 step below).
+        const BOUNDED_SCAN_LIMIT: usize = 10_000;
+
+        // Collect the layers NEWER than L1 — L0 (oldest-first per bucket), then read-only
+        // memtables (oldest-first), then the active memtable (newest) — into one list in
+        // that oldest→newest order. Two uses: (a) bound the L1 scan (a page needs only each
+        // bucket's smallest `limit` live keys, but a newer-layer tombstone can delete one,
+        // so we over-read by the count of newer in-range entries — a safe upper bound on
+        // possible deletes, since keys are bucket-partitioned so only a same-bucket newer
+        // entry can shadow a bucket's L1 key); (b) replay over L1 for identical
+        // tombstone-suppression semantics.
+        let mut newer: Vec<ScanEntry> = Vec::new();
+        let bounded = limit <= BOUNDED_SCAN_LIMIT;
+
+        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
+        // range-filtered. L0 has no min/max or sparse index, so files are scanned in full.
+        let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
+            let mut bucket_entries = Vec::new();
+            for guard in &l0_guards[bucket] {
+                let mut file = File::open(&guard.entry.path)?;
+                let mut entry_bytes: Vec<u8> = Vec::new();
+                loop {
+                    let mut size_buf = [0u8; 4];
+                    match file.read_exact(&mut size_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(LSMError::Io(e)),
+                    }
+                    let size = u32::from_le_bytes(size_buf) as usize;
+                    entry_bytes.resize(size, 0);
+                    file.read_exact(&mut entry_bytes[..size])?;
+                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+                    if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
+                        let val = if archived.tombstone { None } else { Some((archived.value.to_native(), archived.seq.to_native())) };
+                        bucket_entries.push((archived.key.as_slice().to_vec(), val));
+                    }
+                }
+            }
+            Ok(bucket_entries)
+        };
+
+        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY: L0 is small in the
+        // steady state, so spawning a thread per bucket costs more than it saves (same
+        // reasoning as the bounded L1 path below). Full/large scan → parallel read-everything.
+        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
+        if bounded {
+            for bucket in busy_l0 {
+                newer.extend(read_l0_bucket(bucket)?);
+            }
+        } else {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
-                let handles: Vec<_> = l1_files
-                    .iter()
-                    .map(|file| {
-                        s.spawn(|| -> Result<Vec<ScanEntry>> {
-                            let file_size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                            if file_size == 0 {
-                                return Ok(Vec::new());
-                            }
-                            let mut file_buf = vec![0u8; file_size];
-                            let mut total_read = 0usize;
-                            while total_read < file_size {
-                                match file.read_at(&mut file_buf[total_read..], total_read as u64) {
-                                    Ok(0) => break,
-                                    Ok(n) => total_read += n,
-                                    Err(e) => return Err(LSMError::Io(e)),
-                                }
-                            }
-                            let file_content = &file_buf[..total_read];
-                            let mut entries = Vec::new();
-                            let mut pos = 0usize;
-                            while pos + 4 <= file_content.len() {
-                                let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
-                                pos += 4;
-                                if pos + size > file_content.len() {
-                                    break;
-                                }
-                                let entry_slice = &file_content[pos..pos + size];
-                                pos += size;
-                                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(entry_slice)?) };
-                                if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                                    let val = if archived.tombstone {
-                                        None
-                                    } else {
-                                        Some((archived.value.to_native(), archived.seq.to_native()))
-                                    };
-                                    entries.push((archived.key.as_slice().to_vec(), val));
-                                }
-                            }
-                            Ok(entries)
-                        })
-                    })
-                    .collect();
+                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
                 for handle in handles {
                     match handle
                         .join()
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
-                        Ok(entries) => {
-                            for (k, v) in entries {
-                                all_entries.insert(k, v);
-                            }
-                        }
+                        Ok(entries) => newer.extend(entries),
                         Err(e) => {
                             if first_err.is_none() {
                                 first_err = Some(e);
@@ -2888,80 +3064,86 @@ impl LSMTree {
                 return Err(e);
             }
         }
-
-        // 2. L0 SSTables (newer than L1) — captured guards, oldest-first per bucket
-        //    so newer L0 entries shadow older ones. All buckets in parallel.
-        {
-            let l0_ref = &l0_guards;
-            let mut first_err: Option<LSMError> = None;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = (0..self.config.num_buckets)
-                    .map(|bucket| {
-                        s.spawn(move || -> Result<Vec<ScanEntry>> {
-                            let mut bucket_entries = Vec::new();
-                            for guard in &l0_ref[bucket] {
-                                let mut file = File::open(&guard.entry.path)?;
-                                let mut entry_bytes: Vec<u8> = Vec::new();
-                                loop {
-                                    let mut size_buf = [0u8; 4];
-                                    match file.read_exact(&mut size_buf) {
-                                        Ok(_) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                                        Err(e) => return Err(LSMError::Io(e)),
-                                    }
-                                    let size = u32::from_le_bytes(size_buf) as usize;
-                                    entry_bytes.resize(size, 0);
-                                    file.read_exact(&mut entry_bytes[..size])?;
-                                    let archived =
-                                        unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                                    if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                                        let val = if archived.tombstone {
-                                            None
-                                        } else {
-                                            Some((archived.value.to_native(), archived.seq.to_native()))
-                                        };
-                                        bucket_entries.push((archived.key.as_slice().to_vec(), val));
-                                    }
-                                }
-                            }
-                            Ok(bucket_entries)
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    match handle
-                        .join()
-                        .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                    {
-                        Ok(entries) => {
-                            for (k, v) in entries {
-                                all_entries.insert(k, v);
-                            }
-                        }
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                        }
-                    }
-                }
-            });
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-
-        // 3. Read-only memtables oldest-first — overwrite SSTable data.
         for ro_memtable in ro_snapshot.iter() {
             for record in ro_memtable.records().iter() {
                 if record.key.as_slice() >= start && end.is_none_or(|e| record.key.as_slice() < e) {
-                    all_entries.insert(record.key.clone(), if record.tombstone { None } else { Some((record.value, record.seq)) });
+                    newer.push((record.key.clone(), if record.tombstone { None } else { Some((record.value, record.seq)) }));
+                }
+            }
+        }
+        newer.extend(active_snapshot);
+
+        // L1 SSTables (oldest layer) — only buckets whose min/max overlaps `[start, end)`;
+        // each seeks near `start` via the sparse index and stops at `end`. The L0 guards
+        // captured above make the metadata read race-safe (see `l1_overlaps`). Keys are
+        // hash-sharded so bucket key-sets are disjoint.
+        //
+        // Bounded page: read at most `limit + 1 + |newer in range in THIS bucket|` LIVE keys
+        // per bucket and scan buckets SERIALLY — per-bucket work is tiny, so a thread per
+        // bucket costs more than it saves. Full/large scan: keep the parallel, read-everything
+        // path. Only a same-bucket newer entry can shadow a bucket's L1 key (keys are
+        // hash-sharded), so the slack is sharded per bucket — a global `|newer|` slack would
+        // over-read every bucket by the total newer count. See `get_bucket_for_key`.
+        match bounded {
+            true => {
+                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
+                for (key, _) in newer.iter() {
+                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
+                }
+                for (bucket, file) in l1_files.iter().enumerate() {
+                    if !self.l1_overlaps(bucket, start, end) {
+                        continue;
+                    }
+                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
+                    let mut entries = Vec::new();
+                    self.scan_l1_range_into(bucket, file, start, end, Some(cap), &mut entries)?;
+                    for (k, v) in entries {
+                        all_entries.insert(k, v);
+                    }
+                }
+            }
+            false => {
+                let mut first_err: Option<LSMError> = None;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = l1_files
+                        .iter()
+                        .enumerate()
+                        .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, end))
+                        .map(|(bucket, file)| {
+                            s.spawn(move || -> Result<Vec<ScanEntry>> {
+                                let mut entries = Vec::new();
+                                self.scan_l1_range_into(bucket, file, start, end, None, &mut entries)?;
+                                Ok(entries)
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        match handle
+                            .join()
+                            .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
+                        {
+                            Ok(entries) => {
+                                for (k, v) in entries {
+                                    all_entries.insert(k, v);
+                                }
+                            }
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Some(e) = first_err {
+                    return Err(e);
                 }
             }
         }
 
-        // 4. Active memtable (newest layer) — overwrites everything below.
-        for (key, value) in active_snapshot {
+        // Replay the newer layers over L1 (oldest→newest) so tombstones and updates shadow
+        // the L1 values exactly as before.
+        for (key, value) in newer {
             all_entries.insert(key, value);
         }
 
@@ -3825,6 +4007,51 @@ mod tests {
     }
 
     #[test]
+    fn test_get_multiple_l1_prefilter_skips_absent_keys() -> Result<()> {
+        // Single bucket so every key shares one L1 file with a known [min, max]; the
+        // batch mixes present keys, keys below/above the L1 range (min/max reject), and
+        // an in-range key never inserted (bloom reject / L1 miss). The L1 pre-filter
+        // must never drop a live key and must return None for every absent one.
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+
+        for i in 30u128..50 {
+            lsm.insert(format!("m{i}").as_bytes(), i)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?; // land everything in L1 (min "m30", max "m49") with a bloom + min/max
+
+        let keys = vec![
+            b"m30".to_vec(),  // present, == min
+            b"m49".to_vec(),  // present, == max
+            b"m40".to_vec(),  // present, interior
+            b"a00".to_vec(),  // absent, below min       -> min/max reject
+            b"z99".to_vec(),  // absent, above max       -> min/max reject
+            b"m300".to_vec(), // absent, inside [min,max] -> bloom reject / L1 miss
+        ];
+        let batch: Vec<Option<u128>> = lsm.get_multiple(&keys)?.into_iter().map(|o| o.map(|(p, _)| p)).collect();
+        assert_eq!(batch[0], Some(30));
+        assert_eq!(batch[1], Some(49));
+        assert_eq!(batch[2], Some(40));
+        assert_eq!(batch[3], None);
+        assert_eq!(batch[4], None);
+        assert_eq!(batch[5], None);
+
+        // A batch of only out-of-range keys exercises the full skip (no L1 read): all None.
+        let absent_only = vec![b"a00".to_vec(), b"b11".to_vec(), b"z99".to_vec()];
+        let batch2: Vec<Option<u128>> = lsm.get_multiple(&absent_only)?.into_iter().map(|o| o.map(|(p, _)| p)).collect();
+        assert!(batch2.iter().all(|r| r.is_none()));
+
+        // The pre-filtered batch path must agree with the single-key point-lookup path.
+        for k in &keys {
+            let single = lsm.get(k)?;
+            let multi = lsm.get_multiple(std::slice::from_ref(k))?[0].map(|(p, _)| p);
+            assert_eq!(single, multi, "get vs get_multiple mismatch for {:?}", String::from_utf8_lossy(k));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_get_multiple_deleted_keys_return_none() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
@@ -3979,12 +4206,179 @@ mod tests {
         Ok(())
     }
 
+    // ── min/max skip + sparse-index seek over real L1 SSTables ──────────────
+
+    #[test]
+    fn prefix_upper_bound_cases() {
+        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_upper_bound(b"a"), Some(b"b".to_vec()));
+        // A trailing 0xFF is dropped and the previous byte incremented.
+        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(b"ab\xff\xff"), Some(b"ac".to_vec()));
+        // No finite upper bound.
+        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
+        assert_eq!(prefix_upper_bound(b""), None);
+    }
+
+    /// Sort scan output to `(key, pointer)` for order-insensitive comparison.
+    fn kv_sorted(v: Vec<(Vec<u8>, u128, u32)>) -> Vec<(Vec<u8>, u128)> {
+        let mut r: Vec<(Vec<u8>, u128)> = v.into_iter().map(|(k, val, _)| (k, val)).collect();
+        r.sort();
+        r
+    }
+
+    #[test]
+    fn scan_over_l1_matches_reference_with_seek_and_skip() -> Result<()> {
+        // 1000 keys, all compacted into L1 (well past SAMPLE_INTERVAL per bucket, so
+        // the sparse index has multiple samples and block_start is exercised).
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let n = 1000u64;
+        for seq in 0..n {
+            lsm.insert(format!("key:{seq:06}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test(); // data lives only in L1 now
+
+        // Full prefix → every key, values intact.
+        let all = kv_sorted(lsm.scan_prefix(b"key:")?);
+        assert_eq!(all.len(), n as usize);
+        for (seq, (k, v)) in all.iter().enumerate() {
+            assert_eq!((k.clone(), *v), (format!("key:{seq:06}").into_bytes(), seq as u128));
+        }
+
+        // Middle range → sparse-index seek near start + early stop at end.
+        let mid = kv_sorted(lsm.range_pointers_bounded(b"key:000100", Some(b"key:000200"), usize::MAX)?);
+        assert_eq!(mid.len(), 100);
+        assert_eq!(mid.first().unwrap().1, 100);
+        assert_eq!(mid.last().unwrap().1, 199);
+
+        // Sub-prefix selecting a middle slice (key:000100..000199).
+        assert_eq!(kv_sorted(lsm.scan_prefix(b"key:0001")?).len(), 100);
+
+        // Ranges/prefixes that fall entirely outside [min,max] → min/max skip → empty.
+        assert!(lsm.range_pointers_bounded(b"aaa", Some(b"aab"), usize::MAX)?.is_empty());
+        assert!(lsm.range_pointers_bounded(b"zzz", None, usize::MAX)?.is_empty());
+        assert!(lsm.scan_prefix(b"nomatch:")?.is_empty());
+
+        // A bounded page still honours `limit` after the seek.
+        assert_eq!(lsm.range_pointers_bounded(b"key:", Some(b"key;"), 10)?.len(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_over_l1_suppresses_tombstone() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        for seq in 0..200u64 {
+            lsm.insert(format!("k:{seq:04}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.delete(b"k:0100")?;
+        lsm.flush_and_compact_all()?; // tombstone merged into L1
+        lsm.purge_ro_memtables_for_test();
+
+        let keys: Vec<Vec<u8>> = lsm
+            .range_pointers_bounded(b"k:0050", Some(b"k:0150"), usize::MAX)?
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        assert!(!keys.contains(&b"k:0100".to_vec()), "deleted key must be excluded after min/max seek");
+        assert_eq!(keys.len(), 99, "50..149 minus the one deleted key");
+        Ok(())
+    }
+
+    #[test]
+    fn scan_across_l0_and_l1_after_partial_flush() -> Result<()> {
+        // Some keys in L1, a newer overlapping batch in L0 (no min/max there): the
+        // scan must still merge both. Exercises the "L1 skipped/seeked, L0 always
+        // scanned" split.
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        for seq in 0..100u64 {
+            lsm.insert(format!("m:{seq:04}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?; // → L1
+        // Overwrite a slice with new values, land them in L0 only.
+        for seq in 40..60u64 {
+            lsm.insert(format!("m:{seq:04}").as_bytes(), 1000 + seq as u128)?;
+        }
+        lsm.flush_memtable_to_level0()?; // → L0
+        lsm.purge_ro_memtables_for_test();
+
+        let map: std::collections::HashMap<Vec<u8>, u128> = lsm
+            .range_pointers_bounded(b"m:", Some(b"m;"), usize::MAX)?
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect();
+        assert_eq!(map.len(), 100);
+        assert_eq!(map[b"m:0005".as_slice()], 5, "untouched L1 value");
+        assert_eq!(map[b"m:0050".as_slice()], 1050, "L0 overwrite must win over L1");
+        Ok(())
+    }
+
     // ── scan_prefixes ──────────────────────────────────────────────
 
     fn u32_prefixed_key(prefix: u32, suffix: u32) -> Vec<u8> {
         let mut k = prefix.to_be_bytes().to_vec();
         k.extend_from_slice(&suffix.to_be_bytes());
         k
+    }
+
+    #[test]
+    fn scan_prefixes_over_l1_seeks_per_prefix() -> Result<()> {
+        // Many cluster prefixes flushed to L1; probing a few must return exactly
+        // those clusters' keys (per-prefix sparse seek + bucket min/max skip).
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let n_clusters = 200u32;
+        let per = 30u32;
+        for cid in 0..n_clusters {
+            for did in 0..per {
+                lsm.insert(&u32_prefixed_key(cid, did), (cid as u128) * 1000 + did as u128)?;
+            }
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test();
+
+        // Probe three scattered clusters out of 200.
+        let ids: std::collections::HashSet<u32> = [3u32, 100, 199].into_iter().collect();
+        let results = lsm.scan_prefixes(&ids)?;
+        assert_eq!(results.len(), (ids.len() as u32 * per) as usize);
+        for (k, v) in &results {
+            let cid = u32::from_be_bytes(k[..4].try_into().unwrap());
+            let did = u32::from_be_bytes(k[4..8].try_into().unwrap());
+            assert!(ids.contains(&cid), "returned a non-probed cluster {cid}");
+            assert_eq!(*v, (cid as u128) * 1000 + did as u128);
+        }
+        // A cluster id past every key's range → min/max skip → empty.
+        let none: std::collections::HashSet<u32> = [u32::MAX].into_iter().collect();
+        assert!(lsm.scan_prefixes(&none)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn range_keys_bounded_over_l1_seeks_and_skips() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        for seq in 0..1000u64 {
+            lsm.insert(format!("r:{seq:06}").as_bytes(), seq as u128)?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test();
+
+        // Unbounded from a mid start, limited page — seeks to start, min/max keeps
+        // only buckets reaching it.
+        let keys = lsm.range_keys_bounded(b"r:000900", 50)?;
+        assert_eq!(keys.len(), 50);
+        assert_eq!(keys[0], b"r:000900".to_vec());
+        assert!(keys.iter().all(|k| k.as_slice() >= b"r:000900".as_slice()));
+
+        // Start past the max key → every bucket skipped → empty.
+        assert!(lsm.range_keys_bounded(b"zzz", usize::MAX)?.is_empty());
+        // Full range from the front returns everything.
+        assert_eq!(lsm.range_keys_bounded(b"r:", usize::MAX)?.len(), 1000);
+        Ok(())
     }
 
     #[test]
@@ -4046,6 +4440,109 @@ mod tests {
         let results = lsm.scan_prefixes(&ids)?;
         assert!(results.is_empty());
         Ok(())
+    }
+
+    // ── Scan latency benchmark (memtable / L1 / L0+L1) ──────────────────────
+    //
+    // A kept, deterministic micro-benchmark for the scan paths across LSM layer
+    // states. `#[ignore]`d so it never runs in normal `cargo test`; run it on demand:
+    //
+    //   cargo test -p minnal_db --lib scan_latency_benchmark -- --ignored --nocapture
+    //
+    // It lives here (not in `benches/`) on purpose: building an exact L0+L1 state is
+    // only possible through the crate-internal `LSMTree` flush methods — the public
+    // `Db` facade only flushes to SSTables via the background worker, so a criterion
+    // bench cannot construct these states deterministically. The full scans show
+    // throughput per layer; the *selective* scans show the L1 min/max skip +
+    // sparse-index seek (a bounded slice out of a large L1 should not read the whole
+    // file), which the memtable-resident timings never exercised.
+
+    /// Insert `k:{seq:06}` for `seq` in `0..total`, all left in the active memtable.
+    fn bench_state_memtable(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        for seq in 0..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        (temp, lsm)
+    }
+
+    /// Same keys, all compacted into L1 (memtable/RO drained).
+    fn bench_state_l1(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        for seq in 0..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_and_compact_all().unwrap();
+        lsm.purge_ro_memtables_for_test();
+        (temp, lsm)
+    }
+
+    /// Same keys spread across all three layers: ~80% in L1, ~15% in an uncompacted
+    /// L0 file, ~5% left in the memtable — the realistic "recently written over a
+    /// compacted base" shape a scan must merge.
+    fn bench_state_l0_l1(total: u64) -> (TempDir, LSMTree) {
+        let temp = TempDir::new().unwrap();
+        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        let l1_cut = total * 80 / 100;
+        let l0_cut = total * 95 / 100;
+        for seq in 0..l1_cut {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_and_compact_all().unwrap(); // → L1
+        for seq in l1_cut..l0_cut {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
+        }
+        lsm.flush_memtable_to_level0().unwrap(); // → L0 (uncompacted)
+        lsm.purge_ro_memtables_for_test();
+        for seq in l0_cut..total {
+            lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap(); // → memtable
+        }
+        (temp, lsm)
+    }
+
+    #[test]
+    #[ignore]
+    fn scan_latency_benchmark() {
+        use std::time::Instant;
+        let total = 5_000u64;
+
+        // Warm up, run `iters`, report median-ish average µs/call. Asserts the result
+        // count so a broken scan can't silently post a fast time.
+        fn time_it(label: &str, iters: u32, mut f: impl FnMut() -> usize, expect: usize) {
+            for _ in 0..5 {
+                assert_eq!(f(), expect);
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                assert_eq!(f(), expect);
+            }
+            let per = t.elapsed().as_nanos() as f64 / iters as f64 / 1e3;
+            eprintln!("    {label:34} {expect:>5} results  {per:>9.2} µs/call");
+        }
+
+        // A 50-key slice in the middle of the keyspace, for the selective scans.
+        let mid = total / 2;
+        let sel_start = format!("k:{mid:06}").into_bytes();
+        let sel_end = format!("k:{:06}", mid + 50).into_bytes();
+        let sel_prefix = format!("k:{:04}", mid / 100).into_bytes(); // matches k:{mid/100}XX → 100 keys
+
+        eprintln!("\n=== scan latency: {total} keys, 128-bit values, per LSM layer state ===");
+        for (state, (_temp, lsm)) in [
+            ("memtable", bench_state_memtable(total)),
+            ("L1-only", bench_state_l1(total)),
+            ("L0+L1+mem", bench_state_l0_l1(total)),
+        ] {
+            eprintln!("  [{state}]");
+            let l = &lsm;
+            time_it("prefix(k:) full", 60, || l.scan_prefix(b"k:").unwrap().len(), total as usize);
+            time_it("range(k:..) full", 60, || l.range_pointers_bounded(b"k:", Some(b"k;"), usize::MAX).unwrap().len(), total as usize);
+            let (s, e) = (&sel_start, &sel_end);
+            time_it("range selective [50]", 500, || l.range_pointers_bounded(s, Some(e), usize::MAX).unwrap().len(), 50);
+            let p = &sel_prefix;
+            time_it("prefix selective [100]", 500, || l.scan_prefix(p).unwrap().len(), 100);
+        }
     }
 
     // ── scan_prefixes tombstone regressions ───────────────────────
@@ -4366,6 +4863,215 @@ mod tests {
         assert_eq!(keys.len(), 4, "limit must be respected");
         assert_eq!(keys[0], b"klim:00");
         assert_eq!(keys[3], b"klim:03");
+        Ok(())
+    }
+
+    // ── bounded-page L1 scan (limit-bounded merge) ─────────────────────────────
+
+    /// A newer-layer (memtable) tombstone shadowing an L1 key *inside* the first `limit`
+    /// keys must not short the page. The bounded L1 scan over-reads each bucket by the
+    /// count of newer in-range entries, so `limit` live keys still come back. num_buckets=1
+    /// exercises the per-bucket cap tightly. **This would FAIL if L1 were capped at exactly
+    /// `limit`+1** (the page would come back with only ~11 keys).
+    #[test]
+    fn test_range_pointers_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        for i in 0u128..50 {
+            lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?; // k00..k49 all live in L1
+        // Delete the first 10 keys — tombstones live in the active memtable (newer than L1).
+        for i in 0u128..10 {
+            lsm.delete(format!("k{:02}", i).as_bytes())?;
+        }
+        let pairs = lsm.range_pointers_bounded(b"k", None, 20)?;
+        let keys: Vec<String> = pairs.iter().map(|(k, _, _)| String::from_utf8_lossy(k).into_owned()).collect();
+        assert_eq!(keys.len(), 20, "page must return a full `limit` of live keys despite newer tombstones; got {keys:?}");
+        assert_eq!(keys[0], "k10", "deleted head keys must be skipped");
+        assert_eq!(keys[19], "k29");
+        Ok(())
+    }
+
+    /// Keys-only twin of the tombstone-slack test.
+    #[test]
+    fn test_range_keys_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        for i in 0u128..50 {
+            lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?;
+        for i in 0u128..10 {
+            lsm.delete(format!("k{:02}", i).as_bytes())?;
+        }
+        let keys = lsm.range_keys_bounded(b"k", 20)?;
+        assert_eq!(keys.len(), 20, "keys page must be full despite newer tombstones");
+        assert_eq!(keys[0], b"k10");
+        assert_eq!(keys[19], b"k29");
+        Ok(())
+    }
+
+    /// Per-bucket slack teeth: the L1 cap is sized by each bucket's OWN newer-entry count,
+    /// not a global one spread across buckets. Here 20 tombstones all hash to a SINGLE bucket
+    /// and sit at the page head; that bucket's cap must be `limit + 1 + 20` for the page to
+    /// come back full. A bound that undercounts the clustered bucket (e.g. `|newer| /
+    /// num_buckets ≈ 2`) would read only tombstones and short the page to empty.
+    #[test]
+    fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+        let num_buckets = 8;
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+
+        // 40 keys that all hash to bucket 0 (prefix "a", so they sort ahead of everything else).
+        let mut bucket0: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0u64;
+        while bucket0.len() < 40 {
+            let k = format!("a{i:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) == 0 {
+                bucket0.push(k);
+            }
+            i += 1;
+        }
+        // Filler spread across the OTHER buckets, at higher keys (prefix "b").
+        let mut others: Vec<Vec<u8>> = Vec::new();
+        let mut j = 0u64;
+        while others.len() < 40 {
+            let k = format!("b{j:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) != 0 {
+                others.push(k);
+            }
+            j += 1;
+        }
+        for (v, k) in bucket0.iter().chain(others.iter()).enumerate() {
+            lsm.insert(k, v as u128)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?; // all live in L1
+
+        // Delete the first 20 bucket-0 keys — all in ONE bucket, all at the page head.
+        for k in &bucket0[..20] {
+            lsm.delete(k)?;
+        }
+
+        // Scan the "a" range: only bucket 0 has in-range keys, so its per-bucket cap is what
+        // gates the page. limit=15 needs the cap to reach past all 20 head tombstones.
+        let pairs = lsm.range_pointers_bounded(b"a", Some(b"b"), 15)?;
+        let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _, _)| k.clone()).collect();
+        assert_eq!(keys.len(), 15, "page must be full despite 20 clustered tombstones in one bucket; got {}", keys.len());
+        assert_eq!(keys.as_slice(), &bucket0[20..35], "page must be the first live keys after the deleted head");
+        Ok(())
+    }
+
+    /// Keys-only twin of the clustered-tombstone per-bucket-slack test.
+    #[test]
+    fn test_range_keys_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+        let num_buckets = 8;
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+
+        let mut bucket0: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0u64;
+        while bucket0.len() < 40 {
+            let k = format!("a{i:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) == 0 {
+                bucket0.push(k);
+            }
+            i += 1;
+        }
+        let mut others: Vec<Vec<u8>> = Vec::new();
+        let mut j = 0u64;
+        while others.len() < 40 {
+            let k = format!("b{j:06}").into_bytes();
+            if get_bucket_for_key(&k, num_buckets) != 0 {
+                others.push(k);
+            }
+            j += 1;
+        }
+        for (v, k) in bucket0.iter().chain(others.iter()).enumerate() {
+            lsm.insert(k, v as u128)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?;
+
+        for k in &bucket0[..20] {
+            lsm.delete(k)?;
+        }
+
+        let keys = lsm.range_keys_bounded(b"a", 15)?;
+        assert_eq!(keys.len(), 15, "keys page must be full despite clustered tombstones; got {}", keys.len());
+        assert_eq!(keys.as_slice(), &bucket0[20..35]);
+        Ok(())
+    }
+
+    /// A run of tombstones **in L1 itself** at the page head must be skipped without
+    /// shorting the page (the L1 early-stop counts LIVE entries, not raw entries). The
+    /// tombstones reach L1 by compacting a delete-over-an-L0-value into level 1.
+    #[test]
+    fn test_range_pointers_bounded_l1_tombstones_at_head_skipped() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        for i in 0u128..40 {
+            lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
+        }
+        lsm.flush_memtable_to_level0()?; // values land in L0
+        // Delete the first 8, flush the tombstones to L0, then compact everything to L1 so
+        // the L1 file physically carries tombstones for k00..k07 ahead of the live keys.
+        for i in 0u128..8 {
+            lsm.delete(format!("k{:02}", i).as_bytes())?;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test();
+        let pairs = lsm.range_pointers_bounded(b"k", None, 20)?;
+        let keys: Vec<String> = pairs.iter().map(|(k, _, _)| String::from_utf8_lossy(k).into_owned()).collect();
+        assert_eq!(keys.len(), 20, "page must be full past the L1-tombstone head; got {keys:?}");
+        assert_eq!(keys[0], "k08");
+        assert_eq!(keys[19], "k27");
+        Ok(())
+    }
+
+    /// A full cursor walk with small pages, over multiple buckets with scattered deletes,
+    /// must return exactly the same ordered set as one unbounded scan — the bounded
+    /// per-bucket L1 cap must never drop or duplicate a live key across page boundaries.
+    #[test]
+    fn test_bounded_page_walk_matches_unbounded_reference() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?; // default multi-bucket
+        for i in 0u128..500 {
+            lsm.insert(format!("row:{:04}", i).as_bytes(), i)?;
+        }
+        lsm.flush_memtable()?;
+        lsm.compact_all()?;
+        // Delete every 7th key (scattered across buckets); tombstones live in the memtable.
+        for i in (0u128..500).filter(|i| i % 7 == 0) {
+            lsm.delete(format!("row:{:04}", i).as_bytes())?;
+        }
+        // Reference: one unbounded scan (uses the parallel read-everything path).
+        let reference: Vec<Vec<u8>> = lsm
+            .range_pointers_bounded(b"row:", None, usize::MAX)?
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        assert!(reference.len() >= 400, "sanity: most keys still live");
+        assert!(!reference.iter().any(|k| k == b"row:0000"), "row:0000 was deleted");
+
+        // Paginated walk with a small page (limit 20; +1 sentinel for has_more).
+        let mut walked: Vec<Vec<u8>> = Vec::new();
+        let mut cursor: Vec<u8> = b"row:".to_vec();
+        loop {
+            let page = lsm.range_pointers_bounded(&cursor, None, 21)?;
+            let has_more = page.len() > 20;
+            for (k, _, _) in page.iter().take(20) {
+                walked.push(k.clone());
+            }
+            if !has_more {
+                break;
+            }
+            cursor = page[20].0.clone();
+        }
+        assert_eq!(walked, reference, "bounded paginated walk must equal the unbounded reference");
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use minnal_doc_store::{
     AttributeDef, AttributeType, DocId, DocStore, DocStoreError, DocStoreSchema, IndexSpec, IndexType, KeyType, Pagination, SchemaAmendment,
-    SemanticSearchContext,
+    SemanticSearchContext, StoreType,
 };
 use semantic_search::index::vector_index::QueryResult;
 use semantic_search::{ClusterIndex, service::SemanticSearchConfig};
@@ -21,6 +21,7 @@ fn show_doc(id: DocId, doc: &serde_json::Value) {
 
 fn user_schema() -> DocStoreSchema {
     DocStoreSchema {
+        store_type: StoreType::Doc,
         namespace: "users".to_owned(),
         ns_id: None,
         key_type: KeyType::U64,
@@ -52,6 +53,7 @@ async fn demo_create_and_list(store: &DocStore) -> Result<()> {
     // Create a second store — no indices, KV-only
     store
         .create(DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "events".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -335,6 +337,7 @@ async fn demo_restart(db_path: &str, schema_dir: &str) -> Result<()> {
         let store = DocStore::open(db_path, schema_dir).await?;
         store
             .create(DocStoreSchema {
+                store_type: StoreType::Doc,
                 namespace: "products".to_owned(),
                 ns_id: None,
                 key_type: KeyType::U64,
@@ -439,6 +442,7 @@ async fn demo_semantic_search(store: &DocStore) -> Result<()> {
     // Schema: semantic search on 'description'; 'title' is a regular Str index.
     store
         .create(DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "jobs".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,

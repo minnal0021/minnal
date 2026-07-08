@@ -15,7 +15,7 @@ pub use error::{DocStoreError, SchemaError};
 // ── Schema types ───────────────────────────────────────────────────────────
 pub use schema::{
     AttributeDef, AttributeType, DocStoreSchema, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES,
-    SchemaAmendment,
+    SchemaAmendment, StoreType,
 };
 
 // ── Pagination types ───────────────────────────────────────────────────────

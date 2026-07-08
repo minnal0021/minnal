@@ -81,7 +81,7 @@ By default, field-index row IDs are **dense, monotonic** integers (0, 1, 2, …)
 
 The map is a **derived** structure with the same durability model as the field index: writes mutate mmap in memory, flushed at the index checkpoint, rebuilt by WAL replay on open. **Load-bearing ordering:** `run_index_checkpoint` flushes the row map (advancing its `rowmap.ckpt` marker) **before** any field index, so the map is always at least as durable as every persisted bitmap bit — otherwise a crash could leave a bit whose row ID can't be reproduced. The row map's `key → id` slot table is in-memory (rebuilt from the on-disk id array on open), so it is never a persisted source of truth; a torn tail past the marker is ignored. See `index::RowMap` docs.
 
-**Escape hatch (unchanged):** register `RowIdFn` + `RowToKeyFn` together to bypass the row map and derive the ID directly from the key (e.g., a UUID in the key) — O(|hits|) query resolution with zero map. The legacy Murmur3 `key_to_row_id` remains only as a defensive fallback for an indexed namespace with no row map loaded (should not occur).
+**Escape hatch (unchanged):** register `RowIdFn` + `RowToKeyFn` together to bypass the row map and derive the ID directly from the key (e.g., a UUID in the key) — O(|hits|) query resolution with zero map. These are the only two row-ID sources (`resolve_row_id_alloc`/`resolve_row_id_get`): a `RowIdFn` if registered, otherwise the dense `RowMap`. The row map is always loaded before any field is activated (`ensure_rowmap` in `activate_field_index`), so an indexed namespace always has one or the other — resolution never falls through. (The old Murmur3 `key_to_row_id` fallback was removed once dense row IDs became the default.)
 
 ## Sharding
 

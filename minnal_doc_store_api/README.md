@@ -2,9 +2,11 @@
 
 A lightweight embedded document and key-value store with a REST API, built on top of [minnal_db](../minnal_db).
 
-**Document stores** (`/stores`) — JSON objects stored by a typed primary key, with optional field-level indices and semantic search.
+Both store kinds live under a single `/stores` path; the kind is set by a mandatory `store_type` field at creation and resolved from the schema thereafter.
 
-**KV stores** (`/kv-stores`) — schema-lite namespaces for raw typed key-value data, with optional semantic search on string values.
+**Document stores** (`store_type: "doc"`) — JSON objects stored by a typed primary key, with optional field-level indices and semantic search; data under `/stores/{ns}/docs`.
+
+**KV stores** (`store_type: "kv"`) — schema-lite namespaces for raw typed key-value data, with optional semantic search on string values; data under `/stores/{ns}/kv`.
 
 ---
 
@@ -25,12 +27,13 @@ A lightweight embedded document and key-value store with a REST API, built on to
   - [Index management](#index-management)
   - [Document CRUD](#document-crud)
   - [Queries](#queries)
-  - [KV store lifecycle](#kv-store-lifecycle)
+  - [KV store creation](#kv-store-creation)
   - [KV CRUD](#kv-crud)
   - [KV range scan](#kv-range-scan)
   - [KV prefix scan](#kv-prefix-scan)
   - [KV semantic search](#kv-semantic-search)
   - [Admin Stores API](#admin-stores-api)
+  - [Operational & Storage Metrics](#operational--storage-metrics)
   - [Admin Storage API](#admin-storage-api)
   - [Admin Indices API](#admin-indices-api)
 - [Predicate syntax](#predicate-syntax)
@@ -73,6 +76,7 @@ curl -s -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "users",
+    "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
     "indices": [
@@ -230,13 +234,13 @@ Requires the external embedding service and a cluster index (`semantic_search.cl
 
 ### KV store concept
 
-A **KV store** is a schema-lite namespace managed under `/kv-stores`. Unlike a document store it has:
+A **KV store** is a schema-lite namespace managed under `/stores`. Unlike a document store it has:
 
 - No field indices and no predicate queries
 - Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
 - Optional semantic search when `value_type = str`
 
-KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished by its `key_type` value on disk (`"str"`/`"int"` vs `"uuid"`/`"u64"`/`"u128"`).
+KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished on disk by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
 
 **Key types:**
 
@@ -258,19 +262,24 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 
 ## REST API reference
 
-All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. The endpoints fall into two families — `/stores/*` for document stores and `/kv-stores/*` for KV stores — plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
+All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. Every store — document or KV — lives under a single `/stores` path. The store kind is chosen by the mandatory `store_type` (`"doc"` or `"kv"`) in the create/import payload and resolved from the stored schema thereafter; document stores additionally expose `/docs`, indices, and predicate queries, while KV stores expose `/kv`. A data operation on the wrong kind (e.g. a `/docs` call on a KV namespace) returns `409 Conflict`. Plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
 
 ### Quick reference
 
-**Document stores:**
+**Store lifecycle (both kinds):**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `POST` | `/stores` | `201` | Create a document store with schema |
-| `GET` | `/stores` | `200` | List all document stores |
-| `DELETE` | `/stores/{ns}` | `204` | Drop a document store and all its data |
-| `GET` | `/stores/{ns}/schema` | `200` | Fetch the current schema |
-| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute |
+| `POST` | `/stores` | `201` | Create a store (`store_type` in body selects doc vs KV) |
+| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type`) |
+| `DELETE` | `/stores/{ns}` | `204` | Drop a store and all its data (kind resolved from its schema) |
+| `GET` | `/stores/{ns}/schema` | `200` | Fetch a store's current schema |
+| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only) |
+
+**Document store data:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
 | `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
 | `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
 | `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
@@ -281,40 +290,34 @@ All request and response bodies are JSON, and errors are returned as `{"error": 
 | `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
 | `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
 
-**KV stores:**
+**KV store data:**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `POST` | `/kv-stores` | `201` | Create a KV store |
-| `GET` | `/kv-stores` | `200` | List all KV stores |
-| `DELETE` | `/kv-stores/{ns}` | `204` | Drop a KV store and all its data |
-| `GET` | `/kv-stores/{ns}/schema` | `200` | Fetch the current KV-store schema |
-| `PUT` | `/kv-stores/{ns}/kv/{key}` | `204` | Set a value |
-| `GET` | `/kv-stores/{ns}/kv/{key}` | `200` | Get a value by key |
-| `DELETE` | `/kv-stores/{ns}/kv/{key}` | `204` | Delete a key |
-| `GET` | `/kv-stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
-| `GET` | `/kv-stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
-| `POST` | `/kv-stores/{ns}/semantic-search` | `200` | ANN search (`value_type = str` only) |
+| `PUT` | `/stores/{ns}/kv/{key}` | `204` | Set a value |
+| `GET` | `/stores/{ns}/kv/{key}` | `200` | Get a value by key |
+| `DELETE` | `/stores/{ns}/kv/{key}` | `204` | Delete a key |
+| `GET` | `/stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
+| `GET` | `/stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
+| `POST` | `/stores/{ns}/kv/semantic-search` | `200` | ANN search (`value_type = str` only) |
 
 **Schema export / import (admin):**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a doc-store schema as a JSON attachment |
-| `POST` | `/admin/stores/import` | `201` | Create a doc store from an exported schema |
+| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a store's schema as a JSON attachment (doc or KV) |
+| `POST` | `/admin/stores/import` | `201` | Create a store from an exported schema (`store_type` selects the kind) |
 | `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
-| `GET` | `/admin/kv-stores/{ns}/schema/export` | `200` | Download a KV-store schema as a JSON attachment |
-| `POST` | `/admin/kv-stores/import` | `201` | Create a KV store from an exported schema |
 
 ---
 
 ### Store lifecycle
 
-These endpoints create, list, inspect, and drop document stores, and amend their non-indexed attributes. A store must exist before any document can be written to it.
+These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendment via `PATCH` applies to document stores only.)
 
 #### `GET /stores`
 
-List all stores.
+List all stores, document and KV. Each entry carries its `store_type` so callers can tell them apart.
 
 ```bash
 curl http://localhost:8080/stores
@@ -324,12 +327,19 @@ curl http://localhost:8080/stores
 [
   {
     "namespace": "users",
+    "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
     "indices": [
       {"field": "status", "index_type": "str"},
       {"field": "age",    "index_type": "int"}
     ]
+  },
+  {
+    "namespace": "session-cache",
+    "store_type": "kv",
+    "key_type": "str",
+    "value_type": "str"
   }
 ]
 ```
@@ -338,12 +348,15 @@ curl http://localhost:8080/stores
 
 #### `POST /stores`
 
-Create a new store.
+Create a new store. The mandatory `store_type` field selects the kind: `"doc"`
+for a document store (body fields below) or `"kv"` for a KV store (see
+[`KV store concept`](#kv-store-concept) for its `key_type`/`value_type` body).
 
-**Request body:**
+**Request body (document store, `store_type: "doc"`):**
 
 | Field        | Type             | Required | Description                          |
 |-------------|-----------------|----------|--------------------------------------|
+| `store_type` | `"doc"`          | yes      | Selects a document store             |
 | `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
 | `key_type`   | `uuid`/`u64`/`u128` | yes  | Primary key type                     |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
@@ -370,6 +383,7 @@ curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "orders",
+    "store_type": "doc",
     "key_type": "u64",
     "indices": [
       {"field": "state",      "index_type": "str"},
@@ -407,6 +421,7 @@ curl http://localhost:8080/stores/users/schema
 ```json
 {
   "namespace": "users",
+  "store_type": "doc",
   "key_type": "uuid",
   "indices": [
     {"field": "status", "index_type": "str"},
@@ -457,13 +472,47 @@ curl -X PATCH http://localhost:8080/stores/users/schema \
 # → 204 No Content
 ```
 
-| `op` value           | Required fields          |
-|---------------------|--------------------------|
-| `add_attribute`      | `name`, `attr_type`      |
-| `update_attribute`   | `name`, `attr_type`      |
-| `remove_attribute`   | `name`                   |
+**Add an embedding attribute (enable the vector index):** declares a `str`
+attribute that feeds the namespace's vector index and turns on semantic search.
 
-All ops accept an optional `"description"` string.
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "add_embedding_attribute", "name": "bio", "description": "embedded text"}'
+# → 204 No Content
+```
+
+A namespace has **at most one vector index**. Once semantic search is enabled,
+this op returns **`409 Conflict`** (`SemanticSearchAlreadyEnabled`) — drop the
+vector index first (`DELETE /stores/{ns}/indices/vector`) before re-adding.
+
+**Enable the vector index over multiple fields:** `add_embedding_attribute` only
+adds one field. To create a multi-field vector index after the store exists, use
+`enable_vector_index` with the full field list in a single call (valid only when
+no vector index is present):
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "enable_vector_index", "fields": ["bio", "headline"]}'
+# → 204 No Content
+```
+
+So the post-create workflow to **change which fields are embedded** is: drop the
+vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
+`enable_vector_index` with the new field set. Like `add_embedding_attribute`, it
+returns `409` if a vector index already exists, and `400` if `fields` is empty,
+contains duplicates, or names an existing index/attribute.
+
+| `op` value                | Required fields          |
+|---------------------------|--------------------------|
+| `add_attribute`           | `name`, `attr_type`      |
+| `update_attribute`        | `name`, `attr_type`      |
+| `remove_attribute`        | `name`                   |
+| `add_embedding_attribute` | `name`                   |
+| `enable_vector_index`     | `fields` (non-empty)     |
+
+All ops except `enable_vector_index` accept an optional `"description"` string.
 
 ---
 
@@ -494,7 +543,7 @@ curl -X POST http://localhost:8080/stores/users/indices \
 # → 202 Accepted
 ```
 
-Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Monitor progress via `GET /admin/indices/{ns}/progress`.
+Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Returns `400 Bad Request` (`TooManyIndices`) if the namespace is already at the **5-index limit** — the cap is enforced here, not just at create/import time. Monitor progress via `GET /admin/indices/{ns}/progress`.
 
 ---
 
@@ -643,55 +692,38 @@ Response — `{id, doc}` pairs plus the pagination envelope:
 
 ---
 
-### KV store lifecycle
+### KV store creation
 
-The KV-store endpoints mirror the document-store lifecycle, but for schema-lite namespaces under `/kv-stores`: create, list, inspect, and drop. A KV store fixes its key and value types at creation and has no field indices — see the [KV store concept](#kv-store-concept) for the available type combinations.
+Listing, dropping, and fetching a KV store's schema all use the unified
+[Store lifecycle](#store-lifecycle) endpoints (`GET /stores`, `DELETE
+/stores/{ns}`, `GET /stores/{ns}/schema`) — they resolve the kind from the
+stored schema. Creating one is the same `POST /stores`, with `store_type: "kv"`.
+A KV store fixes its key and value types at creation and has no field indices —
+see the [KV store concept](#kv-store-concept) for the available type
+combinations.
 
-#### `GET /kv-stores`
-
-List all KV stores.
-
-```bash
-curl http://localhost:8080/kv-stores
-```
-
-```json
-[
-  {
-    "namespace": "session-cache",
-    "key_type": "str",
-    "value_type": "str",
-    "semantic_search_enabled": false
-  }
-]
-```
-
----
-
-#### `POST /kv-stores`
-
-Create a new KV store.
-
-**Request body:**
+**Request body (KV store, `store_type: "kv"`):**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `store_type` | `"kv"` | yes | Selects a KV store |
 | `namespace` | string | yes | Unique name (`[a-zA-Z0-9_-]+`) |
 | `key_type` | `str` / `int` | yes | Key type |
 | `value_type` | `str` / `int` / `f32` / `vec_f32` | yes | Value type |
 | `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str` and a cluster index at startup) |
 
 ```bash
-curl -X POST http://localhost:8080/kv-stores \
+curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
-  -d '{"namespace": "session-cache", "key_type": "str", "value_type": "str"}'
+  -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
 # → 201 Created
 
 # With semantic search
-curl -X POST http://localhost:8080/kv-stores \
+curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "product-descriptions",
+    "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
     "semantic_search_enabled": true
@@ -700,39 +732,6 @@ curl -X POST http://localhost:8080/kv-stores \
 ```
 
 Returns `409 Conflict` if a store with that namespace already exists (doc or KV).
-
----
-
-#### `DELETE /kv-stores/{ns}`
-
-Permanently delete a KV store. Irreversible.
-
-```bash
-curl -X DELETE http://localhost:8080/kv-stores/session-cache
-# → 204 No Content
-```
-
----
-
-#### `GET /kv-stores/{ns}/schema`
-
-Fetch the current schema for a KV store as JSON.
-
-```bash
-curl http://localhost:8080/kv-stores/session-cache/schema
-```
-
-```json
-{
-  "namespace": "session-cache",
-  "ns_id": 7,
-  "key_type": "str",
-  "value_type": "str",
-  "semantic_search_enabled": false
-}
-```
-
-Returns `404 Not Found` if the namespace does not exist as a KV store. To download the schema as a file (e.g. for backup or migration to another deployment), use [`GET /admin/kv-stores/{ns}/schema/export`](#get-adminkv-storesnsschemaexport).
 
 ---
 
@@ -756,18 +755,18 @@ The request / response body is a raw JSON value matching `value_type`:
 
 ---
 
-#### `PUT /kv-stores/{ns}/kv/{key}`
+#### `PUT /stores/{ns}/kv/{key}`
 
 Insert or replace a value (upsert). When `semantic_search_enabled = true` the value text is enqueued for async embedding — the request returns immediately and the vector index is updated in the background.
 
 ```bash
-curl -X PUT http://localhost:8080/kv-stores/session-cache/kv/user-42 \
+curl -X PUT http://localhost:8080/stores/session-cache/kv/user-42 \
   -H 'Content-Type: application/json' \
   -d '"eyJhbGciOiJIUzI1NiJ9..."'
 # → 204 No Content
 
 # vec_f32 example
-curl -X PUT http://localhost:8080/kv-stores/embeddings/kv/doc-1 \
+curl -X PUT http://localhost:8080/stores/embeddings/kv/doc-1 \
   -H 'Content-Type: application/json' \
   -d '[0.12, -0.45, 0.89]'
 # → 204 No Content
@@ -775,12 +774,12 @@ curl -X PUT http://localhost:8080/kv-stores/embeddings/kv/doc-1 \
 
 ---
 
-#### `GET /kv-stores/{ns}/kv/{key}`
+#### `GET /stores/{ns}/kv/{key}`
 
 Retrieve a value by key. Returns the value as a JSON body.
 
 ```bash
-curl http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl http://localhost:8080/stores/session-cache/kv/user-42
 # → "eyJhbGciOiJIUzI1NiJ9..."
 ```
 
@@ -788,12 +787,12 @@ Returns `404 Not Found` if the key does not exist.
 
 ---
 
-#### `DELETE /kv-stores/{ns}/kv/{key}`
+#### `DELETE /stores/{ns}/kv/{key}`
 
 Delete a key. No-op if the key does not exist. Also removes the companion vector index entry when semantic search is enabled.
 
 ```bash
-curl -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
+curl -X DELETE http://localhost:8080/stores/session-cache/kv/user-42
 # → 204 No Content
 ```
 
@@ -801,7 +800,7 @@ curl -X DELETE http://localhost:8080/kv-stores/session-cache/kv/user-42
 
 ### KV range scan
 
-`GET /kv-stores/{ns}/kv?start=&end=`
+`GET /stores/{ns}/kv?start=&end=`
 
 Scan all entries whose key falls in `[start, end)`, returned in ascending key
 order. **Cursor-paginated** — each page resolves only its own values, so memory
@@ -816,14 +815,14 @@ stays bounded regardless of how many keys match.
 
 ```bash
 # str key store — scan all sessions for users with IDs "user-10" through "user-20"
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-10&end=user-21"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-10&end=user-21"
 
 # int key store — fetch entries with keys 100 through 199
-curl "http://localhost:8080/kv-stores/counters/kv?start=100&end=200"
+curl "http://localhost:8080/stores/counters/kv?start=100&end=200"
 
 # first page of 50, then follow next_cursor for the next page
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50"
-curl "http://localhost:8080/kv-stores/session-cache/kv?start=user-&limit=50&cursor=757365722d3530"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-&limit=50"
+curl "http://localhost:8080/stores/session-cache/kv?start=user-&limit=50&cursor=757365722d3530"
 ```
 
 Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
@@ -845,7 +844,7 @@ Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
 
 ### KV prefix scan
 
-`GET /kv-stores/{ns}/kv/prefix?prefix=`
+`GET /stores/{ns}/kv/prefix?prefix=`
 
 Scan all entries whose key starts with `prefix`. Most useful for `key_type = str` stores where keys share a common string prefix (e.g. `"user-"` to find all user entries).
 
@@ -862,11 +861,11 @@ scan — each page resolves only its own values.
 
 ```bash
 # Find all session-cache entries whose key starts with "user-"
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-"
 
 # Paginate through a large prefix result set via next_cursor
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100"
-curl "http://localhost:8080/kv-stores/session-cache/kv/prefix?prefix=user-&limit=100&cursor=757365722d393939"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-&limit=100"
+curl "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-&limit=100&cursor=757365722d393939"
 ```
 
 Response — same format as range scan:
@@ -886,7 +885,7 @@ Response — same format as range scan:
 
 ### KV semantic search
 
-`POST /kv-stores/{ns}/semantic-search`
+`POST /stores/{ns}/kv/semantic-search`
 
 Requires `semantic_search_enabled = true` and `value_type = str` on the KV store. The stored string values are used as the text that was embedded at write time.
 
@@ -900,7 +899,7 @@ Requires `semantic_search_enabled = true` and `value_type = str` on the KV store
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
 ```bash
-curl -X POST http://localhost:8080/kv-stores/product-descriptions/semantic-search \
+curl -X POST http://localhost:8080/stores/product-descriptions/kv/semantic-search \
   -H 'Content-Type: application/json' \
   -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
 ```
@@ -942,53 +941,25 @@ Schema export / import for backup and for migrating a namespace definition betwe
 
 #### `GET /admin/stores/{ns}/schema/export`
 
-Download a doc-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-schema.json"`).
+Download a store's schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-schema.json"`). Works for both kinds — the kind is resolved from the stored schema, and the exported JSON carries its `store_type`.
 
 ```bash
 curl -OJ http://localhost:8080/admin/stores/users/schema/export
 # → writes users-schema.json
 ```
 
-Returns `404 Not Found` if the namespace does not exist as a doc store.
+Returns `404 Not Found` if the namespace does not exist.
 
 ---
 
 #### `POST /admin/stores/import`
 
-Create a doc store from a previously exported schema. The internal `ns_id` is stripped and reassigned, so an exported schema can be imported into a fresh deployment. Equivalent to `POST /stores` with the schema body.
+Create a store from a previously exported schema. The payload's `store_type` selects the kind (doc or KV); the internal `ns_id` is stripped and reassigned, so an exported schema can be imported into a fresh deployment. Equivalent to `POST /stores` with the schema body.
 
 ```bash
 curl -X POST http://localhost:8080/admin/stores/import \
   -H 'Content-Type: application/json' \
   --data-binary @users-schema.json
-# → 201 Created
-```
-
-Returns `409 Conflict` if a store with that namespace already exists.
-
----
-
-#### `GET /admin/kv-stores/{ns}/schema/export`
-
-Download a KV-store schema as a JSON file attachment (`Content-Disposition: attachment; filename="{ns}-kv-schema.json"`).
-
-```bash
-curl -OJ http://localhost:8080/admin/kv-stores/session-cache/schema/export
-# → writes session-cache-kv-schema.json
-```
-
-Returns `404 Not Found` if the namespace does not exist as a KV store.
-
----
-
-#### `POST /admin/kv-stores/import`
-
-Create a KV store from a previously exported schema. The internal `ns_id` is stripped and reassigned. Equivalent to `POST /kv-stores` with the schema body.
-
-```bash
-curl -X POST http://localhost:8080/admin/kv-stores/import \
-  -H 'Content-Type: application/json' \
-  --data-binary @session-cache-kv-schema.json
 # → 201 Created
 ```
 
@@ -1010,6 +981,199 @@ curl http://localhost:8080/admin/stores/users/row-count
 
 ---
 
+### Operational & Storage Metrics
+
+This is a consolidated reference for everything reported by the metrics/diagnostic
+endpoints under `/admin/storage`, with a **"survives restart?"** column for each
+value. There are two distinct kinds:
+
+- **Operational metrics** (`GET /admin/storage/ops-metrics`) — runtime counters of
+  *what the engine is doing* (throughput, read-path efficiency, compaction/GC
+  activity). They are in-memory `AtomicU64`s, **not persisted** — every restart
+  starts them at zero. Cumulative since process start; sample twice to compute a
+  rate. Recorded **per namespace** and also available broken out via
+  `GET /admin/storage/ops-metrics/by-namespace` and
+  `GET /admin/storage/stores/{ns}/ops-metrics` (see below).
+- **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
+  snapshots of *how big the engine is* and *how much dead space it holds*. These
+  are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
+  metadata, index blob stores) on every request, so a restart does not reset them
+  — they reflect whatever is durably on disk.
+
+**"Survives restart?" legend:** **No** = in-memory only, zero at process start.
+**Yes** = read/derived from persisted on-disk state, so unaffected by a restart.
+
+#### Endpoint overview
+
+| Endpoint | Kind | Survives restart? |
+|----------|------|-------------------|
+| `GET /admin/storage/ops-metrics` | Runtime counters | **No** (see startup-repopulation note) |
+| `GET /admin/storage/health` | Liveness / uptime | `uptime_s` **No**; `status` n/a |
+| `GET /admin/storage/stats` | Value-log aggregate | **Yes** |
+| `GET /admin/storage/wal` | WAL metadata | **Yes** |
+| `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
+| `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
+| `GET /admin/storage/value-log/{ns}/pages` | Value-log per page | **Yes** |
+| `GET /admin/storage/index-waste` | Field-index dead space | **Yes** (derived from on-disk state, not a stored counter) |
+| `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
+| `GET /admin/storage/namespaces/physical` | Physical engine namespaces | **Yes** |
+| `GET /admin/storage/stores/{ns}/kv-meta` | Per-ns LSM+value-log (doc or KV) | **Yes** (except `in_memory.*`) |
+| `GET /admin/storage/system/stores` | System namespaces | **Yes** |
+| `GET /admin/storage/system/stores/{ns}/meta` | One system store | **Yes** (except `in_memory.*`) |
+
+#### Operational metrics — `GET /admin/storage/ops-metrics`
+
+All counters below are **in-memory and reset to zero on restart**. They are grouped
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`, plus a
+top-level `uptime_s`.
+
+| Field | Group | Meaning | Survives restart? |
+|-------|-------|---------|-------------------|
+| `uptime_s` | (top) | Seconds since the server process started | **No** |
+| `reads` | reads | User-facing point reads (`GET` by key) | **No** |
+| `read_hits` | reads | Reads that found a live value | **No** |
+| `read_misses` | reads | Reads that found nothing (absent/tombstoned) | **No** |
+| `read_hit_ratio` | reads | `read_hits / reads` (derived) | **No** |
+| `scans` | reads | Multi-key scans (range/prefix) executed | **No** |
+| `scan_rows` | reads | Total rows returned across all scans | **No** |
+| `lookups` | lsm_lookups | LSM point lookups (≥ `reads` — also counts GC-validation reads and WAL-replay probes) | **No** |
+| `fast_path_hits` | lsm_lookups | Lookups served by the active-memtable fast path (no lower-layer scan) | **No** |
+| `fast_path_hit_ratio` | lsm_lookups | `fast_path_hits / lookups` (derived) | **No** |
+| `l0_probes` | lsm_lookups | Lookups that scanned at least one L0 SSTable | **No** |
+| `l1_probes` | lsm_lookups | Lookups that scanned the L1 SSTable (not bloom-rejected) | **No** |
+| `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
+| `puts` | writes | WAL-backed upserts applied | **No** |
+| `deletes` | writes | WAL-backed deletes applied | **No** |
+| `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads, query-embedding cache) | **No** |
+| `no_wal_deletes` | writes | Deletes written bypassing the WAL (query-embedding cache populate/clear) | **No** |
+| `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
+| `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
+| `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
+| `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
+| `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
+| `compaction_bytes_merged` | compaction | Total bytes merged during compactions | **No** |
+| `compaction_duration_ms` | compaction | Cumulative time spent compacting (ms) | **No** |
+| `vlog_gc_runs` | gc | Value-log GC passes run | **No** |
+| `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
+| `wal_gc_runs` | gc | WAL GC passes run | **No** |
+| `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+
+> **Startup-repopulation note.** Although these counters start at zero, they are
+> wired in *before* recovery, so the work the engine does on the way up bumps some
+> of them before any user request arrives — they are **regenerated, not persisted**.
+> In particular WAL replay does one `lsm.get` per replayed entry (bumping
+> `lookups`), and startup vector-index reconciliation re-enqueues missing docs via
+> the normal write path (bumping `puts` / `wal_fsyncs` / `wal_bytes_appended`). So
+> a non-zero reading right after a restart is expected and reflects startup
+> activity, not pre-restart totals — `lookups` in particular jumps with the size of
+> the WAL replay. Vector-search corruption counters
+> ([`/admin/indices/vector/corruption-metrics`](#get-adminindicesvectorcorruption-metrics))
+> follow the same in-memory, reset-on-restart model.
+
+**Per-namespace breakdown.** Every counter is recorded per namespace; the engine
+view above is their sum plus a small global instance (the WAL-GC counters, which
+belong to the shared WAL, and a fold of every dropped namespace's final totals so
+the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
+returning the same grouped shape as the engine endpoint:
+
+- `GET /admin/storage/stores/{ns}/ops-metrics` — one namespace's counters (`404`
+  if the namespace does not exist). Its `gc.wal_gc_runs` / `gc.wal_segments_deleted`
+  are always `0` — WAL GC is engine-global and reported only by the engine endpoint.
+- `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
+  lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
+  `uptime_s`).
+
+#### Storage metrics — field reference
+
+All fields below are **recomputed from on-disk state on every request** (survives
+restart = **Yes**), except the explicitly-flagged in-memory ones.
+
+**`GET /admin/storage/stats`** — engine-wide value-log aggregate:
+
+| Field | Meaning |
+|-------|---------|
+| `head`, `tail` | Value-log logical start/end offsets |
+| `garbage_bytes` | Reclaimable dead bytes across the value log |
+| `waste_ratio_pct` | Dead / total written (%) |
+| `free_space_ratio_pct` | Free fraction of the allocated region (%) |
+| `total_gc_runs` | Value-log GC passes ever run (persisted in metadata) |
+| `total_bytes_reclaimed` | Bytes ever reclaimed by value-log GC (persisted) |
+| `live_bytes` | Live (non-garbage) bytes |
+
+**`GET /admin/storage/wal`** — WAL metadata:
+
+| Field | Meaning |
+|-------|---------|
+| `head`, `tail` | WAL byte offsets of the live window |
+| `total_entries` | Entries currently tracked |
+| `persisted_entries` | Entries already applied + persisted |
+| `pending_entries` | `total − persisted` (replayed on next open) |
+| `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
+| `base_segment_id` | Absolute id the per-segment counters start at (lower segments trimmed) |
+| `live_segments` | Tracked segments still carrying entries |
+| `last_sequence` | Highest write sequence the WAL has observed |
+| `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+
+**`GET /admin/storage/lsm`** — per-namespace LSM manifest:
+
+| Field | Meaning | Survives restart? |
+|-------|---------|-------------------|
+| `manifest_version`, `created_at_ms` | Manifest version + creation time | **Yes** |
+| `level_count`, `total_entries`, `total_size_bytes` | Levels, key count, on-disk SSTable bytes | **Yes** |
+| `levels[].buckets[].files[]` | Per-file `{path, created_at_ms, entry_count, size_bytes}` | **Yes** |
+| `in_memory.memtable_entries` | Live active-memtable entry count | **No** |
+| `in_memory.read_only_entries` / `read_only_count` | Sealed (read-only) memtable entries / count | **No** |
+| `in_memory.compaction_in_progress` | Whether a compaction is running now | **No** |
+
+**`GET /admin/storage/value-log`** — per-namespace, per-shard utilisation:
+
+| Field | Meaning |
+|-------|---------|
+| `total_live_bytes`, `total_garbage_bytes`, `waste_ratio_pct`, `total_physical_bytes` | Namespace rollups across shards |
+| `shards[].bucket`, `head`, `tail` | Shard id and offsets |
+| `shards[].live_bytes`, `garbage_bytes`, `waste_ratio_pct` | Per-shard utilisation |
+| `shards[].total_gc_runs`, `total_bytes_reclaimed` | Per-shard GC activity (persisted) |
+| `shards[].physical_bytes` | Blocks actually allocated on disk (`st_blocks`; excludes sparse holes) |
+| `shards[].logical_bytes` | File length including sparse holes (≥ `physical_bytes`) |
+
+**`GET /admin/storage/value-log/{ns}/pages`** — per-page garbage breakdown:
+
+| Field | Meaning |
+|-------|---------|
+| `shards[].pages[].page_offset` | Page start offset within the shard |
+| `live_bytes`, `garbage_bytes`, `garbage_ratio_pct` | Per-page live/dead bytes and ratio |
+| `total_records`, `garbage_records` | Records on the page, and how many are garbage |
+
+**`GET /admin/storage/index-waste`** — field-index dead space:
+
+> **Derived, not a stored counter.** The waste ratios are **not** persisted
+> figures — they are computed on demand from the field-index blob store
+> (`waste_ratio = (logical_bytes − live_bytes) / logical_bytes`, where both inputs
+> come from the on-disk `blobs.keys` header + slot table). Because those files are
+> persisted, a restart reproduces the **identical** value (it "survives restart"),
+> but unlike the ops-metrics counters there is no accumulated history: the ratio
+> always reflects *current* dead space and reads back to ≈0 right after a
+> compaction. `distinct_count` is likewise derived from the field's in-memory
+> value→slot map, which is rebuilt from persisted state on open.
+
+| Field | Meaning |
+|-------|---------|
+| `threshold` | Compaction threshold (fraction `0.0..1.0`) — config, not on-disk state |
+| `namespaces[].fields[].bitmap_waste_ratio` | Reclaimable fraction of the bitmap blob store — *derived from on-disk state* (`null` if field still building) |
+| `namespaces[].fields[].keymap_waste_ratio` | Reclaimable fraction of the keymap blob store — *derived from on-disk state* |
+| `namespaces[].fields[].over_threshold` | True if either store has reached the threshold (compacted next checkpoint) |
+| `namespaces[].fields[].distinct_count` | Distinct indexed values for the field — *derived from the rebuilt-on-open value map* |
+
+The listing endpoints — `GET /admin/storage/namespaces`, `/namespaces/physical`,
+`/stores/{ns}/kv-meta`, `/system/stores`, and
+`/system/stores/{ns}/meta` — return registry/schema descriptors (names, `ns_id`,
+key/value types, `semantic_search_enabled`, TTL config, indexed fields) plus, where
+relevant, the same LSM/value-log blocks documented above. All are derived from the
+persisted registry + on-disk state and so **survive restart** (their nested
+`in_memory.*` LSM blocks, when present, are the only **No** values).
+
+---
+
 ### Admin Storage API
 
 Storage diagnostics and engine operations. Not intended for application traffic.
@@ -1020,20 +1184,23 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 |--------|------|----------|---------|
 | `GET` | `/admin/storage/health` | `200` | Liveness probe — uptime in seconds |
 | `GET` | `/admin/storage/stats` | `200` | Engine-wide value-log statistics |
+| `GET` | `/admin/storage/ops-metrics` | `200` | Engine-wide operational counters since startup (reads/writes/lookups/compaction/GC) |
+| `GET` | `/admin/storage/ops-metrics/by-namespace` | `200` | The same counters broken out per namespace |
+| `GET` | `/admin/storage/stores/{ns}/ops-metrics` | `200` | Operational counters for one namespace |
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
+| `GET` | `/admin/storage/value-log/{ns}/pages` | `200` | Per-page garbage breakdown for one namespace |
 | `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
-| `GET` | `/admin/storage/kv-namespaces` | `200` | All engine KV namespaces, annotated by role |
-| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | KV-layer metrics for one doc store namespace |
-| `GET` | `/admin/storage/kv-stores/{ns}/kv-meta` | `200` | KV-layer metrics for one KV store namespace |
+| `GET` | `/admin/storage/namespaces/physical` | `200` | Every physical engine namespace, annotated by role |
+| `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | Engine (LSM+value-log) metrics for one store, doc or KV |
 | `GET` | `/admin/storage/system/stores` | `200` | List system-namespace KV and doc stores |
 | `GET` | `/admin/storage/system/stores/{ns}/meta` | `200` | Full metadata for one system KV store |
 | `GET` | `/admin/storage/index-waste` | `200` | Per-field field-index bitmap/keymap waste + compaction threshold |
 | `POST` | `/admin/storage/gc` | `200` | Trigger value-log GC across all namespaces |
 | `POST` | `/admin/storage/gc/wal` | `200` | Trigger WAL GC |
 | `POST` | `/admin/storage/compact` | `204` | Trigger LSM compaction across all namespaces |
-| `POST` | `/admin/storage/index-checkpoint` | `200` | Flush + compact field indexes (and row maps) across all namespaces |
+| `POST` | `/admin/storage/index-checkpoint` | `202` | Flush + compact field indexes (and row maps) across all namespaces — runs in background; `409` if one is already running |
 
 ---
 
@@ -1113,13 +1280,19 @@ curl http://localhost:8080/admin/storage/index-waste
 
 Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (default every 15 min) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
 
-This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem. Returns the number of active field indexes checkpointed.
+This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem.
+
+Because the flush + compaction can take a long time on a large/wasted index, this **returns `202 Accepted` immediately and runs the pass in the background**; the checkpointed-field count is written to the server log on completion (and any failure is logged there too). If a checkpoint is already running, the request is rejected with `409 Conflict` so passes cannot stack.
 
 ```bash
-curl -X POST http://localhost:8080/admin/storage/index-checkpoint
+curl -i -X POST http://localhost:8080/admin/storage/index-checkpoint
+```
+```text
+HTTP/1.1 202 Accepted
 ```
 ```json
-{ "fields_checkpointed": 4 }
+// 409 Conflict when one is already running
+{ "error": "an index checkpoint is already running" }
 ```
 
 ---
@@ -1135,7 +1308,8 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
 | `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
 | `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
-| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Cumulative counts of vector entries skipped during search due to corrupt bytes |
+| `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Per-namespace counts of vector entries skipped during search due to corrupt bytes (all namespaces) |
+| `GET` | `/admin/indices/{ns}/vector/corruption-metrics` | `200` | Corrupt-skip counts for a single namespace |
 | `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
@@ -1197,7 +1371,7 @@ Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace
 
 #### `GET /admin/indices/vector/corruption-metrics`
 
-Cumulative counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug). Process-wide and monotonically increasing since startup — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`.
+Counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug), **broken down per namespace**. In-memory and monotonically increasing since startup (reset on restart) — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`. A namespace that has never recorded a corruption is omitted; an empty object means none have.
 
 A rising value means stored vectors are corrupt and queries are silently degraded; run the validating [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) to re-embed the affected documents.
 
@@ -1205,7 +1379,22 @@ A rising value means stored vectors are corrupt and queries are silently degrade
 curl http://localhost:8080/admin/indices/vector/corruption-metrics
 ```
 ```json
-{ "sparse_corrupt_skipped": 0, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 0 }
+{
+  "products": { "sparse_corrupt_skipped": 2, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 2 }
+}
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/corruption-metrics`
+
+The same corrupt-skip counts for a single namespace `{ns}`. Returns all-zero if the namespace has never recorded a corruption.
+
+```bash
+curl http://localhost:8080/admin/indices/products/vector/corruption-metrics
+```
+```json
+{ "sparse_corrupt_skipped": 2, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 2 }
 ```
 
 ---
@@ -1591,7 +1780,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
         build_progress.json   ← index rebuild progress (created on add_index)
 
 {schema_dir}/
-  {namespace}.json            ← schema for each store (doc or KV — distinguished by key_type value)
+  {namespace}.json            ← schema for each store (doc or KV — distinguished by mandatory store_type field)
 ```
 
-Schema files are written atomically (tmp-then-rename). Doc schemas use `key_type` values `"uuid"`, `"u64"`, or `"u128"`; KV schemas use `"str"` or `"int"`. Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.
+Schema files are written atomically (tmp-then-rename). Every schema declares a mandatory `store_type` field — `"doc"` or `"kv"` — which is the authoritative on-disk discriminant between the two store kinds (doc schemas additionally use `key_type` values `"uuid"`/`"u64"`/`"u128"`, KV schemas `"str"`/`"int"`, but that is no longer what distinguishes them). Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.

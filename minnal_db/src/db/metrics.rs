@@ -8,9 +8,14 @@
 //! (plus a few accumulated durations); callers compute rates by sampling twice.
 //!
 //! All counters are `Relaxed` atomics on paths that already do far more work, so
-//! the overhead is negligible. A single shared [`Metrics`] is created in
-//! `Database::open` and threaded into every `KVStore`/`LSMTree` via a
-//! `OnceLock`, so a standalone store/tree (in tests) simply records nothing.
+//! the overhead is negligible. Each namespace's `KVStore`/`LSMTree` owns its own
+//! [`Metrics`] instance (threaded in via a `OnceLock`), so counters are recorded
+//! **per namespace**; a standalone store/tree (in tests) simply records nothing.
+//! `Database` keeps one extra global [`Metrics`] for the counters that belong to
+//! no single namespace (WAL GC) plus a fold of every dropped namespace's final
+//! totals (so engine-wide aggregates stay monotonic across namespace drops). The
+//! engine-wide snapshot is the sum of all live per-namespace snapshots and that
+//! global instance ([`Database::metrics_snapshot`](crate::db::database::Database)).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,6 +48,7 @@ pub struct Metrics {
     pub puts: AtomicU64,
     pub deletes: AtomicU64,
     pub no_wal_puts: AtomicU64,
+    pub no_wal_deletes: AtomicU64,
     pub wal_bytes_appended: AtomicU64,
     /// WAL fsyncs (one per WAL-backed write — durability cost).
     pub wal_fsyncs: AtomicU64,
@@ -108,6 +114,7 @@ impl Metrics {
             puts: g(&self.puts),
             deletes: g(&self.deletes),
             no_wal_puts: g(&self.no_wal_puts),
+            no_wal_deletes: g(&self.no_wal_deletes),
             wal_bytes_appended: g(&self.wal_bytes_appended),
             wal_fsyncs: g(&self.wal_fsyncs),
             apply_failures: g(&self.apply_failures),
@@ -121,11 +128,47 @@ impl Metrics {
             wal_segments_deleted: g(&self.wal_segments_deleted),
         }
     }
+
+    /// Fold a snapshot into these counters (each field `fetch_add`-ed).
+    ///
+    /// Used when a namespace is dropped: its final per-namespace totals are
+    /// folded into the `Database`-level global instance so engine-wide aggregates
+    /// remain monotonic even though the per-namespace counters disappear with it.
+    pub fn add_snapshot(&self, o: &MetricsSnapshot) {
+        let a = |c: &AtomicU64, v: u64| {
+            c.fetch_add(v, Ordering::Relaxed);
+        };
+        a(&self.reads, o.reads);
+        a(&self.read_hits, o.read_hits);
+        a(&self.read_misses, o.read_misses);
+        a(&self.scans, o.scans);
+        a(&self.scan_rows, o.scan_rows);
+        a(&self.lookups, o.lookups);
+        a(&self.fast_path_hits, o.fast_path_hits);
+        a(&self.l0_probes, o.l0_probes);
+        a(&self.l1_probes, o.l1_probes);
+        a(&self.bloom_rejects, o.bloom_rejects);
+        a(&self.puts, o.puts);
+        a(&self.deletes, o.deletes);
+        a(&self.no_wal_puts, o.no_wal_puts);
+        a(&self.no_wal_deletes, o.no_wal_deletes);
+        a(&self.wal_bytes_appended, o.wal_bytes_appended);
+        a(&self.wal_fsyncs, o.wal_fsyncs);
+        a(&self.apply_failures, o.apply_failures);
+        a(&self.memtable_flushes, o.memtable_flushes);
+        a(&self.l0_l1_compactions, o.l0_l1_compactions);
+        a(&self.compaction_bytes_merged, o.compaction_bytes_merged);
+        a(&self.compaction_duration_ms, o.compaction_duration_ms);
+        a(&self.vlog_gc_runs, o.vlog_gc_runs);
+        a(&self.vlog_gc_duration_ms, o.vlog_gc_duration_ms);
+        a(&self.wal_gc_runs, o.wal_gc_runs);
+        a(&self.wal_segments_deleted, o.wal_segments_deleted);
+    }
 }
 
 /// A point-in-time copy of every [`Metrics`] counter. Serializable for the
 /// admin API.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MetricsSnapshot {
     pub reads: u64,
     pub read_hits: u64,
@@ -140,6 +183,7 @@ pub struct MetricsSnapshot {
     pub puts: u64,
     pub deletes: u64,
     pub no_wal_puts: u64,
+    pub no_wal_deletes: u64,
     pub wal_bytes_appended: u64,
     pub wal_fsyncs: u64,
     pub apply_failures: u64,
@@ -151,4 +195,36 @@ pub struct MetricsSnapshot {
     pub vlog_gc_duration_ms: u64,
     pub wal_gc_runs: u64,
     pub wal_segments_deleted: u64,
+}
+
+impl MetricsSnapshot {
+    /// Add every field of `o` into `self`. Used to build the engine-wide
+    /// aggregate by summing all per-namespace snapshots.
+    pub fn accumulate(&mut self, o: &MetricsSnapshot) {
+        self.reads += o.reads;
+        self.read_hits += o.read_hits;
+        self.read_misses += o.read_misses;
+        self.scans += o.scans;
+        self.scan_rows += o.scan_rows;
+        self.lookups += o.lookups;
+        self.fast_path_hits += o.fast_path_hits;
+        self.l0_probes += o.l0_probes;
+        self.l1_probes += o.l1_probes;
+        self.bloom_rejects += o.bloom_rejects;
+        self.puts += o.puts;
+        self.deletes += o.deletes;
+        self.no_wal_puts += o.no_wal_puts;
+        self.no_wal_deletes += o.no_wal_deletes;
+        self.wal_bytes_appended += o.wal_bytes_appended;
+        self.wal_fsyncs += o.wal_fsyncs;
+        self.apply_failures += o.apply_failures;
+        self.memtable_flushes += o.memtable_flushes;
+        self.l0_l1_compactions += o.l0_l1_compactions;
+        self.compaction_bytes_merged += o.compaction_bytes_merged;
+        self.compaction_duration_ms += o.compaction_duration_ms;
+        self.vlog_gc_runs += o.vlog_gc_runs;
+        self.vlog_gc_duration_ms += o.vlog_gc_duration_ms;
+        self.wal_gc_runs += o.wal_gc_runs;
+        self.wal_segments_deleted += o.wal_segments_deleted;
+    }
 }

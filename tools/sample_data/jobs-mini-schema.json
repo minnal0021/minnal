@@ -1,5 +1,6 @@
 {
   "namespace": "jobs",
+  "store_type": "doc",
   "key_type": "u64",
   "attributes": [
     { "name": "jobTitle", "attr_type": "str" }

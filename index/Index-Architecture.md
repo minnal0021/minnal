@@ -1,19 +1,26 @@
 # Index Architecture
 
 This document describes the `index` crate end to end: the custom RoaringBitmap
-engine at its core, how per-field indexes are defined, built, stored, compacted,
-and recovered after a crash, and how dense row IDs keep the bitmaps small.
+engine at its core, how per-field indexes are defined and built on top of it, how
+they are stored and kept compact, and how the whole structure is brought back
+after a crash. It is meant to be read in order — each section builds on the one
+before it, from the raw bitmap up to the recovery model.
 
-> **Scope note.** The bitmap engine (`bitmap.rs`, `container/`, `container_store.rs`,
-> `blob_store.rs`, `rowmap.rs`, `storage.rs`) lives in the `index` crate. The
-> *lifecycle* glue — schema registration, activation, checkpointing, WAL replay —
-> lives in `minnal_db` (`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`),
-> which owns the indexes per namespace. File/line references below point at the
-> code as of this writing.
+Two crates share the work. The bitmap engine itself — `bitmap.rs`, `container/`,
+`container_store.rs`, `blob_store.rs`, `rowmap.rs`, `storage.rs` — lives in the
+`index` crate and knows nothing about databases. The *lifecycle* around it —
+schema registration, activation, checkpointing, WAL replay — lives in `minnal_db`
+(`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one set of
+indexes per namespace. File and line references throughout point at the code as
+of this writing.
 
 ---
 
-## 0. The big picture
+## The shape of the whole thing
+
+At the top sits a query DSL; at the bottom sits a hand-rolled RoaringBitmap. In
+between, each indexed field owns a structure that maps field values to the sets of
+documents that hold them:
 
 ```
                         QUERY DSL  (query/: lexer → parser → eval)
@@ -37,24 +44,32 @@ and recovered after a crash, and how dense row IDs keep the bitmaps small.
             └─ the row IDs that get inserted into the bitmaps above
 ```
 
-Two things are worth internalising before the details:
+Two design choices shape everything that follows, and are worth holding in mind
+before the details.
 
-1. **The RoaringBitmap is hand-rolled.** There is no `roaring` crate dependency
-   (`index/Cargo.toml` pulls only `memmap2`, `parking_lot`, `rkyv`). The whole
-   container model — array/bitset/run, promotion/demotion, all cross-type set
-   operations, and the mmap-backed store underneath — is implemented in this
-   crate (`bitmap.rs` + `container/`).
+The first is that **the RoaringBitmap is written from scratch.** There is no
+`roaring` crate dependency — `index/Cargo.toml` pulls only `memmap2`,
+`parking_lot`, and `rkyv`. The entire container model (array, bitset, run, with
+promotion and demotion between them), every cross-type set operation, and the
+memory-mapped store underneath are all implemented here, in `bitmap.rs` and
+`container/`.
 
-2. **Bitmaps are stored off-heap as serialised blobs, and materialised on
-   demand.** A `FieldIndex` keeps only a small `BTreeMap` on the heap; each
-   value's bitmap lives as a serialised byte blob in a memory-mapped `BlobStore`
-   and is deserialised into an in-memory `RoaringBitmap` only when touched.
+The second is that **bitmaps live off-heap and are materialised only on demand.**
+A field index keeps just a small `BTreeMap` resident in memory. Each value's
+bitmap is a serialised byte blob in a memory-mapped `BlobStore`, deserialised into
+a live `RoaringBitmap` only when a query or a write actually touches it. This is
+what lets a namespace carry many large indexes without a proportional heap cost.
+
+The sections below walk up this stack: first how a field comes into existence,
+then the row IDs that populate its bitmaps, then the bitmap engine itself, then
+the per-field structure built on top, and finally the disk format, compaction,
+checkpointing, and recovery that keep it all durable.
 
 ---
 
-## 1. Field definition & creation
+## 1. Defining a field
 
-**Schema** (`minnal_db/src/db/namespace.rs`):
+An index begins with a field definition (`minnal_db/src/db/namespace.rs`):
 
 ```rust
 pub struct FieldDef {
@@ -64,35 +79,40 @@ pub struct FieldDef {
 }
 ```
 
-Registration happens via `Database::register_index_field`:
+Fields are registered through `Database::register_index_field`, which is
+idempotent: registering the same name-and-type pair twice returns the existing
+`FieldId` rather than allocating a new one. A fresh registration assigns the next
+monotonic `FieldId`, creates the field's on-disk home at
+`{db_path}/index/{namespace_id}/{field_id}/`, and persists the updated field list
+to `{db_path}/ns_{namespace}/config.json`.
 
-- Assigns a new monotonic `FieldId`, or returns the existing one if the same
-  name+type was already registered (idempotent).
-- Creates the on-disk directory `{db_path}/index/{namespace_id}/{field_id}/`.
-- Persists the updated field list to `{db_path}/ns_{namespace}/config.json`.
+That `config.json` is the authoritative schema record. It is written atomically on
+every registration and loaded on every `Database::open()`, so the set of indexed
+fields survives restarts without any separate bookkeeping.
 
-`config.json` is the authoritative schema record: loaded on every
-`Database::open()`, written atomically whenever a field is registered.
-
-The three indexable value types (`IndexValueType` in `src/field/value.rs`) are
-`Bool`, `Int` (i64), and `Str`, matching the `IndexValue` enum variants.
+A field's type is one of three, drawn from `IndexValueType` in
+`src/field/value.rs`: `Bool`, `Int` (an i64), and `Str`. These match the variants
+of the `IndexValue` enum that the rest of the crate operates on.
 
 ---
 
 ## 2. Dense row IDs — the `RowMap`
 
-Field-index bitmaps are sets of **row IDs**, not keys. How those IDs are chosen
-determines how the bitmaps pack — and is the single biggest lever on index size.
+A field-index bitmap is a set of **row IDs**, not keys. Which IDs those are turns
+out to be the single biggest lever on how large the index becomes, so it is worth
+understanding before the bitmaps themselves.
 
-**Why dense.** A RoaringBitmap groups values by their high 112 bits into
-*containers* (see §3). If row IDs are random `u128`s (the old Murmur3-hash
-scheme), every document lands in its own high-key bucket, so the bitmap
-degenerates to ~one container per document — pathologically sparse and huge.
-Assigning **dense, monotonic** IDs (`0, 1, 2, …`) makes consecutive documents
-share a high key and fill a single container, which is the whole reason the
-bitmaps stay small.
+The reason comes from how a RoaringBitmap is laid out (see §3): it groups values
+by their high bits into *containers*. If row IDs are scattered across the `u128`
+space — as they would be if derived by hashing each key — then almost every
+document falls into its own high-key bucket, and the bitmap degenerates into
+roughly one container per document: pathologically sparse, and enormous.
+Assigning **dense, monotonic** IDs instead (`0, 1, 2, …`) means consecutive
+documents share a high key and pack into a single container. That packing is the
+entire reason the bitmaps stay small, and it is why dense IDs from the `RowMap`
+are the default.
 
-**`RowMap`** (`src/rowmap.rs`) is a per-namespace, mmap-backed sidecar with three
+`RowMap` (`src/rowmap.rs`) is a per-namespace, memory-mapped sidecar in three
 parts:
 
 | Part | Backing | Role |
@@ -101,40 +121,52 @@ parts:
 | `id → key` | `rows.idarray` (append-only, indexed by ID) → `rows.keybytes` (append-only key bytes) | `O(1)` resolution of query hits back to keys |
 | counter | `next_id`, stored in the `rowmap.ckpt` marker | next dense ID to assign |
 
-The hash table keys on the **full key bytes** (FNV-1a is used only to pick the
-probe start, then keys are compared byte-for-byte), so there are no ID
-collisions. Entries are **never removed** — a deleted-then-recreated key reuses
-its original ID — so the table has no tombstones and `count == next_id` always.
+The `key → id` table keys on the **full key bytes** — FNV-1a picks only the probe
+start, after which keys are compared byte for byte — so two keys can never
+collide onto the same ID. Entries are **never removed**: a key that is deleted and
+later recreated reuses its original ID. That gives the table a useful invariant —
+no tombstones, and `count == next_id` at all times.
 
-**Row-ID precedence** (`KVStore::resolve_row_id_alloc`, `kv_store.rs`):
+When it comes time to assign an ID for a key, `KVStore::resolve_row_id_alloc`
+(`kv_store.rs`) consults two sources in order:
 
-1. A caller-supplied `RowIdFn` (escape hatch for keys that embed their own ID,
-   e.g. a UUID) wins, paired with a `RowToKeyFn` for reverse resolution.
-2. Otherwise the dense `RowMap`.
-3. Otherwise the legacy Murmur3 `key_to_row_id` — a defensive fallback only
-   reachable for an indexed namespace with no row map loaded (should not occur).
+1. A caller-supplied `RowIdFn` wins if present — an escape hatch for keys that
+   embed their own ID (a UUID, say), paired with a `RowToKeyFn` for the reverse
+   direction. Such IDs are scattered rather than dense, so this trades bitmap
+   compactness for a stable, caller-controlled identifier.
+2. Otherwise the dense `RowMap`, the normal path.
 
-On disk at `{db_path}/index/{namespace_id}/rowmap/` — a sibling of the per-field
-directories (`rowmap` can never collide with a numeric `FieldId`).
+These are the only two sources: a namespace's row map is always loaded before any
+field index is activated (`ensure_rowmap` in `activate_field_index`), so a write
+that reaches index maintenance always has one or the other available.
+
+On disk the row map lives at `{db_path}/index/{namespace_id}/rowmap/`, a sibling
+of the per-field directories. Because the directory is named `rowmap` rather than
+a number, it can never collide with a numeric `FieldId`.
 
 ---
 
 ## 3. The RoaringBitmap engine
 
-### 3.1 `u128` keyspace and containers
+With row IDs in hand, we can look at what actually stores them. A RoaringBitmap
+is a compressed set of integers; this crate's version operates over a `u128`
+keyspace and picks its internal encoding adaptively as the data changes.
+
+### 3.1 Keyspace and containers
 
 A `RoaringBitmap` (`src/bitmap.rs`) holds a set of `u128` values. Each value is
-split (`decompose`) into a **high key** (upper 112 bits) and a **low value**
-(lower 16 bits):
+split (`decompose`) into a **high key** — the upper 112 bits — and a **low
+value** — the lower 16 bits:
 
 ```
 value: u128  ──►  high (112 bits) ──► selects a container
                   low  (16 bits)  ──► the bit within that container
 ```
 
-The high key selects a `Container`; the low 16-bit value is stored inside it.
-A `Container` (`src/container/mod.rs`) is one of three encodings, chosen
-adaptively for the data it holds:
+The high key selects a `Container`, and the low 16-bit value is the specific bit
+stored inside it. A `Container` (`src/container/mod.rs`) comes in three encodings,
+each suited to a different data shape, and the engine moves between them
+automatically as a container's contents change:
 
 | Container | Backing | Best for | Boundary |
 |---|---|---|---|
@@ -142,29 +174,34 @@ adaptively for the data it holds:
 | `BitsetContainer` | fixed `[u64; 1024]` (8 KB) | dense | demotes back to `Array` below the threshold |
 | `RunContainer` | run-length `(start, len)` pairs | long consecutive runs | chosen by `optimize()` / set ops when `is_efficient()` (fewer bytes than the alternatives) |
 
-`Container::insert` / `remove` auto-promote and auto-demote as cardinality
-crosses the threshold; `Container::optimize()` re-evaluates all three encodings
-(including switching to/from `Run`). `cardinality()` is `O(1)` — the total bit
-count is cached in the store header and maintained on every mutation.
+`Container::insert` and `remove` promote and demote across the array/bitset
+boundary as cardinality crosses the threshold, while `Container::optimize()`
+re-evaluates all three encodings at once — including switching a container to or
+from the run form when that is smaller. Cardinality itself is free to read:
+`cardinality()` is `O(1)`, because the running bit count is cached in the store
+header and maintained on every mutation.
 
 ### 3.2 Set operations
 
-`RoaringBitmap` provides `and` / `or` / `and_not` (plus in-place variants),
-`flip`, range-scoped `range_and` / `range_or`, `rank` / `select`, and bulk
-`from_sorted_iter` / `from_unsorted_iter`. The top level walks the two bitmaps'
-high keys in sorted-merge order; per matching high key it dispatches to the
-container layer.
+On top of the containers, `RoaringBitmap` offers the full complement of set
+algebra: `and` / `or` / `and_not` and their in-place variants, `flip`,
+range-scoped `range_and` / `range_or`, `rank` / `select`, and the bulk
+constructors `from_sorted_iter` / `from_unsorted_iter`. A binary operation walks
+the two bitmaps' high keys in sorted-merge order at the top level, and for each
+high key that both share it hands the work down to the container layer.
 
-`container/ops.rs` implements **all nine cross-type combinations** of the binary
-operations (Array×Array, Array×Bitset, Bitset×Run, …), each returning the
-best container type for its result (and demoting/promoting as needed). The hot
-paths use SIMD helpers in `src/simd_support/` (popcount, bitwise AND/OR/AND-NOT,
-sorted-array merge, bit extraction).
+That container layer, in `container/ops.rs`, implements **all nine cross-type
+combinations** of the binary operations — Array×Array, Array×Bitset, Bitset×Run,
+and so on — each producing whichever container type best fits its result and
+promoting or demoting as needed. The hot loops lean on the SIMD helpers in
+`src/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, and bit
+extraction.
 
 ### 3.3 `ContainerStore` — the mmap backing
 
-Each `RoaringBitmap` is backed by a `ContainerStore` (`src/container_store.rs`):
-a two-file, memory-mapped `u128 → Container` map.
+Each `RoaringBitmap`'s containers live in a `ContainerStore`
+(`src/container_store.rs`), a two-file, memory-mapped map from `u128` high key to
+`Container`:
 
 ```
 containers.keys   64-byte header (magic "MINNALBI", version, capacity, count,
@@ -174,17 +211,20 @@ containers.keys   64-byte header (magic "MINNALBI", version, capacity, count,
 containers.vals   append-only rkyv-serialised Container blobs, 16-byte aligned
 ```
 
-A store is either **anonymous** (an in-memory mmap, used for transient bitmaps —
-set-operation results and the field-index bitmaps materialised on demand) or
-**file-backed**. The public API is identical; growth is handled transparently by
-remapping. `value_write_pos` only ever advances — values are **append-only**
-within a store, never overwritten in place.
+A store is either **anonymous** — an in-memory mmap used for transient bitmaps,
+such as set-operation results and the field-index bitmaps materialised on demand —
+or **file-backed**. The public API is identical either way, and growth is handled
+transparently by remapping. The one rule that matters for correctness later is
+that `value_write_pos` only ever advances: values are **append-only** within a
+store, never overwritten in place.
 
 ---
 
-## 4. Field index in-memory structure
+## 4. The field index
 
-**`FieldIndex<V>`** (`src/field/field_index.rs`):
+A single bitmap answers "which rows hold this exact value". A field index
+(`FieldIndex<V>`, `src/field/field_index.rs`) is the layer that turns a whole
+field into many such bitmaps and routes queries to the right ones:
 
 ```
 ordering:  BTreeMap<V, u128>   // value → slot_id  (sorted; drives range queries)
@@ -192,43 +232,52 @@ bitmaps:   BlobStore           // slot_id → serialised RoaringBitmap bytes
 next_slot: u128
 ```
 
-The heap carries only the `ordering` map (values + slot IDs, no bitmap data).
-The bitmaps themselves live in a `BlobStore` (`src/blob_store.rs`) — the same
-two-file mmap layout as `ContainerStore` (header "MINNALBS" + 48-byte slots +
-append-only `blobs.vals`), but with arbitrary byte blobs as values.
+Only the `ordering` map is kept on the heap — the values and their slot IDs, but
+none of the bitmap data. The bitmaps live in a `BlobStore` (`src/blob_store.rs`),
+which uses the same two-file mmap layout as `ContainerStore` (a header
+"MINNALBS", 48-byte slots, and an append-only `blobs.vals`) but stores arbitrary
+byte blobs rather than containers.
 
-**Insert** `(value, row_id)`:
+Inserting `(value, row_id)` walks that structure top to bottom:
 
-1. Look up or allocate `slot_id` for `value` in `ordering`.
-2. `load_bitmap(slot_id)` → read the blob, `storage::deserialize` it into an
+1. Find or allocate the `slot_id` for `value` in `ordering`.
+2. `load_bitmap(slot_id)` reads the blob and `storage::deserialize`s it into an
    in-memory (anonymous) `RoaringBitmap`.
 3. `bitmap.insert(row_id)`.
-4. `store_bitmap` → `storage::serialize` the whole bitmap, `BlobStore::upsert`
-   (which **appends** the new blob).
+4. `store_bitmap` re-serialises the whole bitmap and hands it to
+   `BlobStore::upsert`, which **appends** the new blob.
 
-**Remove** is symmetric; when a bitmap becomes empty its slot is freed
-(`remove_key`) and the `ordering` entry dropped. `remove_all_for_row` clears a
-row from every value bucket — used to handle document **updates** (clear old
-buckets, then re-insert the new value).
+Removal is the mirror image, and when a bitmap empties out its slot is freed
+(`remove_key`) and its `ordering` entry dropped. One helper deserves a name:
+`remove_all_for_row` clears a single row from *every* value bucket at once, which
+is how a document **update** is handled — clear the row from its old values, then
+insert it under the new ones.
 
-Predicate evaluation (`evaluate`) uses `ordering` to find the relevant slots —
-a single `get` for `Eq`/`In`, a `BTreeMap::range` for `Lt`/`Le`/`Gt`/`Ge`/
-`Between`, a full scan minus one for `Ne` — then OR-folds their bitmaps.
+Queries run through `evaluate`, which uses `ordering` to locate the slots a
+predicate needs and then OR-folds their bitmaps together. The lookup shape follows
+the operator: a single `get` for `Eq` and `In`, a `BTreeMap::range` for the
+ordered comparisons (`Lt`/`Le`/`Gt`/`Ge`/`Between`), and a full scan minus the one
+excluded slot for `Ne`.
 
-### Keymap — reconstructing `ordering` on open
+### Rebuilding `ordering` on open — the keymap
 
-The `ordering` map is heap-only, so it must be rebuilt at startup. A second
-`BlobStore` under `keymap/` persists `slot_id → raw value bytes` (1 byte for
-bool, 8-byte LE i64, UTF-8 for strings). It is written **once per distinct
-value** (not per document), so a fixed value set never bloats it — but under
-**distinct-value churn** (values that appear and are later fully removed,
-freeing their slot) it accumulates dead entries and is compacted on its own
-waste ratio (§6). On open, scanning it reconstructs `BTreeMap<V, slot_id>`
-exactly.
+Because `ordering` is heap-only, nothing on disk records it directly, so it has to
+be reconstructed at startup. That is the purpose of a second `BlobStore`, under
+`keymap/`, which persists `slot_id → raw value bytes` (one byte for a bool, an
+8-byte little-endian i64, or UTF-8 for a string). Scanning it on open rebuilds
+`BTreeMap<V, slot_id>` exactly.
+
+The keymap is written **once per distinct value**, not once per document, so a
+stable set of values never bloats it. Its one failure mode is distinct-value
+*churn* — values that appear and are then fully removed, freeing their slots —
+which leaves dead entries behind. Those are reclaimed by the same compaction pass
+that handles the bitmaps (§6).
 
 ---
 
-## 5. Storage format on disk
+## 5. On-disk layout
+
+Pulling the pieces together, a namespace's index directory looks like this:
 
 ```
 {db_path}/index/{namespace_id}/
@@ -245,10 +294,9 @@ exactly.
     checkpoint                 ← 8-byte LE u64: WAL offset at last flush
 ```
 
-### Serialised RoaringBitmap format (`src/storage.rs`)
-
-A bitmap blob in `blobs.vals` is **not** a copy of the `ContainerStore` mmap; it
-is an independent length-prefixed encoding:
+The bitmap blobs in `blobs.vals` warrant a note, because they are **not** a copy
+of the `ContainerStore` mmap. A stored bitmap is an independent, length-prefixed
+encoding (`src/storage.rs`):
 
 ```
 [4B  LE u32   container_count]
@@ -258,56 +306,62 @@ for each container (sorted by high key):
   [blob_len bytes  rkyv-serialised Container]
 ```
 
-`deserialize` rebuilds an anonymous `RoaringBitmap` from these bytes (the
-`unaligned` rkyv feature lets archived containers be read without an aligned
-copy).
-
-The keymap store is **immediately durable** — mmap writes are OS-mediated and do
-not require separate WAL entries.
+`deserialize` rebuilds an anonymous `RoaringBitmap` from these bytes; the
+`unaligned` rkyv feature lets the archived containers be read straight out of the
+buffer without an aligned copy. The keymap store, for its part, needs no WAL of
+its own — its mmap writes are OS-mediated and durable once flushed.
 
 ---
 
-## 6. Append-only growth & crash-safe compaction
+## 6. Append-only growth and crash-safe compaction
 
-Every `FieldIndex::insert` re-serialises the **whole** bitmap and `upsert`s it,
-and `upsert` always **appends** (the value region only grows). So a field value
-shared by *N* documents leaves *N−1* stale bitmap copies behind — `O(N²)`
-cumulative bytes, and **catastrophic for low-cardinality fields** (a boolean over
-tens of thousands of docs can bloat to gigabytes). The dense row IDs (§2) shrink
-each individual bitmap; compaction reclaims the append churn.
+The append-only rule from §3.3 — values are only ever appended, never overwritten
+in place — has a cost that this section and the next exist to manage. Every
+`FieldIndex::insert` re-serialises the **whole** bitmap and `upsert`s it, and
+`upsert` only ever appends. So a value shared by *N* documents
+leaves *N−1* stale copies of its bitmap behind it in `blobs.vals` — `O(N²)`
+cumulative bytes. For a low-cardinality field this is catastrophic: a boolean
+spread across tens of thousands of documents can bloat to gigabytes. Dense row
+IDs (§2) keep each individual bitmap small; compaction is what reclaims the
+accumulated churn.
 
-The same applies, more mildly, to the **keymap** store: a distinct value is
-written once, so a fixed value set never bloats — but under distinct-value churn
-(values created then fully removed) its freed slots leave dead bytes. `maybe_compact`
-therefore compacts **both** stores, each on its own `waste_ratio()`. They key on
-the same slot IDs and free the same slots together (when a value's bitmap empties),
-so compacting them independently keeps them consistent.
+The keymap store has the same shape of problem in a milder form. It is written
+once per distinct value, so a fixed value set never grows it — but distinct-value
+churn leaves dead entries, exactly as described in §4. So compaction covers
+**both** stores, each triggered on its own `waste_ratio()`. Because the two stores
+key on the same slot IDs and free the same slots together (a value's slot is
+released in both the moment its bitmap empties), compacting them independently
+still leaves them mutually consistent.
 
-**`BlobStore::compact()`** rebuilds the value region from live slots only,
-drops dead space and tombstones, and shrinks the file. `waste_ratio()` reports
-the reclaimable fraction (alignment padding counts as live, so it reads ≈0 right
-after a compaction). Compaction is driven at the checkpoint (§7) for any field
-whose waste crosses `ThresholdConfig::index_blob_waste_threshold` (percent,
-default 50; TOML `thresholds.index_blob_waste_threshold`).
+`BlobStore::compact()` does the reclaiming: it rebuilds the value region from the
+live slots only, dropping dead space and tombstones, and shrinks the file.
+`waste_ratio()` reports the reclaimable fraction — alignment padding counts as
+live, so it reads ≈0 immediately after a compaction. The trigger is a single
+threshold, `ThresholdConfig::index_blob_waste_threshold` (a percentage, default 50,
+set in TOML as `thresholds.index_blob_waste_threshold`).
 
-> **The checkpoint pass is the *only* trigger for compaction.** `compact()` is
-> invoked from exactly one place — `Database::run_index_checkpoint` — and only
-> for a field over the waste threshold. That pass is reached three ways, all
-> running the *same* code: the periodic `IndexCheckpointWorker` (~15 min), clean
-> shutdown, and the on-demand `Db::checkpoint_index()` (exposed over REST as
-> `POST /admin/storage/index-checkpoint`). There is no write-path or standalone
-> compaction. (Note: `Db::compact()` / `POST /admin/storage/compact` is the
-> unrelated KV-engine LSM/value-log compaction, not this.)
+Where that trigger fires is deliberately narrow. `compact()` is invoked from
+exactly one place — `Database::run_index_checkpoint` — and only for a field over
+the waste threshold. That checkpoint pass is reached three ways, all running the
+same code: the periodic `IndexCheckpointWorker` (~15 min), a clean shutdown, and
+the on-demand `Db::checkpoint_index()` exposed over REST as `POST
+/admin/storage/index-checkpoint`. There is no write-path compaction and no
+standalone one. (Do not confuse this with `Db::compact()` / `POST
+/admin/storage/compact`, which is the unrelated KV-engine LSM and value-log
+compaction.)
 
-### Compaction must never rewrite in place
+### Why compaction must never rewrite in place
 
-Index recovery (§8) loads the on-disk store and replays only the **WAL tail** on
-top of it — it does *not* rebuild from scratch. So a crash that left new key
-offsets pointing into a half-rewritten value region would be inherited as
-**silent corruption** that replay cannot heal (any value bucket not touched in
-the replay window stays wrong).
+Recovery (§8) does not rebuild the index from scratch. It loads the on-disk store
+as it stands and replays only the **WAL tail** on top of it. That makes in-place
+rewriting during compaction dangerous: a crash that left new key offsets pointing
+into a half-rewritten value region would be inherited as **silent corruption** —
+any value bucket the replay window happened not to touch would simply stay wrong,
+and nothing would ever detect it.
 
-`compact()` therefore uses a **staged file swap**:
+So `compact()` never touches the live files. It builds the compacted pair in
+memory and swaps it in through a staged sequence, with a marker file as the atomic
+commit point:
 
 ```
 build compacted (key table, val region) in memory   (~1× live size, read from mmap)
@@ -317,47 +371,57 @@ build compacted (key table, val region) in memory   (~1× live size, read from m
   remap onto the new files
 ```
 
-`BlobStore::open()` calls `recover_compaction()` first: **marker present** ⇒ the
-staged files are complete, finish the swap idempotently; **marker absent** ⇒ the
-staged files are partial, discard them. Two-file renames are not atomic as a
-pair — the marker is what makes the swap atomic, not any lock.
+`BlobStore::open()` calls `recover_compaction()` before anything else. If the
+marker is **present**, the staged files are known-complete and the swap is
+finished idempotently; if it is **absent**, the staged files are partial and are
+discarded. A two-file rename is not atomic as a pair, so it is the marker — not
+any lock — that makes the swap atomic.
 
-> **Invariant:** after any crash the on-disk pair is fully **old** or fully
-> **new**, never a torn mix. If you touch this path, preserve the ordering
-> (stage+fsync → marker+fsync → rename → drop marker) and keep
-> `recover_compaction` in `open`.
+The invariant this buys is simple and load-bearing: **after any crash the on-disk
+pair is fully old or fully new, never a torn mix.** Anyone touching this path must
+preserve the ordering (stage+fsync → marker+fsync → rename → drop marker) and keep
+`recover_compaction` in `open`.
 
 ---
 
 ## 7. Checkpointing
 
-A background worker (`index_checkpoint_worker`) runs every **15 minutes** by
-default; the same sequence runs on clean shutdown and on demand via
-`Database::run_index_checkpoint()`. Per tick, for the namespace then each active
-field:
+Checkpointing is the routine that flushes the index to disk and, where needed,
+invokes the compaction of §6. The `index_checkpoint_worker` runs it every **15
+minutes** by default, and the identical sequence runs on clean shutdown and on
+demand via `Database::run_index_checkpoint()`. Each tick processes the namespace's
+row map first, then each active field in turn:
 
 1. **Flush the `RowMap` first.** `flush_rowmap(wal_tail)` msyncs `rows.*` and
-   atomically writes the `rowmap.ckpt` marker. **Load-bearing ordering:** the row
-   map is flushed *before* any field index, so it is always at least as durable
-   as every persisted bitmap bit — otherwise a crash could leave a bit whose row
-   ID can't be reproduced.
-2. Per field, under the field's `index` **read** lock: `msync` the bitmap and
-   keymap mmaps; compute `bitmap_waste_ratio()` and `keymap_waste_ratio()`.
-3. If **either** is ≥ `index_blob_waste_threshold`, take the field's **write**
-   lock and `maybe_compact()` → `BlobStore::compact()` (§6) on whichever store(s)
-   are over. This stalls *that field's* reads and writes for the compaction's I/O
-   (dominated by the fsyncs), and only for fields over the threshold — not every
-   tick.
-4. Atomically write the current WAL tail offset to `{field_path}/checkpoint` via
-   **tmp-then-rename**.
+   atomically writes the `rowmap.ckpt` marker. The ordering here is load-bearing:
+   the row map is made durable *before* any field index, so it is always at least
+   as current as every persisted bitmap bit. Otherwise a crash could leave a
+   persisted bit whose row ID the row map could no longer reproduce.
+2. **Flush each field**, under that field's `index` **read** lock: msync the
+   bitmap and keymap mmaps, then compute `bitmap_waste_ratio()` and
+   `keymap_waste_ratio()`.
+3. **Compact if either is over threshold.** When a store's waste is ≥
+   `index_blob_waste_threshold`, take the field's **write** lock and
+   `maybe_compact()` → `BlobStore::compact()` (§6) on whichever store(s) qualify.
+   This stalls *that one field's* reads and writes for the compaction's I/O —
+   dominated by the fsyncs — and only for fields actually over the threshold, not
+   every field every tick.
+4. **Record the offset.** Atomically write the current WAL tail offset to
+   `{field_path}/checkpoint` via tmp-then-rename.
+
+That final offset is the hinge between checkpointing and recovery: it marks
+exactly how much of the WAL is already reflected on disk, which is where the next
+section picks up.
 
 ---
 
 ## 8. Crash recovery
 
-Recovery is a **checkpoint + WAL replay** model. The index is a *derived*
-structure: its durable on-disk state is brought current by replaying the WAL
-entries written since its last checkpoint.
+The index is a *derived* structure — everything in it can be reconstructed from
+the KV data and the WAL — so recovery is a **checkpoint + WAL replay** model
+rather than a rebuild. Each on-disk component is loaded as it was last flushed,
+and then the WAL entries written since its checkpoint are replayed to bring it
+current.
 
 ```
 Database::open()
@@ -387,7 +451,14 @@ activate_field_index()                            ← index-layer recovery
   └── Flush the index before making it visible (under Arc<RwLock>)
 ```
 
-### Guarantees
+The order across these three passes is what makes them safe. The KV data is
+replayed before any index is activated, so the index always re-inserts from
+current values. The row map is recovered before the fields, so every replayed
+insert has a stable ID to reuse. And because replay runs in sequence order, a
+freshly allocated dense ID picks up deterministically from `next_id` — the same ID
+a key would have received the first time.
+
+Each component's guarantee, in one place:
 
 | Component | Recovery mechanism |
 |---|---|
@@ -399,15 +470,17 @@ activate_field_index()                            ← index-layer recovery
 | Checkpoint markers | tmp-then-rename; a partial write is never observed |
 | Sequence numbers | `max(WAL scan, metadata hint) + 1` |
 
-WAL replay is idempotent, and there is no transaction spanning multiple
-operations — each write's intent is durable in the WAL before the op is
-acknowledged.
+All of this rests on WAL replay being idempotent and on there being no transaction
+that spans multiple operations: each write's intent is durable in the WAL before
+the operation is acknowledged, so replaying it twice is harmless and replaying it
+once is enough.
 
-### Why index recovery lives in `activate_field_index`
+### Why recovery lives inside `activate_field_index`
 
-Prior to commit `9399ff5` ("Simplified index recovery process"), index WAL replay
-ran in a separate `recover_indices()` pass. That introduced a race: a concurrent
-put arriving between recovery and index registration could have its effect
-overwritten by the replayed state. Moving replay into `activate_field_index()` —
-before the index is wrapped in `Arc<RwLock>` and made visible — closes that
-window entirely.
+The replay step above deliberately runs *inside* field activation rather than in a
+pass of its own. It did not always. Before commit `9399ff5` ("Simplified index
+recovery process"), WAL replay ran in a separate `recover_indices()` step, which
+opened a race: a concurrent put arriving between recovery and the index being
+registered could have its effect silently overwritten by the replayed state.
+Folding replay into `activate_field_index()` — before the index is wrapped in
+`Arc<RwLock>` and made visible to anyone — closes that window completely.

@@ -43,6 +43,9 @@ pub enum SchemaError {
     #[error("embedding field '{field}' conflicts with an existing index field name")]
     EmbeddingFieldConflict { field: String },
 
+    #[error("namespace '{namespace}' already has a vector index — drop it before adding another")]
+    SemanticSearchAlreadyEnabled { namespace: String },
+
     #[error("embedding field '{field}' must be declared as a string (Str) attribute")]
     EmbeddingFieldNotString { field: String },
 
@@ -67,6 +70,13 @@ pub enum SchemaError {
 
     #[error("semantic search is only supported for KV stores with value_type = str")]
     KvSemanticSearchOnlyForStr,
+
+    #[error("wrong store type for namespace '{namespace}': expected {expected}, found {found}")]
+    WrongStoreType {
+        namespace: String,
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 // ── Doc-store-level errors ─────────────────────────────────────────────────

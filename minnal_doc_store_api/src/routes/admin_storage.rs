@@ -4,21 +4,22 @@
 //! GET  /admin/storage/health                          → server liveness + uptime
 //! GET  /admin/storage/stats                           → engine-wide value-log statistics
 //! GET  /admin/storage/ops-metrics                      → engine-wide operational counters (reads/writes/compaction/GC + read-path efficiency)
+//! GET  /admin/storage/ops-metrics/by-namespace         → the same counters, broken out per namespace
+//! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
 //! GET  /admin/storage/wal                             → WAL metadata snapshot
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
 //! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ physical st_blocks bytes)
 //! GET  /admin/storage/value-log/{ns}/pages            → per-page garbage breakdown for one namespace (deep dive)
-//! GET  /admin/storage/namespaces                      → namespace registry with field schemas
-//! GET  /admin/storage/kv-namespaces                   → all KV namespaces open in the engine
-//! GET  /admin/storage/stores/{ns}/kv-meta             → KV monitoring for one doc store namespace
-//! GET  /admin/storage/kv-stores/{ns}/kv-meta          → KV monitoring for one user KV namespace
+//! GET  /admin/storage/namespaces                      → doc-store namespace registry with field schemas
+//! GET  /admin/storage/namespaces/physical             → every physical engine namespace (incl. companions/system), each with a role
+//! GET  /admin/storage/stores/{ns}/kv-meta             → engine storage metadata for one store (doc or KV)
 //! GET  /admin/storage/system/stores                   → list all stores in the system namespace
 //! GET  /admin/storage/system/stores/{ns}/meta         → metadata for one system KV store
 //! GET  /admin/storage/index-waste                     → per-field field-index bitmap/keymap waste + threshold
 //! POST /admin/storage/gc                              → trigger value-log GC across all namespaces
 //! POST /admin/storage/gc/wal                          → trigger WAL GC
 //! POST /admin/storage/compact                         → trigger LSM compaction
-//! POST /admin/storage/index-checkpoint                → flush + compact field indexes (and row maps)
+//! POST /admin/storage/index-checkpoint                → flush + compact field indexes (and row maps) — runs in background (202)
 //! ```
 
 use std::collections::HashMap;
@@ -33,9 +34,9 @@ use minnal_db::{FieldMeta, LsmManifest, ValueLogMetadata};
 use serde::Serialize;
 use tracing::{error, info};
 
-use minnal_doc_store::{KvKeyType, KvValueType};
+use minnal_doc_store::{KvKeyType, KvValueType, StoreType};
 
-use crate::AppState;
+use crate::{AppState, error::AppError};
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +110,7 @@ pub struct WriteMetrics {
     puts: u64,
     deletes: u64,
     no_wal_puts: u64,
+    no_wal_deletes: u64,
     wal_bytes_appended: u64,
     wal_fsyncs: u64,
     apply_failures: u64,
@@ -130,9 +132,10 @@ pub struct GcMetrics {
     wal_segments_deleted: u64,
 }
 
+/// The grouped operational-metrics body (without the engine-level `uptime_s`),
+/// reused by the engine, per-namespace, and by-namespace endpoints.
 #[derive(Serialize)]
-pub struct OpsMetricsResponse {
-    uptime_s: u64,
+pub struct OpsMetricsBody {
     reads: ReadMetrics,
     lsm_lookups: LsmLookupMetrics,
     writes: WriteMetrics,
@@ -140,19 +143,29 @@ pub struct OpsMetricsResponse {
     gc: GcMetrics,
 }
 
+#[derive(Serialize)]
+pub struct OpsMetricsResponse {
+    uptime_s: u64,
+    #[serde(flatten)]
+    body: OpsMetricsBody,
+}
+
+/// One namespace's operational metrics (engine `uptime_s` omitted; the WAL-GC
+/// counters under `gc` are engine-global and always `0` here).
+#[derive(Serialize)]
+pub struct NamespaceOpsMetrics {
+    namespace: String,
+    #[serde(flatten)]
+    body: OpsMetricsBody,
+}
+
 fn ratio(num: u64, denom: u64) -> f64 {
     if denom == 0 { 0.0 } else { num as f64 / denom as f64 }
 }
 
-/// `GET /admin/storage/ops-metrics` — engine-wide operational counters since
-/// startup (cumulative; sample twice to compute rates). Includes a few derived
-/// ratios that directly show read-path efficiency: `read_hit_ratio`,
-/// `fast_path_hit_ratio` (how often the active-memtable fast path serves a
-/// lookup), and the bloom/L0/L1 probe counts.
-pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let m = state.store.ops_metrics();
-    Json(OpsMetricsResponse {
-        uptime_s: state.started_at.elapsed().as_secs(),
+/// Build the grouped metrics body (with derived ratios) from a raw snapshot.
+fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
+    OpsMetricsBody {
         reads: ReadMetrics {
             reads: m.reads,
             read_hits: m.read_hits,
@@ -173,6 +186,7 @@ pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
             puts: m.puts,
             deletes: m.deletes,
             no_wal_puts: m.no_wal_puts,
+            no_wal_deletes: m.no_wal_deletes,
             wal_bytes_appended: m.wal_bytes_appended,
             wal_fsyncs: m.wal_fsyncs,
             apply_failures: m.apply_failures,
@@ -189,7 +203,44 @@ pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
             wal_gc_runs: m.wal_gc_runs,
             wal_segments_deleted: m.wal_segments_deleted,
         },
+    }
+}
+
+/// `GET /admin/storage/ops-metrics` — engine-wide operational counters since
+/// startup (cumulative; sample twice to compute rates). The engine view is the
+/// sum of every namespace's counters plus the global WAL-GC/retired totals.
+/// Includes derived read-path ratios (`read_hit_ratio`, `fast_path_hit_ratio`).
+pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let m = state.store.ops_metrics();
+    Json(OpsMetricsResponse {
+        uptime_s: state.started_at.elapsed().as_secs(),
+        body: ops_metrics_body(&m),
     })
+}
+
+/// `GET /admin/storage/stores/{ns}/ops-metrics` — operational counters for one
+/// namespace. The WAL-GC counters are engine-global and read `0` here.
+pub async fn ops_metrics_ns(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    let m = state.store.ops_metrics_for(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
+    Ok(Json(OpsMetricsResponse {
+        uptime_s: state.started_at.elapsed().as_secs(),
+        body: ops_metrics_body(&m),
+    }))
+}
+
+/// `GET /admin/storage/ops-metrics/by-namespace` — per-namespace operational
+/// counters for every live namespace (engine-global WAL-GC counters excluded).
+pub async fn ops_metrics_by_namespace(State(state): State<AppState>) -> impl IntoResponse {
+    let per_ns: Vec<NamespaceOpsMetrics> = state
+        .store
+        .ops_metrics_by_namespace()
+        .into_iter()
+        .map(|(namespace, m)| NamespaceOpsMetrics {
+            namespace,
+            body: ops_metrics_body(&m),
+        })
+        .collect();
+    Json(per_ns)
 }
 
 // ── WAL ───────────────────────────────────────────────────────────────────────
@@ -438,10 +489,14 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(name, schema)| {
             let ns_id = schema.ns_id.unwrap_or(0);
             let indexed_fields = if let Some(id) = schema.ns_id {
+                // Filter to the schema's current indices — the db registry retains
+                // dropped fields (for field_id reuse), which must not show here.
+                let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
                 state
                     .store
                     .list_index_fields(id)
                     .into_iter()
+                    .filter(|m| active.contains(m.field_name.as_str()))
                     .map(|m| FieldInfo::from_meta(m, &state.store, name))
                     .collect()
             } else {
@@ -650,7 +705,7 @@ pub struct KvNamespaceInfo {
     role: &'static str,
 }
 
-pub async fn kv_namespaces(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn physical_namespaces(State(state): State<AppState>) -> impl IntoResponse {
     let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
     let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
 
@@ -769,20 +824,50 @@ pub async fn trigger_compact(State(state): State<AppState>) -> Result<StatusCode
 /// Force an index checkpoint: flush every namespace's dense row map and all
 /// active field indexes to disk, compacting any field-index bitmap store whose
 /// waste exceeds `thresholds.index_blob_waste_threshold`. This is the same pass
-/// the periodic worker and clean shutdown run. Responds with the number of
-/// active field indexes checkpointed.
-pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    info!("index checkpoint triggered manually");
-    match state.store.checkpoint_index().await {
-        Ok(fields_checkpointed) => {
-            info!(fields_checkpointed, "index checkpoint complete");
-            Ok(Json(serde_json::json!({ "fields_checkpointed": fields_checkpointed })))
-        }
-        Err(e) => {
-            error!(error = %e, "index checkpoint failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))
-        }
+/// the periodic worker and clean shutdown run.
+///
+/// Because the compaction can take a long time on a large/wasted index (each
+/// over-threshold field is rebuilt under its own write lock), this **returns
+/// immediately with `202 Accepted`** and runs the pass in the **background**; the
+/// checkpointed-field count is written to the log (`info!` on completion,
+/// `error!` on failure). Overlapping runs are rejected with `409 Conflict` so
+/// expensive flush/compaction passes cannot stack.
+pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use std::sync::atomic::Ordering;
+
+    // Reject overlapping runs — a checkpoint can be a full flush + compaction.
+    if state
+        .index_checkpoint_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "an index checkpoint is already running" })),
+        ));
     }
+
+    info!("index checkpoint accepted — running in background");
+    let store = std::sync::Arc::clone(&state.store);
+    let running = std::sync::Arc::clone(&state.index_checkpoint_running);
+    tokio::spawn(async move {
+        // Clear the running flag however the task exits (including a panic), so a
+        // failure can never wedge the endpoint into a permanent 409.
+        struct ResetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetOnDrop(running);
+
+        match store.checkpoint_index().await {
+            Ok(fields_checkpointed) => info!(fields_checkpointed, "index checkpoint complete"),
+            Err(e) => error!(error = %e, "index checkpoint failed"),
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ── Index waste ────────────────────────────────────────────────────────────────
@@ -830,10 +915,15 @@ pub async fn index_waste(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .filter_map(|(name, schema)| {
             let ns_id = schema.ns_id?;
+            // The db registry retains dropped fields (for field_id reuse), so use
+            // the schema's current `indices` as the source of truth for which
+            // indexes are still active — otherwise a dropped index lingers here.
+            let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
             let fields = state
                 .store
                 .list_index_fields(ns_id)
                 .into_iter()
+                .filter(|m| active.contains(m.field_name.as_str()))
                 .map(|m| {
                     let waste = state.store.field_index_waste(name, &m.field_name);
                     FieldWasteInfo {
@@ -930,39 +1020,6 @@ pub fn build_namespace_meta(
     (lsm_info, vlog_info, associated_stores)
 }
 
-pub async fn store_kv_meta(
-    State(state): State<AppState>,
-    Path(ns): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ns_id, semantic_search_enabled, doc_names, kv_names) = {
-        let schemas = state.schemas.read().await;
-        match schemas.get(&ns) {
-            Some(s) if s.ns_id.is_some() => {
-                let doc_names: std::collections::HashSet<String> = schemas.keys().cloned().collect();
-                let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
-                (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
-            }
-            _ => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": format!("doc store '{}' does not exist", ns) })),
-                ));
-            }
-        }
-    };
-
-    let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
-
-    Ok(Json(DocStoreKvMeta {
-        namespace: ns,
-        ns_id,
-        semantic_search_enabled,
-        lsm: lsm_info,
-        value_log: vlog_info,
-        associated_stores,
-    }))
-}
-
 #[derive(Serialize)]
 pub struct KvStoreKvMeta {
     namespace: String,
@@ -977,46 +1034,69 @@ pub struct KvStoreKvMeta {
     associated_stores: Vec<AssociatedKvStore>,
 }
 
-pub async fn kv_store_kv_meta(
+/// `GET /admin/storage/stores/{ns}/kv-meta` — engine-level (LSM + value-log)
+/// storage metadata for one store of **either** kind, plus its companion KV
+/// stores. The kind is resolved from the store's `store_type`; the KV-store
+/// response additionally carries `key_type`/`value_type`.
+pub async fn store_kv_meta(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ns_id, key_type, value_type, semantic_search_enabled, doc_store_names, kv_store_names) = {
-        let kv_schemas = state.kv_schemas.read().await;
-        match kv_schemas.get(&ns) {
-            Some(s) if s.ns_id.is_some() => {
-                let doc_store_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
-                let kv_store_names: std::collections::HashSet<String> = kv_schemas.keys().cloned().collect();
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("store '{}' does not exist", ns) })),
+        )
+    };
+
+    match state.store.store_type(&ns) {
+        Ok(StoreType::Doc) => {
+            let (ns_id, semantic_search_enabled, doc_names, kv_names) = {
+                let schemas = state.schemas.read().await;
+                let s = schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
+                let doc_names: std::collections::HashSet<String> = schemas.keys().cloned().collect();
+                let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
+                (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
+            };
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            Ok(Json(serde_json::json!(DocStoreKvMeta {
+                namespace: ns,
+                ns_id,
+                semantic_search_enabled,
+                lsm: lsm_info,
+                value_log: vlog_info,
+                associated_stores,
+            })))
+        }
+        Ok(StoreType::Kv) => {
+            let (ns_id, key_type, value_type, semantic_search_enabled, doc_names, kv_names) = {
+                let kv_schemas = state.kv_schemas.read().await;
+                let s = kv_schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
+                let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
+                let kv_names: std::collections::HashSet<String> = kv_schemas.keys().cloned().collect();
                 (
                     s.ns_id.unwrap(),
                     kv_key_type_str(s.key_type),
                     kv_value_type_str(s.value_type),
                     s.semantic_search_enabled,
-                    doc_store_names,
-                    kv_store_names,
+                    doc_names,
+                    kv_names,
                 )
-            }
-            _ => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": format!("KV store '{}' does not exist", ns) })),
-                ));
-            }
+            };
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            Ok(Json(serde_json::json!(KvStoreKvMeta {
+                namespace: ns,
+                ns_id,
+                key_type,
+                value_type,
+                semantic_search_enabled,
+                lsm: lsm_info,
+                value_log: vlog_info,
+                associated_stores,
+            })))
         }
-    };
-
-    let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_store_names, &kv_store_names);
-
-    Ok(Json(KvStoreKvMeta {
-        namespace: ns,
-        ns_id,
-        key_type,
-        value_type,
-        semantic_search_enabled,
-        lsm: lsm_info,
-        value_log: vlog_info,
-        associated_stores,
-    }))
+        Err(_) => Err(not_found()),
+    }
 }
 
 // ── Type helpers ──────────────────────────────────────────────────────────────

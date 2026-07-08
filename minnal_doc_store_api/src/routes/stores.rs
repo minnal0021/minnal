@@ -1,15 +1,12 @@
-//! Store lifecycle endpoints:
+//! Store lifecycle endpoints — a single unified `/stores` path for both
+//! document stores and KV stores, dispatched on the schema's `store_type`:
 //!
 //! ```text
-//! GET    /stores                 → list all doc stores
-//! POST   /stores                 → create doc store
-//! DELETE /stores/{ns}            → drop doc store
-//! GET    /stores/{ns}/schema     → fetch current doc-store schema
-//! PATCH  /stores/{ns}/schema     → amend doc-store schema
-//! GET    /kv-stores              → list all KV stores
-//! POST   /kv-stores              → create KV store
-//! DELETE /kv-stores/{ns}         → drop KV store
-//! GET    /kv-stores/{ns}/schema  → fetch current KV-store schema
+//! GET    /stores                 → list all stores (doc and KV)
+//! POST   /stores                 → create a store (store_type in payload picks doc vs kv)
+//! DELETE /stores/{ns}            → drop a store (kind resolved from its schema)
+//! GET    /stores/{ns}/schema     → fetch a store's schema (doc or KV)
+//! PATCH  /stores/{ns}/schema     → amend schema (doc stores only; KV → 409)
 //! ```
 
 use std::sync::Arc;
@@ -20,19 +17,46 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment};
+use minnal_doc_store::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, StoreType};
 use serde::Deserialize;
 use tracing::{debug, error, info};
 
 use crate::{AppState, error::AppError};
 
+/// Read the mandatory `store_type` discriminant from a raw create/import
+/// payload, returning a 400 if it is missing or unparseable.
+pub(crate) fn store_type_from_value(body: &serde_json::Value) -> Result<StoreType, AppError> {
+    body.get("store_type")
+        .and_then(|v| serde_json::from_value::<StoreType>(v.clone()).ok())
+        .ok_or_else(|| AppError::from(DocStoreError::InvalidId("payload is missing a valid 'store_type' (expected \"doc\" or \"kv\")".into())))
+}
+
 pub async fn list(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     debug!("listing stores");
-    let stores = state.store.list()?;
+    // Combine both kinds; each schema carries its own `store_type` so callers
+    // can tell them apart.
+    let mut stores = state.store.list()?;
+    stores.extend(state.store.list_kv()?);
     Ok(Json(stores))
 }
 
-pub async fn create(State(state): State<AppState>, Json(schema): Json<DocStoreSchema>) -> Result<impl IntoResponse, AppError> {
+/// `POST /stores` — create a doc or KV store, dispatched on the payload's
+/// `store_type`.
+pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Result<impl IntoResponse, AppError> {
+    match store_type_from_value(&body)? {
+        StoreType::Doc => {
+            let schema: DocStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            create_doc_schema(&state, schema).await
+        }
+        StoreType::Kv => {
+            let schema: KvStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            create_kv_schema(&state, schema).await
+        }
+    }
+}
+
+/// Core doc-store creation, shared by `POST /stores` and schema import.
+pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<StatusCode, AppError> {
     // Reject semantic-search-enabled stores when no cluster index is loaded.
     // Without the index, writes would attempt (and fail) to quantise embeddings,
     // leaving the namespace in a permanently broken state.
@@ -48,22 +72,34 @@ pub async fn create(State(state): State<AppState>, Json(schema): Json<DocStoreSc
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
     state.store.create(schema).await?;
     // Reload from the persisted copy so the cache has the store-assigned ns_id.
-    reload_schema(&state, &ns).await;
+    reload_schema(state, &ns).await;
     info!(namespace = %ns, "store created");
     Ok(StatusCode::CREATED)
 }
 
 pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "dropping store");
-    state.store.remove(&ns).await?;
-    state.schemas.write().await.remove(&ns);
+    match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
+        StoreType::Doc => {
+            state.store.remove(&ns).await?;
+            state.schemas.write().await.remove(&ns);
+        }
+        StoreType::Kv => {
+            state.store.remove_kv(&ns).await?;
+            state.kv_schemas.write().await.remove(&ns);
+        }
+    }
     info!(namespace = %ns, "store dropped");
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
-    let schema = state.store.get_schema(&ns)?;
-    Ok(Json(schema))
+    match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
+        StoreType::Doc => Ok(Json(serde_json::to_value(state.store.get_schema(&ns)?).map_err(|e| AppError::from(DocStoreError::from(e)))?)),
+        StoreType::Kv => Ok(Json(
+            serde_json::to_value(state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?).map_err(|e| AppError::from(DocStoreError::from(e)))?,
+        )),
+    }
 }
 
 /// Request body for `PATCH /stores/{ns}/schema`.
@@ -95,6 +131,9 @@ pub(crate) enum AmendRequest {
         name: String,
         description: Option<String>,
     },
+    EnableVectorIndex {
+        fields: Vec<String>,
+    },
 }
 
 impl From<AmendRequest> for SchemaAmendment {
@@ -120,6 +159,7 @@ impl From<AmendRequest> for SchemaAmendment {
                 description,
             },
             AmendRequest::AddEmbeddingAttribute { name, description } => SchemaAmendment::AddEmbeddingAttribute { name, description },
+            AmendRequest::EnableVectorIndex { fields } => SchemaAmendment::EnableVectorIndex { fields },
         }
     }
 }
@@ -131,12 +171,11 @@ pub async fn amend_schema(
 ) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "amending schema");
 
-    // Adding an embedding attribute requires semantic search infrastructure.
-    if let AmendRequest::AddEmbeddingAttribute { .. } = &req
-        && state.cluster_index.is_none()
-    {
+    // Enabling the vector index (single- or multi-field) requires semantic
+    // search infrastructure.
+    if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) && state.cluster_index.is_none() {
         return Err(DocStoreError::EmbeddingFailed(
-            "cannot add embedding attribute: cluster index is not loaded \
+            "cannot enable the vector index: cluster index is not loaded \
                  (check semantic_search.cluster_path in config)"
                 .into(),
         )
@@ -190,15 +229,10 @@ pub(crate) async fn reload_schema(state: &AppState, ns: &str) {
     }
 }
 
-// ── KV store lifecycle ────────────────────────────────────────────────────────
+// ── KV store creation (shared core) ─────────────────────────────────────────────
 
-pub async fn list_kv(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    debug!("listing KV stores");
-    let stores = state.store.list_kv()?;
-    Ok(Json(stores))
-}
-
-pub async fn create_kv(State(state): State<AppState>, Json(schema): Json<KvStoreSchema>) -> Result<impl IntoResponse, AppError> {
+/// Core KV-store creation, shared by `POST /stores` and schema import.
+pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<StatusCode, AppError> {
     if schema.semantic_search_enabled && state.cluster_index.is_none() {
         return Err(DocStoreError::EmbeddingFailed(
             "cannot create a semantic-search-enabled KV store: \
@@ -210,22 +244,9 @@ pub async fn create_kv(State(state): State<AppState>, Json(schema): Json<KvStore
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");
     state.store.create_kv(schema).await?;
-    reload_kv_schema(&state, &ns).await;
+    reload_kv_schema(state, &ns).await;
     info!(namespace = %ns, "KV store created");
     Ok(StatusCode::CREATED)
-}
-
-pub async fn get_kv_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
-    let schema = state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
-    Ok(Json(schema))
-}
-
-pub async fn drop_kv_store(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
-    info!(namespace = %ns, "dropping KV store");
-    state.store.remove_kv(&ns).await?;
-    state.kv_schemas.write().await.remove(&ns);
-    info!(namespace = %ns, "KV store dropped");
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Re-read one KV namespace's schema and update the in-memory cache.

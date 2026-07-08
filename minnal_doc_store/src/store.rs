@@ -32,7 +32,7 @@ use crate::hex::hex_to_bytes;
 use crate::index_observer::{ChainedObserver, DiskProgress, InMemoryProgress, IndexProgressObserver};
 use crate::index_progress::{BuildStatus, now_ms};
 use crate::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
-use crate::schema::{DocStoreSchema, IndexSpec, IndexType, KeyType, KvStoreSchema, SchemaAmendment};
+use crate::schema::{DocStoreSchema, IndexSpec, IndexType, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 use crate::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
 use crate::vector_kv;
 
@@ -1418,6 +1418,7 @@ impl DocStore {
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,
@@ -1559,29 +1560,24 @@ impl DocStore {
         info!("drop_vector_index_data: clearing embedding queue for namespace='{namespace}'");
         self.delete_all_queue_entries(namespace).await?;
 
-        let sparse_meta_ns = vector_kv::sparse_vectors_meta_ns(namespace);
-        if let Ok(ns) = self.db.namespace(sparse_meta_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
+        // Remove the companion vector namespaces outright (reclaiming their
+        // storage) rather than just emptying their entries — otherwise the empty
+        // namespaces linger in /admin/storage/kv-namespaces as orphaned
+        // "companion" stores after the index is dropped.
+        for companion in [
+            vector_kv::sparse_vectors_meta_ns(namespace),
+            vector_kv::sparse_vectors_ns(namespace),
+            vector_kv::dense_vectors_ns(namespace),
+        ] {
+            if let Err(e) = self.db.remove_namespace(companion.clone()).await {
+                // Best-effort: a missing companion is fine (nothing was indexed).
+                debug!("drop_vector_index_data: removing companion '{companion}' for '{namespace}': {e}");
             }
         }
 
-        let sparse_ns = vector_kv::sparse_vectors_ns(namespace);
-        if let Ok(ns) = self.db.namespace(sparse_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
-            }
-        }
-
-        let dense_ns = vector_kv::dense_vectors_ns(namespace);
-        if let Ok(ns) = self.db.namespace(dense_ns).await {
-            let entries = ns.iter().await.unwrap_or_default();
-            for (key, _) in entries {
-                let _ = ns.delete(key).await;
-            }
-        }
+        // Clear the in-memory corruption counters so a dropped index stops
+        // showing up in /admin/indices/vector/corruption-metrics.
+        semantic_search::metrics::reset(namespace);
 
         if let Ok(schema) = self.load_schema(namespace)
             && let Some(ns_id) = schema.ns_id
@@ -1671,6 +1667,17 @@ impl DocStore {
                 namespace: namespace.to_owned(),
                 field: spec.field.clone(),
             });
+        }
+
+        // Enforce the per-namespace index cap here too: `schema.save()` below does
+        // not validate (only `validate_and_save` does), so without this check
+        // `add_index` could push the namespace past MAX_INDICES one field at a
+        // time even though create/import reject it.
+        if schema.indices.len() >= crate::schema::MAX_INDICES {
+            return Err(DocStoreError::Schema(SchemaError::TooManyIndices {
+                count: schema.indices.len() + 1,
+                max: crate::schema::MAX_INDICES,
+            }));
         }
 
         // Guard against a second caller racing in while a background build is
@@ -1857,6 +1864,21 @@ impl DocStore {
     /// Returns a snapshot of engine-wide operational metrics (runtime counters).
     pub fn ops_metrics(&self) -> minnal_db::MetricsSnapshot {
         self.db.ops_metrics()
+    }
+
+    /// Operational metrics for a single namespace, by name.
+    ///
+    /// The only failure mode is an unknown namespace, so any underlying error is
+    /// surfaced as [`DocStoreError::NotFound`] (→ 404).
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<minnal_db::MetricsSnapshot, DocStoreError> {
+        self.db.ops_metrics_for(namespace).map_err(|_| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, minnal_db::MetricsSnapshot)> {
+        self.db.ops_metrics_by_namespace()
     }
 
     /// Returns a snapshot of the shared WAL metadata.
@@ -2236,6 +2258,7 @@ impl DocStore {
 
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,
@@ -2298,6 +2321,7 @@ impl DocStore {
 
         let all = semantic_search::service::search(
             &ctx.config,
+            namespace,
             &ctx.cluster_index,
             &query_sparse,
             &query_dense,
@@ -2472,6 +2496,20 @@ impl DocStore {
         self.schema_dir.join(format!("{namespace}.json"))
     }
 
+    /// Resolve the [`StoreType`] of an existing namespace by reading its
+    /// persisted schema's discriminant, without committing to either full schema
+    /// struct. Returns [`DocStoreError::NotFound`] if no schema exists (or it
+    /// carries no parseable `store_type`).
+    pub fn store_type(&self, namespace: &str) -> Result<StoreType, DocStoreError> {
+        let path = self.schema_path(namespace);
+        let json = std::fs::read_to_string(&path).map_err(|_| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })?;
+        crate::schema::peek_store_type(&json).ok_or_else(|| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    }
+
     fn load_schema(&self, namespace: &str) -> Result<DocStoreSchema, DocStoreError> {
         DocStoreSchema::load(&self.schema_dir, namespace).map_err(|e| match e {
             SchemaError::NotFound { namespace } => DocStoreError::NotFound { namespace },
@@ -2507,7 +2545,11 @@ fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocSt
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let json = std::fs::read_to_string(&path)?;
-            if let Ok(schema) = serde_json::from_str::<DocStoreSchema>(&json) {
+            // Dispatch on the explicit `store_type` discriminant; skip anything
+            // that isn't a doc store (or has no parseable discriminant).
+            if crate::schema::peek_store_type(&json) == Some(StoreType::Doc)
+                && let Ok(schema) = serde_json::from_str::<DocStoreSchema>(&json)
+            {
                 schemas.push(schema);
             }
         }
@@ -2527,7 +2569,11 @@ fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, Doc
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let json = std::fs::read_to_string(&path)?;
-            if let Ok(schema) = serde_json::from_str::<KvStoreSchema>(&json) {
+            // Dispatch on the explicit `store_type` discriminant; skip anything
+            // that isn't a KV store (or has no parseable discriminant).
+            if crate::schema::peek_store_type(&json) == Some(StoreType::Kv)
+                && let Ok(schema) = serde_json::from_str::<KvStoreSchema>(&json)
+            {
                 schemas.push(schema);
             }
         }
@@ -2787,6 +2833,10 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
         std::fs::remove_file(schema_path)?;
     }
 
+    // Drop any in-memory vector corruption counters for this namespace so a
+    // dropped store stops appearing in /admin/indices/vector/corruption-metrics.
+    semantic_search::metrics::reset(namespace);
+
     Ok(())
 }
 
@@ -2930,6 +2980,7 @@ mod tests {
 
     fn make_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreSchema {
         DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3088,6 +3139,7 @@ mod tests {
         // Create a schema with semantic_search_enabled + embedding_fields so
         // that `is_semantic_search_enabled()` returns true.
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "sem_docs".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3289,6 +3341,7 @@ mod tests {
         let store = open_fresh(db_dir.path(), schema_dir.path()).await;
 
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "sem_range".to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -3430,6 +3483,47 @@ mod tests {
     }
 
     // ── Drop / add index ────────────────────────────────────────────────────
+
+    /// `add_index` must enforce the per-namespace `MAX_INDICES` cap incrementally,
+    /// not just at create/import time (`schema.save()` does not validate).
+    #[tokio::test]
+    async fn test_add_index_enforces_max_indices() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Start at the cap with MAX_INDICES indices.
+        let indices = (0..crate::schema::MAX_INDICES)
+            .map(|i| IndexSpec {
+                field: format!("f{i}"),
+                index_type: IndexType::Int,
+            })
+            .collect();
+        store.create(make_schema("ns", indices)).await.unwrap();
+
+        // One more must be rejected (not silently accepted past the cap).
+        let result = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "one_too_many".to_owned(),
+                    index_type: IndexType::Int,
+                },
+            )
+            .await;
+        match result {
+            Err(DocStoreError::Schema(crate::error::SchemaError::TooManyIndices { max, .. })) => {
+                assert_eq!(max, crate::schema::MAX_INDICES);
+            }
+            Ok(_) => panic!("expected TooManyIndices, got Ok"),
+            Err(e) => panic!("expected TooManyIndices, got {e:?}"),
+        }
+
+        // And the rejected field must not have been registered/persisted.
+        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        assert_eq!(loaded.indices.len(), crate::schema::MAX_INDICES);
+        assert!(!loaded.indices.iter().any(|s| s.field == "one_too_many"));
+    }
 
     #[tokio::test]
     async fn test_drop_index_demotes_to_attribute() {
@@ -3909,6 +4003,7 @@ mod tests {
     fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: KvValueType) -> KvStoreSchema {
         use crate::schema::KvStoreSchema;
         KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type,
@@ -4440,6 +4535,7 @@ mod tests {
         let schema: DocStoreSchema = serde_json::from_str(
             r#"{
             "namespace": "imported",
+            "store_type": "doc",
             "key_type": "u64",
             "attributes": [],
             "indices": [],
@@ -4598,6 +4694,7 @@ mod tests {
 
         // Simulate a stale exported schema that has "agency" in both lists.
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: "stale_export".to_owned(),
             ns_id: None,
             key_type: crate::schema::KeyType::U64,
@@ -4624,6 +4721,7 @@ mod tests {
     /// Helper: create a semantic-search-enabled doc schema with a `title` field.
     async fn create_semantic_schema(store: &DocStore, namespace: &str) {
         let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
             namespace: namespace.to_owned(),
             ns_id: None,
             key_type: KeyType::U64,
@@ -4711,6 +4809,7 @@ mod tests {
         // A namespace without semantic search is rejected.
         store
             .create(DocStoreSchema {
+                store_type: StoreType::Doc,
                 namespace: "plain".to_owned(),
                 ns_id: None,
                 key_type: KeyType::U64,
@@ -4857,6 +4956,7 @@ mod tests {
         let store = open_fresh(db_dir.path(), schema_dir.path()).await;
 
         let schema = KvStoreSchema {
+            store_type: StoreType::Kv,
             namespace: "kv".to_owned(),
             ns_id: None,
             key_type: KvKeyType::Str,

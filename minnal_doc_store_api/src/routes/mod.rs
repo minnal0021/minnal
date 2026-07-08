@@ -50,15 +50,16 @@ pub fn router() -> Router<AppState> {
         .route("/admin/storage/health", get(admin_storage::health))
         .route("/admin/storage/stats", get(admin_storage::stats))
         .route("/admin/storage/ops-metrics", get(admin_storage::ops_metrics))
+        .route("/admin/storage/ops-metrics/by-namespace", get(admin_storage::ops_metrics_by_namespace))
+        .route("/admin/storage/stores/{ns}/ops-metrics", get(admin_storage::ops_metrics_ns))
         .route("/admin/storage/wal", get(admin_storage::wal))
         .route("/admin/storage/lsm", get(admin_storage::lsm))
         .route("/admin/storage/value-log", get(admin_storage::value_log))
         .route("/admin/storage/value-log/{ns}/pages", get(admin_storage::value_log_pages))
         .route("/admin/storage/namespaces", get(admin_storage::namespaces))
-        .route("/admin/storage/kv-namespaces", get(admin_storage::kv_namespaces))
-        // Admin / storage — per-namespace KV metrics
+        .route("/admin/storage/namespaces/physical", get(admin_storage::physical_namespaces))
+        // Admin / storage — per-namespace engine metadata (doc or KV, unified)
         .route("/admin/storage/stores/{ns}/kv-meta", get(admin_storage::store_kv_meta))
-        .route("/admin/storage/kv-stores/{ns}/kv-meta", get(admin_storage::kv_store_kv_meta))
         // Admin / storage — system namespace
         .route("/admin/storage/system/stores", get(admin_storage::system_stores))
         .route("/admin/storage/system/stores/{ns}/meta", get(admin_storage::system_store_meta))
@@ -77,6 +78,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/vector/reconcile", post(admin_indices::vector_reconcile))
         // Admin / indices — per-namespace monitoring & operations
         .route("/admin/indices/{ns}/progress", get(admin_indices::progress_ns))
+        .route(
+            "/admin/indices/{ns}/vector/corruption-metrics",
+            get(admin_indices::vector_corruption_metrics_ns),
+        )
         .route("/admin/indices/{ns}/attribute/reindex-all", post(admin_indices::attribute_reindex_all))
         .route("/admin/indices/{ns}/attribute/drop-all", delete(admin_indices::attribute_drop_all))
         .route(
@@ -106,32 +111,26 @@ pub fn router() -> Router<AppState> {
         .route("/admin/stores/{ns}/schema/export", get(admin_stores::export_schema))
         .route("/admin/stores/import", post(admin_stores::import_schema))
         .route("/admin/stores/{ns}/row-count", get(admin_stores::row_count))
-        .route("/admin/kv-stores/{ns}/schema/export", get(admin_stores::export_kv_schema))
-        .route("/admin/kv-stores/import", post(admin_stores::import_kv_schema))
-        // ── Store lifecycle ───────────────────────────────────────────────────
+        // ── Store lifecycle (unified: doc + KV, dispatched on store_type) ──────
         .route("/stores", get(stores::list).post(stores::create))
         .route("/stores/{ns}", delete(stores::drop_store))
         .route("/stores/{ns}/schema", get(stores::get_schema).patch(stores::amend_schema))
-        // ── Index management ──────────────────────────────────────────────────
+        // ── Index management (doc stores) ─────────────────────────────────────
         .route("/stores/{ns}/indices", get(indices::list_indices).post(indices::add_index))
         .route("/stores/{ns}/indices/vector", delete(indices::drop_vector_index))
         .route("/stores/{ns}/indices/{field}", delete(indices::drop_index))
-        // ── Document CRUD ─────────────────────────────────────────────────────
+        // ── Document CRUD (doc stores) ────────────────────────────────────────
         .route("/stores/{ns}/docs/{id}", get(docs::get_doc).put(docs::put_doc).delete(docs::delete_doc))
         .route("/stores/{ns}/docs", get(docs::range_query))
         .route("/stores/{ns}/docs/prefix", get(docs::prefix_scan))
         .route("/stores/{ns}/query", post(docs::index_query))
-        // ── Semantic search ───────────────────────────────────────────────────
+        // ── Semantic search (doc stores) ──────────────────────────────────────
         .route("/stores/{ns}/semantic-search", post(semantic_search::query))
         .route("/stores/{ns}/semantic-search/filtered", post(semantic_search::query_filtered))
-        // ── KV store lifecycle ────────────────────────────────────────────────
-        .route("/kv-stores", get(stores::list_kv).post(stores::create_kv))
-        .route("/kv-stores/{ns}", delete(stores::drop_kv_store))
-        .route("/kv-stores/{ns}/schema", get(stores::get_kv_schema))
-        // ── KV CRUD ───────────────────────────────────────────────────────────
-        .route("/kv-stores/{ns}/kv/{key}", get(kv::get_kv).put(kv::put_kv).delete(kv::delete_kv))
-        .route("/kv-stores/{ns}/kv", get(kv::range_kv))
-        .route("/kv-stores/{ns}/kv/prefix", get(kv::prefix_scan_kv))
-        // ── KV semantic search ────────────────────────────────────────────────
-        .route("/kv-stores/{ns}/semantic-search", post(kv::search_kv_semantic))
+        // ── KV CRUD (KV stores) ───────────────────────────────────────────────
+        .route("/stores/{ns}/kv/{key}", get(kv::get_kv).put(kv::put_kv).delete(kv::delete_kv))
+        .route("/stores/{ns}/kv", get(kv::range_kv))
+        .route("/stores/{ns}/kv/prefix", get(kv::prefix_scan_kv))
+        // ── KV semantic search (KV stores) ────────────────────────────────────
+        .route("/stores/{ns}/kv/semantic-search", post(kv::search_kv_semantic))
 }

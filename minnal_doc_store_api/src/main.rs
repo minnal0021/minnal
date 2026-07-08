@@ -56,6 +56,10 @@ pub struct AppState {
     /// the on-demand endpoint can reject overlapping runs instead of stacking
     /// expensive full scans.
     pub vec_reconcile_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while a (background) index checkpoint (field-index flush + compaction)
+    /// is running, so the on-demand endpoint can reject overlapping runs instead
+    /// of stacking expensive flush/compaction passes.
+    pub index_checkpoint_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[tokio::main]
@@ -196,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attr_index_ops: Arc::new(std::sync::Mutex::new(HashSet::new())),
         vec_index_cleanup: Arc::new(std::sync::Mutex::new(HashSet::new())),
         vec_reconcile_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let shutdown_store = Arc::clone(&state.store);

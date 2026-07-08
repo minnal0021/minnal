@@ -104,17 +104,34 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 /// The set of IVF cluster centroids, loaded once at startup and shared read-only
 /// across all requests.
 ///
-/// Clusters are probed by **exact** nearest-centroid distance: for each query
-/// embedding, [`find_top_n_cluster_ids`] computes the distance to every centroid and
-/// returns the `n_probes` nearest (see [`crate::service::search`]). There is
-/// deliberately **no precomputed neighbour graph** — at the cluster counts in use the
-/// exhaustive scan is cheap (microseconds) and yields the *exact* nearest clusters, so
-/// an approximate graph traversal would trade recall for no speed-up. A neighbour graph
-/// would only pay off at much larger, sparse cluster counts; revisit it then.
+/// Clusters are probed by **exact** nearest-centroid distance. Coarse assignment is an
+/// exhaustive scan: [`find_top_n_cluster_ids_batch`](ClusterIndex::find_top_n_cluster_ids_batch)
+/// computes the distance from every query chunk to every centroid and returns the
+/// `n_probes` nearest per chunk (see [`crate::service::search`]). There is deliberately
+/// **no precomputed neighbour graph** — coarse-assignment cost is `T·C·D` (query chunks ×
+/// centroids × dim), which at the cluster counts in use (a few hundred) is microseconds
+/// per chunk; a graph is approximate on the most recall-sensitive stage and does nothing
+/// about the per-chunk `T` factor. Revisit graph-over-centroids only if `C` reaches tens
+/// of thousands. (Parallelising the per-chunk scans was benchmarked and *regressed* —
+/// the work is too small to amortise a thread pool; see `find_top_n_cluster_ids_batch`.)
+///
+/// To make that scan cache-friendly the centroids are held **twice**: once as the
+/// `clusters` map (id lookup) and once as a row-major `centroids` matrix with a parallel
+/// `centroid_ids` (row → id). The map's `Cluster` values each own a separately
+/// heap-allocated `Vec<f32>`, so scanning them pointer-chases scattered buffers; the
+/// matrix is one contiguous allocation the scan streams sequentially (a measured ~12%
+/// win). The two are built together and never mutated after construction, so they cannot
+/// drift.
 #[derive(Debug)]
 pub struct ClusterIndex {
     /// All clusters keyed by their ID.
     pub clusters: HashMap<u32, Cluster>,
+    /// Row-major `C×dim` centroid matrix — the same centroids as `clusters`, laid out
+    /// contiguously so the coarse-assignment scan streams sequential memory. Row `r`
+    /// holds `centroids[r*dim .. (r+1)*dim]` and belongs to cluster `centroid_ids[r]`.
+    centroids: Vec<f32>,
+    /// Cluster id for each row of `centroids` (same length as the row count).
+    centroid_ids: Vec<u32>,
     /// The uniform centroid dimension, validated at load time. Every query and
     /// document embedding compared against these centroids must share it.
     dim: usize,
@@ -148,7 +165,29 @@ impl ClusterIndex {
         let centroid_map = read_clusters_from_file(cluster_file_path)?;
         let dim = validate_centroids(&centroid_map, expected_dim)?;
         let clusters: HashMap<u32, Cluster> = centroid_map.into_iter().map(|(id, centroid)| (id, Cluster::new(id, centroid))).collect();
-        Ok(Self { clusters, dim })
+        Ok(Self::from_parts(clusters, dim))
+    }
+
+    /// Build the index from a validated cluster map of known dimension, deriving the
+    /// contiguous `centroids` matrix / `centroid_ids` from the map in one pass.
+    ///
+    /// This is the single place the map and the matrix are materialised together, so
+    /// they are consistent by construction. Row order follows the map's iteration
+    /// order — arbitrary but irrelevant, since every row carries its own id in
+    /// `centroid_ids` and results are ranked by distance.
+    fn from_parts(clusters: HashMap<u32, Cluster>, dim: usize) -> Self {
+        let mut centroids = Vec::with_capacity(clusters.len() * dim);
+        let mut centroid_ids = Vec::with_capacity(clusters.len());
+        for cluster in clusters.values() {
+            centroids.extend_from_slice(&cluster.centroid);
+            centroid_ids.push(cluster.cluster_id);
+        }
+        Self {
+            clusters,
+            centroids,
+            centroid_ids,
+            dim,
+        }
     }
 
     /// Build an index directly from in-memory clusters, inferring the dimension
@@ -159,12 +198,76 @@ impl ClusterIndex {
     /// concern; in-memory callers are trusted to pass uniform centroids.
     pub fn from_clusters(clusters: HashMap<u32, Cluster>) -> Self {
         let dim = clusters.values().next().map(|c| c.centroid.len()).unwrap_or(0);
-        Self { clusters, dim }
+        Self::from_parts(clusters, dim)
     }
 
     /// The uniform centroid dimension every embedding must match.
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The number of centroids (clusters) in the index.
+    pub fn len(&self) -> usize {
+        self.centroid_ids.len()
+    }
+
+    /// Whether the index holds no centroids.
+    pub fn is_empty(&self) -> bool {
+        self.centroid_ids.is_empty()
+    }
+
+    /// Batched coarse assignment: for each query chunk in `queries`, the ids of the `n`
+    /// centroids closest to it (ascending distance), returned as one `Vec<u32>` per
+    /// query in input order.
+    ///
+    /// This is the Pass-1 cluster-probing primitive, called once per search over all
+    /// query chunks. It is exact and exhaustive — every query is compared against every
+    /// centroid — and differs from the historical per-query [`find_top_n_cluster_ids`]
+    /// loop over the `clusters` map only in that each query streams the contiguous,
+    /// row-major `centroids` matrix in order instead of pointer-chasing the map's
+    /// scattered per-`Cluster` `Vec`s. At the cluster counts in use (a few hundred) that
+    /// contiguous layout is a measured ~12% win at 100 query chunks (`bench_distance_estimation`,
+    /// `coarse_assignment`).
+    ///
+    /// The scan is deliberately **serial** across query chunks. Parallelising it with
+    /// rayon was benchmarked and *regressed* (~2.4× slower at 100 chunks): each per-query
+    /// scan is only microseconds, so the pool's dispatch/sync overhead dwarfs the work.
+    /// Batching only becomes worth parallelising via a blocked GEMM (reusing each
+    /// centroid tile across queries), which is worth revisiting only at far larger `C`.
+    ///
+    /// Distances use the same `l2sq` primitive as [`find_top_n_cluster_ids`], so the
+    /// per-query result is identical to calling that function on each query (the
+    /// distance-ranked `n` nearest ids). When `n >= len()` every id is returned.
+    pub fn find_top_n_cluster_ids_batch(&self, queries: &[Vec<f32>], n: usize) -> Vec<Vec<u32>> {
+        queries.iter().map(|q| self.top_n_over_matrix(q, n)).collect()
+    }
+
+    /// Top-`n` nearest centroid ids for a single query, computed over the contiguous
+    /// `centroids` matrix. Selection mirrors [`find_top_n_cluster_ids`]: partition the
+    /// `n` smallest by distance in ~O(C) with `select_nth_unstable`, then sort only
+    /// those `n`.
+    fn top_n_over_matrix(&self, embedding: &[f32], n: usize) -> Vec<u32> {
+        let mut distances: Vec<(u32, f32)> = self
+            .centroid_ids
+            .iter()
+            .enumerate()
+            .map(|(row, &id)| {
+                let base = row * self.dim;
+                let centroid = &self.centroids[base..base + self.dim];
+                // Masked like Cluster::euclidean_distance — load_with_dim and the embed
+                // boundary guarantee equal lengths, so this never actually fires.
+                let distance = f32::l2sq(centroid, embedding).unwrap_or(f64::MAX) as f32;
+                (id, distance)
+            })
+            .collect();
+
+        let by_distance = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1);
+        if n < distances.len() {
+            distances.select_nth_unstable_by(n, by_distance);
+            distances.truncate(n);
+        }
+        distances.sort_unstable_by(by_distance);
+        distances.into_iter().map(|(id, _)| id).collect()
     }
 }
 
@@ -214,9 +317,13 @@ pub fn find_closest_cluster_id(clusters: &HashMap<u32, Cluster>, embedding: &[f3
 /// For `n < cluster_count` this selects the `n` nearest with
 /// [`select_nth_unstable_by`](slice::select_nth_unstable_by) (introselect, ~O(C))
 /// and sorts only those `n` (O(n log n)), rather than fully sorting all `C` clusters
-/// (O(C log C)). The result is identical — the `n` closest in ascending distance —
-/// but the cost stays close to linear in the cluster count as the cluster file grows
-/// (it is called once per query chunk).
+/// (O(C log C)). The result is identical — the `n` closest in ascending distance.
+///
+/// This is the single-query form over a plain cluster map, kept for callers that hold a
+/// `HashMap<u32, Cluster>` directly (and as the reference the batched path is tested
+/// against). The search path uses
+/// [`ClusterIndex::find_top_n_cluster_ids_batch`], which produces the same per-query
+/// result but scans a contiguous centroid matrix in parallel across query chunks.
 pub fn find_top_n_cluster_ids(clusters: &HashMap<u32, Cluster>, embedding: &[f32], n: usize) -> Vec<u32> {
     let mut distances: Vec<(u32, f32)> = clusters.values().map(|c| (c.cluster_id, c.euclidean_distance(embedding))).collect();
     let by_distance = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1);
@@ -362,6 +469,132 @@ mod tests {
         for n in 0..=clusters.len() + 3 {
             assert_eq!(find_top_n_cluster_ids(&clusters, &query, n), reference(n), "mismatch at n={n}");
         }
+    }
+
+    // ── Batched coarse assignment (ClusterIndex::find_top_n_cluster_ids_batch) ──
+
+    /// Deterministic XorShift64 → f32 in [-1, 1], for reproducible random vectors.
+    fn prng(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as i64 as f32) / (i64::MAX as f32)
+        }
+    }
+
+    fn random_clusters(count: u32, dim: usize, seed: u64) -> HashMap<u32, Cluster> {
+        let mut next = prng(seed);
+        (0..count).map(|id| (id, Cluster::new(id, (0..dim).map(|_| next()).collect()))).collect()
+    }
+
+    fn random_queries(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut next = prng(seed);
+        (0..count).map(|_| (0..dim).map(|_| next()).collect()).collect()
+    }
+
+    fn sorted(mut v: Vec<u32>) -> Vec<u32> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn batch_matches_serial_free_fn_probe_set() {
+        // The batched path must probe exactly the clusters the historical per-query
+        // serial path does, for every query chunk and a range of n. Compared as sets:
+        // recall depends on *which* clusters are probed, and the caller unions them.
+        let clusters = random_clusters(64, 48, 0x1234_5678_9abc_def0);
+        let index = ClusterIndex::from_clusters(clusters.clone());
+        let queries = random_queries(16, 48, 0x0fed_cba9_8765_4321);
+
+        for &n in &[1usize, 4, 16, 63, 64, 100] {
+            let batched = index.find_top_n_cluster_ids_batch(&queries, n);
+            assert_eq!(batched.len(), queries.len(), "one result per query, in order");
+            for (q, got) in queries.iter().zip(&batched) {
+                let expected = find_top_n_cluster_ids(&clusters, q, n);
+                assert_eq!(
+                    sorted(got.clone()),
+                    sorted(expected),
+                    "batched probe set diverged from serial free-fn at n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_preserves_query_order_and_ranking() {
+        // Two well-separated centroids; each query sits on top of one of them. The
+        // result vec must align with input order, and each row must be distance-ranked
+        // (nearest centroid first).
+        let mut clusters = HashMap::new();
+        clusters.insert(10, Cluster::new(10, vec![1.0, 0.0, 0.0]));
+        clusters.insert(20, Cluster::new(20, vec![0.0, 1.0, 0.0]));
+        let index = ClusterIndex::from_clusters(clusters);
+
+        let queries = vec![vec![0.9, 0.1, 0.0], vec![0.1, 0.9, 0.0]];
+        let out = index.find_top_n_cluster_ids_batch(&queries, 2);
+
+        assert_eq!(out[0][0], 10, "query 0 is nearest cluster 10");
+        assert_eq!(out[1][0], 20, "query 1 is nearest cluster 20");
+        assert_eq!(out[0], vec![10, 20], "row 0 ranked nearest-first");
+        assert_eq!(out[1], vec![20, 10], "row 1 ranked nearest-first");
+    }
+
+    #[test]
+    fn batch_n_exceeds_count_returns_all_per_query() {
+        let index = ClusterIndex::from_clusters(random_clusters(5, 8, 42));
+        let queries = random_queries(3, 8, 99);
+        let out = index.find_top_n_cluster_ids_batch(&queries, 100);
+        for row in &out {
+            assert_eq!(sorted(row.clone()), vec![0, 1, 2, 3, 4], "n >= count returns every cluster id");
+        }
+    }
+
+    #[test]
+    fn batch_empty_queries_returns_empty() {
+        let index = ClusterIndex::from_clusters(random_clusters(4, 8, 7));
+        assert!(index.find_top_n_cluster_ids_batch(&[], 2).is_empty());
+    }
+
+    #[test]
+    fn batch_single_cluster() {
+        let mut clusters = HashMap::new();
+        clusters.insert(3, Cluster::new(3, vec![0.5, 0.5]));
+        let index = ClusterIndex::from_clusters(clusters);
+        let out = index.find_top_n_cluster_ids_batch(&[vec![0.0, 0.0], vec![1.0, 1.0]], 4);
+        assert_eq!(out, vec![vec![3], vec![3]]);
+    }
+
+    #[test]
+    fn contiguous_matrix_is_consistent_with_clusters_map() {
+        // The matrix is a second copy of the centroids; each row must equal the mapped
+        // cluster's centroid, and len()/is_empty() must track the cluster count.
+        let clusters = random_clusters(20, 12, 555);
+        let index = ClusterIndex::from_clusters(clusters.clone());
+
+        assert_eq!(index.len(), 20);
+        assert!(!index.is_empty());
+        assert_eq!(index.centroid_ids.len(), 20);
+        assert_eq!(index.centroids.len(), 20 * 12);
+
+        for (row, &id) in index.centroid_ids.iter().enumerate() {
+            let base = row * index.dim;
+            let matrix_row = &index.centroids[base..base + index.dim];
+            assert_eq!(
+                matrix_row,
+                clusters[&id].centroid.as_slice(),
+                "matrix row {row} != mapped centroid for id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_index_len_and_is_empty() {
+        let index = ClusterIndex::from_clusters(HashMap::new());
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+        assert!(index.find_top_n_cluster_ids_batch(&[vec![1.0, 2.0]], 3)[0].is_empty());
     }
 
     // ── Centroid validation (ClusterIndexError) ──────────────────────────────

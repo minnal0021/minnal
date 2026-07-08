@@ -13,7 +13,7 @@ use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::store::value_log::{PAGE_SIZE_BYTES, ValueLog, ValueLogMetadata, ValueRecordMeta};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -105,7 +105,7 @@ pub struct KVStore {
 
     // Optional caller-supplied row-ID function.  When set, every key passed
     // to the index write path is resolved via this closure instead of the
-    // default Murmur3 hash.
+    // default dense row-ID map (`RowMap`).
     pub(crate) row_id_fn: Arc<RwLock<Option<RowIdFn>>>,
 
     // Optional inverse of `row_id_fn`.  When set alongside `row_id_fn`,
@@ -287,9 +287,13 @@ impl KVStore {
     /// unseen. Used on the put and WAL-replay paths.
     ///
     /// Precedence: a caller-supplied [`RowIdFn`] (the escape hatch for keys that
-    /// embed their own ID) wins; otherwise the dense [`RowMap`](index::RowMap);
-    /// otherwise the legacy Murmur3 hash (only reachable for an indexed namespace
-    /// with no row map loaded, which should not occur).
+    /// embed their own ID) wins; otherwise the dense [`RowMap`](index::RowMap).
+    ///
+    /// Only reached once a namespace has an active field index, and
+    /// `activate_field_index` loads the row map (`ensure_rowmap`) before
+    /// activating any field — so exactly one of the two sources is always
+    /// present. If neither is (which should be impossible), we log an error and
+    /// return `0` rather than crash the write path.
     pub(crate) fn resolve_row_id_alloc(&self, key: &[u8]) -> u128 {
         if let Some(f) = self.row_id_fn.read().as_ref() {
             return f(key);
@@ -297,12 +301,22 @@ impl KVStore {
         if let Some(rm) = self.rowmap.write().as_mut() {
             return rm.get_or_alloc(key);
         }
-        crate::db::namespace_index::key_to_row_id(key)
+        error!(
+            "[KVStore '{}'] resolve_row_id_alloc reached with neither a row_id_fn nor a loaded \
+             RowMap despite an active field index — indexing may be inconsistent for this key",
+            self.name
+        );
+        0
     }
 
     /// Resolve the row ID for `key` **without allocating** — returns `None` when
     /// the dense map has never seen the key. Used on the delete and query
     /// fallback paths, where an unseen key simply has nothing indexed.
+    ///
+    /// Like `resolve_row_id_alloc`, only reached with an active field index, so a
+    /// `row_id_fn` or a loaded `RowMap` is always present. If neither is (which
+    /// should be impossible), we log an error and return `None` — the caller then
+    /// treats the key as having nothing indexed rather than crashing.
     pub(crate) fn resolve_row_id_get(&self, key: &[u8]) -> Option<u128> {
         if let Some(f) = self.row_id_fn.read().as_ref() {
             return Some(f(key));
@@ -310,7 +324,12 @@ impl KVStore {
         if let Some(rm) = self.rowmap.read().as_ref() {
             return rm.get(key);
         }
-        Some(crate::db::namespace_index::key_to_row_id(key))
+        error!(
+            "[KVStore '{}'] resolve_row_id_get reached with neither a row_id_fn nor a loaded \
+             RowMap despite an active field index — treating key as unindexed",
+            self.name
+        );
+        None
     }
 
     /// Resolve a row ID back to its key via the dense map, if loaded.
@@ -347,7 +366,7 @@ impl KVStore {
     ///
     /// After this call every key passed through the index write path is
     /// assigned the row ID returned by `row_id_fn` instead of the default
-    /// Murmur3 hash.  Providing `row_to_key_fn` (the inverse) also enables
+    /// dense row-ID map.  Providing `row_to_key_fn` (the inverse) also enables
     /// O(|hits|) query resolution in `Database::query_keys` — the inverse
     /// reconstructs each matching key directly from its row ID, requiring
     /// zero extra memory and no maintenance on writes.
@@ -586,11 +605,13 @@ impl KVStore {
     /// high-cardinality fields. When the prior bytes are unavailable on a replace
     /// we fall back to the scan so the row never lingers in a stale bucket.
     fn update_indices_on_put(&self, key: &[u8], value: &[u8], old_value: Option<&[u8]>, key_existed: bool) {
-        let row_id = self.resolve_row_id_alloc(key);
         let ns_index = self.namespace_index.read();
         if ns_index.is_empty() {
             return;
         }
+        // Resolve only after confirming there are indexed fields — an unindexed
+        // namespace has no row map loaded and nothing to resolve for.
+        let row_id = self.resolve_row_id_alloc(key);
         for entry in ns_index.iter() {
             let new_val = (entry.extractor)(value);
             let mut idx = entry.index.write();

@@ -267,6 +267,16 @@ impl Db {
         self.inner.metrics_snapshot()
     }
 
+    /// Operational metrics for a single namespace, by name.
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+        self.inner.metrics_snapshot_for(namespace)
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+        self.inner.metrics_snapshot_by_namespace()
+    }
+
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
@@ -1136,6 +1146,16 @@ impl AsyncDb {
         self.inner.ops_metrics()
     }
 
+    /// Operational metrics for a single namespace, by name.
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+        self.inner.ops_metrics_for(namespace)
+    }
+
+    /// Per-namespace operational metrics for every live namespace, keyed by name.
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+        self.inner.ops_metrics_by_namespace()
+    }
+
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
@@ -1453,6 +1473,17 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Delete a key without WAL — see [`Database::delete_ns_no_wal`] for the
+    /// crash-safety trade-off. The no-WAL counterpart of [`Self::put_no_wal`],
+    /// intended for derived/regenerable data such as TTL caches.
+    pub async fn delete_no_wal(&self, key: Vec<u8>) -> Result<()> {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.delete_ns_no_wal(ns_id, &key))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn iter(&self) -> Result<Vec<KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))
@@ -1698,6 +1729,43 @@ mod tests {
     }
 
     #[test]
+    fn test_per_namespace_ops_metrics() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+
+        let a = db.namespace("a").unwrap();
+        a.put(b"k1", b"v").unwrap();
+        a.put(b"k2", b"v").unwrap();
+        let b = db.namespace("b").unwrap();
+        b.put(b"k1", b"v").unwrap();
+
+        // Counters are isolated per namespace.
+        assert_eq!(db.ops_metrics_for("a").unwrap().puts, 2);
+        assert_eq!(db.ops_metrics_for("b").unwrap().puts, 1);
+
+        // Engine-wide view is the sum across namespaces.
+        assert_eq!(db.ops_metrics().puts, 3);
+
+        // by-namespace map carries each namespace's own counters.
+        let by_ns: std::collections::HashMap<String, _> = db.ops_metrics_by_namespace().into_iter().collect();
+        assert_eq!(by_ns["a"].puts, 2);
+        assert_eq!(by_ns["b"].puts, 1);
+
+        // Unknown namespace is an error, not a zero snapshot.
+        assert!(db.ops_metrics_for("missing").is_err());
+
+        // Dropping a namespace folds its totals into the global accumulator, so
+        // the engine aggregate stays monotonic, but the namespace is no longer
+        // individually queryable.
+        db.remove_namespace("a").unwrap();
+        assert_eq!(db.ops_metrics().puts, 3, "engine total stays monotonic after drop");
+        assert!(db.ops_metrics_for("a").is_err(), "dropped ns is no longer queryable");
+        assert!(!db.ops_metrics_by_namespace().iter().any(|(n, _)| n == "a"));
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
     fn test_remove_namespace_deletes_storage_and_survives_reopen() {
         let dir = TempDir::new().unwrap();
         let doomed_dir = dir.path().join("ns_doomed");
@@ -1787,6 +1855,34 @@ mod tests {
 
         // Default namespace should not see it
         assert_eq!(db.get(b"e1".to_vec()).await.unwrap(), None);
+
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_namespace_no_wal_crud() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let ns = db.namespace("cache".to_string()).await.unwrap();
+
+        // No-WAL write is readable like any other write.
+        ns.put_no_wal(b"q1".to_vec(), b"emb1".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q1".to_vec()).await.unwrap(), Some(b"emb1".to_vec()));
+
+        // No-WAL delete removes it.
+        ns.delete_no_wal(b"q1".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q1".to_vec()).await.unwrap(), None);
+
+        // No-WAL delete tombstones a key written *with* the WAL too.
+        ns.put(b"q2".to_vec(), b"emb2".to_vec()).await.unwrap();
+        ns.delete_no_wal(b"q2".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"q2".to_vec()).await.unwrap(), None);
+
+        // The no-WAL paths bump their own counters and skip the WAL fsync path:
+        // one WAL-backed put (q2) accounts for the only wal_fsync from these ops.
+        let m = db.ops_metrics();
+        assert_eq!(m.no_wal_puts, 1, "one put_no_wal");
+        assert_eq!(m.no_wal_deletes, 2, "two delete_no_wal calls");
 
         db.shutdown().await.unwrap();
     }
