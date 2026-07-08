@@ -10,13 +10,15 @@ This document describes how semantic search works end-to-end: embedding generati
 
 Minnal does **not** generate embeddings itself. It relies on an **external embedding service** and treats it as the sole source of vectors: minnal prepares payloads, the service returns embeddings, and minnal quantises and indexes them as-is.
 
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) is a reference implementation that serves the **gemma** embedding model over HTTP — the external dependency described here. Run it, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
+
 The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`. Minnal does not negotiate or version models with the service — every request goes to fixed endpoints with no model identifier in the URL or body. Choosing the concrete model, and pinning its exact version, is entirely the embedding service's responsibility, decided server-side and applied uniformly to every request.
 
 The `model` name in the config (e.g. `qwen`) is therefore *not* used to select or version a model at request time. It is only an indication of which *family* of model the deployment is built around, and within minnal it serves a single purpose: selecting the matching cluster-centroid file and embedding dimension for this instance (validated at startup against `[[semantic_search.supported_models]]`). Keeping the config name aligned with whatever the embedding service actually serves is an operational convention, not something minnal enforces against the service.
 
 ### Service interface
 
-The service exposes a **batch interface** — chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service. A whole-text embedding is just a one-element `payloads` array; chunked (sliding-window) embeddings send one payload per chunk.
+Each request carries a **`payloads` array of strings and returns one embedding per string**, so a single HTTP call can embed many strings at once. Minnal decides how many strings to send: chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service, so the service never splits a string — it embeds exactly the strings it is given. To embed a whole text, minnal sends a `payloads` array with a single string; to embed a chunked (sliding-window) document, it sends one string per chunk — all in the same request.
 
 Two `POST` endpoints, identical in request/response shape, differing only in which side of the asymmetric model they target (documents are embedded differently from queries):
 
@@ -109,11 +111,8 @@ All quantised entries share the same `VectorIndex` struct:
 The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
 
 - A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
-- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid and returns the `n_probes` nearest (using `select_nth_unstable` to select the top-`n_probes` in ~O(C) rather than a full O(C log C) sort). The union of these sets across all query embeddings is scanned once.
-- **There is deliberately no neighbour graph / approximate cluster traversal.** Coarse-assignment cost is **T·C·D** (query chunks × centroids × dim) — the scan runs once per query chunk. At C≈256 this is genuinely cheap: ~50 µs at 4 chunks, ~1.1 ms at 100 chunks (`bench_distance_estimation` → `coarse_assignment`). It grows *linearly with query length*, so it is not entirely free for long, many-chunk queries on a warm query-embedding cache (where the embedding round-trip no longer hides it), but it is a small fraction of a query at realistic lengths. A neighbour graph is the wrong lever regardless: it is approximate on the most recall-sensitive stage (missing the right coarse cluster drops the document entirely), barely reduces work at a few hundred nodes, and does nothing about the per-chunk (T) factor. The exact optimisations, measured:
-  - **Contiguous centroid matrix** (streamed by `find_top_n_cluster_ids_batch`) instead of a `HashMap` of per-`Cluster` `Vec`s — ~12% faster, no recall change. **Done.**
-  - **Parallelising the per-chunk scans (rayon)** — *tried and reverted*: ~2.4× **slower** at 100 chunks, because each per-chunk scan is only microseconds and the thread-pool dispatch dwarfs the work.
-  - A true **blocked GEMM** (reuse each centroid tile across query chunks) is the only remaining lever, and only pays at far larger C. Revisit it — and graph-over-centroids — only if C reaches the *tens of thousands* (orders-of-magnitude corpus growth forcing many more centroids), behind a config flag with recall/latency benchmarking.
+- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. The union of these sets across all query embeddings is scanned once.
+- **Coarse-assignment cost is cheap at this scale.** The cost is **T·C·D** (query chunks × centroids × dim) — the distance scan runs once per query chunk. At C≈256 that is ~50 µs at 4 chunks, ~1.1 ms at 100 chunks (`bench_distance_estimation` → `coarse_assignment`). It grows *linearly with query length*, so it is not entirely free for long, many-chunk queries on a warm query-embedding cache (where the embedding round-trip no longer hides it), but it is a small fraction of a query at realistic lengths.
 
 Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
 
