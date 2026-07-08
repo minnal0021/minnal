@@ -31,9 +31,9 @@ pub type ExtractorFn = Arc<dyn Fn(&[u8]) -> Option<IndexValue> + Send + Sync>;
 // # Row IDs, keys, and the isomorphism question
 //
 // Every entry in a field index is stored against a u128 "row ID".  By default
-// the row ID is derived from the key bytes by a two-pass Murmur3 hash
-// (`key_to_row_id`).  That is fine for a pure KV workload, but a doc-store
-// layer needs something better for two reasons:
+// the row ID is a dense, monotonic integer assigned per namespace by the
+// `RowMap` sidecar (`index::RowMap`), which keeps the RoaringBitmaps compact.
+// A doc-store layer may still want to supply its own IDs for two reasons:
 //
 //   1. STABILITY — hashes are implementation details.  A doc store wants the
 //      row ID to *be* the document ID (e.g. a UUID), so it stays stable across
@@ -171,28 +171,6 @@ impl Default for NamespaceIndexSet {
     }
 }
 
-// ── key_to_row_id ──────────────────────────────────────────────────────────
-
-/// Derive a stable 128-bit row ID from raw key bytes.
-///
-/// Uses two Murmur3 passes with distinct seeds to produce a full 128-bit
-/// value.  This is a temporary approach; the DocStore layer will provide
-/// explicit row IDs once it is built.
-pub fn key_to_row_id(key: &[u8]) -> u128 {
-    use mm3h::Murmur3Hasher;
-    use std::hash::Hasher;
-
-    let mut h1 = Murmur3Hasher::new_with_seed(0xFEACBE01);
-    h1.write(key);
-    let lo = h1.finish();
-
-    let mut h2 = Murmur3Hasher::new_with_seed(0xDEADBEEF);
-    h2.write(key);
-    let hi = h2.finish();
-
-    (hi as u128) << 64 | lo as u128
-}
-
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -213,18 +191,4 @@ mod tests {
         assert!(set.get(1).is_none());
     }
 
-    #[test]
-    fn test_key_to_row_id_deterministic() {
-        let key = b"some:key:123";
-        let id1 = key_to_row_id(key);
-        let id2 = key_to_row_id(key);
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
-    fn test_key_to_row_id_distinct_keys() {
-        let id1 = key_to_row_id(b"key:1");
-        let id2 = key_to_row_id(b"key:2");
-        assert_ne!(id1, id2);
-    }
 }

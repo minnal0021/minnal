@@ -119,8 +119,8 @@ pub use db::namespace_index::ExtractorFn;
 
 /// Row-ID function type: derives a stable 128-bit row ID from raw key bytes.
 ///
-/// Register one via [`Db::set_row_id_fn`] to replace the default Murmur3 hash
-/// with an explicit identifier (e.g. a UUID embedded in the key).
+/// Register one via [`Db::set_row_id_fn`] to replace the default dense row-ID
+/// map with an explicit identifier (e.g. a UUID embedded in the key).
 pub use db::namespace_index::RowIdFn;
 
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.

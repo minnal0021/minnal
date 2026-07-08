@@ -919,7 +919,7 @@ impl Database {
     ///
     /// When set, every key written to or deleted from `namespace_id` will be
     /// assigned a row ID produced by `row_id_fn` rather than the default
-    /// Murmur3 hash.  Providing `row_to_key_fn` (the exact inverse) additionally
+    /// dense row-ID map.  Providing `row_to_key_fn` (the exact inverse) additionally
     /// enables O(|hits|) query resolution with zero memory overhead: each matching
     /// key is reconstructed directly from its row ID without any in-memory map.
     ///
@@ -1163,7 +1163,7 @@ impl Database {
     /// 1. Parses and evaluates `query_str` against the in-memory field indices,
     ///    producing a bitmap of matching row IDs.
     /// 2. Scans all keys in the namespace's KVStore and returns those whose
-    ///    derived row ID (`key_to_row_id`) appears in the bitmap.
+    ///    row ID (from the dense row map) appears in the bitmap.
     ///
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
