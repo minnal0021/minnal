@@ -104,6 +104,8 @@ All quantised entries share the same `VectorIndex` struct:
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
+> **TODO — random rotation not yet implemented.** The current RaBitQ implementation quantises document and query vectors directly, without the **random orthogonal rotation** (random projection) that the RaBitQ paper applies to both the stored embeddings and the query before quantisation. The rotation decorrelates dimensions and tightens the error bound, so until it lands the estimated dot products are noisier than the theoretical guarantee. Applying a shared rotation matrix to both the embedding (at index time) and the query (at search time) is outstanding work.
+
 ---
 
 ## 3. IVF Index Structure
