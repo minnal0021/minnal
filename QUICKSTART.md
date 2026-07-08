@@ -60,6 +60,18 @@ cargo build --release -p minnal_doc_store_api
 cargo build --release -p tools     # minnal_tools (bulk_load, …)
 ```
 
+> **Semantic search needs an external embedding service.** Everything else —
+> key-value and document storage, field indexing, and predicate queries — runs
+> entirely in-process with no external dependency. But **semantic search** relies
+> on an embedding service to turn text into vectors, both when documents are
+> indexed and when a query is run. If you plan to use semantic search, set up and
+> run one first. The companion
+> [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service)
+> serves the **gemma** model over HTTP — see its
+> [README](https://github.com/minnal0021/embedding_service#readme) to get started,
+> then point `semantic_search.embedding_service_url` at it (default
+> `http://localhost:8001`).
+
 ---
 
 ## Getting Started: bulk-load a store and query it
