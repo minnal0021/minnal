@@ -45,6 +45,7 @@ static BIT_COUNTS: [u8; 256] = {
 ///  - `cardinality >= DENSE_EXTRACT_THRESHOLD` **and** AVX-512F available →
 ///    AVX-512 word scan (8 u64s per ZMM) + byte-level lookup table extraction.
 ///  - Otherwise → scalar `trailing_zeros` + `blsr` loop (unchanged behaviour).
+#[allow(unreachable_code)]
 pub fn extract_bitset_to_values(bits: &[u64; BITSET_WORDS], cardinality: usize) -> Vec<u16> {
     if cardinality >= DENSE_EXTRACT_THRESHOLD {
         #[cfg(target_arch = "x86_64")]
@@ -58,6 +59,9 @@ pub fn extract_bitset_to_values(bits: &[u64; BITSET_WORDS], cardinality: usize) 
                 return unsafe { extract_dense_avx2(bits, cardinality) };
             }
         }
+        // SAFETY: NEON is a baseline feature on all aarch64 targets.
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { extract_dense_neon(bits, cardinality) };
         // Neither AVX-512 nor AVX2: use lookup table without SIMD word scan.
         return extract_dense_lookup(bits, cardinality);
     }
@@ -95,6 +99,46 @@ fn extract_dense_lookup(bits: &[u64; BITSET_WORDS], cardinality: usize) -> Vec<u
         }
         push_word_positions(word, (word_idx * 64) as u16, &mut result);
     }
+    result
+}
+
+// ── NEON path (dense bitsets, aarch64) ──────────────────────────────────────
+//
+// Strategy mirrors the AVX2/AVX-512 paths at 128-bit width:
+//   1. Load 2 u64 words (128 bits) per iteration into a Q register.
+//   2. Reinterpret as u32×4 and reduce with `vmaxvq_u32`; a zero result means
+//      both words are zero, so the whole group is skipped with one branch.
+//   3. For each non-zero word, use the byte lookup table to push positions.
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn extract_dense_neon(bits: &[u64; BITSET_WORDS], cardinality: usize) -> Vec<u16> {
+    use std::arch::aarch64::*;
+
+    let mut result = Vec::with_capacity(cardinality);
+    let chunks = BITSET_WORDS / 2; // 1024 / 2 = 512 chunks
+
+    unsafe {
+        for chunk in 0..chunks {
+            let base_word = chunk * 2;
+            let v = vld1q_u64(bits.as_ptr().add(base_word));
+
+            // Skip the whole 2-word group when every bit is zero.
+            if vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0 {
+                continue;
+            }
+
+            let w0 = vgetq_lane_u64(v, 0);
+            if w0 != 0 {
+                push_word_positions(w0, (base_word * 64) as u16, &mut result);
+            }
+            let w1 = vgetq_lane_u64(v, 1);
+            if w1 != 0 {
+                push_word_positions(w1, ((base_word + 1) * 64) as u16, &mut result);
+            }
+        }
+    }
+
     result
 }
 
@@ -299,6 +343,25 @@ mod tests {
         let scalar = extract_scalar(&bits, values.len());
         let dense = extract_bitset_to_values(&bits, values.len());
         assert_eq!(dense, scalar);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_path_matches_scalar() {
+        let values: Vec<u16> = (0..4096).step_by(2).collect();
+        let bits = make_bits(&values);
+        let scalar = extract_scalar(&bits, values.len());
+        let simd = unsafe { extract_dense_neon(&bits, values.len()) };
+        assert_eq!(simd, scalar);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_path_full_bitset() {
+        let values: Vec<u16> = (0..=65535).collect();
+        let bits = make_bits(&values);
+        let simd = unsafe { extract_dense_neon(&bits, 65536) };
+        assert_eq!(simd, values);
     }
 
     #[cfg(target_arch = "x86_64")]

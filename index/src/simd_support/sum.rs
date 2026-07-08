@@ -10,6 +10,7 @@
 ///   3. Scalar fallback — simple iterator sum.
 ///
 /// Used by `RunContainer::cardinality()` to sum run lengths across many runs.
+#[allow(unreachable_code)]
 pub fn sum_u16_slice(data: &[u16]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -23,12 +24,48 @@ pub fn sum_u16_slice(data: &[u16]) -> usize {
         }
     }
 
+    // SAFETY: NEON is a baseline feature on all aarch64 targets.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { sum_u16_neon(data) };
+
     sum_u16_scalar(data)
 }
 
 #[inline]
 fn sum_u16_scalar(data: &[u16]) -> usize {
     data.iter().map(|&v| v as usize).sum()
+}
+
+/// NEON implementation.
+///
+/// Processes 8 u16s per iteration: loads 8 × u16 into a Q register, widens the
+/// low and high halves to u32 and sums them lane-wise via `vaddl_u16`, and
+/// accumulates into a 4-lane u32 accumulator. The final `vaddvq_u32` reduces the
+/// four lanes to a scalar. Per the caller contract the total (≤ 65536 for a run
+/// container) fits comfortably in u32.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sum_u16_neon(data: &[u16]) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = vdupq_n_u32(0);
+        let chunks = data.len() / 8;
+
+        for i in 0..chunks {
+            let v = vld1q_u16(data.as_ptr().add(i * 8)); // 8 × u16
+            // Widen-add the low and high u16×4 halves into u32×4.
+            acc = vaddq_u32(acc, vaddl_u16(vget_low_u16(v), vget_high_u16(v)));
+        }
+
+        let mut total = vaddvq_u32(acc) as usize;
+
+        // Scalar tail for the remaining 0–7 values.
+        for &v in &data[chunks * 8..] {
+            total += v as usize;
+        }
+
+        total
+    }
 }
 
 /// AVX2 implementation.
@@ -161,6 +198,21 @@ mod tests {
         let scalar = sum_u16_scalar(&data);
         let simd = unsafe { sum_u16_avx2(&data) };
         assert_eq!(simd, scalar);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        let data: Vec<u16> = (0..500).map(|i| i as u16 % 200).collect();
+        assert_eq!(unsafe { sum_u16_neon(&data) }, sum_u16_scalar(&data));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_handles_tail() {
+        // 13 values — not a multiple of 8, exercises the scalar tail.
+        let data: Vec<u16> = (0..13).collect();
+        assert_eq!(unsafe { sum_u16_neon(&data) }, sum_u16_scalar(&data));
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -9,7 +9,9 @@
 ///      the hardware POPCNT instruction on x86-64).
 ///
 /// The AVX-512 and AVX2 paths are selected at runtime via `is_x86_feature_detected!`
-/// so the binary runs correctly on CPUs without those extensions.
+/// so the binary runs correctly on CPUs without those extensions. On aarch64 the
+/// NEON path is always taken (Advanced SIMD is baseline-mandatory on AArch64).
+#[allow(unreachable_code)]
 pub fn popcount_u64_slice(data: &[u64]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -23,6 +25,10 @@ pub fn popcount_u64_slice(data: &[u64]) -> usize {
         }
     }
 
+    // SAFETY: NEON is a baseline feature on all aarch64 targets.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { popcount_neon(data) };
+
     popcount_scalar(data)
 }
 
@@ -30,6 +36,46 @@ pub fn popcount_u64_slice(data: &[u64]) -> usize {
 #[inline]
 fn popcount_scalar(data: &[u64]) -> usize {
     data.iter().map(|w| w.count_ones() as usize).sum()
+}
+
+/// NEON implementation.
+///
+/// Loads 2 u64s (16 bytes) per iteration, uses `vcntq_u8` (per-byte popcount)
+/// then a widening pairwise-add ladder (`vpaddlq_u8` → `vpaddlq_u16` →
+/// `vpaddlq_u32`) to accumulate into a 2-lane u64 accumulator. Because each
+/// per-lane u64 sum grows by at most 128 per iteration it cannot overflow for
+/// any realistically-sized slice.
+///
+/// Processes 2 u64s (128 bits) per iteration; the scalar tail handles the odd
+/// trailing word.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn popcount_neon(data: &[u64]) -> usize {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = vdupq_n_u64(0);
+        let chunks = data.len() / 2; // 2 u64s = 128 bits per iteration
+        let ptr = data.as_ptr() as *const u8;
+
+        for i in 0..chunks {
+            let v = vld1q_u8(ptr.add(i * 16));
+            let cnt = vcntq_u8(v); // per-byte popcount
+            // Widening pairwise adds: u8×16 → u16×8 → u32×4 → u64×2
+            let s16 = vpaddlq_u8(cnt);
+            let s32 = vpaddlq_u16(s16);
+            let s64 = vpaddlq_u32(s32);
+            acc = vaddq_u64(acc, s64);
+        }
+
+        let mut total = (vgetq_lane_u64(acc, 0) + vgetq_lane_u64(acc, 1)) as usize;
+
+        // Scalar tail for the remaining word (0 or 1).
+        for &word in &data[chunks * 2..] {
+            total += word.count_ones() as usize;
+        }
+
+        total
+    }
 }
 
 /// AVX2 implementation using the Wilkes-Wheeler-Gill nibble lookup (VPSHUFB).
@@ -190,6 +236,22 @@ mod tests {
         let scalar = popcount_scalar(&data);
         let simd = unsafe { popcount_avx2(&data) };
         assert_eq!(simd, scalar);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        // NEON is baseline on aarch64, so this always exercises the SIMD path.
+        let data: Vec<u64> = (0..1024).map(|i| (i as u64).wrapping_mul(0x0101_0101_0101_0101)).collect();
+        assert_eq!(unsafe { popcount_neon(&data) }, popcount_scalar(&data));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_handles_tail() {
+        // 13 words — not a multiple of 2, exercises the scalar tail.
+        let data: Vec<u64> = (0..13).map(|i| (i as u64).wrapping_mul(123456789)).collect();
+        assert_eq!(unsafe { popcount_neon(&data) }, popcount_scalar(&data));
     }
 
     #[cfg(target_arch = "x86_64")]
