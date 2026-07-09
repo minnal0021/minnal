@@ -22,6 +22,10 @@ pub fn and_sorted_u16(a: &[u16], b: &[u16]) -> Vec<u16> {
             return unsafe { and_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if a.len() >= SIMD_THRESHOLD && b.len() >= SIMD_THRESHOLD {
+        return unsafe { and_neon(a, b) };
+    }
     and_scalar(a, b)
 }
 
@@ -42,6 +46,10 @@ pub fn and_not_sorted_u16(a: &[u16], b: &[u16]) -> Vec<u16> {
         if is_x86_feature_detected!("avx2") {
             return unsafe { and_not_avx2(a, b) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if a.len() >= SIMD_THRESHOLD && b.len() >= SIMD_THRESHOLD {
+        return unsafe { and_not_neon(a, b) };
     }
     and_not_scalar(a, b)
 }
@@ -102,6 +110,112 @@ fn and_not_scalar(a: &[u16], b: &[u16]) -> Vec<u16> {
         }
         i += 1;
     }
+    result
+}
+
+// ── NEON implementations ──────────────────────────────────────────────────────
+//
+// Strategy mirrors the AVX2 path at half the register width (8 × u16 per Q
+// register instead of 16). For each element of the smaller array, broadcast it
+// and probe the larger array in 8-element chunks:
+//   - `vceqq_u16(needle, chunk)` sets each 16-bit lane to 0xFFFF on a match.
+//   - `vmaxvq_u16(eq) != 0` is true iff at least one lane matched.
+// The early-exit on `first > needle` relies on both inputs being sorted ascending.
+// OR falls through to the scalar two-pointer merge (same reasoning as x86).
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_neon(a: &[u16], b: &[u16]) -> Vec<u16> {
+    use std::arch::aarch64::*;
+
+    let (probe, scan) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let mut result: Vec<u16> = Vec::with_capacity(probe.len());
+
+    let scan_ptr = scan.as_ptr();
+    let scan_chunks = scan.len() / 8;
+    let scan_tail_start = scan_chunks * 8;
+
+    unsafe {
+        for &p in probe {
+            let needle = vdupq_n_u16(p);
+
+            let mut found = false;
+            for chunk in 0..scan_chunks {
+                let first = *scan_ptr.add(chunk * 8);
+                if first > p {
+                    break;
+                }
+                let chunk_vec = vld1q_u16(scan_ptr.add(chunk * 8));
+                let eq = vceqq_u16(needle, chunk_vec);
+                if vmaxvq_u16(eq) != 0 {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                for &s in &scan[scan_tail_start..] {
+                    if s == p {
+                        found = true;
+                        break;
+                    }
+                    if s > p {
+                        break;
+                    }
+                }
+            }
+            if found {
+                result.push(p);
+            }
+        }
+    }
+
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_not_neon(a: &[u16], b: &[u16]) -> Vec<u16> {
+    use std::arch::aarch64::*;
+
+    let mut result: Vec<u16> = Vec::with_capacity(a.len());
+    let b_ptr = b.as_ptr();
+    let b_chunks = b.len() / 8;
+    let b_tail_start = b_chunks * 8;
+
+    unsafe {
+        for &av in a {
+            let needle = vdupq_n_u16(av);
+
+            let mut found = false;
+            for chunk in 0..b_chunks {
+                let first = *b_ptr.add(chunk * 8);
+                if first > av {
+                    break;
+                }
+                let chunk_vec = vld1q_u16(b_ptr.add(chunk * 8));
+                let eq = vceqq_u16(needle, chunk_vec);
+                if vmaxvq_u16(eq) != 0 {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                for &bv in &b[b_tail_start..] {
+                    if bv == av {
+                        found = true;
+                        break;
+                    }
+                    if bv > av {
+                        break;
+                    }
+                }
+            }
+            if !found {
+                result.push(av);
+            }
+        }
+    }
+
     result
 }
 
@@ -395,6 +509,22 @@ mod tests {
         let a: Vec<u16> = (0u16..200).step_by(3).collect();
         let b: Vec<u16> = (0u16..200).step_by(5).collect();
         assert_eq!(unsafe { and_avx2(&a, &b) }, and_scalar(&a, &b));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_and_matches_scalar() {
+        let a: Vec<u16> = (0u16..200).step_by(3).collect();
+        let b: Vec<u16> = (0u16..200).step_by(5).collect();
+        assert_eq!(unsafe { and_neon(&a, &b) }, and_scalar(&a, &b));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_and_not_matches_scalar() {
+        let a: Vec<u16> = (0u16..200).step_by(3).collect();
+        let b: Vec<u16> = (0u16..200).step_by(5).collect();
+        assert_eq!(unsafe { and_not_neon(&a, &b) }, and_not_scalar(&a, &b));
     }
 
     #[cfg(target_arch = "x86_64")]

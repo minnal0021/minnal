@@ -11,6 +11,7 @@ use crate::container::run::Run;
 /// Used by the Bitset × Run cross-container ops in `container::ops`: building the
 /// run bitmask once and then invoking the existing `simd_support::bitwise` kernel
 /// gives a single-pass fused bitwise+popcount when AVX-512 VPOPCNTDQ is present.
+#[allow(unreachable_code)]
 pub fn runs_to_bitmask(runs: &[Run]) -> Box<[u64; BITSET_WORDS]> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -21,6 +22,9 @@ pub fn runs_to_bitmask(runs: &[Run]) -> Box<[u64; BITSET_WORDS]> {
             return unsafe { runs_to_bitmask_avx2(runs) };
         }
     }
+    // SAFETY: NEON is a baseline feature on all aarch64 targets.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { runs_to_bitmask_neon(runs) };
     runs_to_bitmask_scalar(runs)
 }
 
@@ -86,6 +90,58 @@ fn word_mask(lo: usize, hi: usize) -> u64 {
     debug_assert!(lo <= hi && hi < 64);
     let len = hi - lo + 1;
     if len == 64 { !0u64 } else { ((1u64 << len) - 1) << lo }
+}
+
+// ── NEON implementation ───────────────────────────────────────────────────────
+//
+// Strategy mirrors the AVX2 path at 128-bit width: fill complete 2-word chunks
+// with ALL_ONES using a Q-register store; partial head/tail words and the small
+// scalar remainder (0–1 words) are handled identically to the scalar path.
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn runs_to_bitmask_neon(runs: &[Run]) -> Box<[u64; BITSET_WORDS]> {
+    use std::arch::aarch64::*;
+
+    let mut bits = Box::new([0u64; BITSET_WORDS]);
+    let all_ones = vdupq_n_u64(!0u64);
+
+    unsafe {
+        for run in runs {
+            let first = run.start as usize;
+            let last = run.end() as usize;
+            let first_word = first >> 6;
+            let last_word = last >> 6;
+
+            if first_word == last_word {
+                bits[first_word] |= word_mask(first & 63, last & 63);
+                continue;
+            }
+
+            // Partial head
+            bits[first_word] |= !0u64 << (first & 63);
+
+            let fill_start = first_word + 1;
+            let fill_end = last_word; // exclusive
+
+            // NEON fill: 2 words (128 bits) per store
+            let chunks = (fill_end - fill_start) / 2;
+            let neon_end = fill_start + chunks * 2;
+            for chunk in 0..chunks {
+                vst1q_u64(bits.as_mut_ptr().add(fill_start + chunk * 2), all_ones);
+            }
+
+            // Scalar fill of remaining full word (0–1)
+            for w in neon_end..fill_end {
+                bits[w] = !0u64;
+            }
+
+            // Partial tail
+            bits[last_word] |= word_mask(0, last & 63);
+        }
+    }
+
+    bits
 }
 
 // ── AVX2 implementation ───────────────────────────────────────────────────────
@@ -271,6 +327,18 @@ mod tests {
         let scalar = runs_to_bitmask_scalar(&[run]);
         let simd = unsafe { runs_to_bitmask_avx2(&[run]) };
         assert_eq!(scalar[..], simd[..]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        let run = Run::new(128, 511); // [128, 639] — 9 full words
+        let scalar = runs_to_bitmask_scalar(&[run]);
+        let simd = unsafe { runs_to_bitmask_neon(&[run]) };
+        assert_eq!(scalar[..], simd[..]);
+        // Also exercise a multi-run / odd-remainder case against scalar.
+        let rc = RunContainer::from_sorted_values(&(0u16..1000).step_by(3).collect::<Vec<_>>());
+        assert_eq!(runs_to_bitmask_scalar(rc.runs())[..], unsafe { runs_to_bitmask_neon(rc.runs()) }[..]);
     }
 
     #[cfg(target_arch = "x86_64")]

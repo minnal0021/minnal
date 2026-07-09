@@ -9,6 +9,7 @@ pub struct BitwiseResult {
 // ── Public entry points ──────────────────────────────────────────────────────
 
 /// AND: `a & b` — intersection.
+#[allow(unreachable_code)]
 pub fn and(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
     #[cfg(target_arch = "x86_64")]
     {
@@ -22,10 +23,13 @@ pub fn and(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
             return unsafe { and_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { and_neon(a, b) };
     and_scalar(a, b)
 }
 
 /// OR: `a | b` — union.
+#[allow(unreachable_code)]
 pub fn or(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
     #[cfg(target_arch = "x86_64")]
     {
@@ -39,10 +43,13 @@ pub fn or(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
             return unsafe { or_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { or_neon(a, b) };
     or_scalar(a, b)
 }
 
 /// AND NOT: `a & !b` — difference.
+#[allow(unreachable_code)]
 pub fn and_not(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
     #[cfg(target_arch = "x86_64")]
     {
@@ -56,10 +63,13 @@ pub fn and_not(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResul
             return unsafe { and_not_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { and_not_neon(a, b) };
     and_not_scalar(a, b)
 }
 
 /// In-place AND: `dst &= src`. Returns the new cardinality.
+#[allow(unreachable_code)]
 pub fn and_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -73,10 +83,13 @@ pub fn and_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> 
             return unsafe { and_inplace_avx2(dst, src) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { and_inplace_neon(dst, src) };
     and_inplace_scalar(dst, src)
 }
 
 /// In-place OR: `dst |= src`. Returns the new cardinality.
+#[allow(unreachable_code)]
 pub fn or_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -90,10 +103,13 @@ pub fn or_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> u
             return unsafe { or_inplace_avx2(dst, src) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { or_inplace_neon(dst, src) };
     or_inplace_scalar(dst, src)
 }
 
 /// In-place AND NOT: `dst &= !src`. Returns the new cardinality.
+#[allow(unreachable_code)]
 pub fn and_not_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -107,6 +123,8 @@ pub fn and_not_inplace(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS])
             return unsafe { and_not_inplace_avx2(dst, src) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { and_not_inplace_neon(dst, src) };
     and_not_inplace_scalar(dst, src)
 }
 
@@ -167,6 +185,115 @@ fn and_not_inplace_scalar(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORD
         cardinality += dst[i].count_ones() as usize;
     }
     cardinality
+}
+
+// ── NEON paths (bitwise only, cardinality via second pass) ───────────────────
+//
+// Uses 128-bit Q registers: 2 × u64 per register = 512 chunks × 2 = 1024 words
+// (BITSET_WORDS is a multiple of 2, so there is no tail). After the bitwise
+// operation a separate popcount pass computes cardinality (which itself uses the
+// NEON popcount kernel).
+//
+// Available operations:
+//   AND      : vandq_u64
+//   OR       : vorrq_u64
+//   AND NOT  : vbicq_u64(a, b)  →  a & ~b   (note operand order: ~second & first)
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_neon(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
+    use std::arch::aarch64::*;
+    let mut bits = Box::new([0u64; BITSET_WORDS]);
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let va = vld1q_u64(a.as_ptr().add(i * 2));
+            let vb = vld1q_u64(b.as_ptr().add(i * 2));
+            vst1q_u64(bits.as_mut_ptr().add(i * 2), vandq_u64(va, vb));
+        }
+    }
+    let cardinality = super::popcount::popcount_u64_slice(bits.as_ref());
+    BitwiseResult { bits, cardinality }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn or_neon(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
+    use std::arch::aarch64::*;
+    let mut bits = Box::new([0u64; BITSET_WORDS]);
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let va = vld1q_u64(a.as_ptr().add(i * 2));
+            let vb = vld1q_u64(b.as_ptr().add(i * 2));
+            vst1q_u64(bits.as_mut_ptr().add(i * 2), vorrq_u64(va, vb));
+        }
+    }
+    let cardinality = super::popcount::popcount_u64_slice(bits.as_ref());
+    BitwiseResult { bits, cardinality }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_not_neon(a: &[u64; BITSET_WORDS], b: &[u64; BITSET_WORDS]) -> BitwiseResult {
+    use std::arch::aarch64::*;
+    let mut bits = Box::new([0u64; BITSET_WORDS]);
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let va = vld1q_u64(a.as_ptr().add(i * 2));
+            let vb = vld1q_u64(b.as_ptr().add(i * 2));
+            // vbicq_u64(x, y) computes x & ~y → pass (a, b) to get a & ~b.
+            vst1q_u64(bits.as_mut_ptr().add(i * 2), vbicq_u64(va, vb));
+        }
+    }
+    let cardinality = super::popcount::popcount_u64_slice(bits.as_ref());
+    BitwiseResult { bits, cardinality }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_inplace_neon(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
+    use std::arch::aarch64::*;
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let vd = vld1q_u64(dst.as_ptr().add(i * 2));
+            let vs = vld1q_u64(src.as_ptr().add(i * 2));
+            vst1q_u64(dst.as_mut_ptr().add(i * 2), vandq_u64(vd, vs));
+        }
+    }
+    super::popcount::popcount_u64_slice(dst.as_ref())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn or_inplace_neon(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
+    use std::arch::aarch64::*;
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let vd = vld1q_u64(dst.as_ptr().add(i * 2));
+            let vs = vld1q_u64(src.as_ptr().add(i * 2));
+            vst1q_u64(dst.as_mut_ptr().add(i * 2), vorrq_u64(vd, vs));
+        }
+    }
+    super::popcount::popcount_u64_slice(dst.as_ref())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_not_inplace_neon(dst: &mut [u64; BITSET_WORDS], src: &[u64; BITSET_WORDS]) -> usize {
+    use std::arch::aarch64::*;
+    let chunks = BITSET_WORDS / 2;
+    unsafe {
+        for i in 0..chunks {
+            let vd = vld1q_u64(dst.as_ptr().add(i * 2));
+            let vs = vld1q_u64(src.as_ptr().add(i * 2));
+            vst1q_u64(dst.as_mut_ptr().add(i * 2), vbicq_u64(vd, vs)); // dst & ~src
+        }
+    }
+    super::popcount::popcount_u64_slice(dst.as_ref())
 }
 
 // ── AVX2 paths (bitwise only, cardinality via second pass) ───────────────────
@@ -670,6 +797,58 @@ mod tests {
         let dispatch_card = and_not_inplace(&mut dispatch_dst, &b);
         assert_eq!(dispatch_dst[..], scalar_dst[..]);
         assert_eq!(dispatch_card, scalar_card);
+    }
+
+    // ── NEON specific tests (aarch64; NEON is baseline so always runs) ──
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_ops_match_scalar() {
+        let a = make_bits(&(0u16..1000).step_by(2).collect::<Vec<_>>());
+        let b = make_bits(&(0u16..1000).step_by(3).collect::<Vec<_>>());
+
+        let s_and = and_scalar(&a, &b);
+        let n_and = unsafe { and_neon(&a, &b) };
+        assert_eq!(n_and.bits[..], s_and.bits[..]);
+        assert_eq!(n_and.cardinality, s_and.cardinality);
+
+        let s_or = or_scalar(&a, &b);
+        let n_or = unsafe { or_neon(&a, &b) };
+        assert_eq!(n_or.bits[..], s_or.bits[..]);
+        assert_eq!(n_or.cardinality, s_or.cardinality);
+
+        let s_andnot = and_not_scalar(&a, &b);
+        let n_andnot = unsafe { and_not_neon(&a, &b) };
+        assert_eq!(n_andnot.bits[..], s_andnot.bits[..]);
+        assert_eq!(n_andnot.cardinality, s_andnot.cardinality);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_inplace_ops_match_scalar() {
+        let a = make_bits(&(0u16..1000).step_by(2).collect::<Vec<_>>());
+        let b = make_bits(&(0u16..1000).step_by(3).collect::<Vec<_>>());
+
+        let mut s = a.clone();
+        let s_card = and_inplace_scalar(&mut s, &b);
+        let mut n = a.clone();
+        let n_card = unsafe { and_inplace_neon(&mut n, &b) };
+        assert_eq!(n[..], s[..]);
+        assert_eq!(n_card, s_card);
+
+        let mut s = a.clone();
+        let s_card = or_inplace_scalar(&mut s, &b);
+        let mut n = a.clone();
+        let n_card = unsafe { or_inplace_neon(&mut n, &b) };
+        assert_eq!(n[..], s[..]);
+        assert_eq!(n_card, s_card);
+
+        let mut s = a.clone();
+        let s_card = and_not_inplace_scalar(&mut s, &b);
+        let mut n = a.clone();
+        let n_card = unsafe { and_not_inplace_neon(&mut n, &b) };
+        assert_eq!(n[..], s[..]);
+        assert_eq!(n_card, s_card);
     }
 
     // ── AVX2 specific tests (skipped if not available) ──────────────
