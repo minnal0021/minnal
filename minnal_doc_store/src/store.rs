@@ -2992,7 +2992,7 @@ mod tests {
     }
 
     async fn open_fresh(db_dir: &Path, schema_dir: &Path) -> DocStore {
-        DocStore::open(db_dir, schema_dir).await.unwrap()
+        DocStore::open_with_config(db_dir, schema_dir, crate::test_db_config()).await.unwrap()
     }
 
     // ── create / list / drop ────────────────────────────────────────────────

@@ -10,7 +10,21 @@
 use std::sync::Arc;
 
 use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
-use minnal_db::{Archived, DEFAULT_NAMESPACE_ID, Db, ExtractorFn, IndexValue, IndexValueType, KVError, access, rancor};
+use minnal_db::{Archived, DEFAULT_NAMESPACE_ID, Db, DbConfig, ExtractorFn, IndexValue, IndexValueType, KVError, access, rancor};
+
+/// Small bucket count keeps the eager per-namespace fd footprint low so the
+/// suite survives high `cargo test` parallelism (each namespace opens
+/// `2 × num_buckets` files). Two buckets still exercises multi-bucket routing.
+fn small_config() -> DbConfig {
+    DbConfig {
+        num_buckets: 2,
+        ..DbConfig::default()
+    }
+}
+
+fn open_test_db(path: &std::path::Path) -> Result<Db, KVError> {
+    Db::open_with_config(path, small_config())
+}
 
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 struct User {
@@ -64,7 +78,7 @@ fn put_user(db: &Db, key: u64, status: &str) -> Result<(), KVError> {
 #[test]
 fn dense_bitmap_stays_compact() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = Db::open(dir.path())?;
+    let db = open_test_db(dir.path())?;
     let field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
@@ -98,7 +112,7 @@ fn ids_survive_clean_restart() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
     let field;
     {
-        let db = Db::open(dir.path())?;
+        let db = open_test_db(dir.path())?;
         field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
         db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
         for i in 0..200u64 {
@@ -109,7 +123,7 @@ fn ids_survive_clean_restart() -> Result<(), KVError> {
 
     // Reopen: the field is still registered (schema persisted); re-supply the
     // extractor. The row map is loaded from disk, so query resolution works.
-    let db = Db::open(dir.path())?;
+    let db = open_test_db(dir.path())?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
     let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
@@ -137,7 +151,7 @@ fn ids_rebuilt_by_wal_replay_after_crash() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
     let field;
     {
-        let db = Db::open(dir.path())?;
+        let db = open_test_db(dir.path())?;
         field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
         db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
@@ -159,7 +173,7 @@ fn ids_rebuilt_by_wal_replay_after_crash() -> Result<(), KVError> {
     // Reopen: activation replays the WAL tail, re-resolving every touched key
     // through the row map (durable keys keep their id; post-checkpoint keys are
     // re-allocated deterministically) and rebuilding the bitmaps.
-    let db = Db::open(dir.path())?;
+    let db = open_test_db(dir.path())?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
     let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;

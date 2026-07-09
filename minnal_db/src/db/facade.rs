@@ -1624,10 +1624,20 @@ mod tests {
     use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
     use tempfile::TempDir;
 
+    /// Config for facade tests: keeps the eager per-namespace fd footprint small
+    /// so the suite survives high `cargo test` parallelism. See
+    /// [`crate::support::TEST_NUM_BUCKETS`].
+    fn test_config() -> DbConfig {
+        DbConfig {
+            num_buckets: crate::support::TEST_NUM_BUCKETS,
+            ..DbConfig::default()
+        }
+    }
+
     #[test]
     fn test_db_open_and_crud() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put(b"k1", b"v1").unwrap();
         db.put(b"k2", b"v2").unwrap();
@@ -1645,7 +1655,7 @@ mod tests {
     #[test]
     fn test_db_iteration() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
@@ -1666,7 +1676,7 @@ mod tests {
     #[test]
     fn test_db_range() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
@@ -1684,7 +1694,7 @@ mod tests {
     #[test]
     fn test_db_scan_prefix() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put(b"user:1", b"alice").unwrap();
         db.put(b"user:2", b"bob").unwrap();
@@ -1700,7 +1710,7 @@ mod tests {
     #[test]
     fn test_db_namespaces() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         // Default namespace
         db.put(b"global", b"value").unwrap();
@@ -1731,7 +1741,7 @@ mod tests {
     #[test]
     fn test_per_namespace_ops_metrics() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         let a = db.namespace("a").unwrap();
         a.put(b"k1", b"v").unwrap();
@@ -1772,7 +1782,7 @@ mod tests {
         let keeper_dir = dir.path().join("ns_keeper");
 
         {
-            let db = Db::open(dir.path()).unwrap();
+            let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
             // Two namespaces so we can confirm the survivor is untouched.
             let doomed = db.namespace("doomed").unwrap();
@@ -1795,7 +1805,7 @@ mod tests {
 
         // Reopen: recovery must not resurrect the removed namespace, and the
         // surviving namespace's data must still be intact.
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
         assert!(!db.list_namespaces().iter().any(|(n, _)| n == "doomed"));
         let keeper = db.namespace("keeper").unwrap();
         assert_eq!(keeper.get(b"alive").unwrap(), Some(b"yes".to_vec()));
@@ -1805,7 +1815,7 @@ mod tests {
     #[test]
     fn test_db_namespace_gc() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         let ns = db.namespace("test_ns").unwrap();
         ns.put(b"k", b"v").unwrap();
@@ -1818,7 +1828,7 @@ mod tests {
     #[test]
     fn test_db_maintenance() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put(b"k", b"v").unwrap();
 
@@ -1833,7 +1843,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_crud() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         db.put(b"k1".to_vec(), b"v1".to_vec()).await.unwrap();
         assert_eq!(db.get(b"k1".to_vec()).await.unwrap(), Some(b"v1".to_vec()));
@@ -1847,7 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_namespace() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         let ns = db.namespace("events".to_string()).await.unwrap();
         ns.put(b"e1".to_vec(), b"click".to_vec()).await.unwrap();
@@ -1862,7 +1872,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_namespace_no_wal_crud() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
         let ns = db.namespace("cache".to_string()).await.unwrap();
 
         // No-WAL write is readable like any other write.
@@ -1901,7 +1911,7 @@ mod tests {
     #[test]
     fn test_db_typed_crud() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         let key = UserId(42);
         let value = UserProfile {
@@ -1934,7 +1944,7 @@ mod tests {
     #[test]
     fn test_namespace_typed_crud() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         let ns = db.namespace("users").unwrap();
         let key = UserId(1);
@@ -1957,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_typed_crud() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         let key = UserId(99);
         let value = UserProfile {
@@ -1979,7 +1989,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_namespace_typed_crud() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         let ns = db.namespace("products".to_string()).await.unwrap();
         let key = 42u64;
@@ -1997,7 +2007,7 @@ mod tests {
     #[test]
     fn test_db_typed_iter() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         db.put_typed(
             &UserId(1),
@@ -2032,7 +2042,7 @@ mod tests {
     #[test]
     fn test_namespace_typed_iter() {
         let dir = TempDir::new().unwrap();
-        let db = Db::open(dir.path()).unwrap();
+        let db = Db::open_with_config(dir.path(), test_config()).unwrap();
 
         let ns = db.namespace("users").unwrap();
         ns.put_typed(&UserId(10), &UserProfile { name: "Dan".into(), age: 20 }).unwrap();
@@ -2050,7 +2060,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_db_typed_iter() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         db.put_typed(
             &UserId(1),
@@ -2075,7 +2085,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_namespace_typed_iter() {
         let dir = TempDir::new().unwrap();
-        let db = AsyncDb::open(dir.path().to_path_buf()).await.unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), test_config()).await.unwrap();
 
         let ns = db.namespace("items".to_string()).await.unwrap();
         ns.put_typed(&1u64, &"first".to_string()).await.unwrap();

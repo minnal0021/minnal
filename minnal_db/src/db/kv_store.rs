@@ -2100,7 +2100,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn default_lsm_config() -> LSMConfig {
-        LSMConfig::default()
+        LSMConfig {
+            num_buckets: crate::support::TEST_NUM_BUCKETS,
+            ..LSMConfig::default()
+        }
     }
 
     // ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────

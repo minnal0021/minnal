@@ -7,7 +7,20 @@
 use std::sync::Arc;
 
 use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
-use minnal_db::{Archived, DEFAULT_NAMESPACE_ID, Db, ExtractorFn, IndexValue, IndexValueType, KVError, access, rancor};
+use minnal_db::{Archived, DEFAULT_NAMESPACE_ID, Db, DbConfig, ExtractorFn, IndexValue, IndexValueType, KVError, access, rancor};
+
+/// Small bucket count keeps the eager per-namespace fd footprint low so the
+/// suite survives high `cargo test` parallelism (each namespace opens
+/// `2 × num_buckets` files). Two buckets still exercises multi-bucket routing.
+fn open_test_db(path: &std::path::Path) -> Result<Db, KVError> {
+    Db::open_with_config(
+        path,
+        DbConfig {
+            num_buckets: 2,
+            ..DbConfig::default()
+        },
+    )
+}
 
 /// The value type. Derives the rkyv traits re-exported from `minnal_db`, so the
 /// derive macro also generates `ArchivedUser` for zero-copy field access.
@@ -20,7 +33,7 @@ struct User {
 #[test]
 fn field_index_over_typed_struct_value() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = Db::open(dir.path())?;
+    let db = open_test_db(dir.path())?;
 
     // 1. Declare which fields to index on the default namespace. Returns a FieldId.
     let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
@@ -120,7 +133,7 @@ fn total_blob_value_bytes(root: &std::path::Path) -> u64 {
 #[test]
 fn checkpoint_compacts_bloated_field_index() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = Db::open(dir.path())?;
+    let db = open_test_db(dir.path())?;
 
     let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
     let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
