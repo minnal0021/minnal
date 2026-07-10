@@ -1,4 +1,4 @@
-//! Configuration for the minnal_doc_store_api server.
+//! Configuration for the minnal_db_api server.
 //!
 //! [`DocStoreApiConfig`] is a superset of `minnal.toml`: it shares the same
 //! TOML sections as `MinnalTomlConfig` and adds two extras:
@@ -8,7 +8,7 @@
 //! A plain `minnal.toml` (without `schema_dir` or `[api]`) is valid here;
 //! the missing fields fall back to their built-in defaults.
 //!
-//! # Example `minnal_doc_store_api.toml`
+//! # Example `minnal_db_api.toml`
 //!
 //! ```toml
 //! [storage]
@@ -116,7 +116,7 @@ impl SupportedModelEntry {
 
 // ── Top-level config ──────────────────────────────────────────────────────────
 
-/// Superset configuration for the minnal_doc_store_api HTTP server.
+/// Superset configuration for the minnal_db_api HTTP server.
 #[derive(Debug, Default, Deserialize)]
 pub struct DocStoreApiConfig {
     pub storage: StorageSection,

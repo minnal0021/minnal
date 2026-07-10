@@ -1,6 +1,6 @@
-# minnal doc store
+# minnal_db_api — REST Service
 
-A lightweight embedded document and key-value store with a REST API, built on top of [minnal_db](../minnal_db).
+The `minnal_db_api` binary exposes minnal's document and key-value stores over an HTTP REST API. It is a thin Axum server built on the [`minnal_db`](../minnal_db) crate (with the `doc-store` and `semantic-search` features enabled). For **embedded** in-process use instead, see [`minnal_db/QUICKSTART.md`](../minnal_db/QUICKSTART.md).
 
 Both store kinds live under a single `/stores` path; the kind is set by a mandatory `store_type` field at creation and resolved from the schema thereafter.
 
@@ -48,23 +48,23 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
 ### 1 — Build
 
 ```bash
-cargo build --release -p minnal_doc_store_api
+cargo build --release -p minnal_db_api
 ```
 
-The binary is at `target/release/minnal_doc_store_api`.
+The binary is at `target/release/minnal_db_api`.
 
 ### 2 — Start the server
 
 Run with built-in defaults (data stored under `./data/`):
 
 ```bash
-./target/release/minnal_doc_store_api
+./target/release/minnal_db_api
 ```
 
 Or point it at a config file:
 
 ```bash
-./target/release/minnal_doc_store_api /path/to/config.toml
+./target/release/minnal_db_api /path/to/config.toml
 ```
 
 The server listens on `0.0.0.0:8080` by default.
@@ -121,7 +121,7 @@ curl -s -X POST http://localhost:8080/stores/users/query \
 All settings have built-in defaults so no config file is required to get started.
 
 ```toml
-# minnal_doc_store_api.toml
+# minnal_db_api.toml
 
 [storage]
 db_path    = "./data/db"       # where minnal_db stores its files
@@ -163,7 +163,7 @@ concurrency     = 4            # max concurrent embedding calls in flight
 ```
 
 The config file path is resolved in this order:
-1. First CLI argument: `minnal_doc_store_api /path/to/config.toml`
+1. First CLI argument: `minnal_db_api /path/to/config.toml`
 2. `MINNAL_CONFIG_FILE` environment variable
 3. Built-in defaults (no file needed)
 
@@ -1702,12 +1702,12 @@ All errors return JSON with an `"error"` key:
 
 ## Bulk loading data
 
-Use the `bulk_load` tool from the `tools` crate (binary `minnal_tools`) to bulk-load a [JSONL](https://jsonlines.org/) file (one JSON object per line) into a store. The loader streams each line to the running server over the REST API, so **the server must already be up**. By default the namespace must already exist; pass `--schema <schema.json>` to import the schema first.
+Use the `bulk_load` tool from the `minnal_tools` crate to bulk-load a [JSONL](https://jsonlines.org/) file (one JSON object per line) into a store. The loader streams each line to the running server over the REST API, so **the server must already be up**. By default the namespace must already exist; pass `--schema <schema.json>` to import the schema first.
 
 ### Build
 
 ```bash
-cargo build --release -p tools
+cargo build --release -p minnal_tools
 # binary: target/release/minnal_tools
 ```
 

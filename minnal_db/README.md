@@ -544,29 +544,27 @@ ns.put(b"sess:abc".to_vec(), b"user=42".to_vec()).await?;
 
 MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
 
-It sits beneath the rest of the stack, with the dependency direction strictly downward:
+`minnal_db` is a **single crate**; the document and semantic-search layers are
+folded in as cargo features (`doc-store`, `semantic-search`) that you opt into.
+The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
+secondary (field-level) indexing is a capability of the engine itself, not
+something layered on by the document store.
 
-```
-minnal_doc_store_api   (REST server)
-    └── minnal_doc_store   (JSON schema, document CRUD, semantic search)
-            └── minnal_db   ← this crate: embedded LSM + value-log KV engine
-                    └── index   (RoaringBitmap field indexing + predicate evaluator)
-```
+### What each feature adds
 
-`minnal_db` has no knowledge of the document or semantic-search layers above it. The one workspace crate it depends on is `index`, because **secondary (field-level) indexing is a built-in capability of the KV engine itself**, not something layered on by the document store.
-
-### What an embedded store can and cannot do
-
-| Capability | Where it lives | Embeddable via `minnal_db`? |
+| Capability | Feature | Extra deps |
 |---|---|---|
-| Key-value CRUD, namespaces, TTL, typed (rkyv) values | `minnal_db` | ✅ Yes |
-| RoaringBitmap **field/secondary index** + predicate query DSL | `index`, wired into `minnal_db` | ✅ Yes |
-| JSON schema, document lifecycle, extractor generation | `minnal_doc_store` | ❌ No — higher layer |
-| Semantic / vector (IVF + RaBitQ) search | `semantic_search` + `minnal_doc_store` | ❌ No — higher layer |
+| Key-value CRUD, namespaces, TTL, typed (rkyv) values | `kv-store` (default) | — |
+| RoaringBitmap **field/secondary index** + predicate query DSL | `kv-store` (default) | — |
+| Quantised IVF + RaBitQ vector search (on raw KV or documents) | `semantic-search` | `reqwest`, `simsimd`, `rayon`, `futures` |
+| JSON schema, document lifecycle, extractor generation | `doc-store` | `json_dotpath` |
 
-Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, bincode, rkyv, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what `minnal_doc_store` adds on top; the indexing machinery itself is engine-level.
+Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, bincode, rkyv, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what the `doc-store` feature adds on top; the indexing machinery itself is engine-level.
 
-> **Not published to crates.io.** Because `index` is a path dependency, embedding `minnal_db` elsewhere means pulling in both crates (via path or git), not `cargo add minnal_db`. **Platform:** Linux and macOS only (`pread`/`pwrite`).
+> **Publishable single crate.** Depend on `minnal_db` and select features:
+> `minnal_db = { version = "0.1", features = ["doc-store"] }`. See
+> [`QUICKSTART.md`](QUICKSTART.md) for the full feature matrix. **Platform:**
+> Linux and macOS only (`pread`/`pwrite`).
 
 ### Field-Level Indexing
 

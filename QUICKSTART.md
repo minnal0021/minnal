@@ -12,7 +12,7 @@ or a schema-lite *KV store*):
 | Mode | Document store | KV store |
 |---|---|---|
 | **Embedded** — link `minnal_db` directly into a Rust process | ❌ Not available — the document model is a higher layer | ✅ Key-value CRUD, TTL, typed values, **RoaringBitmap field index + predicate queries** |
-| **Service (REST)** — run `minnal_doc_store_api` | ✅ Full: CRUD, predicate queries, **semantic search** | ✅ CRUD, range/prefix scans, optional **semantic search** |
+| **Service (REST)** — run `minnal_db_api` | ✅ Full: CRUD, predicate queries, **semantic search** | ✅ CRUD, range/prefix scans, optional **semantic search** |
 
 The two modes share the same engine — everything below the REST boundary is the
 same code whether you call it in-process or over HTTP. The rest of this guide is
@@ -56,8 +56,8 @@ first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, the
 cargo build
 
 # Build optimised binaries
-cargo build --release -p minnal_doc_store_api
-cargo build --release -p tools     # minnal_tools (bulk_load, …)
+cargo build --release -p minnal_db_api
+cargo build --release -p minnal_tools     # minnal_tools (bulk_load, …)
 ```
 
 > **Semantic search needs an external embedding service.** Everything else —
@@ -94,7 +94,7 @@ minimal — one index field (`agency`) and one semantic-search field (`jobTitle`
 ./work/bin/start.sh
 ```
 
-The `-s` flag stages [`tools/sample_data/`](tools/sample_data) into
+The `-s` flag stages [`minnal_tools/sample_data/`](minnal_tools/sample_data) into
 `./work/sample_data/`, including the two files this quickstart uses:
 `jobs-mini-schema.json` and `jobs-mini.jsonl` (ten rows). It also stages a
 KV-store sample — `job-content-kv-schema.json` and `job-content-kv.jsonl` (twenty
@@ -204,7 +204,7 @@ the workspace root.
 
 ```bash
 # Debug build and run directly
-cargo run -p minnal_doc_store_api -- config/sample.toml
+cargo run -p minnal_db_api -- config/sample.toml
 ```
 
 The server listens on `0.0.0.0:8080` by default (configurable via
@@ -544,7 +544,7 @@ the field holding the document ID:
 ./work/bin/run_tool.sh bulk_load http://localhost:8080 profiles id profiles.jsonl
 
 # Development: build and run directly via cargo (instead of the staged binary)
-cargo run -p tools -- bulk_load http://localhost:8080 profiles id profiles.jsonl
+cargo run -p minnal_tools -- bulk_load http://localhost:8080 profiles id profiles.jsonl
 ```
 
 The `id_field` value is parsed according to the namespace's `key_type` (`u64`,
@@ -649,10 +649,10 @@ curl -X POST http://localhost:8080/admin/storage/index-checkpoint
 ```
 
 For the full admin API reference see
-[`minnal_doc_store_api/README.md`](minnal_doc_store_api/README.md). For a
+[`minnal_db_api/README.md`](minnal_db_api/README.md). For a
 consolidated table of every metric these endpoints report — with explanations and
 whether each value survives a restart — see
-[Operational & Storage Metrics](minnal_doc_store_api/README.md#operational--storage-metrics).
+[Operational & Storage Metrics](minnal_db_api/README.md#operational--storage-metrics).
 
 ### Logging
 
@@ -687,19 +687,19 @@ the `[logging] level` value entirely:
 
 ```bash
 # Warnings and above only (quiet)
-RUST_LOG=warn ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=warn ./target/release/minnal_db_api config/sample.toml
 
 # Info level (default recommended)
-RUST_LOG=info ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=info ./target/release/minnal_db_api config/sample.toml
 
 # Debug messages
-RUST_LOG=debug ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=debug ./target/release/minnal_db_api config/sample.toml
 
 # Per-crate control — debug for the KV engine, info elsewhere
-RUST_LOG=info,minnal_db=debug ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=info,minnal_db=debug ./target/release/minnal_db_api config/sample.toml
 
 # Narrow to a single module
-RUST_LOG=minnal_db::db::database=trace ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=minnal_db::db::database=trace ./target/release/minnal_db_api config/sample.toml
 ```
 
 Level hierarchy (most → least verbose): `trace > debug > info > warn > error`.
@@ -708,7 +708,7 @@ The same variable works with the staged binary and `cargo run`:
 
 ```bash
 RUST_LOG=info ./work/bin/start.sh
-RUST_LOG=info cargo run -p minnal_doc_store_api -- config/sample.toml
+RUST_LOG=info cargo run -p minnal_db_api -- config/sample.toml
 ```
 
 ### Write Durability and Recovery
@@ -772,117 +772,15 @@ data is no longer needed.
 
 ## Using minnal Embedded (as a Library)
 
-The bottom layer, [`minnal_db`](README.md#layer-1--minnal_db-key-value-engine),
-is a standalone **embedded key-value store** you can link directly into any Rust
-process — no server, no daemon. You call `Db::open` (or `AsyncDb::open`) on a
-directory and get a durable, namespaced KV store with all background workers
-(compaction, value-log GC, WAL GC, TTL) running in-process.
+To embed minnal in a Rust process, add the `minnal_db` crate and call it
+in-process — no server, no daemon. Capabilities are selected by cargo feature
+(`kv-store` default, `doc-store`, `semantic-search`), so you compile only what
+you use and the lean default pulls no vector dependencies.
 
-The dependency direction is strictly downward — `minnal_db` knows nothing of the
-layers above it. Its one workspace dependency is `index`, because **secondary
-(field-level) indexing is a built-in capability of the KV engine itself**, not
-something the document store layers on.
-
-### What an embedded store can and cannot do
-
-| Capability | Where it lives | Embeddable via `minnal_db`? |
-|---|---|---|
-| Key-value CRUD, namespaces, TTL, typed (rkyv) values | `minnal_db` | ✅ Yes |
-| RoaringBitmap **field/secondary index** + predicate query DSL | `index`, wired into `minnal_db` | ✅ Yes |
-| JSON schema, document lifecycle, extractor generation | `minnal_doc_store` | ❌ No — higher layer |
-| Semantic / vector (IVF + RaBitQ) search | `semantic_search` + `minnal_doc_store` | ❌ No — higher layer |
-
-MinnalDB stores **opaque value bytes** — it never assumes a format. The field
-index is driven by an *extractor closure* you supply
-(`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of
-your own value encoding (JSON, bincode, rkyv, a fixed binary layout, …). Deriving
-those extractors from a JSON schema is precisely what `minnal_doc_store` adds on
-top; the indexing machinery itself is engine-level. See
-[`minnal_db/README.md`](minnal_db/README.md#minnaldb-as-an-embedded-store) for the
-full engine documentation.
-
-> **Not published to crates.io.** Because `index` is a path dependency, embedding
-> `minnal_db` elsewhere means pulling in both crates (via path or git), not
-> `cargo add minnal_db`. **Platform:** Linux and macOS only (`pread`/`pwrite`).
-
-### Field-Level Indexing
-
-The example below opens a store, indexes two fields (`status`, `age`), writes a
-few records keyed by `u64`, and runs a predicate query — all in-process, with no
-document-store layer involved. Here the values are a **typed `rkyv` struct**
-(`User`), so the extractors read the indexed fields straight off the zero-copy
-archive; the engine still only ever sees opaque value bytes.
-
-```rust
-use std::sync::Arc;
-use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
-use minnal_db::{
-    access, rancor, Archived, Db, ExtractorFn, IndexValue, IndexValueType, KVError,
-    DEFAULT_NAMESPACE_ID,
-};
-
-// The value type. Deriving the rkyv traits also generates `ArchivedUser`,
-// which the extractors below borrow zero-copy. The derive macros are
-// re-exported from minnal_db, so no direct rkyv dependency is needed for them.
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-struct User {
-    status: String,
-    age: i64,
-}
-
-fn main() -> Result<(), KVError> {
-    let db = Db::open("/tmp/users_db")?;
-
-    // 1. Declare which fields to index on the default namespace. Returns a FieldId.
-    //    The schema is persisted in config.json, so after a restart you only
-    //    re-activate (step 2) — you don't re-register.
-    let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
-    let age_field    = db.register_index_field(DEFAULT_NAMESPACE_ID, "age",    IndexValueType::Int)?;
-
-    // 2. Activate each field with an *extractor*: a closure that pulls the field
-    //    out of the raw stored value. minnal_db has no idea what your value bytes
-    //    mean — here they're an rkyv archive of `User`, so we borrow it zero-copy
-    //    with `access` and read the field off `ArchivedUser` (no full decode).
-    let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let user = access::<ArchivedUser, rancor::Error>(bytes).ok()?;
-        Some(IndexValue::Str(user.status.as_str().to_string()))
-    });
-    let age_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let user = access::<ArchivedUser, rancor::Error>(bytes).ok()?;
-        Some(IndexValue::Int(user.age.to_native()))
-    });
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor)?;
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor)?;
-
-    // 3. Write records with a plain `u64` key. Each put_typed rkyv-serialises key
-    //    and value, runs the extractors, and updates the RoaringBitmap indices
-    //    automatically — there is no separate "index" call.
-    db.put_typed(&1u64, &User { status: "active".into(),   age: 30 })?;
-    db.put_typed(&2u64, &User { status: "inactive".into(), age: 25 })?;
-    db.put_typed(&3u64, &User { status: "active".into(),   age: 42 })?;
-    db.put_typed(&4u64, &User { status: "active".into(),   age: 18 })?;
-
-    // 4. Query the index with the predicate DSL (=, !=, <, <=, >, >=, AND, OR,
-    //    BETWEEN, IN). Returns the raw (rkyv) key bytes of matching records.
-    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
-
-    // 5. Resolve matched keys: decode the archived u64, then get_typed the value.
-    for key in keys {
-        let id = access::<Archived<u64>, rancor::Error>(&key)
-            .expect("key is an archived u64")
-            .to_native();
-        if let Some(user) = db.get_typed::<u64, User>(&id)? {
-            println!("user {id} => status={}, age={}", user.status, user.age);
-        }
-    }
-    // → user 1 and user 3  (active AND age > 20; user 4 is active but 18, user 2 is inactive)
-
-    db.shutdown()?;
-    Ok(())
-}
-```
-
----
+See the dedicated **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — it covers
+feature selection as a table, the key-value and field-index APIs with runnable
+examples, and the document-store handle. Full engine internals are in
+[`minnal_db/README.md`](minnal_db/README.md).
 
 ## Scripts and Config
 
@@ -897,7 +795,7 @@ fn main() -> Result<(), KVError> {
 
 | Script | Purpose |
 |---|---|
-| `./work/bin/start.sh` | Start `minnal_doc_store_api` using the staged binary and `minnal.toml`. |
+| `./work/bin/start.sh` | Start `minnal_db_api` using the staged binary and `minnal.toml`. |
 | `./work/bin/run_tool.sh` | Run `minnal_tools` (e.g. `bulk_load`) using the staged binary. |
 
 ### Example scripts

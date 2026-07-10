@@ -352,7 +352,7 @@ All parameters are under `[semantic_search]` in the TOML config:
   scoring remainder, and the whole query — sweeping `n_probes ∈ {10, 32, 128}` at several
   chunks-per-doc. It needs no embedding service.
   ```sh
-  cargo test -p minnal_doc_store --lib real_kv_search_profile --release -- --ignored --nocapture
+  cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_kv_search_profile --release -- --ignored --nocapture
   ```
 - **Recall** — `real_recall_vs_nprobes` indexes a real text corpus through the real
   embedding service (the production `embed_document` → `upsert_vectors` path) and reports
@@ -364,7 +364,7 @@ All parameters are under `[semantic_search]` in the TOML config:
   is absent).
   ```sh
   MINNAL_EMBED_URL=http://<host>:8001 \
-    cargo test -p minnal_doc_store --lib real_recall_vs_nprobes --release -- --ignored --nocapture
+    cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_recall_vs_nprobes --release -- --ignored --nocapture
   ```
 
 Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency: 5000-doc

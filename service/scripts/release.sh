@@ -2,11 +2,11 @@
 # Build release binaries and stage everything under ./work/bin.
 #
 # What this script does:
-#   1. Builds minnal_doc_store_api and minnal_tools in release mode.
-#   2. Gracefully stops any running minnal_doc_store_api (via stop.sh if present,
+#   1. Builds minnal_db_api and minnal_tools in release mode.
+#   2. Gracefully stops any running minnal_db_api (via stop.sh if present,
 #      otherwise inline — waits up to 30 s before aborting).
 #   3. Creates ./work/bin/ (if needed) and copies both binaries into it.
-#   4. Copies tools/sample_data/ → ./work/sample_data/  (only with -s flag).
+#   4. Copies minnal_tools/sample_data/ → ./work/sample_data/  (only with -s flag).
 #   5. Copies service/embedding_support/qwen/clusters.json → ./work/bin/clusters.bin.
 #   6. Generates ./work/bin/minnal.toml from config/sample.toml, rewriting
 #      all data paths to use ./work/doc_store as the base directory.
@@ -42,14 +42,14 @@ stop_server() {
     local pid
     # pgrep -x won't match: Linux truncates comm to 15 chars and the binary
     # name is 20 chars long. Use -f to search the full command line instead.
-    pid=$(pgrep -f minnal_doc_store_api 2>/dev/null || true)
+    pid=$(pgrep -f minnal_db_api 2>/dev/null || true)
 
     if [[ -z "$pid" ]]; then
-        echo "  No running minnal_doc_store_api found — nothing to stop."
+        echo "  No running minnal_db_api found — nothing to stop."
         return 0
     fi
 
-    echo "  Found minnal_doc_store_api (PID $pid) — sending SIGTERM..."
+    echo "  Found minnal_db_api (PID $pid) — sending SIGTERM..."
     kill -TERM "$pid"
 
     local elapsed=0
@@ -71,7 +71,7 @@ stop_server() {
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 echo "==> [1/9] Building release binaries..."
-cargo build --release -p minnal_doc_store_api -p tools
+cargo build --release -p minnal_db_api -p minnal_tools
 echo "  Build complete."
 
 # ── 2. Gracefully stop any running server ─────────────────────────────────────
@@ -89,8 +89,8 @@ fi
 echo ""
 echo "==> [3/9] Staging binaries → ${BIN_DIR}"
 mkdir -p "${BIN_DIR}"
-cp target/release/minnal_doc_store_api "${BIN_DIR}/minnal_doc_store_api"
-echo "  Copied minnal_doc_store_api"
+cp target/release/minnal_db_api "${BIN_DIR}/minnal_db_api"
+echo "  Copied minnal_db_api"
 cp target/release/minnal_tools         "${BIN_DIR}/minnal_tools"
 echo "  Copied minnal_tools"
 
@@ -99,7 +99,7 @@ echo ""
 if [[ "${COPY_SAMPLE_DATA}" == true ]]; then
     echo "==> [4/9] Copying sample data → ${WORKSPACE_ROOT}/work/sample_data"
     mkdir -p "${WORKSPACE_ROOT}/work/sample_data"
-    cp "${WORKSPACE_ROOT}/tools/sample_data/"* "${WORKSPACE_ROOT}/work/sample_data/"
+    cp "${WORKSPACE_ROOT}/minnal_tools/sample_data/"* "${WORKSPACE_ROOT}/work/sample_data/"
     echo "  Sample data staged in ./work/sample_data/"
 else
     echo "==> [4/9] Skipping sample data (pass -s to copy)"
@@ -133,14 +133,14 @@ set -euo pipefail
 
 STOP_TIMEOUT=30
 
-pid=$(pgrep -f minnal_doc_store_api 2>/dev/null || true)
+pid=$(pgrep -f minnal_db_api 2>/dev/null || true)
 
 if [[ -z "$pid" ]]; then
-    echo "minnal_doc_store_api is not running."
+    echo "minnal_db_api is not running."
     exit 0
 fi
 
-echo "Found minnal_doc_store_api (PID $pid) — sending SIGTERM..."
+echo "Found minnal_db_api (PID $pid) — sending SIGTERM..."
 kill -TERM "$pid"
 
 elapsed=0
@@ -172,7 +172,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${WORKSPACE_ROOT}"
-exec "${SCRIPT_DIR}/minnal_doc_store_api" "${SCRIPT_DIR}/minnal.toml"
+exec "${SCRIPT_DIR}/minnal_db_api" "${SCRIPT_DIR}/minnal.toml"
 EOF
 chmod +x "${BIN_DIR}/start.sh"
 echo "  Written start.sh"
@@ -221,7 +221,7 @@ echo "  Written test_embedding.sh"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Release ready in ${BIN_DIR}:"
-echo "  minnal_doc_store_api      — server binary"
+echo "  minnal_db_api      — server binary"
 echo "  minnal_tools              — tools binary"
 echo "  clusters.bin              — ANN cluster centroids"
 echo "  minnal.toml               — server config"

@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_dir = cfg.log_dir();
     std::fs::create_dir_all(&log_dir)?;
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "minnal_doc_store_api.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "minnal_db_api.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     use tracing_subscriber::prelude::*;
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_path    = %cfg.db_path().display(),
         schema_dir = %cfg.schema_dir().display(),
         listen     = %cfg.listen_addr(),
-        "starting minnal_doc_store_api",
+        "starting minnal_db_api",
     );
 
     let db_config = cfg.to_db_config();
@@ -247,7 +247,7 @@ async fn shutdown_signal() {
 /// Resolve and load configuration.
 ///
 /// Priority:
-/// 1. First positional CLI argument: `minnal_doc_store_api /path/to/config.toml`
+/// 1. First positional CLI argument: `minnal_db_api /path/to/config.toml`
 /// 2. `MINNAL_CONFIG_FILE` environment variable
 /// 3. All built-in defaults (no file required)
 fn load_config() -> DocStoreApiConfig {

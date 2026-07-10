@@ -1,11 +1,11 @@
-# minnal_doc_store_api.toml — sample configuration
+# minnal_db_api.toml — sample configuration
 #
 # This file is a superset of minnal.toml.  Every field has a built-in default,
 # so you only need to specify the values you want to override.
 #
 # Start the server with:
-#   minnal_doc_store_api /path/to/this/file.toml
-#   MINNAL_CONFIG_FILE=/path/to/this/file.toml minnal_doc_store_api
+#   minnal_db_api /path/to/this/file.toml
+#   MINNAL_CONFIG_FILE=/path/to/this/file.toml minnal_db_api
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

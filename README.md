@@ -16,10 +16,10 @@ Minnal is a layered document database written in Rust. It combines a high-perfor
 
 It works in **two ways**, from the same engine:
 
-- **Embedded** — link `minnal_db` (and the upper layers) directly into your Rust application and call the API in-process, with no server or network hop. See [Using minnal Embedded](QUICKSTART.md#using-minnal-embedded-as-a-library).
-- **Server (REST)** — run `minnal_doc_store_api` to expose the same stores over an HTTP REST API for any client or language. See [Using minnal as a Service](QUICKSTART.md#using-minnal-as-a-service-rest).
+- **Embedded** — add the `minnal_db` crate to your Rust application and call the API in-process, with no server or network hop. Capabilities are opt-in via cargo features (`kv-store` default, `doc-store`, `semantic-search`). See the **[Embedded Quickstart](minnal_db/QUICKSTART.md)**.
+- **Server (REST)** — run `minnal_db_api` to expose the same stores over an HTTP REST API for any client or language. See **[minnal_db_api](minnal_db_api/README.md)**.
 
-For a hands-on walkthrough of both modes — build, bulk-load, and every endpoint — see the **[Quickstart & Usage Guide](QUICKSTART.md)**.
+For a hands-on server walkthrough — build, bulk-load, and every endpoint — see the **[Quickstart & Usage Guide](QUICKSTART.md)**.
 
 > **Platform support:** Linux and macOS only. Windows is not supported — the storage engine relies on Unix positional I/O (`pread`/`pwrite`) and the server requires POSIX signals.
 
@@ -33,14 +33,14 @@ For a hands-on walkthrough of both modes — build, bulk-load, and every endpoin
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-  - [Layer 1 — minnal\_db (Key-Value Engine)](#layer-1--minnal_db-key-value-engine)
-  - [Layer 2 — index (RoaringBitmap Field Indexing)](#layer-2--index-roaringbitmap-field-indexing)
-  - [Layer 3 — semantic\_search (Vector Quantisation + ANN)](#layer-3--semantic_search-vector-quantisation--ann)
-  - [Layer 4 — minnal\_doc\_store (Document Store + KV Store)](#layer-4--minnal_doc_store-document-store--kv-store)
-  - [Layer 5 — minnal\_doc\_store\_api (REST API)](#layer-5--minnal_doc_store_api-rest-api)
+  - [Layer 1 — KV Engine (`kv-store`, always on)](#layer-1--kv-engine-kv-store-always-on)
+  - [Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)](#layer-2--field-indexing-roaringbitmap-part-of-kv-store)
+  - [Layer 3 — Semantic Search (Vector Quantisation + ANN, `semantic-search`)](#layer-3--semantic-search-vector-quantisation--ann-semantic-search)
+  - [Layer 4 — Document Store + KV Store (`doc-store`)](#layer-4--document-store--kv-store-doc-store)
+  - [Layer 5 — REST API (`minnal_db_api`)](#layer-5--rest-api-minnal_db_api)
 - [Salient Features](#salient-features)
 - [Quickstart & Usage](#quickstart--usage)
-- [Crate Structure](#crate-structure)
+- [Repository Structure](#repository-structure)
 - [Acknowledgements](#acknowledgements)
 
 ---
@@ -49,33 +49,36 @@ For a hands-on walkthrough of both modes — build, bulk-load, and every endpoin
 
 Minnal is designed for use cases that need fast key-value storage, structured predicate queries on JSON fields, *and* semantic (embedding-based) similarity search — in a single embedded process. The only piece that lives outside the process is the embedding service, and only when semantic search is enabled — it generates the vector embeddings for documents (at index time) and for queries (at search time) that semantic search relies on. Everything else — quantisation, indexing, and the ANN search itself — runs in-process.
 
-A typical deployment looks like this:
+Everything below the REST boundary is a **single crate, `minnal_db`**, whose
+capabilities are selected with cargo features — the KV engine and field indexing
+are always present; the JSON document store and semantic search are opt-in:
 
-```
-REST client
-    │
-    ▼
-minnal_doc_store_api   ← Axum HTTP server
-    │
-    ├── minnal_doc_store   ← JSON schema, doc lifecycle, index builders
-    │       ├── minnal_db  ← LSM + value-log KV engine (WiscKey-style)
-    │       ├── index      ← RoaringBitmap field indices, predicate evaluator
-    │       └── semantic_search  ← IVF clustering, RaBitQ quantisation, ANN search
-    │
-    └── embedding service  ← external HTTP service (e.g. E5, Instructor)
-```
+| Layer (feature) | Role |
+|---|---|
+| KV engine + field indexing (`kv-store`, default) | LSM + value-log store, namespaces, TTL; RoaringBitmap field indices + predicate evaluator |
+| Semantic search (`semantic-search`) | IVF clustering, RaBitQ quantisation, two-pass ANN — usable on raw KV or documents |
+| Document store (`doc-store`) | JSON schema, document lifecycle, background index builders |
+| `minnal_db_api` (separate binary crate) | Axum HTTP server exposing all of the above over REST |
 
-The diagram shows the **server** deployment. For **embedded** use, drop the top `minnal_doc_store_api` box and call `minnal_doc_store` (or `minnal_db` directly) in-process — everything below the REST boundary is the same code either way.
-
-Each namespace (logical store) maintains its own KV storage, field indices, and a companion vector store for quantised embeddings.
+The **only** component outside the process is the embedding service, and only
+when `semantic-search` is enabled. For **embedded** use, add `minnal_db` and call
+it in-process; the **server** simply wraps the same crate. Each namespace
+maintains its own KV storage, field indices, and a companion vector store for
+quantised embeddings.
 
 ---
 
 ## Architecture
 
-Minnal is built as five layers, each consuming the one below it. The bottom layer is a raw key-value engine; every layer above adds a capability — structured indexing, vector search, a document model, and finally an HTTP interface — without the lower layers needing to know about it. Reading the layers in order is the fastest way to understand how a single REST request ends up touching the LSM tree at the bottom.
+Minnal is built as layers, each adding a capability over the one below — a raw
+key-value engine at the bottom, then structured indexing, vector search, a
+document model, and finally an HTTP interface. All the library layers live in a
+**single crate, `minnal_db`**, selected with cargo features (`kv-store` default,
+`doc-store`, `semantic-search`); the REST server (`minnal_db_api`) is a thin
+binary crate on top. Reading the layers in order is the fastest way to
+understand how a single REST request ends up touching the LSM tree at the bottom.
 
-### Layer 1 — minnal\_db (Key-Value Engine)
+### Layer 1 — KV Engine (`kv-store`, always on)
 
 At the foundation sits `minnal_db`, an embedded, multi-namespace key-value store built on the **WiscKey** key-value separation principle: keys (with value-log pointers) live in a small LSM tree, while values live in a separate append-only sharded value log. This dramatically reduces compaction write-amplification — the LSM tree stays small and cheap to rewrite, and large values are only touched during dedicated GC passes.
 
@@ -120,19 +123,19 @@ When two keys share the same `u64` prefix (i.e. the first 8 bytes are identical)
 
 The SIMD paths are also used for all ordered key lookups and range scans in the skip list, not just prefix scans, so the benefit extends across all read paths.
 
-### Layer 2 — index (RoaringBitmap Field Indexing)
+### Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)
 
-The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. That is what the stand-alone `index` crate provides: fast predicate queries over document fields.
+The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. Field indexing is built into the engine (the folded `index` module): fast predicate queries over document fields.
 
 Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files (`memmap2`), so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated. A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
 
 Index writes are checkpointed against WAL offsets, so a crash partway through a rebuild resumes exactly where it left off rather than starting over.
 
-For the full design — how field attributes are created, updated, stored, and recovered after a crash — see [`index/Index-Architecture.md`](index/Index-Architecture.md).
+For the full design — how field attributes are created, updated, stored, and recovered after a crash — see [`Index-Architecture.md`](minnal_db/src/index/Index-Architecture.md).
 
-### Layer 3 — semantic\_search (Vector Quantisation + ANN)
+### Layer 3 — Semantic Search (Vector Quantisation + ANN, `semantic-search`)
 
-Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint). The `semantic_search` crate implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up from how the space is partitioned, through how values are quantised at write time, to how a query is resolved.
+Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint). The `semantic-search` feature implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up from how the space is partitioned, through how values are quantised at write time, to how a query is resolved.
 
 #### IVF Clustering
 
@@ -220,11 +223,11 @@ The set of models is **data-driven** — no code change or recompile is required
 
 6. **Re-index affected namespaces.** Existing vectors were quantised against the previous model's centroids/dimension and are not comparable. Since secondary indices are reconstructable, re-embed each namespace you want searchable under the new model with `POST /admin/indices/{ns}/vector/reindex-all` — it re-enqueues every document for embedding (a fresh full build) and returns `202 Accepted`. For a clean slate first (recommended when the dimension changes), clear the old vectors with `DELETE /admin/indices/{ns}/vector/drop-all` before re-indexing.
 
-For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`semantic_search/Semantic-Search-Architecture.md`](semantic_search/Semantic-Search-Architecture.md).
+For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/Semantic-Search-Architecture.md).
 
-### Layer 4 — minnal\_doc\_store (Document Store + KV Store)
+### Layer 4 — Document Store + KV Store (`doc-store`)
 
-The three layers below are independent engines — one stores bytes, one indexes fields, one searches vectors. `minnal_doc_store` is where they come together: it sits on top of `minnal_db`, `index`, and `semantic_search` and presents them as a coherent document model, exposing two distinct store types behind a unified `DocStore` handle.
+The engine, field indexing, and vector search are independent capabilities — one stores bytes, one indexes fields, one searches vectors. The `doc-store` feature is where they come together: it presents them as a coherent document model, exposing two distinct store types behind a unified `DocStore` handle.
 
 **Document stores (`DocStoreSchema`)**
 
@@ -260,9 +263,9 @@ Document writes return immediately without blocking on the embedding service. Ve
 
 **Reconciliation.** Reconciliation re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry — self-healing the write-then-enqueue crash window the same way field indices self-heal via WAL replay, but routing the recovered work into the async queue. It also covers the vector write itself: the quantised payloads are written with `put_no_wal`, so a crash before the memtable flush drops a just-indexed vector — possibly flushing one half and losing the other. A "complete" index requires **both** the sparse-meta and dense entries, so a partially committed index counts as not-indexed and is re-enqueued, letting the re-embed regenerate the missing half. It runs **automatically as a background task on startup**, and on demand via `POST /admin/indices/vector/reconcile` (e.g. to re-run after the startup pass logs a failure).
 
-### Layer 5 — minnal\_doc\_store\_api (REST API)
+### Layer 5 — REST API (`minnal_db_api`)
 
-An [Axum](https://github.com/tokio-rs/axum) HTTP server that wraps `minnal_doc_store` with a full REST interface. It loads the schema cache and cluster index at startup, then serves all store, document, index, and semantic-search endpoints.
+An [Axum](https://github.com/tokio-rs/axum) HTTP server (the `minnal_db_api` binary crate) that wraps `minnal_db` (with `doc-store` + `semantic-search`) in a full REST interface. It loads the schema cache and cluster index at startup, then serves all store, document, index, and semantic-search endpoints.
 
 Server state:
 
@@ -314,45 +317,45 @@ It is organised by how you run minnal and which store type you use:
 
 - **[Getting Started](QUICKSTART.md#getting-started-bulk-load-a-store-and-query-it)** — the fastest end-to-end path: stage the release, start the server, bulk-load a bundled sample dataset, and query it.
 - **[Using minnal as a Service (REST)](QUICKSTART.md#using-minnal-as-a-service-rest)** — start the server, then work with [document stores](QUICKSTART.md#document-stores) (CRUD, predicate queries, semantic search) and [KV stores](QUICKSTART.md#kv-stores), plus [bulk loading](QUICKSTART.md#bulk-loading), [configuration](QUICKSTART.md#configuration), [admin/monitoring](QUICKSTART.md#admin-and-monitoring), [logging](QUICKSTART.md#logging), and [durability & recovery](QUICKSTART.md#write-durability-and-recovery).
-- **[Using minnal Embedded (as a library)](QUICKSTART.md#using-minnal-embedded-as-a-library)** — link `minnal_db` into a Rust process for in-process key-value storage with RoaringBitmap field indexing and predicate queries.
+- **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — add `minnal_db` to a Rust process for in-process storage; feature selection (`kv-store`/`doc-store`/`semantic-search`) and code examples.
 - **[Scripts & Config](QUICKSTART.md#scripts-and-config)** — the `release.sh`/`start.sh`/`run_tool.sh` helpers, the bundled `curl` example scripts, cluster centroids, and the annotated sample config.
 
 ---
 
-## Crate Structure
+## Repository Structure
+
+The workspace is a **single publishable library crate** (`minnal_db`, with the
+former `index`, `semantic_search`, and `minnal_doc_store` crates folded in as
+feature-gated modules) plus two binary crates.
 
 ```
 minnal/
-├── minnal_db/          ← LSM + value-log KV engine
-│   └── README.md       ← detailed KV engine documentation
-├── index/              ← RoaringBitmap field indexing + predicate evaluator
-├── semantic_search/    ← IVF clustering, RaBitQ quantisation, embedding client
-├── minnal_doc_store/   ← JSON document store (schema, indices, semantic search integration)
-├── minnal_doc_store_api/  ← Axum REST API server
-│   └── README.md       ← full REST API reference with curl examples
-├── tools/              ← minnal_tools binary (bulk_load and future tools)
+├── minnal_db/              ← the library crate (all layers, feature-gated)
+│   ├── QUICKSTART.md       ← embedded quickstart + feature selection
+│   ├── README.md           ← detailed KV engine documentation
+│   └── src/
+│       ├── db/ store/      ← LSM + value-log KV engine
+│       ├── index/          ← RoaringBitmap field indexing (part of kv-store)
+│       ├── semantic_search/← IVF clustering, RaBitQ quantisation (semantic-search)
+│       ├── vector_kv.rs    ← vector↔KV bridge, usable on raw namespaces
+│       └── doc_store/      ← JSON document store (doc-store)
+├── minnal_db_api/          ← Axum REST API server (binary)
+│   └── README.md           ← full REST API reference with curl examples
+├── minnal_tools/            ← minnal_tools binary (bulk_load and future tools)
 ├── service/
-│   ├── scripts/
-│   │   ├── release.sh      ← build release binaries + stage to ./work/bin/
-│   │   ├── build_docker.sh ← build the Docker image
-│   │   └── examples/       ← curl demo scripts (stores, docs, indices)
-│   ├── docker/
-│   │   └── Dockerfile
-│   └── embedding_support/
-│       └── qwen/
-│           └── clusters.json   ← 50 pre-computed IVF cluster centroids (JSONL)
-├── config/
-│   └── sample.toml     ← annotated reference configuration
-└── work/bin/           ← generated by release.sh (not committed)
-    ├── minnal_doc_store_api
-    ├── minnal_tools
-    ├── minnal.toml     ← config with ./work/doc_store paths
-    ├── start.sh        ← start the server
-    └── run_tool.sh     ← run bulk_load / other tools
+│   ├── scripts/            ← release.sh / build_docker.sh / curl examples
+│   ├── docker/Dockerfile
+│   └── embedding_support/qwen/clusters.json   ← pre-computed IVF centroids (JSONL)
+├── config/sample.toml      ← annotated reference configuration
+└── work/bin/               ← generated by release.sh (not committed)
+    ├── minnal_db_api        ├── minnal.toml    ├── start.sh    └── run_tool.sh
 ```
 
-For the detailed KV engine documentation see [`minnal_db/README.md`](minnal_db/README.md).
-For the full REST API reference with all endpoints, error codes, predicate syntax, and on-disk layout see [`minnal_doc_store_api/README.md`](minnal_doc_store_api/README.md).
+Feature selection (`kv-store` default, `doc-store`, `semantic-search`) and the
+embedded API are covered in [`minnal_db/QUICKSTART.md`](minnal_db/QUICKSTART.md);
+the detailed engine internals in [`minnal_db/README.md`](minnal_db/README.md).
+For the full REST API reference — endpoints, error codes, predicate syntax, and
+on-disk layout — see [`minnal_db_api/README.md`](minnal_db_api/README.md).
 
 ---
 
@@ -369,7 +372,7 @@ The storage engine at the core of minnal is directly inspired by the WiscKey pap
 
 ### RaBitQ
 
-The quantisation scheme used in `semantic_search` is RaBitQ, which provides a tight theoretical error bound on the estimated inner product between a quantised document vector and a full-precision query vector. This bound is what populates the `error_bound` field in semantic search responses.
+The quantisation scheme used in the `semantic-search` layer is RaBitQ, which provides a tight theoretical error bound on the estimated inner product between a quantised document vector and a full-precision query vector. This bound is what populates the `error_bound` field in semantic search responses.
 
 > **RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search**
 > Jianyang Gao, Cheng Long
@@ -382,7 +385,7 @@ The reference C++ implementation of RaBitQ, which informed the multi-bit quantis
 
 ### RoaringBitmap
 
-The field indexing layer in the `index` crate uses Roaring Bitmaps as its compressed bitmap representation. Roaring Bitmaps partition a 32-bit integer space into 65 536 chunks and choose the most space-efficient container type (array, bitset, or run-length encoded) per chunk, giving excellent compression on both sparse and dense sets while keeping set operations fast.
+The field indexing layer (the folded `index` module) uses Roaring Bitmaps as its compressed bitmap representation. Roaring Bitmaps partition a 32-bit integer space into 65 536 chunks and choose the most space-efficient container type (array, bitset, or run-length encoded) per chunk, giving excellent compression on both sparse and dense sets while keeping set operations fast.
 
 > **Roaring Bitmaps: Implementation of an Optimized Software Library**
 > Daniel Lemire, Owen Kaser, Nathan Kurz, Luca Deri, Chris O'Hern, François Saint-Jacques, Gregory Ssi-Yan-Kai

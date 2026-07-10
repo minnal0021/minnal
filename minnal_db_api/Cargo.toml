@@ -1,12 +1,12 @@
 [package]
-name = "minnal_doc_store_api"
+name = "minnal_db_api"
 version = "0.1.0"
 edition = "2024"
-description = "RESTful HTTP API server for minnal_doc_store"
+description = "RESTful HTTP API server for minnal_db"
 publish = false
 
 [[bin]]
-name = "minnal_doc_store_api"
+name = "minnal_db_api"
 path = "src/main.rs"
 
 [dependencies]
