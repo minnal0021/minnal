@@ -185,7 +185,10 @@ mod tests {
     }
 
     fn create_test_store(dir: &TempDir) -> Arc<KVStore> {
-        let lsm_config = LSMConfig::default();
+        let lsm_config = LSMConfig {
+            num_buckets: crate::support::TEST_NUM_BUCKETS,
+            ..LSMConfig::default()
+        };
         let sync_config = SyncConfig::default();
         let path = dir.path().join("ns_test");
         Arc::new(KVStore::open(0, "test", &path, lsm_config, sync_config).unwrap())

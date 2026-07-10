@@ -1,0 +1,15 @@
+# Force `cargo test` to run its test binaries single-threaded by default.
+#
+# Each namespace eagerly opens `2 x num_buckets` file descriptors (one LSM L1
+# file plus one value-log file per bucket), held for the namespace's lifetime.
+# The libtest harness runs one test per core, so on a many-core machine the
+# aggregate fd demand across concurrent tests scales with cores x namespaces and
+# can exceed the OS soft limit ("Too many open files", os error 24). This bites
+# hardest on macOS, whose default soft limit is 256 (vs 1024+ on typical Linux).
+#
+# `RUST_TEST_THREADS` is read by the libtest harness; setting it here applies to
+# a bare `cargo test` on any machine without anyone needing to remember a flag.
+# It is NOT `force`d, so a user on a high-limit machine can still opt back into
+# parallelism for a run, e.g. `RUST_TEST_THREADS=8 cargo test`.
+[env]
+RUST_TEST_THREADS = "1"

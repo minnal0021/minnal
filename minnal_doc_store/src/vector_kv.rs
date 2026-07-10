@@ -675,7 +675,7 @@ mod vector_upsert_tests {
     use tempfile::TempDir;
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
-        AsyncDb::open(dir.path().to_owned()).await.unwrap()
+        AsyncDb::open_with_config(dir.path().to_owned(), crate::test_db_config()).await.unwrap()
     }
 
     const MULTI8: QuantisationStyle = QuantisationStyle::MultiBit { number_of_bits: 8 };
@@ -925,7 +925,7 @@ mod queue_tests {
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
         let path = dir.path().to_owned();
-        AsyncDb::open(path).await.unwrap()
+        AsyncDb::open_with_config(path, crate::test_db_config()).await.unwrap()
     }
 
     #[tokio::test]
@@ -1220,7 +1220,7 @@ mod dual_style_tests {
     const MULTI8: QuantisationStyle = QuantisationStyle::MultiBit { number_of_bits: 8 };
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
-        AsyncDb::open(dir.path().to_owned()).await.unwrap()
+        AsyncDb::open_with_config(dir.path().to_owned(), crate::test_db_config()).await.unwrap()
     }
 
     /// One MultiBit + two SingleBit entries stored together. MultiBit goes to
@@ -1360,7 +1360,7 @@ mod query_embedding_cache_tests {
     use tempfile::TempDir;
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
-        AsyncDb::open(dir.path().to_owned()).await.unwrap()
+        AsyncDb::open_with_config(dir.path().to_owned(), crate::test_db_config()).await.unwrap()
     }
 
     /// TTL used by the cache round-trip tests.
@@ -1619,7 +1619,7 @@ mod real_kv_profile {
 
         for &cpd in &[1usize, 4, 8] {
             let dir = TempDir::new().unwrap();
-            let db = AsyncDb::open(dir.path().to_owned()).await.unwrap();
+            let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::test_db_config()).await.unwrap();
 
             // Populate: one MultiBit dense whole-doc vector + `cpd` SingleBit chunks per
             // doc, quantised against the real centroids and written through the
@@ -1841,7 +1841,7 @@ mod real_recall {
 
         // ── Index the corpus through the real embedding service (bounded concurrency) ──
         let dir = TempDir::new().unwrap();
-        let db = Arc::new(AsyncDb::open(dir.path().to_owned()).await.unwrap());
+        let db = Arc::new(AsyncDb::open_with_config(dir.path().to_owned(), crate::test_db_config()).await.unwrap());
         let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
         let t_index = Instant::now();
         let mut set = tokio::task::JoinSet::new();

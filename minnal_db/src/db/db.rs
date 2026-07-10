@@ -22,7 +22,9 @@ mod tests {
         let threshold_config = ThresholdConfig::new(2.5);
         let scheduled_task_config = ScheduledTaskConfig::new(gc_interval, wal_gc_interval, lsm_compaction_interval);
         let lsm_config = LSMConfig::default();
-        DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config)
+        let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
+        config.num_buckets = crate::support::TEST_NUM_BUCKETS;
+        config
     }
 
     #[test]
@@ -298,7 +300,9 @@ mod iterator_tests {
         let threshold_config = ThresholdConfig::new(2.5);
         let scheduled_task_config = ScheduledTaskConfig::new(gc_interval, wal_gc_interval, lsm_compaction_interval);
         let lsm_config = LSMConfig::default();
-        DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config)
+        let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
+        config.num_buckets = crate::support::TEST_NUM_BUCKETS;
+        config
     }
 
     #[test]

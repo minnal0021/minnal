@@ -3251,6 +3251,17 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    /// LSM config for tests: a small bucket count keeps the eager per-tree fd
+    /// footprint low (one L1 file per bucket) so the suite survives high
+    /// `cargo test` parallelism. See [`crate::support::TEST_NUM_BUCKETS`]. None
+    /// of these tests depend on the specific bucket count, only on correctness.
+    fn test_lsm_config() -> LSMConfig {
+        LSMConfig {
+            num_buckets: crate::support::TEST_NUM_BUCKETS,
+            ..LSMConfig::default()
+        }
+    }
+
     #[test]
     fn test_sstable_entry_codec_roundtrip_and_corruption() {
         let entry = SStableEntry {
@@ -3282,7 +3293,7 @@ mod tests {
     #[test]
     fn test_sparse_index_lookup_after_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Enough keys that some bucket's L1 file spans many SAMPLE_INTERVAL
         // blocks, so `block_start` returns non-zero offsets and the validated
@@ -3312,7 +3323,7 @@ mod tests {
     #[test]
     fn test_sparse_index_hint_is_valid_and_engaged() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
         let n: u128 = 3000;
         for i in 0..n {
             lsm.insert(format!("k:{i:08}").as_bytes(), i)?;
@@ -3341,7 +3352,7 @@ mod tests {
     #[test]
     fn test_sparse_index_stale_hint_falls_back_correctly() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
         let n: u128 = 2000;
         for i in 0..n {
             lsm.insert(format!("k:{i:08}").as_bytes(), i + 1)?; // values are 1-based (non-zero)
@@ -3393,14 +3404,14 @@ mod tests {
     fn test_sparse_index_rebuilt_on_reopen() -> Result<()> {
         let temp_dir = TempDir::new()?;
         {
-            let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
             for i in 0..2000u128 {
                 lsm.insert(format!("k:{i:08}").as_bytes(), i + 1)?;
             }
             lsm.flush_and_compact_all()?;
         }
         // Reopen: indexes are rebuilt from the L1 files during the open scan.
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
         for i in 0..2000u128 {
             assert_eq!(lsm.get(format!("k:{i:08}").as_bytes())?, Some(i + 1), "key {i} after reopen");
         }
@@ -3412,7 +3423,7 @@ mod tests {
     #[test]
     fn test_sparse_index_lookup_with_deletes() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
         let n: u128 = 1000;
         for i in 0..n {
             lsm.insert(format!("k:{i:08}").as_bytes(), i + 1)?;
@@ -3436,7 +3447,7 @@ mod tests {
     #[test]
     fn test_lsm_basic_operations() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert a value
         lsm.insert(b"key1", 12345)?;
@@ -3467,7 +3478,7 @@ mod tests {
     #[test]
     fn test_repoint_at_old_seq_does_not_resurrect_across_layers() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert_with_seq(b"k", 0xAAAA, 1)?; // value @ seq 1
         lsm.delete_with_seq(b"k", 5)?; // tombstone @ seq 5 (newer)
@@ -3492,7 +3503,7 @@ mod tests {
     fn test_max_lower_seq_folds_l0_at_open_so_fast_path_is_safe() -> Result<()> {
         let temp_dir = TempDir::new()?;
         {
-            let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
             lsm.insert_with_seq(b"k", 0xAAAA, 1)?; // value @ seq 1
             lsm.delete_with_seq(b"k", 5)?; // tombstone @ seq 5 (newer)
             lsm.flush_memtable_to_level0()?; // tombstone @ seq 5 → an L0 file (no L1)
@@ -3501,7 +3512,7 @@ mod tests {
 
         // Reopen: max_lower_seq must be folded from the L0 file (seq 5), not left
         // at 0 (which only L1 would have contributed).
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
         assert_eq!(lsm.get(b"k")?, None, "still deleted after restart");
 
         // Re-point at the old seq into the fresh (empty) active memtable. With the
@@ -3519,7 +3530,7 @@ mod tests {
     #[test]
     fn test_lsm_delete() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"key1", 12345)?;
         assert_eq!(lsm.get(b"key1")?, Some(12345));
@@ -3542,7 +3553,7 @@ mod tests {
     #[test]
     fn test_keys_excludes_sstable_entry_tombstoned_in_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"keep", 1)?;
         lsm.insert(b"delete_me", 2)?;
@@ -3566,7 +3577,7 @@ mod tests {
     #[test]
     fn test_lsm_stats() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"key1", 12345)?;
         lsm.insert(b"key2", 67890)?;
@@ -3580,7 +3591,7 @@ mod tests {
     #[test]
     fn test_lsm_flush_and_readonly() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert data
         lsm.insert(b"key1", 100)?;
@@ -3604,7 +3615,7 @@ mod tests {
     #[test]
     fn test_lsm_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert and flush to create read-only memtable
         lsm.insert(b"apple", 1)?;
@@ -3636,7 +3647,7 @@ mod tests {
     #[test]
     fn test_compact_bucket_resets_flag_on_merge_error() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"key1", 12345)?;
         lsm.flush_memtable_to_level0()?; // writes L0 SSTable file(s) without compacting
@@ -3684,7 +3695,7 @@ mod tests {
     #[test]
     fn test_lsm_two_way_merge() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // First batch: insert initial data
         lsm.insert(b"key1", 100)?;
@@ -3715,7 +3726,7 @@ mod tests {
     #[test]
     fn test_lsm_delete_with_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert data
         lsm.insert(b"key1", 100)?;
@@ -3748,7 +3759,7 @@ mod tests {
 
         // First session: insert and compact
         {
-            let lsm = LSMTree::open(&path, LSMConfig::default())?;
+            let lsm = LSMTree::open(&path, test_lsm_config())?;
             lsm.insert(b"persistent_key1", 1000)?;
             lsm.insert(b"persistent_key2", 2000)?;
             lsm.flush_memtable()?;
@@ -3758,7 +3769,7 @@ mod tests {
 
         // Second session: reopen and verify
         {
-            let lsm = LSMTree::open(&path, LSMConfig::default())?;
+            let lsm = LSMTree::open(&path, test_lsm_config())?;
             assert_eq!(lsm.get(b"persistent_key1")?, Some(1000));
             assert_eq!(lsm.get(b"persistent_key2")?, Some(2000));
         }
@@ -3769,7 +3780,7 @@ mod tests {
     #[test]
     fn test_lsm_prefix_scan() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert keys with various prefixes
         lsm.insert(b"user:1:name", 100)?;
@@ -3805,7 +3816,7 @@ mod tests {
     #[test]
     fn test_lsm_prefix_scan_with_flush() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert and flush some data
         lsm.insert(b"app:config:version", 100)?;
@@ -3829,7 +3840,7 @@ mod tests {
     #[test]
     fn test_lsm_prefix_scan_with_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Insert data and compact to SSTable
         lsm.insert(b"session:123:user", 1000)?;
@@ -3854,7 +3865,7 @@ mod tests {
     #[test]
     fn test_lsm_compaction_stress() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = Arc::new(LSMTree::open(temp_dir.path(), LSMConfig::default())?);
+        let lsm = Arc::new(LSMTree::open(temp_dir.path(), test_lsm_config())?);
 
         let writer_threads = 4usize;
         let writes_per_thread = 200usize;
@@ -3932,7 +3943,7 @@ mod tests {
     #[test]
     fn test_get_multiple_matches_individual_get() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         for i in 0u128..20 {
             lsm.insert(format!("k{i}").as_bytes(), i * 10)?;
@@ -3951,7 +3962,7 @@ mod tests {
     #[test]
     fn test_get_multiple_missing_keys_return_none() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"present", 42)?;
 
@@ -3966,7 +3977,7 @@ mod tests {
     #[test]
     fn test_get_multiple_after_flush_to_sstable() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Write to memtable, flush to SSTable, write more to a fresh memtable
         for i in 0u128..10 {
@@ -3989,7 +4000,7 @@ mod tests {
     #[test]
     fn test_get_multiple_after_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         for i in 0u128..20 {
             lsm.insert(format!("compact:{i}").as_bytes(), i + 100)?;
@@ -4013,7 +4024,7 @@ mod tests {
         // an in-range key never inserted (bloom reject / L1 miss). The L1 pre-filter
         // must never drop a live key and must return None for every absent one.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
 
         for i in 30u128..50 {
             lsm.insert(format!("m{i}").as_bytes(), i)?;
@@ -4054,7 +4065,7 @@ mod tests {
     #[test]
     fn test_get_multiple_deleted_keys_return_none() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"alive", 1)?;
         lsm.insert(b"dead", 2)?;
@@ -4071,7 +4082,7 @@ mod tests {
     #[test]
     fn test_get_multiple_deleted_after_flush() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"kept", 10)?;
         lsm.insert(b"gone", 20)?;
@@ -4094,7 +4105,7 @@ mod tests {
         // iterator (which skips tombstones), so a key deleted after a flush still
         // appeared in prefix-scan results because the SSTable entry was not shadowed.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"doc:1", 10)?;
         lsm.insert(b"doc:2", 20)?;
@@ -4114,7 +4125,7 @@ mod tests {
     #[test]
     fn test_scan_prefix_deleted_key_then_reinserted() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"k:1", 1)?;
         lsm.flush_memtable()?;
@@ -4138,7 +4149,7 @@ mod tests {
     fn test_scan_prefix_sees_l0_only_data() -> Result<()> {
         // Data lives only in L0 (memtable + read-only memtables empty).
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"p:1", 100)?;
         lsm.insert(b"p:2", 200)?;
@@ -4155,7 +4166,7 @@ mod tests {
     fn test_scan_prefix_l0_value_shadows_stale_l1() -> Result<()> {
         // Updated value: new in L0, old in L1 — the newer L0 value must win.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"p:a", 111)?;
         lsm.flush_and_compact_all()?; // p:a=111 -> L1
@@ -4172,7 +4183,7 @@ mod tests {
     fn test_scan_prefix_l0_tombstone_suppresses_l1() -> Result<()> {
         // Deleted key: tombstone in L0, live value in L1 — the tombstone must win.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"p:1", 100)?;
         lsm.flush_and_compact_all()?; // p:1 -> L1
@@ -4191,7 +4202,7 @@ mod tests {
     fn test_scan_prefix_l0_reinsert_after_l1_delete() -> Result<()> {
         // Re-insert into L0 after the key was deleted (tombstone) in L1.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"p:1", 100)?;
         lsm.flush_and_compact_all()?;
@@ -4232,7 +4243,7 @@ mod tests {
         // 1000 keys, all compacted into L1 (well past SAMPLE_INTERVAL per bucket, so
         // the sparse index has multiple samples and block_start is exercised).
         let temp = TempDir::new()?;
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         let n = 1000u64;
         for seq in 0..n {
             lsm.insert(format!("key:{seq:06}").as_bytes(), seq as u128)?;
@@ -4269,7 +4280,7 @@ mod tests {
     #[test]
     fn scan_over_l1_suppresses_tombstone() -> Result<()> {
         let temp = TempDir::new()?;
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         for seq in 0..200u64 {
             lsm.insert(format!("k:{seq:04}").as_bytes(), seq as u128)?;
         }
@@ -4294,7 +4305,7 @@ mod tests {
         // scan must still merge both. Exercises the "L1 skipped/seeked, L0 always
         // scanned" split.
         let temp = TempDir::new()?;
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         for seq in 0..100u64 {
             lsm.insert(format!("m:{seq:04}").as_bytes(), seq as u128)?;
         }
@@ -4330,7 +4341,7 @@ mod tests {
         // Many cluster prefixes flushed to L1; probing a few must return exactly
         // those clusters' keys (per-prefix sparse seek + bucket min/max skip).
         let temp = TempDir::new()?;
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         let n_clusters = 200u32;
         let per = 30u32;
         for cid in 0..n_clusters {
@@ -4360,7 +4371,7 @@ mod tests {
     #[test]
     fn range_keys_bounded_over_l1_seeks_and_skips() -> Result<()> {
         let temp = TempDir::new()?;
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         for seq in 0..1000u64 {
             lsm.insert(format!("r:{seq:06}").as_bytes(), seq as u128)?;
         }
@@ -4384,7 +4395,7 @@ mod tests {
     #[test]
     fn test_scan_prefixes_basic() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // cluster 1: docs 10, 11, 12; cluster 2: doc 20; cluster 3: doc 30
         let entries = [(1u32, 10u32, 100u128), (1, 11, 101), (1, 12, 102), (2, 20, 200), (3, 30, 300)];
@@ -4407,7 +4418,7 @@ mod tests {
     #[test]
     fn test_scan_prefixes_after_flush_and_compaction() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         // Write to memtable and flush
         lsm.insert(&u32_prefixed_key(5, 1), 501)?;
@@ -4432,7 +4443,7 @@ mod tests {
     #[test]
     fn test_scan_prefixes_empty_result() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(&u32_prefixed_key(1, 1), 10)?;
 
@@ -4460,7 +4471,7 @@ mod tests {
     /// Insert `k:{seq:06}` for `seq` in `0..total`, all left in the active memtable.
     fn bench_state_memtable(total: u64) -> (TempDir, LSMTree) {
         let temp = TempDir::new().unwrap();
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        let lsm = LSMTree::open(temp.path(), test_lsm_config()).unwrap();
         for seq in 0..total {
             lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
         }
@@ -4470,7 +4481,7 @@ mod tests {
     /// Same keys, all compacted into L1 (memtable/RO drained).
     fn bench_state_l1(total: u64) -> (TempDir, LSMTree) {
         let temp = TempDir::new().unwrap();
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        let lsm = LSMTree::open(temp.path(), test_lsm_config()).unwrap();
         for seq in 0..total {
             lsm.insert(format!("k:{seq:06}").as_bytes(), seq as u128).unwrap();
         }
@@ -4484,7 +4495,7 @@ mod tests {
     /// compacted base" shape a scan must merge.
     fn bench_state_l0_l1(total: u64) -> (TempDir, LSMTree) {
         let temp = TempDir::new().unwrap();
-        let lsm = LSMTree::open(temp.path(), LSMConfig::default()).unwrap();
+        let lsm = LSMTree::open(temp.path(), test_lsm_config()).unwrap();
         let l1_cut = total * 80 / 100;
         let l0_cut = total * 95 / 100;
         for seq in 0..l1_cut {
@@ -4553,7 +4564,7 @@ mod tests {
         // memtable's live-only iterator, so a key deleted after a flush still
         // appeared because the SSTable entry was never shadowed by the tombstone.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(&u32_prefixed_key(1, 10), 100)?;
         lsm.insert(&u32_prefixed_key(1, 11), 101)?;
@@ -4572,7 +4583,7 @@ mod tests {
     #[test]
     fn test_scan_prefixes_tombstone_in_ro_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(&u32_prefixed_key(2, 1), 201)?;
         lsm.flush_memtable()?; // key in SSTable
@@ -4588,7 +4599,7 @@ mod tests {
     #[test]
     fn test_scan_prefixes_delete_then_reinsert() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(&u32_prefixed_key(3, 5), 300)?;
         lsm.flush_memtable()?;
@@ -4611,7 +4622,7 @@ mod tests {
         // Regression: before the fix, range_keys_bounded scanned SSTables last and
         // used blind set-insert, so a key deleted after a flush still appeared.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"r:1", 1)?;
         lsm.insert(b"r:2", 2)?;
@@ -4631,7 +4642,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_tombstone_in_ro_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"m:1", 10)?;
         lsm.insert(b"m:2", 20)?;
@@ -4649,7 +4660,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_delete_then_reinsert() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"q:1", 1)?;
         lsm.flush_memtable()?;
@@ -4667,7 +4678,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_deleted_after_flush() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"p:1", 10)?;
         lsm.insert(b"p:2", 20)?;
@@ -4685,7 +4696,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_tombstone_in_ro_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"w:1", 100)?;
         lsm.insert(b"w:2", 200)?;
@@ -4709,7 +4720,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_sees_l0_only_data() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"l0:1", 11)?;
         lsm.insert(b"l0:2", 22)?;
@@ -4734,7 +4745,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_sees_l0_only_data() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"lk:a", 1)?;
         lsm.insert(b"lk:b", 2)?;
@@ -4753,7 +4764,7 @@ mod tests {
         // Write a key → compact to L1 → delete it (write tombstone to L0) → verify
         // the range scan returns nothing.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"lt:1", 99)?;
         lsm.flush_memtable()?;
@@ -4771,7 +4782,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_l0_tombstone_suppresses_l1() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"lkt:x", 5)?;
         lsm.flush_memtable()?;
@@ -4791,7 +4802,7 @@ mod tests {
         // Delete a key (tombstone in L1 after compact), then re-insert it in L0.
         // The re-insert in L0 must win.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"lr:1", 10)?;
         lsm.flush_memtable()?;
@@ -4814,7 +4825,7 @@ mod tests {
     fn test_range_pointers_bounded_after_compact_all() -> Result<()> {
         // Verify that after a full compact_all cycle, data is visible via L1.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         lsm.insert(b"ca:1", 1)?;
         lsm.insert(b"ca:2", 2)?;
@@ -4831,7 +4842,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_limit_respected_with_l0() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         for i in 0u128..10 {
             lsm.insert(format!("lim:{:02}", i).as_bytes(), i)?;
@@ -4851,7 +4862,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_limit_respected_with_l0() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
         for i in 0u128..8 {
             lsm.insert(format!("klim:{:02}", i).as_bytes(), i)?;
@@ -4876,7 +4887,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
         for i in 0u128..50 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }
@@ -4898,7 +4909,7 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
         for i in 0u128..50 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }
@@ -4923,7 +4934,7 @@ mod tests {
     fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..test_lsm_config() })?;
 
         // 40 keys that all hash to bucket 0 (prefix "a", so they sort ahead of everything else).
         let mut bucket0: Vec<Vec<u8>> = Vec::new();
@@ -4970,7 +4981,7 @@ mod tests {
     fn test_range_keys_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..test_lsm_config() })?;
 
         let mut bucket0: Vec<Vec<u8>> = Vec::new();
         let mut i = 0u64;
@@ -5012,7 +5023,7 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_l1_tombstones_at_head_skipped() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..LSMConfig::default() })?;
+        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
         for i in 0u128..40 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }
@@ -5038,7 +5049,7 @@ mod tests {
     #[test]
     fn test_bounded_page_walk_matches_unbounded_reference() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig::default())?; // default multi-bucket
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?; // default multi-bucket
         for i in 0u128..500 {
             lsm.insert(format!("row:{:04}", i).as_bytes(), i)?;
         }

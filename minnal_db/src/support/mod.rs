@@ -60,6 +60,22 @@ const _: () = assert!(
     "DEFAULT_NUM_BUCKETS exceeds u32::MAX + 1: bucket indices are stored as u32 in ShardedValuePointer and would overflow"
 );
 
+/// Bucket count used by tests that open a `Db`/`Database`/`KVStore` with the
+/// generic (non-sharding-specific) config.
+///
+/// Each namespace eagerly opens `2 × num_buckets` file descriptors (one LSM L1
+/// file plus one value-log file per bucket), held for its lifetime. With the
+/// production default of 16 buckets a single fresh `Db` (which opens the
+/// `default` + `system` namespaces) holds ~65 fds; a namespace-heavy test can
+/// hold several hundred. `cargo test` runs one test per core, so on a
+/// many-core machine the aggregate fd demand blows past the typical 1024 soft
+/// limit ("Too many open files"). Keeping test databases at 2 buckets cuts the
+/// per-namespace fd cost ~8× while still exercising the multi-bucket routing,
+/// scan-over-buckets, and per-bucket GC paths. Tests that specifically need a
+/// single bucket set `num_buckets: 1` explicitly.
+#[cfg(test)]
+pub(crate) const TEST_NUM_BUCKETS: usize = 2;
+
 /// Validate that a runtime bucket count is within the u32 limit.
 #[allow(dead_code)]
 pub fn validate_num_buckets(num_buckets: usize) {
