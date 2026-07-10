@@ -29,33 +29,29 @@ required-features = ["doc-store", "semantic-search"]
 
 [dependencies]
 # ── Core engine ────────────────────────────────────────────────────────────
-tokio = { version = "1.49.0", features = ["full"] }
-tokio-stream = { version = "0.1" }
-rkyv = { version = "0.8.15", features = ["unaligned", "bytecheck", "alloc"] }
-bytecheck = "0.8.0"
-crc32fast = "1.5.0"
-thiserror = { version = "2.0.18" }
-parking_lot = { version = "0.12.5" }
-log = { version = "0.4.29" }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-tracing-log = "0.2"
-tempfile = { version = "3.26.0" }
+tokio = { version = "1.52.3", features = ["full"] }
+rkyv = { version = "0.8.17", features = ["unaligned", "bytecheck", "alloc"] }
+bytecheck = "0.8.2"
+crc32fast = "1.5"
+thiserror = "2.0.18"
+parking_lot = "0.12.5"
+log = "0.4.33"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
 mm3h = { version = "0.1.3", features = ["avx"] }
-crossbeam-epoch = "0.9.18"
-toml = "1.1.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+crossbeam-epoch = "0.9.20"
+toml = "1.1.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 # ── Field indexing (folded `index` crate — part of the base engine) ─────────
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 # ── Semantic search (folded `semantic_search` crate) — behind `semantic-search`
-rayon = { version = "1.11.0", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rayon = { version = "1.12", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 simsimd = { version = "6.5.16", optional = true }
-futures = { version = "0.3", optional = true }
 # ── Document store (folded `minnal_doc_store` crate) — behind `doc-store` ────
-json_dotpath = { version = "1.1", optional = true }
+json_dotpath = { version = "1.1.0", optional = true }
 
 [features]
 default = ["kv-store"]
@@ -64,15 +60,16 @@ default = ["kv-store"]
 # default so downstreams can be explicit and leaves room for future splits.
 kv-store = []
 # Quantised ANN semantic search over stored vectors (external embedding service).
-semantic-search = ["dep:reqwest", "dep:simsimd", "dep:rayon", "dep:futures"]
+semantic-search = ["dep:reqwest", "dep:simsimd", "dep:rayon"]
 # JSON document store (schema, CRUD, field-index queries). Independent of
 # `semantic-search`: enable both together for embed-on-write + doc vector search.
 doc-store = ["dep:json_dotpath"]
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
-rand = "0.9"
+rand = "0.10"
 approx = "0.5.1"
+tempfile = "3.27"
 
 [[bench]]
 name = "bench_write"
