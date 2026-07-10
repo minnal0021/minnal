@@ -92,7 +92,7 @@ let val = db.get(b"hello")?;          // Some(b"world")
 db.delete(b"hello")?;
 
 for (key, value) in db.scan_prefix(b"user:")? { /* … */ }
-for (key, value) in db.range(b"a"..b"z")? { /* … */ }
+for (key, value) in db.range(b"a", Some(b"z"))? { /* … */ }
 
 // Namespaces — each has its own isolated keyspace
 let ns = db.namespace("orders")?;
