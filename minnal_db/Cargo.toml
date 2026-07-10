@@ -13,6 +13,13 @@ default-run = "minnal_db"
 # out of the published tarball.
 exclude = ["src/test_data/", "benches/data/", "src/**/*.md"]
 
+# docs.rs builds on supported (Unix) targets only, with all features enabled so
+# the doc-store and semantic-search modules are documented.
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
 [[bin]]
 name = "minnal_db"
 path = "src/main.rs"

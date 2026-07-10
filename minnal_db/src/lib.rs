@@ -45,6 +45,13 @@
 //! }
 //! ```
 
+// minnal_db's storage engine relies on Unix positional I/O (`pread`/`pwrite`,
+// via `std::os::unix::fs::FileExt`) and the server on POSIX signals. Windows is
+// unsupported; fail early with a clear message rather than a cryptic
+// `unresolved import std::os::unix` further down.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
+
 pub mod db;
 mod store;
 mod support;
