@@ -168,18 +168,32 @@ the same engine. The schema mirrors the REST create payload documented in
 [`minnal_db_api`](../minnal_db_api/README.md).
 
 ```rust
-use minnal_db::{DocStore, DocId, Pagination};
+use minnal_db::{DocId, DocStore, DocStoreSchema, IndexSpec, IndexType, KeyType, Pagination, StoreType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // db data dir + schema dir
     let store = DocStore::open("/tmp/docs", "/tmp/docs/schemas").await?;
 
-    // create(schema) — build a DocStoreSchema (a "doc" store with a `status`
-    // string index); see the REST payload reference for every field.
-    // store.create(schema).await?;
+    // Define a "users" doc store keyed by u64, with `status` (string) and
+    // `age` (int) field indices so both can be queried. (`ns_id` is assigned
+    // by `create`; `attributes` are optional non-indexed field declarations.)
+    let schema = DocStoreSchema {
+        namespace: "users".into(),
+        store_type: StoreType::Doc,
+        ns_id: None,
+        key_type: KeyType::U64,
+        attributes: vec![],
+        indices: vec![
+            IndexSpec { field: "status".into(), index_type: IndexType::Str },
+            IndexSpec { field: "age".into(), index_type: IndexType::Int },
+        ],
+        semantic_search_enabled: false,
+        embedding_fields: vec![],
+    };
+    store.create(schema).await?;
 
-    store.put("users", DocId::U64(1), serde_json::json!({"status": "active", "age": 30})).await?;
+    store.put("users", DocId::U64(1), serde_json::json!({ "status": "active", "age": 30 })).await?;
     let doc = store.get("users", DocId::U64(1)).await?;
 
     let page = store.query("users", r#"status = "active" AND age > 20"#, Pagination::default()).await?;
@@ -191,5 +205,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Add `"semantic-search"` to the features to enable embed-on-write and vector
-search on document (or `value_type = "str"` KV) stores — this needs the external
-embedding service running.
+search on document (or `value_type = "str"` KV) stores — see §6.
+
+---
+
+## 6. Semantic search (`doc-store` / `kv-store` + `semantic-search`)
+
+With `semantic-search` enabled you can run quantised ANN vector search on either
+a **document** store or a **`value_type = "str"` KV** store. It needs an external
+**embedding service** (default `http://localhost:8001`) and a set of pre-computed
+IVF cluster centroids (bundled at `service/embedding_support/qwen/clusters.json`).
+
+Indexing is **asynchronous**: a write returns immediately after enqueuing an
+embed job; a background worker (started by `with_semantic_search`) calls the
+service, quantises the result, and stores the vector. So a query right after a
+write may not see it yet, and if the service is down, writes still succeed and
+the worker retries — only vector *indexing* lags and semantic *queries* error.
+
+### Shared setup — attach a `SemanticSearchContext`
+
+```rust
+use std::sync::Arc;
+use minnal_db::{
+    AttributeDef, AttributeType, DocId, DocStore, DocStoreSchema, KeyType, KvKeyType,
+    KvStoreSchema, KvValueType, Pagination, SemanticSearchContext, StoreType,
+};
+use minnal_db::semantic_search::ClusterIndex;
+use minnal_db::semantic_search::service::SemanticSearchConfig;
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let embedding_dim = 768; // must match the model the embedding service serves
+let cluster_index = Arc::new(ClusterIndex::load_with_dim(
+    "service/embedding_support/qwen/clusters.json",
+    embedding_dim,
+)?);
+let config = SemanticSearchConfig { embedding_dim, ..Default::default() };
+
+// `with_semantic_search` also starts the background embed-worker + a one-shot
+// startup reconciliation, so attach it once, up front.
+let store = DocStore::open("/tmp/sem", "/tmp/sem/schemas")
+    .await?
+    .with_semantic_search(SemanticSearchContext { config, cluster_index });
+```
+
+### Document store
+
+```rust
+// A doc store whose `body` field is embedded (semantic_search_enabled + embedding_fields).
+let schema = DocStoreSchema {
+    namespace: "articles".into(),
+    store_type: StoreType::Doc,
+    ns_id: None,
+    key_type: KeyType::U64,
+    attributes: vec![AttributeDef { name: "body".into(), attr_type: AttributeType::Str, description: None }],
+    indices: vec![],
+    semantic_search_enabled: true,
+    embedding_fields: vec!["body".into()],
+};
+store.create(schema).await?;
+
+// Each put enqueues an async embed job and returns immediately.
+store.put("articles", DocId::U64(1), serde_json::json!({ "body": "thunder and lightning over the sea" })).await?;
+store.put("articles", DocId::U64(2), serde_json::json!({ "body": "a quiet afternoon in the library" })).await?;
+
+// Two-pass ANN search over the stored vectors (top 5). `document_id` is the doc's key bytes.
+let hits = store.search_semantic("articles", "a storm at night", Some(5), Pagination::default()).await?;
+for r in hits.results {
+    let id = u64::from_be_bytes(r.document_id[..8].try_into().unwrap());
+    println!("doc {id}  score={:.4}", r.dot_product);
+}
+```
+
+### KV store
+
+```rust
+// A KV store whose string values are embedded (value_type = str + semantic_search_enabled).
+let kv_schema = KvStoreSchema {
+    namespace: "notes".into(),
+    store_type: StoreType::Kv,
+    ns_id: None,
+    key_type: KvKeyType::Str,
+    value_type: KvValueType::Str,
+    semantic_search_enabled: true,
+};
+store.create_kv(kv_schema).await?;
+
+store.kv_put("notes", &serde_json::json!("n1"), &serde_json::json!("meeting about the Q3 budget")).await?;
+store.kv_put("notes", &serde_json::json!("n2"), &serde_json::json!("weekend hiking trip planning")).await?;
+
+// `document_id` here is the raw string key.
+let hits = store.kv_search_semantic("notes", "financial planning", Some(5), Pagination::default()).await?;
+for r in hits.results {
+    println!("key {}  score={:.4}", String::from_utf8_lossy(&r.document_id), r.dot_product);
+}
+
+store.shutdown().await?; // stops the embed-worker cleanly
+# Ok(()) }
+```
+
+The `cluster_path` and `embedding_dim` must match the embedding model the
+service actually serves (see the model-pinning notes in
+`src/semantic_search/CLAUDE.md`). To run vector search over the **REST** API
+instead, use [`minnal_db_api`](../minnal_db_api/README.md).

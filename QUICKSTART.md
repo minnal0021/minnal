@@ -1,24 +1,22 @@
 # minnal — Quickstart & Usage Guide
 
-A practical walkthrough of every way to use minnal: build the binaries, then
-exercise each part of the API. For what minnal *is* — the architecture, the
-five layers, and the design of the storage engine and semantic search — see the
-[main README](README.md).
+A practical walkthrough of running minnal as a **REST service** and using its
+HTTP API — build the server, start it, and exercise every endpoint. For
+**embedded** (in-process) use, add the `minnal_db` crate to your Rust app and
+follow the [Embedded Quickstart](minnal_db/QUICKSTART.md) instead. For what
+minnal *is* — its architecture and design — see the [main README](README.md).
 
-Minnal can be used along **two axes** — how you run it (embedded in-process, or
-as a REST service) and which **store type** you talk to (a JSON *document store*,
-or a schema-lite *KV store*):
+The server exposes two **store types** under one unified `/stores` route tree,
+chosen by a `store_type` field at creation:
 
-| Mode | Document store | KV store |
+| Store type | Holds | Highlights |
 |---|---|---|
-| **Embedded** — link `minnal_db` directly into a Rust process | ❌ Not available — the document model is a higher layer | ✅ Key-value CRUD, TTL, typed values, **RoaringBitmap field index + predicate queries** |
-| **Service (REST)** — run `minnal_db_api` | ✅ Full: CRUD, predicate queries, **semantic search** | ✅ CRUD, range/prefix scans, optional **semantic search** |
+| **Document store** (`store_type: "doc"`) | JSON documents under a typed key (`uuid` / `u64` / `u128`) | RoaringBitmap field-index predicate queries; optional semantic search |
+| **KV store** (`store_type: "kv"`) | raw typed key-value data (`str`/`int` keys; `str`/`int`/`f32`/`vec_f32` values) | range & prefix scans; optional semantic search on string values |
 
-The two modes share the same engine — everything below the REST boundary is the
-same code whether you call it in-process or over HTTP. The rest of this guide is
-organised by mode: the [fastest end-to-end path](#getting-started-bulk-load-a-store-and-query-it)
-first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, then
-[embedded](#using-minnal-embedded-as-a-library) use.
+Both store types share the same engine and durability guarantees. This guide
+starts with the [fastest end-to-end path](#getting-started-bulk-load-a-store-and-query-it),
+then the full [service walkthrough](#using-minnal-as-a-service-rest).
 
 ## Table of Contents
 
@@ -39,8 +37,6 @@ first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, the
   - [Logging](#logging)
   - [Write Durability and Recovery](#write-durability-and-recovery)
 - [Using minnal Embedded (as a Library)](#using-minnal-embedded-as-a-library)
-  - [What an embedded store can and cannot do](#what-an-embedded-store-can-and-cannot-do)
-  - [Field-Level Indexing](#field-level-indexing)
 - [Scripts and Config](#scripts-and-config)
   - [Server scripts](#server-scripts)
   - [Example scripts](#example-scripts)
