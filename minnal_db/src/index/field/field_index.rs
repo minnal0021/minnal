@@ -319,10 +319,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
                     // flag so the owner can rebuild instead of trusting a result
                     // that silently dropped this value's rows.
                     self.corrupted.store(true, Ordering::Relaxed);
-                    tracing::error!(
-                        slot = slot_id,
-                        error = %e,
-                        "load_bitmap: bitmap blob failed to deserialize; serving empty and flagging the index corrupt (rebuild this field from the WAL)"
+                    log::error!(
+                        "load_bitmap: bitmap blob failed to deserialize; serving empty and flagging the index corrupt (rebuild this field from the WAL) (slot={slot_id}, error={e})"
                     );
                     RoaringBitmap::new()
                 }
@@ -342,10 +340,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
                 // every row under this value. Leave the prior blob intact and flag
                 // the corruption for the owner to repair from the WAL.
                 self.corrupted.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    slot = slot_id,
-                    error = %e,
-                    "store_bitmap: bitmap failed to serialize; keeping the prior blob and flagging the index corrupt"
+                log::error!(
+                    "store_bitmap: bitmap failed to serialize; keeping the prior blob and flagging the index corrupt (slot={slot_id}, error={e})"
                 );
             }
         }

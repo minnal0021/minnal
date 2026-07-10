@@ -71,6 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "minnal_db_api.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
+    // `minnal_db` logs exclusively through the `log` facade (it has no direct
+    // `tracing` dependency). Those records only reach the subscriber below via
+    // the `log` → `tracing` bridge that `.init()` installs — which exists only
+    // because `tracing-subscriber`'s default `tracing-log` feature is enabled.
+    // Do NOT disable that feature (e.g. via `default-features = false`) without
+    // installing the bridge another way, or all engine logs go silent.
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())

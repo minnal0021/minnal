@@ -151,28 +151,25 @@ impl DynFieldIndex {
             let inner = match value_type {
                 IndexValueType::Bool => {
                     let (ordering, next_slot) = rebuild_ordering_bool(&ks);
-                    tracing::debug!(
-                        ordering_len = ordering.len(),
-                        next_slot,
-                        "DynFieldIndex::open: Bool keymap rebuilt from mmap"
+                    log::debug!(
+                        "DynFieldIndex::open: Bool keymap rebuilt from mmap (ordering_len={}, next_slot={next_slot})",
+                        ordering.len()
                     );
                     DynFieldIndexInner::Bool(FieldIndex::from_parts(ordering, bitmaps, next_slot))
                 }
                 IndexValueType::Int => {
                     let (ordering, next_slot) = rebuild_ordering_int(&ks);
-                    tracing::debug!(
-                        ordering_len = ordering.len(),
-                        next_slot,
-                        "DynFieldIndex::open: Int keymap rebuilt from mmap"
+                    log::debug!(
+                        "DynFieldIndex::open: Int keymap rebuilt from mmap (ordering_len={}, next_slot={next_slot})",
+                        ordering.len()
                     );
                     DynFieldIndexInner::Int(FieldIndex::from_parts(ordering, bitmaps, next_slot))
                 }
                 IndexValueType::Str => {
                     let (ordering, next_slot) = rebuild_ordering_str(&ks);
-                    tracing::debug!(
-                        ordering_len = ordering.len(),
-                        next_slot,
-                        "DynFieldIndex::open: Str keymap rebuilt from mmap"
+                    log::debug!(
+                        "DynFieldIndex::open: Str keymap rebuilt from mmap (ordering_len={}, next_slot={next_slot})",
+                        ordering.len()
                     );
                     DynFieldIndexInner::Str(FieldIndex::from_parts(ordering, bitmaps, next_slot))
                 }
@@ -180,7 +177,7 @@ impl DynFieldIndex {
             (inner, ks)
         } else {
             // ── fresh index — create empty keymap store ───────────────────
-            tracing::debug!("DynFieldIndex::open: no keymap found — starting empty");
+            log::debug!("DynFieldIndex::open: no keymap found — starting empty");
             std::fs::create_dir_all(&keymap_dir)?;
             let ks = BlobStore::create(&keymap_dir)?;
             let inner = match value_type {

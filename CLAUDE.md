@@ -96,12 +96,10 @@ Do not add new dependencies without discussion.
 
 ## Configuration
 
-Both binaries accept a TOML config file:
+`minnal_db` is a library crate (embed it and build a `DbConfig` in code). The
+API server binary accepts a TOML config file:
 
 ```sh
-# KV engine standalone
-minnal_db /path/to/minnal.toml
-
 # Full API server
 minnal_db_api /path/to/config.toml
 # or via env

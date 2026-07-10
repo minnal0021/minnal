@@ -11,6 +11,18 @@ For running minnal as a REST **service** instead, see
 
 > **Platform:** Linux and macOS only — the engine uses `pread`/`pwrite`.
 
+> **Semantic search needs an embedding service.** The default `kv-store` and
+> `doc-store` features have **no external dependencies**. But the moment you
+> enable `semantic-search`, indexing and querying vectors require an external
+> **embedding service** reachable over HTTP (default `http://localhost:8001`) —
+> minnal calls it to turn text into vectors. To get started, run the companion
+> reference service, [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
+> which serves the **gemma** embedding model, then point
+> `SemanticSearchConfig::embedding_service_url` (embedded) or
+> `semantic_search.embedding_service_url` (REST server) at it. Without a service
+> reachable, writes still succeed but vector indexing lags and semantic
+> *queries* error. See [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
+
 ---
 
 ## 1. Select your features
