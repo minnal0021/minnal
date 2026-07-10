@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{DocStoreError, Pagination, SchemaError, StoreType};
+use minnal_db::{DocStoreError, Pagination, SchemaError, StoreType};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -45,13 +45,19 @@ fn doc_cache_miss(state: &AppState, ns: &str) -> AppError {
 }
 
 /// Resolve the key type for `ns` from the schema cache, or the appropriate error.
-async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_doc_store::KeyType, AppError> {
-    state.schemas.read().await.get(ns).map(|s| s.key_type).ok_or_else(|| doc_cache_miss(state, ns))
+async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_db::KeyType, AppError> {
+    state
+        .schemas
+        .read()
+        .await
+        .get(ns)
+        .map(|s| s.key_type)
+        .ok_or_else(|| doc_cache_miss(state, ns))
 }
 
 /// Resolve `(ns_id, key_type)` for `ns` from the schema cache, or the
 /// appropriate error.
-async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(u32, minnal_doc_store::KeyType), AppError> {
+async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(u32, minnal_db::KeyType), AppError> {
     let schemas = state.schemas.read().await;
     let schema = schemas.get(ns).ok_or_else(|| doc_cache_miss(state, ns))?;
     let ns_id = schema

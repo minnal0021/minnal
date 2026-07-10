@@ -76,6 +76,18 @@ const _: () = assert!(
 #[cfg(test)]
 pub(crate) const TEST_NUM_BUCKETS: usize = 2;
 
+/// Test-only `DbConfig` with the small [`TEST_NUM_BUCKETS`] bucket count.
+///
+/// Used by the `vector_kv` tests so the fd mitigation above applies there too.
+/// See [`TEST_NUM_BUCKETS`] for the why.
+#[cfg(all(test, feature = "semantic-search"))]
+pub(crate) fn test_db_config() -> crate::DbConfig {
+    crate::DbConfig {
+        num_buckets: TEST_NUM_BUCKETS,
+        ..Default::default()
+    }
+}
+
 /// Validate that a runtime bucket count is within the u32 limit.
 #[allow(dead_code)]
 pub fn validate_num_buckets(num_buckets: usize) {

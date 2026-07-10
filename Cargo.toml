@@ -1,18 +1,12 @@
 [workspace]
 members = [
     "minnal_db",
-    "index",
-    "minnal_doc_store",
     "minnal_doc_store_api",
-    "semantic_search",
     "tools",
 ]
 default-members = [
     "minnal_db",
-    "index",
-    "minnal_doc_store",
     "minnal_doc_store_api",
-    "semantic_search",
     "tools",
 ]
 resolver = "2"

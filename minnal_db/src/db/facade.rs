@@ -19,9 +19,9 @@ use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::wal_worker::WalGcWorker;
+use crate::index::IndexValueType;
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
 use crate::store::lsm_worker::{LsmCompactionTarget, LsmCompactionWorker};
-use index::IndexValueType;
 
 // ── rkyv trait alias ───────────────────────────────────────────────────
 //
@@ -474,7 +474,7 @@ impl Db {
     /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
     /// is not currently active. Use it to monitor the append-only write
     /// amplification that low-cardinality fields suffer.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::index::IndexBlobStats> {
         self.inner.field_index_blob_stats(namespace_id, field_id)
     }
 
@@ -1343,7 +1343,7 @@ impl AsyncDb {
     /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
     /// is not currently active. Use it to monitor the append-only write
     /// amplification that low-cardinality fields suffer.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::index::IndexBlobStats> {
         self.inner.inner.field_index_blob_stats(namespace_id, field_id)
     }
 

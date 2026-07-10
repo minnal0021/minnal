@@ -1,4 +1,4 @@
-use minnal_doc_store::{DocId, DocStoreError, KeyType};
+use minnal_db::{DocId, DocStoreError, KeyType};
 
 use crate::error::AppError;
 

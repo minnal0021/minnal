@@ -31,9 +31,9 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::hex::hex_to_bytes;
-use minnal_doc_store::index_progress::IndexBuildSnapshot;
-use minnal_doc_store::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
+use minnal_db::doc_store::hex::hex_to_bytes;
+use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
+use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
@@ -640,8 +640,8 @@ pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<J
 /// re-embed the affected documents. Split by pass (`sparse` = Pass 1, `dense` =
 /// Pass 2). For a single namespace use
 /// [`GET /admin/indices/{ns}/vector/corruption-metrics`](vector_corruption_metrics_ns).
-pub async fn vector_corruption_metrics() -> Json<std::collections::BTreeMap<String, semantic_search::metrics::VectorMetricsSnapshot>> {
-    Json(semantic_search::metrics::snapshot_all())
+pub async fn vector_corruption_metrics() -> Json<std::collections::BTreeMap<String, minnal_db::semantic_search::metrics::VectorMetricsSnapshot>> {
+    Json(minnal_db::semantic_search::metrics::snapshot_all())
 }
 
 // ── GET /admin/indices/{ns}/vector/corruption-metrics ─────────────────────────
@@ -649,8 +649,8 @@ pub async fn vector_corruption_metrics() -> Json<std::collections::BTreeMap<Stri
 /// `GET /admin/indices/{ns}/vector/corruption-metrics` — corruption counts for a
 /// single namespace (all-zero if the namespace has never recorded a corruption).
 /// See [`vector_corruption_metrics`] for the cross-namespace view and semantics.
-pub async fn vector_corruption_metrics_ns(Path(ns): Path<String>) -> Json<semantic_search::metrics::VectorMetricsSnapshot> {
-    Json(semantic_search::metrics::snapshot(&ns))
+pub async fn vector_corruption_metrics_ns(Path(ns): Path<String>) -> Json<minnal_db::semantic_search::metrics::VectorMetricsSnapshot> {
+    Json(minnal_db::semantic_search::metrics::snapshot(&ns))
 }
 
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────
@@ -723,7 +723,7 @@ pub struct QueueEntryInfo {
 
 impl From<QueueEntry> for QueueEntryInfo {
     fn from(e: QueueEntry) -> Self {
-        let doc_id_hex = minnal_doc_store::hex::bytes_to_hex(&e.doc_id_bytes);
+        let doc_id_hex = minnal_db::doc_store::hex::bytes_to_hex(&e.doc_id_bytes);
         let doc_id_str = std::str::from_utf8(&e.doc_id_bytes)
             .ok()
             .filter(|s| s.chars().all(|c| c.is_ascii_graphic() || c == ' '))

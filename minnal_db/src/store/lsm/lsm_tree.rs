@@ -1948,7 +1948,15 @@ impl LSMTree {
     /// (a concurrent compaction can swap the file under the in-memory index): a
     /// stale hint just falls back to a full scan from 0, so it is a performance
     /// hint, never a correctness input.
-    fn scan_l1_range_into(&self, bucket: usize, file: &File, start: &[u8], end: Option<&[u8]>, max_live: Option<usize>, out: &mut Vec<ScanEntry>) -> Result<()> {
+    fn scan_l1_range_into(
+        &self,
+        bucket: usize,
+        file: &File,
+        start: &[u8],
+        end: Option<&[u8]>,
+        max_live: Option<usize>,
+        out: &mut Vec<ScanEntry>,
+    ) -> Result<()> {
         self.for_each_l1_entry_in_range(bucket, file, start, end, max_live, |archived| {
             let val = if archived.tombstone {
                 None
@@ -3026,7 +3034,11 @@ impl LSMTree {
                     file.read_exact(&mut entry_bytes[..size])?;
                     let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
                     if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                        let val = if archived.tombstone { None } else { Some((archived.value.to_native(), archived.seq.to_native())) };
+                        let val = if archived.tombstone {
+                            None
+                        } else {
+                            Some((archived.value.to_native(), archived.seq.to_native()))
+                        };
                         bucket_entries.push((archived.key.as_slice().to_vec(), val));
                     }
                 }
@@ -4024,7 +4036,13 @@ mod tests {
         // an in-range key never inserted (bloom reject / L1 miss). The L1 pre-filter
         // must never drop a live key and must return None for every absent one.
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets: 1,
+                ..test_lsm_config()
+            },
+        )?;
 
         for i in 30u128..50 {
             lsm.insert(format!("m{i}").as_bytes(), i)?;
@@ -4548,9 +4566,19 @@ mod tests {
             eprintln!("  [{state}]");
             let l = &lsm;
             time_it("prefix(k:) full", 60, || l.scan_prefix(b"k:").unwrap().len(), total as usize);
-            time_it("range(k:..) full", 60, || l.range_pointers_bounded(b"k:", Some(b"k;"), usize::MAX).unwrap().len(), total as usize);
+            time_it(
+                "range(k:..) full",
+                60,
+                || l.range_pointers_bounded(b"k:", Some(b"k;"), usize::MAX).unwrap().len(),
+                total as usize,
+            );
             let (s, e) = (&sel_start, &sel_end);
-            time_it("range selective [50]", 500, || l.range_pointers_bounded(s, Some(e), usize::MAX).unwrap().len(), 50);
+            time_it(
+                "range selective [50]",
+                500,
+                || l.range_pointers_bounded(s, Some(e), usize::MAX).unwrap().len(),
+                50,
+            );
             let p = &sel_prefix;
             time_it("prefix selective [100]", 500, || l.scan_prefix(p).unwrap().len(), 100);
         }
@@ -4887,7 +4915,13 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets: 1,
+                ..test_lsm_config()
+            },
+        )?;
         for i in 0u128..50 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }
@@ -4899,7 +4933,11 @@ mod tests {
         }
         let pairs = lsm.range_pointers_bounded(b"k", None, 20)?;
         let keys: Vec<String> = pairs.iter().map(|(k, _, _)| String::from_utf8_lossy(k).into_owned()).collect();
-        assert_eq!(keys.len(), 20, "page must return a full `limit` of live keys despite newer tombstones; got {keys:?}");
+        assert_eq!(
+            keys.len(),
+            20,
+            "page must return a full `limit` of live keys despite newer tombstones; got {keys:?}"
+        );
         assert_eq!(keys[0], "k10", "deleted head keys must be skipped");
         assert_eq!(keys[19], "k29");
         Ok(())
@@ -4909,7 +4947,13 @@ mod tests {
     #[test]
     fn test_range_keys_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets: 1,
+                ..test_lsm_config()
+            },
+        )?;
         for i in 0u128..50 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }
@@ -4934,7 +4978,13 @@ mod tests {
     fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets,
+                ..test_lsm_config()
+            },
+        )?;
 
         // 40 keys that all hash to bucket 0 (prefix "a", so they sort ahead of everything else).
         let mut bucket0: Vec<Vec<u8>> = Vec::new();
@@ -4971,8 +5021,17 @@ mod tests {
         // gates the page. limit=15 needs the cap to reach past all 20 head tombstones.
         let pairs = lsm.range_pointers_bounded(b"a", Some(b"b"), 15)?;
         let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _, _)| k.clone()).collect();
-        assert_eq!(keys.len(), 15, "page must be full despite 20 clustered tombstones in one bucket; got {}", keys.len());
-        assert_eq!(keys.as_slice(), &bucket0[20..35], "page must be the first live keys after the deleted head");
+        assert_eq!(
+            keys.len(),
+            15,
+            "page must be full despite 20 clustered tombstones in one bucket; got {}",
+            keys.len()
+        );
+        assert_eq!(
+            keys.as_slice(),
+            &bucket0[20..35],
+            "page must be the first live keys after the deleted head"
+        );
         Ok(())
     }
 
@@ -4981,7 +5040,13 @@ mod tests {
     fn test_range_keys_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets,
+                ..test_lsm_config()
+            },
+        )?;
 
         let mut bucket0: Vec<Vec<u8>> = Vec::new();
         let mut i = 0u64;
@@ -5023,7 +5088,13 @@ mod tests {
     #[test]
     fn test_range_pointers_bounded_l1_tombstones_at_head_skipped() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let lsm = LSMTree::open(temp_dir.path(), LSMConfig { num_buckets: 1, ..test_lsm_config() })?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets: 1,
+                ..test_lsm_config()
+            },
+        )?;
         for i in 0u128..40 {
             lsm.insert(format!("k{:02}", i).as_bytes(), i)?;
         }

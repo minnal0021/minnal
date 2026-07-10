@@ -38,8 +38,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use minnal_db::VectorIndexConfig;
 use minnal_db::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig, lsm::LSMConfig};
-use minnal_doc_store::VectorIndexConfig;
 use serde::Deserialize;
 
 // ── Supported embedding models ────────────────────────────────────────────────
@@ -104,8 +104,12 @@ impl SupportedModelEntry {
             .to_str()
             .ok_or_else(|| format!("supported_models: cluster file path for '{}' is not valid UTF-8", self.name))?;
 
-        semantic_search::ClusterIndex::load_with_dim(cluster_path, self.dimension as usize)
-            .map_err(|e| format!("supported_models: cluster file for '{}' (expected at '{}') is unusable: {e}", self.name, cluster_path))?;
+        minnal_db::semantic_search::ClusterIndex::load_with_dim(cluster_path, self.dimension as usize).map_err(|e| {
+            format!(
+                "supported_models: cluster file for '{}' (expected at '{}') is unusable: {e}",
+                self.name, cluster_path
+            )
+        })?;
         Ok(())
     }
 }
@@ -162,7 +166,7 @@ impl DocStoreApiConfig {
     /// `u8` and an out-of-range width panics (or silently truncates) deep in the
     /// indexing path. Reject it at startup instead.
     fn validate_semantic_search(&self) -> Result<(), String> {
-        use semantic_search::quantisation::rabitq::{MAX_MULTI_BIT_QUANTISATION_BITS, MIN_MULTI_BIT_QUANTISATION_BITS};
+        use minnal_db::semantic_search::quantisation::rabitq::{MAX_MULTI_BIT_QUANTISATION_BITS, MIN_MULTI_BIT_QUANTISATION_BITS};
         let bits = self.semantic_search.number_of_bits_for_dense_quantisation;
         if !(MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS).contains(&bits) {
             return Err(format!(
@@ -183,7 +187,7 @@ impl DocStoreApiConfig {
     ///
     /// The model set is **data-driven**: any name is accepted provided its
     /// cluster file exists and is consistent. Loading the file via
-    /// [`ClusterIndex::load_with_dim`](semantic_search::ClusterIndex::load_with_dim)
+    /// [`ClusterIndex::load_with_dim`](minnal_db::semantic_search::ClusterIndex::load_with_dim)
     /// validates existence, well-formedness, and centroid dimension in one step
     /// — the replacement for the old hard-coded canonical-dimension check.
     ///
@@ -852,7 +856,10 @@ mod tests {
         // Data-driven: a name that is NOT "qwen" is accepted as long as its
         // cluster file exists and the centroid dimension matches.
         let support_dir = write_cluster_file("brandnew", 1024, 3);
-        let entry = SupportedModelEntry { name: "BrandNew".to_string(), dimension: 1024 };
+        let entry = SupportedModelEntry {
+            name: "BrandNew".to_string(),
+            dimension: 1024,
+        };
         assert!(entry.validate(&support_dir).is_ok());
         std::fs::remove_dir_all(&support_dir).ok();
     }
@@ -860,9 +867,12 @@ mod tests {
     #[test]
     fn validate_rejects_dimension_mismatch() {
         let support_dir = write_cluster_file("modelx", 768, 2);
-        let err = SupportedModelEntry { name: "modelx".to_string(), dimension: 512 }
-            .validate(&support_dir)
-            .unwrap_err();
+        let err = SupportedModelEntry {
+            name: "modelx".to_string(),
+            dimension: 512,
+        }
+        .validate(&support_dir)
+        .unwrap_err();
         assert!(err.contains("modelx"), "got: {err}");
         std::fs::remove_dir_all(&support_dir).ok();
     }
@@ -870,17 +880,34 @@ mod tests {
     #[test]
     fn validate_rejects_missing_cluster_file() {
         let support_dir = std::env::temp_dir().join(format!("minnal_cfg_missing_{}", std::process::id()));
-        let err = SupportedModelEntry { name: "ghost".to_string(), dimension: 768 }
-            .validate(&support_dir)
-            .unwrap_err();
+        let err = SupportedModelEntry {
+            name: "ghost".to_string(),
+            dimension: 768,
+        }
+        .validate(&support_dir)
+        .unwrap_err();
         assert!(err.contains("ghost"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_empty_name_and_zero_dimension() {
         let support_dir = std::env::temp_dir();
-        assert!(SupportedModelEntry { name: "  ".to_string(), dimension: 768 }.validate(&support_dir).is_err());
-        assert!(SupportedModelEntry { name: "ok".to_string(), dimension: 0 }.validate(&support_dir).is_err());
+        assert!(
+            SupportedModelEntry {
+                name: "  ".to_string(),
+                dimension: 768
+            }
+            .validate(&support_dir)
+            .is_err()
+        );
+        assert!(
+            SupportedModelEntry {
+                name: "ok".to_string(),
+                dimension: 0
+            }
+            .validate(&support_dir)
+            .is_err()
+        );
     }
 
     #[test]
@@ -896,7 +923,10 @@ mod tests {
     fn active_model_check_passes_when_listed_case_insensitively() {
         let mut cfg = DocStoreApiConfig::default();
         cfg.semantic_search.model = "Qwen".to_string();
-        cfg.semantic_search.supported_models = vec![SupportedModelEntry { name: "qwen".to_string(), dimension: 768 }];
+        cfg.semantic_search.supported_models = vec![SupportedModelEntry {
+            name: "qwen".to_string(),
+            dimension: 768,
+        }];
         assert!(cfg.validate_active_model_listed().is_ok());
     }
 
@@ -904,7 +934,10 @@ mod tests {
     fn active_model_check_rejects_unlisted_model() {
         let mut cfg = DocStoreApiConfig::default();
         cfg.semantic_search.model = "qwen".to_string();
-        cfg.semantic_search.supported_models = vec![SupportedModelEntry { name: "other".to_string(), dimension: 768 }];
+        cfg.semantic_search.supported_models = vec![SupportedModelEntry {
+            name: "other".to_string(),
+            dimension: 768,
+        }];
         let err = cfg.validate_active_model_listed().unwrap_err();
         assert!(err.contains("qwen") && err.contains("supported_models"), "got: {err}");
     }

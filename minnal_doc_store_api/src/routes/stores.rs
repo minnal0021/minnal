@@ -17,7 +17,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, StoreType};
+use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, StoreType};
 use serde::Deserialize;
 use tracing::{debug, error, info};
 
@@ -28,7 +28,11 @@ use crate::{AppState, error::AppError};
 pub(crate) fn store_type_from_value(body: &serde_json::Value) -> Result<StoreType, AppError> {
     body.get("store_type")
         .and_then(|v| serde_json::from_value::<StoreType>(v.clone()).ok())
-        .ok_or_else(|| AppError::from(DocStoreError::InvalidId("payload is missing a valid 'store_type' (expected \"doc\" or \"kv\")".into())))
+        .ok_or_else(|| {
+            AppError::from(DocStoreError::InvalidId(
+                "payload is missing a valid 'store_type' (expected \"doc\" or \"kv\")".into(),
+            ))
+        })
 }
 
 pub async fn list(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
@@ -95,9 +99,12 @@ pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -
 
 pub async fn get_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
-        StoreType::Doc => Ok(Json(serde_json::to_value(state.store.get_schema(&ns)?).map_err(|e| AppError::from(DocStoreError::from(e)))?)),
+        StoreType::Doc => Ok(Json(
+            serde_json::to_value(state.store.get_schema(&ns)?).map_err(|e| AppError::from(DocStoreError::from(e)))?,
+        )),
         StoreType::Kv => Ok(Json(
-            serde_json::to_value(state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?).map_err(|e| AppError::from(DocStoreError::from(e)))?,
+            serde_json::to_value(state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?)
+                .map_err(|e| AppError::from(DocStoreError::from(e)))?,
         )),
     }
 }

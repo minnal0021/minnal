@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use minnal_doc_store::{DocStoreError, DocStoreSchema, KvStoreSchema, StoreType};
+use minnal_db::{DocStoreError, DocStoreSchema, KvStoreSchema, StoreType};
 use tracing::info;
 
 use crate::{AppState, error::AppError};
@@ -36,9 +36,8 @@ fn schema_attachment(ns: &str, json: Vec<u8>) -> Result<(StatusCode, HeaderMap, 
 pub async fn export_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     let json = match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
         StoreType::Doc => serde_json::to_vec_pretty(&state.store.get_schema(&ns)?).map_err(|e| AppError::from(DocStoreError::from(e)))?,
-        StoreType::Kv => {
-            serde_json::to_vec_pretty(&state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?).map_err(|e| AppError::from(DocStoreError::from(e)))?
-        }
+        StoreType::Kv => serde_json::to_vec_pretty(&state.store.get_kv_schema(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?)
+            .map_err(|e| AppError::from(DocStoreError::from(e)))?,
     };
     schema_attachment(&ns, json)
 }

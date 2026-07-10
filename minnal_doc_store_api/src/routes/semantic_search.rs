@@ -60,7 +60,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{DocId, DocStoreError, Pagination};
+use minnal_db::{DocId, DocStoreError, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -200,7 +200,7 @@ pub async fn query_filtered(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_doc_store::KeyType, AppError> {
+async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_db::KeyType, AppError> {
     state
         .schemas
         .read()
@@ -213,8 +213,8 @@ async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_doc_store::Ke
 /// Decode raw `QueryResult` bytes into API-friendly [`SemanticSearchResult`]s,
 /// fetching all stored document values in parallel.
 async fn decode_results(
-    raw: Vec<semantic_search::index::vector_index::QueryResult>,
-    key_type: minnal_doc_store::KeyType,
+    raw: Vec<minnal_db::semantic_search::index::vector_index::QueryResult>,
+    key_type: minnal_db::KeyType,
     state: &AppState,
     ns: &str,
 ) -> Result<Vec<SemanticSearchResult>, AppError> {

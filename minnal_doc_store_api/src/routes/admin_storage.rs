@@ -34,7 +34,7 @@ use minnal_db::{FieldMeta, LsmManifest, ValueLogMetadata};
 use serde::Serialize;
 use tracing::{error, info};
 
-use minnal_doc_store::{KvKeyType, KvValueType, StoreType};
+use minnal_db::{KvKeyType, KvValueType, StoreType};
 
 use crate::{AppState, error::AppError};
 
@@ -447,7 +447,7 @@ pub struct FieldInfo {
 }
 
 impl FieldInfo {
-    fn from_meta(m: FieldMeta, store: &minnal_doc_store::DocStore, ns: &str) -> Self {
+    fn from_meta(m: FieldMeta, store: &minnal_db::DocStore, ns: &str) -> Self {
         let distinct_count = store.field_index_distinct_count(ns, &m.field_name);
         Self {
             field_id: m.field_id,
@@ -981,7 +981,7 @@ fn companion_purpose(suffix: &str) -> String {
 }
 
 pub fn build_namespace_meta(
-    store: &minnal_doc_store::DocStore,
+    store: &minnal_db::DocStore,
     ns: &str,
     doc_names: &std::collections::HashSet<String>,
     kv_names: &std::collections::HashSet<String>,

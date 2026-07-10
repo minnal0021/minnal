@@ -115,8 +115,8 @@ pub struct KVStore {
 
     // Per-namespace dense row-ID map (the default ID source when no custom
     // `row_id_fn` is registered).  Loaded lazily when the first field index is
-    // activated; `None` until then.  See `index::RowMap`.
-    pub(crate) rowmap: Arc<RwLock<Option<index::RowMap>>>,
+    // activated; `None` until then.  See `crate::index::RowMap`.
+    pub(crate) rowmap: Arc<RwLock<Option<crate::index::RowMap>>>,
 
     // Global write-sequence counter used for highest-sequence-wins conflict
     // resolution in the memtable. In production this is shared with the WAL
@@ -278,7 +278,7 @@ impl KVStore {
     pub(crate) fn ensure_rowmap(&self, dir: &Path) -> Result<()> {
         let mut guard = self.rowmap.write();
         if guard.is_none() {
-            *guard = Some(index::RowMap::open(dir).map_err(KVError::Io)?);
+            *guard = Some(crate::index::RowMap::open(dir).map_err(KVError::Io)?);
         }
         Ok(())
     }
@@ -287,7 +287,7 @@ impl KVStore {
     /// unseen. Used on the put and WAL-replay paths.
     ///
     /// Precedence: a caller-supplied [`RowIdFn`] (the escape hatch for keys that
-    /// embed their own ID) wins; otherwise the dense [`RowMap`](index::RowMap).
+    /// embed their own ID) wins; otherwise the dense [`RowMap`](crate::index::RowMap).
     ///
     /// Only reached once a namespace has an active field index, and
     /// `activate_field_index` loads the row map (`ensure_rowmap`) before

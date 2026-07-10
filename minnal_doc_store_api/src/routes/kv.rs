@@ -27,7 +27,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{DocStoreError, KvKeyType, Pagination};
+use minnal_db::{DocStoreError, KvKeyType, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -264,7 +264,7 @@ async fn key_to_json(state: &AppState, ns: &str, raw: &str) -> Result<serde_json
 
 /// Fetch stored values in parallel and zip them with the ANN result metadata.
 async fn hydrate_kv_results(
-    raw: Vec<semantic_search::index::vector_index::QueryResult>,
+    raw: Vec<minnal_db::semantic_search::index::vector_index::QueryResult>,
     key_type: KvKeyType,
     state: &AppState,
     ns: &str,

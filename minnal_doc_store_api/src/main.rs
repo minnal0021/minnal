@@ -10,9 +10,9 @@ use std::{
 };
 
 use config::DocStoreApiConfig;
-use minnal_doc_store::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
-use semantic_search::ClusterIndex;
-use semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
+use minnal_db::semantic_search::ClusterIndex;
+use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
+use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -27,7 +27,7 @@ pub struct AppState {
     /// Handlers use this to resolve the [`KeyType`] needed to parse `{id}` path
     /// segments without re-reading from disk on every request.
     ///
-    /// [`KeyType`]: minnal_doc_store::KeyType
+    /// [`KeyType`]: minnal_db::KeyType
     pub schemas: Arc<RwLock<HashMap<String, DocStoreSchema>>>,
     /// In-memory schema cache for KV stores, keyed by namespace name.
     pub kv_schemas: Arc<RwLock<HashMap<String, KvStoreSchema>>>,
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // is unreachable or misconfigured.  Failure is non-fatal: the server
         // starts anyway and semantic search requests will surface the error at
         // call time.
-        match semantic_search::service::check_embedding_service(&embedding_cfg).await {
+        match minnal_db::semantic_search::service::check_embedding_service(&embedding_cfg).await {
             Ok(()) => info!(
                 url = %embedding_cfg.embedding_service_url,
                 dim = embedding_cfg.embedding_dim,

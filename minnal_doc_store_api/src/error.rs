@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use minnal_doc_store::{DocStoreError, SchemaError};
+use minnal_db::{DocStoreError, SchemaError};
 use tracing::error;
 
 /// Wraps [`DocStoreError`] so it can be returned from axum handlers.

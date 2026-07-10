@@ -29,13 +29,13 @@ pub(crate) fn encode_cursor(key: &[u8]) -> String {
 /// bytes. Returns a 400-class error on malformed input.
 pub(crate) fn decode_cursor(s: &str) -> Result<Vec<u8>, AppError> {
     if !s.len().is_multiple_of(2) {
-        return Err(minnal_doc_store::DocStoreError::InvalidId("cursor must be an even-length hex string".into()).into());
+        return Err(minnal_db::DocStoreError::InvalidId("cursor must be an even-length hex string".into()).into());
     }
     (0..s.len())
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| {
-                AppError::from(minnal_doc_store::DocStoreError::InvalidId(format!(
+                AppError::from(minnal_db::DocStoreError::InvalidId(format!(
                     "invalid hex byte '{}' in cursor",
                     &s[i..i + 2]
                 )))

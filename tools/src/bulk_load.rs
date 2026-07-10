@@ -358,8 +358,8 @@ async fn resolve_doc_key_type(client: &Client, base_url: &str, namespace: &str) 
     let stores = fetch_stores(client, base_url).await?;
     match stores.iter().find(|s| s.get("namespace").and_then(Value::as_str) == Some(namespace)) {
         Some(entry) => {
-            let schema: DocSchema =
-                serde_json::from_value(entry.clone()).map_err(|_| format!("namespace '{namespace}' is not a document store (drop --kv or use the KV path)"))?;
+            let schema: DocSchema = serde_json::from_value(entry.clone())
+                .map_err(|_| format!("namespace '{namespace}' is not a document store (drop --kv or use the KV path)"))?;
             Ok(schema.key_type)
         }
         None => Err(namespace_not_found("namespace", namespace, &stores)),
@@ -386,7 +386,11 @@ fn namespace_not_found(label: &str, namespace: &str, stores: &[Value]) -> Box<dy
     let available: Vec<&str> = stores.iter().filter_map(|s| s.get("namespace").and_then(Value::as_str)).collect();
     format!(
         "{label} '{namespace}' not found — available: {}",
-        if available.is_empty() { "(none)".to_owned() } else { available.join(", ") }
+        if available.is_empty() {
+            "(none)".to_owned()
+        } else {
+            available.join(", ")
+        }
     )
     .into()
 }
@@ -532,7 +536,8 @@ async fn resolve_kv_key_type(client: &Client, base_url: &str, namespace: &str) -
     let stores = fetch_stores(client, base_url).await?;
     match stores.iter().find(|s| s.get("namespace").and_then(Value::as_str) == Some(namespace)) {
         Some(entry) => {
-            let schema: KvSchema = serde_json::from_value(entry.clone()).map_err(|_| format!("namespace '{namespace}' is not a KV store (pass --kv only for KV stores)"))?;
+            let schema: KvSchema = serde_json::from_value(entry.clone())
+                .map_err(|_| format!("namespace '{namespace}' is not a KV store (pass --kv only for KV stores)"))?;
             Ok(schema.key_type)
         }
         None => Err(namespace_not_found("KV namespace", namespace, &stores)),

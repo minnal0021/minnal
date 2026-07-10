@@ -3,15 +3,14 @@ name = "minnal_doc_store_api"
 version = "0.1.0"
 edition = "2024"
 description = "RESTful HTTP API server for minnal_doc_store"
+publish = false
 
 [[bin]]
 name = "minnal_doc_store_api"
 path = "src/main.rs"
 
 [dependencies]
-minnal_doc_store = { path = "../minnal_doc_store" }
-minnal_db = { path = "../minnal_db" }
-semantic_search = { path = "../semantic_search" }
+minnal_db = { path = "../minnal_db", features = ["doc-store", "semantic-search"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

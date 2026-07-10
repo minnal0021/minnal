@@ -3,6 +3,7 @@ name = "tools"
 version = "0.1.0"
 edition = "2024"
 description = "Stand-alone utility tools for minnal"
+publish = false
 
 [[bin]]
 name = "minnal_tools"

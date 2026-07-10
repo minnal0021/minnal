@@ -15,9 +15,9 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_doc_store::{
+use minnal_db::{
     DocStoreError, IndexSpec,
-    index_progress::{BuildStatus, IndexBuildSnapshot, IndexId},
+    doc_store::index_progress::{BuildStatus, IndexBuildSnapshot, IndexId},
 };
 use tracing::{error, info};
 
@@ -28,7 +28,7 @@ pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>)
     let mut snaps: Vec<IndexBuildSnapshot> = state.index_manager.list().into_iter().filter(|s| s.id.namespace() == ns).collect();
 
     if let Some(c) = state.store.vec_reindex_progress(&ns) {
-        use minnal_doc_store::index_progress::now_ms;
+        use minnal_db::doc_store::index_progress::now_ms;
         let status = match c.status.as_str() {
             "complete" => BuildStatus::Complete,
             "failed" => BuildStatus::Failed,
