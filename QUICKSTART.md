@@ -1,10 +1,12 @@
 # minnal — Quickstart & Usage Guide
 
-A practical walkthrough of running minnal as a **REST service** and using its
-HTTP API — build the server, start it, and exercise every endpoint. For
-**embedded** (in-process) use, add the `minnal_db` crate to your Rust app and
-follow the [Embedded Quickstart](minnal_db/QUICKSTART.md) instead. For what
-minnal *is* — its architecture and design — see the [main README](README.md).
+A practical walkthrough of running minnal as a **REST service**: build the
+server, start it, load data, and query it. The complete endpoint-by-endpoint
+REST reference lives in the [API server README](minnal_db_api/README.md) — this
+guide points into it rather than repeating it. For **embedded** (in-process)
+use, add the `minnal_db` crate to your Rust app and follow the
+[Embedded Quickstart](minnal_db/QUICKSTART.md) instead. For what minnal *is* —
+its architecture and design — see the [main README](README.md).
 
 The server exposes two **store types** under one unified `/stores` route tree,
 chosen by a `store_type` field at creation:
@@ -25,13 +27,7 @@ then the full [service walkthrough](#using-minnal-as-a-service-rest).
 - [Using minnal as a Service (REST)](#using-minnal-as-a-service-rest)
   - [Start the Server](#start-the-server)
   - [Configuration](#configuration)
-  - [Document Stores](#document-stores)
-    - [Store Lifecycle](#store-lifecycle)
-    - [Document CRUD](#document-crud)
-    - [Predicate Queries](#predicate-queries)
-    - [Semantic Search](#semantic-search)
-    - [Index Management](#index-management)
-  - [KV Stores](#kv-stores)
+  - [Document and KV Stores (REST API)](#document-and-kv-stores-rest-api)
   - [Bulk Loading](#bulk-loading)
   - [Admin and Monitoring](#admin-and-monitoring)
   - [Logging](#logging)
@@ -94,7 +90,7 @@ The `-s` flag stages [`minnal_tools/sample_data/`](minnal_tools/sample_data) int
 `./work/sample_data/`, including the two files this quickstart uses:
 `jobs-mini-schema.json` and `jobs-mini.jsonl` (ten rows). It also stages a
 KV-store sample — `job-content-kv-schema.json` and `job-content-kv.jsonl` (twenty
-long job descriptions) — used by the [KV Stores](#kv-stores) bulk-load example.
+long job descriptions) — used by the [Bulk Loading](#bulk-loading) KV example.
 
 **2. Look at the schema**
 
@@ -157,7 +153,7 @@ curl -s -X POST http://localhost:8080/stores/jobs/query \
 > asynchronously by an embedding service (default `http://localhost:8001`).
 > **Without it, the load and all attribute queries above still work** — only
 > `POST /stores/jobs/semantic-search` returns nothing until embeddings exist. See
-> [Semantic Search](#semantic-search) below to enable it.
+> [semantic search](minnal_db_api/README.md#semantic-search-document-stores) to enable it.
 
 For the full `bulk_load` reference (KV stores, existing namespaces, `--no-wal`),
 see [Bulk Loading](#bulk-loading).
@@ -276,236 +272,27 @@ number_of_bits_for_dense_quantisation = 8
 The config file is located by (in order): first CLI argument → `MINNAL_CONFIG_FILE`
 env var → built-in defaults.
 
-### Document Stores
+### Document and KV Stores (REST API)
 
-A document store holds JSON documents keyed by `uuid`, `u64`, or `u128`, with up
-to five typed field indices and optional semantic search.
+Both store kinds live under the unified `/stores` route tree, selected by a
+`store_type` field at creation. Rather than repeat every endpoint here, this
+guide defers to the **[API server README](minnal_db_api/README.md)**, which
+documents each route with its request/response schema:
 
-#### Store Lifecycle
+- **Document stores** — [store lifecycle](minnal_db_api/README.md#store-lifecycle),
+  [document CRUD](minnal_db_api/README.md#document-crud),
+  [predicate queries](minnal_db_api/README.md#queries),
+  [semantic search](minnal_db_api/README.md#semantic-search-document-stores), and
+  [index management](minnal_db_api/README.md#index-management).
+- **KV stores** — [creation](minnal_db_api/README.md#kv-store-creation),
+  [CRUD](minnal_db_api/README.md#kv-crud),
+  [range](minnal_db_api/README.md#kv-range-scan) / [prefix](minnal_db_api/README.md#kv-prefix-scan)
+  scans, and [semantic search](minnal_db_api/README.md#kv-semantic-search).
 
-```bash
-# Create a store with UUID keys, two indices, and semantic search
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "namespace": "profiles",
-    "store_type": "doc",
-    "key_type": "uuid",
-    "semantic_search_enabled": true,
-    "embedding_fields": ["bio"],
-    "indices": [
-      {"field": "status",   "index_type": "str"},
-      {"field": "seniority","index_type": "str"}
-    ],
-    "attributes": [
-      {"name": "name",  "attr_type": "str"},
-      {"name": "email", "attr_type": "str", "description": "primary contact"},
-      {"name": "bio",   "attr_type": "str", "description": "embedded for semantic search"}
-    ]
-  }'
-# → 201 Created
-
-# List all stores
-curl -s http://localhost:8080/stores
-
-# Amend a non-indexed attribute
-curl -s -X PATCH http://localhost:8080/stores/profiles/schema \
-  -H 'Content-Type: application/json' \
-  -d '{"op": "add_attribute", "name": "team", "attr_type": "str"}'
-# → 204 No Content
-
-# Drop a store (irreversible)
-curl -s -X DELETE http://localhost:8080/stores/profiles
-# → 204 No Content
-```
-
-Schema amendment operations: `add_attribute`, `update_attribute`,
-`remove_attribute`. Indexed fields cannot be amended directly — drop the index
-first.
-
-#### Document CRUD
-
-```bash
-# Insert (upsert)
-curl -s -X PUT \
-  "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "Alice",
-    "status": "active",
-    "seniority": "senior",
-    "bio": "distributed systems engineer with a focus on storage engines"
-  }'
-# → 204 No Content
-
-# Read by ID
-curl -s "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000"
-# → {"name":"Alice","status":"active","seniority":"senior","bio":"..."}
-
-# Delete
-curl -s -X DELETE \
-  "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000"
-# → 204 No Content
-
-# Range scan (key order, inclusive start, exclusive end)
-curl -s "http://localhost:8080/stores/profiles/docs?start=00000000-0000-0000-0000-000000000000"
-# → [{"id":"550e8400-...","doc":{...}}, ...]
-```
-
-#### Predicate Queries
-
-Only indexed fields may appear in predicates. Operators: `=`, `!=`, `<`, `<=`,
-`>`, `>=`, `AND`, `OR`, `NOT`.
-
-```bash
-curl -s -X POST http://localhost:8080/stores/profiles/query \
-  -H 'Content-Type: application/json' \
-  -d '{"predicate": "status = \"active\" AND seniority = \"senior\""}'
-# → [{"id":"550e8400-...","doc":{...}}, ...]
-```
-
-#### Semantic Search
-
-Semantic search requires:
-- The store was created with `"semantic_search_enabled": true` — a doc store also needs `"embedding_fields"` set; a `value_type = str` KV store embeds the stored string directly.
-- A cluster centroids file is configured and loaded at startup (`[semantic_search] cluster_path = …`).
-- An embedding service is reachable at the configured URL.
-
-```bash
-# Unfiltered — all candidates ranked by similarity
-curl -s -X POST http://localhost:8080/stores/profiles/semantic-search \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "senior engineer with distributed systems experience"}'
-
-# Filtered — ANN scoring restricted to documents that pass the predicate
-curl -s -X POST http://localhost:8080/stores/profiles/semantic-search/filtered \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": "senior engineer with distributed systems experience",
-    "predicate": "status = \"active\""
-  }'
-```
-
-Response (both endpoints) — ordered array, highest similarity first:
-
-```json
-[
-  {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "dot_product": 0.94,
-    "error_bound": 0.02,
-    "cluster_id": 7,
-    "is_primary": true
-  }
-]
-```
-
-| Field | Meaning |
-|---|---|
-| `dot_product` | Estimated cosine similarity to the query (higher = more similar) |
-| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
-| `cluster_id` | IVF cluster this document was indexed under |
-| `is_primary` | `true` if the document's cluster is the closest cluster to the query |
-
-#### Index Management
-
-```bash
-# Add an index (returns 202; background rebuild if documents already exist)
-curl -s -X POST http://localhost:8080/stores/profiles/indices \
-  -H 'Content-Type: application/json' \
-  -d '{"field": "team", "index_type": "str"}'
-# → 202 Accepted
-
-# Monitor rebuild progress (per namespace)
-curl -s http://localhost:8080/admin/indices/profiles/progress
-# → {"attribute_builds":[{"id":{"Field":{"namespace":"profiles","field":"team"}},"status":"Running","total":50000,"indexed":12340,...}],"vector_progress":[...]}
-
-# Drop a field index (background cleanup, field becomes a plain attribute)
-curl -s -X DELETE http://localhost:8080/stores/profiles/indices/team
-# → 202 Accepted
-
-# Drop the vector index (disables semantic search, background cleanup)
-curl -s -X DELETE http://localhost:8080/stores/profiles/indices/vector
-# → 202 Accepted
-
-# Admin: drop + rebuild all field indices for a namespace
-curl -s -X POST http://localhost:8080/admin/indices/profiles/attribute/reindex-all
-# → 202 Accepted
-```
-
-### KV Stores
-
-A KV store is a schema-lite namespace for raw key-value data. It has no field
-indices but supports the same WAL durability, LSM compaction, value-log GC, and
-optional semantic search as document stores.
-
-```bash
-# Create a KV store (str key → str value)
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
-# → 201 Created
-
-# Create a KV store with semantic search (str key → str value, ANN enabled)
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "product-descriptions", "store_type": "kv", "key_type": "str", "value_type": "str",
-       "semantic_search_enabled": true}'
-# → 201 Created
-
-# List all stores (doc and KV; each entry carries its store_type)
-curl -s http://localhost:8080/stores
-
-# Write a value
-curl -s -X PUT http://localhost:8080/stores/session-cache/kv/user-42 \
-  -H 'Content-Type: application/json' \
-  -d '"eyJhbGciOiJIUzI1NiJ9..."'
-# → 204 No Content
-
-# Read a value
-curl -s http://localhost:8080/stores/session-cache/kv/user-42
-# → "eyJhbGciOiJIUzI1NiJ9..."
-
-# Delete a key
-curl -s -X DELETE http://localhost:8080/stores/session-cache/kv/user-42
-# → 204 No Content
-
-# Range scan — entries with keys "user-10" through "user-20" (exclusive end)
-curl -s "http://localhost:8080/stores/session-cache/kv?start=user-10&end=user-21"
-# → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":2}
-
-# Prefix scan — all entries whose key starts with "user-"
-curl -s "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-"
-# → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":3}
-
-# Semantic search (value_type = str, semantic_search_enabled = true only)
-curl -s -X POST http://localhost:8080/stores/product-descriptions/kv/semantic-search \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
-
-# Drop a KV store (irreversible)
-curl -s -X DELETE http://localhost:8080/stores/session-cache
-# → 204 No Content
-```
-
-**Key and value types:**
-
-| `key_type` | URL path segment format |
-|-----------|------------------------|
-| `str` | any UTF-8 string |
-| `int` | decimal integer (stored big-endian for ordered scans) |
-
-| `value_type` | JSON body format |
-|-------------|-----------------|
-| `str` | JSON string: `"hello"` |
-| `int` | JSON integer: `42` |
-| `f32` | JSON number: `3.14` |
-| `vec_f32` | JSON array of numbers: `[1.0, -0.5, 0.25]` |
-
-To populate a KV store from a JSONL file in one step, use `bulk_load --kv` — the
-release bundles a sample str→str store (`job-content-kv-schema.json` +
-`job-content-kv.jsonl`, 20 long job descriptions keyed by job id). See
-[Bulk Loading](#bulk-loading) below.
+For key/value type tables and the async vector-indexing model, see the
+[Concepts](minnal_db_api/README.md#concepts) section there. For a hands-on
+end-to-end example, see [Getting Started](#getting-started-bulk-load-a-store-and-query-it)
+above; to fill a store from a JSONL file, see [Bulk Loading](#bulk-loading) below.
 
 ### Bulk Loading
 
@@ -576,78 +363,19 @@ complete `bulk_load` walkthrough with a sample schema and rows.
 
 ### Admin and Monitoring
 
-The `/admin` routes are split into two groups:
+The `/admin` routes are for operations and monitoring — not application traffic —
+and split into two groups:
 
-- `/admin/storage/*` — storage engine diagnostics and GC/compaction triggers
-- `/admin/indices/*` — index monitoring and bulk index operations
+- `/admin/storage/*` — storage-engine diagnostics (health, value-log/LSM stats)
+  and GC / compaction / index-checkpoint triggers.
+- `/admin/indices/*` — index build progress, vector-queue inspection, and bulk
+  reindex / reconcile operations.
 
-They are intended for operations and monitoring — not application traffic.
-
-```bash
-# Liveness check
-curl http://localhost:8080/admin/storage/health
-# → {"status":"ok","uptime_s":42}
-
-# Value-log GC statistics
-curl http://localhost:8080/admin/storage/stats
-
-# LSM manifest (all namespaces)
-curl http://localhost:8080/admin/storage/lsm
-
-# All active index builds + vector progress across all namespaces
-curl http://localhost:8080/admin/indices/progress
-
-# Index progress for one namespace
-curl http://localhost:8080/admin/indices/products/progress
-# → {"attribute_builds":[...],"vector_progress":[{"namespace":"products","indexed_approx":970,"pending":10,"exhausted":2,"progress_pct":99.0}]}
-
-# Vector-index queue depth / lag by namespace
-curl http://localhost:8080/admin/indices/vector/queue/summary
-# → {"max_retries_configured":5,"total_pending":12,...}
-
-# All retried queue entries (retry_count > 0) across all namespaces
-curl http://localhost:8080/admin/indices/vector/queue/retried
-
-# Queue entries for one namespace
-curl http://localhost:8080/admin/indices/products/vector/queue
-
-# Retried entries for one namespace
-curl http://localhost:8080/admin/indices/products/vector/queue/retried
-
-# Remove a stuck queue entry (doc_id_hex from the listing above)
-curl -X DELETE \
-  http://localhost:8080/admin/indices/products/vector/queue/550e8400e29b41d4
-# → 204 No Content
-
-# Reset all exhausted entries for a namespace
-curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-failed
-# → {"retried":3}
-
-# Re-enqueue all docs for a fresh full vector rebuild
-curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
-# → 202 Accepted
-
-# Drop and rebuild all field indices for a namespace
-curl -X POST http://localhost:8080/admin/indices/products/attribute/reindex-all
-# → 202 Accepted
-
-# Trigger value-log GC
-curl -X POST http://localhost:8080/admin/storage/gc
-
-# Trigger LSM compaction
-curl -X POST http://localhost:8080/admin/storage/compact
-
-# Monitor field-index bitmap/keymap waste (decide if a checkpoint is worthwhile)
-curl http://localhost:8080/admin/storage/index-waste
-
-# Force an index checkpoint (flush + compact field indexes and row maps)
-curl -X POST http://localhost:8080/admin/storage/index-checkpoint
-```
-
-For the full admin API reference see
-[`minnal_db_api/README.md`](minnal_db_api/README.md). For a
-consolidated table of every metric these endpoints report — with explanations and
-whether each value survives a restart — see
+Every endpoint is documented in the
+[Admin Storage](minnal_db_api/README.md#admin-storage-api) and
+[Admin Indices](minnal_db_api/README.md#admin-indices-api) references. For a
+consolidated table of every metric these endpoints report — with explanations
+and whether each value survives a restart — see
 [Operational & Storage Metrics](minnal_db_api/README.md#operational--storage-metrics).
 
 ### Logging

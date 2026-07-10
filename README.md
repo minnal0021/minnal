@@ -117,17 +117,30 @@ Each SSTable file records the `min_key_prefix` and `max_key_prefix` of all entri
 
 When two keys share the same `u64` prefix (i.e. the first 8 bytes are identical), the skip list calls `compare_bytes_simd` to resolve the full lexicographic order. The implementation selects the widest available SIMD path at compile time:
 
-- **AVX512** — 64 bytes per iteration using `_mm512_loadu_epi8` / `_mm512_cmpeq_epi8_mask`. The equality mask is a 64-bit integer; `trailing_ones()` finds the first differing byte without a branch per byte.
-- **AVX2** — 32 bytes per iteration using `_mm256_cmpeq_epi8` / `_mm256_movemask_epi8`. The 32-bit equality mask is inspected with `trailing_ones()` in the same way.
-- **Scalar fallback** — standard byte-by-byte comparison on targets without AVX2.
+- **AVX512** (x86_64) — 64 bytes per iteration using `_mm512_loadu_epi8` / `_mm512_cmpeq_epi8_mask`. The equality mask is a 64-bit integer; `trailing_ones()` finds the first differing byte without a branch per byte.
+- **AVX2** (x86_64) — 32 bytes per iteration using `_mm256_cmpeq_epi8` / `_mm256_movemask_epi8`. The 32-bit equality mask is inspected with `trailing_ones()` in the same way.
+- **Scalar fallback** — standard byte-by-byte comparison on every other target. This includes **aarch64 (Apple Silicon / ARM64)**: this particular comparator has no NEON path yet, so on Apple hardware ordered key comparison currently runs the scalar `slice::cmp`. NEON acceleration *is* used elsewhere in the engine — see [SIMD across CPU architectures](#simd-across-cpu-architectures) below.
 
 The SIMD paths are also used for all ordered key lookups and range scans in the skip list, not just prefix scans, so the benefit extends across all read paths.
+
+##### SIMD across CPU architectures
+
+minnal targets both x86_64 and aarch64 (Apple Silicon / ARM64). SIMD coverage differs by subsystem — some kernels have hand-written NEON, one does not:
+
+| Subsystem | x86_64 | aarch64 (Apple Silicon) | Dispatch |
+|---|---|---|---|
+| **Field-index bitmap kernels** (`index/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, extract, sum, run-bitset) | AVX-512 → AVX2 → scalar | **NEON** → scalar tail | x86: runtime (`is_x86_feature_detected!`); aarch64: compile-time (NEON is baseline on every aarch64 target, so no runtime probe) |
+| **Vector-distance math** (`semantic_search`, via the `simsimd` crate) | AVX-512 / AVX2 | **NEON / SVE** | `simsimd` runtime dispatch |
+| **Skip-list key comparator** (`compare_bytes_simd`) | AVX-512 / AVX2 (compile-time `target_feature`) | scalar (`slice::cmp`) — **no NEON path** | compile-time `cfg` |
+| **Murmur3 bucket hashing** (`mm3h`) | AVX (`avx` crate feature) | crate's portable/scalar path | compile-time (crate-internal) |
+
+So on Apple Silicon the field-index bitmap operations and vector search run on NEON, while skip-list key ordering and bucket hashing fall back to portable scalar code. The scalar paths are correctness-equivalent — only the skip-list comparator and hashing give up the SIMD speed-up on ARM. (The NEON field-index kernels are compile- and clippy-clean on aarch64 and unit-tested against their scalar counterparts, but have not yet been benchmarked on Apple hardware.)
 
 ### Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)
 
 The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. Field indexing is built into the engine (the folded `index` module): fast predicate queries over document fields.
 
-Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files (`memmap2`), so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated. A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
+Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files (`memmap2`), so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated (AVX-512/AVX2 on x86_64, **NEON on Apple Silicon** — see [SIMD across CPU architectures](#simd-across-cpu-architectures)). A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
 
 Index writes are checkpointed against WAL offsets, so a crash partway through a rebuild resumes exactly where it left off rather than starting over.
 
@@ -291,8 +304,8 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **Multi-namespace isolation** | Each logical store has independent LSM, value-log, and index shards. |
 | **Crash-safe WAL** | All mutations go through a WAL before they reach the memtable. Replay on startup. |
 | **Background GC** | Value-log GC reclaims space from deleted/overwritten entries. Tunable waste threshold. |
-| **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers. Short prefixes (≤ 8 bytes) match against a stored `u64` key fingerprint — a single integer comparison. Skip-list traversal uses AVX2 (32 bytes/cycle) or AVX512 (64 bytes/cycle) for full-key ordering when fingerprints tie. SSTable files are skipped entirely when their `min`/`max` key prefix bounds exclude the target. |
-| **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates. |
+| **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers. Short prefixes (≤ 8 bytes) match against a stored `u64` key fingerprint — a single integer comparison. Skip-list traversal uses AVX2 (32 bytes/cycle) or AVX512 (64 bytes/cycle) on x86_64 for full-key ordering when fingerprints tie (scalar on Apple Silicon). SSTable files are skipped entirely when their `min`/`max` key prefix bounds exclude the target. |
+| **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates — AVX-512/AVX2 on x86_64, NEON on Apple Silicon. See [SIMD across CPU architectures](#simd-across-cpu-architectures). |
 | **Restartable index builds** | Checkpoint files track progress; interrupted builds resume automatically on startup. |
 | **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact 1-bit chunk embeddings (32× compression vs f32) over IVF clusters for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
 | **Async vector indexing** | Document writes enqueue a pending embedding job and return immediately. A background worker (round-robin across namespaces, bounded concurrency) drains the queue and retries on failure. Configurable retry budget and concurrency under `[vector_index]`. |
@@ -316,7 +329,7 @@ sample data, and every REST and embedded example — lives in a dedicated guide:
 It is organised by how you run minnal and which store type you use:
 
 - **[Getting Started](QUICKSTART.md#getting-started-bulk-load-a-store-and-query-it)** — the fastest end-to-end path: stage the release, start the server, bulk-load a bundled sample dataset, and query it.
-- **[Using minnal as a Service (REST)](QUICKSTART.md#using-minnal-as-a-service-rest)** — start the server, then work with [document stores](QUICKSTART.md#document-stores) (CRUD, predicate queries, semantic search) and [KV stores](QUICKSTART.md#kv-stores), plus [bulk loading](QUICKSTART.md#bulk-loading), [configuration](QUICKSTART.md#configuration), [admin/monitoring](QUICKSTART.md#admin-and-monitoring), [logging](QUICKSTART.md#logging), and [durability & recovery](QUICKSTART.md#write-durability-and-recovery).
+- **[Using minnal as a Service (REST)](QUICKSTART.md#using-minnal-as-a-service-rest)** — start the server, then work with [document and KV stores](QUICKSTART.md#document-and-kv-stores-rest-api) (CRUD, predicate queries, semantic search — full endpoint reference in [`minnal_db_api`](minnal_db_api/README.md)), plus [bulk loading](QUICKSTART.md#bulk-loading), [configuration](QUICKSTART.md#configuration), [admin/monitoring](QUICKSTART.md#admin-and-monitoring), [logging](QUICKSTART.md#logging), and [durability & recovery](QUICKSTART.md#write-durability-and-recovery).
 - **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — add `minnal_db` to a Rust process for in-process storage; feature selection (`kv-store`/`doc-store`/`semantic-search`) and code examples.
 - **[Scripts & Config](QUICKSTART.md#scripts-and-config)** — the `release.sh`/`start.sh`/`run_tool.sh` helpers, the bundled `curl` example scripts, cluster centroids, and the annotated sample config.
 

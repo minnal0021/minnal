@@ -27,6 +27,7 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
   - [Index management](#index-management)
   - [Document CRUD](#document-crud)
   - [Queries](#queries)
+  - [Semantic search (document stores)](#semantic-search-document-stores)
   - [KV store creation](#kv-store-creation)
   - [KV CRUD](#kv-crud)
   - [KV range scan](#kv-range-scan)
@@ -289,6 +290,8 @@ All request and response bodies are JSON, and errors are returned as `{"error": 
 | `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
 | `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
 | `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
+| `POST` | `/stores/{ns}/semantic-search` | `200` | ANN similarity search (`semantic_search_enabled` only) |
+| `POST` | `/stores/{ns}/semantic-search/filtered` | `200` | ANN search restricted by an index predicate |
 
 **KV store data:**
 
@@ -624,7 +627,7 @@ curl -X DELETE "http://localhost:8080/stores/users/docs/1"
 
 ### Queries
 
-There are two ways to retrieve documents beyond a single primary-key lookup: a **range scan** that walks documents in key order, and an **index predicate query** that returns the documents matching a boolean expression over indexed fields. (Semantic similarity search is documented separately, under the KV and store sections.)
+There are two ways to retrieve documents beyond a single primary-key lookup: a **range scan** that walks documents in key order, and an **index predicate query** that returns the documents matching a boolean expression over indexed fields. (Semantic similarity search has its own section: [Semantic search (document stores)](#semantic-search-document-stores) below, and [KV semantic search](#kv-semantic-search) for KV stores.)
 
 #### `GET /stores/{ns}/docs?start=&end=`
 
@@ -689,6 +692,87 @@ Response — `{id, doc}` pairs plus the pagination envelope:
   "total": 1
 }
 ```
+
+---
+
+### Semantic search (document stores)
+
+Two-pass ANN similarity search over the document vectors. Requires the store to
+have been created with `semantic_search_enabled = true` and `embedding_fields`
+set, a cluster index loaded at startup (`semantic_search.cluster_path`), and the
+external embedding service reachable. Because vector indexing is
+[asynchronous](#semantic-search-async-vector-indexing), a document written moments
+earlier may not be searchable yet. Candidates whose document has since been
+deleted are dropped, so every hit resolves to a live document.
+
+#### `POST /stores/{ns}/semantic-search`
+
+Embed `query` and return the top-k most similar documents.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | yes | Query text to embed and search |
+| `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
+| `page_size` | integer | no | Page size (default: 20). Also accepts `limit` as a query-param alias; `page_size` wins if both are given. |
+| `page_no` | integer | no | 1-based page number (default: 1) |
+
+```bash
+curl -X POST http://localhost:8080/stores/profiles/semantic-search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "senior engineer with distributed systems experience", "top_k": 5}'
+```
+
+Response — ranked highest-similarity first, plus the pagination envelope:
+
+```json
+{
+  "results": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "dot_product": 0.94,
+      "error_bound": 0.02,
+      "document": {"name": "Alice", "status": "active", "bio": "…"}
+    }
+  ],
+  "page_no": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Document key, serialised according to the namespace's `key_type` |
+| `dot_product` | Estimated cosine similarity to the query (higher = more similar) |
+| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
+| `document` | The stored document (never `null` — orphaned index entries are filtered out) |
+
+---
+
+#### `POST /stores/{ns}/semantic-search/filtered`
+
+Same as above, but only documents that also satisfy an index `predicate` are
+eligible. The predicate uses the same [syntax](#predicate-syntax) as
+`POST /stores/{ns}/query`, so only indexed fields may appear in it.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | yes | Query text to embed and search |
+| `predicate` | string | yes | Index predicate candidates must satisfy |
+| `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
+| `page_size` | integer | no | Page size (default: 20). `limit` query param is an alias. |
+| `page_no` | integer | no | 1-based page number (default: 1) |
+
+```bash
+curl -X POST http://localhost:8080/stores/profiles/semantic-search/filtered \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "senior engineer with distributed systems experience",
+    "predicate": "status = \"active\""
+  }'
+```
+
+The response shape is identical to the unfiltered endpoint.
 
 ---
 

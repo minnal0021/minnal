@@ -256,7 +256,7 @@ The structure's other properties:
 - Up to **32 levels**, with probabilistic height assignment.
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
 - **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
-- Key ordering uses **SIMD-accelerated byte comparison** (via `mm3h` with AVX).
+- Key ordering uses **SIMD-accelerated byte comparison** (`compare_bytes_simd`): AVX2/AVX512 on x86_64, scalar on aarch64/Apple Silicon (this comparator has no NEON path — but the field-index bitmap kernels and vector search do use NEON). Bucket assignment separately hashes the key prefix with `mm3h` (AVX on x86_64).
 - A monotonic **`u32` sequence counter** records insertion order within the table.
 
 ### Sharding
@@ -687,7 +687,7 @@ Each design choice in MinnalDB pays off as a specific performance property:
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
 | 16-bucket sharding | 16× parallel GC and compaction; 16× write parallelism |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
-| SIMD key comparison | Faster skip-list traversal on modern CPUs |
+| SIMD key comparison | Faster skip-list traversal on x86_64 (AVX2/AVX512; scalar on Apple Silicon). Field-index bitmap ops use NEON on aarch64. |
 | `rkyv` zero-copy serialization | No deserialization overhead on typed reads |
 | Epoch-based memory reclamation | Lock-free L0 cleanup without stopping readers |
 

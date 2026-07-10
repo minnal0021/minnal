@@ -19,7 +19,7 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 | `src/blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store (same layout as `ContainerStore`); holds each `FieldIndex`'s serialised bitmaps off-heap. Also defines the `pub(crate) GrowableMmap` helper that `RowMap` reuses (`ContainerStore` keeps its own private one) |
 | `src/rowmap.rs` | `RowMap` — per-namespace dense row-ID map (`key↔id` + counter), mmap sidecar |
 | `src/storage.rs` | `serialize` / `deserialize` — `RoaringBitmap` ⇄ bytes (length-prefixed, rkyv per `Container`) for blob storage |
-| `src/simd_support/` | SIMD helpers for container set ops (popcount, bitwise, array merge, extract) |
+| `src/simd_support/` | SIMD helpers for container set ops (popcount, bitwise, array merge, extract, sum, run-bitset). Each kernel has AVX-512/AVX2 (x86_64, runtime-detected) **and NEON (aarch64/Apple Silicon, baseline, compile-time)** paths plus a scalar fallback; all are unit-tested against the scalar reference. When adding a kernel, provide all three or guard the missing arch with `cfg`. |
 
 ## How it works
 

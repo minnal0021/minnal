@@ -197,6 +197,14 @@ promoting or demoting as needed. The hot loops lean on the SIMD helpers in
 `src/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, and bit
 extraction.
 
+Each helper carries three implementations selected per target: **AVX-512** and
+**AVX2** on x86_64 (chosen at runtime via `is_x86_feature_detected!`, so one
+binary runs correctly on any x86 CPU), **NEON** on aarch64 (Apple Silicon / ARM64
+— NEON is baseline on every aarch64 target, so it is compiled in unconditionally
+with no runtime probe), and a portable **scalar** fallback everywhere else and for
+the sub-vector tail. All three are unit-tested against the scalar reference, so
+the vectorised paths are drop-in equivalents that only change speed, not results.
+
 ### 3.3 `ContainerStore` — the mmap backing
 
 Each `RoaringBitmap`'s containers live in a `ContainerStore`
