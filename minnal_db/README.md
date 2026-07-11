@@ -4,6 +4,12 @@ MinnalDB is an embedded, high-performance key-value store written in Rust. Its d
 
 > **Platform support:** Linux and macOS only. Windows is not supported — the WAL relies on Unix positional I/O (`pread`/`pwrite`) for safe concurrent access without a global file lock.
 
+> **Just want to use it?** This document is the engine's internal design
+> reference — it walks through the storage internals in depth. If you want to
+> add `minnal_db` to your project and start writing code, go straight to the
+> **[Embedded Quickstart](QUICKSTART.md)** instead; come back here when you
+> want to know *why* it works the way it does.
+
 ## Table of Contents
 
 - [Design Inspiration](#design-inspiration)
@@ -198,7 +204,7 @@ The WAL is the safety net beneath every write. It is a single, global, append-on
 
 **Durability model (deliberate — do not "optimise" with group commit).** Every `put`/`delete` `fsync`s the WAL *before returning*, so each acknowledged write is durable against power loss the moment the call returns. The engine intentionally does **not** group-commit independent writes — that is, it never defers or batches their WAL `fsync`. Doing so would let a write be acknowledged before it reached stable storage, so a power loss in that window would silently lose a write the caller believed had succeeded. (Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL already holds a durable copy that recovery can replay.)
 
-Each WAL entry is length-prefixed, CRC-protected, and `rkyv`-serialized:
+Each WAL entry is length-prefixed, checksummed, and stored in a compact binary format:
 
 ```
 [size: 4B] [rkyv-serialized WalEntry] [CRC32: 4B]
@@ -256,7 +262,7 @@ The structure's other properties:
 - Up to **32 levels**, with probabilistic height assignment.
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
 - **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
-- Key ordering uses **SIMD-accelerated byte comparison** (via `mm3h` with AVX).
+- Key ordering uses **SIMD-accelerated byte comparison** on x86_64 (a plain scalar comparison on Apple Silicon — see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
 - A monotonic **`u32` sequence counter** records insertion order within the table.
 
 ### Sharding
@@ -289,7 +295,7 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 
 **Each namespace is self-contained.** It has its own LSM tree (skip list, L0 files, L1 SSTables), its own sharded value log (`num_buckets` shards), and its own on-disk directory at `<db_path>/ns_<name>/`. Keys in one namespace are invisible to another. (Maintenance — GC, LSM compaction, and TTL expiry — is run by single global workers that fan out over the namespaces, not one worker per namespace; see [Background Workers](#background-workers).)
 
-**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent, `rkyv`-serialized file that maps names to numeric IDs. The registry makes two guarantees worth relying on: the default namespace is always ID `0`, and IDs are assigned monotonically and **never reused**, even after a namespace is deleted. The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
+**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to numeric IDs. The registry makes two guarantees worth relying on: the default namespace is always ID `0`, and IDs are assigned monotonically and **never reused**, even after a namespace is deleted. The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
 
 **Dropping a namespace** (`remove_namespace`) reclaims its storage and is carefully ordered so that it is crash-safe:
 
@@ -418,7 +424,7 @@ LSM compaction runs when a memtable fills (95% capacity) or on the compaction wo
 1. The active MemTable is sealed, becoming a read-only table.
 2. A background worker flushes that sealed table to per-bucket L0 files.
 3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable.
-4. The old L0 files are removed once every reader has released its epoch reference (via `crossbeam-epoch`), so a concurrent read is never pulled out from under.
+4. The old L0 files are removed only once every in-flight read has finished with them, so a concurrent read is never pulled out from under.
 
 ### Value Log GC
 
@@ -492,7 +498,7 @@ db.delete(b"hello")?;
 // Iteration
 for (key, value) in db.iter()? { ... }
 for (key, value) in db.scan_prefix(b"user:")? { ... }
-for (key, value) in db.range(b"a"..b"z")? { ... }
+for (key, value) in db.range(b"a", Some(b"z"))? { ... }
 
 // Namespaces
 let ns = db.namespace("orders")?;
@@ -505,7 +511,7 @@ let v = db.get_typed::<MyKey, MyValue>(&my_key)?;
 // Maintenance
 db.garbage_collect()?;
 db.compact()?;
-println!("waste ratio: {:.1}%", db.waste_ratio()? * 100.0);
+println!("waste ratio: {:.1}%", db.waste_ratio() * 100.0);
 ```
 
 ### Asynchronous
@@ -514,12 +520,12 @@ println!("waste ratio: {:.1}%", db.waste_ratio()? * 100.0);
 use minnal_db::AsyncDb;
 
 let db = AsyncDb::open("/tmp/mydb").await?;
-db.put(b"hello", b"world").await?;
-let val = db.get(b"hello").await?;
+db.put(b"hello".to_vec(), b"world".to_vec()).await?;
+let val = db.get(b"hello".to_vec()).await?;
 
-let ns = db.namespace("events").await?;
-ns.put(b"e1", b"click").await?;
-ns.put(b"e2", b"scroll").await?;
+let ns = db.namespace("events".to_string()).await?;
+ns.put(b"e1".to_vec(), b"click".to_vec()).await?;
+ns.put(b"e2".to_vec(), b"scroll".to_vec()).await?;
 ```
 
 ### TTL
@@ -544,29 +550,27 @@ ns.put(b"sess:abc".to_vec(), b"user=42".to_vec()).await?;
 
 MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
 
-It sits beneath the rest of the stack, with the dependency direction strictly downward:
+`minnal_db` is a **single crate**; the document and semantic-search layers are
+folded in as cargo features (`doc-store`, `semantic-search`) that you opt into.
+The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
+secondary (field-level) indexing is a capability of the engine itself, not
+something layered on by the document store.
 
-```
-minnal_doc_store_api   (REST server)
-    └── minnal_doc_store   (JSON schema, document CRUD, semantic search)
-            └── minnal_db   ← this crate: embedded LSM + value-log KV engine
-                    └── index   (RoaringBitmap field indexing + predicate evaluator)
-```
+### What each feature adds
 
-`minnal_db` has no knowledge of the document or semantic-search layers above it. The one workspace crate it depends on is `index`, because **secondary (field-level) indexing is a built-in capability of the KV engine itself**, not something layered on by the document store.
-
-### What an embedded store can and cannot do
-
-| Capability | Where it lives | Embeddable via `minnal_db`? |
+| Capability | Feature | Extra deps |
 |---|---|---|
-| Key-value CRUD, namespaces, TTL, typed (rkyv) values | `minnal_db` | ✅ Yes |
-| RoaringBitmap **field/secondary index** + predicate query DSL | `index`, wired into `minnal_db` | ✅ Yes |
-| JSON schema, document lifecycle, extractor generation | `minnal_doc_store` | ❌ No — higher layer |
-| Semantic / vector (IVF + RaBitQ) search | `semantic_search` + `minnal_doc_store` | ❌ No — higher layer |
+| Key-value CRUD, namespaces, TTL, typed (zero-copy) values | `kv-store` (default) | — |
+| RoaringBitmap **field/secondary index** + predicate query DSL | `kv-store` (default) | — |
+| Quantised IVF + RaBitQ vector search (on raw KV or documents) | `semantic-search` | `reqwest`, `simsimd`, `rayon`, `futures` |
+| JSON schema, document lifecycle, extractor generation | `doc-store` | `json_dotpath` |
 
-Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, bincode, rkyv, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what `minnal_doc_store` adds on top; the indexing machinery itself is engine-level.
+Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, Protocol Buffers, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what the `doc-store` feature adds on top; the indexing machinery itself is engine-level.
 
-> **Not published to crates.io.** Because `index` is a path dependency, embedding `minnal_db` elsewhere means pulling in both crates (via path or git), not `cargo add minnal_db`. **Platform:** Linux and macOS only (`pread`/`pwrite`).
+> **Publishable single crate.** Depend on `minnal_db` and select features:
+> `minnal_db = { version = "0.1", features = ["doc-store"] }`. See
+> [`QUICKSTART.md`](QUICKSTART.md) for the full feature matrix. **Platform:**
+> Linux and macOS only (`pread`/`pwrite`).
 
 ### Field-Level Indexing
 
@@ -689,9 +693,22 @@ Each design choice in MinnalDB pays off as a specific performance property:
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
 | 16-bucket sharding | 16× parallel GC and compaction; 16× write parallelism |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
-| SIMD key comparison | Faster skip-list traversal on modern CPUs |
-| `rkyv` zero-copy serialization | No deserialization overhead on typed reads |
+| SIMD key comparison | Faster skip-list traversal on x86_64. See [SIMD coverage by architecture](#simd-coverage-by-architecture) below for the Apple Silicon story. |
+| Zero-copy serialization | No deserialization overhead on typed reads |
 | Epoch-based memory reclamation | Lock-free L0 cleanup without stopping readers |
+
+### SIMD coverage by architecture
+
+minnal targets both x86_64 and Apple Silicon (aarch64/ARM64). Not every hot path has a hand-written vector version for both — this table is the accurate picture of what's accelerated where:
+
+| Subsystem | x86_64 | Apple Silicon | Notes |
+|---|---|---|---|
+| Field-index bitmap operations (AND/OR/NOT, popcount, merge) | AVX-512 → AVX2 → scalar | NEON | Detected automatically at build/run time; both paths are unit-tested against a scalar reference |
+| Vector search distance math | AVX-512 / AVX2 | NEON / SVE | Provided by the `simsimd` library |
+| Skip-list key comparison | AVX-512 / AVX2 | Plain scalar loop | No NEON version yet — correct, just not vectorised on Apple Silicon |
+| Bucket-assignment hashing | AVX | Portable scalar path | From the `mm3h` hashing library |
+
+In short: on Apple Silicon, field-index queries and vector search get their full SIMD speed-up; ordinary key comparisons and hashing currently run the portable fallback. All fallback paths are correctness-equivalent — this is a speed difference, not a behavioural one.
 
 ### Expected throughput
 

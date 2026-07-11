@@ -2,6 +2,8 @@
 
 WiscKey-style embedded store: keys live in an LSM tree, values in a separate value log, reducing write amplification for large values.
 
+> **This file covers the KV engine (`src/db`, `src/store`, `src/support`).** `minnal_db` is a single feature-gated crate that also folds in `src/index/` (field indexing, always on), `src/semantic_search/` + `src/vector_kv.rs` (`#[cfg(semantic-search)]`), and `src/doc_store/` (`#[cfg(doc-store)]`). See the root `CLAUDE.md` for the feature model and the folded modules' own `CLAUDE.md` files.
+
 ## Key files
 
 | File | Role |
@@ -59,7 +61,7 @@ These are load-bearing; preserve them when touching the store/GC paths:
 Two families of multi-key reads, differing in **memory profile**:
 
 - **Unbounded** — `scan_prefix_batch` / `scan_range_batch` (facade: `scan_prefix` / `range`) materialise the *entire* matching result set — keys **and all values** — in one `Vec`. Memory scales with total matches. Use only when the result is known-small or genuinely needs to be whole.
-- **Bounded (cursor-paginated)** — `scan_page_batch(cursor, end, limit)` (facade: `Namespace::scan` / `AsyncNamespace::scan`) returns at most `limit` pairs plus a `next_cursor` (the raw key the next page starts at, or `None` at the end). **Each page resolves only its own values**, so peak memory is O(page), not O(total). Prefer this for anything user-facing or unbounded. `end` (exclusive) bounds the scan to `[cursor, end)`; a prefix scan passes the prefix's upper bound (`minnal_doc_store::prefix_upper_bound`) as `end` so it stops at the prefix instead of walking the keyspace tail.
+- **Bounded (cursor-paginated)** — `scan_page_batch(cursor, end, limit)` (facade: `Namespace::scan` / `AsyncNamespace::scan`) returns at most `limit` pairs plus a `next_cursor` (the raw key the next page starts at, or `None` at the end). **Each page resolves only its own values**, so peak memory is O(page), not O(total). Prefer this for anything user-facing or unbounded. `end` (exclusive) bounds the scan to `[cursor, end)`; a prefix scan passes the prefix's upper bound (`minnal_db::prefix_upper_bound`) as `end` so it stops at the prefix instead of walking the keyspace tail.
 
 Semantics: cursor pagination is **read-committed across the walk**, not a point-in-time snapshot — a key deleted/overwritten between pages reflects the newer state (each page is its own generation-stable read + `refetch_dropped` fallback). Acceptable here because writes are single-op (no transactions).
 

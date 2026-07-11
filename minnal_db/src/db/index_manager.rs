@@ -90,7 +90,7 @@ impl IndexManager {
     /// `{field_path}/checkpoint` using a durable tmp-then-rename write: the tmp
     /// file is fsynced before the rename (so its bytes are on disk) and the field
     /// directory is fsynced after (so the rename itself survives a crash). This
-    /// matches [`RowMap::write_marker`](index::RowMap) — without it a crash could
+    /// matches [`RowMap::write_marker`](crate::index::RowMap) — without it a crash could
     /// expose a renamed but torn checkpoint whose garbage offset, if read back as
     /// greater than the WAL tail, would make recovery *skip* replay and silently
     /// drop index entries.

@@ -45,9 +45,29 @@
 //! }
 //! ```
 
+// minnal_db's storage engine relies on Unix positional I/O (`pread`/`pwrite`,
+// via `std::os::unix::fs::FileExt`) and the server on POSIX signals. Windows is
+// unsupported; fail early with a clear message rather than a cryptic
+// `unresolved import std::os::unix` further down.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
+
 pub mod db;
 mod store;
 mod support;
+
+// ── Folded layers ─────────────────────────────────────────────────────────────
+// `index` is part of the base engine (field indexing is core). `semantic_search`
+// and `doc_store` are opt-in via cargo features.
+#[cfg(feature = "doc-store")]
+pub mod doc_store;
+pub mod index;
+#[cfg(feature = "semantic-search")]
+pub mod semantic_search;
+// Vector-index storage bridge (`DbVectorStore`, upsert/delete, query-embedding
+// cache) over raw namespaces — usable with `kv-store` alone, no `doc-store`.
+#[cfg(feature = "semantic-search")]
+pub mod vector_kv;
 
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 
@@ -98,14 +118,14 @@ pub use db::error::KVError;
 // ── Index types ───────────────────────────────────────────────────────────────
 
 /// Discriminant used when registering a field index.
-pub use index::IndexValueType;
+pub use crate::index::IndexValueType;
 
 /// A typed field value extracted from a document by an extractor closure.
-pub use index::IndexValue;
+pub use crate::index::IndexValue;
 
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
 /// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
-pub use index::IndexBlobStats;
+pub use crate::index::IndexBlobStats;
 
 /// Unique identifier for a registered field within a namespace.
 pub use db::namespace::FieldId;
@@ -169,6 +189,24 @@ pub use store::value_log::sharded::ShardPhysicalStats;
 
 /// Per-page value-log garbage breakdown, returned by [`Db::value_log_page_stats`].
 pub use store::value_log::PageGarbageStats;
+
+// ── Document store (folded layer) ─────────────────────────────────────────────
+//
+// The full `doc_store` and `semantic_search` module trees are public modules
+// above (`minnal_db::doc_store::…`, `minnal_db::semantic_search::…`). These
+// re-export the most-used document-store types at the crate root for ergonomics.
+// Engine diagnostic types (`KVError`, `Stats`, manifests, …) are intentionally
+// NOT re-listed here — they already live at the crate root.
+#[cfg(feature = "doc-store")]
+pub use doc_store::{
+    AttributeDef, AttributeType, CursorPage, DiskBuildProgress, DocId, DocStore, DocStoreError, DocStoreSchema, IndexBuildHandle, IndexBuildManager,
+    IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, Page, Pagination,
+    SchemaAmendment, SchemaError, StoreType, prefix_upper_bound,
+};
+
+// Document-store types that only exist alongside `semantic-search`.
+#[cfg(all(feature = "doc-store", feature = "semantic-search"))]
+pub use doc_store::{QueueEntry, ReindexStats, SemanticSearchContext, VecReindexProgress, VectorIndexConfig, VectorReindexOutcome};
 
 // ── rkyv re-exports (for typed API) ──────────────────────────────────────────
 

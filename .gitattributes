@@ -1,2 +1,2 @@
-tools/sample_data/sample_data.jsonl filter=lfs diff=lfs merge=lfs -text
+minnal_tools/sample_data/sample_data.jsonl filter=lfs diff=lfs merge=lfs -text
 service/embedding_support/**/clusters.json filter=lfs diff=lfs merge=lfs -text

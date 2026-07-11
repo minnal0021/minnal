@@ -1,24 +1,24 @@
 # minnal — Quickstart & Usage Guide
 
-A practical walkthrough of every way to use minnal: build the binaries, then
-exercise each part of the API. For what minnal *is* — the architecture, the
-five layers, and the design of the storage engine and semantic search — see the
-[main README](README.md).
+A practical walkthrough of running minnal as a **REST service**: build the
+server, start it, load data, and query it. The complete endpoint-by-endpoint
+REST reference lives in the [API server README](minnal_db_api/README.md) — this
+guide points into it rather than repeating it. For **embedded** (in-process)
+use, add the `minnal_db` crate to your Rust app and follow the
+[Embedded Quickstart](minnal_db/QUICKSTART.md) instead. For what minnal *is* —
+its architecture and design — see the [main README](README.md).
 
-Minnal can be used along **two axes** — how you run it (embedded in-process, or
-as a REST service) and which **store type** you talk to (a JSON *document store*,
-or a schema-lite *KV store*):
+The server exposes two **store types** under one unified `/stores` route tree,
+chosen by a `store_type` field at creation:
 
-| Mode | Document store | KV store |
+| Store type | Holds | Highlights |
 |---|---|---|
-| **Embedded** — link `minnal_db` directly into a Rust process | ❌ Not available — the document model is a higher layer | ✅ Key-value CRUD, TTL, typed values, **RoaringBitmap field index + predicate queries** |
-| **Service (REST)** — run `minnal_doc_store_api` | ✅ Full: CRUD, predicate queries, **semantic search** | ✅ CRUD, range/prefix scans, optional **semantic search** |
+| **Document store** (`store_type: "doc"`) | JSON documents under a typed key (`uuid` / `u64` / `u128`) | RoaringBitmap field-index predicate queries; optional semantic search |
+| **KV store** (`store_type: "kv"`) | raw typed key-value data (`str`/`int` keys; `str`/`int`/`f32`/`vec_f32` values) | range & prefix scans; optional semantic search on string values |
 
-The two modes share the same engine — everything below the REST boundary is the
-same code whether you call it in-process or over HTTP. The rest of this guide is
-organised by mode: the [fastest end-to-end path](#getting-started-bulk-load-a-store-and-query-it)
-first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, then
-[embedded](#using-minnal-embedded-as-a-library) use.
+Both store types share the same engine and durability guarantees. This guide
+starts with the [fastest end-to-end path](#getting-started-bulk-load-a-store-and-query-it),
+then the full [service walkthrough](#using-minnal-as-a-service-rest).
 
 ## Table of Contents
 
@@ -27,20 +27,12 @@ first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, the
 - [Using minnal as a Service (REST)](#using-minnal-as-a-service-rest)
   - [Start the Server](#start-the-server)
   - [Configuration](#configuration)
-  - [Document Stores](#document-stores)
-    - [Store Lifecycle](#store-lifecycle)
-    - [Document CRUD](#document-crud)
-    - [Predicate Queries](#predicate-queries)
-    - [Semantic Search](#semantic-search)
-    - [Index Management](#index-management)
-  - [KV Stores](#kv-stores)
+  - [Document and KV Stores (REST API)](#document-and-kv-stores-rest-api)
   - [Bulk Loading](#bulk-loading)
   - [Admin and Monitoring](#admin-and-monitoring)
   - [Logging](#logging)
   - [Write Durability and Recovery](#write-durability-and-recovery)
 - [Using minnal Embedded (as a Library)](#using-minnal-embedded-as-a-library)
-  - [What an embedded store can and cannot do](#what-an-embedded-store-can-and-cannot-do)
-  - [Field-Level Indexing](#field-level-indexing)
 - [Scripts and Config](#scripts-and-config)
   - [Server scripts](#server-scripts)
   - [Example scripts](#example-scripts)
@@ -56,8 +48,8 @@ first, then the full [service](#using-minnal-as-a-service-rest) walkthrough, the
 cargo build
 
 # Build optimised binaries
-cargo build --release -p minnal_doc_store_api
-cargo build --release -p tools     # minnal_tools (bulk_load, …)
+cargo build --release -p minnal_db_api
+cargo build --release -p minnal_tools     # minnal_tools (bulk_load, …)
 ```
 
 > **Semantic search needs an external embedding service.** Everything else —
@@ -94,11 +86,11 @@ minimal — one index field (`agency`) and one semantic-search field (`jobTitle`
 ./work/bin/start.sh
 ```
 
-The `-s` flag stages [`tools/sample_data/`](tools/sample_data) into
+The `-s` flag stages [`minnal_tools/sample_data/`](minnal_tools/sample_data) into
 `./work/sample_data/`, including the two files this quickstart uses:
 `jobs-mini-schema.json` and `jobs-mini.jsonl` (ten rows). It also stages a
 KV-store sample — `job-content-kv-schema.json` and `job-content-kv.jsonl` (twenty
-long job descriptions) — used by the [KV Stores](#kv-stores) bulk-load example.
+long job descriptions) — used by the [Bulk Loading](#bulk-loading) KV example.
 
 **2. Look at the schema**
 
@@ -161,7 +153,7 @@ curl -s -X POST http://localhost:8080/stores/jobs/query \
 > asynchronously by an embedding service (default `http://localhost:8001`).
 > **Without it, the load and all attribute queries above still work** — only
 > `POST /stores/jobs/semantic-search` returns nothing until embeddings exist. See
-> [Semantic Search](#semantic-search) below to enable it.
+> [semantic search](minnal_db_api/README.md#semantic-search-document-stores) to enable it.
 
 For the full `bulk_load` reference (KV stores, existing namespaces, `--no-wal`),
 see [Bulk Loading](#bulk-loading).
@@ -204,7 +196,7 @@ the workspace root.
 
 ```bash
 # Debug build and run directly
-cargo run -p minnal_doc_store_api -- config/sample.toml
+cargo run -p minnal_db_api -- config/sample.toml
 ```
 
 The server listens on `0.0.0.0:8080` by default (configurable via
@@ -280,236 +272,27 @@ number_of_bits_for_dense_quantisation = 8
 The config file is located by (in order): first CLI argument → `MINNAL_CONFIG_FILE`
 env var → built-in defaults.
 
-### Document Stores
+### Document and KV Stores (REST API)
 
-A document store holds JSON documents keyed by `uuid`, `u64`, or `u128`, with up
-to five typed field indices and optional semantic search.
+Both store kinds live under the unified `/stores` route tree, selected by a
+`store_type` field at creation. Rather than repeat every endpoint here, this
+guide defers to the **[API server README](minnal_db_api/README.md)**, which
+documents each route with its request/response schema:
 
-#### Store Lifecycle
+- **Document stores** — [store lifecycle](minnal_db_api/README.md#store-lifecycle),
+  [document CRUD](minnal_db_api/README.md#document-crud),
+  [predicate queries](minnal_db_api/README.md#queries),
+  [semantic search](minnal_db_api/README.md#semantic-search-document-stores), and
+  [index management](minnal_db_api/README.md#index-management).
+- **KV stores** — [creation](minnal_db_api/README.md#kv-store-creation),
+  [CRUD](minnal_db_api/README.md#kv-crud),
+  [range](minnal_db_api/README.md#kv-range-scan) / [prefix](minnal_db_api/README.md#kv-prefix-scan)
+  scans, and [semantic search](minnal_db_api/README.md#kv-semantic-search).
 
-```bash
-# Create a store with UUID keys, two indices, and semantic search
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "namespace": "profiles",
-    "store_type": "doc",
-    "key_type": "uuid",
-    "semantic_search_enabled": true,
-    "embedding_fields": ["bio"],
-    "indices": [
-      {"field": "status",   "index_type": "str"},
-      {"field": "seniority","index_type": "str"}
-    ],
-    "attributes": [
-      {"name": "name",  "attr_type": "str"},
-      {"name": "email", "attr_type": "str", "description": "primary contact"},
-      {"name": "bio",   "attr_type": "str", "description": "embedded for semantic search"}
-    ]
-  }'
-# → 201 Created
-
-# List all stores
-curl -s http://localhost:8080/stores
-
-# Amend a non-indexed attribute
-curl -s -X PATCH http://localhost:8080/stores/profiles/schema \
-  -H 'Content-Type: application/json' \
-  -d '{"op": "add_attribute", "name": "team", "attr_type": "str"}'
-# → 204 No Content
-
-# Drop a store (irreversible)
-curl -s -X DELETE http://localhost:8080/stores/profiles
-# → 204 No Content
-```
-
-Schema amendment operations: `add_attribute`, `update_attribute`,
-`remove_attribute`. Indexed fields cannot be amended directly — drop the index
-first.
-
-#### Document CRUD
-
-```bash
-# Insert (upsert)
-curl -s -X PUT \
-  "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "Alice",
-    "status": "active",
-    "seniority": "senior",
-    "bio": "distributed systems engineer with a focus on storage engines"
-  }'
-# → 204 No Content
-
-# Read by ID
-curl -s "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000"
-# → {"name":"Alice","status":"active","seniority":"senior","bio":"..."}
-
-# Delete
-curl -s -X DELETE \
-  "http://localhost:8080/stores/profiles/docs/550e8400-e29b-41d4-a716-446655440000"
-# → 204 No Content
-
-# Range scan (key order, inclusive start, exclusive end)
-curl -s "http://localhost:8080/stores/profiles/docs?start=00000000-0000-0000-0000-000000000000"
-# → [{"id":"550e8400-...","doc":{...}}, ...]
-```
-
-#### Predicate Queries
-
-Only indexed fields may appear in predicates. Operators: `=`, `!=`, `<`, `<=`,
-`>`, `>=`, `AND`, `OR`, `NOT`.
-
-```bash
-curl -s -X POST http://localhost:8080/stores/profiles/query \
-  -H 'Content-Type: application/json' \
-  -d '{"predicate": "status = \"active\" AND seniority = \"senior\""}'
-# → [{"id":"550e8400-...","doc":{...}}, ...]
-```
-
-#### Semantic Search
-
-Semantic search requires:
-- The store was created with `"semantic_search_enabled": true` — a doc store also needs `"embedding_fields"` set; a `value_type = str` KV store embeds the stored string directly.
-- A cluster centroids file is configured and loaded at startup (`[semantic_search] cluster_path = …`).
-- An embedding service is reachable at the configured URL.
-
-```bash
-# Unfiltered — all candidates ranked by similarity
-curl -s -X POST http://localhost:8080/stores/profiles/semantic-search \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "senior engineer with distributed systems experience"}'
-
-# Filtered — ANN scoring restricted to documents that pass the predicate
-curl -s -X POST http://localhost:8080/stores/profiles/semantic-search/filtered \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": "senior engineer with distributed systems experience",
-    "predicate": "status = \"active\""
-  }'
-```
-
-Response (both endpoints) — ordered array, highest similarity first:
-
-```json
-[
-  {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "dot_product": 0.94,
-    "error_bound": 0.02,
-    "cluster_id": 7,
-    "is_primary": true
-  }
-]
-```
-
-| Field | Meaning |
-|---|---|
-| `dot_product` | Estimated cosine similarity to the query (higher = more similar) |
-| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
-| `cluster_id` | IVF cluster this document was indexed under |
-| `is_primary` | `true` if the document's cluster is the closest cluster to the query |
-
-#### Index Management
-
-```bash
-# Add an index (returns 202; background rebuild if documents already exist)
-curl -s -X POST http://localhost:8080/stores/profiles/indices \
-  -H 'Content-Type: application/json' \
-  -d '{"field": "team", "index_type": "str"}'
-# → 202 Accepted
-
-# Monitor rebuild progress (per namespace)
-curl -s http://localhost:8080/admin/indices/profiles/progress
-# → {"attribute_builds":[{"id":{"Field":{"namespace":"profiles","field":"team"}},"status":"Running","total":50000,"indexed":12340,...}],"vector_progress":[...]}
-
-# Drop a field index (background cleanup, field becomes a plain attribute)
-curl -s -X DELETE http://localhost:8080/stores/profiles/indices/team
-# → 202 Accepted
-
-# Drop the vector index (disables semantic search, background cleanup)
-curl -s -X DELETE http://localhost:8080/stores/profiles/indices/vector
-# → 202 Accepted
-
-# Admin: drop + rebuild all field indices for a namespace
-curl -s -X POST http://localhost:8080/admin/indices/profiles/attribute/reindex-all
-# → 202 Accepted
-```
-
-### KV Stores
-
-A KV store is a schema-lite namespace for raw key-value data. It has no field
-indices but supports the same WAL durability, LSM compaction, value-log GC, and
-optional semantic search as document stores.
-
-```bash
-# Create a KV store (str key → str value)
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
-# → 201 Created
-
-# Create a KV store with semantic search (str key → str value, ANN enabled)
-curl -s -X POST http://localhost:8080/stores \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace": "product-descriptions", "store_type": "kv", "key_type": "str", "value_type": "str",
-       "semantic_search_enabled": true}'
-# → 201 Created
-
-# List all stores (doc and KV; each entry carries its store_type)
-curl -s http://localhost:8080/stores
-
-# Write a value
-curl -s -X PUT http://localhost:8080/stores/session-cache/kv/user-42 \
-  -H 'Content-Type: application/json' \
-  -d '"eyJhbGciOiJIUzI1NiJ9..."'
-# → 204 No Content
-
-# Read a value
-curl -s http://localhost:8080/stores/session-cache/kv/user-42
-# → "eyJhbGciOiJIUzI1NiJ9..."
-
-# Delete a key
-curl -s -X DELETE http://localhost:8080/stores/session-cache/kv/user-42
-# → 204 No Content
-
-# Range scan — entries with keys "user-10" through "user-20" (exclusive end)
-curl -s "http://localhost:8080/stores/session-cache/kv?start=user-10&end=user-21"
-# → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":2}
-
-# Prefix scan — all entries whose key starts with "user-"
-curl -s "http://localhost:8080/stores/session-cache/kv/prefix?prefix=user-"
-# → {"results":[{"key":"user-10","value":"..."},...],"page_no":1,"page_size":20,"total":3}
-
-# Semantic search (value_type = str, semantic_search_enabled = true only)
-curl -s -X POST http://localhost:8080/stores/product-descriptions/kv/semantic-search \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "lightweight waterproof running shoes", "top_k": 5}'
-
-# Drop a KV store (irreversible)
-curl -s -X DELETE http://localhost:8080/stores/session-cache
-# → 204 No Content
-```
-
-**Key and value types:**
-
-| `key_type` | URL path segment format |
-|-----------|------------------------|
-| `str` | any UTF-8 string |
-| `int` | decimal integer (stored big-endian for ordered scans) |
-
-| `value_type` | JSON body format |
-|-------------|-----------------|
-| `str` | JSON string: `"hello"` |
-| `int` | JSON integer: `42` |
-| `f32` | JSON number: `3.14` |
-| `vec_f32` | JSON array of numbers: `[1.0, -0.5, 0.25]` |
-
-To populate a KV store from a JSONL file in one step, use `bulk_load --kv` — the
-release bundles a sample str→str store (`job-content-kv-schema.json` +
-`job-content-kv.jsonl`, 20 long job descriptions keyed by job id). See
-[Bulk Loading](#bulk-loading) below.
+For key/value type tables and the async vector-indexing model, see the
+[Concepts](minnal_db_api/README.md#concepts) section there. For a hands-on
+end-to-end example, see [Getting Started](#getting-started-bulk-load-a-store-and-query-it)
+above; to fill a store from a JSONL file, see [Bulk Loading](#bulk-loading) below.
 
 ### Bulk Loading
 
@@ -544,7 +327,7 @@ the field holding the document ID:
 ./work/bin/run_tool.sh bulk_load http://localhost:8080 profiles id profiles.jsonl
 
 # Development: build and run directly via cargo (instead of the staged binary)
-cargo run -p tools -- bulk_load http://localhost:8080 profiles id profiles.jsonl
+cargo run -p minnal_tools -- bulk_load http://localhost:8080 profiles id profiles.jsonl
 ```
 
 The `id_field` value is parsed according to the namespace's `key_type` (`u64`,
@@ -580,79 +363,20 @@ complete `bulk_load` walkthrough with a sample schema and rows.
 
 ### Admin and Monitoring
 
-The `/admin` routes are split into two groups:
+The `/admin` routes are for operations and monitoring — not application traffic —
+and split into two groups:
 
-- `/admin/storage/*` — storage engine diagnostics and GC/compaction triggers
-- `/admin/indices/*` — index monitoring and bulk index operations
+- `/admin/storage/*` — storage-engine diagnostics (health, value-log/LSM stats)
+  and GC / compaction / index-checkpoint triggers.
+- `/admin/indices/*` — index build progress, vector-queue inspection, and bulk
+  reindex / reconcile operations.
 
-They are intended for operations and monitoring — not application traffic.
-
-```bash
-# Liveness check
-curl http://localhost:8080/admin/storage/health
-# → {"status":"ok","uptime_s":42}
-
-# Value-log GC statistics
-curl http://localhost:8080/admin/storage/stats
-
-# LSM manifest (all namespaces)
-curl http://localhost:8080/admin/storage/lsm
-
-# All active index builds + vector progress across all namespaces
-curl http://localhost:8080/admin/indices/progress
-
-# Index progress for one namespace
-curl http://localhost:8080/admin/indices/products/progress
-# → {"attribute_builds":[...],"vector_progress":[{"namespace":"products","indexed_approx":970,"pending":10,"exhausted":2,"progress_pct":99.0}]}
-
-# Vector-index queue depth / lag by namespace
-curl http://localhost:8080/admin/indices/vector/queue/summary
-# → {"max_retries_configured":5,"total_pending":12,...}
-
-# All retried queue entries (retry_count > 0) across all namespaces
-curl http://localhost:8080/admin/indices/vector/queue/retried
-
-# Queue entries for one namespace
-curl http://localhost:8080/admin/indices/products/vector/queue
-
-# Retried entries for one namespace
-curl http://localhost:8080/admin/indices/products/vector/queue/retried
-
-# Remove a stuck queue entry (doc_id_hex from the listing above)
-curl -X DELETE \
-  http://localhost:8080/admin/indices/products/vector/queue/550e8400e29b41d4
-# → 204 No Content
-
-# Reset all exhausted entries for a namespace
-curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-failed
-# → {"retried":3}
-
-# Re-enqueue all docs for a fresh full vector rebuild
-curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
-# → 202 Accepted
-
-# Drop and rebuild all field indices for a namespace
-curl -X POST http://localhost:8080/admin/indices/products/attribute/reindex-all
-# → 202 Accepted
-
-# Trigger value-log GC
-curl -X POST http://localhost:8080/admin/storage/gc
-
-# Trigger LSM compaction
-curl -X POST http://localhost:8080/admin/storage/compact
-
-# Monitor field-index bitmap/keymap waste (decide if a checkpoint is worthwhile)
-curl http://localhost:8080/admin/storage/index-waste
-
-# Force an index checkpoint (flush + compact field indexes and row maps)
-curl -X POST http://localhost:8080/admin/storage/index-checkpoint
-```
-
-For the full admin API reference see
-[`minnal_doc_store_api/README.md`](minnal_doc_store_api/README.md). For a
-consolidated table of every metric these endpoints report — with explanations and
-whether each value survives a restart — see
-[Operational & Storage Metrics](minnal_doc_store_api/README.md#operational--storage-metrics).
+Every endpoint is documented in the
+[Admin Storage](minnal_db_api/README.md#admin-storage-api) and
+[Admin Indices](minnal_db_api/README.md#admin-indices-api) references. For a
+consolidated table of every metric these endpoints report — with explanations
+and whether each value survives a restart — see
+[Operational & Storage Metrics](minnal_db_api/README.md#operational--storage-metrics).
 
 ### Logging
 
@@ -687,19 +411,19 @@ the `[logging] level` value entirely:
 
 ```bash
 # Warnings and above only (quiet)
-RUST_LOG=warn ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=warn ./target/release/minnal_db_api config/sample.toml
 
 # Info level (default recommended)
-RUST_LOG=info ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=info ./target/release/minnal_db_api config/sample.toml
 
 # Debug messages
-RUST_LOG=debug ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=debug ./target/release/minnal_db_api config/sample.toml
 
 # Per-crate control — debug for the KV engine, info elsewhere
-RUST_LOG=info,minnal_db=debug ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=info,minnal_db=debug ./target/release/minnal_db_api config/sample.toml
 
 # Narrow to a single module
-RUST_LOG=minnal_db::db::database=trace ./target/release/minnal_doc_store_api config/sample.toml
+RUST_LOG=minnal_db::db::database=trace ./target/release/minnal_db_api config/sample.toml
 ```
 
 Level hierarchy (most → least verbose): `trace > debug > info > warn > error`.
@@ -708,7 +432,7 @@ The same variable works with the staged binary and `cargo run`:
 
 ```bash
 RUST_LOG=info ./work/bin/start.sh
-RUST_LOG=info cargo run -p minnal_doc_store_api -- config/sample.toml
+RUST_LOG=info cargo run -p minnal_db_api -- config/sample.toml
 ```
 
 ### Write Durability and Recovery
@@ -772,117 +496,15 @@ data is no longer needed.
 
 ## Using minnal Embedded (as a Library)
 
-The bottom layer, [`minnal_db`](README.md#layer-1--minnal_db-key-value-engine),
-is a standalone **embedded key-value store** you can link directly into any Rust
-process — no server, no daemon. You call `Db::open` (or `AsyncDb::open`) on a
-directory and get a durable, namespaced KV store with all background workers
-(compaction, value-log GC, WAL GC, TTL) running in-process.
+To embed minnal in a Rust process, add the `minnal_db` crate and call it
+in-process — no server, no daemon. Capabilities are selected by cargo feature
+(`kv-store` default, `doc-store`, `semantic-search`), so you compile only what
+you use and the lean default pulls no vector dependencies.
 
-The dependency direction is strictly downward — `minnal_db` knows nothing of the
-layers above it. Its one workspace dependency is `index`, because **secondary
-(field-level) indexing is a built-in capability of the KV engine itself**, not
-something the document store layers on.
-
-### What an embedded store can and cannot do
-
-| Capability | Where it lives | Embeddable via `minnal_db`? |
-|---|---|---|
-| Key-value CRUD, namespaces, TTL, typed (rkyv) values | `minnal_db` | ✅ Yes |
-| RoaringBitmap **field/secondary index** + predicate query DSL | `index`, wired into `minnal_db` | ✅ Yes |
-| JSON schema, document lifecycle, extractor generation | `minnal_doc_store` | ❌ No — higher layer |
-| Semantic / vector (IVF + RaBitQ) search | `semantic_search` + `minnal_doc_store` | ❌ No — higher layer |
-
-MinnalDB stores **opaque value bytes** — it never assumes a format. The field
-index is driven by an *extractor closure* you supply
-(`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of
-your own value encoding (JSON, bincode, rkyv, a fixed binary layout, …). Deriving
-those extractors from a JSON schema is precisely what `minnal_doc_store` adds on
-top; the indexing machinery itself is engine-level. See
-[`minnal_db/README.md`](minnal_db/README.md#minnaldb-as-an-embedded-store) for the
-full engine documentation.
-
-> **Not published to crates.io.** Because `index` is a path dependency, embedding
-> `minnal_db` elsewhere means pulling in both crates (via path or git), not
-> `cargo add minnal_db`. **Platform:** Linux and macOS only (`pread`/`pwrite`).
-
-### Field-Level Indexing
-
-The example below opens a store, indexes two fields (`status`, `age`), writes a
-few records keyed by `u64`, and runs a predicate query — all in-process, with no
-document-store layer involved. Here the values are a **typed `rkyv` struct**
-(`User`), so the extractors read the indexed fields straight off the zero-copy
-archive; the engine still only ever sees opaque value bytes.
-
-```rust
-use std::sync::Arc;
-use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
-use minnal_db::{
-    access, rancor, Archived, Db, ExtractorFn, IndexValue, IndexValueType, KVError,
-    DEFAULT_NAMESPACE_ID,
-};
-
-// The value type. Deriving the rkyv traits also generates `ArchivedUser`,
-// which the extractors below borrow zero-copy. The derive macros are
-// re-exported from minnal_db, so no direct rkyv dependency is needed for them.
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-struct User {
-    status: String,
-    age: i64,
-}
-
-fn main() -> Result<(), KVError> {
-    let db = Db::open("/tmp/users_db")?;
-
-    // 1. Declare which fields to index on the default namespace. Returns a FieldId.
-    //    The schema is persisted in config.json, so after a restart you only
-    //    re-activate (step 2) — you don't re-register.
-    let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
-    let age_field    = db.register_index_field(DEFAULT_NAMESPACE_ID, "age",    IndexValueType::Int)?;
-
-    // 2. Activate each field with an *extractor*: a closure that pulls the field
-    //    out of the raw stored value. minnal_db has no idea what your value bytes
-    //    mean — here they're an rkyv archive of `User`, so we borrow it zero-copy
-    //    with `access` and read the field off `ArchivedUser` (no full decode).
-    let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let user = access::<ArchivedUser, rancor::Error>(bytes).ok()?;
-        Some(IndexValue::Str(user.status.as_str().to_string()))
-    });
-    let age_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let user = access::<ArchivedUser, rancor::Error>(bytes).ok()?;
-        Some(IndexValue::Int(user.age.to_native()))
-    });
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor)?;
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor)?;
-
-    // 3. Write records with a plain `u64` key. Each put_typed rkyv-serialises key
-    //    and value, runs the extractors, and updates the RoaringBitmap indices
-    //    automatically — there is no separate "index" call.
-    db.put_typed(&1u64, &User { status: "active".into(),   age: 30 })?;
-    db.put_typed(&2u64, &User { status: "inactive".into(), age: 25 })?;
-    db.put_typed(&3u64, &User { status: "active".into(),   age: 42 })?;
-    db.put_typed(&4u64, &User { status: "active".into(),   age: 18 })?;
-
-    // 4. Query the index with the predicate DSL (=, !=, <, <=, >, >=, AND, OR,
-    //    BETWEEN, IN). Returns the raw (rkyv) key bytes of matching records.
-    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
-
-    // 5. Resolve matched keys: decode the archived u64, then get_typed the value.
-    for key in keys {
-        let id = access::<Archived<u64>, rancor::Error>(&key)
-            .expect("key is an archived u64")
-            .to_native();
-        if let Some(user) = db.get_typed::<u64, User>(&id)? {
-            println!("user {id} => status={}, age={}", user.status, user.age);
-        }
-    }
-    // → user 1 and user 3  (active AND age > 20; user 4 is active but 18, user 2 is inactive)
-
-    db.shutdown()?;
-    Ok(())
-}
-```
-
----
+See the dedicated **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — it covers
+feature selection as a table, the key-value and field-index APIs with runnable
+examples, and the document-store handle. Full engine internals are in
+[`minnal_db/README.md`](minnal_db/README.md).
 
 ## Scripts and Config
 
@@ -897,7 +519,7 @@ fn main() -> Result<(), KVError> {
 
 | Script | Purpose |
 |---|---|
-| `./work/bin/start.sh` | Start `minnal_doc_store_api` using the staged binary and `minnal.toml`. |
+| `./work/bin/start.sh` | Start `minnal_db_api` using the staged binary and `minnal.toml`. |
 | `./work/bin/run_tool.sh` | Run `minnal_tools` (e.g. `bulk_load`) using the staged binary. |
 
 ### Example scripts

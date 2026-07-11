@@ -14,11 +14,11 @@ use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::wal::{Wal, WalEntry, WalEntryStatus, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
+use crate::index::{DynFieldIndex, IndexValueType};
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
 use crate::store::lsm::lsm_tree::LsmFlushObserver;
 use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
 use crate::store::value_log::ValueLogMetadata;
-use index::{DynFieldIndex, IndexValueType};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
@@ -976,7 +976,7 @@ impl Database {
     /// e.g. to alert before disk fills between compactions.
     ///
     /// Returns `None` when the field is not active.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::index::IndexBlobStats> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| e.index.read().blob_stats())
@@ -1143,7 +1143,7 @@ impl Database {
     ///
     /// After this call the field's bitmap is dropped and any predicate query
     /// that references it returns [`KVError::Serialization`] wrapping
-    /// [`index::query::QueryError::InactiveField`].  The on-disk checkpoint
+    /// [`crate::index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         self.get_store(namespace_id)?.namespace_index.write().deregister(field_id);
@@ -1168,9 +1168,9 @@ impl Database {
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Serialization`]
-    /// wrapping a [`index::query::QueryError::InactiveField`].
+    /// wrapping a [`crate::index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
-        use index::query::{SchemaMap, parse_and_evaluate};
+        use crate::index::query::{SchemaMap, parse_and_evaluate};
 
         let store = self.get_store(namespace_id)?;
 
@@ -1238,7 +1238,7 @@ impl Database {
     ///
     /// [`query_keys`]: Self::query_keys
     pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
-        use index::query::{SchemaMap, parse_and_evaluate};
+        use crate::index::query::{SchemaMap, parse_and_evaluate};
 
         let store = self.get_store(namespace_id)?;
 
@@ -2107,7 +2107,7 @@ impl IndexCheckpointTarget for Database {
         // Flush each namespace's dense row map FIRST and advance its marker, so
         // the map is at least as durable as every field bitmap that references
         // its IDs (a crash must never leave a persisted bit whose row ID is not
-        // reproducible from the row map). See `index::RowMap` durability docs.
+        // reproducible from the row map). See `crate::index::RowMap` durability docs.
         let mut flushed_ns = std::collections::HashSet::new();
         for &(ns_id, _) in &fields {
             if flushed_ns.insert(ns_id)
@@ -2790,7 +2790,7 @@ mod tests {
     #[test]
     fn test_activate_type_mismatch_rejected() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::IndexValueType;
+        use crate::index::IndexValueType;
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -2812,7 +2812,7 @@ mod tests {
     #[test]
     fn test_activate_unknown_field_id_rejected() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::IndexValueType;
+        use crate::index::IndexValueType;
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -2828,7 +2828,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_register_field_idempotent() {
-        use index::IndexValueType;
+        use crate::index::IndexValueType;
 
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -2845,7 +2845,7 @@ mod tests {
     #[test]
     fn test_schema_survives_restart_and_index_activates_without_re_register() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -2935,7 +2935,7 @@ mod tests {
     #[test]
     fn test_activate_field_index_replays_wal_after_crash() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3022,7 +3022,7 @@ mod tests {
     #[test]
     fn test_field_index_replays_updates_after_crash() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3074,7 +3074,7 @@ mod tests {
     #[test]
     fn test_field_index_update_field_appears_and_disappears() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3546,7 +3546,7 @@ mod tests {
     #[test]
     fn test_deactivate_field_index_makes_field_unqueryable() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3589,7 +3589,7 @@ mod tests {
     #[test]
     fn test_field_index_targeted_update_and_delete() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3633,7 +3633,7 @@ mod tests {
     fn test_reindex_field_repairs_and_reports_outcome() {
         use crate::db::namespace::FieldReindexOutcome;
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -3669,7 +3669,7 @@ mod tests {
     #[test]
     fn test_shutdown_after_drop_index_does_not_error() {
         use crate::db::namespace_index::ExtractorFn;
-        use index::{IndexValue, IndexValueType};
+        use crate::index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();

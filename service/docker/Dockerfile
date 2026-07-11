@@ -13,7 +13,7 @@ WORKDIR /build
 COPY . .
 
 # Build only the API server in release mode
-RUN cargo build --release -p minnal_doc_store_api
+RUN cargo build --release -p minnal_db_api
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -25,8 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the compiled binary
 COPY --from=builder \
-     /build/target/release/minnal_doc_store_api \
-     /usr/local/bin/minnal_doc_store_api
+     /build/target/release/minnal_db_api \
+     /usr/local/bin/minnal_db_api
 
 # Copy the IVF cluster centroids file — referenced by config as /clusters.json
 COPY service/embedding_support/qwen/clusters.json /clusters.json
@@ -53,4 +53,4 @@ WORKDIR /data
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/minnal_doc_store_api", "/minnal.toml"]
+ENTRYPOINT ["/usr/local/bin/minnal_db_api", "/minnal.toml"]
