@@ -35,7 +35,7 @@ the base engine; `doc-store` and `semantic-search` are independent knobs.
 
 | Feature | Default | What it adds | Extra dependencies pulled in |
 |---|:---:|---|---|
-| `kv-store` | ✅ | LSM + value-log KV engine, namespaces, TTL, typed (`rkyv`) values, **RoaringBitmap field indexing + predicate query DSL** | — (base only) |
+| `kv-store` | ✅ | LSM + value-log KV engine, namespaces, TTL, typed (zero-copy) values, **RoaringBitmap field indexing + predicate query DSL** | — (base only) |
 | `doc-store` | | JSON document store: schema, document CRUD, background index builders, cursor pagination | `json_dotpath` |
 | `semantic-search` | | Quantised IVF + RaBitQ ANN vector search over stored vectors, usable on **raw KV namespaces** (`vector_kv::DbVectorStore`), plus the embedding-service client | `reqwest`, `simsimd`, `rayon`, `futures` |
 
@@ -118,8 +118,8 @@ db.shutdown().await?;
 
 `minnal_db` stores **opaque value bytes** — the field index is driven by an
 *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide
-how to pull an indexed field out of your own value encoding (JSON, `rkyv`, a
-fixed binary layout, …). Indexing runs **inline on every `put`**, so a query
+how to pull an indexed field out of your own value encoding (JSON, a fixed
+binary layout, …). Indexing runs **inline on every `put`**, so a query
 immediately after a write sees it.
 
 ```rust

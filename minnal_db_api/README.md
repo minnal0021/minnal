@@ -229,7 +229,12 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 **Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
 
-**Reconciliation.** Because the document write and the queue enqueue are two separate writes, a crash between them could leave a document written but not queued; likewise the quantised vector payloads are written with `put_no_wal`, so a crash before the memtable flush can drop a just-indexed vector (or flush one half and lose the other). Reconciliation heals both: across every semantic-search-enabled namespace it re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry. "Complete" means **both** the sparse-meta and dense entries are present — a document with only one half is a partially committed index and is re-enqueued so the re-embed regenerates the missing half. This mirrors how field indices self-heal via WAL replay, but routes the recovered work into the async queue. It runs **automatically as a background task on store startup** (presence-only: a cheap count short-circuit — nothing queued **and** both the sparse-meta and dense key counts already cover the live-key count — skips namespaces already fully covered, so a clean boot is inexpensive). The on-demand [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) endpoint runs a stronger **validating** variant that *also* re-enqueues documents whose committed bytes are present but **fail to deserialize** (corruption the presence check cannot see) — it deserializes every entry and skips the short-circuit, so it is a full scan that runs in the background (`202 Accepted`). To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
+**Reconciliation.** Because writing the document and queuing its embed job are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any such document, self-healing the gap automatically — no manual intervention needed. It runs two ways:
+
+- **Automatically on startup** — a fast, presence-only check that skips namespaces already fully covered, so a clean boot is cheap.
+- **On demand**, via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) — a slower but more thorough pass that also catches corrupted (not just missing) vector-index entries.
+
+To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
 Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup.
 
@@ -263,7 +268,11 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 
 ## REST API reference
 
-All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`. Every store — document or KV — lives under a single `/stores` path. The store kind is chosen by the mandatory `store_type` (`"doc"` or `"kv"`) in the create/import payload and resolved from the stored schema thereafter; document stores additionally expose `/docs`, indices, and predicate queries, while KV stores expose `/kv`. A data operation on the wrong kind (e.g. a `/docs` call on a KV namespace) returns `409 Conflict`. Plus a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
+All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`.
+
+Every store — document or KV — lives under a single `/stores` path. The store kind is chosen by the mandatory `store_type` (`"doc"` or `"kv"`) in the create/import payload and resolved from the stored schema thereafter; document stores additionally expose `/docs`, indices, and predicate queries, while KV stores expose `/kv`. A data operation on the wrong kind (e.g. a `/docs` call on a KV namespace) returns `409 Conflict`.
+
+On top of that there's a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
 
 ### Quick reference
 

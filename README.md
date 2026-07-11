@@ -89,58 +89,41 @@ Key design choices:
 | Key storage | Single skip-list memtable → sharded L0/L1 SSTables (per-bucket LSM) |
 | Value storage | Sharded append-only value log (configurable page size, 64 MiB default) |
 | Durability | Write-ahead log (WAL) with configurable fsync cadence |
-| Concurrency | `parking_lot` RwLock per bucket; epoch-based reclamation (`crossbeam-epoch`) |
-| Serialization | Zero-copy `rkyv` for typed values; `crc32fast` checksums on every record |
+| Concurrency | A reader/writer lock per bucket, plus lock-free reclamation so readers never block a cleanup pass |
+| Serialization | Compact binary encoding for typed values, with a checksum on every record |
 | TTL | Native per-record expiry tracked in the value log |
 | Namespaces | Logical isolation within a single DB; each namespace has its own LSM shards and value-log shards |
-| Background workers | LSM compaction, value-log GC, WAL cleanup, TTL eviction — each on its own tokio task |
-| Hashing | SIMD-accelerated Murmur3 (`mm3h`) for bucket assignment |
+| Background workers | LSM compaction, value-log GC, WAL cleanup, TTL eviction — each on its own async task |
+| Hashing | Fast, SIMD-accelerated hashing for bucket assignment |
 | Prefix scan | SIMD-accelerated prefix scan across all layers — see below |
 
 The WAL is written before every mutation. On startup the engine replays any WAL segments that postdate the last LSM flush, ensuring no committed write is lost after a crash.
 
 #### Prefix scan with SIMD acceleration
 
-`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. The full API is available on `Db`, `Namespace`, `AsyncDb`, and `AsyncNamespace`, including a zero-copy typed variant (`scan_prefix_typed<K, V>`) that deserialises keys and values with `rkyv`.
+`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. The full API is available on `Db`, `Namespace`, `AsyncDb`, and `AsyncNamespace`, including a zero-copy typed variant for callers who store typed values.
 
 Three layers of acceleration keep prefix scans fast even as data accumulates across layers:
 
-**1 — Stored `u64` key prefix for O(1) integer comparison**
+**1 — A stored key prefix for instant comparison**
 
-Every skip-list node and every SSTable record stores the first 8 bytes of its key as a big-endian `u64` field (`key_prefix`). The same field drives bucket assignment (via a Murmur3 hash of the `u64`). For prefixes up to 8 bytes, matching reduces to a single integer comparison against the stored `u64` — no byte-by-byte string walk needed. Only prefixes longer than 8 bytes fall back to `starts_with`.
+Every skip-list node and every SSTable record stores the first 8 bytes of its key as a single integer. For prefixes up to 8 bytes, matching reduces to one integer comparison — no byte-by-byte string walk needed. Only prefixes longer than 8 bytes fall back to a direct byte comparison.
 
 **2 — File-level bounds pruning**
 
-Each SSTable file records the `min_key_prefix` and `max_key_prefix` of all entries it contains (both stored as `u64`). Before scanning a file, the engine checks whether the search prefix can possibly fall within those bounds. Files whose prefix range excludes the target are skipped entirely, with no I/O.
+Each SSTable file records the smallest and largest key prefix it contains. Before scanning a file, the engine checks whether the search prefix can possibly fall within those bounds. Files whose range excludes the target are skipped entirely, with no I/O.
 
-**3 — AVX2/AVX512 key comparison in skip-list traversal**
+**3 — SIMD key comparison in skip-list traversal**
 
-When two keys share the same `u64` prefix (i.e. the first 8 bytes are identical), the skip list calls `compare_bytes_simd` to resolve the full lexicographic order. The implementation selects the widest available SIMD path at compile time:
-
-- **AVX512** (x86_64) — 64 bytes per iteration using `_mm512_loadu_epi8` / `_mm512_cmpeq_epi8_mask`. The equality mask is a 64-bit integer; `trailing_ones()` finds the first differing byte without a branch per byte.
-- **AVX2** (x86_64) — 32 bytes per iteration using `_mm256_cmpeq_epi8` / `_mm256_movemask_epi8`. The 32-bit equality mask is inspected with `trailing_ones()` in the same way.
-- **Scalar fallback** — standard byte-by-byte comparison on every other target. This includes **aarch64 (Apple Silicon / ARM64)**: this particular comparator has no NEON path yet, so on Apple hardware ordered key comparison currently runs the scalar `slice::cmp`. NEON acceleration *is* used elsewhere in the engine — see [SIMD across CPU architectures](#simd-across-cpu-architectures) below.
+When two keys share the same 8-byte prefix, the skip list falls back to a full byte-by-byte comparison to resolve the order — and that comparison itself is SIMD-accelerated on x86_64 (processing many bytes per CPU cycle instead of one). On Apple Silicon this particular comparison currently runs as a plain, non-SIMD loop; it's still correct, just not vectorised yet. (SIMD acceleration elsewhere in the engine, such as the field-index bitmap operations and vector search, does cover Apple Silicon — see [SIMD coverage by architecture](minnal_db/README.md#simd-coverage-by-architecture) for the full breakdown.)
 
 The SIMD paths are also used for all ordered key lookups and range scans in the skip list, not just prefix scans, so the benefit extends across all read paths.
-
-##### SIMD across CPU architectures
-
-minnal targets both x86_64 and aarch64 (Apple Silicon / ARM64). SIMD coverage differs by subsystem — some kernels have hand-written NEON, one does not:
-
-| Subsystem | x86_64 | aarch64 (Apple Silicon) | Dispatch |
-|---|---|---|---|
-| **Field-index bitmap kernels** (`index/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, extract, sum, run-bitset) | AVX-512 → AVX2 → scalar | **NEON** → scalar tail | x86: runtime (`is_x86_feature_detected!`); aarch64: compile-time (NEON is baseline on every aarch64 target, so no runtime probe) |
-| **Vector-distance math** (`semantic_search`, via the `simsimd` crate) | AVX-512 / AVX2 | **NEON / SVE** | `simsimd` runtime dispatch |
-| **Skip-list key comparator** (`compare_bytes_simd`) | AVX-512 / AVX2 (compile-time `target_feature`) | scalar (`slice::cmp`) — **no NEON path** | compile-time `cfg` |
-| **Murmur3 bucket hashing** (`mm3h`) | AVX (`avx` crate feature) | crate's portable/scalar path | compile-time (crate-internal) |
-
-So on Apple Silicon the field-index bitmap operations and vector search run on NEON, while skip-list key ordering and bucket hashing fall back to portable scalar code. The scalar paths are correctness-equivalent — only the skip-list comparator and hashing give up the SIMD speed-up on ARM. (The NEON field-index kernels are compile- and clippy-clean on aarch64 and unit-tested against their scalar counterparts, but have not yet been benchmarked on Apple hardware.)
 
 ### Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)
 
 The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. Field indexing is built into the engine (the folded `index` module): fast predicate queries over document fields.
 
-Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files (`memmap2`), so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated (AVX-512/AVX2 on x86_64, **NEON on Apple Silicon** — see [SIMD across CPU architectures](#simd-across-cpu-architectures)). A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
+Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files, so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated on both x86_64 and Apple Silicon. A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
 
 Index writes are checkpointed against WAL offsets, so a crash partway through a rebuild resumes exactly where it left off rather than starting over.
 
@@ -148,13 +131,15 @@ For the full design — how field attributes are created, updated, stored, and r
 
 ### Layer 3 — Semantic Search (Vector Quantisation + ANN, `semantic-search`)
 
-Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint). The `semantic-search` feature implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up from how the space is partitioned, through how values are quantised at write time, to how a query is resolved.
+Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint).
+
+The `semantic-search` feature implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up step by step: how the embedding space is partitioned, how values are quantised at write time, and how a query is resolved.
 
 #### IVF Clustering
 
 The embedding space is partitioned into a fixed number of clusters. The cluster centroids are pre-computed offline (e.g. with k-means over a representative corpus) and stored as a JSONL file (one `{cluster_id, centroid}` per line). At startup, minnal loads the centroids once into a read-only index shared across all requests.
 
-This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their assigned `cluster_id`, so a query only has to scan the chunks in a handful of relevant clusters instead of the whole corpus. At query time the relevant clusters are chosen by an **exact** nearest-centroid scan — each query embedding's distance to every centroid is computed and the `n_probes` nearest are selected (introselect, ~O(C) where C is the cluster count). There is deliberately **no precomputed neighbour graph over the clusters**: at the cluster counts in use the exhaustive scan takes microseconds and yields the *exact* nearest clusters, whereas an approximate graph traversal would trade recall for no meaningful speed-up. (A neighbour graph would only pay off at much larger, sparser cluster counts.)
+This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their assigned `cluster_id`, so a query only has to scan the chunks in a handful of relevant clusters instead of the whole corpus. At query time the relevant clusters are chosen by an **exact** nearest-centroid scan — each query embedding's distance to every centroid is computed and the `n_probes` nearest are selected. There is deliberately **no precomputed neighbour graph over the clusters**: at the cluster counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest clusters, whereas an approximate graph traversal would trade away recall for no meaningful speed-up. (A neighbour graph would only pay off at much larger, sparser cluster counts.)
 
 #### Dual Quantisation at Index Time
 
@@ -173,12 +158,12 @@ A third namespace, `{ns}_sparse_vector_meta`, records which clusters each docume
 2. The top-`n_probes` clusters by Euclidean distance are identified; the union of probe sets across all query chunks is scanned.
 3. All SingleBit entries for the probed clusters are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
-5. Candidates are scored with `SingleBitQuanDotProductEstimator` and aggregated via **SimMax** (max score per `doc_id` across all clusters × all query chunks).
+5. Candidates are scored and aggregated via **SimMax** (max score per `doc_id` across all clusters × all query chunks).
 6. The top `first_pass_sparse_search_top_k` candidates are retained.
 
 **Pass 2 — Dense (MultiBit):**
-1. MultiBit entries for all sparse candidates are fetched directly from `{ns}_dense_vector` by `doc_id` in parallel — O(1) per lookup, no cluster scan.
-2. Candidates are grouped by `cluster_id` and scored in parallel with `MultiBitQuanDotProductEstimator`.
+1. MultiBit entries for all sparse candidates are fetched directly from `{ns}_dense_vector` by `doc_id` in parallel — a direct lookup per candidate, no cluster scan.
+2. Candidates are grouped by `cluster_id` and scored in parallel.
 3. The top-K results are returned, sorted by estimated dot product (higher = more similar).
 
 The attribute-predicate filter is applied **only in Pass 1**. Pass 2 operates on the already-filtered candidate list.
@@ -274,23 +259,11 @@ When `semantic_search_enabled` is `true` and an embedding field is declared, eve
 
 Document writes return immediately without blocking on the embedding service. Vector index entries may lag slightly behind the most recent writes. If the embedding service is temporarily unavailable, entries are retried with configurable back-off (see `[vector_index]` below).
 
-**Reconciliation.** Reconciliation re-enqueues any document missing **both** a *complete* committed vector index and a pending queue entry — self-healing the write-then-enqueue crash window the same way field indices self-heal via WAL replay, but routing the recovered work into the async queue. It also covers the vector write itself: the quantised payloads are written with `put_no_wal`, so a crash before the memtable flush drops a just-indexed vector — possibly flushing one half and losing the other. A "complete" index requires **both** the sparse-meta and dense entries, so a partially committed index counts as not-indexed and is re-enqueued, letting the re-embed regenerate the missing half. It runs **automatically as a background task on startup**, and on demand via `POST /admin/indices/vector/reconcile` (e.g. to re-run after the startup pass logs a failure).
+**Reconciliation.** Because the document write and its embed enqueue are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any document that's missing its vector index, self-healing the gap automatically — it runs on every startup, and can also be triggered on demand via `POST /admin/indices/vector/reconcile`. For the exact crash windows it closes, see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
 ### Layer 5 — REST API (`minnal_db_api`)
 
-An [Axum](https://github.com/tokio-rs/axum) HTTP server (the `minnal_db_api` binary crate) that wraps `minnal_db` (with `doc-store` + `semantic-search`) in a full REST interface. It loads the schema cache and cluster index at startup, then serves all store, document, index, and semantic-search endpoints.
-
-Server state:
-
-| Field | Type | Purpose |
-|---|---|---|
-| `store` | `Arc<DocStore>` | Shared document + KV store |
-| `schemas` | `Arc<RwLock<HashMap<String, DocStoreSchema>>>` | In-memory doc-store schema cache |
-| `kv_schemas` | `Arc<RwLock<HashMap<String, KvStoreSchema>>>` | In-memory KV-store schema cache (key-type lookup on hot path) |
-| `index_manager` | `Arc<IndexBuildManager>` | Active background index builds (field and vector) |
-| `cluster_index` | `Option<Arc<ClusterIndex>>` | Pre-loaded IVF cluster index |
-| `attr_index_ops` | `Arc<Mutex<HashSet<String>>>` | Namespaces with an active attribute index operation |
-| `vec_index_cleanup` | `Arc<Mutex<HashSet<String>>>` | Namespaces with an active vector index cleanup |
+An [Axum](https://github.com/tokio-rs/axum) HTTP server (the `minnal_db_api` binary crate) that wraps `minnal_db` (with `doc-store` + `semantic-search`) in a full REST interface. At startup it loads every store's schema and the IVF cluster index into memory, so requests can validate and route without touching disk first. It then serves all store, document, index, and semantic-search endpoints, tracking which namespaces have an index build or cleanup in progress so concurrent admin operations on the same namespace are rejected rather than racing each other.
 
 ---
 
@@ -304,8 +277,8 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **Multi-namespace isolation** | Each logical store has independent LSM, value-log, and index shards. |
 | **Crash-safe WAL** | All mutations go through a WAL before they reach the memtable. Replay on startup. |
 | **Background GC** | Value-log GC reclaims space from deleted/overwritten entries. Tunable waste threshold. |
-| **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers. Short prefixes (≤ 8 bytes) match against a stored `u64` key fingerprint — a single integer comparison. Skip-list traversal uses AVX2 (32 bytes/cycle) or AVX512 (64 bytes/cycle) on x86_64 for full-key ordering when fingerprints tie (scalar on Apple Silicon). SSTable files are skipped entirely when their `min`/`max` key prefix bounds exclude the target. |
-| **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates — AVX-512/AVX2 on x86_64, NEON on Apple Silicon. See [SIMD across CPU architectures](#simd-across-cpu-architectures). |
+| **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers, using a stored key fingerprint and file-level bounds to skip work before falling back to a SIMD-accelerated byte comparison. See [Prefix scan with SIMD acceleration](#prefix-scan-with-simd-acceleration) above. |
+| **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates. |
 | **Restartable index builds** | Checkpoint files track progress; interrupted builds resume automatically on startup. |
 | **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact 1-bit chunk embeddings (32× compression vs f32) over IVF clusters for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
 | **Async vector indexing** | Document writes enqueue a pending embedding job and return immediately. A background worker (round-robin across namespaces, bounded concurrency) drains the queue and retries on failure. Configurable retry budget and concurrency under `[vector_index]`. |
