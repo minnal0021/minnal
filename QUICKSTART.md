@@ -269,8 +269,8 @@ number_of_bits_for_dense_quantisation = 8
 > a fixed indexing decision: if you change either value, re-embed the corpus with
 > `POST /admin/indices/{ns}/vector/reindex-all`.
 
-The config file is located by (in order): first CLI argument → `MINNAL_CONFIG_FILE`
-env var → built-in defaults.
+Config file resolution order (CLI argument → `MINNAL_CONFIG_FILE` → built-in
+defaults) is documented in [`minnal_db_api/README.md`](minnal_db_api/README.md#configuration).
 
 ### Document and KV Stores (REST API)
 
@@ -543,16 +543,9 @@ Run any script against a running server:
 
 ### Cluster centroids
 
-[`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) contains 50 pre-computed cluster centroids for 768-dimensional embeddings. This sample cluster file is for the **Qwen Embedding model** — to use a different embedding model, generate your own centroids (see below). The file is in JSONL format — one cluster per line:
+[`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) contains 50 pre-computed cluster centroids for 768-dimensional embeddings, for the **Qwen Embedding model**. The cluster index is loaded once at startup and held in memory (negligible — ~150 KB for 50 clusters of 768 dimensions).
 
-```json
-{"cluster_id": 1, "centroid": [-0.6687, 0.6142, ...]}
-{"cluster_id": 2, "centroid": [0.1234, -0.9876, ...]}
-```
-
-To generate your own centroids for a different model or dimensionality, run k-means (e.g. with `faiss` or `sklearn`) over a representative sample of your corpus embeddings and write the output in this JSONL format. Point the server at your file via `[semantic_search] cluster_path` in the config.
-
-The cluster index is loaded once at startup and held in memory. For 50 clusters of 768 dimensions, the in-memory footprint is negligible (~150 KB).
+To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at the file via `[semantic_search] cluster_path`. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
 
 ### Sample config
 
