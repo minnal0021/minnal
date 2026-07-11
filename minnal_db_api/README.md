@@ -13,6 +13,7 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Quick reference](#quick-reference)
 - [Configuration](#configuration)
 - [Concepts](#concepts)
   - [Namespace](#namespace)
@@ -22,7 +23,6 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
   - [Semantic search (async vector indexing)](#semantic-search-async-vector-indexing)
   - [KV store](#kv-store-concept)
 - [REST API reference](#rest-api-reference)
-  - [Quick reference](#quick-reference)
   - [Store lifecycle](#store-lifecycle)
   - [Index management](#index-management)
   - [Document CRUD](#document-crud)
@@ -114,6 +114,57 @@ curl -s -X POST http://localhost:8080/stores/users/query \
   -d '{"predicate": "status = \"active\" AND age >= 18"}'
 # → [{"id":"550e8400-...","doc":{"name":"Alice","status":"active","age":30}}]
 ```
+
+---
+
+## Quick reference
+
+Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-reference) below documents each one in detail, including request/response bodies and error cases.
+
+**Store lifecycle (both kinds):**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `POST` | `/stores` | `201` | Create a store (`store_type` in body selects doc vs KV) |
+| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type`) |
+| `DELETE` | `/stores/{ns}` | `204` | Drop a store and all its data (kind resolved from its schema) |
+| `GET` | `/stores/{ns}/schema` | `200` | Fetch a store's current schema |
+| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only) |
+
+**Document store data:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
+| `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
+| `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
+| `DELETE` | `/stores/{ns}/indices/{field}` | `202` | Drop a field index (background cleanup) |
+| `PUT` | `/stores/{ns}/docs/{id}` | `204` | Upsert a document |
+| `GET` | `/stores/{ns}/docs/{id}` | `200` | Retrieve a document by primary key |
+| `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
+| `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
+| `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
+| `POST` | `/stores/{ns}/semantic-search` | `200` | ANN similarity search (`semantic_search_enabled` only) |
+| `POST` | `/stores/{ns}/semantic-search/filtered` | `200` | ANN search restricted by an index predicate |
+
+**KV store data:**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `PUT` | `/stores/{ns}/kv/{key}` | `204` | Set a value |
+| `GET` | `/stores/{ns}/kv/{key}` | `200` | Get a value by key |
+| `DELETE` | `/stores/{ns}/kv/{key}` | `204` | Delete a key |
+| `GET` | `/stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
+| `GET` | `/stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
+| `POST` | `/stores/{ns}/kv/semantic-search` | `200` | ANN search (`value_type = str` only) |
+
+**Schema export / import (admin):**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a store's schema as a JSON attachment (doc or KV) |
+| `POST` | `/admin/stores/import` | `201` | Create a store from an exported schema (`store_type` selects the kind) |
+| `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
 
 ---
 
@@ -272,56 +323,7 @@ All request and response bodies are JSON, and errors are returned as `{"error": 
 
 Every store — document or KV — lives under a single `/stores` path. The store kind is chosen by the mandatory `store_type` (`"doc"` or `"kv"`) in the create/import payload and resolved from the stored schema thereafter; document stores additionally expose `/docs`, indices, and predicate queries, while KV stores expose `/kv`. A data operation on the wrong kind (e.g. a `/docs` call on a KV namespace) returns `409 Conflict`.
 
-On top of that there's a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. The quick-reference tables below list every endpoint at a glance; the sections that follow document each one in detail, grouped by task.
-
-### Quick reference
-
-**Store lifecycle (both kinds):**
-
-| Method | Path | Response | Purpose |
-|--------|------|----------|---------|
-| `POST` | `/stores` | `201` | Create a store (`store_type` in body selects doc vs KV) |
-| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type`) |
-| `DELETE` | `/stores/{ns}` | `204` | Drop a store and all its data (kind resolved from its schema) |
-| `GET` | `/stores/{ns}/schema` | `200` | Fetch a store's current schema |
-| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only) |
-
-**Document store data:**
-
-| Method | Path | Response | Purpose |
-|--------|------|----------|---------|
-| `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
-| `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
-| `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
-| `DELETE` | `/stores/{ns}/indices/{field}` | `202` | Drop a field index (background cleanup) |
-| `PUT` | `/stores/{ns}/docs/{id}` | `204` | Upsert a document |
-| `GET` | `/stores/{ns}/docs/{id}` | `200` | Retrieve a document by primary key |
-| `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
-| `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
-| `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
-| `POST` | `/stores/{ns}/semantic-search` | `200` | ANN similarity search (`semantic_search_enabled` only) |
-| `POST` | `/stores/{ns}/semantic-search/filtered` | `200` | ANN search restricted by an index predicate |
-
-**KV store data:**
-
-| Method | Path | Response | Purpose |
-|--------|------|----------|---------|
-| `PUT` | `/stores/{ns}/kv/{key}` | `204` | Set a value |
-| `GET` | `/stores/{ns}/kv/{key}` | `200` | Get a value by key |
-| `DELETE` | `/stores/{ns}/kv/{key}` | `204` | Delete a key |
-| `GET` | `/stores/{ns}/kv?start=&end=` | `200` | Range scan in key order |
-| `GET` | `/stores/{ns}/kv/prefix?prefix=` | `200` | Prefix scan (`key_type = str` most useful) |
-| `POST` | `/stores/{ns}/kv/semantic-search` | `200` | ANN search (`value_type = str` only) |
-
-**Schema export / import (admin):**
-
-| Method | Path | Response | Purpose |
-|--------|------|----------|---------|
-| `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a store's schema as a JSON attachment (doc or KV) |
-| `POST` | `/admin/stores/import` | `201` | Create a store from an exported schema (`store_type` selects the kind) |
-| `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
-
----
+On top of that there's a set of `/admin/*` routes for backup, diagnostics, and bulk index operations. See the [Quick reference](#quick-reference) near the top of this document for every endpoint at a glance; the sections below document each one in detail, grouped by task.
 
 ### Store lifecycle
 

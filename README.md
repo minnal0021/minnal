@@ -32,6 +32,7 @@ For a hands-on server walkthrough — build, bulk-load, and every endpoint — s
 ## Table of Contents
 
 - [Overview](#overview)
+- [Concepts Primer](#concepts-primer)
 - [Architecture](#architecture)
   - [Layer 1 — KV Engine (`kv-store`, always on)](#layer-1--kv-engine-kv-store-always-on)
   - [Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)](#layer-2--field-indexing-roaringbitmap-part-of-kv-store)
@@ -65,6 +66,23 @@ when `semantic-search` is enabled. For **embedded** use, add `minnal_db` and cal
 it in-process; the **server** simply wraps the same crate. Each namespace
 maintains its own KV storage, field indices, and a companion vector store for
 quantised embeddings.
+
+---
+
+## Concepts Primer
+
+The sections below assume some familiarity with a handful of database-internals
+terms. If you already know them, skip ahead to [Architecture](#architecture);
+otherwise, here's the short version of each:
+
+| Term | In one sentence |
+|---|---|
+| **LSM tree** (Log-Structured Merge tree) | An on-disk index tuned for fast writes: new data lands in a small in-memory buffer first and is merged into sorted files on disk later, in the background, instead of updating records in place. |
+| **WiscKey** | An LSM variant used here: store only keys (plus a pointer) in the LSM tree, and put the bulky values in a separate append-only log, so compacting the tree never has to rewrite large values. |
+| **IVF** (Inverted File index) | A way to make similarity search fast: pre-group all vectors into clusters by proximity, so a query only has to compare against the handful of clusters nearest to it instead of every stored vector. |
+| **ANN** (Approximate Nearest Neighbour search) | Finding the vectors most similar to a query vector without an exhaustive, exact comparison against every stored vector — trading a small amount of accuracy for a large speed-up. |
+| **RaBitQ** | A technique for compressing ("quantising") a high-precision vector into a compact bit string, with a mathematical bound on how far the compressed version's similarity score can drift from the true one. |
+| **RoaringBitmap** | A compressed representation of a set of integers. Used here to record "which documents have field `X = Y`", so that combining several such conditions with AND/OR/NOT is both fast and memory-efficient. |
 
 ---
 
@@ -190,15 +208,7 @@ The set of models is **data-driven** — no code change or recompile is required
 
 1. **Generate the cluster centroids offline.** Run k-means (or any IVF clustering) over a representative corpus *embedded with the new model*. The number of centroids is the IVF cluster count (more clusters → finer partitioning, the trade-off knob against `n_probes`). Every centroid vector must have the model's embedding dimension.
 
-2. **Write them as a JSONL file** — one JSON object per line (not a JSON array), each with a unique `cluster_id` and its `centroid` vector:
-
-   ```jsonl
-   {"cluster_id": 0, "centroid": [0.0123, -0.0456, 0.0789, ...]}
-   {"cluster_id": 1, "centroid": [-0.0021,  0.0095, 0.0310, ...]}
-   {"cluster_id": 2, "centroid": [ 0.0440, -0.0177, 0.0002, ...]}
-   ```
-
-   Rules enforced at startup: every centroid must be the **same, non-zero dimension**, that dimension must match the `dimension` declared in config, `cluster_id`s must be **unique**, and no centroid may be empty. A malformed file is rejected at boot, not at first query.
+2. **Write them as a JSONL file** — one `{cluster_id, centroid}` object per line, each centroid dimensioned to match the model. For the exact file format and the validation rules enforced at startup, see [`Semantic-Search-Architecture.md` §3 — IVF Index Structure](minnal_db/src/semantic_search/Semantic-Search-Architecture.md#3-ivf-index-structure).
 
 3. **Place the file** at `service/embedding_support/{model}/clusters.json`, where `{model}` is the lower-cased model name (e.g. `service/embedding_support/e5/clusters.json`).
 
