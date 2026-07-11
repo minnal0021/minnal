@@ -3150,7 +3150,7 @@ mod tests {
 
         // Page stats: per-bucket page breakdown, with live records counted.
         let pages = db.value_log_page_stats("default").unwrap();
-        assert_eq!(pages.len(), db.config.num_buckets as usize, "one entry per bucket");
+        assert_eq!(pages.len(), db.config.num_buckets, "one entry per bucket");
         let total_records: u32 = pages.iter().flat_map(|(_, ps)| ps.iter()).map(|p| p.total_records).sum();
         assert!(total_records >= 50, "every written record should appear in a page, got {}", total_records);
 

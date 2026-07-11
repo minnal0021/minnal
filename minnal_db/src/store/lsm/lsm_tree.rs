@@ -892,7 +892,7 @@ impl LSMTree {
                     .filter(|e| !e.is_obsolete())
                     .map(|e| L0ReadGuard::new(Arc::clone(e)))
                     .collect();
-                guards.sort_by(|a, b| a.entry.created_at_ms.cmp(&b.entry.created_at_ms));
+                guards.sort_by_key(|a| a.entry.created_at_ms);
                 guards
             })
             .collect();
@@ -1498,7 +1498,7 @@ impl LSMTree {
             Metrics::bump(&m.l0_probes);
         }
 
-        entries.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
 
         let mut best = SsLookup::Missing;
         for entry in entries {
@@ -1537,7 +1537,7 @@ impl LSMTree {
         // already resolve by seq, so seq-aware resolution here keeps the merge
         // consistent with them. The oldest-first sort only breaks exact seq ties
         // (prefer the newer file).
-        entries.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        entries.sort_by_key(|a| a.created_at_ms);
 
         let mut by_key: std::collections::BTreeMap<Vec<u8>, SStableEntry> = std::collections::BTreeMap::new();
         let mut any_read = false;
@@ -2079,7 +2079,7 @@ impl LSMTree {
                 .map(|e| L0ReadGuard::new(Arc::clone(e)))
                 .collect()
         };
-        l0_guards.sort_by(|a, b| a.entry.created_at_ms.cmp(&b.entry.created_at_ms));
+        l0_guards.sort_by_key(|a| a.entry.created_at_ms);
 
         // Search the Level 1 file (oldest layer) first — but only if its min/max
         // says it overlaps `[prefix, upper)`, and then seeking near `prefix` via the
@@ -2400,7 +2400,7 @@ impl LSMTree {
                                 .filter(|e| !e.is_obsolete())
                                 .map(|e| L0ReadGuard::new(Arc::clone(e)))
                                 .collect();
-                            l0_guards.sort_by(|a, b| b.entry.created_at_ms.cmp(&a.entry.created_at_ms));
+                            l0_guards.sort_by_key(|b| std::cmp::Reverse(b.entry.created_at_ms));
                             for guard in &l0_guards {
                                 if lookup.is_empty() {
                                     break;
