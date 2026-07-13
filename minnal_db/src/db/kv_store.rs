@@ -1645,10 +1645,6 @@ impl KVStore {
                 seq: 0,
             });
 
-            // Drop records that are obsolete (overwritten or tombstoned) as of this
-            // GC run. The cutoff is the GC run's wall-clock start, so a record whose
-            // epoch is somehow newer than that (backward clock skew) is conservatively
-            // retained and reclaimed on a later run instead.
             if (record_meta.tombstone || record_meta.updated) && record_meta.epoch <= reclaim_cutoff_epoch {
                 continue;
             }
@@ -1752,10 +1748,6 @@ impl KVStore {
     }
 
     /// Value log garbage collection.
-    ///
-    /// Obsolete (overwritten/tombstoned) records are reclaimed up to a cutoff
-    /// sampled once at the start of the run — the run's wall-clock time — so the
-    /// whole pass shares a single, consistent reclaim horizon.
     pub fn garbage_collect_with_threshold(&self, page_gc_threshold_pct: f64) -> Result<GCStats> {
         let reclaim_cutoff_epoch = current_epoch_millis();
 
