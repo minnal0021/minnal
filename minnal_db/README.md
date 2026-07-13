@@ -26,9 +26,7 @@ MinnalDB is an embedded, high-performance key-value store written in Rust. Its d
 - [Read & Write Paths](#read--write-paths)
 - [Compaction & Garbage Collection](#compaction--garbage-collection)
 - [Crash Safety & Recovery](#crash-safety--recovery)
-- [API](#api)
 - [MinnalDB as an Embedded Store](#minnaldb-as-an-embedded-store)
-  - [Field-Level Indexing](#field-level-indexing)
 - [Configuration](#configuration)
 - [Performance](#performance)
 - [Building & Benchmarks](#building--benchmarks)
@@ -481,71 +479,6 @@ The components above were each designed with one shared goal: surviving a crash 
 
 ---
 
-## API
-
-### Synchronous
-
-```rust
-use minnal_db::Db;
-
-let db = Db::open("/tmp/mydb")?;
-
-// Basic CRUD
-db.put(b"hello", b"world")?;
-let val = db.get(b"hello")?;          // Some(b"world")
-db.delete(b"hello")?;
-
-// Iteration
-for (key, value) in db.iter()? { ... }
-for (key, value) in db.scan_prefix(b"user:")? { ... }
-for (key, value) in db.range(b"a", Some(b"z"))? { ... }
-
-// Namespaces
-let ns = db.namespace("orders")?;
-ns.put(b"o1", b"shipped")?;
-
-// Typed (rkyv)
-db.put_typed::<MyKey, MyValue>(&my_key, &my_value)?;
-let v = db.get_typed::<MyKey, MyValue>(&my_key)?;
-
-// Maintenance
-db.garbage_collect()?;
-db.compact()?;
-println!("waste ratio: {:.1}%", db.waste_ratio() * 100.0);
-```
-
-### Asynchronous
-
-```rust
-use minnal_db::AsyncDb;
-
-let db = AsyncDb::open("/tmp/mydb").await?;
-db.put(b"hello".to_vec(), b"world".to_vec()).await?;
-let val = db.get(b"hello".to_vec()).await?;
-
-let ns = db.namespace("events".to_string()).await?;
-ns.put(b"e1".to_vec(), b"click".to_vec()).await?;
-ns.put(b"e2".to_vec(), b"scroll".to_vec()).await?;
-```
-
-### TTL
-
-Automatic expiry runs only under the async handle (`AsyncDb`), where the single global TTL worker tombstones aged records. The TTL configuration — the lifetime and the per-pass delete cap — is stored in the namespace registry, so it is **restored on restart** without re-declaring it:
-
-```rust
-use std::time::Duration;
-
-// ttl = 1 hour, at most 1000 records tombstoned per pass
-let ns = db.namespace_with_ttl("sessions".into(), Duration::from_secs(3600), 1000).await?;
-ns.put(b"sess:abc".to_vec(), b"user=42".to_vec()).await?;
-// Records are automatically tombstoned ~1 hour after they were written,
-// and expiry resumes automatically the next time the database is opened.
-```
-
-(The synchronous `Db::namespace_with_ttl(name, ttl)` records the TTL on the store for read-side awareness but runs no worker, so it does not expire records and is not persisted.)
-
----
-
 ## MinnalDB as an Embedded Store
 
 MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
@@ -556,128 +489,32 @@ The base (`kv-store`, default) is the KV engine plus **built-in field indexing**
 secondary (field-level) indexing is a capability of the engine itself, not
 something layered on by the document store.
 
-### What each feature adds
-
-| Capability | Feature | Extra deps |
-|---|---|---|
-| Key-value CRUD, namespaces, TTL, typed (zero-copy) values | `kv-store` (default) | — |
-| RoaringBitmap **field/secondary index** + predicate query DSL | `kv-store` (default) | — |
-| Quantised IVF + RaBitQ vector search (on raw KV or documents) | `semantic-search` | `reqwest`, `simsimd`, `rayon`, `futures` |
-| JSON schema, document lifecycle, extractor generation | `doc-store` | `json_dotpath` |
-
 Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, Protocol Buffers, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what the `doc-store` feature adds on top; the indexing machinery itself is engine-level.
 
-> **Publishable single crate.** Depend on `minnal_db` and select features:
-> `minnal_db = { version = "0.1", features = ["doc-store"] }`. See
-> [`QUICKSTART.md`](QUICKSTART.md) for the full feature matrix. **Platform:**
-> Linux and macOS only (`pread`/`pwrite`).
-
-### Field-Level Indexing
-
-The example below opens a store, indexes two fields (`status`, `age`), writes a few JSON records, and runs a predicate query — all in-process, with no document-store layer involved.
-
-```rust
-use std::sync::Arc;
-use minnal_db::{Db, ExtractorFn, IndexValue, IndexValueType, KVError, DEFAULT_NAMESPACE_ID};
-
-fn main() -> Result<(), KVError> {
-    let db = Db::open("/tmp/users_db")?;
-
-    // 1. Declare which fields to index on the default namespace. Returns a FieldId.
-    //    The schema is persisted in config.json, so after a restart you only
-    //    re-activate (step 2) — you don't re-register.
-    let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
-    let age_field    = db.register_index_field(DEFAULT_NAMESPACE_ID, "age",    IndexValueType::Int)?;
-
-    // 2. Activate each field with an *extractor*: a closure that pulls the field
-    //    out of the raw stored value. minnal_db has no idea what your value bytes
-    //    mean — here they're JSON, but it could be any encoding you choose.
-    let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-        Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-    });
-    let age_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-        Some(IndexValue::Int(v["age"].as_i64()?))
-    });
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor)?;
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor)?;
-
-    // 3. Write records. Each put runs the extractors and updates the
-    //    RoaringBitmap indices automatically — there is no separate "index" call.
-    db.put(b"user:1", br#"{"status":"active","age":30}"#)?;
-    db.put(b"user:2", br#"{"status":"inactive","age":25}"#)?;
-    db.put(b"user:3", br#"{"status":"active","age":42}"#)?;
-    db.put(b"user:4", br#"{"status":"active","age":18}"#)?;
-
-    // 4. Query the index with the predicate DSL (=, !=, <, <=, >, >=, AND, OR,
-    //    BETWEEN, IN). Returns the raw keys of matching records.
-    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
-
-    // 5. Resolve matched keys back to their values.
-    for key in keys {
-        if let Some(value) = db.get(&key)? {
-            println!("{} => {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
-        }
-    }
-    // → user:1 and user:3  (active AND age > 20; user:4 is active but 18, user:2 is inactive)
-
-    db.shutdown()?;
-    Ok(())
-}
-```
-
-Key points about the embedded field-index contract:
-
-- **The extractor is yours, not the engine's.** MinnalDB stores opaque bytes; the `&[u8] -> Option<IndexValue>` closure is where you interpret them. Return `None` to skip indexing a record for that field.
-- **Match the types.** The `IndexValue` your extractor returns must match the `IndexValueType` you registered (`Bool`, `Int` (i64), or `Str`), or activation fails.
-- **Closures can't be persisted — re-activate on restart.** The schema (field names, IDs, types) survives in `config.json`, so on reopen you skip `register_index_field` and just call `activate_field_index` again with the same closures. Activation also replays any un-checkpointed WAL tail into the index.
-- **Indexing is synchronous with the write.** The field index is updated inline on `put`, so a query immediately after a write sees it (unlike the async semantic-search pipeline in the layers above).
-- **Pagination.** Use `query_index_paginated(ns, predicate, offset, limit)` and register a `RowToKeyFn` via `set_row_id_fn` so only `offset + limit` keys are resolved (O(|hits|), no in-memory key map). An `AsyncDb` equivalent of the whole API exists for tokio contexts.
+> **Want the API?** The feature matrix, the key-value API (sync and async), TTL
+> namespaces, field indexing with predicate queries, and the document-store and
+> semantic-search handles are all covered — with runnable examples — in the
+> **[Embedded Quickstart](QUICKSTART.md)**. **Platform:** Linux and macOS only
+> (`pread`/`pwrite`).
 
 ---
 
 ## Configuration
 
-MinnalDB is configured through a `minnal.toml` file (or a `DbConfig` built in code). The keys below are grouped by the subsystem they tune:
+MinnalDB is configured through a TOML file or a `DbConfig` built in code.
 
-```toml
-[storage]
-db_path = "/var/data/minnal"
+[`config/sample.toml`](../config/sample.toml) is the annotated reference: it lists every tunable parameter with its default and a short explanation, and is the recommended starting point rather than writing a config from scratch.
 
-[memtable]
-max_capacity = 100000            # SkipList max entries
+The knobs that most affect engine behaviour:
 
-[sharding]
-num_buckets = 16                 # Fixed at creation; affects parallelism
-
-[lsm]
-compaction_threshold_percent = 95  # Flush memtable when N% full
-
-[sync]
-records_per_sync = 1000          # Value-log fsync cadence (the WAL is fsynced
-                                 # on every single-op write regardless)
-
-[thresholds]
-value_log_waste_threshold = 30.0 # Trigger GC when waste exceeds N%
-
-[scheduled_tasks]
-value_log_gc_interval_secs  = 60
-wal_gc_interval_secs        = 60
-lsm_compaction_interval_secs = 60
-ttl_cleanup_interval_secs    = 3600
-
-[wal]
-segment_size_bytes  = 67108864   # 64 MB
-
-[value_log]
-page_size_bytes = 67108864       # 64 MB
-
-[recovery]
-# Directory for timestamped fail-log JSON files written when a WAL entry
-# cannot be applied even after one retry.  Defaults to <db_path>/fail_logs.
-# fail_log_dir = "/var/data/minnal/fail_logs"
-```
+| Key | Effect |
+|---|---|
+| `sharding.num_buckets` | Value-log / L1 shard count. **Fixed at creation** — it cannot change once data exists. |
+| `memtable.max_capacity` | SkipList entry limit before a flush is triggered. |
+| `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
+| `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |
+| `thresholds.value_log_waste_threshold` | Waste ratio at which value-log GC compacts a bucket. |
+| `recovery.fail_log_dir` | Where recovery fail-log JSON files are written (defaults to `<db_path>/fail_logs`). |
 
 ---
 
@@ -748,20 +585,6 @@ cargo bench
 ```
 
 Benchmark reports are written to `target/criterion/`. The helpers in `benches/common.rs` disable background workers and use `target/bench_tmp/` (rather than `/tmp/`) to avoid skew from RAM-backed filesystems.
-
----
-
-## Dependencies
-
-| Crate | Version | Purpose |
-|---|---|---|
-| `tokio` | 1.49 | Async runtime (workers, async API) |
-| `rkyv` | 0.8 | Zero-copy serialization (LSM SSTables, typed API) |
-| `parking_lot` | 0.12 | Efficient `RwLock` / `Mutex` |
-| `crc32fast` | 1.5 | Checksums for WAL, metadata, GC journals |
-| `mm3h` | 0.1 | Murmur3 hash with AVX acceleration (bucket routing) |
-| `crossbeam-epoch` | 0.9 | Epoch-based memory reclamation (safe L0 cleanup) |
-| `criterion` | — | Benchmarking framework |
 
 ---
 
