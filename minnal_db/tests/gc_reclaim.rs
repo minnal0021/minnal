@@ -329,3 +329,56 @@ fn gc_does_not_resurrect_deleted_keys() {
     }
     db.shutdown().unwrap();
 }
+
+/// A bucket whose metadata file is lost has no live/garbage accounting, so GC would
+/// never trigger on it — the value log would grow forever. On open, that accounting is
+/// recomputed **exactly** from the LSM's pointers (a record is live iff the LSM still
+/// points at it), not guessed at.
+#[test]
+fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+    let value = vec![0x88u8; 100 * 1024];
+    for i in 0..10 {
+        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+    }
+    // Churn, so a large share of the value log is garbage.
+    for _ in 0..25 {
+        db.put(b"hot", &value).unwrap();
+    }
+    assert!(db.waste_ratio() > 0.0, "expected garbage before the metadata is lost");
+    db.shutdown().unwrap();
+
+    // Lose every bucket's metadata, as a crash before its flush would.
+    let metadata_files: Vec<PathBuf> = walkdir(dir.path())
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "metadata"))
+        .collect();
+    assert!(!metadata_files.is_empty(), "expected value-log metadata files to exist");
+    for f in &metadata_files {
+        std::fs::remove_file(f).unwrap();
+    }
+
+    // Reopen: the accounting is recomputed from the LSM's pointers.
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    assert!(
+        db.waste_ratio() > 0.0,
+        "garbage accounting was not rebuilt after the metadata was lost — GC would never trigger \
+         on this bucket, and the value log would grow without bound"
+    );
+
+    // And it is *exact*, not conservative: GC still finds the garbage and reclaims it,
+    // while every live value survives.
+    let gc = db.garbage_collect().unwrap();
+    assert!(gc.bytes_reclaimed > 0, "GC found nothing to reclaim after the rebuild");
+    for i in 0..10 {
+        assert_eq!(
+            db.get(format!("k{i}").as_bytes()).unwrap(),
+            Some(value.clone()),
+            "k{i} lost after the accounting rebuild"
+        );
+    }
+    assert_eq!(db.get(b"hot").unwrap(), Some(value));
+    db.shutdown().unwrap();
+}

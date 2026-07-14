@@ -128,6 +128,14 @@ pub struct KVStore {
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
     pub(crate) metrics: OnceLock<Arc<crate::db::metrics::Metrics>>,
+
+    /// Test-only crash point: when set, a GC pass returns the moment its segments are
+    /// unlinked, skipping everything after. It exists to prove the *ordering* of
+    /// `flush → unlink` is what makes GC crash-safe: with the flush first (correct), a
+    /// crash here is harmless; if the two were ever swapped, this window would lose the
+    /// re-point along with the segments it referred to, and the guard test would fail.
+    #[cfg(test)]
+    pub(crate) gc_crash_after_unlink: AtomicBool,
 }
 
 /// What one bucket's GC pass did.
@@ -217,6 +225,8 @@ impl KVStore {
             rowmap: Arc::new(RwLock::new(None)),
             seq_counter: RwLock::new(Arc::new(AtomicU64::new(1))),
             metrics: OnceLock::new(),
+            #[cfg(test)]
+            gc_crash_after_unlink: AtomicBool::new(false),
         };
 
         // A bucket whose metadata file was lost has no live/garbage accounting, so GC
@@ -1309,7 +1319,9 @@ impl KVStore {
             return Ok(self.gc_stats_now(0, start_time));
         }
 
-        // Step 3: make the re-points durable BEFORE unlinking anything. Load-bearing.
+        // Step 3: make the re-points durable BEFORE unlinking anything. Load-bearing —
+        // `test_gc_crash_the_instant_segments_are_unlinked_loses_nothing` fails if these
+        // two steps are ever swapped.
         self.lsm.flush_memtable_to_level0()?;
 
         // Step 4: the old segments are now unreferenced by anything durable.
@@ -1336,6 +1348,13 @@ impl KVStore {
             log.record_gc_run(reclaimed_here);
             bytes_reclaimed += reclaimed_here;
             bytes_rewritten += result.bytes_rewritten;
+        }
+
+        // Test-only crash point (see `gc_crash_after_unlink`): the segments are gone, and
+        // nothing after this line has run.
+        #[cfg(test)]
+        if self.gc_crash_after_unlink.load(Ordering::SeqCst) {
+            return Ok(self.gc_stats_now(bytes_reclaimed, start_time));
         }
 
         self.value_log.flush_all_metadata()?;
@@ -1487,11 +1506,6 @@ mod tests {
     // ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────
     //
     // These exercise the FILE-level pass directly with distinct "OLD"/"NEW"
-    // contents in the .log files, asserting which file lands at `bucket_path`
-    // and how the journal/marker are disposed of. They do not need a real
-    // value-log format — only which inode becomes live and whether a journal
-    // survives to be replayed.
-
     #[test]
     fn test_kvstore_basic_operations() {
         let dir = TempDir::new().unwrap();
@@ -1821,6 +1835,160 @@ mod tests {
     // The fix: writes hold the bucket lock across the value-log write AND
     // the LSM insert; GC scans the LSM inside the same lock, guaranteeing a
     // consistent snapshot.
+
+    // ── GC crash-safety ordering ────────────────────────────────────────────
+    //
+    // The load-bearing invariant of the segmented value log:
+    //
+    //     relocate survivors → CAS re-point → FLUSH to L0 → unlink the old segment
+    //
+    // Unlinking before the flush is silent data loss: the durable LSM would point
+    // into a file that no longer exists, and the WAL entries that could replay those
+    // writes are long gone. These tests pin both halves of that ordering.
+
+    /// A crash between GC's re-point and its unlink must lose nothing: the old segment
+    /// is still on disk, and the durable LSM still points into it.
+    ///
+    /// `compact_bucket` deliberately does NOT unlink — it only hands back the segments
+    /// that *become* safe to unlink once the re-point is durable. So calling it and then
+    /// dropping the store without flushing simulates exactly that crash window.
+    #[test]
+    fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
+        let dir = TempDir::new().unwrap();
+        // Small segments so a few values roll several of them.
+        let segment_size = 64 * 1024;
+        let value = vec![0xC3u8; 8 * 1024];
+
+        let pending = {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            // Churn one key so its old records become garbage worth collecting.
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+            // Make the WRITES durable first. (A standalone KVStore has no WAL — the
+            // Database coordinator owns that — so without this the crash below would
+            // simply lose the writes themselves, which is not what we are testing.)
+            store.lsm.flush_memtable_to_level0().unwrap();
+
+            // Phases 1-2 only: survivors relocated and keys re-pointed in the MEMTABLE,
+            // but nothing flushed and nothing unlinked.
+            let mut pending = Vec::new();
+            for bucket in 0..store.value_log.num_buckets() as u32 {
+                let result = store.compact_bucket(bucket, 10.0).unwrap();
+                pending.extend(result.pending_unlink.iter().map(|id| (bucket, *id)));
+            }
+            assert!(!pending.is_empty(), "expected GC to have relocated at least one segment");
+
+            // The old segments MUST still be on disk at this point.
+            for (bucket, segment_id) in &pending {
+                let log = store.value_log.get_bucket_log(*bucket).unwrap();
+                assert!(
+                    log.segment_stats().iter().any(|s| s.id == *segment_id),
+                    "segment {segment_id} was unlinked before the re-point was durable — that is data loss"
+                );
+            }
+            // A faithful crash: `mem::forget` skips `Drop`, which would otherwise flush
+            // the LSM and make this a graceful close instead of the crash we mean to test.
+            std::mem::forget(store);
+            pending
+        };
+        assert!(!pending.is_empty());
+
+        // Reopen. The re-point may have been lost with the memtable, in which case the
+        // keys still point at the OLD segments — which is exactly why they must not have
+        // been unlinked. Either way every value must still read back.
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost across a crash between GC's re-point and its unlink"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value), "hot key lost across the same crash");
+    }
+
+    /// **The data-loss guard.** Crash at the worst possible instant: the moment GC has
+    /// unlinked the old segments.
+    ///
+    /// With the correct order (flush to L0, *then* unlink), the re-point is already
+    /// durable when the segments go, so this crash is harmless. Swap the two — unlink
+    /// first, flush second — and this same crash loses the re-point *and* the segments
+    /// it pointed into: the durable LSM would reference files that no longer exist, and
+    /// the WAL entries that could replay those writes are long gone. This test fails
+    /// outright in that world, which is the whole point of it.
+    #[test]
+    fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = 64 * 1024;
+        let value = vec![0xE5u8; 8 * 1024];
+
+        {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+
+            // Arm the crash point: GC will return the instant its segments are unlinked.
+            store.gc_crash_after_unlink.store(true, Ordering::SeqCst);
+            let stats = store.garbage_collect_with_threshold(10.0).unwrap();
+            assert!(stats.bytes_reclaimed > 0, "expected GC to have unlinked at least one segment");
+
+            // Crash: skip Drop, so nothing beyond what GC itself made durable survives.
+            std::mem::forget(store);
+        }
+
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost when GC crashed the instant it unlinked — the re-point was not durable first"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value), "hot key lost to the same crash");
+    }
+
+    /// The full pass, then a crash: after `garbage_collect_with_threshold` returns, the
+    /// re-point IS durable (it flushed to L0 before unlinking), so a crash immediately
+    /// afterwards must still resolve every key — now through the *new* segments.
+    #[test]
+    fn test_gc_survives_a_crash_immediately_after_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = 64 * 1024;
+        let value = vec![0xD4u8; 8 * 1024];
+
+        {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+            let stats = store.garbage_collect_with_threshold(10.0).unwrap();
+            assert!(stats.bytes_reclaimed > 0, "expected GC to reclaim at least one segment");
+            // A faithful crash right after the pass: skip `Drop` (which would flush the
+            // LSM), so only what GC itself made durable survives.
+            std::mem::forget(store);
+        }
+
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost across a crash right after a GC pass — the re-point was not durable before the unlink"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value));
+    }
 
     #[test]
     fn test_gc_write_before_gc_survives() {

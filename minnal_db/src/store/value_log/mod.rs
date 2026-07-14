@@ -1207,4 +1207,120 @@ mod tests {
         assert_eq!(log.read_value(dead_loc)?, value, "the bytes are still there — just unreferenced");
         Ok(())
     }
+
+    #[test]
+    fn a_corrupted_value_is_detected_when_checksums_are_verified() -> Result<()> {
+        // Regression: values carry a CRC32 of their payload, and `verify_checksums_on_read`
+        // makes reads re-check it. Without this the structural checks (length, offset)
+        // would happily serve bit-rotted bytes.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let loc = log.append(b"k", b"the-original-value", meta(1), true)?;
+
+        // Flip a byte inside the value payload, in place, behind the log's back.
+        let path = ValueLog::segment_path(dir.path(), 0, loc.segment_id);
+        let mut bytes = std::fs::read(&path)?;
+        let value_at = loc.rec_offset as usize + ValueRecordHeader::SIZE;
+        bytes[value_at] ^= 0xFF;
+        std::fs::write(&path, &bytes)?;
+
+        // A fresh log (so nothing is cached) with verification off still returns the
+        // corrupted bytes — that is the documented latency-first default.
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert_ne!(log.read_value(loc)?, b"the-original-value", "sanity: the bytes really were corrupted");
+
+        // With verification on, the read fails instead of serving them.
+        log.set_verify_checksums_on_read(true);
+        assert!(
+            matches!(log.read_value(loc), Err(ValueLogError::CorruptedLog)),
+            "a corrupted value must be rejected, not served"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_tail_from_a_crash_mid_append_is_ignored() -> Result<()> {
+        // A crash can leave a partial record at the end of the active segment. Nothing
+        // references it — the LSM only ever learned about records whose append
+        // returned — so the scan must stop cleanly there and keep everything before it.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let a = log.append(b"a", b"value-a", meta(1), true)?;
+        let b = log.append(b"b", b"value-b", meta(2), true)?;
+
+        // Simulate the torn write: garbage bytes appended past the last good record.
+        let path = ValueLog::segment_path(dir.path(), 0, a.segment_id);
+        let mut bytes = std::fs::read(&path)?;
+        bytes.extend_from_slice(&[0xAB; 20]); // shorter than a header, and not one anyway
+        std::fs::write(&path, &bytes)?;
+
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let mut seen = Vec::new();
+        log.for_each_record(a.segment_id, |key, _, _, _| seen.push(key.to_vec()))?;
+        assert_eq!(
+            seen,
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "the complete records must survive the torn tail"
+        );
+
+        // ...and both are still readable by pointer.
+        assert_eq!(log.read_value(a)?, b"value-a");
+        assert_eq!(log.read_value(b)?, b"value-b");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_stay_correct_when_the_fd_cache_evicts() -> Result<()> {
+        // The fd cache is bounded (MAX_OPEN_SEGMENTS_PER_BUCKET). A bucket with more
+        // segments than that must still read correctly from the evicted ones — they are
+        // immutable, so an evicted handle is simply reopened on demand.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        // ~2 records per 64 KiB segment → comfortably more segments than the cache holds.
+        let value = vec![0x5A; 30 * 1024];
+        let mut locs = Vec::new();
+        for i in 0..(MAX_OPEN_SEGMENTS_PER_BUCKET * 3) {
+            locs.push(log.append(format!("k{i:04}").as_bytes(), &value, meta(i as u64), false)?);
+        }
+        let distinct: std::collections::HashSet<u32> = locs.iter().map(|l| l.segment_id).collect();
+        assert!(
+            distinct.len() > MAX_OPEN_SEGMENTS_PER_BUCKET,
+            "this test needs more segments ({}) than the fd cache holds ({MAX_OPEN_SEGMENTS_PER_BUCKET})",
+            distinct.len()
+        );
+
+        // Read the OLDEST records last — they are the ones evicted from the cache.
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(log.read_value(*loc)?, value, "record {i} unreadable after its segment was evicted");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_and_garbage_always_sum_to_total() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let value = vec![0x9C; 4 * 1024];
+        let mut locs = Vec::new();
+        for i in 0..12 {
+            locs.push(log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?);
+        }
+        for (i, loc) in locs.iter().enumerate() {
+            if i % 3 == 0 {
+                log.note_displaced(*loc, format!("k{i}").len());
+            }
+        }
+
+        for s in log.segment_stats() {
+            assert_eq!(
+                s.live_bytes + s.garbage_bytes,
+                s.total_bytes,
+                "segment {} broke the live+garbage==total invariant that GC selection relies on",
+                s.id
+            );
+        }
+        Ok(())
+    }
 }
