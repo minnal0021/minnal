@@ -143,29 +143,19 @@ With the overall shape in mind, this section examines each component in turn: th
 
 The LSM (Log-Structured Merge) tree is MinnalDB's index over keys. Following WiscKey, it stores **only keys and value-log pointers — never the values themselves**. Because the entries are tiny, the tree stays small and is cheap to compact.
 
-Data moves through three levels, from fast-and-volatile to slow-and-durable:
+Data moves through three levels, from fast-and-volatile to slow-and-durable — the in-memory **MemTable**, the **L0 files** it flushes into, and the single sorted **L1 SSTable** those compact down to:
 
-```
-Write
-  │
-  ▼
-MemTable (SkipList, in-memory)
-  │  flush at 95% capacity
-  ▼
-L0 Files  (per bucket, timestamp-named, multiple allowed)
-  │  background compaction: merge-sort all L0 files per bucket
-  ▼
-L1 SSTables  (per bucket, one stable file per bucket)
-```
+![Animated diagram of the LSM tiers: keys land in the in-memory MemTable, which is sealed and flushed to an L0 file when it fills; accumulated L0 files are merge-sorted by background compaction into one sorted L1 SSTable per bucket, collapsing duplicate keys and dropping tombstoned ones](docs/lsm-tiers.svg)
 
-A write first lands in the in-memory **MemTable**. When that fills up, it is flushed to disk as one or more **L0 files** for the relevant bucket. L0 files accumulate over time, so a background worker periodically merge-sorts them into a single, sorted **L1 SSTable** per bucket.
+A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so a background worker periodically merge-sorts a bucket's L0 files together with its L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
 
-Because newer data lives in the faster tiers, a **read searches top-down and stops at the first hit**:
+Because the same key can exist in several tiers at once, a read must decide which copy is current. It does that by **write sequence, not by layer order**:
 
-1. Check the active MemTable (an `O(log n)` skip-list lookup).
-2. Check the bucket's L0 files, most-recent first.
-3. Check the bucket's L1 SSTable.
-4. If any of these yields a valid pointer, follow it into the value log to fetch the actual bytes.
+1. **Fast path.** Look up the key in the active MemTable (an `O(log n)` skip-list lookup). Each tree tracks the highest sequence held anywhere below that MemTable, so if the hit's sequence beats it, no lower tier can hold anything newer and the read returns straight away. Ordinary writes always carry the newest sequence, so this is the common case.
+2. **Full resolution.** Otherwise, gather the key's entry from *every* layer — the active MemTable, each sealed read-only MemTable, the bucket's L0 files, and its L1 SSTable — and keep the one with the **highest sequence**. A tombstone winning means "not found".
+3. Follow the winning pointer into the value log to fetch the actual bytes.
+
+Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
 Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32-bit) | page_offset (64-bit) | segment_id (32-bit)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
 
@@ -173,28 +163,46 @@ Two details make this efficient. First, each LSM entry stores its key alongside 
 
 If the LSM tree holds the keys, the value log holds the bytes. It is the heart of the WiscKey design: **values never enter the LSM at all**, so compaction never has to move them. Each shard bucket gets its own append-only file, divided into fixed-size 64 MB pages.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  Page Header (32 bytes)                                  │
-│  magic="VPG1", version, free_offset, table_offset,       │
-│  next_segment_id, page_size                              │
-├──────────────────────────────────────────────────────────┤
-│  Record 1: total_len(4B) + version(4B) + flags(1B) +    │
-│            padding(3B) + epoch_ms(8B) +                  │
-│            value_len(4B) + [value bytes] + CRC32(4B)    │
-│  Record 2: ...                                           │
-│  ...                                                     │
-├──────────────────────────────────────────────────────────┤
-│  Reverse index table (grows from page end toward start)  │
-└──────────────────────────────────────────────────────────┘
-```
+#### A page and its slot table
+
+A page has a 32-byte header (`magic="VPG1"`, `version`, `free_offset`, `table_offset`, `next_segment_id`, `page_size`), and then grows from **both ends**: value records append forward from the header, while an 8-byte **slot entry** per record — `(segment_id, record_offset)` — is written backward from the page's end. When the two regions meet, the page is closed and a new one opens at the file's tail.
+
+![Animated diagram of a value-log page: a record is appended at free_offset while an 8-byte slot entry is written at the page end, so records are addressed by segment id rather than byte offset; a read follows the slot table to the record, and when the two regions meet a new page opens and segment ids restart](docs/vlog-page.svg)
+
+The slot table is the load-bearing indirection. A key's pointer is **`(page_offset, segment_id)`** — never a raw byte offset — so a read is "look up the slot, follow it to the record", and GC is free to move a record's bytes within a page as long as the slot agrees. The LSM packs the whole address into one `u128`: `bucket (32b) | page_offset (64b) | segment_id (32b)`. Each record carries a 36-byte header (`total_len`, `version`, `flags`, `epoch_ms`, `value_len`, CRC32 of the value, and the write `seq`) followed by the value bytes.
+
+#### Writes, deletes, and garbage
 
 Writes only ever append, which turns all value writes into sequential I/O — exactly what SSDs and NVMe drives are fastest at. Records are never modified in place; instead, two **flags** mark records that are no longer current:
 
 - `0x01` **Tombstone** — a logical delete. The bytes stay until garbage collection reclaims the space.
 - `0x02` **Updated** — superseded by a newer write, and therefore treated as garbage.
 
+So an update appends a *new* record and flags the old one; a delete flags the record and writes an LSM tombstone. Neither reclaims a byte — that is GC's job, and it only runs once a bucket's waste ratio crosses the threshold (30% by default):
+
+![Animated diagram of value-log writes and GC: an insert appends a live record, an update appends a new record and flags the old one Updated, a delete flags the record Tombstone; once garbage passes the waste threshold, GC rewrites the surviving records into a new file, writes a journal and commit marker, then swaps the file inside a swap epoch and re-points each key by compare-and-set](docs/vlog-write-gc.svg)
+
+GC is a **copying** collector, and its ordering is what makes it crash-safe. It takes the bucket write lock (the same one `put`/`delete` hold, so its scan and re-point are atomic against them), rewrites the survivors of the dirty pages into a new file — pages *below* the waste threshold are copied byte-for-byte, so their pointers stay valid and need no LSM update — and then fsyncs a **GC journal** (`key → new pointer`) plus a **commit marker** *before* swapping the file in. If a crash lands after the swap, startup replays the journal; if the journal is unreadable, it reverts to the preserved old file. The re-point itself is a compare-and-set: a key is only moved if it still maps to the exact pointer GC copied, and it is re-inserted under its **existing sequence**, so a relocation can neither resurrect a deleted key nor change a key's version.
+
 Every record also carries an **`epoch_ms` timestamp** (its creation time in Unix milliseconds). This is what makes TTL cheap: the TTL worker can find and tombstone expired records straight from the value log, without ever scanning the LSM tree.
+
+#### Reading while GC moves the bytes
+
+A read happens in two steps: first ask the LSM where the value is, then go read it there. GC is what makes that risky — between those two steps it can rewrite the file and move the value somewhere else. A reader that is unlucky enough to land in that window is holding a pointer into a file that no longer exists, or worse, into a slot that now belongs to a *different* record. Reads never take the bucket lock (that would put them behind GC), so instead they **detect** the race and retry:
+
+![Animated diagram of value-log reads under GC: a get reads the bucket generation counter, resolves a pointer and sequence from the LSM, reads the record, and trusts the value only if the generation is unchanged and the record's sequence matches; scans do all of this inside one generation-stable bracket; batch gets group reads by bucket and validate every record's sequence the same way](docs/vlog-read-gc.svg)
+
+**Check 1 — did GC touch this bucket while I was reading?** Every bucket has a counter that GC bumps when it starts a swap and again when it finishes, so an **odd** value means "a swap is happening right now" and an **even** value means "the file and the pointers agree". A reader reads the counter before it starts and again after it finishes. If it was odd, or if it changed in between, GC ran underneath the read — the result is thrown away and the read starts over.
+
+**Check 2 — is this still the record I asked for?** The counter catches a swap in progress, but not a read that arrives *after* one finished and follows a pointer GC has since reused for someone else's value. So every value record also stores the **sequence number** of the write that created it, and the LSM stores the same number next to the pointer. If the record's sequence isn't the one the LSM expected, this slot was recycled and the bytes belong to another key — throw it away and retry.
+
+Both checks are cheap, and together they mean a stale read is always *caught*, never served. A reader that keeps losing the race isn't stuck retrying forever, either: after a few attempts, `get` falls back to reading while holding the bucket write lock, which locks GC out of that bucket and guarantees the read completes.
+
+The three read paths run exactly these checks; they differ only in how much work they batch behind them:
+
+- **`get`** — the walk-through above: one key, one pointer, one record.
+- **Scans** — the LSM pass, the file handles, and the value reads all happen *inside* one before/after counter check covering every bucket, so the whole page is either consistent or retried as a unit. (Resolving a pointer outside that window is precisely the bug the window exists to prevent.) A key that resolved but came back empty is re-read afterwards through single-key `get`.
+- **`get_multiple`** — resolves every key in one LSM pass, groups the pointers by bucket, and reads each bucket in parallel with batched `pread`s (roughly `2 + N` syscalls per page rather than four per key), checking each record's sequence just as `get` does.
 
 ### Write-Ahead Log (WAL)
 
@@ -220,28 +228,23 @@ WalEntry {
 
 Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every un-persisted entry is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes and reconcile on recovery rather than committing them atomically.
 
-Putting the write path and the background lifecycle together, an entry moves through these stages:
-
-```
-put(key, val)
-  → WAL.append(Upsert)
-  → fsync(WAL)   (every op)
-  → ValueLog.append(val)
-  → LSM.insert(key, vlog_ptr)
-
-...every records_per_sync writes...
-  → fsync(value_log)        (WAL is already fsynced per op above)
-
-...on LSM memtable flush to L0...
-  → WAL entries for those keys marked Persisted
-
-...WAL GC...
-  → Segments where all entries are Persisted are removed
-```
-
 The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
 
 Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Once every entry in a segment is marked `Persisted` — meaning the data is safely in an L0 or L1 SSTable on disk — the WAL garbage collector deletes the whole segment, decrements the global `total_entries`/`persisted_entries` counters, and advances the WAL head pointer past any consecutively deleted segments so a later startup scan never tries to open a file that is gone.
+
+#### How WAL storage evolves over time
+
+The log grows with every write and shrinks in whole-segment steps, so its on-disk size is a sawtooth rather than a monotonic climb. The animation below follows entries through all three stages — appended (`Inserted`), covered by a memtable flush (`Persisted`), and reclaimed:
+
+![Animated diagram of the WAL lifecycle: entries are appended and fsynced, a memtable flush marks them persisted, and WAL GC deletes fully-persisted segments, keeping the on-disk log bounded](docs/wal-lifecycle.svg)
+
+Three rules set the shape of that curve:
+
+- **Only flushes shrink the log.** An entry stays `Inserted` — and its segment stays on disk — until *its* memtable is flushed to an L0 SSTable. Until then the WAL is the only durable copy of that write, so nothing about it can be reclaimed.
+- **Reclamation is per segment, never per entry.** A segment is deleted only when *every* entry in it is `Persisted`, which is why the size drops in 64 MB steps: one straggler entry pins the whole file. GC also skips the **active segment** — the tail the log is currently appending to is never reclaimed, even if all of its entries are persisted.
+- **The head only moves forward over contiguous deletions.** After deleting segments, GC advances `head` past the consecutively deleted ones, so recovery's `scan_entries(head, tail)` always starts at a file that still exists.
+
+The steady-state footprint therefore isn't "everything ever written" but roughly *the entries not yet flushed to L0, plus the active segment*. A large memtable (or a stalled flush) widens the sawtooth by holding more segments un-persisted; a database that stops writing settles at a single active segment once the last flush lands, with all earlier segments reclaimed.
 
 ### Skip List
 
@@ -253,7 +256,18 @@ keys[]    — Raw key bytes, packed contiguously (nodes index by offset+len)
 links[]   — Forward pointer arrays (u32 node indices, packed per-node)
 ```
 
-Keeping nodes, keys, and forward links in separate flat arrays means that walking the list touches cache-local memory, which makes traversal markedly faster than a pointer-chasing node graph.
+Keeping nodes, keys, and forward links in separate flat arrays means that walking the list touches cache-local memory, which makes traversal markedly faster than a pointer-chasing node graph. A node is referred to by its **`u32` index into `nodes[]`**, not by a pointer.
+
+Here is the whole structure under the four operations that touch it:
+
+![Animated diagram of the skip list under create, read, update and delete: an insert allocates a node whose height is coin-flipped and links it in at each level; a search starts at the head's top level, hops right while the next key is smaller, and drops a level when it would overshoot; an update rewrites a node's value and sequence in place while a write carrying an older sequence is dropped; a delete flags the node as a tombstone without unlinking it](docs/skiplist-crud.svg)
+
+Each operation earns its keep differently:
+
+- **Create.** A new node's height is decided by a coin flip (geometric, `p = 0.5`, capped at 32 levels), then it is linked in at every level it reaches. Tall nodes are the express lanes — level 0 is the complete sorted list, and each level above it is a shortcut over the level below.
+- **Read.** Start at the head's top level and hop right while the next key is still smaller than the target; when the next hop would overshoot, drop a level and continue. That is the `O(log n)` search, and every hop is an array index rather than a pointer dereference.
+- **Update.** If the key is already present, its value and sequence are overwritten **in place** — no new node, no relinking. A write whose sequence is *older* than the node's is **dropped** (highest-sequence-wins), which is what makes the winner of two racing same-key writes identical to the one WAL recovery would replay.
+- **Delete.** The node is **not** unlinked; it is flagged as a **tombstone** and stays in the list. That is deliberate: a search must be able to report "deleted" as distinct from "absent", because a delete recorded here has to shadow any older copy of the key still sitting in an L0 file or the L1 SSTable.
 
 The structure's other properties:
 
@@ -391,23 +405,31 @@ put(key, value)
 
 ### Read Path
 
-A read consults the LSM tiers newest-first, and the first valid pointer it finds is followed into the value log:
+A read resolves the key's current version by **highest write sequence**, then follows that pointer into the value log:
 
 ```
 get(key)
         │
-        ├──► SkipList.get(key)          → pointer? ──┐
-        │                                            │ yes
-        ├──► L0 files for bucket        → pointer? ──┤
-        │    (most recent first)                     │ yes
-        ├──► L1 SSTable for bucket      → pointer? ──┤
-        │                                            │ yes
+        ├──► SkipList.get(key)  → hit whose seq beats every lower tier?
+        │                            └─► yes: nothing below can be newer, return it  (fast path)
+        │
+        │    otherwise gather candidates from every layer and keep the highest seq:
+        ├──► active MemTable            → (pointer | tombstone, seq)
+        ├──► read-only MemTables         → (pointer | tombstone, seq)
+        ├──► L0 files for bucket         → (pointer | tombstone, seq)
+        ├──► L1 SSTable for bucket       → (pointer | tombstone, seq)
+        │                                            │
+        │                          winner = max by seq
+        │                                            │
+        │                    tombstone ──► None      │ pointer
         │                                            ▼
         │                                 ValueLog.read(bucket, offset)
         │                                     └─► value bytes
         │
-        └──► not found → return None
+        └──► no candidate → return None
 ```
+
+Layer order is deliberately *not* the tie-breaker: value-log GC re-points a relocated key under its original sequence, so a newer layer can legitimately hold an older version. See [LSM Tree](#lsm-tree) for why first-hit-wins would resurrect deleted keys.
 
 ---
 
@@ -424,6 +446,8 @@ LSM compaction runs when a memtable fills (95% capacity) or on the compaction wo
 3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable.
 4. The old L0 files are removed only once every in-flight read has finished with them, so a concurrent read is never pulled out from under.
 
+The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush, accumulate, merge — including how duplicate keys and tombstones make L1 smaller than the files it was built from.
+
 ### Value Log GC
 
 Value-log GC runs when a bucket's waste ratio (garbage bytes ÷ total bytes) exceeds 30% (configurable). The tricky part is doing this safely while writes and deletes are landing in the same bucket, so the whole compaction holds the **per-bucket write lock** that `put` and `delete` also take — making the scan and the subsequent LSM update atomic with respect to concurrent mutations.
@@ -436,7 +460,7 @@ Value-log GC runs when a bucket's waste ratio (garbage bytes ÷ total bytes) exc
 6. Re-point each relocated key in the LSM as a **compare-and-set**: a key is only updated if it still maps to the exact pointer that was copied. A key deleted or overwritten since the scan is left alone, so GC never resurrects a deletion or reverts a newer write.
 7. Delete the GC journal. (If a crash interrupts the swap, the journal replay on startup applies the same "skip keys that are now deleted" rule.)
 
-Readers stay correct throughout *without* taking the bucket lock. A reader samples the bucket's swap generation before and after it reads the pointer and value, and only trusts the result if the generation is unchanged; otherwise it retries and, if needed, falls back to a lock-held read. This guarantees a reader can never pair a stale pointer with a freshly-swapped file.
+Readers stay correct throughout *without* taking the bucket lock. A reader samples the bucket's swap generation before and after it reads the pointer and value, and only trusts the result if the generation is unchanged; otherwise it retries and, if needed, falls back to a lock-held read. This guarantees a reader can never pair a stale pointer with a freshly-swapped file. The [Value Log](#value-log) section animates both sides of this — the swap protocol and what each read path does while it runs.
 
 ### WAL GC
 
@@ -446,7 +470,7 @@ WAL GC runs every 60s. Its job is simply to drop segments whose every entry is a
 2. If every entry is `Persisted`, delete the segment file and subtract its counts from the global totals.
 3. Advance the WAL `head` past all consecutively deleted segments, so the next startup scan begins at a live file.
 
-An entry becomes `Persisted` the moment its key is flushed from the MemTable to an on-disk L0 file — that is, once a durable copy exists in the LSM and the WAL no longer needs to protect it.
+An entry becomes `Persisted` the moment its key is flushed from the MemTable to an on-disk L0 file — that is, once a durable copy exists in the LSM and the WAL no longer needs to protect it. See [How WAL storage evolves over time](#how-wal-storage-evolves-over-time) for the resulting sawtooth in on-disk size.
 
 ---
 
