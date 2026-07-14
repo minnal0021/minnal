@@ -64,6 +64,15 @@ pub struct Metrics {
     // ── Garbage collection ──────────────────────────────────────────────
     pub vlog_gc_runs: AtomicU64,
     pub vlog_gc_duration_ms: AtomicU64,
+    /// Value-log segment files GC has unlinked.
+    pub vlog_segments_reclaimed: AtomicU64,
+    /// Bytes returned to the filesystem by unlinking those segments.
+    pub vlog_gc_bytes_reclaimed: AtomicU64,
+    /// Bytes of *survivors* GC rewrote to relocate them out of those segments — the
+    /// cost of the pass. `bytes_rewritten / bytes_reclaimed` is GC's write
+    /// amplification, and is the number to watch: it should sit near 1, and a value
+    /// far above it means GC is repeatedly relocating data it cannot actually free.
+    pub vlog_gc_bytes_rewritten: AtomicU64,
     pub wal_gc_runs: AtomicU64,
     pub wal_segments_deleted: AtomicU64,
 }
@@ -124,6 +133,9 @@ impl Metrics {
             compaction_duration_ms: g(&self.compaction_duration_ms),
             vlog_gc_runs: g(&self.vlog_gc_runs),
             vlog_gc_duration_ms: g(&self.vlog_gc_duration_ms),
+            vlog_segments_reclaimed: g(&self.vlog_segments_reclaimed),
+            vlog_gc_bytes_reclaimed: g(&self.vlog_gc_bytes_reclaimed),
+            vlog_gc_bytes_rewritten: g(&self.vlog_gc_bytes_rewritten),
             wal_gc_runs: g(&self.wal_gc_runs),
             wal_segments_deleted: g(&self.wal_segments_deleted),
         }
@@ -193,6 +205,9 @@ pub struct MetricsSnapshot {
     pub compaction_duration_ms: u64,
     pub vlog_gc_runs: u64,
     pub vlog_gc_duration_ms: u64,
+    pub vlog_segments_reclaimed: u64,
+    pub vlog_gc_bytes_reclaimed: u64,
+    pub vlog_gc_bytes_rewritten: u64,
     pub wal_gc_runs: u64,
     pub wal_segments_deleted: u64,
 }
@@ -224,6 +239,9 @@ impl MetricsSnapshot {
         self.compaction_duration_ms += o.compaction_duration_ms;
         self.vlog_gc_runs += o.vlog_gc_runs;
         self.vlog_gc_duration_ms += o.vlog_gc_duration_ms;
+        self.vlog_segments_reclaimed += o.vlog_segments_reclaimed;
+        self.vlog_gc_bytes_reclaimed += o.vlog_gc_bytes_reclaimed;
+        self.vlog_gc_bytes_rewritten += o.vlog_gc_bytes_rewritten;
         self.wal_gc_runs += o.wal_gc_runs;
         self.wal_segments_deleted += o.wal_segments_deleted;
     }

@@ -1370,6 +1370,11 @@ impl KVStore {
         if let Some(m) = self.metrics() {
             Metrics::bump(&m.vlog_gc_runs);
             Metrics::add(&m.vlog_gc_duration_ms, start_time.elapsed().as_millis() as u64);
+            Metrics::add(&m.vlog_segments_reclaimed, segments_reclaimed as u64);
+            Metrics::add(&m.vlog_gc_bytes_reclaimed, bytes_reclaimed);
+            // Together with bytes_reclaimed this is GC's write amplification — the cost
+            // of a pass against what it actually freed.
+            Metrics::add(&m.vlog_gc_bytes_rewritten, bytes_rewritten);
         }
 
         Ok(self.gc_stats_now(bytes_reclaimed, start_time))

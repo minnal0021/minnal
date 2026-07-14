@@ -242,6 +242,13 @@ pub struct SegmentStats {
 }
 
 impl SegmentStats {
+    /// The segment file's size on disk: its 16-byte header plus its records. Segments
+    /// are dense append-only files, so this is exact — no `stat` needed, and there are
+    /// no sparse holes to reason about.
+    pub fn file_bytes(&self) -> u64 {
+        SEGMENT_HEADER_SIZE + self.total_bytes
+    }
+
     pub fn garbage_ratio_pct(&self) -> f64 {
         if self.total_bytes == 0 {
             return 0.0;
