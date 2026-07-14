@@ -440,7 +440,15 @@ impl Database {
         for (name, ns_id) in registry.list() {
             let ns_path = db_path.join(format!("ns_{}", name));
             let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
-            let kv_store = KVStore::open_with_ttl(ns_id, name, &ns_path, config.lsm_config.clone(), config.sync_config, ttl)?;
+            let kv_store = KVStore::open_with_ttl(
+                ns_id,
+                name,
+                &ns_path,
+                config.lsm_config.clone(),
+                config.sync_config,
+                config.page_size_bytes,
+                ttl,
+            )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
             stores.insert(ns_id, Arc::new(kv_store));
@@ -752,7 +760,14 @@ impl Database {
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = self.db_path.join(format!("ns_{}", name));
-        let kv_store = KVStore::open(ns_id, name, &ns_path, self.config.lsm_config.clone(), self.config.sync_config)?;
+        let kv_store = KVStore::open(
+            ns_id,
+            name,
+            &ns_path,
+            self.config.lsm_config.clone(),
+            self.config.sync_config,
+            self.config.page_size_bytes,
+        )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
@@ -784,7 +799,15 @@ impl Database {
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = self.db_path.join(format!("ns_{}", name));
-        let kv_store = KVStore::open_with_ttl(ns_id, name, &ns_path, self.config.lsm_config.clone(), self.config.sync_config, ttl)?;
+        let kv_store = KVStore::open_with_ttl(
+            ns_id,
+            name,
+            &ns_path,
+            self.config.lsm_config.clone(),
+            self.config.sync_config,
+            self.config.page_size_bytes,
+            ttl,
+        )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
@@ -1687,11 +1710,16 @@ impl Database {
 
     // ── Value log GC (per namespace) ───────────────────────────────────
 
-    /// Run value log GC on a specific namespace
+    /// Run value log GC on a specific namespace.
+    ///
+    /// Note the threshold passed here is the **per-page** one, not the bucket-level
+    /// trigger: an explicit `garbage_collect()` call has already decided the
+    /// namespace is worth collecting, so what is left to decide is which *pages*
+    /// to rewrite.
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
-        let threshold = self.config.threshold_config.value_log_waste_threshold;
-        kv_store.garbage_collect_with_threshold(threshold)
+        let page_threshold = self.config.threshold_config.page_gc_threshold;
+        kv_store.garbage_collect_with_threshold(page_threshold)
     }
 
     /// Run value log GC on the default namespace
@@ -1981,7 +2009,14 @@ impl Database {
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
             let ns_path = db_path.join(format!("ns_{}", name));
-            let kv_store = KVStore::open(ns_id, name, &ns_path, config.lsm_config.clone(), config.sync_config)?;
+            let kv_store = KVStore::open(
+                ns_id,
+                name,
+                &ns_path,
+                config.lsm_config.clone(),
+                config.sync_config,
+                config.page_size_bytes,
+            )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
             stores.insert(ns_id, Arc::new(kv_store));
@@ -2212,12 +2247,21 @@ impl ValueLogGcTarget for Database {
         self.is_closed()
     }
 
+    /// `waste_threshold` decides **whether** a namespace is collected; the separate,
+    /// lower `page_gc_threshold` then decides **which pages** get rewritten. Passing
+    /// the trigger through as the page threshold (as this used to) makes garbage
+    /// sitting just under it uncollectable: those pages read as "clean", get copied
+    /// byte-for-byte into the compacted file with their garbage intact, and keep the
+    /// bucket over its trigger forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
+        let page_threshold = self.config.threshold_config.page_gc_threshold;
         info!(
-            "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold",
+            "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
+             (pages rewritten at >= {:.2}% garbage)",
             stores.len(),
-            waste_threshold
+            waste_threshold,
+            page_threshold
         );
         for (ns_id, kv_store) in stores.iter() {
             let waste_ratio = kv_store.get_waste_ratio();
@@ -2232,7 +2276,7 @@ impl ValueLogGcTarget for Database {
                 ns_id, waste_ratio, garbage_bytes, written_bytes, waste_threshold
             );
             let start = std::time::Instant::now();
-            match kv_store.garbage_collect_with_threshold(waste_threshold) {
+            match kv_store.garbage_collect_with_threshold(page_threshold) {
                 Ok(stats) => info!(
                     "[GCWorker] ns_id={} GC complete in {:?} — reclaimed {} bytes, live {} bytes, \
                      total reclaimed {} bytes across {} run(s)",

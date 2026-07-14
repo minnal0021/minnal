@@ -191,7 +191,17 @@ mod tests {
         };
         let sync_config = SyncConfig::default();
         let path = dir.path().join("ns_test");
-        Arc::new(KVStore::open(0, "test", &path, lsm_config, sync_config).unwrap())
+        Arc::new(
+            KVStore::open(
+                0,
+                "test",
+                &path,
+                lsm_config,
+                sync_config,
+                crate::store::value_log::DEFAULT_PAGE_SIZE_BYTES,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]

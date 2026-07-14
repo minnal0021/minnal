@@ -109,7 +109,7 @@ MINNAL_CONFIG_FILE=/path/to/config.toml minnal_db_api
 Reference config:
 - `config/sample.toml` — full API server config (covers all KV engine options plus `[api]`, `[logging]`, `[semantic_search]`)
 
-Key knobs: `sharding.num_buckets` (cannot change after data exists), `sync.records_per_sync` (value-log fsync cadence — the WAL is fsynced on every write regardless), `thresholds.value_log_waste_threshold` (GC trigger), `thresholds.index_blob_waste_threshold` (field-index bitmap compaction trigger at checkpoint), `recovery.fail_log_dir` (where fail-log JSON files are written; defaults to `<db_path>/fail_logs`).
+Key knobs: `sharding.num_buckets` (cannot change after data exists), `value_log.page_size_bytes` (value-log page size, default 64 MiB — also fixed at creation: it is encoded in every value pointer), `sync.records_per_sync` (value-log fsync cadence — the WAL is fsynced on every write regardless), `thresholds.value_log_waste_threshold` (GC trigger), `thresholds.index_blob_waste_threshold` (field-index bitmap compaction trigger at checkpoint), `recovery.fail_log_dir` (where fail-log JSON files are written; defaults to `<db_path>/fail_logs`).
 
 ## Semantic search
 
