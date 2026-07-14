@@ -113,6 +113,20 @@ const SEGMENT_HEADER_SIZE: u64 = 16;
 const VALUE_LOG_METADATA_MAGIC: [u8; 4] = *b"VLOG";
 const VALUE_LOG_METADATA_VERSION: u32 = 3;
 
+/// Garbage share at which GC will **seal the active tail** so it can be collected.
+///
+/// The tail is normally off-limits (it is still being appended to), which is fine while
+/// it keeps filling: it seals on its own and becomes collectable. But a small or idle
+/// namespace may never fill a segment, so garbage can pile up in the tail and be
+/// unreclaimable *forever* — while the bucket-level waste trigger keeps firing, so GC
+/// wakes every interval, finds no candidate, and reclaims nothing.
+///
+/// Sealing the tail early costs a rewrite of whatever is still live in it, so it is only
+/// worth doing when garbage **dominates**. At 50% the pass rewrites at most as much as it
+/// frees; the common case that motivates this — a store whose keys were all deleted or
+/// overwritten — is at or near 100%, where there is nothing to rewrite at all.
+pub const TAIL_GC_MIN_GARBAGE_PCT: f64 = 50.0;
+
 /// How many segment files a bucket keeps open at once.
 ///
 /// Segments are immutable, so an evicted handle can always be reopened. Eviction
@@ -807,8 +821,43 @@ impl ValueLog {
 
     // ── GC support ────────────────────────────────────────────────────────
 
-    /// Sealed segments at or above `threshold_pct` garbage, worst first. The active
-    /// tail is never a candidate — it is still being appended to.
+    /// Is there anything for GC to actually do in this bucket?
+    ///
+    /// Cheap (in-memory counters) and exact enough to keep the GC worker from waking on a
+    /// bucket whose garbage it cannot collect — which is what made a small, fully-deleted
+    /// namespace log "starting GC ... reclaimed 0 bytes" on every tick.
+    pub fn has_gc_work(&self, threshold_pct: f64) -> bool {
+        !self.gc_candidates(threshold_pct).is_empty() || self.tail_needs_sealing()
+    }
+
+    /// True when the active tail is mostly garbage and should be sealed so GC can collect
+    /// it (see [`TAIL_GC_MIN_GARBAGE_PCT`]).
+    fn tail_needs_sealing(&self) -> bool {
+        let inner = self.inner.read();
+        inner
+            .segments
+            .get(&inner.active_id)
+            .is_some_and(|s| s.garbage_bytes > 0 && s.garbage_ratio_pct() >= TAIL_GC_MIN_GARBAGE_PCT)
+    }
+
+    /// Seal the active tail if it is mostly garbage, opening a fresh one in its place, and
+    /// return the id it just sealed so GC can collect it in this same pass.
+    ///
+    /// The caller must hold the bucket write lock: this rolls the segment writers append
+    /// to. A record appended just before the roll is simply live data in the sealed
+    /// segment, and GC will relocate it like any other survivor.
+    pub fn seal_tail_for_gc(&self) -> Result<Option<u32>> {
+        if !self.tail_needs_sealing() {
+            return Ok(None);
+        }
+        let mut inner = self.inner.write();
+        let sealed = inner.active_id;
+        self.roll_active_segment(&mut inner)?;
+        Ok(Some(sealed))
+    }
+
+    /// Sealed segments at or above `threshold_pct` garbage, worst first. The active tail is
+    /// not a candidate here — it must be sealed first (see [`seal_tail_for_gc`](Self::seal_tail_for_gc)).
     pub fn gc_candidates(&self, threshold_pct: f64) -> Vec<SegmentStats> {
         let inner = self.inner.read();
         let mut candidates: Vec<SegmentStats> = inner

@@ -2265,6 +2265,17 @@ impl ValueLogGcTarget for Database {
                 debug!("[GCWorker] ns_id={} waste {:.2}% below threshold, skipping", ns_id, waste_ratio);
                 continue;
             }
+            // Over the trigger, but is any of that garbage actually collectable? Garbage in
+            // a bucket's active tail is not, until the tail is either filled or sealed — so
+            // without this check a small, fully-deleted namespace would sit at 100% waste
+            // and make the worker log "starting GC ... reclaimed 0 bytes" on every tick.
+            if !kv_store.has_gc_work(page_threshold) {
+                debug!(
+                    "[GCWorker] ns_id={} waste {:.2}% is over the trigger but no segment is collectable yet, skipping",
+                    ns_id, waste_ratio
+                );
+                continue;
+            }
             let (garbage_bytes, written_bytes) = kv_store.waste_bytes();
             info!(
                 "[GCWorker] ns_id={} waste {:.2}% ({} garbage / {} written bytes; waste = garbage / (live + garbage)) \

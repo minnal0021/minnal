@@ -382,3 +382,91 @@ fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
     assert_eq!(db.get(b"hot").unwrap(), Some(value));
     db.shutdown().unwrap();
 }
+/// Regression: garbage in a bucket's **active tail** used to be uncollectable forever.
+///
+/// The tail is normally off-limits to GC — it is still being appended to — which is fine
+/// while it keeps filling, because it seals on its own and becomes collectable. But a
+/// small or idle namespace may never fill a 256 MiB segment. So a store whose keys were
+/// all deleted or overwritten would sit at 100% waste with nothing GC could touch: the
+/// bucket trigger fired on every 60s tick, GC found no candidate, reclaimed 0 bytes, and
+/// logged "starting GC" again a minute later. Forever.
+///
+/// GC now seals a tail that is mostly garbage (`TAIL_GC_MIN_GARBAGE_PCT`) so it can be
+/// collected in the same pass.
+#[test]
+fn garbage_in_the_active_tail_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+    // Small enough that nothing ever fills a segment: it all lives in the active tail.
+    let value = vec![0x11u8; 4 * 1024];
+    for i in 0..8 {
+        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+    }
+    for i in 0..8 {
+        db.delete(format!("k{i}").as_bytes()).unwrap();
+    }
+
+    let before = db.stats();
+    assert!(before.garbage_size > 0 && before.live_bytes == 0, "expected an all-garbage tail");
+    assert!(before.waste_ratio >= 99.0, "expected ~100% waste, got {:.1}%", before.waste_ratio);
+
+    let gc = db.garbage_collect().unwrap();
+    assert!(
+        gc.bytes_reclaimed > 0,
+        "GC reclaimed nothing — the garbage is all in the active tail, which GC would never select"
+    );
+
+    let after = db.stats();
+    assert_eq!(after.garbage_size, 0, "the tail's garbage should be gone");
+    assert!(after.waste_ratio < 1.0, "waste should have collapsed, got {:.1}%", after.waste_ratio);
+
+    // ...and the store still works: writes land, reads resolve.
+    db.put(b"fresh", &value).unwrap();
+    assert_eq!(db.get(b"fresh").unwrap(), Some(value));
+    for i in 0..8 {
+        assert_eq!(db.get(format!("k{i}").as_bytes()).unwrap(), None, "k{i} was resurrected");
+    }
+    db.shutdown().unwrap();
+}
+
+/// A tail that is mostly LIVE must not be sealed and rewritten — that would relocate all
+/// of it to reclaim very little, on every GC tick. Only a tail dominated by garbage is
+/// worth the rewrite.
+#[test]
+fn a_mostly_live_tail_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+    let value = vec![0x22u8; 4 * 1024];
+    for i in 0..10 {
+        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+    }
+    // Overwrite just one key: ~10% garbage — well under the seal threshold.
+    db.put(b"k0", &value).unwrap();
+
+    let segments_before: Vec<u32> = db
+        .value_log_segment_stats("default")
+        .unwrap()
+        .iter()
+        .flat_map(|(_, ss)| ss.iter().map(|s| s.id))
+        .collect();
+
+    db.garbage_collect().unwrap();
+
+    let segments_after: Vec<u32> = db
+        .value_log_segment_stats("default")
+        .unwrap()
+        .iter()
+        .flat_map(|(_, ss)| ss.iter().map(|s| s.id))
+        .collect();
+    assert_eq!(
+        segments_before, segments_after,
+        "a mostly-live tail was sealed and rewritten; GC would churn it on every tick"
+    );
+
+    for i in 0..10 {
+        assert_eq!(db.get(format!("k{i}").as_bytes()).unwrap(), Some(value.clone()), "k{i} lost");
+    }
+    db.shutdown().unwrap();
+}

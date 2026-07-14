@@ -12,7 +12,7 @@ use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::store::value_log::{ValueLocation, ValueRecordMeta};
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1199,6 +1199,21 @@ impl KVStore {
             pending_unlink: Vec::new(),
         };
 
+        // The active tail is normally off-limits, but a small or idle namespace may never
+        // fill a segment — so its garbage would be uncollectable forever while the waste
+        // trigger kept firing. If the tail is mostly garbage, seal it (under the bucket
+        // lock, since this rolls the segment writers append to) so it can be collected in
+        // this same pass. See `TAIL_GC_MIN_GARBAGE_PCT`.
+        {
+            let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+            if let Some(sealed) = log.seal_tail_for_gc()? {
+                debug!(
+                    "[KVStore '{}'] bucket {}: sealed the active tail (segment {}) — it was mostly garbage",
+                    self.name, bucket, sealed
+                );
+            }
+        }
+
         let candidates = log.gc_candidates(page_gc_threshold_pct);
         if candidates.is_empty() {
             return Ok(result);
@@ -1394,6 +1409,16 @@ impl KVStore {
     #[allow(dead_code)]
     pub fn garbage_collect(&self) -> Result<GCStats> {
         self.garbage_collect_with_threshold(crate::db::config::ThresholdConfig::default().value_log_waste_threshold)
+    }
+
+    /// Does this namespace have value-log garbage GC can actually collect right now?
+    ///
+    /// The bucket-level waste ratio alone is not enough: garbage sitting in a bucket's
+    /// active tail is not collectable until the tail is sealed, so a small, fully-deleted
+    /// namespace could show 100% waste while GC had nothing to do — and the worker would
+    /// wake, log "starting GC", reclaim nothing, and repeat on every tick.
+    pub(crate) fn has_gc_work(&self, page_gc_threshold_pct: f64) -> bool {
+        (0..self.value_log.num_buckets() as u32).any(|b| self.value_log.get_bucket_log(b).is_ok_and(|log| log.has_gc_work(page_gc_threshold_pct)))
     }
 
     /// Waste across the whole namespace: `garbage / (live + garbage)`, as a percentage.
