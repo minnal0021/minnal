@@ -118,7 +118,16 @@ pub struct DbConfig {
     pub skip_list_capacity: usize,
     /// WAL segment size in bytes.
     pub wal_segment_size: u64,
-    /// Value log page size in bytes.
+    /// Value log page size in bytes (default 64 MiB).
+    ///
+    /// **Fixed when a namespace's value log is created and cannot be changed
+    /// afterwards** — like [`num_buckets`](Self::num_buckets). A page's size
+    /// determines the page-aligned `page_offset` in every stored value pointer
+    /// and where a record's slot entry lives, so reopening existing data with a
+    /// different size would reinterpret every pointer. Opening a namespace whose
+    /// value log was written with a different page size fails.
+    ///
+    /// Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
     pub page_size_bytes: u64,
     /// Directory for recovery fail-log files.
     /// `None` defaults to `<db_path>/fail_logs` at open time.

@@ -137,6 +137,11 @@ segment_size_bytes = 67_108_864   # 64 MiB
 # Size of each page within the value log in bytes.
 # Larger pages improve sequential read throughput; smaller pages reduce
 # space amplification for small values.  Default: 64 MiB.
+#
+# Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
+# Fixed at creation: a page's size is encoded in every stored value pointer, so
+# changing it after data exists is not supported — opening a database whose value
+# log was written with a different page size fails.
 page_size_bytes = 67_108_864   # 64 MiB
 
 # Re-verify each value's CRC32 checksum on every read.

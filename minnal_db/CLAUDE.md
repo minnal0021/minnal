@@ -89,6 +89,8 @@ The map is a **derived** structure with the same durability model as the field i
 
 `num_buckets` (default 16) shards both the value log and LSM SSTables. Keys are hash-distributed. **Cannot change `num_buckets` on an existing database** — the value is locked at creation time.
 
+The value log's **page size** (`DbConfig::page_size_bytes`, default 64 MiB) is locked the same way: it determines the page-aligned `page_offset` in every stored `u128` pointer and where a record's slot entry sits (`page_size - segment_id * 8`), so reopening a value log with a different size fails (`ValueLogError::PageSizeMismatch`) instead of reinterpreting every pointer. `ValueLog::open_with_page_size` enforces it; GC's replacement file must be opened with the bucket's size (`ShardedValueLog::page_size()`).
+
 ## Background workers
 
 All background workers (`lsm_worker`, `gc_value_log_worker`, `wal_worker`, `ttl_worker`, `index_checkpoint_worker`) are spawned on `Db::open` and stopped on `Db::shutdown`. Always call `shutdown()` — dropping without it may lose buffered writes.

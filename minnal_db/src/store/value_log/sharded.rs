@@ -4,7 +4,7 @@
 //! based on the hash of the key. Each bucket is backed by a single
 //! value log file. The bucket determination is dynamic via hashing.
 
-use super::{PAGE_SIZE_BYTES, PageGarbageStats, ValueLocation, ValueLog, ValueLogMetadata, ValueRecordMeta};
+use super::{DEFAULT_PAGE_SIZE_BYTES, PageGarbageStats, ValueLocation, ValueLog, ValueLogMetadata, ValueRecordMeta};
 use crate::support;
 use parking_lot::{Mutex, RwLock};
 use std::fs::File;
@@ -128,15 +128,27 @@ pub struct ShardedValueLog {
     // Number of sharding buckets
     num_buckets: usize,
 
+    // Page size of every bucket file. Fixed at creation (see `ValueLog::page_size`).
+    page_size: u64,
+
     // Base directory path
     base_path: PathBuf,
 }
 
 impl ShardedValueLog {
-    /// Open or create a sharded value log with the given number of buckets.
+    /// Open or create a sharded value log with the given number of buckets and
+    /// the default page size.
+    #[allow(dead_code)] // test/convenience constructor; production opens with the configured size
+    pub fn open<P: AsRef<Path>>(base_path: P, num_buckets: usize) -> Result<Self> {
+        Self::open_with_page_size(base_path, num_buckets, DEFAULT_PAGE_SIZE_BYTES)
+    }
+
+    /// Open or create a sharded value log whose bucket files use `page_size` pages.
     ///
     /// Creates `num_buckets` value log files (one per bucket) in the given directory.
-    pub fn open<P: AsRef<Path>>(base_path: P, num_buckets: usize) -> Result<Self> {
+    /// The page size is fixed at creation: reopening buckets that already hold data
+    /// with a different size fails with [`ValueLogError::PageSizeMismatch`].
+    pub fn open_with_page_size<P: AsRef<Path>>(base_path: P, num_buckets: usize, page_size: u64) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path)?;
 
@@ -148,16 +160,16 @@ impl ShardedValueLog {
             let bucket_path = base_path.join(format!("value_log_{}.log", bucket));
             let metadata_path = base_path.join(format!("value_log_{}.metadata", bucket));
 
-            let log = ValueLog::open(&bucket_path)?;
+            let log = ValueLog::open_with_page_size(&bucket_path, page_size)?;
 
             // Load metadata, or rebuild it from the value-log pages when it is
-            // missing or corrupt. Resetting to `ValueLogMetadata::new()` would
+            // missing or corrupt. Resetting to `ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES)` would
             // zero the live/garbage counters (GC would never trigger) and the
             // page cursors (a later write could land a new page over existing
             // data) — `reconstruct_metadata` recovers both by scanning the file.
             let mut meta = if metadata_path.exists() {
                 let data = std::fs::read(&metadata_path)?;
-                match ValueLogMetadata::from_file_bytes(&data) {
+                match ValueLogMetadata::from_file_bytes(&data, page_size) {
                     Ok(metadata) => metadata,
                     Err(_) => {
                         let backup_path = metadata_path.with_extension("corrupt");
@@ -181,8 +193,15 @@ impl ShardedValueLog {
             metadata,
             bucket_write_locks,
             num_buckets,
+            page_size,
             base_path,
         })
+    }
+
+    /// Page size of every bucket file (fixed at creation).
+    #[inline]
+    pub fn page_size(&self) -> u64 {
+        self.page_size
     }
 
     /// Write a value to the appropriate bucket
@@ -334,8 +353,8 @@ impl ShardedValueLog {
     }
 
     #[allow(dead_code)]
-    fn used_capacity_bytes(metadata: &ValueLogMetadata) -> u64 {
-        let used_in_current = metadata.current_page_free_offset as u64 + (PAGE_SIZE_BYTES.saturating_sub(metadata.current_page_table_offset as u64));
+    fn used_capacity_bytes(&self, metadata: &ValueLogMetadata) -> u64 {
+        let used_in_current = metadata.current_page_free_offset as u64 + (self.page_size.saturating_sub(metadata.current_page_table_offset as u64));
         metadata.current_page_offset.saturating_add(used_in_current)
     }
 
@@ -350,12 +369,12 @@ impl ShardedValueLog {
     }
 
     #[allow(dead_code)]
-    fn free_space_ratio(metadata: &ValueLogMetadata) -> f64 {
+    fn free_space_ratio(&self, metadata: &ValueLogMetadata) -> f64 {
         let allocated = metadata.tail;
         if allocated == 0 {
             return 0.0;
         }
-        let used = Self::used_capacity_bytes(metadata).min(allocated);
+        let used = self.used_capacity_bytes(metadata).min(allocated);
         let free = allocated.saturating_sub(used);
         (free as f64 / allocated as f64) * 100.0
     }
@@ -379,7 +398,7 @@ impl ShardedValueLog {
         }
 
         let metadata = self.metadata[bucket as usize].read();
-        Ok(Self::free_space_ratio(&metadata))
+        Ok(self.free_space_ratio(&metadata))
     }
 
     /// Backward-compat alias for garbage ratio.
@@ -415,7 +434,7 @@ impl ShardedValueLog {
         for bucket in 0u32..self.num_buckets as u32 {
             let metadata = self.metadata[bucket as usize].read();
             let allocated = metadata.tail;
-            let used = Self::used_capacity_bytes(&metadata).min(allocated);
+            let used = self.used_capacity_bytes(&metadata).min(allocated);
             total_free = total_free.saturating_add(allocated.saturating_sub(used));
             total_allocated = total_allocated.saturating_add(allocated);
         }
@@ -457,7 +476,7 @@ impl ShardedValueLog {
     /// parent directory is fsynced so the rename itself is durable. A crash
     /// mid-write can never leave a torn/partial metadata file — the reader sees
     /// either the previous complete version or the new one. (A corrupt file
-    /// would otherwise force a full reset to `ValueLogMetadata::new()` on open;
+    /// would otherwise force a full reset to `ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES)` on open;
     /// see `open`.)
     pub fn flush_all_metadata(&self) -> Result<()> {
         for bucket in 0u32..self.num_buckets as u32 {

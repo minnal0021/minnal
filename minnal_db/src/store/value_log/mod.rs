@@ -29,11 +29,37 @@ pub enum ValueLogError {
     CorruptedLog,
     #[error("Invalid value location")]
     InvalidLocation,
+    #[error("invalid page size {0} bytes: must be a multiple of {PAGE_SIZE_ALIGNMENT}, at least {MIN_PAGE_SIZE_BYTES}, and less than 4 GiB")]
+    InvalidPageSize(u64),
+    #[error(
+        "page size mismatch: this value log was created with {stored} byte pages, but is being opened with {configured}. The page size is fixed at creation — a page's size is encoded in every stored value pointer."
+    )]
+    PageSizeMismatch { stored: u64, configured: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, ValueLogError>;
 
-pub const PAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+/// Page size used when a caller does not specify one (`value_log.page_size_bytes`).
+pub const DEFAULT_PAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Page sizes must be a multiple of this (one filesystem block).
+const PAGE_SIZE_ALIGNMENT: u64 = 4096;
+
+/// Smallest permitted page size. A page must hold its header, at least one
+/// record, and that record's slot entry with room to spare.
+const MIN_PAGE_SIZE_BYTES: u64 = 64 * 1024;
+
+/// Validate a configured page size.
+///
+/// The page size is bounded above by `u32::MAX` because `PageHeader`'s
+/// `free_offset`, `table_offset` and `page_size` are all `u32`, and bounded
+/// below by [`MIN_PAGE_SIZE_BYTES`] so a page can always hold a record.
+fn validate_page_size(page_size: u64) -> Result<()> {
+    if page_size < MIN_PAGE_SIZE_BYTES || page_size > u32::MAX as u64 || !page_size.is_multiple_of(PAGE_SIZE_ALIGNMENT) {
+        return Err(ValueLogError::InvalidPageSize(page_size));
+    }
+    Ok(())
+}
 const PAGE_HEADER_MAGIC: [u8; 4] = *b"VPG1";
 const PAGE_HEADER_VERSION: u32 = 1;
 const PAGE_HEADER_SIZE: u32 = 32;
@@ -155,14 +181,14 @@ struct PageHeader {
 }
 
 impl PageHeader {
-    fn new() -> Self {
+    fn new(page_size: u64) -> Self {
         Self {
             magic: PAGE_HEADER_MAGIC,
             version: PAGE_HEADER_VERSION,
             free_offset: PAGE_HEADER_SIZE,
-            table_offset: PAGE_SIZE_BYTES as u32,
+            table_offset: page_size as u32,
             next_segment_id: 1,
-            page_size: PAGE_SIZE_BYTES as u32,
+            page_size: page_size as u32,
             reserved0: 0,
             reserved1: 0,
         }
@@ -255,18 +281,19 @@ struct ValueLogMetadataV1 {
 
 impl Default for ValueLogMetadata {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_PAGE_SIZE_BYTES)
     }
 }
 
 impl ValueLogMetadata {
-    pub fn new() -> Self {
+    /// Fresh metadata for a value log whose pages are `page_size` bytes.
+    pub fn new(page_size: u64) -> Self {
         Self {
             head: 0,
-            tail: PAGE_SIZE_BYTES,
+            tail: page_size,
             current_page_offset: 0,
             current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: PAGE_SIZE_BYTES as u32,
+            current_page_table_offset: page_size as u32,
             current_page_next_segment_id: 1,
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
@@ -323,7 +350,9 @@ impl ValueLogMetadata {
         })
     }
 
-    pub fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
+    /// Decode metadata from its on-disk form. `page_size` is the value log's page
+    /// size, used to rebuild the page cursors a v1 payload does not carry.
+    pub fn from_file_bytes(bytes: &[u8], page_size: u64) -> Result<Self> {
         if bytes.len() >= 16 && bytes.get(0..4) == Some(&VALUE_LOG_METADATA_MAGIC) {
             let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -351,10 +380,10 @@ impl ValueLogMetadata {
                     .map_err(|e| ValueLogError::Serialization(format!("Value log metadata v1 validation failed: {}", e)))?;
                 return Ok(ValueLogMetadata {
                     head: archived.head.to_native(),
-                    tail: PAGE_SIZE_BYTES,
+                    tail: page_size,
                     current_page_offset: 0,
                     current_page_free_offset: PAGE_HEADER_SIZE,
-                    current_page_table_offset: PAGE_SIZE_BYTES as u32,
+                    current_page_table_offset: page_size as u32,
                     current_page_next_segment_id: 1,
                     total_gc_runs: archived.total_gc_runs.to_native(),
                     total_bytes_reclaimed: archived.total_bytes_reclaimed.to_native(),
@@ -401,6 +430,13 @@ pub struct ValueLog {
     // value bytes. Off by default (latency first) — see `DbConfig::verify_checksums_on_read`.
     verify_checksums_on_read: AtomicBool,
 
+    // Size of every page in this file. Fixed for the life of the file: a page's
+    // size determines both the page-aligned `page_offset` in every stored value
+    // pointer and where a segment's slot entry sits (`page_size - segment_id * 8`),
+    // so reopening existing data with a different size would reinterpret every
+    // pointer. `open_with_page_size` rejects that (`PageSizeMismatch`).
+    page_size: u64,
+
     // Path to the value log file
     #[allow(dead_code)]
     path: PathBuf,
@@ -425,17 +461,56 @@ impl Drop for SwapEpochGuard<'_> {
 }
 
 impl ValueLog {
-    /// Open or create a value log
+    /// Open or create a value log with the default page size.
+    #[allow(dead_code)] // test/convenience constructor; production opens with the configured size
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_page_size(path, DEFAULT_PAGE_SIZE_BYTES)
+    }
+
+    /// Open or create a value log whose pages are `page_size` bytes.
+    ///
+    /// The page size is **fixed at creation**. It determines the page-aligned
+    /// `page_offset` carried in every stored value pointer and the position of a
+    /// record's slot entry (`page_size - segment_id * 8`), so opening a file that
+    /// already holds data with a different page size would silently reinterpret
+    /// every pointer. When the file already has a page-0 header, its recorded
+    /// `page_size` wins the argument: a mismatch is rejected with
+    /// [`ValueLogError::PageSizeMismatch`] rather than corrupting the data.
+    pub fn open_with_page_size<P: AsRef<Path>>(path: P, page_size: u64) -> Result<Self> {
+        validate_page_size(page_size)?;
+
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+
+        // A file that already holds a page-0 header was created with a page size
+        // of its own; refuse to reinterpret it under a different one. A brand-new
+        // (or empty) file has no header yet and is free to adopt `page_size` —
+        // which is what lets GC open its `.log.new` with the bucket's size.
+        let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
+        if file.read_at(&mut hdr_buf, 0).is_ok()
+            && let Some(existing) = PageHeader::from_bytes(&hdr_buf)
+            && existing.page_size as u64 != page_size
+        {
+            return Err(ValueLogError::PageSizeMismatch {
+                stored: existing.page_size as u64,
+                configured: page_size,
+            });
+        }
 
         Ok(Self {
             file: Arc::new(RwLock::new(Arc::new(file))),
             generation: AtomicU64::new(0),
             verify_checksums_on_read: AtomicBool::new(false),
+            page_size,
             path,
         })
+    }
+
+    /// Size of every page in this value log (fixed at creation).
+    #[allow(dead_code)] // callers reach this through `ShardedValueLog::page_size`
+    #[inline]
+    pub fn page_size(&self) -> u64 {
+        self.page_size
     }
 
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
@@ -473,14 +548,14 @@ impl ValueLog {
 
     pub fn ensure_current_page(&self, metadata: &mut ValueLogMetadata) -> Result<()> {
         let file = self.get_file();
-        let desired_len = metadata.tail.max(PAGE_SIZE_BYTES);
+        let desired_len = metadata.tail.max(self.page_size);
         if file.metadata()?.len() < desired_len {
             file.set_len(desired_len)?;
         }
 
         let header = self.read_page_header(&file, metadata.current_page_offset)?;
         if header.is_none() {
-            self.write_page_header(&file, metadata.current_page_offset, PageHeader::new())?;
+            self.write_page_header(&file, metadata.current_page_offset, PageHeader::new(self.page_size))?;
         } else if let Some(header) = header {
             metadata.current_page_free_offset = header.free_offset;
             metadata.current_page_table_offset = header.table_offset;
@@ -502,9 +577,9 @@ impl ValueLog {
 
         if metadata.current_page_free_offset.saturating_add(required) > metadata.current_page_table_offset {
             metadata.current_page_offset = metadata.tail;
-            metadata.tail = metadata.tail.saturating_add(PAGE_SIZE_BYTES);
+            metadata.tail = metadata.tail.saturating_add(self.page_size);
             metadata.current_page_free_offset = PAGE_HEADER_SIZE;
-            metadata.current_page_table_offset = PAGE_SIZE_BYTES as u32;
+            metadata.current_page_table_offset = self.page_size as u32;
             metadata.current_page_next_segment_id = 1;
             self.ensure_current_page(metadata)?;
         }
@@ -558,7 +633,7 @@ impl ValueLog {
             free_offset: metadata.current_page_free_offset,
             table_offset: metadata.current_page_table_offset,
             next_segment_id: metadata.current_page_next_segment_id,
-            page_size: PAGE_SIZE_BYTES as u32,
+            page_size: self.page_size as u32,
             reserved0: 0,
             reserved1: 0,
         };
@@ -599,7 +674,7 @@ impl ValueLog {
         file.read_at(&mut hdr_buf, location.page_offset).map_err(ValueLogError::Io)?;
         let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
         // 2. Compute and validate the table entry position.
-        let entry_offset = (PAGE_SIZE_BYTES as usize)
+        let entry_offset = (self.page_size as usize)
             .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
             .ok_or(ValueLogError::InvalidLocation)?;
         if entry_offset < page_header.table_offset as usize {
@@ -689,7 +764,7 @@ impl ValueLog {
             // max_seg has the lowest file offset; min_seg has the highest.
             let max_seg = page_entries.iter().map(|(_, s)| *s).max().unwrap();
             let min_seg = page_entries.iter().map(|(_, s)| *s).min().unwrap();
-            let entry_offset_for_max = (PAGE_SIZE_BYTES as usize).saturating_sub(max_seg as usize * TABLE_ENTRY_SIZE as usize);
+            let entry_offset_for_max = (self.page_size as usize).saturating_sub(max_seg as usize * TABLE_ENTRY_SIZE as usize);
             if entry_offset_for_max < page_header.table_offset as usize {
                 results.extend(page_entries.iter().map(|(idx, _)| (*idx, None)));
                 continue;
@@ -767,7 +842,7 @@ impl ValueLog {
         let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
         file.read_at(&mut hdr_buf, location.page_offset).map_err(ValueLogError::Io)?;
         let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-        let entry_offset = (PAGE_SIZE_BYTES as usize)
+        let entry_offset = (self.page_size as usize)
             .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
             .ok_or(ValueLogError::InvalidLocation)?;
         if entry_offset < page_header.table_offset as usize {
@@ -806,7 +881,7 @@ impl ValueLog {
         let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
 
         // Look up record offset from translation table
-        let entry_offset = (PAGE_SIZE_BYTES as usize)
+        let entry_offset = (self.page_size as usize)
             .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
             .ok_or(ValueLogError::InvalidLocation)?;
         if entry_offset < page_header.table_offset as usize {
@@ -892,7 +967,7 @@ impl ValueLog {
     }
 
     fn ensure_page_len(&self, file: &File, page_offset: u64) -> Result<()> {
-        let expected = page_offset.saturating_add(PAGE_SIZE_BYTES);
+        let expected = page_offset.saturating_add(self.page_size);
         if file.metadata()?.len() < expected {
             file.set_len(expected)?;
         }
@@ -940,10 +1015,10 @@ impl ValueLog {
             garbage_records: 0,
         };
 
-        // Walk the segment table from table_offset to PAGE_SIZE_BYTES in TABLE_ENTRY_SIZE steps.
+        // Walk the segment table from table_offset to the page end in TABLE_ENTRY_SIZE steps.
         // Each entry is 8 bytes: [segment_id: u32, record_offset: u32].
         let mut table_pos = page_header.table_offset as u64;
-        while table_pos + TABLE_ENTRY_SIZE as u64 <= PAGE_SIZE_BYTES {
+        while table_pos + TABLE_ENTRY_SIZE as u64 <= self.page_size {
             let abs_entry = page_offset + table_pos;
             let mut entry_buf = [0u8; TABLE_ENTRY_SIZE as usize];
             file.read_at(&mut entry_buf, abs_entry).map_err(ValueLogError::Io)?;
@@ -991,7 +1066,7 @@ impl ValueLog {
             if let Ok(stats) = self.scan_page_stats(file, page_offset) {
                 all_stats.push(stats);
             }
-            page_offset += PAGE_SIZE_BYTES;
+            page_offset += self.page_size;
         }
 
         Ok(all_stats)
@@ -1017,7 +1092,7 @@ impl ValueLog {
         let file = self.get_file();
         let file_len = file.metadata()?.len();
 
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(self.page_size);
         let mut live_bytes = 0u64;
         let mut garbage_bytes = 0u64;
         let mut last_valid_page: Option<u64> = None;
@@ -1031,13 +1106,13 @@ impl ValueLog {
             live_bytes = live_bytes.saturating_add(stats.live_bytes);
             garbage_bytes = garbage_bytes.saturating_add(stats.garbage_bytes);
             last_valid_page = Some(page_offset);
-            page_offset = page_offset.saturating_add(PAGE_SIZE_BYTES);
+            page_offset = page_offset.saturating_add(self.page_size);
         }
 
         if let Some(last) = last_valid_page {
             let header = self.read_page_header(&file, last)?.ok_or(ValueLogError::CorruptedLog)?;
             meta.current_page_offset = last;
-            meta.tail = last.saturating_add(PAGE_SIZE_BYTES);
+            meta.tail = last.saturating_add(self.page_size);
             meta.current_page_free_offset = header.free_offset;
             meta.current_page_table_offset = header.table_offset;
             meta.current_page_next_segment_id = header.next_segment_id.max(1);
@@ -1050,13 +1125,16 @@ impl ValueLog {
         Ok(meta)
     }
 
-    /// Copy a raw 64MB page from one file to another at the same offset.
-    pub fn copy_page_raw(src_file: &File, dst_file: &File, page_offset: u64) -> Result<()> {
+    /// Copy one whole page from one file to another at the same offset.
+    ///
+    /// `page_size` must be the page size of *both* files — GC's replacement file
+    /// is opened with the bucket's page size for exactly this reason.
+    pub fn copy_page_raw(src_file: &File, dst_file: &File, page_offset: u64, page_size: u64) -> Result<()> {
         // Copy in 64KB chunks to avoid huge stack/heap allocations
         const CHUNK_SIZE: usize = 64 * 1024;
         let mut buf = vec![0u8; CHUNK_SIZE];
         let mut offset = page_offset;
-        let end = page_offset + PAGE_SIZE_BYTES;
+        let end = page_offset + page_size;
 
         // Ensure destination file is large enough
         let expected_len = end;
@@ -1080,6 +1158,110 @@ impl ValueLog {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A small but legal page size: enough for records, small enough that a
+    /// handful of writes roll the page over.
+    const SMALL_PAGE: u64 = 64 * 1024;
+
+    fn meta(page_size: u64) -> ValueRecordMeta {
+        ValueRecordMeta {
+            version: 1,
+            tombstone: false,
+            updated: false,
+            epoch: page_size, // any stable value; not asserted on
+            seq: 7,
+        }
+    }
+
+    #[test]
+    fn custom_page_size_round_trips_across_a_page_rollover() -> Result<()> {
+        // The configured page size must actually drive page allocation, the slot
+        // table's position, and reads — end to end, including after reopening.
+        let dir = TempDir::new()?;
+        let path = dir.path().join("custom.log");
+
+        let values: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 4096]).collect();
+        let mut locations = Vec::new();
+        {
+            let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
+            let mut m = ValueLogMetadata::new(SMALL_PAGE);
+            for v in &values {
+                locations.push(log.write_record(v, meta(SMALL_PAGE), &mut m, false)?);
+            }
+            // 40 × ~4 KiB records cannot fit in one 64 KiB page, so the writes
+            // must have rolled onto later pages — at SMALL_PAGE boundaries.
+            assert!(
+                locations.iter().any(|l| l.page_offset > 0),
+                "expected a page rollover with a {SMALL_PAGE}-byte page size"
+            );
+            for l in &locations {
+                assert!(
+                    l.page_offset.is_multiple_of(SMALL_PAGE),
+                    "page_offset {} is not aligned to the configured page size",
+                    l.page_offset
+                );
+            }
+            for (v, l) in values.iter().zip(&locations) {
+                assert_eq!(&log.read_value(*l)?, v);
+            }
+        }
+
+        // Reopen with the same page size: every pointer must still resolve.
+        let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
+        for (v, l) in values.iter().zip(&locations) {
+            assert_eq!(&log.read_value(*l)?, v, "value unreadable after reopen");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn page_size_is_fixed_at_creation() -> Result<()> {
+        // Reopening existing data under a different page size would reinterpret
+        // every stored pointer (page_offset is page-aligned; a slot entry lives at
+        // `page_size - segment_id * 8`). It must be refused, not silently accepted.
+        let dir = TempDir::new()?;
+        let path = dir.path().join("locked.log");
+
+        let location = {
+            let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
+            let mut m = ValueLogMetadata::new(SMALL_PAGE);
+            log.write_record(b"payload", meta(SMALL_PAGE), &mut m, true)?
+        };
+
+        let Err(err) = ValueLog::open_with_page_size(&path, SMALL_PAGE * 2) else {
+            panic!("opening with a different page size must be refused");
+        };
+        assert!(
+            matches!(err, ValueLogError::PageSizeMismatch { stored, configured }
+                if stored == SMALL_PAGE && configured == SMALL_PAGE * 2),
+            "unexpected error: {err:?}"
+        );
+
+        // ...and the data is untouched: reopening at the original size still reads.
+        let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
+        assert_eq!(log.read_value(location)?, b"payload");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_page_sizes_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        for bad in [
+            0,                      // zero
+            4096,                   // below the minimum
+            SMALL_PAGE + 1,         // not 4096-aligned
+            u32::MAX as u64 + 1,    // will not fit the u32 page header fields
+            8 * 1024 * 1024 * 1024, // 8 GiB — same reason
+        ] {
+            let Err(err) = ValueLog::open_with_page_size(dir.path().join(format!("bad_{bad}.log")), bad) else {
+                panic!("page size {bad} must be rejected");
+            };
+            assert!(
+                matches!(err, ValueLogError::InvalidPageSize(got) if got == bad),
+                "unexpected error: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn generation_is_a_seqlock_around_each_swap() {
@@ -1126,7 +1308,7 @@ mod tests {
             tail: 1024,
             current_page_offset: 0,
             current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: PAGE_SIZE_BYTES as u32,
+            current_page_table_offset: DEFAULT_PAGE_SIZE_BYTES as u32,
             current_page_next_segment_id: 3,
             total_gc_runs: 5,
             total_bytes_reclaimed: 512,
@@ -1157,7 +1339,7 @@ mod tests {
 
         // Write a mix of live and garbage (tombstoned) records, letting the
         // in-memory metadata track the counters as the source of truth.
-        let mut tracked = ValueLogMetadata::new();
+        let mut tracked = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut tracked)?;
         let live = ValueRecordMeta {
             version: 1,
@@ -1196,7 +1378,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("empty.log"))?;
         let rebuilt = log.reconstruct_metadata()?;
-        let fresh = ValueLogMetadata::new();
+        let fresh = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         assert_eq!(rebuilt.current_page_offset, fresh.current_page_offset);
         assert_eq!(rebuilt.tail, fresh.tail);
         assert_eq!(rebuilt.live_bytes, 0);
@@ -1209,7 +1391,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
 
-        let mut metadata = ValueLogMetadata::new();
+        let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut metadata)?;
         let value = b"test_value";
 
@@ -1237,7 +1419,7 @@ mod tests {
         let log_path = temp_dir.path().join("test.log");
         let location = {
             let log = ValueLog::open(&log_path)?;
-            let mut metadata = ValueLogMetadata::new();
+            let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
             log.ensure_current_page(&mut metadata)?;
             log.write_record(
                 b"a_value_long_enough_to_corrupt",
@@ -1282,7 +1464,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
 
-        let mut metadata = ValueLogMetadata::new();
+        let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut metadata)?;
         let values: Vec<&[u8]> = vec![b"value1", b"value2", b"value3"];
         let mut locations = vec![];
@@ -1318,7 +1500,7 @@ mod tests {
             tail: 1024,
             current_page_offset: 0,
             current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: PAGE_SIZE_BYTES as u32,
+            current_page_table_offset: DEFAULT_PAGE_SIZE_BYTES as u32,
             current_page_next_segment_id: 1,
             total_gc_runs: 5,
             total_bytes_reclaimed: 512,
@@ -1327,7 +1509,7 @@ mod tests {
         };
 
         let bytes = metadata.to_file_bytes()?;
-        let restored = ValueLogMetadata::from_file_bytes(&bytes)?;
+        let restored = ValueLogMetadata::from_file_bytes(&bytes, DEFAULT_PAGE_SIZE_BYTES)?;
 
         assert_eq!(metadata.head, restored.head);
         assert_eq!(metadata.tail, restored.tail);
@@ -1361,7 +1543,7 @@ mod tests {
     fn test_batch_read_matches_individual() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut meta)?;
 
         let values: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; (i as usize + 1) * 8]).collect();
@@ -1386,7 +1568,7 @@ mod tests {
     fn test_batch_read_empty_input() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut meta)?;
 
         let file = log.get_file();
@@ -1399,7 +1581,7 @@ mod tests {
     fn test_batch_read_segment_id_zero_returns_none() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut meta)?;
 
         // Write one real entry and mix in an invalid location (segment_id=0)
@@ -1425,7 +1607,7 @@ mod tests {
         // Values > 1280 bytes exercise the slow-path fallback read in read_values_batch_from_file.
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut meta)?;
 
         let small = b"tiny".to_vec();
@@ -1449,7 +1631,7 @@ mod tests {
         // the bulk slot-directory read that covers the full max_seg..min_seg span.
         let temp_dir = TempDir::new()?;
         let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new();
+        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
         log.ensure_current_page(&mut meta)?;
 
         let mut all_locs = Vec::new();

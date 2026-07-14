@@ -161,7 +161,7 @@ Two details make this efficient. First, each LSM entry stores its key alongside 
 
 ### Value Log
 
-If the LSM tree holds the keys, the value log holds the bytes. It is the heart of the WiscKey design: **values never enter the LSM at all**, so compaction never has to move them. Each shard bucket gets its own append-only file, divided into fixed-size 64 MB pages.
+If the LSM tree holds the keys, the value log holds the bytes. It is the heart of the WiscKey design: **values never enter the LSM at all**, so compaction never has to move them. Each shard bucket gets its own append-only file, divided into fixed-size pages (`value_log.page_size_bytes`, 64 MB by default, and fixed once the value log exists).
 
 #### A page and its slot table
 
@@ -534,6 +534,7 @@ The knobs that most affect engine behaviour:
 | Key | Effect |
 |---|---|
 | `sharding.num_buckets` | Value-log / L1 shard count. **Fixed at creation** — it cannot change once data exists. |
+| `value_log.page_size_bytes` | Value-log page size (default 64 MiB; multiple of 4096, ≥ 64 KiB, < 4 GiB). **Fixed at creation** — a page's size is encoded in every stored value pointer, so opening a database whose value log used a different size fails. |
 | `memtable.max_capacity` | SkipList entry limit before a flush is triggered. |
 | `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
 | `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |

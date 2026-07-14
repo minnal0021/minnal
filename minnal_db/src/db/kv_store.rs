@@ -11,7 +11,7 @@ use crate::store::gc_journal::{GCJournal, fsync_dir};
 use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver};
 use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
-use crate::store::value_log::{PAGE_SIZE_BYTES, ValueLog, ValueLogMetadata, ValueRecordMeta};
+use crate::store::value_log::{ValueLog, ValueLogMetadata, ValueRecordMeta};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
@@ -156,8 +156,19 @@ impl KVStore {
 
     /// Open a KVStore for the given namespace at the specified base directory.
     /// The directory will contain `lsm/` and `value_logs/` subdirectories.
-    pub fn open(namespace_id: u32, name: &str, base_path: &Path, lsm_config: LSMConfig, sync_config: SyncConfig) -> Result<Self> {
-        Self::open_with_ttl(namespace_id, name, base_path, lsm_config, sync_config, None)
+    ///
+    /// `page_size_bytes` is the value log's page size (`DbConfig::page_size_bytes`).
+    /// It is fixed when a namespace's value log is first created — see
+    /// [`ValueLog::open_with_page_size`].
+    pub fn open(
+        namespace_id: u32,
+        name: &str,
+        base_path: &Path,
+        lsm_config: LSMConfig,
+        sync_config: SyncConfig,
+        page_size_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_with_ttl(namespace_id, name, base_path, lsm_config, sync_config, page_size_bytes, None)
     }
 
     /// Open a KVStore with an optional TTL for automatic record expiry.
@@ -167,6 +178,7 @@ impl KVStore {
         base_path: &Path,
         lsm_config: LSMConfig,
         sync_config: SyncConfig,
+        page_size_bytes: u64,
         ttl: Option<Duration>,
     ) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
@@ -187,10 +199,14 @@ impl KVStore {
         // committed swap forward, or reverts one whose journal is unreadable.
         Self::recover_gc_swaps(&value_log_path, num_buckets)?;
 
-        // Open sharded value log
-        let value_log = ShardedValueLog::open(&value_log_path, num_buckets).map_err(|e| {
+        // Open sharded value log. The page size is fixed at creation: if these
+        // buckets already hold data written with a different one, this fails
+        // rather than reinterpreting every stored pointer.
+        let value_log = ShardedValueLog::open_with_page_size(&value_log_path, num_buckets, page_size_bytes).map_err(|e| {
+            // Display, not Debug: a page-size mismatch is a user-facing config
+            // error whose message explains itself.
             KVError::Io(std::io::Error::other(format!(
-                "Failed to open sharded value log for namespace '{}': {:?}",
+                "Failed to open sharded value log for namespace '{}': {}",
                 name, e
             )))
         })?;
@@ -204,16 +220,16 @@ impl KVStore {
         // Load or initialize value log metadata
         let metadata = if metadata_path.exists() {
             let data = std::fs::read(&metadata_path)?;
-            match ValueLogMetadata::from_file_bytes(&data) {
+            match ValueLogMetadata::from_file_bytes(&data, page_size_bytes) {
                 Ok(m) => m,
                 Err(_) => {
                     let backup = metadata_path.with_extension("corrupt");
                     let _ = std::fs::rename(&metadata_path, &backup);
-                    ValueLogMetadata::new()
+                    ValueLogMetadata::new(page_size_bytes)
                 }
             }
         } else {
-            ValueLogMetadata::new()
+            ValueLogMetadata::new(page_size_bytes)
         };
 
         let lsm_compaction_trigger = Arc::new(RwLock::new(None));
@@ -1558,7 +1574,11 @@ impl KVStore {
             });
         }
 
-        let new_log = ValueLog::open(&new_path)?;
+        // The replacement file MUST use the bucket's page size: clean pages are
+        // copied to identical offsets and their pointers are left untouched, so a
+        // different page size here would reinterpret every one of them.
+        let page_size = self.value_log.page_size();
+        let new_log = ValueLog::open_with_page_size(&new_path, page_size)?;
         let new_file = new_log.get_file();
 
         // Track live/garbage bytes for the new file
@@ -1569,7 +1589,7 @@ impl KVStore {
         // Pointers (page_offset + segment_id) remain valid → no LSM updates needed.
         for stats in &page_stats {
             if !dirty_pages.contains(&stats.page_offset) {
-                ValueLog::copy_page_raw(&old_file, &new_file, stats.page_offset)?;
+                ValueLog::copy_page_raw(&old_file, &new_file, stats.page_offset, page_size)?;
                 new_live_bytes += stats.live_bytes;
                 new_garbage_bytes += stats.garbage_bytes;
             }
@@ -1590,17 +1610,17 @@ impl KVStore {
             .filter(|s| !dirty_pages.contains(&s.page_offset))
             .map(|s| s.page_offset)
             .max()
-            .map(|highest_clean| highest_clean.saturating_add(PAGE_SIZE_BYTES))
+            .map(|highest_clean| highest_clean.saturating_add(page_size))
             .unwrap_or(0);
         let mut new_meta = ValueLogMetadata {
             head: 0,
-            // tail must always be current_page_offset + PAGE_SIZE_BYTES.
-            // Initialising it equal to current_page_offset causes write_record to
-            // overwrite the current page when the page boundary is first crossed.
-            tail: fresh_page_start.saturating_add(PAGE_SIZE_BYTES),
+            // tail must always be current_page_offset + one page. Initialising it
+            // equal to current_page_offset causes write_record to overwrite the
+            // current page when the page boundary is first crossed.
+            tail: fresh_page_start.saturating_add(page_size),
             current_page_offset: fresh_page_start,
             current_page_free_offset: 0, // will be set by ensure_current_page
-            current_page_table_offset: PAGE_SIZE_BYTES as u32,
+            current_page_table_offset: page_size as u32,
             current_page_next_segment_id: 1,
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
@@ -2089,6 +2109,7 @@ impl Drop for KVStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::value_log::DEFAULT_PAGE_SIZE_BYTES;
     use tempfile::TempDir;
 
     fn default_lsm_config() -> LSMConfig {
@@ -2280,7 +2301,15 @@ mod tests {
     #[test]
     fn test_kvstore_basic_operations() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage(b"key1", b"value1").unwrap();
         store.put_to_storage(b"key2", b"value2").unwrap();
@@ -2295,7 +2324,15 @@ mod tests {
     #[test]
     fn test_kvstore_update() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage(b"key1", b"v1").unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Some(b"v1".to_vec()));
@@ -2307,7 +2344,15 @@ mod tests {
     #[test]
     fn test_kvstore_recovery_replay() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.replay_upsert(b"rkey1", b"rval1", 1).unwrap();
         store.replay_upsert(b"rkey2", b"rval2", 2).unwrap();
@@ -2320,7 +2365,15 @@ mod tests {
     #[test]
     fn test_kvstore_gc() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         // Write and overwrite to create garbage
         for i in 0..5 {
@@ -2348,7 +2401,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let num_buckets = default_lsm_config().num_buckets as u32;
         {
-            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+            let store = KVStore::open(
+                0,
+                "default",
+                dir.path(),
+                default_lsm_config(),
+                SyncConfig::default(),
+                DEFAULT_PAGE_SIZE_BYTES,
+            )
+            .unwrap();
             for i in 0..5 {
                 store.put_to_storage(&format!("key{i}").into_bytes(), &[0u8; 50]).unwrap();
             }
@@ -2370,7 +2431,15 @@ mod tests {
 
         // Reopen: recover_gc_swaps + recover_gc_journals run over the finalized
         // state and must be a clean no-op (no panic / error, data intact).
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
         for i in 0..5 {
             assert!(
                 store.get(&format!("key{i}").into_bytes()).unwrap().is_some(),
@@ -2390,7 +2459,7 @@ mod tests {
             ..LSMConfig::default()
         }; // force key into bucket 0
         {
-            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default()).unwrap();
+            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
             store.put_to_storage(b"k", b"value_v1").unwrap();
             store.flush_and_compact_all().unwrap(); // persist the LSM pointer (KVStore has no WAL)
             assert_eq!(store.get(b"k").unwrap(), Some(b"value_v1".to_vec()));
@@ -2409,7 +2478,7 @@ mod tests {
 
         // Reopen: recover_gc_swaps reverts (renames .old back over bucket_path),
         // so the LSM pointer for "k" resolves against the restored file.
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
         assert_eq!(
             store.get(b"k").unwrap(),
             Some(b"value_v1".to_vec()),
@@ -2433,7 +2502,7 @@ mod tests {
             ..LSMConfig::default()
         };
         {
-            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default()).unwrap();
+            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
             store.put_to_storage(b"k", b"value_v1").unwrap(); // → old file, segment 1
             store.flush_and_compact_all().unwrap(); // persist old pointer
         }
@@ -2454,7 +2523,7 @@ mod tests {
         };
         let new_loc = {
             let vl = ValueLog::open(&build_path).unwrap();
-            let mut m = ValueLogMetadata::new();
+            let mut m = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
             vl.ensure_current_page(&mut m).unwrap();
             vl.write_record(b"pad_record", meta_rec, &mut m, true).unwrap(); // segment 1
             vl.write_record(b"value_v1", meta_rec, &mut m, true).unwrap() // segment 2 (the live one)
@@ -2468,7 +2537,7 @@ mod tests {
         GCJournal::write_commit_marker(&vlp, 0).unwrap();
 
         // Reopen: recover_gc_journals replays, repointing k to the new location.
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
         assert_eq!(
             store.get(b"k").unwrap(),
             Some(b"value_v1".to_vec()),
@@ -2483,7 +2552,7 @@ mod tests {
     #[test]
     fn test_get_multiple_matches_individual_get() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..20).map(|i| (format!("doc:{i:03}").into_bytes(), vec![i; 64])).collect();
         for (k, v) in &pairs {
@@ -2503,7 +2572,7 @@ mod tests {
     #[test]
     fn test_get_multiple_missing_keys_are_none() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         store.put_to_storage(b"exists", b"val").unwrap();
 
@@ -2517,7 +2586,7 @@ mod tests {
     #[test]
     fn test_get_multiple_after_flush_to_sstable() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         for i in 0u8..10 {
             store.put_to_storage(&[i], &[i; 32]).unwrap();
@@ -2544,7 +2613,15 @@ mod tests {
     #[test]
     fn test_scan_prefixes_batch_basic() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "test_ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "test_ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         let entries = [
             (7u32, 1u32, b"val_7_1".as_slice()),
@@ -2570,7 +2647,15 @@ mod tests {
     #[test]
     fn test_scan_page_batch_end_bound_excludes_upper() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "test_ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "test_ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
         for i in 0u32..10 {
             store.put_to_storage(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
         }
@@ -2585,7 +2670,15 @@ mod tests {
     #[test]
     fn test_scan_page_batch_cursor_walk_is_complete_and_ordered() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "test_ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "test_ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
         for i in 0u32..10 {
             store.put_to_storage(format!("k{i:02}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
         }
@@ -2609,7 +2702,15 @@ mod tests {
     #[test]
     fn test_scan_prefixes_batch_missing_prefix_absent() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "test_ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "test_ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage(&u32_prefixed_key(1, 1), b"v").unwrap();
 
@@ -2620,7 +2721,15 @@ mod tests {
     #[test]
     fn test_scan_prefixes_batch_after_flush() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "test_ns", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "test_ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         for sid in 0u32..5 {
             store.put_to_storage(&u32_prefixed_key(2, sid), &[sid as u8; 16]).unwrap();
@@ -2652,7 +2761,15 @@ mod tests {
     fn test_gc_write_before_gc_survives() {
         // A write that completes immediately before GC starts must not be lost.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         // Create enough garbage to trigger GC (75% garbage after 4 overwrites).
         for round in 0..4u8 {
@@ -2678,7 +2795,15 @@ mod tests {
         // Regression: concurrent writes and GC must not lose any data.
         // Writer thread writes 200 unique keys while GC runs 5 times in parallel.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         // Create garbage so GC actually fires.
         for round in 0..4u8 {
@@ -2725,7 +2850,15 @@ mod tests {
         // After GC swaps the value-log file, subsequent writes must go to the
         // new file and be readable.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         for round in 0..4u8 {
             for i in 0u32..30 {
@@ -2750,7 +2883,15 @@ mod tests {
     fn test_gc_multi_round_all_values_survive() {
         // Multiple sequential GC runs must not lose any values.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         for round in 0..6u8 {
             for i in 0u32..40 {
@@ -2776,7 +2917,15 @@ mod tests {
         // per-bucket generation guard, reads must always succeed and return the
         // last-written value while GC churns the same buckets continuously.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         const N: u32 = 120;
 
@@ -2829,7 +2978,15 @@ mod tests {
         // SSTable value — otherwise a delete is silently resurrected on read
         // until the next compaction.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage(b"k", b"v").unwrap();
         store.lsm.flush_and_compact_all().unwrap(); // k now lives only in L1
@@ -2845,7 +3002,15 @@ mod tests {
         // when the lower-sequence write is applied last — matching recovery's
         // sequence-ordered replay (live == recovery for racing same-key writes).
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage_seq(b"k", b"newer", 10).unwrap();
         store.put_to_storage_seq(b"k", b"older", 5).unwrap(); // applied later, lower seq → must lose
@@ -2855,7 +3020,15 @@ mod tests {
     #[test]
     fn test_delete_from_storage_seq_respects_sequence() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage_seq(b"k", b"v", 10).unwrap();
         store.delete_from_storage_seq(b"k", 5).unwrap(); // older delete → no-op
@@ -2867,7 +3040,15 @@ mod tests {
     #[test]
     fn test_gc_after_delete_sequential_stays_deleted() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
         const N: u32 = 120;
         for round in 0..4u8 {
             for i in 0..N {
@@ -2896,7 +3077,15 @@ mod tests {
         // about-to-be-deleted record and re-insert its pointer *after* the
         // delete removed it, resurrecting the key.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default()).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_PAGE_SIZE_BYTES,
+        )
+        .unwrap();
 
         const N: u32 = 120;
 
@@ -2953,7 +3142,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = default_lsm_config();
         cfg.num_buckets = 1; // concentrate every key in one bucket
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         const N: u32 = 200;
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
@@ -3071,7 +3260,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = default_lsm_config();
         cfg.num_buckets = 1; // concentrate every key in one bucket
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default()).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         const N: u32 = 200;
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();

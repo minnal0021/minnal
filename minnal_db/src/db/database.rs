@@ -440,7 +440,15 @@ impl Database {
         for (name, ns_id) in registry.list() {
             let ns_path = db_path.join(format!("ns_{}", name));
             let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
-            let kv_store = KVStore::open_with_ttl(ns_id, name, &ns_path, config.lsm_config.clone(), config.sync_config, ttl)?;
+            let kv_store = KVStore::open_with_ttl(
+                ns_id,
+                name,
+                &ns_path,
+                config.lsm_config.clone(),
+                config.sync_config,
+                config.page_size_bytes,
+                ttl,
+            )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
             stores.insert(ns_id, Arc::new(kv_store));
@@ -752,7 +760,14 @@ impl Database {
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = self.db_path.join(format!("ns_{}", name));
-        let kv_store = KVStore::open(ns_id, name, &ns_path, self.config.lsm_config.clone(), self.config.sync_config)?;
+        let kv_store = KVStore::open(
+            ns_id,
+            name,
+            &ns_path,
+            self.config.lsm_config.clone(),
+            self.config.sync_config,
+            self.config.page_size_bytes,
+        )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
@@ -784,7 +799,15 @@ impl Database {
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = self.db_path.join(format!("ns_{}", name));
-        let kv_store = KVStore::open_with_ttl(ns_id, name, &ns_path, self.config.lsm_config.clone(), self.config.sync_config, ttl)?;
+        let kv_store = KVStore::open_with_ttl(
+            ns_id,
+            name,
+            &ns_path,
+            self.config.lsm_config.clone(),
+            self.config.sync_config,
+            self.config.page_size_bytes,
+            ttl,
+        )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
@@ -1981,7 +2004,14 @@ impl Database {
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
             let ns_path = db_path.join(format!("ns_{}", name));
-            let kv_store = KVStore::open(ns_id, name, &ns_path, config.lsm_config.clone(), config.sync_config)?;
+            let kv_store = KVStore::open(
+                ns_id,
+                name,
+                &ns_path,
+                config.lsm_config.clone(),
+                config.sync_config,
+                config.page_size_bytes,
+            )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
             stores.insert(ns_id, Arc::new(kv_store));

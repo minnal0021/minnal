@@ -13,6 +13,9 @@ fn one_bucket_config() -> DbConfig {
 
 const VALUE_LOG_PAGE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// A non-default page size, to prove `page_size_bytes` actually drives the layout.
+const CUSTOM_PAGE_SIZE: u64 = 1024 * 1024;
+
 /// Find `value_log_0.log` under the db dir (its exact namespace path is internal).
 fn find_value_log(dir: &Path) -> Option<PathBuf> {
     walkdir(dir).into_iter().find(|p| p.file_name().is_some_and(|n| n == "value_log_0.log"))
@@ -135,5 +138,127 @@ fn value_log_gc_stays_bounded_across_repeated_cycles() {
         );
     }
 
+    db.shutdown().unwrap();
+}
+
+/// `page_size_bytes` must actually reach the value log — it was parsed into
+/// `DbConfig` and then ignored, so pages were always 64 MiB no matter the config.
+/// Drive a configured page size end to end: writes must roll over at that size,
+/// GC must rewrite survivors into pages of that size, and every value must
+/// survive the compaction.
+#[test]
+fn configured_page_size_drives_layout_and_survives_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = DbConfig {
+        num_buckets: 1,
+        page_size_bytes: CUSTOM_PAGE_SIZE,
+        ..DbConfig::default()
+    };
+    let db = Db::open_with_config(dir.path(), config).unwrap();
+
+    // Values large enough that a handful of them cannot share one 1 MiB page.
+    let blob = |b: u8| vec![b; 300 * 1024];
+
+    // Keep one key live; overwrite another repeatedly to pile up garbage.
+    db.put(b"keep", &blob(0x11)).unwrap();
+    for _ in 0..12 {
+        db.put(b"hot", &blob(0x22)).unwrap();
+    }
+    let final_value = blob(0x33);
+    db.put(b"hot", &final_value).unwrap();
+
+    // Pages are laid out at the CONFIGURED size, not the 64 MiB default — with a
+    // 64 MiB page all of this would still be sitting in page 0.
+    let pages = db.value_log_page_stats("default").unwrap();
+    let offsets: Vec<u64> = pages.iter().flat_map(|(_, ps)| ps.iter().map(|p| p.page_offset)).collect();
+    assert!(
+        offsets.iter().any(|&o| o > 0),
+        "expected writes to roll onto later pages at a {CUSTOM_PAGE_SIZE}-byte page size, got offsets {offsets:?}"
+    );
+    for o in &offsets {
+        assert!(
+            o.is_multiple_of(CUSTOM_PAGE_SIZE),
+            "page offset {o} is not aligned to the configured page size {CUSTOM_PAGE_SIZE}"
+        );
+    }
+
+    // GC must rewrite survivors using the same page size (its replacement file is
+    // opened with the bucket's size — a mismatch here would corrupt every pointer).
+    assert!(db.waste_ratio() >= 30.0, "expected enough garbage to trigger GC");
+    let gc = db.garbage_collect().unwrap();
+    assert!(gc.bytes_reclaimed > 0, "GC should reclaim garbage bytes");
+
+    for (_, ps) in db.value_log_page_stats("default").unwrap() {
+        for p in ps {
+            assert!(
+                p.page_offset.is_multiple_of(CUSTOM_PAGE_SIZE),
+                "GC produced a page at {} — not aligned to the configured page size",
+                p.page_offset
+            );
+        }
+    }
+
+    // Both values survive the compaction and still resolve through their pointers.
+    assert_eq!(db.get(b"hot").unwrap(), Some(final_value.clone()), "live value lost across GC");
+    assert_eq!(db.get(b"keep").unwrap(), Some(blob(0x11)), "untouched value lost across GC");
+
+    db.shutdown().unwrap();
+
+    // And the pointers still resolve after a reopen at the same page size.
+    let config = DbConfig {
+        num_buckets: 1,
+        page_size_bytes: CUSTOM_PAGE_SIZE,
+        ..DbConfig::default()
+    };
+    let db = Db::open_with_config(dir.path(), config).unwrap();
+    assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "value lost across reopen");
+    assert_eq!(db.get(b"keep").unwrap(), Some(blob(0x11)), "value lost across reopen");
+    db.shutdown().unwrap();
+}
+
+/// The page size is fixed at creation: reopening a database whose value log was
+/// written with a different page size must fail loudly rather than reinterpret
+/// every stored pointer (`page_offset` is page-aligned and a record's slot entry
+/// sits at `page_size - segment_id * 8`).
+#[test]
+fn reopening_with_a_different_page_size_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Db::open_with_config(
+        dir.path(),
+        DbConfig {
+            num_buckets: 1,
+            page_size_bytes: CUSTOM_PAGE_SIZE,
+            ..DbConfig::default()
+        },
+    )
+    .unwrap();
+    db.put(b"k", b"v").unwrap();
+    db.shutdown().unwrap();
+
+    let Err(err) = Db::open_with_config(
+        dir.path(),
+        DbConfig {
+            num_buckets: 1,
+            page_size_bytes: CUSTOM_PAGE_SIZE * 2,
+            ..DbConfig::default()
+        },
+    ) else {
+        panic!("reopening with a different page size must fail");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("page size"), "error should name the page-size mismatch, got: {msg}");
+
+    // The original database is untouched and still opens at its own page size.
+    let db = Db::open_with_config(
+        dir.path(),
+        DbConfig {
+            num_buckets: 1,
+            page_size_bytes: CUSTOM_PAGE_SIZE,
+            ..DbConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     db.shutdown().unwrap();
 }
