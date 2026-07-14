@@ -446,7 +446,7 @@ impl Database {
                 &ns_path,
                 config.lsm_config.clone(),
                 config.sync_config,
-                config.page_size_bytes,
+                config.segment_size_bytes,
                 ttl,
             )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
@@ -766,7 +766,7 @@ impl Database {
             &ns_path,
             self.config.lsm_config.clone(),
             self.config.sync_config,
-            self.config.page_size_bytes,
+            self.config.segment_size_bytes,
         )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
@@ -805,7 +805,7 @@ impl Database {
             &ns_path,
             self.config.lsm_config.clone(),
             self.config.sync_config,
-            self.config.page_size_bytes,
+            self.config.segment_size_bytes,
             ttl,
         )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
@@ -1747,11 +1747,10 @@ impl Database {
 
     pub fn stats(&self) -> Stats {
         self.default_store().map(|s| s.stats()).unwrap_or_else(|_| Stats {
-            head: 0,
-            tail: 0,
+            segment_count: 0,
+            disk_bytes: 0,
             garbage_size: 0,
             waste_ratio: 0.0,
-            free_space_ratio: 0.0,
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
             live_bytes: 0,
@@ -1770,7 +1769,7 @@ impl Database {
         let stores = self.stores.read();
         namespaces
             .into_iter()
-            .filter_map(|(name, ns_id)| stores.get(&ns_id).map(|s| (name, s.value_log.get_all_bucket_stats())))
+            .filter_map(|(name, ns_id)| stores.get(&ns_id).map(|s| (name, s.value_log.all_bucket_metadata())))
             .collect()
     }
 
@@ -1785,16 +1784,13 @@ impl Database {
             .collect()
     }
 
-    /// Per-page garbage breakdown for one namespace's value-log shards. Cost is
-    /// O(pages × records), so it is scoped to a single namespace (by name).
-    pub fn value_log_page_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::PageGarbageStats>)>> {
+    /// Per-segment live/garbage breakdown for one namespace's value-log shards.
+    ///
+    /// Cheap: the counters are maintained in memory by writers, so this reads no
+    /// segment data at all (the old per-page version had to scan every record).
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
         let store = self.get_store_by_name(namespace)?;
-        let mut out = Vec::new();
-        for bucket in 0..store.value_log.num_buckets() as u32 {
-            let pages = store.value_log.page_stats(bucket).map_err(KVError::from)?;
-            out.push((bucket, pages));
-        }
-        Ok(out)
+        Ok(store.value_log.all_segment_stats())
     }
 
     /// Run value-log GC on every namespace and return per-namespace results.
@@ -2015,7 +2011,7 @@ impl Database {
                 &ns_path,
                 config.lsm_config.clone(),
                 config.sync_config,
-                config.page_size_bytes,
+                config.segment_size_bytes,
             )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
@@ -3177,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_log_physical_and_page_stats() {
+    fn test_value_log_physical_and_segment_stats() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
@@ -3192,14 +3188,19 @@ mod tests {
         let total_physical: u64 = shards.iter().map(|s| s.physical_bytes).sum();
         assert!(total_physical > 0, "physical bytes should be non-zero after writes");
 
-        // Page stats: per-bucket page breakdown, with live records counted.
-        let pages = db.value_log_page_stats("default").unwrap();
-        assert_eq!(pages.len(), db.config.num_buckets, "one entry per bucket");
-        let total_records: u32 = pages.iter().flat_map(|(_, ps)| ps.iter()).map(|p| p.total_records).sum();
-        assert!(total_records >= 50, "every written record should appear in a page, got {}", total_records);
+        // Segment stats: per-bucket segment breakdown, with live bytes accounted.
+        let segments = db.value_log_segment_stats("default").unwrap();
+        assert_eq!(segments.len(), db.config.num_buckets, "one entry per bucket");
+        let live: u64 = segments.iter().flat_map(|(_, ss)| ss.iter()).map(|s| s.live_bytes).sum();
+        assert!(live > 0, "written records should be accounted as live bytes, got {live}");
+        // Every bucket has exactly one active tail (unsealed) segment.
+        for (bucket, ss) in &segments {
+            let unsealed = ss.iter().filter(|s| !s.sealed).count();
+            assert_eq!(unsealed, 1, "bucket {bucket} must have exactly one active tail segment");
+        }
 
         // Unknown namespace errors rather than panicking.
-        assert!(db.value_log_page_stats("nope").is_err());
+        assert!(db.value_log_segment_stats("nope").is_err());
 
         db.shutdown().unwrap();
     }

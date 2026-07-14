@@ -145,19 +145,22 @@ ttl_cleanup_interval_secs = 3_600
 segment_size_bytes = 67_108_864   # 64 MiB
 
 # ---------------------------------------------------------------------------
-# [value_log] — value-log page size
+# [value_log] — value-log segment files
 # ---------------------------------------------------------------------------
 [value_log]
 
-# Size of each page within the value log in bytes.
-# Larger pages improve sequential read throughput; smaller pages reduce
-# space amplification for small values.  Default: 64 MiB.
+# Size at which a value-log segment file is sealed and a new one opened.
+# Default: 256 MiB.  Must be a multiple of 4096, at least 64 KiB, and at most
+# 4 GiB (a record's offset within its segment is stored as a u32).
 #
-# Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
-# Fixed at creation: a page's size is encoded in every stored value pointer, so
-# changing it after data exists is not supported — opening a database whose value
-# log was written with a different page size fails.
-page_size_bytes = 67_108_864   # 64 MiB
+# Larger segments mean fewer files (and fewer open file descriptors) but coarser
+# GC: a segment is the unit GC reclaims, so its size bounds how much survivor
+# data a single pass may have to rewrite.
+#
+# Unlike sharding.num_buckets, this is NOT fixed at creation: a segment's size is
+# not encoded in any value pointer, so existing segments keep the size they were
+# written at and new ones simply use whatever is configured now.
+segment_size_bytes = 268_435_456   # 256 MiB
 
 # Re-verify each value's CRC32 checksum on every read.
 # Values always carry a CRC on disk; this controls whether reads re-check it.

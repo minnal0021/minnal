@@ -55,7 +55,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/storage/wal", get(admin_storage::wal))
         .route("/admin/storage/lsm", get(admin_storage::lsm))
         .route("/admin/storage/value-log", get(admin_storage::value_log))
-        .route("/admin/storage/value-log/{ns}/pages", get(admin_storage::value_log_pages))
+        .route("/admin/storage/value-log/{ns}/segments", get(admin_storage::value_log_segments))
         .route("/admin/storage/namespaces", get(admin_storage::namespaces))
         .route("/admin/storage/namespaces/physical", get(admin_storage::physical_namespaces))
         // Admin / storage — per-namespace engine metadata (doc or KV, unified)

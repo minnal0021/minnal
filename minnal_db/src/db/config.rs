@@ -148,17 +148,17 @@ pub struct DbConfig {
     pub skip_list_capacity: usize,
     /// WAL segment size in bytes.
     pub wal_segment_size: u64,
-    /// Value log page size in bytes (default 64 MiB).
+    /// Size at which a value-log segment is sealed and a new one opened
+    /// (default 256 MiB).
     ///
-    /// **Fixed when a namespace's value log is created and cannot be changed
-    /// afterwards** — like [`num_buckets`](Self::num_buckets). A page's size
-    /// determines the page-aligned `page_offset` in every stored value pointer
-    /// and where a record's slot entry lives, so reopening existing data with a
-    /// different size would reinterpret every pointer. Opening a namespace whose
-    /// value log was written with a different page size fails.
+    /// Unlike the page size it replaces, this is **not** fixed at creation: a
+    /// segment's size is not encoded in any value pointer (only its id and a byte
+    /// offset are), so existing segments keep the size they were written at and new
+    /// ones simply use whatever is configured now.
     ///
-    /// Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
-    pub page_size_bytes: u64,
+    /// Must be a multiple of 4096, at least 64 KiB, and at most 4 GiB (a record's
+    /// offset within its segment is a `u32`).
+    pub segment_size_bytes: u64,
     /// Directory for recovery fail-log files.
     /// `None` defaults to `<db_path>/fail_logs` at open time.
     pub fail_log_dir: Option<PathBuf>,
@@ -183,7 +183,7 @@ impl Default for DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: 64 * 1024 * 1024,
-            page_size_bytes: 64 * 1024 * 1024,
+            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }
@@ -205,7 +205,7 @@ impl DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: 64 * 1024 * 1024,
-            page_size_bytes: 64 * 1024 * 1024,
+            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }

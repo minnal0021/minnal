@@ -282,7 +282,7 @@ impl DocStoreApiConfig {
             num_buckets: self.sharding.num_buckets,
             skip_list_capacity: self.memtable.max_capacity,
             wal_segment_size: self.wal.segment_size_bytes,
-            page_size_bytes: self.value_log.page_size_bytes,
+            segment_size_bytes: self.value_log.segment_size_bytes,
             fail_log_dir: None,
             verify_checksums_on_read: self.value_log.verify_checksums_on_read,
         }
@@ -519,8 +519,8 @@ fn default_wal_segment_size() -> u64 {
 
 #[derive(Debug, Deserialize)]
 pub struct ValueLogSection {
-    #[serde(default = "default_page_size")]
-    pub page_size_bytes: u64,
+    #[serde(default = "default_segment_size")]
+    pub segment_size_bytes: u64,
     /// Re-verify each value's CRC32 on every read. Defaults to `false`
     /// (latency first); see `DbConfig::verify_checksums_on_read`.
     #[serde(default)]
@@ -530,14 +530,14 @@ pub struct ValueLogSection {
 impl Default for ValueLogSection {
     fn default() -> Self {
         Self {
-            page_size_bytes: default_page_size(),
+            segment_size_bytes: default_segment_size(),
             verify_checksums_on_read: false,
         }
     }
 }
 
-fn default_page_size() -> u64 {
-    64 * 1024 * 1024
+fn default_segment_size() -> u64 {
+    minnal_db::DEFAULT_SEGMENT_SIZE_BYTES
 }
 
 // ── Vector index worker section ───────────────────────────────────────────────

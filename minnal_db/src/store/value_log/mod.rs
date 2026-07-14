@@ -1,17 +1,53 @@
-//! Value Log Module
+//! Value Log — immutable segment files.
 //!
-//! This module handles storage and management of actual values in a file.
-//! It provides:
-//! - Value pointer serialization/deserialization
-//! - Value log file operations (read/write)
-//! - Metadata management (head/tail tracking)
-//! - Value log compaction during GC
+//! Each bucket's values live in a series of **segment files**
+//! (`value_log_{bucket}.seg000123`). A segment is appended to while it is the
+//! bucket's *active tail*; once it fills it is **sealed and never modified
+//! again**. Segment ids are **monotone and never reused**.
+//!
+//! That single property is what the rest of the engine leans on:
+//!
+//! - A value's address is `(segment_id, rec_offset, value_len)`, and because ids
+//!   are never reused, an address means **one record forever**. A pointer the LSM
+//!   has since re-pointed still resolves to *that key's own bytes* (GC preserves a
+//!   key's sequence when it relocates the record), and a pointer into a segment GC
+//!   has already deleted fails loudly with [`ValueLogError::SegmentMissing`] —
+//!   never silently to a *different* key's record. Readers therefore need no
+//!   seqlock and no stale-slot detection: on `SegmentMissing` they re-resolve
+//!   through the LSM and retry.
+//! - GC's unit is a segment, not the whole bucket. It rewrites one sealed
+//!   segment's survivors and unlinks the file; it never copies untouched data and
+//!   never rewrites a file in place.
+//!
+//! # Layout
+//!
+//! ```text
+//! segment file:  [file header 16B] [record] [record] ...
+//!
+//! record:        [header 36B][value bytes][key bytes]
+//!                 ^ rec_offset
+//! ```
+//!
+//! The value sits **before** the key deliberately: a reader knows `value_len` from
+//! the pointer, so a `get` is **one `pread` of exactly `36 + value_len` bytes**.
+//! Only GC needs the key, and it reads whole records sequentially anyway.
+//!
+//! # Liveness and garbage
+//!
+//! Records carry **no tombstone/updated flags** — the LSM is the sole authority on
+//! what is live. When a write displaces an older record the writer just adds that
+//! record's size to its segment's garbage counter: it already holds the old
+//! pointer, and the pointer carries `value_len`, so the accounting costs **zero
+//! I/O** (the old design did a read-modify-write of a record header at a random,
+//! possibly-cold offset on *every* overwrite and delete). The counters are a *hint*
+//! for GC selection; the exact live set always comes from the LSM.
 
 pub mod sharded;
 
 use crc32fast::Hasher;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -29,109 +65,128 @@ pub enum ValueLogError {
     CorruptedLog,
     #[error("Invalid value location")]
     InvalidLocation,
-    #[error("invalid page size {0} bytes: must be a multiple of {PAGE_SIZE_ALIGNMENT}, at least {MIN_PAGE_SIZE_BYTES}, and less than 4 GiB")]
-    InvalidPageSize(u64),
+    /// The pointer names a segment whose file is gone — GC reclaimed it after
+    /// relocating its records. Re-resolve the key through the LSM (which holds the
+    /// new pointer) and retry. An expected, benign race; not corruption.
+    #[error("value-log segment {0} no longer exists (reclaimed by GC); re-resolve the pointer")]
+    SegmentMissing(u32),
     #[error(
-        "page size mismatch: this value log was created with {stored} byte pages, but is being opened with {configured}. The page size is fixed at creation — a page's size is encoded in every stored value pointer."
+        "invalid segment size {0} bytes: must be a multiple of {SEGMENT_SIZE_ALIGNMENT}, at least {MIN_SEGMENT_SIZE_BYTES}, and at most {MAX_SEGMENT_SIZE_BYTES}"
     )]
-    PageSizeMismatch { stored: u64, configured: u64 },
+    InvalidSegmentSize(u64),
+    /// A single record cannot exceed one segment.
+    #[error("value too large: a record of {record_len} bytes does not fit in a {segment_size}-byte segment")]
+    ValueTooLarge { record_len: u64, segment_size: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, ValueLogError>;
 
-/// Page size used when a caller does not specify one (`value_log.page_size_bytes`).
-pub const DEFAULT_PAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+/// Default size at which a segment is sealed and a new one opened.
+pub const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Page sizes must be a multiple of this (one filesystem block).
-const PAGE_SIZE_ALIGNMENT: u64 = 4096;
+const SEGMENT_SIZE_ALIGNMENT: u64 = 4096;
+const MIN_SEGMENT_SIZE_BYTES: u64 = 64 * 1024;
+/// `rec_offset` in the value pointer is a `u32`, so every record must be
+/// addressable within 4 GiB of its segment.
+const MAX_SEGMENT_SIZE_BYTES: u64 = u32::MAX as u64;
 
-/// Smallest permitted page size. A page must hold its header, at least one
-/// record, and that record's slot entry with room to spare.
-const MIN_PAGE_SIZE_BYTES: u64 = 64 * 1024;
-
-/// Validate a configured page size.
+/// Validate a configured segment size.
 ///
-/// The page size is bounded above by `u32::MAX` because `PageHeader`'s
-/// `free_offset`, `table_offset` and `page_size` are all `u32`, and bounded
-/// below by [`MIN_PAGE_SIZE_BYTES`] so a page can always hold a record.
-fn validate_page_size(page_size: u64) -> Result<()> {
-    if page_size < MIN_PAGE_SIZE_BYTES || page_size > u32::MAX as u64 || !page_size.is_multiple_of(PAGE_SIZE_ALIGNMENT) {
-        return Err(ValueLogError::InvalidPageSize(page_size));
+/// Unlike the page size it replaces, this is **not** fixed at creation: a
+/// segment's size is not encoded in any pointer (only its id and a byte offset
+/// are), so existing segments keep the size they were written at and new ones use
+/// whatever is configured now.
+pub fn validate_segment_size(segment_size: u64) -> Result<()> {
+    if !(MIN_SEGMENT_SIZE_BYTES..=MAX_SEGMENT_SIZE_BYTES).contains(&segment_size) || !segment_size.is_multiple_of(SEGMENT_SIZE_ALIGNMENT) {
+        return Err(ValueLogError::InvalidSegmentSize(segment_size));
     }
     Ok(())
 }
-const PAGE_HEADER_MAGIC: [u8; 4] = *b"VPG1";
-const PAGE_HEADER_VERSION: u32 = 1;
-const PAGE_HEADER_SIZE: u32 = 32;
-const TABLE_ENTRY_SIZE: u32 = 8;
 
-const FLAG_TOMBSTONE: u8 = 0x01;
-const FLAG_UPDATED: u8 = 0x02;
+// ── On-disk formats ────────────────────────────────────────────────────────
 
-/// A batched value read result: `(original_index, Some((value, record_seq)))`
-/// for a readable slot, or `(index, None)`. `record_seq` lets the caller verify
-/// the slot still holds the write its pointer referred to.
-pub(crate) type BatchValue = (usize, Option<(Vec<u8>, u64)>);
+const SEGMENT_MAGIC: [u8; 4] = *b"VSG1";
+const SEGMENT_FORMAT_VERSION: u32 = 1;
+/// magic(4) + version(4) + segment_id(4) + reserved(4)
+const SEGMENT_HEADER_SIZE: u64 = 16;
 
-/// Location of a value record inside a bucket file (page offset + segment id).
+const VALUE_LOG_METADATA_MAGIC: [u8; 4] = *b"VLOG";
+const VALUE_LOG_METADATA_VERSION: u32 = 3;
+
+/// How many segment files a bucket keeps open at once.
+///
+/// Segments are immutable, so an evicted handle can always be reopened. Eviction
+/// only drops the cache's `Arc<File>`, so an in-flight reader's clone keeps the fd
+/// alive — and an already-open fd keeps reading correctly even after the file is
+/// unlinked.
+const MAX_OPEN_SEGMENTS_PER_BUCKET: usize = 32;
+
+/// `(original_index, Some(value))` for a readable slot, or `(index, None)` when the
+/// pointer could not be resolved (segment reclaimed, or the record failed
+/// validation) — the caller re-resolves those through the LSM.
+pub(crate) type BatchValue = (usize, Option<Vec<u8>>);
+
+/// Where a value lives: which segment, where in it, and how long it is.
+/// `segment_id == 0` is the reserved "no value" sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueLocation {
-    pub page_offset: u64,
     pub segment_id: u32,
+    pub rec_offset: u32,
+    pub value_len: u32,
 }
 
+/// Per-record metadata that is not the value itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueRecordMeta {
+    /// Per-key version counter, incremented on each overwrite.
     pub version: u32,
-    pub tombstone: bool,
-    pub updated: bool,
+    /// Creation time in Unix millis. TTL expiry reads this straight from the record.
     pub epoch: u64,
-    /// Full global write sequence (u64) of the write that produced this record.
-    /// Mirrors the LSM's per-key seq so a reader can verify that a resolved
-    /// pointer still refers to this exact write (a recycled slot carries a
-    /// different, globally-unique seq → stale-pointer detection). Stored at full
-    /// u64 width for debugging precision; the read-time check compares the low
-    /// 32 bits against the LSM's u32 seq.
+    /// The global write sequence that produced this record. GC preserves it when it
+    /// relocates a record. Reads no longer verify it: a segment id is never reused,
+    /// so a pointer can never resolve to a different write.
     pub seq: u64,
 }
 
-/// CRC32 of a value record's payload bytes. Stored in the record header and
-/// re-verified on each value read **when `verify_checksums_on_read` is enabled**
-/// (off by default for latency; see `DbConfig::verify_checksums_on_read`) to
-/// catch silent on-disk corruption (bit rot, torn writes) that the structural
-/// checks (segment-id / length bounds) would otherwise miss.
 fn value_checksum(value: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(value);
     hasher.finalize()
 }
 
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// 36 bytes, followed by the value bytes and then the key bytes.
 #[derive(Debug, Clone, Copy)]
-struct ValueRecordHeader {
+pub(crate) struct ValueRecordHeader {
     total_len: u32,
     version: u32,
-    flags: u8,
     epoch: u64,
-    value_len: u32,
-    /// CRC32 over the value payload (`value_checksum`).
-    checksum: u32,
-    /// Full global write sequence (see [`ValueRecordMeta::seq`]).
     seq: u64,
+    key_len: u32,
+    value_len: u32,
+    /// CRC32 over the value payload.
+    checksum: u32,
 }
 
 impl ValueRecordHeader {
-    const SIZE: usize = 36;
+    pub(crate) const SIZE: usize = 36;
+
+    pub(crate) fn record_len(key_len: usize, value_len: usize) -> u64 {
+        Self::SIZE as u64 + key_len as u64 + value_len as u64
+    }
 
     fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut out = [0u8; Self::SIZE];
         out[0..4].copy_from_slice(&self.total_len.to_le_bytes());
         out[4..8].copy_from_slice(&self.version.to_le_bytes());
-        out[8] = self.flags;
-        out[9..12].copy_from_slice(&[0u8; 3]);
-        out[12..20].copy_from_slice(&self.epoch.to_le_bytes());
-        out[20..24].copy_from_slice(&self.value_len.to_le_bytes());
-        out[24..28].copy_from_slice(&self.checksum.to_le_bytes());
-        out[28..36].copy_from_slice(&self.seq.to_le_bytes());
+        out[8..16].copy_from_slice(&self.epoch.to_le_bytes());
+        out[16..24].copy_from_slice(&self.seq.to_le_bytes());
+        out[24..28].copy_from_slice(&self.key_len.to_le_bytes());
+        out[28..32].copy_from_slice(&self.value_len.to_le_bytes());
+        out[32..36].copy_from_slice(&self.checksum.to_le_bytes());
         out
     }
 
@@ -141,176 +196,104 @@ impl ValueRecordHeader {
         }
         let total_len = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
         let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        let flags = bytes[8];
-        let epoch = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
-        let value_len = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
-        let checksum = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
-        let seq = u64::from_le_bytes(bytes[28..36].try_into().ok()?);
+        let epoch = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let seq = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        let key_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+        let value_len = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
+        let checksum = u32::from_le_bytes(bytes[32..36].try_into().ok()?);
+        // The length must agree with its parts, or these bytes are not a record
+        // header — a torn tail, or a pointer into the middle of a record.
+        if total_len as u64 != Self::record_len(key_len as usize, value_len as usize) {
+            return None;
+        }
         Some(Self {
             total_len,
             version,
-            flags,
             epoch,
+            seq,
+            key_len,
             value_len,
             checksum,
-            seq,
         })
     }
 
     fn meta(&self) -> ValueRecordMeta {
         ValueRecordMeta {
             version: self.version,
-            tombstone: (self.flags & FLAG_TOMBSTONE) != 0,
-            updated: (self.flags & FLAG_UPDATED) != 0,
             epoch: self.epoch,
             seq: self.seq,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PageHeader {
-    magic: [u8; 4],
-    version: u32,
-    free_offset: u32,
-    table_offset: u32,
-    next_segment_id: u32,
-    page_size: u32,
-    reserved0: u32,
-    reserved1: u32,
-}
-
-impl PageHeader {
-    fn new(page_size: u64) -> Self {
-        Self {
-            magic: PAGE_HEADER_MAGIC,
-            version: PAGE_HEADER_VERSION,
-            free_offset: PAGE_HEADER_SIZE,
-            table_offset: page_size as u32,
-            next_segment_id: 1,
-            page_size: page_size as u32,
-            reserved0: 0,
-            reserved1: 0,
-        }
-    }
-
-    fn to_bytes(self) -> [u8; PAGE_HEADER_SIZE as usize] {
-        let mut out = [0u8; PAGE_HEADER_SIZE as usize];
-        out[0..4].copy_from_slice(&self.magic);
-        out[4..8].copy_from_slice(&self.version.to_le_bytes());
-        out[8..12].copy_from_slice(&self.free_offset.to_le_bytes());
-        out[12..16].copy_from_slice(&self.table_offset.to_le_bytes());
-        out[16..20].copy_from_slice(&self.next_segment_id.to_le_bytes());
-        out[20..24].copy_from_slice(&self.page_size.to_le_bytes());
-        out[24..28].copy_from_slice(&self.reserved0.to_le_bytes());
-        out[28..32].copy_from_slice(&self.reserved1.to_le_bytes());
-        out
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < PAGE_HEADER_SIZE as usize {
-            return None;
-        }
-        let magic: [u8; 4] = bytes[0..4].try_into().ok()?;
-        if magic != PAGE_HEADER_MAGIC {
-            return None;
-        }
-        let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        if version != PAGE_HEADER_VERSION {
-            return None;
-        }
-        Some(Self {
-            magic,
-            version,
-            free_offset: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
-            table_offset: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
-            next_segment_id: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
-            page_size: u32::from_le_bytes(bytes[20..24].try_into().ok()?),
-            reserved0: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
-            reserved1: u32::from_le_bytes(bytes[28..32].try_into().ok()?),
-        })
-    }
-}
-
-/// Per-page garbage statistics for selective compaction.
-#[derive(Debug, Clone)]
-pub struct PageGarbageStats {
-    pub page_offset: u64,
+/// Live/garbage accounting for one segment. `live + garbage == total`.
+#[derive(Debug, Clone, Copy, PartialEq, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+pub struct SegmentStats {
+    pub id: u32,
+    /// Record bytes written into this segment (excludes the 16-byte file header).
+    pub total_bytes: u64,
+    /// Bytes still referenced by the LSM, as tracked by writers.
     pub live_bytes: u64,
+    /// Bytes displaced by an overwrite or a delete.
     pub garbage_bytes: u64,
-    pub total_records: u32,
-    pub garbage_records: u32,
+    /// Sealed segments are immutable. Exactly one segment per bucket is unsealed —
+    /// the active tail — and GC never selects it.
+    pub sealed: bool,
 }
 
-impl PageGarbageStats {
-    /// Returns the garbage ratio as a percentage (0.0 - 100.0).
+impl SegmentStats {
     pub fn garbage_ratio_pct(&self) -> f64 {
-        let total = self.live_bytes + self.garbage_bytes;
-        if total == 0 {
+        if self.total_bytes == 0 {
             return 0.0;
         }
-        (self.garbage_bytes as f64 / total as f64) * 100.0
+        (self.garbage_bytes as f64 / self.total_bytes as f64) * 100.0
     }
 }
 
-/// Metadata for tracking value log state
+/// Durable per-bucket state: the segment inventory and the id high-water mark.
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
 pub struct ValueLogMetadata {
-    pub head: u64,
-    pub tail: u64,
-    pub current_page_offset: u64,
-    pub current_page_free_offset: u32,
-    pub current_page_table_offset: u32,
-    pub current_page_next_segment_id: u32,
-    pub total_gc_runs: u64,
-    pub total_bytes_reclaimed: u64,
-    pub live_bytes: u64,
-    pub garbage_bytes: u64,
-}
-
-const VALUE_LOG_METADATA_MAGIC: [u8; 4] = *b"VLOG";
-const VALUE_LOG_METADATA_VERSION: u32 = 2;
-
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-struct ValueLogMetadataV1 {
-    pub head: u64,
-    pub tail: u64,
+    /// High-water mark of segment ids handed out, so ids stay unique for the life of
+    /// the database across restarts too — see [`ValueLog::open`].
+    pub next_segment_id: u64,
+    pub active_segment_id: u32,
+    pub segments: Vec<SegmentStats>,
     pub total_gc_runs: u64,
     pub total_bytes_reclaimed: u64,
 }
 
 impl Default for ValueLogMetadata {
     fn default() -> Self {
-        Self::new(DEFAULT_PAGE_SIZE_BYTES)
+        Self::new()
     }
 }
 
 impl ValueLogMetadata {
-    /// Fresh metadata for a value log whose pages are `page_size` bytes.
-    pub fn new(page_size: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            head: 0,
-            tail: page_size,
-            current_page_offset: 0,
-            current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: page_size as u32,
-            current_page_next_segment_id: 1,
+            next_segment_id: 1,
+            active_segment_id: 0,
+            segments: Vec::new(),
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
-            live_bytes: 0,
-            garbage_bytes: 0,
         }
     }
 
-    /// Serialize metadata to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| ValueLogError::Serialization(format!("Failed to serialize metadata: {}", e)))
-            .map(|buf| buf.to_vec())
+    pub fn live_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.live_bytes).sum()
     }
 
-    pub fn to_file_bytes(&self) -> Result<Vec<u8>> {
-        let payload = self.to_bytes()?;
+    pub fn garbage_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.garbage_bytes).sum()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.total_bytes).sum()
+    }
+
+    fn to_file_bytes(&self) -> Result<Vec<u8>> {
+        let payload =
+            rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| ValueLogError::Serialization(format!("Failed to serialize metadata: {}", e)))?;
         let mut hasher = Hasher::new();
         hasher.update(&payload);
         let checksum = hasher.finalize();
@@ -324,196 +307,270 @@ impl ValueLogMetadata {
         Ok(out)
     }
 
-    /// Deserialize metadata from bytes
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let min_size = std::mem::size_of::<ArchivedValueLogMetadata>();
-        if bytes.len() < min_size {
+    /// Decode metadata. An older version is **rejected, never upgraded**: the
+    /// segmented value log is a hard format break (segment files, keys in records, a
+    /// re-meaning of the value pointer), so an old file cannot be reinterpreted —
+    /// only misread. The caller rebuilds from the segment files instead.
+    fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 || bytes.get(0..4) != Some(&VALUE_LOG_METADATA_MAGIC) {
+            return Err(ValueLogError::Serialization("value log metadata: bad magic".into()));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != VALUE_LOG_METADATA_VERSION {
             return Err(ValueLogError::Serialization(format!(
-                "Value log metadata too small: {} < {}",
-                bytes.len(),
-                min_size
+                "value log metadata version {version} unsupported (expected {VALUE_LOG_METADATA_VERSION})"
             )));
         }
-        let archived = rkyv::access::<ArchivedValueLogMetadata, rkyv::rancor::Error>(bytes)
-            .map_err(|e| ValueLogError::Serialization(format!("Value log metadata validation failed: {}", e)))?;
-        Ok(ValueLogMetadata {
-            head: archived.head.to_native(),
-            tail: archived.tail.to_native(),
-            current_page_offset: archived.current_page_offset.to_native(),
-            current_page_free_offset: archived.current_page_free_offset.to_native(),
-            current_page_table_offset: archived.current_page_table_offset.to_native(),
-            current_page_next_segment_id: archived.current_page_next_segment_id.to_native(),
-            total_gc_runs: archived.total_gc_runs.to_native(),
-            total_bytes_reclaimed: archived.total_bytes_reclaimed.to_native(),
-            live_bytes: archived.live_bytes.to_native(),
-            garbage_bytes: archived.garbage_bytes.to_native(),
-        })
-    }
-
-    /// Decode metadata from its on-disk form. `page_size` is the value log's page
-    /// size, used to rebuild the page cursors a v1 payload does not carry.
-    pub fn from_file_bytes(bytes: &[u8], page_size: u64) -> Result<Self> {
-        if bytes.len() >= 16 && bytes.get(0..4) == Some(&VALUE_LOG_METADATA_MAGIC) {
-            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-            let payload_end = 16usize.saturating_add(payload_len);
-            if bytes.len() < payload_end {
-                return Err(ValueLogError::Serialization(format!(
-                    "Value log metadata payload truncated: {} < {}",
-                    bytes.len(),
-                    payload_end
-                )));
-            }
-            let payload = &bytes[16..payload_end];
-            let mut hasher = Hasher::new();
-            hasher.update(payload);
-            let actual = hasher.finalize();
-            if actual != checksum {
-                return Err(ValueLogError::Serialization("Value log metadata checksum mismatch".to_string()));
-            }
-            if version == VALUE_LOG_METADATA_VERSION {
-                return Self::from_bytes(payload);
-            }
-            if version == 1 {
-                let archived = rkyv::access::<ArchivedValueLogMetadataV1, rkyv::rancor::Error>(payload)
-                    .map_err(|e| ValueLogError::Serialization(format!("Value log metadata v1 validation failed: {}", e)))?;
-                return Ok(ValueLogMetadata {
-                    head: archived.head.to_native(),
-                    tail: page_size,
-                    current_page_offset: 0,
-                    current_page_free_offset: PAGE_HEADER_SIZE,
-                    current_page_table_offset: page_size as u32,
-                    current_page_next_segment_id: 1,
-                    total_gc_runs: archived.total_gc_runs.to_native(),
-                    total_bytes_reclaimed: archived.total_bytes_reclaimed.to_native(),
-                    live_bytes: 0,
-                    garbage_bytes: 0,
-                });
-            }
-            return Err(ValueLogError::Serialization(format!(
-                "Unsupported value log metadata version: {}",
-                version
-            )));
+        let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let end = 16usize.saturating_add(payload_len);
+        if bytes.len() < end {
+            return Err(ValueLogError::Serialization("value log metadata: truncated payload".into()));
         }
-
-        Self::from_bytes(bytes)
+        let payload = &bytes[16..end];
+        let mut hasher = Hasher::new();
+        hasher.update(payload);
+        if hasher.finalize() != checksum {
+            return Err(ValueLogError::Serialization("value log metadata: checksum mismatch".into()));
+        }
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(payload)
+            .map_err(|e| ValueLogError::Serialization(format!("Failed to deserialize metadata: {}", e)))
     }
 }
 
-/// Value Log Manager
-///
-/// Handles all file I/O operations for the value log
+// ── The bucket's value log ─────────────────────────────────────────────────
+
+/// Bounded cache of open segment handles.
+struct FdCache {
+    open: HashMap<u32, Arc<File>>,
+    order: Vec<u32>,
+    capacity: usize,
+}
+
+impl FdCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            open: HashMap::new(),
+            order: Vec::new(),
+            capacity,
+        }
+    }
+
+    fn get(&self, id: u32) -> Option<Arc<File>> {
+        self.open.get(&id).cloned()
+    }
+
+    fn insert(&mut self, id: u32, file: Arc<File>) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.open.entry(id) {
+            e.insert(file);
+            return;
+        }
+        while self.open.len() >= self.capacity && !self.order.is_empty() {
+            let victim = self.order.remove(0);
+            self.open.remove(&victim);
+        }
+        self.open.insert(id, file);
+        self.order.push(id);
+    }
+
+    fn remove(&mut self, id: u32) {
+        self.open.remove(&id);
+        self.order.retain(|&i| i != id);
+    }
+}
+
+/// The mutable half of a bucket's value log: the segment inventory and the tail it
+/// is appending to.
+struct Inner {
+    segments: BTreeMap<u32, SegmentStats>,
+    active_id: u32,
+    active_file: Arc<File>,
+    /// Offset in the active segment where the next record goes.
+    active_offset: u64,
+    total_gc_runs: u64,
+    total_bytes_reclaimed: u64,
+}
+
+/// One bucket's value log: a series of immutable segment files plus an active tail.
 pub struct ValueLog {
-    // Value log file
-    // Arc<RwLock<Arc<File>>> enables atomic pointer swaps during GC
-    // This allows readers to hold their own Arc reference while new readers switch to new file
-    file: Arc<RwLock<Arc<File>>>,
-
-    // Seqlock-style generation counter for GC swaps. A GC compaction of this
-    // bucket brackets BOTH the file swap and the subsequent LSM pointer re-point
-    // with [`begin_swap`](Self::begin_swap) (→ odd) and the returned guard's drop
-    // (→ even). An *even* value means "consistent"; an *odd* value means "a swap
-    // is in progress, the LSM and the value-log file may disagree right now".
-    //
-    // Readers sample it before and after a pointer+value read and trust the read
-    // only if the sample was even and unchanged. This is stronger than tracking
-    // the file swap alone: the file swap and the LSM re-point are two separate
-    // steps, so a counter bumped only at the file swap leaves a window where the
-    // file is new but the LSM still holds the old pointer — a reader there pairs
-    // a stale pointer with the new file and reads garbage. Bracketing both steps
-    // closes that window. The counter never resets, so a completed swap (+2) can
-    // never alias back to a prior even value.
-    generation: AtomicU64,
-
-    // When true, every value read re-verifies the record's CRC32 against the
-    // value bytes. Off by default (latency first) — see `DbConfig::verify_checksums_on_read`.
+    dir: PathBuf,
+    bucket: u32,
+    segment_size: u64,
+    /// Monotone id allocator. **Never derived from the filesystem at runtime**: if
+    /// GC unlinked the highest segment, `max(files) + 1` would hand its id out again
+    /// and a reader holding the old pointer would silently read a *different*
+    /// record. Seeded at open from `max(persisted high-water mark, max id + 1)`.
+    next_segment_id: AtomicU64,
+    inner: RwLock<Inner>,
+    fd_cache: Mutex<FdCache>,
     verify_checksums_on_read: AtomicBool,
-
-    // Size of every page in this file. Fixed for the life of the file: a page's
-    // size determines both the page-aligned `page_offset` in every stored value
-    // pointer and where a segment's slot entry sits (`page_size - segment_id * 8`),
-    // so reopening existing data with a different size would reinterpret every
-    // pointer. `open_with_page_size` rejects that (`PageSizeMismatch`).
-    page_size: u64,
-
-    // Path to the value log file
-    #[allow(dead_code)]
-    path: PathBuf,
-}
-
-/// RAII guard for a GC swap epoch (see [`ValueLog::begin_swap`]). While alive,
-/// the bucket's generation is odd ("swap in progress"); on drop it is bumped
-/// back to even ("consistent"), so the epoch is closed even on an early return
-/// or panic mid-swap.
-pub struct SwapEpochGuard<'a> {
-    value_log: &'a ValueLog,
-}
-
-impl Drop for SwapEpochGuard<'_> {
-    fn drop(&mut self) {
-        let prev = self.value_log.generation.fetch_add(1, Ordering::AcqRel);
-        debug_assert!(
-            !prev.is_multiple_of(2),
-            "SwapEpochGuard drop on a bucket not mid-swap (generation {prev} was even)"
-        );
-    }
+    /// Set when the metadata file was missing or unreadable, so live/garbage
+    /// accounting could not be loaded. `KVStore::open` then recomputes it exactly
+    /// from the LSM's pointers; until it does, GC would under-trigger.
+    stats_need_rebuild: AtomicBool,
 }
 
 impl ValueLog {
-    /// Open or create a value log with the default page size.
-    #[allow(dead_code)] // test/convenience constructor; production opens with the configured size
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_page_size(path, DEFAULT_PAGE_SIZE_BYTES)
+    fn segment_path(dir: &Path, bucket: u32, id: u32) -> PathBuf {
+        dir.join(format!("value_log_{bucket}.seg{id:06}"))
     }
 
-    /// Open or create a value log whose pages are `page_size` bytes.
+    fn metadata_path(dir: &Path, bucket: u32) -> PathBuf {
+        dir.join(format!("value_log_{bucket}.metadata"))
+    }
+
+    fn parse_segment_id(bucket: u32, name: &str) -> Option<u32> {
+        name.strip_prefix(&format!("value_log_{bucket}.seg"))?.parse::<u32>().ok()
+    }
+
+    fn write_segment_header(file: &File, id: u32) -> Result<()> {
+        let mut header = [0u8; SEGMENT_HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&SEGMENT_MAGIC);
+        header[4..8].copy_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
+        header[8..12].copy_from_slice(&id.to_le_bytes());
+        file.write_all_at(&header, 0)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Open (or create) the value log for `bucket`.
     ///
-    /// The page size is **fixed at creation**. It determines the page-aligned
-    /// `page_offset` carried in every stored value pointer and the position of a
-    /// record's slot entry (`page_size - segment_id * 8`), so opening a file that
-    /// already holds data with a different page size would silently reinterpret
-    /// every pointer. When the file already has a page-0 header, its recorded
-    /// `page_size` wins the argument: a mismatch is rejected with
-    /// [`ValueLogError::PageSizeMismatch`] rather than corrupting the data.
-    pub fn open_with_page_size<P: AsRef<Path>>(path: P, page_size: u64) -> Result<Self> {
-        validate_page_size(page_size)?;
+    /// The **files on disk** are the source of truth for what exists; the metadata
+    /// file supplies live/garbage accounting and the id high-water mark. The id
+    /// allocator starts at the **max** of both, so neither a lost metadata file nor a
+    /// GC-deleted top segment can hand out an id that was already used.
+    pub fn open(dir: &Path, bucket: u32, segment_size: u64) -> Result<Self> {
+        validate_segment_size(segment_size)?;
+        std::fs::create_dir_all(dir)?;
 
-        let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        // 1. What exists on disk.
+        let mut on_disk: BTreeMap<u32, u64> = BTreeMap::new(); // id -> record bytes
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(id) = Self::parse_segment_id(bucket, name) else {
+                continue;
+            };
+            let len = entry.metadata()?.len();
+            on_disk.insert(id, len.saturating_sub(SEGMENT_HEADER_SIZE));
+        }
 
-        // A file that already holds a page-0 header was created with a page size
-        // of its own; refuse to reinterpret it under a different one. A brand-new
-        // (or empty) file has no header yet and is free to adopt `page_size` —
-        // which is what lets GC open its `.log.new` with the bucket's size.
-        let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
-        if file.read_at(&mut hdr_buf, 0).is_ok()
-            && let Some(existing) = PageHeader::from_bytes(&hdr_buf)
-            && existing.page_size as u64 != page_size
-        {
-            return Err(ValueLogError::PageSizeMismatch {
-                stored: existing.page_size as u64,
-                configured: page_size,
+        // 2. What we last recorded about it.
+        let meta_path = Self::metadata_path(dir, bucket);
+        let (persisted, stats_loaded) = match std::fs::read(&meta_path) {
+            Ok(bytes) => match ValueLogMetadata::from_file_bytes(&bytes) {
+                Ok(m) => (m, true),
+                Err(_) => {
+                    let _ = std::fs::rename(&meta_path, meta_path.with_extension("corrupt"));
+                    (ValueLogMetadata::new(), false)
+                }
+            },
+            // No metadata and no segments = a brand-new bucket, nothing to rebuild.
+            Err(_) => (ValueLogMetadata::new(), on_disk.is_empty()),
+        };
+
+        // 3. Reconcile. Accounting survives only for segments whose file is still
+        //    there; a file we have no accounting for is assumed fully live
+        //    (conservative — GC under-triggers rather than dropping live data) and
+        //    flagged for an exact rebuild from the LSM.
+        let mut need_rebuild = !stats_loaded;
+        let mut segments: BTreeMap<u32, SegmentStats> = BTreeMap::new();
+        for stats in &persisted.segments {
+            if on_disk.contains_key(&stats.id) {
+                segments.insert(stats.id, *stats);
+            }
+        }
+        for (&id, &total) in &on_disk {
+            segments.entry(id).or_insert_with(|| {
+                need_rebuild = true;
+                SegmentStats {
+                    id,
+                    total_bytes: total,
+                    live_bytes: total,
+                    garbage_bytes: 0,
+                    sealed: true,
+                }
             });
         }
 
-        Ok(Self {
-            file: Arc::new(RwLock::new(Arc::new(file))),
-            generation: AtomicU64::new(0),
+        // 4. The id floor: never below a segment that exists, never below what we
+        //    already promised was handed out.
+        let max_existing = on_disk.keys().next_back().copied().unwrap_or(0) as u64;
+        let mut next_id = persisted.next_segment_id.max(max_existing + 1).max(1);
+
+        // 5. The active tail: reuse the newest segment if it still has room (so a
+        //    restart doesn't strand a half-empty file), else start a fresh one.
+        let reusable = on_disk
+            .iter()
+            .next_back()
+            .filter(|(_, bytes)| SEGMENT_HEADER_SIZE + **bytes < segment_size)
+            .map(|(&id, &bytes)| (id, bytes));
+
+        let (active_id, active_file, active_offset) = match reusable {
+            Some((id, bytes)) => {
+                let file = OpenOptions::new().read(true).write(true).open(Self::segment_path(dir, bucket, id))?;
+                if let Some(s) = segments.get_mut(&id) {
+                    s.sealed = false;
+                }
+                (id, Arc::new(file), SEGMENT_HEADER_SIZE + bytes)
+            }
+            None => {
+                let id = next_id as u32;
+                next_id += 1;
+                let path = Self::segment_path(dir, bucket, id);
+                let file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path)?;
+                Self::write_segment_header(&file, id)?;
+                fsync_dir(dir)?;
+                segments.insert(
+                    id,
+                    SegmentStats {
+                        id,
+                        total_bytes: 0,
+                        live_bytes: 0,
+                        garbage_bytes: 0,
+                        sealed: false,
+                    },
+                );
+                (id, Arc::new(file), SEGMENT_HEADER_SIZE)
+            }
+        };
+
+        let mut fd_cache = FdCache::new(MAX_OPEN_SEGMENTS_PER_BUCKET);
+        fd_cache.insert(active_id, Arc::clone(&active_file));
+
+        let log = Self {
+            dir: dir.to_path_buf(),
+            bucket,
+            segment_size,
+            next_segment_id: AtomicU64::new(next_id),
+            inner: RwLock::new(Inner {
+                segments,
+                active_id,
+                active_file,
+                active_offset,
+                total_gc_runs: persisted.total_gc_runs,
+                total_bytes_reclaimed: persisted.total_bytes_reclaimed,
+            }),
+            fd_cache: Mutex::new(fd_cache),
             verify_checksums_on_read: AtomicBool::new(false),
-            page_size,
-            path,
-        })
+            stats_need_rebuild: AtomicBool::new(need_rebuild),
+        };
+        log.flush_metadata()?;
+        Ok(log)
     }
 
-    /// Size of every page in this value log (fixed at creation).
-    #[allow(dead_code)] // callers reach this through `ShardedValueLog::page_size`
-    #[inline]
-    pub fn page_size(&self) -> u64 {
-        self.page_size
+    /// True when live/garbage accounting could not be loaded and must be recomputed
+    /// from the LSM's pointers.
+    pub fn stats_need_rebuild(&self) -> bool {
+        self.stats_need_rebuild.load(Ordering::Acquire)
     }
 
-    /// Enable or disable re-verifying each value's CRC32 on read (default off).
+    #[allow(dead_code)] // surfaced through ShardedValueLog
+    pub fn segment_size(&self) -> u64 {
+        self.segment_size
+    }
+
     pub fn set_verify_checksums_on_read(&self, verify: bool) {
         self.verify_checksums_on_read.store(verify, Ordering::Relaxed);
     }
@@ -523,634 +580,366 @@ impl ValueLog {
         self.verify_checksums_on_read.load(Ordering::Relaxed)
     }
 
-    /// Current swap generation for this bucket (see [`generation`](Self::generation) field).
-    ///
-    /// Sampled by readers around a pointer+value read. The read is trustworthy
-    /// only if this was **even** (no swap in progress) and **unchanged** across
-    /// the read; an odd value, or any change, means a GC swap raced the read and
-    /// it must be retried.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+    /// Allocate the next segment id. Monotone in-process; the persisted high-water
+    /// mark keeps it monotone across restarts.
+    fn alloc_segment_id(&self) -> u32 {
+        self.next_segment_id.fetch_add(1, Ordering::AcqRel) as u32
     }
 
-    /// Begin a GC swap epoch for this bucket: bump the generation to odd ("swap
-    /// in progress") and return a guard whose drop bumps it to even again. The
-    /// caller must hold this guard across BOTH the value-log file swap and the
-    /// LSM pointer re-point, so readers observe the two as a single atomic step.
-    pub fn begin_swap(&self) -> SwapEpochGuard<'_> {
-        let prev = self.generation.fetch_add(1, Ordering::AcqRel);
-        debug_assert!(
-            prev.is_multiple_of(2),
-            "begin_swap on a bucket already mid-swap (generation {prev} was odd)"
+    /// Seal the current tail and open a fresh segment as the new one.
+    fn roll_active_segment(&self, inner: &mut Inner) -> Result<()> {
+        if let Some(s) = inner.segments.get_mut(&inner.active_id) {
+            s.sealed = true;
+        }
+
+        let id = self.alloc_segment_id();
+        let path = Self::segment_path(&self.dir, self.bucket, id);
+        let file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path)?;
+        Self::write_segment_header(&file, id)?;
+        fsync_dir(&self.dir)?;
+
+        let file = Arc::new(file);
+        self.fd_cache.lock().insert(id, Arc::clone(&file));
+        inner.segments.insert(
+            id,
+            SegmentStats {
+                id,
+                total_bytes: 0,
+                live_bytes: 0,
+                garbage_bytes: 0,
+                sealed: false,
+            },
         );
-        SwapEpochGuard { value_log: self }
-    }
-
-    pub fn ensure_current_page(&self, metadata: &mut ValueLogMetadata) -> Result<()> {
-        let file = self.get_file();
-        let desired_len = metadata.tail.max(self.page_size);
-        if file.metadata()?.len() < desired_len {
-            file.set_len(desired_len)?;
-        }
-
-        let header = self.read_page_header(&file, metadata.current_page_offset)?;
-        if header.is_none() {
-            self.write_page_header(&file, metadata.current_page_offset, PageHeader::new(self.page_size))?;
-        } else if let Some(header) = header {
-            metadata.current_page_free_offset = header.free_offset;
-            metadata.current_page_table_offset = header.table_offset;
-            metadata.current_page_next_segment_id = header.next_segment_id.max(1);
-        }
+        inner.active_id = id;
+        inner.active_file = file;
+        inner.active_offset = SEGMENT_HEADER_SIZE;
         Ok(())
     }
 
-    fn record_storage_bytes(total_len: u32) -> u64 {
-        total_len as u64 + TABLE_ENTRY_SIZE as u64
+    /// A handle to a segment's file, opening and caching it on demand.
+    ///
+    /// A missing file is [`ValueLogError::SegmentMissing`], not an IO error: GC
+    /// reclaimed it after relocating its records, so the caller should re-resolve the
+    /// key through the LSM and retry.
+    fn segment_file(&self, id: u32) -> Result<Arc<File>> {
+        if let Some(f) = self.fd_cache.lock().get(id) {
+            return Ok(f);
+        }
+        let path = Self::segment_path(&self.dir, self.bucket, id);
+        match OpenOptions::new().read(true).open(&path) {
+            Ok(f) => {
+                let f = Arc::new(f);
+                self.fd_cache.lock().insert(id, Arc::clone(&f));
+                Ok(f)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ValueLogError::SegmentMissing(id)),
+            Err(e) => Err(ValueLogError::Io(e)),
+        }
     }
 
-    /// Write a value record into the current page or a new page if needed.
-    pub fn write_record(&self, value: &[u8], meta: ValueRecordMeta, metadata: &mut ValueLogMetadata, sync: bool) -> Result<ValueLocation> {
-        self.ensure_current_page(metadata)?;
+    // ── Writes ────────────────────────────────────────────────────────────
 
-        let record_len = ValueRecordHeader::SIZE as u32 + value.len() as u32;
-        let required = record_len.saturating_add(TABLE_ENTRY_SIZE);
-
-        if metadata.current_page_free_offset.saturating_add(required) > metadata.current_page_table_offset {
-            metadata.current_page_offset = metadata.tail;
-            metadata.tail = metadata.tail.saturating_add(self.page_size);
-            metadata.current_page_free_offset = PAGE_HEADER_SIZE;
-            metadata.current_page_table_offset = self.page_size as u32;
-            metadata.current_page_next_segment_id = 1;
-            self.ensure_current_page(metadata)?;
+    /// Append a record, rolling to a new segment if this one is full. Callers hold
+    /// the bucket write lock.
+    pub fn append(&self, key: &[u8], value: &[u8], meta: ValueRecordMeta, sync: bool) -> Result<ValueLocation> {
+        let record_len = ValueRecordHeader::record_len(key.len(), value.len());
+        if SEGMENT_HEADER_SIZE + record_len > self.segment_size {
+            return Err(ValueLogError::ValueTooLarge {
+                record_len,
+                segment_size: self.segment_size,
+            });
         }
 
-        if metadata.current_page_next_segment_id == 0 {
-            metadata.current_page_next_segment_id = 1;
+        let mut inner = self.inner.write();
+        if inner.active_offset + record_len > self.segment_size {
+            self.roll_active_segment(&mut inner)?;
         }
-        let segment_id = metadata.current_page_next_segment_id;
-        metadata.current_page_next_segment_id = metadata.current_page_next_segment_id.saturating_add(1);
 
-        let record_offset = metadata.current_page_free_offset;
-        metadata.current_page_free_offset = metadata.current_page_free_offset.saturating_add(record_len);
-        metadata.current_page_table_offset = metadata.current_page_table_offset.saturating_sub(TABLE_ENTRY_SIZE);
-
-        let flags = (if meta.tombstone { FLAG_TOMBSTONE } else { 0 }) | (if meta.updated { FLAG_UPDATED } else { 0 });
+        let segment_id = inner.active_id;
+        let rec_offset = inner.active_offset;
+        let file = Arc::clone(&inner.active_file);
 
         let header = ValueRecordHeader {
-            total_len: record_len,
+            total_len: record_len as u32,
             version: meta.version,
-            flags,
             epoch: meta.epoch,
+            seq: meta.seq,
+            key_len: key.len() as u32,
             value_len: value.len() as u32,
             checksum: value_checksum(value),
-            seq: meta.seq,
         };
 
-        let file = self.get_file();
-        self.ensure_page_len(&file, metadata.current_page_offset)?;
-
-        let page_base = metadata.current_page_offset;
-
-        // Write record header
-        let abs_record = page_base + record_offset as u64;
-        Self::write_all_at(&file, &header.to_bytes(), abs_record)?;
-
-        // Write value
-        let abs_value = abs_record + ValueRecordHeader::SIZE as u64;
-        Self::write_all_at(&file, value, abs_value)?;
-
-        // Write table entry (segment_id + record_offset, 8 bytes)
-        let abs_table_entry = page_base + metadata.current_page_table_offset as u64;
-        let mut table_entry = [0u8; TABLE_ENTRY_SIZE as usize];
-        table_entry[0..4].copy_from_slice(&segment_id.to_le_bytes());
-        table_entry[4..8].copy_from_slice(&record_offset.to_le_bytes());
-        Self::write_all_at(&file, &table_entry, abs_table_entry)?;
-
-        // Write updated page header
-        let page_header = PageHeader {
-            magic: PAGE_HEADER_MAGIC,
-            version: PAGE_HEADER_VERSION,
-            free_offset: metadata.current_page_free_offset,
-            table_offset: metadata.current_page_table_offset,
-            next_segment_id: metadata.current_page_next_segment_id,
-            page_size: self.page_size as u32,
-            reserved0: 0,
-            reserved1: 0,
-        };
-        Self::write_all_at(&file, &page_header.to_bytes(), page_base)?;
-
+        // [header][value][key] — one write, and a later read of just the value is a
+        // single pread of `header + value_len`.
+        let mut buf = Vec::with_capacity(record_len as usize);
+        buf.extend_from_slice(&header.to_bytes());
+        buf.extend_from_slice(value);
+        buf.extend_from_slice(key);
+        file.write_all_at(&buf, rec_offset)?;
         if sync {
             file.sync_data()?;
         }
 
-        let record_bytes = Self::record_storage_bytes(record_len);
-        if meta.tombstone || meta.updated {
-            metadata.garbage_bytes = metadata.garbage_bytes.saturating_add(record_bytes);
-        } else {
-            metadata.live_bytes = metadata.live_bytes.saturating_add(record_bytes);
+        inner.active_offset += record_len;
+        if let Some(s) = inner.segments.get_mut(&segment_id) {
+            s.total_bytes += record_len;
+            s.live_bytes += record_len;
         }
 
         Ok(ValueLocation {
-            page_offset: metadata.current_page_offset,
             segment_id,
+            rec_offset: rec_offset as u32,
+            value_len: value.len() as u32,
         })
     }
 
-    /// Read a value from a specific file handle (used for snapshot reads)
-    pub fn read_value_from_file(&self, file: &File, location: ValueLocation) -> Result<Vec<u8>> {
-        Ok(self.read_value_and_seq_from_file(file, location)?.0)
+    /// Account for a record a newer write (or a delete) has just displaced.
+    /// Costs **no I/O** — the caller holds the old pointer, which carries `value_len`.
+    pub fn note_displaced(&self, location: ValueLocation, key_len: usize) {
+        if location.segment_id == 0 {
+            return;
+        }
+        let bytes = ValueRecordHeader::record_len(key_len, location.value_len as usize);
+        let mut inner = self.inner.write();
+        if let Some(s) = inner.segments.get_mut(&location.segment_id) {
+            s.live_bytes = s.live_bytes.saturating_sub(bytes);
+            s.garbage_bytes = s.garbage_bytes.saturating_add(bytes);
+        }
     }
 
-    /// Like [`read_value_from_file`](Self::read_value_from_file) but also returns
-    /// the record's stored write `seq`, so a reader can verify the resolved
-    /// pointer still refers to the write the LSM associated with it (a recycled
-    /// slot carries a different, globally-unique seq).
-    pub fn read_value_and_seq_from_file(&self, file: &File, location: ValueLocation) -> Result<(Vec<u8>, u64)> {
+    pub fn sync(&self) -> Result<()> {
+        let file = Arc::clone(&self.inner.read().active_file);
+        file.sync_data()?;
+        Ok(())
+    }
+
+    // ── Reads ─────────────────────────────────────────────────────────────
+
+    fn parse_record(&self, buf: &[u8], location: ValueLocation) -> Result<(Vec<u8>, ValueRecordMeta)> {
+        let header = ValueRecordHeader::from_bytes(buf).ok_or(ValueLogError::CorruptedLog)?;
+        // The pointer's value_len decides how much we read; a record that disagrees
+        // is not the record this pointer names.
+        if header.value_len != location.value_len {
+            return Err(ValueLogError::InvalidLocation);
+        }
+        let start = ValueRecordHeader::SIZE;
+        let end = start + header.value_len as usize;
+        if buf.len() < end {
+            return Err(ValueLogError::CorruptedLog);
+        }
+        let value = buf[start..end].to_vec();
+        if self.verify_checksums_on_read() && value_checksum(&value) != header.checksum {
+            return Err(ValueLogError::CorruptedLog);
+        }
+        Ok((value, header.meta()))
+    }
+
+    /// Read a value: **one `pread`** of exactly `header + value_len` bytes.
+    pub fn read_value(&self, location: ValueLocation) -> Result<Vec<u8>> {
+        Ok(self.read_value_and_meta(location)?.0)
+    }
+
+    pub fn read_value_and_meta(&self, location: ValueLocation) -> Result<(Vec<u8>, ValueRecordMeta)> {
         if location.segment_id == 0 {
             return Err(ValueLogError::InvalidLocation);
         }
-        // 1. Read page header for table_offset validation.
-        let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
-        file.read_at(&mut hdr_buf, location.page_offset).map_err(ValueLogError::Io)?;
-        let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-        // 2. Compute and validate the table entry position.
-        let entry_offset = (self.page_size as usize)
-            .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
-            .ok_or(ValueLogError::InvalidLocation)?;
-        if entry_offset < page_header.table_offset as usize {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let abs_entry_offset = location.page_offset + entry_offset as u64;
-        let mut entry_buf = [0u8; TABLE_ENTRY_SIZE as usize];
-        file.read_at(&mut entry_buf, abs_entry_offset).map_err(ValueLogError::Io)?;
-        let stored_segment = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
-        if stored_segment != location.segment_id {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let record_offset = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
-        // 3. Read record header.
-        let abs_record_offset = location.page_offset + record_offset as u64;
-        let mut rec_hdr_buf = [0u8; ValueRecordHeader::SIZE];
-        file.read_at(&mut rec_hdr_buf, abs_record_offset).map_err(ValueLogError::Io)?;
-        let rec_header = ValueRecordHeader::from_bytes(&rec_hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-        // 4. Read value bytes.
-        let value_abs_offset = abs_record_offset + ValueRecordHeader::SIZE as u64;
-        let mut value = vec![0u8; rec_header.value_len as usize];
-        file.read_at(&mut value, value_abs_offset).map_err(ValueLogError::Io)?;
-        if self.verify_checksums_on_read() && value_checksum(&value) != rec_header.checksum {
-            return Err(ValueLogError::CorruptedLog);
-        }
-        Ok((value, rec_header.seq))
-    }
-
-    /// Read a value from the value log
-    #[allow(dead_code)]
-    pub fn read_value(&self, location: ValueLocation) -> Result<Vec<u8>> {
-        let file = self.get_file();
+        let file = self.segment_file(location.segment_id)?;
         self.read_value_from_file(&file, location)
     }
 
-    /// Read multiple values from the same file handle efficiently.
-    ///
-    /// Groups entries by page and issues:
-    /// - 1 pread for the page header (shared by all entries on the same page)
-    /// - 1 pread for all slot-directory entries in the segment_id range
-    /// - 1 speculative pread per entry that reads record-header + value together
-    ///
-    /// This reduces pread() calls from 4×N (individual) to ≈ 2 + N per page group.
-    /// Values larger than SPECULATIVE_READ_SIZE fall back to a second direct read.
-    /// Returns `(orig_idx, Some((value, record_seq)))` for each readable entry, or
-    /// `(orig_idx, None)` when the slot is empty/unreadable. `record_seq` lets the
-    /// caller verify the slot still holds the write the pointer referred to.
-    pub fn read_values_batch_from_file(&self, file: &File, entries: &[(usize, ValueLocation)]) -> Vec<BatchValue> {
-        // Buffer size for speculative record+value reads.
-        // Dense vectors (768-dim × 8 bits ≈ 800 bytes + rkyv overhead) always fit.
-        const SPECULATIVE_READ_SIZE: usize = 1280;
-
-        let mut results: Vec<BatchValue> = Vec::with_capacity(entries.len());
-        if entries.is_empty() {
-            return results;
+    pub fn read_value_from_file(&self, file: &File, location: ValueLocation) -> Result<(Vec<u8>, ValueRecordMeta)> {
+        if location.segment_id == 0 {
+            return Err(ValueLogError::InvalidLocation);
         }
-        let verify = self.verify_checksums_on_read();
+        let mut buf = vec![0u8; ValueRecordHeader::SIZE + location.value_len as usize];
+        file.read_at(&mut buf, location.rec_offset as u64).map_err(ValueLogError::Io)?;
+        self.parse_record(&buf, location)
+    }
 
-        // Group by page_offset — almost always a single page per bucket batch.
-        let mut by_page: std::collections::HashMap<u64, Vec<(usize, u32)>> = std::collections::HashMap::new();
-        for &(orig_idx, location) in entries {
-            if location.segment_id == 0 {
-                results.push((orig_idx, None));
-                continue;
-            }
-            by_page.entry(location.page_offset).or_default().push((orig_idx, location.segment_id));
+    /// The record's metadata only — a 36-byte read. TTL expiry uses it for `epoch`.
+    pub fn read_record_meta(&self, location: ValueLocation) -> Result<ValueRecordMeta> {
+        if location.segment_id == 0 {
+            return Err(ValueLogError::InvalidLocation);
         }
+        let file = self.segment_file(location.segment_id)?;
+        let mut buf = [0u8; ValueRecordHeader::SIZE];
+        file.read_at(&mut buf, location.rec_offset as u64).map_err(ValueLogError::Io)?;
+        let header = ValueRecordHeader::from_bytes(&buf).ok_or(ValueLogError::CorruptedLog)?;
+        Ok(header.meta())
+    }
 
-        for (page_offset, page_entries) in by_page {
-            // ── Read 1: page header once per page ────────────────────────────
-            let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
-            if file.read_at(&mut hdr_buf, page_offset).is_err() {
-                results.extend(page_entries.iter().map(|(idx, _)| (*idx, None)));
+    /// Read many of this bucket's values. Grouped by segment so each file is opened
+    /// once; one `pread` per value (there is no shared page header or slot directory
+    /// left to amortise — there isn't one).
+    pub fn read_values_batch(&self, entries: &[(usize, ValueLocation)]) -> Vec<BatchValue> {
+        let mut out = Vec::with_capacity(entries.len());
+        let mut by_segment: HashMap<u32, Vec<(usize, ValueLocation)>> = HashMap::new();
+        for &(idx, loc) in entries {
+            if loc.segment_id == 0 {
+                out.push((idx, None));
                 continue;
             }
-            let page_header = match PageHeader::from_bytes(&hdr_buf) {
-                Some(h) => h,
-                None => {
-                    results.extend(page_entries.iter().map(|(idx, _)| (*idx, None)));
-                    continue;
-                }
-            };
-
-            // ── Read 2: bulk slot-directory read ─────────────────────────────
-            // Table entries grow from the end of the page downward.
-            // segment_id K → file offset page_offset + PAGE_SIZE - K * TABLE_ENTRY_SIZE.
-            // max_seg has the lowest file offset; min_seg has the highest.
-            let max_seg = page_entries.iter().map(|(_, s)| *s).max().unwrap();
-            let min_seg = page_entries.iter().map(|(_, s)| *s).min().unwrap();
-            let entry_offset_for_max = (self.page_size as usize).saturating_sub(max_seg as usize * TABLE_ENTRY_SIZE as usize);
-            if entry_offset_for_max < page_header.table_offset as usize {
-                results.extend(page_entries.iter().map(|(idx, _)| (*idx, None)));
-                continue;
-            }
-            let slot_count = (max_seg - min_seg + 1) as usize;
-            let slot_buf_size = slot_count * TABLE_ENTRY_SIZE as usize;
-            let slot_buf_file_offset = page_offset + entry_offset_for_max as u64;
-            let mut slot_buf = vec![0u8; slot_buf_size];
-            if file.read_at(&mut slot_buf, slot_buf_file_offset).is_err() {
-                results.extend(page_entries.iter().map(|(idx, _)| (*idx, None)));
-                continue;
-            }
-
-            // ── Read 3: speculative record+value read per entry ───────────────
-            for (orig_idx, segment_id) in page_entries {
-                let slot_idx = (max_seg - segment_id) as usize;
-                let slot_start = slot_idx * TABLE_ENTRY_SIZE as usize;
-                if slot_start + TABLE_ENTRY_SIZE as usize > slot_buf.len() {
-                    results.push((orig_idx, None));
-                    continue;
-                }
-                let stored_segment = u32::from_le_bytes(slot_buf[slot_start..slot_start + 4].try_into().unwrap());
-                if stored_segment != segment_id {
-                    results.push((orig_idx, None));
-                    continue;
-                }
-                let record_offset = u32::from_le_bytes(slot_buf[slot_start + 4..slot_start + 8].try_into().unwrap());
-                let abs_record_offset = page_offset + record_offset as u64;
-
-                let mut spec_buf = [0u8; ValueRecordHeader::SIZE + SPECULATIVE_READ_SIZE];
-                let n_read = file.read_at(&mut spec_buf, abs_record_offset).unwrap_or(0);
-                if n_read < ValueRecordHeader::SIZE {
-                    results.push((orig_idx, None));
-                    continue;
-                }
-                let rec_header = match ValueRecordHeader::from_bytes(&spec_buf[..ValueRecordHeader::SIZE]) {
-                    Some(h) => h,
-                    None => {
-                        results.push((orig_idx, None));
-                        continue;
-                    }
-                };
-                let value_len = rec_header.value_len as usize;
-                let value_start = ValueRecordHeader::SIZE;
-                let value_end = value_start + value_len;
-                let value = if value_end <= n_read {
-                    spec_buf[value_start..value_end].to_vec()
-                } else {
-                    // Slow path: value larger than speculative buffer
-                    let abs_value_offset = abs_record_offset + ValueRecordHeader::SIZE as u64;
-                    let mut buf = vec![0u8; value_len];
-                    match file.read_at(&mut buf, abs_value_offset) {
-                        Ok(_) => buf,
-                        Err(_) => {
-                            results.push((orig_idx, None));
-                            continue;
+            by_segment.entry(loc.segment_id).or_default().push((idx, loc));
+        }
+        for (segment_id, group) in by_segment {
+            match self.segment_file(segment_id) {
+                Ok(file) => {
+                    for (idx, loc) in group {
+                        match self.read_value_from_file(&file, loc) {
+                            Ok((value, _)) => out.push((idx, Some(value))),
+                            Err(_) => out.push((idx, None)),
                         }
                     }
-                };
-                if verify && value_checksum(&value) != rec_header.checksum {
-                    results.push((orig_idx, None));
-                    continue;
                 }
-                results.push((orig_idx, Some((value, rec_header.seq))));
+                // Reclaimed mid-batch: the caller re-resolves these keys.
+                Err(_) => out.extend(group.into_iter().map(|(idx, _)| (idx, None))),
             }
         }
-
-        results
+        out
     }
 
-    pub fn read_record_meta_from_file(&self, file: &File, location: ValueLocation) -> Result<ValueRecordMeta> {
-        if location.segment_id == 0 {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
-        file.read_at(&mut hdr_buf, location.page_offset).map_err(ValueLogError::Io)?;
-        let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-        let entry_offset = (self.page_size as usize)
-            .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
-            .ok_or(ValueLogError::InvalidLocation)?;
-        if entry_offset < page_header.table_offset as usize {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let abs_entry_offset = location.page_offset + entry_offset as u64;
-        let mut entry_buf = [0u8; TABLE_ENTRY_SIZE as usize];
-        file.read_at(&mut entry_buf, abs_entry_offset).map_err(ValueLogError::Io)?;
-        let stored_segment = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
-        if stored_segment != location.segment_id {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let record_offset = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
-        let abs_record_offset = location.page_offset + record_offset as u64;
-        let mut rec_hdr_buf = [0u8; ValueRecordHeader::SIZE];
-        file.read_at(&mut rec_hdr_buf, abs_record_offset).map_err(ValueLogError::Io)?;
-        let rec_header = ValueRecordHeader::from_bytes(&rec_hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-        Ok(rec_header.meta())
+    // ── GC support ────────────────────────────────────────────────────────
+
+    /// Sealed segments at or above `threshold_pct` garbage, worst first. The active
+    /// tail is never a candidate — it is still being appended to.
+    pub fn gc_candidates(&self, threshold_pct: f64) -> Vec<SegmentStats> {
+        let inner = self.inner.read();
+        let mut candidates: Vec<SegmentStats> = inner
+            .segments
+            .values()
+            .filter(|s| s.id != inner.active_id && s.sealed && s.total_bytes > 0)
+            .filter(|s| s.garbage_ratio_pct() >= threshold_pct)
+            .copied()
+            .collect();
+        candidates.sort_by(|a, b| b.garbage_ratio_pct().total_cmp(&a.garbage_ratio_pct()));
+        candidates
     }
 
-    pub fn update_record_meta(
-        &self,
-        location: ValueLocation,
-        tombstone: Option<bool>,
-        updated: Option<bool>,
-        epoch: Option<u64>,
-    ) -> Result<(ValueRecordMeta, ValueRecordMeta, u64)> {
-        let file = self.get_file();
-
-        if location.segment_id == 0 {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        // Read page header for table_offset
-        let mut hdr_buf = [0u8; PAGE_HEADER_SIZE as usize];
-        file.read_at(&mut hdr_buf, location.page_offset).map_err(ValueLogError::Io)?;
-        let page_header = PageHeader::from_bytes(&hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-
-        // Look up record offset from translation table
-        let entry_offset = (self.page_size as usize)
-            .checked_sub(location.segment_id as usize * TABLE_ENTRY_SIZE as usize)
-            .ok_or(ValueLogError::InvalidLocation)?;
-        if entry_offset < page_header.table_offset as usize {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let abs_entry_offset = location.page_offset + entry_offset as u64;
-        let mut entry_buf = [0u8; TABLE_ENTRY_SIZE as usize];
-        file.read_at(&mut entry_buf, abs_entry_offset).map_err(ValueLogError::Io)?;
-        let stored_segment = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
-        if stored_segment != location.segment_id {
-            return Err(ValueLogError::InvalidLocation);
-        }
-        let record_offset = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
-
-        // Read existing record header
-        let abs_record_offset = location.page_offset + record_offset as u64;
-        let mut rec_hdr_buf = [0u8; ValueRecordHeader::SIZE];
-        file.read_at(&mut rec_hdr_buf, abs_record_offset).map_err(ValueLogError::Io)?;
-        let header = ValueRecordHeader::from_bytes(&rec_hdr_buf).ok_or(ValueLogError::CorruptedLog)?;
-
-        let previous_meta = header.meta();
-        let mut flags = header.flags;
-        if let Some(t) = tombstone {
-            if t {
-                flags |= FLAG_TOMBSTONE;
-            } else {
-                flags &= !FLAG_TOMBSTONE;
-            }
-        }
-        if let Some(u) = updated {
-            if u {
-                flags |= FLAG_UPDATED;
-            } else {
-                flags &= !FLAG_UPDATED;
-            }
-        }
-        let new_epoch = epoch.unwrap_or(header.epoch);
-
-        let updated_header = ValueRecordHeader {
-            total_len: header.total_len,
-            version: header.version,
-            flags,
-            epoch: new_epoch,
-            value_len: header.value_len,
-            checksum: header.checksum,
-            seq: header.seq,
-        };
-
-        // Write modified header back in-place
-        Self::write_all_at(&file, &updated_header.to_bytes(), abs_record_offset)?;
-
-        let record_bytes = Self::record_storage_bytes(header.total_len);
-        Ok((previous_meta, updated_header.meta(), record_bytes))
-    }
-
-    /// Get the current file reference
-    pub fn get_file(&self) -> Arc<File> {
-        Arc::clone(&*self.file.read())
-    }
-
-    /// Swap in a freshly-compacted file (used during GC).
+    /// Walk every record of a sealed segment in write order, handing the callback
+    /// `(key, value, meta, location)`.
     ///
-    /// The generation is **not** bumped here — the swap epoch is owned by the
-    /// [`begin_swap`](Self::begin_swap) guard the caller holds across both this
-    /// swap and the subsequent LSM re-point, so readers treat the pair as one
-    /// atomic step. This must only be called while that guard is held.
-    pub fn swap_file(&self, new_file: Arc<File>) -> Arc<File> {
-        let mut guard = self.file.write();
-        std::mem::replace(&mut *guard, new_file)
-    }
+    /// This is how GC learns what a segment holds — the key is stored in the record
+    /// precisely so a segment can be collected without inverting the entire LSM.
+    pub fn for_each_record(&self, segment_id: u32, mut f: impl FnMut(&[u8], Vec<u8>, ValueRecordMeta, ValueLocation)) -> Result<()> {
+        let file = self.segment_file(segment_id)?;
+        let len = file.metadata()?.len();
+        let mut offset = SEGMENT_HEADER_SIZE;
 
-    /// Flush and sync the value log to disk
-    pub fn sync(&self) -> Result<()> {
-        let file = self.file.read();
-        file.sync_all()?;
-        Ok(())
-    }
-
-    /// Get the path to the value log
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn ensure_page_len(&self, file: &File, page_offset: u64) -> Result<()> {
-        let expected = page_offset.saturating_add(self.page_size);
-        if file.metadata()?.len() < expected {
-            file.set_len(expected)?;
-        }
-        Ok(())
-    }
-
-    fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> Result<()> {
-        while !buf.is_empty() {
-            let n = file.write_at(buf, offset).map_err(ValueLogError::Io)?;
-            if n == 0 {
-                return Err(ValueLogError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "write_at wrote 0 bytes",
-                )));
-            }
-            offset += n as u64;
-            buf = &buf[n..];
-        }
-        Ok(())
-    }
-
-    fn read_page_header(&self, file: &File, page_offset: u64) -> Result<Option<PageHeader>> {
-        if file.metadata()?.len() < page_offset.saturating_add(PAGE_HEADER_SIZE as u64) {
-            return Ok(None);
-        }
-        let mut buf = [0u8; PAGE_HEADER_SIZE as usize];
-        file.read_at(&mut buf, page_offset).map_err(ValueLogError::Io)?;
-        Ok(PageHeader::from_bytes(&buf))
-    }
-
-    fn write_page_header(&self, file: &File, page_offset: u64, header: PageHeader) -> Result<()> {
-        self.ensure_page_len(file, page_offset)?;
-        Self::write_all_at(file, &header.to_bytes(), page_offset)
-    }
-
-    /// Scan a single page and compute garbage statistics by walking the segment table.
-    pub fn scan_page_stats(&self, file: &File, page_offset: u64) -> Result<PageGarbageStats> {
-        let page_header = self.read_page_header(file, page_offset)?.ok_or(ValueLogError::CorruptedLog)?;
-
-        let mut stats = PageGarbageStats {
-            page_offset,
-            live_bytes: 0,
-            garbage_bytes: 0,
-            total_records: 0,
-            garbage_records: 0,
-        };
-
-        // Walk the segment table from table_offset to the page end in TABLE_ENTRY_SIZE steps.
-        // Each entry is 8 bytes: [segment_id: u32, record_offset: u32].
-        let mut table_pos = page_header.table_offset as u64;
-        while table_pos + TABLE_ENTRY_SIZE as u64 <= self.page_size {
-            let abs_entry = page_offset + table_pos;
-            let mut entry_buf = [0u8; TABLE_ENTRY_SIZE as usize];
-            file.read_at(&mut entry_buf, abs_entry).map_err(ValueLogError::Io)?;
-
-            let _segment_id = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
-            let record_offset = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
-
-            // Read record header at the record offset within this page
-            let abs_record = page_offset + record_offset as u64;
-            let mut rec_hdr_buf = [0u8; ValueRecordHeader::SIZE];
-            file.read_at(&mut rec_hdr_buf, abs_record).map_err(ValueLogError::Io)?;
-
-            if let Some(header) = ValueRecordHeader::from_bytes(&rec_hdr_buf) {
-                let record_bytes = Self::record_storage_bytes(header.total_len);
-                let is_garbage = (header.flags & FLAG_TOMBSTONE) != 0 || (header.flags & FLAG_UPDATED) != 0;
-
-                stats.total_records += 1;
-                if is_garbage {
-                    stats.garbage_bytes += record_bytes;
-                    stats.garbage_records += 1;
-                } else {
-                    stats.live_bytes += record_bytes;
-                }
-            }
-
-            table_pos += TABLE_ENTRY_SIZE as u64;
-        }
-
-        Ok(stats)
-    }
-
-    /// Scan all pages in this value log and return per-page garbage stats.
-    pub fn scan_all_page_stats(&self, file: &File, metadata: &ValueLogMetadata) -> Result<Vec<PageGarbageStats>> {
-        let mut all_stats = Vec::new();
-        let mut page_offset = 0u64;
-
-        // Iterate through all pages up to and including the current page.
-        //
-        // A page without a valid header is a hole — a prior GC rewrote a dirty
-        // page's live records to fresh pages further on and left this slot empty.
-        // SKIP such pages and keep scanning; stopping at the first hole would hide
-        // every page beyond it, so GC would stop finding garbage and never reclaim
-        // again (unbounded value-log growth).
-        while page_offset <= metadata.current_page_offset {
-            if let Ok(stats) = self.scan_page_stats(file, page_offset) {
-                all_stats.push(stats);
-            }
-            page_offset += self.page_size;
-        }
-
-        Ok(all_stats)
-    }
-
-    /// Rebuild this bucket's metadata by scanning its value-log pages.
-    ///
-    /// Used at open when the persisted metadata is missing or corrupt. Resetting
-    /// to [`ValueLogMetadata::new`] there would be unsafe in two ways: it zeroes
-    /// the live/garbage byte counters (so GC's waste ratio reads 0 and never
-    /// triggers — garbage grows unbounded), and it resets `current_page_offset`
-    /// to 0, so once the current page fills a *new* page would be allocated at
-    /// `tail` (= one page in) **over existing data**. Scanning rebuilds both the
-    /// byte counts and the page cursors from the on-disk page headers.
-    ///
-    /// Pages are contiguous from offset 0, so the scan stops at the first slot
-    /// without a valid header (the sparse tail left by `set_len`). Cost is
-    /// O(pages × records), but this runs only on the rare metadata-loss path.
-    ///
-    /// `head`, `total_gc_runs` and `total_bytes_reclaimed` are observability-only
-    /// cumulative counters that cannot be derived from the pages and reset to 0.
-    pub fn reconstruct_metadata(&self) -> Result<ValueLogMetadata> {
-        let file = self.get_file();
-        let file_len = file.metadata()?.len();
-
-        let mut meta = ValueLogMetadata::new(self.page_size);
-        let mut live_bytes = 0u64;
-        let mut garbage_bytes = 0u64;
-        let mut last_valid_page: Option<u64> = None;
-
-        let mut page_offset = 0u64;
-        while page_offset.saturating_add(PAGE_HEADER_SIZE as u64) <= file_len {
-            if self.read_page_header(&file, page_offset)?.is_none() {
+        while offset + ValueRecordHeader::SIZE as u64 <= len {
+            let mut hdr_buf = [0u8; ValueRecordHeader::SIZE];
+            file.read_at(&mut hdr_buf, offset).map_err(ValueLogError::Io)?;
+            let Some(header) = ValueRecordHeader::from_bytes(&hdr_buf) else {
+                // A torn tail from a crash mid-append. Nothing references it — the LSM
+                // only ever learned about records whose append returned — so stopping
+                // here is complete.
+                break;
+            };
+            if offset + header.total_len as u64 > len {
                 break;
             }
-            let stats = self.scan_page_stats(&file, page_offset)?;
-            live_bytes = live_bytes.saturating_add(stats.live_bytes);
-            garbage_bytes = garbage_bytes.saturating_add(stats.garbage_bytes);
-            last_valid_page = Some(page_offset);
-            page_offset = page_offset.saturating_add(self.page_size);
-        }
+            let body_len = header.total_len as usize - ValueRecordHeader::SIZE;
+            let mut body = vec![0u8; body_len];
+            file.read_at(&mut body, offset + ValueRecordHeader::SIZE as u64)
+                .map_err(ValueLogError::Io)?;
+            let (value, key) = body.split_at(header.value_len as usize);
 
-        if let Some(last) = last_valid_page {
-            let header = self.read_page_header(&file, last)?.ok_or(ValueLogError::CorruptedLog)?;
-            meta.current_page_offset = last;
-            meta.tail = last.saturating_add(self.page_size);
-            meta.current_page_free_offset = header.free_offset;
-            meta.current_page_table_offset = header.table_offset;
-            meta.current_page_next_segment_id = header.next_segment_id.max(1);
-            meta.live_bytes = live_bytes;
-            meta.garbage_bytes = garbage_bytes;
+            f(
+                key,
+                value.to_vec(),
+                header.meta(),
+                ValueLocation {
+                    segment_id,
+                    rec_offset: offset as u32,
+                    value_len: header.value_len,
+                },
+            );
+            offset += header.total_len as u64;
         }
-        // An empty file leaves the `ValueLogMetadata::new` defaults, which are
-        // correct for a fresh bucket.
-
-        Ok(meta)
+        Ok(())
     }
 
-    /// Copy one whole page from one file to another at the same offset.
+    /// Unlink a segment and drop it from the inventory. Returns its size.
     ///
-    /// `page_size` must be the page size of *both* files — GC's replacement file
-    /// is opened with the bucket's page size for exactly this reason.
-    pub fn copy_page_raw(src_file: &File, dst_file: &File, page_offset: u64, page_size: u64) -> Result<()> {
-        // Copy in 64KB chunks to avoid huge stack/heap allocations
-        const CHUNK_SIZE: usize = 64 * 1024;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut offset = page_offset;
-        let end = page_offset + page_size;
-
-        // Ensure destination file is large enough
-        let expected_len = end;
-        if dst_file.metadata()?.len() < expected_len {
-            dst_file.set_len(expected_len)?;
+    /// **Only call this once the LSM re-point of its survivors is durable** (flushed
+    /// to L0). Until then the durable LSM still points into this segment and the WAL
+    /// entries that could replay those writes are long gone — unlinking early is data
+    /// loss. Readers holding an open handle keep reading safely (the fd outlives the
+    /// unlink); readers that open it afterwards get `SegmentMissing` and re-resolve.
+    pub fn unlink_segment(&self, segment_id: u32) -> Result<u64> {
+        let mut inner = self.inner.write();
+        if segment_id == inner.active_id {
+            return Ok(0);
         }
+        let reclaimed = inner.segments.remove(&segment_id).map(|s| s.total_bytes).unwrap_or(0);
+        drop(inner);
 
-        while offset < end {
-            let to_read = CHUNK_SIZE.min((end - offset) as usize);
-            let buf_slice = &mut buf[..to_read];
-            src_file.read_at(buf_slice, offset).map_err(ValueLogError::Io)?;
-            Self::write_all_at(dst_file, buf_slice, offset)?;
-            offset += to_read as u64;
+        self.fd_cache.lock().remove(segment_id);
+        match std::fs::remove_file(Self::segment_path(&self.dir, self.bucket, segment_id)) {
+            Ok(()) => {}
+            // Already gone (a previous run unlinked it but crashed before persisting
+            // metadata) — the desired end state either way.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ValueLogError::Io(e)),
         }
+        fsync_dir(&self.dir)?;
+        Ok(reclaimed)
+    }
 
+    pub fn record_gc_run(&self, bytes_reclaimed: u64) {
+        let mut inner = self.inner.write();
+        inner.total_gc_runs += 1;
+        inner.total_bytes_reclaimed += bytes_reclaimed;
+    }
+
+    // ── Stats ─────────────────────────────────────────────────────────────
+
+    pub fn segment_stats(&self) -> Vec<SegmentStats> {
+        self.inner.read().segments.values().copied().collect()
+    }
+
+    pub fn metadata_snapshot(&self) -> ValueLogMetadata {
+        let inner = self.inner.read();
+        ValueLogMetadata {
+            next_segment_id: self.next_segment_id.load(Ordering::Acquire),
+            active_segment_id: inner.active_id,
+            segments: inner.segments.values().copied().collect(),
+            total_gc_runs: inner.total_gc_runs,
+            total_bytes_reclaimed: inner.total_bytes_reclaimed,
+        }
+    }
+
+    /// Replace live/garbage accounting with an exact recomputation from the LSM's
+    /// pointers: `live[segment] = bytes still referenced`. Everything else in a
+    /// segment is garbage by definition. Used when the metadata file was lost.
+    pub fn rebuild_stats(&self, live: &HashMap<u32, u64>) {
+        {
+            let mut inner = self.inner.write();
+            for stats in inner.segments.values_mut() {
+                let live_bytes = live.get(&stats.id).copied().unwrap_or(0).min(stats.total_bytes);
+                stats.live_bytes = live_bytes;
+                stats.garbage_bytes = stats.total_bytes - live_bytes;
+            }
+        }
+        self.stats_need_rebuild.store(false, Ordering::Release);
+    }
+
+    pub fn flush_metadata(&self) -> Result<()> {
+        let bytes = self.metadata_snapshot().to_file_bytes()?;
+        crate::support::write_atomic_durable(&Self::metadata_path(&self.dir, self.bucket), &bytes)?;
         Ok(())
+    }
+
+    /// Physical bytes this bucket occupies on disk: the sum of its segment files.
+    /// (Segments are dense, appended files — there are no sparse holes to reason
+    /// about any more.)
+    pub fn disk_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .segments
+            .keys()
+            .filter_map(|&id| std::fs::metadata(Self::segment_path(&self.dir, self.bucket, id)).ok())
+            .map(|m| m.len())
+            .sum()
     }
 }
 
@@ -1159,501 +948,263 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A small but legal page size: enough for records, small enough that a
-    /// handful of writes roll the page over.
-    const SMALL_PAGE: u64 = 64 * 1024;
+    const SEG: u64 = 64 * 1024; // the minimum legal segment size
 
-    fn meta(page_size: u64) -> ValueRecordMeta {
+    fn meta(seq: u64) -> ValueRecordMeta {
         ValueRecordMeta {
             version: 1,
-            tombstone: false,
-            updated: false,
-            epoch: page_size, // any stable value; not asserted on
-            seq: 7,
+            epoch: 1_700_000_000_000,
+            seq,
         }
     }
 
     #[test]
-    fn custom_page_size_round_trips_across_a_page_rollover() -> Result<()> {
-        // The configured page size must actually drive page allocation, the slot
-        // table's position, and reads — end to end, including after reopening.
+    fn record_round_trips_key_and_value() -> Result<()> {
         let dir = TempDir::new()?;
-        let path = dir.path().join("custom.log");
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
 
-        let values: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 4096]).collect();
+        let loc = log.append(b"the-key", b"the-value", meta(7), true)?;
+        // The pointer carries the value length, which is what makes a read one pread.
+        assert_eq!(loc.value_len, b"the-value".len() as u32);
+
+        let (value, m) = log.read_value_and_meta(loc)?;
+        assert_eq!(value, b"the-value");
+        assert_eq!(m.seq, 7);
+
+        // The key is in the record too — this is what lets GC decide liveness without
+        // inverting the whole LSM.
+        let mut seen = Vec::new();
+        log.for_each_record(loc.segment_id, |key, value, _, _| {
+            seen.push((key.to_vec(), value));
+        })?;
+        assert_eq!(seen, vec![(b"the-key".to_vec(), b"the-value".to_vec())]);
+        Ok(())
+    }
+
+    #[test]
+    fn appends_roll_into_new_segments_when_full() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let value = vec![0xAB; 8 * 1024];
         let mut locations = Vec::new();
-        {
-            let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
-            let mut m = ValueLogMetadata::new(SMALL_PAGE);
-            for v in &values {
-                locations.push(log.write_record(v, meta(SMALL_PAGE), &mut m, false)?);
-            }
-            // 40 × ~4 KiB records cannot fit in one 64 KiB page, so the writes
-            // must have rolled onto later pages — at SMALL_PAGE boundaries.
-            assert!(
-                locations.iter().any(|l| l.page_offset > 0),
-                "expected a page rollover with a {SMALL_PAGE}-byte page size"
-            );
-            for l in &locations {
+        for i in 0..20 {
+            locations.push(log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?);
+        }
+
+        let segments: Vec<u32> = locations.iter().map(|l| l.segment_id).collect();
+        assert!(
+            segments.windows(2).any(|w| w[0] != w[1]),
+            "20 × 8 KiB records cannot fit one 64 KiB segment — expected a rollover, got {segments:?}"
+        );
+        // Ids only ever go up.
+        assert!(segments.windows(2).all(|w| w[0] <= w[1]), "segment ids must be monotone");
+
+        for (i, loc) in locations.iter().enumerate() {
+            assert_eq!(log.read_value(*loc)?, value, "record {i} unreadable after rollover");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn segment_ids_are_never_reused_even_after_the_newest_is_unlinked() -> Result<()> {
+        // The landmine: if the next id were `max(existing files) + 1`, unlinking the
+        // newest segment would hand its id out again — and a reader holding the old
+        // pointer would silently read a different record.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let value = vec![0xCD; 8 * 1024];
+        let mut ids = Vec::new();
+        for i in 0..12 {
+            ids.push(log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?.segment_id);
+        }
+        let max_ever = *ids.iter().max().unwrap();
+
+        // Unlink the newest SEALED segment: on disk, `max(files)` now skips its id.
+        let highest_sealed = *ids.iter().filter(|&&id| id != log.inner.read().active_id).max().unwrap();
+        log.unlink_segment(highest_sealed)?;
+
+        // Keep appending so fresh segments get created, and check every NEWLY created
+        // id is above everything ever handed out — including the one we just freed.
+        for i in 20..60 {
+            let id = log.append(format!("n{i}").as_bytes(), &value, meta(i as u64), false)?.segment_id;
+            if !ids.contains(&id) {
                 assert!(
-                    l.page_offset.is_multiple_of(SMALL_PAGE),
-                    "page_offset {} is not aligned to the configured page size",
-                    l.page_offset
+                    id > max_ever,
+                    "segment id {id} was reused (max ever handed out was {max_ever}); \
+                     ids must come from the monotone counter, never max(existing files) + 1"
                 );
             }
-            for (v, l) in values.iter().zip(&locations) {
-                assert_eq!(&log.read_value(*l)?, v);
-            }
-        }
-
-        // Reopen with the same page size: every pointer must still resolve.
-        let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
-        for (v, l) in values.iter().zip(&locations) {
-            assert_eq!(&log.read_value(*l)?, v, "value unreadable after reopen");
         }
         Ok(())
     }
 
     #[test]
-    fn page_size_is_fixed_at_creation() -> Result<()> {
-        // Reopening existing data under a different page size would reinterpret
-        // every stored pointer (page_offset is page-aligned; a slot entry lives at
-        // `page_size - segment_id * 8`). It must be refused, not silently accepted.
+    fn segment_id_high_water_mark_survives_restart() -> Result<()> {
         let dir = TempDir::new()?;
-        let path = dir.path().join("locked.log");
+        let value = vec![0xEF; 8 * 1024];
 
-        let location = {
-            let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
-            let mut m = ValueLogMetadata::new(SMALL_PAGE);
-            log.write_record(b"payload", meta(SMALL_PAGE), &mut m, true)?
+        let last_id = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            let mut id = 0;
+            for i in 0..12 {
+                id = log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?.segment_id;
+            }
+            // Drop every sealed segment, so the filesystem no longer remembers those ids.
+            let sealed: Vec<u32> = log.segment_stats().iter().filter(|s| s.sealed).map(|s| s.id).collect();
+            for id in sealed {
+                log.unlink_segment(id)?;
+            }
+            log.flush_metadata()?;
+            id
         };
 
-        let Err(err) = ValueLog::open_with_page_size(&path, SMALL_PAGE * 2) else {
-            panic!("opening with a different page size must be refused");
-        };
+        // Reopen: the id allocator must not regress, even though the files that used
+        // those ids are gone. The persisted high-water mark is what guarantees it.
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let next = log.append(b"after-restart", &value, meta(99), false)?.segment_id;
         assert!(
-            matches!(err, ValueLogError::PageSizeMismatch { stored, configured }
-                if stored == SMALL_PAGE && configured == SMALL_PAGE * 2),
-            "unexpected error: {err:?}"
+            next >= last_id,
+            "segment id regressed across restart: was {last_id}, handed out {next} — the high-water mark was lost"
         );
-
-        // ...and the data is untouched: reopening at the original size still reads.
-        let log = ValueLog::open_with_page_size(&path, SMALL_PAGE)?;
-        assert_eq!(log.read_value(location)?, b"payload");
         Ok(())
     }
 
     #[test]
-    fn invalid_page_sizes_are_rejected() {
+    fn displaced_records_become_garbage_without_touching_the_record() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let old = log.append(b"k", &vec![1u8; 1000], meta(1), false)?;
+        let stats = log.segment_stats();
+        let live_before = stats[0].live_bytes;
+        assert_eq!(stats[0].garbage_bytes, 0);
+
+        log.note_displaced(old, b"k".len());
+
+        let stats = log.segment_stats();
+        assert_eq!(stats[0].garbage_bytes, live_before, "the displaced record's bytes become garbage");
+        assert_eq!(stats[0].live_bytes, 0);
+
+        // The record itself is untouched — its segment may be sealed and immutable, and
+        // liveness is the LSM's business, not the record's.
+        assert_eq!(log.read_value(old)?, vec![1u8; 1000]);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_candidates_are_sealed_segments_over_the_threshold_worst_first() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let value = vec![0x11; 8 * 1024];
+        let mut locs = Vec::new();
+        for i in 0..20 {
+            locs.push(log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?);
+        }
+        // Garbage the records in the earliest segment only.
+        let first = locs[0].segment_id;
+        for loc in locs.iter().filter(|l| l.segment_id == first) {
+            log.note_displaced(*loc, 2);
+        }
+
+        let candidates = log.gc_candidates(30.0);
+        assert!(candidates.iter().any(|c| c.id == first), "the garbage-heavy segment must be a candidate");
+        assert!(
+            candidates.iter().all(|c| c.sealed),
+            "the active tail must never be collected — it is still being appended to"
+        );
+        assert!(
+            candidates.windows(2).all(|w| w[0].garbage_ratio_pct() >= w[1].garbage_ratio_pct()),
+            "candidates must be worst-first"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reader_holding_an_open_handle_survives_the_unlink() -> Result<()> {
+        // POSIX: an open fd outlives unlink. This is what lets GC delete a segment
+        // without coordinating with in-flight readers.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+
+        let value = vec![0x77; 8 * 1024];
+        let mut locs = Vec::new();
+        for i in 0..12 {
+            locs.push(log.append(format!("k{i}").as_bytes(), &value, meta(i as u64), false)?);
+        }
+        let sealed = log.segment_stats().iter().find(|s| s.sealed).map(|s| s.id).expect("a sealed segment");
+        let victim = *locs.iter().find(|l| l.segment_id == sealed).unwrap();
+
+        let handle = log.segment_file(sealed)?; // a reader's in-flight handle
+        log.unlink_segment(sealed)?;
+
+        // The held handle still reads correctly...
+        assert_eq!(log.read_value_from_file(&handle, victim)?.0, value);
+        // ...while a fresh resolution reports the segment is gone, so the caller
+        // re-resolves through the LSM. Loud, local, retryable — never a wrong value.
+        assert!(
+            matches!(log.read_value(victim), Err(ValueLogError::SegmentMissing(id)) if id == sealed),
+            "a pointer into a reclaimed segment must fail loudly, not silently resolve"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_segment_sizes_are_rejected() {
         let dir = TempDir::new().unwrap();
-        for bad in [
-            0,                      // zero
-            4096,                   // below the minimum
-            SMALL_PAGE + 1,         // not 4096-aligned
-            u32::MAX as u64 + 1,    // will not fit the u32 page header fields
-            8 * 1024 * 1024 * 1024, // 8 GiB — same reason
-        ] {
-            let Err(err) = ValueLog::open_with_page_size(dir.path().join(format!("bad_{bad}.log")), bad) else {
-                panic!("page size {bad} must be rejected");
-            };
+        for bad in [0, 4096, SEG + 1, u32::MAX as u64 + 4096] {
             assert!(
-                matches!(err, ValueLogError::InvalidPageSize(got) if got == bad),
-                "unexpected error: {err:?}"
+                matches!(ValueLog::open(dir.path(), 0, bad), Err(ValueLogError::InvalidSegmentSize(got)) if got == bad),
+                "segment size {bad} must be rejected"
             );
         }
     }
 
     #[test]
-    fn generation_is_a_seqlock_around_each_swap() {
-        // The swap generation is the signal readers use to detect a GC swap that
-        // raced their pointer+value read (see `KVStore::get`). It is a seqlock:
-        // `begin_swap` makes it odd ("swap in progress, don't trust a read"), and
-        // the guard's drop makes it even ("consistent") — so each full swap adds
-        // two and never resets, and an odd value is observable mid-swap.
-        let dir = TempDir::new().unwrap();
-        let vl = ValueLog::open(dir.path().join("vl.log")).unwrap();
-        assert_eq!(vl.generation(), 0, "fresh value log must start at generation 0 (even = consistent)");
-
-        {
-            let _epoch = vl.begin_swap();
-            assert_eq!(vl.generation(), 1, "begin_swap must make the generation odd (swap in progress)");
-            let f = vl.get_file();
-            vl.swap_file(f); // swap no longer touches the generation
-            assert_eq!(vl.generation(), 1, "swap_file must not change the generation");
-        }
-        assert_eq!(vl.generation(), 2, "closing the epoch must make the generation even again");
-
-        {
-            let _epoch = vl.begin_swap();
-            assert_eq!(vl.generation(), 3, "second swap must go odd at 3");
-        }
-        assert_eq!(vl.generation(), 4, "second full swap must leave the generation even at 4");
-    }
-
-    #[test]
-    fn test_value_pointer_serialization() -> Result<()> {
-        let location = ValueLocation {
-            page_offset: 0,
-            segment_id: 10,
-        };
-        assert_eq!(location.page_offset, 0);
-        assert_eq!(location.segment_id, 10);
+    fn a_value_too_large_for_a_segment_is_rejected() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let huge = vec![0u8; SEG as usize];
+        assert!(
+            matches!(log.append(b"k", &huge, meta(1), false), Err(ValueLogError::ValueTooLarge { .. })),
+            "a record that cannot fit a segment must be refused, not silently truncated"
+        );
         Ok(())
     }
 
     #[test]
-    fn test_value_log_metadata_serialization() -> Result<()> {
-        let metadata = ValueLogMetadata {
-            head: 0,
-            tail: 1024,
-            current_page_offset: 0,
-            current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: DEFAULT_PAGE_SIZE_BYTES as u32,
-            current_page_next_segment_id: 3,
-            total_gc_runs: 5,
-            total_bytes_reclaimed: 512,
-            live_bytes: 256,
-            garbage_bytes: 128,
+    fn stats_rebuild_from_the_lsm_when_metadata_is_lost() -> Result<()> {
+        let dir = TempDir::new()?;
+        let value = vec![0x33; 4 * 1024];
+        let (live_loc, dead_loc) = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            let live = log.append(b"live", &value, meta(1), false)?;
+            let dead = log.append(b"dead", &value, meta(2), false)?;
+            log.flush_metadata()?;
+            (live, dead)
         };
 
-        let bytes = metadata.to_bytes()?;
-        let restored = ValueLogMetadata::from_bytes(&bytes)?;
+        // Lose the metadata file, as a crash before the flush would.
+        std::fs::remove_file(dir.path().join("value_log_0.metadata"))?;
 
-        assert_eq!(metadata.head, restored.head);
-        assert_eq!(metadata.tail, restored.tail);
-        assert_eq!(metadata.current_page_offset, restored.current_page_offset);
-        assert_eq!(metadata.current_page_free_offset, restored.current_page_free_offset);
-        assert_eq!(metadata.current_page_table_offset, restored.current_page_table_offset);
-        assert_eq!(metadata.current_page_next_segment_id, restored.current_page_next_segment_id);
-        assert_eq!(metadata.total_gc_runs, restored.total_gc_runs);
-        assert_eq!(metadata.total_bytes_reclaimed, restored.total_bytes_reclaimed);
-        assert_eq!(metadata.live_bytes, restored.live_bytes);
-        assert_eq!(metadata.garbage_bytes, restored.garbage_bytes);
-        Ok(())
-    }
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert!(log.stats_need_rebuild(), "a missing metadata file must be flagged for rebuild");
 
-    #[test]
-    fn test_reconstruct_metadata_matches_tracked_counters() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("recon.log"))?;
+        // The caller recomputes liveness from the LSM's pointers: only `live` is still
+        // referenced, so `dead`'s bytes are garbage.
+        let live_bytes = ValueRecordHeader::record_len(b"live".len(), value.len());
+        let mut live_map = HashMap::new();
+        live_map.insert(live_loc.segment_id, live_bytes);
+        log.rebuild_stats(&live_map);
 
-        // Write a mix of live and garbage (tombstoned) records, letting the
-        // in-memory metadata track the counters as the source of truth.
-        let mut tracked = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut tracked)?;
-        let live = ValueRecordMeta {
-            version: 1,
-            tombstone: false,
-            updated: false,
-            epoch: 0,
-            seq: 0,
-        };
-        let garbage = ValueRecordMeta {
-            version: 1,
-            tombstone: true,
-            updated: false,
-            epoch: 0,
-            seq: 0,
-        };
-        for i in 0u8..12 {
-            let meta = if i % 3 == 0 { garbage } else { live };
-            log.write_record(&[i; 80], meta, &mut tracked, false)?;
-        }
-        assert!(tracked.live_bytes > 0 && tracked.garbage_bytes > 0);
-
-        // Rebuilding from the pages alone must reproduce the byte counts and cursors.
-        let rebuilt = log.reconstruct_metadata()?;
-        assert_eq!(rebuilt.live_bytes, tracked.live_bytes, "live_bytes");
-        assert_eq!(rebuilt.garbage_bytes, tracked.garbage_bytes, "garbage_bytes");
-        assert_eq!(rebuilt.current_page_offset, tracked.current_page_offset);
-        assert_eq!(rebuilt.current_page_free_offset, tracked.current_page_free_offset);
-        assert_eq!(rebuilt.current_page_table_offset, tracked.current_page_table_offset);
-        assert_eq!(rebuilt.current_page_next_segment_id, tracked.current_page_next_segment_id);
-        assert_eq!(rebuilt.tail, tracked.tail);
-        Ok(())
-    }
-
-    #[test]
-    fn test_reconstruct_metadata_empty_file_is_fresh() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("empty.log"))?;
-        let rebuilt = log.reconstruct_metadata()?;
-        let fresh = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        assert_eq!(rebuilt.current_page_offset, fresh.current_page_offset);
-        assert_eq!(rebuilt.tail, fresh.tail);
-        assert_eq!(rebuilt.live_bytes, 0);
-        assert_eq!(rebuilt.garbage_bytes, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn test_value_log_write_read() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-
-        let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut metadata)?;
-        let value = b"test_value";
-
-        let location = log.write_record(
-            &value[..],
-            ValueRecordMeta {
-                version: 1,
-                tombstone: false,
-                updated: false,
-                epoch: 0,
-                seq: 0,
-            },
-            &mut metadata,
-            false,
-        )?;
-        let read_value = log.read_value(location)?;
-
-        assert_eq!(value, &read_value[..]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_value_log_detects_corrupted_value() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log_path = temp_dir.path().join("test.log");
-        let location = {
-            let log = ValueLog::open(&log_path)?;
-            let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-            log.ensure_current_page(&mut metadata)?;
-            log.write_record(
-                b"a_value_long_enough_to_corrupt",
-                ValueRecordMeta {
-                    version: 1,
-                    tombstone: false,
-                    updated: false,
-                    epoch: 0,
-                    seq: 0,
-                },
-                &mut metadata,
-                true,
-            )?
-        };
-
-        // Flip a byte in the value payload directly on disk. The first record
-        // sits at page header + record header on the first page.
-        let value_offset = location.page_offset + PAGE_HEADER_SIZE as u64 + ValueRecordHeader::SIZE as u64;
-        let f = OpenOptions::new().read(true).write(true).open(&log_path)?;
-        let mut byte = [0u8; 1];
-        f.read_at(&mut byte, value_offset)?;
-        byte[0] ^= 0xFF;
-        f.write_at(&byte, value_offset)?;
-        f.sync_all()?;
-        drop(f);
-
-        let log = ValueLog::open(&log_path)?;
-        log.set_verify_checksums_on_read(true);
-        match log.read_value(location) {
-            Err(ValueLogError::CorruptedLog) => {}
-            other => panic!("expected CorruptedLog on a flipped value byte, got {:?}", other),
-        }
-
-        // With verification off (the default), the corrupt value is returned as-is.
-        log.set_verify_checksums_on_read(false);
-        assert!(log.read_value(location).is_ok(), "verification off should not error on corruption");
-        Ok(())
-    }
-
-    #[test]
-    fn test_value_log_multiple_writes() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-
-        let mut metadata = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut metadata)?;
-        let values: Vec<&[u8]> = vec![b"value1", b"value2", b"value3"];
-        let mut locations = vec![];
-
-        for value in &values {
-            let location = log.write_record(
-                value,
-                ValueRecordMeta {
-                    version: 1,
-                    tombstone: false,
-                    updated: false,
-                    epoch: 0,
-                    seq: 0,
-                },
-                &mut metadata,
-                false,
-            )?;
-            locations.push(location);
-        }
-
-        for (i, value) in values.iter().enumerate() {
-            let read_value = log.read_value(locations[i])?;
-            assert_eq!(value.to_vec(), read_value);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_value_log_metadata_file_encoding() -> Result<()> {
-        let metadata = ValueLogMetadata {
-            head: 0,
-            tail: 1024,
-            current_page_offset: 0,
-            current_page_free_offset: PAGE_HEADER_SIZE,
-            current_page_table_offset: DEFAULT_PAGE_SIZE_BYTES as u32,
-            current_page_next_segment_id: 1,
-            total_gc_runs: 5,
-            total_bytes_reclaimed: 512,
-            live_bytes: 256,
-            garbage_bytes: 128,
-        };
-
-        let bytes = metadata.to_file_bytes()?;
-        let restored = ValueLogMetadata::from_file_bytes(&bytes, DEFAULT_PAGE_SIZE_BYTES)?;
-
-        assert_eq!(metadata.head, restored.head);
-        assert_eq!(metadata.tail, restored.tail);
-        assert_eq!(metadata.current_page_offset, restored.current_page_offset);
-        assert_eq!(metadata.current_page_free_offset, restored.current_page_free_offset);
-        assert_eq!(metadata.current_page_table_offset, restored.current_page_table_offset);
-        assert_eq!(metadata.current_page_next_segment_id, restored.current_page_next_segment_id);
-        assert_eq!(metadata.total_gc_runs, restored.total_gc_runs);
-        assert_eq!(metadata.total_bytes_reclaimed, restored.total_bytes_reclaimed);
-        assert_eq!(metadata.live_bytes, restored.live_bytes);
-        assert_eq!(metadata.garbage_bytes, restored.garbage_bytes);
-        Ok(())
-    }
-
-    fn write_value_helper(log: &ValueLog, meta: &mut ValueLogMetadata, value: &[u8]) -> Result<ValueLocation> {
-        log.write_record(
-            value,
-            ValueRecordMeta {
-                version: 1,
-                tombstone: false,
-                updated: false,
-                epoch: 0,
-                seq: 0,
-            },
-            meta,
-            false,
-        )
-    }
-
-    #[test]
-    fn test_batch_read_matches_individual() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut meta)?;
-
-        let values: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; (i as usize + 1) * 8]).collect();
-        let mut locations = Vec::new();
-        for v in &values {
-            locations.push(write_value_helper(&log, &mut meta, v)?);
-        }
-
-        let file = log.get_file();
-        let entries: Vec<(usize, ValueLocation)> = locations.iter().enumerate().map(|(i, &loc)| (i, loc)).collect();
-        let mut batch = log.read_values_batch_from_file(&file, &entries);
-        batch.sort_by_key(|(idx, _)| *idx);
-
-        assert_eq!(batch.len(), values.len());
-        for (idx, val_opt) in batch {
-            assert_eq!(val_opt.map(|(v, _)| v).as_deref(), Some(values[idx].as_slice()));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_batch_read_empty_input() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut meta)?;
-
-        let file = log.get_file();
-        let result = log.read_values_batch_from_file(&file, &[]);
-        assert!(result.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_batch_read_segment_id_zero_returns_none() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut meta)?;
-
-        // Write one real entry and mix in an invalid location (segment_id=0)
-        let loc_real = write_value_helper(&log, &mut meta, b"hello")?;
-        let loc_bad = ValueLocation {
-            page_offset: loc_real.page_offset,
-            segment_id: 0,
-        };
-
-        let file = log.get_file();
-        let entries = vec![(0usize, loc_bad), (1usize, loc_real)];
-        let mut batch = log.read_values_batch_from_file(&file, &entries);
-        batch.sort_by_key(|(idx, _)| *idx);
-
-        assert_eq!(batch[0], (0, None));
-        assert_eq!(batch[1].0, 1);
-        assert_eq!(batch[1].1.as_ref().map(|(v, _)| v.as_slice()), Some(b"hello".as_slice()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_batch_read_large_value_fallback() -> Result<()> {
-        // Values > 1280 bytes exercise the slow-path fallback read in read_values_batch_from_file.
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut meta)?;
-
-        let small = b"tiny".to_vec();
-        let large = vec![0xABu8; 2048]; // exceeds SPECULATIVE_READ_SIZE=1280
-        let loc_small = write_value_helper(&log, &mut meta, &small)?;
-        let loc_large = write_value_helper(&log, &mut meta, &large)?;
-
-        let file = log.get_file();
-        let entries = vec![(0usize, loc_small), (1usize, loc_large)];
-        let mut batch = log.read_values_batch_from_file(&file, &entries);
-        batch.sort_by_key(|(idx, _)| *idx);
-
-        assert_eq!(batch[0].1.as_ref().map(|(v, _)| v.as_slice()), Some(small.as_slice()));
-        assert_eq!(batch[1].1.as_ref().map(|(v, _)| v.as_slice()), Some(large.as_slice()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_batch_read_non_contiguous_segment_ids() -> Result<()> {
-        // Write 20 values, read every other one — segment_id range has gaps, exercising
-        // the bulk slot-directory read that covers the full max_seg..min_seg span.
-        let temp_dir = TempDir::new()?;
-        let log = ValueLog::open(temp_dir.path().join("test.log"))?;
-        let mut meta = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-        log.ensure_current_page(&mut meta)?;
-
-        let mut all_locs = Vec::new();
-        let mut all_vals: Vec<Vec<u8>> = Vec::new();
-        for i in 0u8..20 {
-            let v = vec![i; 32];
-            all_locs.push(write_value_helper(&log, &mut meta, &v)?);
-            all_vals.push(v);
-        }
-
-        // Select every other entry (non-contiguous segment IDs)
-        let entries: Vec<(usize, ValueLocation)> = (0..20usize).step_by(2).map(|i| (i / 2, all_locs[i])).collect();
-
-        let file = log.get_file();
-        let mut batch = log.read_values_batch_from_file(&file, &entries);
-        batch.sort_by_key(|(idx, _)| *idx);
-
-        assert_eq!(batch.len(), 10);
-        for (result_idx, (_, val_opt)) in batch.iter().enumerate() {
-            let original_idx = result_idx * 2;
-            assert_eq!(val_opt.as_ref().map(|(v, _)| v.as_slice()), Some(all_vals[original_idx].as_slice()));
-        }
+        assert!(!log.stats_need_rebuild());
+        let stats = log.segment_stats();
+        let seg = stats.iter().find(|s| s.id == live_loc.segment_id).unwrap();
+        assert_eq!(seg.live_bytes, live_bytes);
+        assert!(seg.garbage_bytes > 0, "the unreferenced record must be counted as garbage");
+        assert_eq!(log.read_value(dead_loc)?, value, "the bytes are still there — just unreferenced");
         Ok(())
     }
 }

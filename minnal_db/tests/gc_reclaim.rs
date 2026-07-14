@@ -1,24 +1,30 @@
-//! Integration test: value-log metadata stats drive GC, and GC logically
-//! reclaims garbage while preserving live values.
+//! Integration tests for the segmented value log: segment rollover, per-segment GC,
+//! the unlink-after-durable ordering, and monotone segment ids across restarts.
 
 use minnal_db::{Db, DbConfig};
 use std::path::{Path, PathBuf};
 
-fn one_bucket_config() -> DbConfig {
+/// A small segment size, so a handful of values roll several segments.
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+
+fn config(segment_size: u64) -> DbConfig {
     DbConfig {
         num_buckets: 1,
+        segment_size_bytes: segment_size,
         ..DbConfig::default()
     }
 }
 
-const VALUE_LOG_PAGE_SIZE: u64 = 64 * 1024 * 1024;
-
-/// A non-default page size, to prove `page_size_bytes` actually drives the layout.
-const CUSTOM_PAGE_SIZE: u64 = 1024 * 1024;
-
-/// Find `value_log_0.log` under the db dir (its exact namespace path is internal).
-fn find_value_log(dir: &Path) -> Option<PathBuf> {
-    walkdir(dir).into_iter().find(|p| p.file_name().is_some_and(|n| n == "value_log_0.log"))
+/// Every value-log segment file under the db dir (their namespace path is internal).
+fn segment_files(dir: &Path) -> Vec<PathBuf> {
+    walkdir(dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("value_log_") && n.contains(".seg"))
+        })
+        .collect()
 }
 
 fn walkdir(dir: &Path) -> Vec<PathBuf> {
@@ -36,271 +42,146 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Writes roll over into new segment files at the configured size, and every value
+/// stays readable across the rollover and a reopen.
 #[test]
-fn value_log_gc_triggers_on_waste_then_reclaims_metadata_and_values() {
+fn writes_roll_into_new_segments_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), one_bucket_config()).unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
 
-    // Overwrite a single key with large values so the value log piles up garbage
-    // spanning more than one 64 MiB page (each overwrite supersedes the prior
-    // record, which becomes reclaimable).
-    let blob = vec![0xAAu8; 8 * 1024 * 1024];
-    for _ in 0..10 {
-        db.put(b"hot", &blob).unwrap();
+    let value = vec![0x11u8; 100 * 1024];
+    for i in 0..30 {
+        db.put(format!("key{i:03}").as_bytes(), &value).unwrap();
     }
-    let final_value = vec![0xBBu8; 8 * 1024 * 1024];
+
+    // 30 × 100 KiB cannot fit in one 1 MiB segment.
+    assert!(
+        segment_files(dir.path()).len() > 1,
+        "expected the writes to roll into several segments, found {:?}",
+        segment_files(dir.path())
+    );
+
+    for i in 0..30 {
+        assert_eq!(db.get(format!("key{i:03}").as_bytes()).unwrap(), Some(value.clone()));
+    }
+    db.shutdown().unwrap();
+
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    for i in 0..30 {
+        assert_eq!(
+            db.get(format!("key{i:03}").as_bytes()).unwrap(),
+            Some(value.clone()),
+            "key{i:03} lost across reopen"
+        );
+    }
+    db.shutdown().unwrap();
+}
+
+/// GC reclaims whole segments: it rewrites only the survivors of the segments it
+/// selects, unlinks those files, and leaves untouched segments alone. Every live
+/// value must survive.
+#[test]
+fn gc_reclaims_whole_segments_and_preserves_live_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+    // One key we keep, and one we overwrite until its old records dominate.
+    let keep = vec![0x22u8; 100 * 1024];
+    db.put(b"keep", &keep).unwrap();
+
+    let churn = vec![0x33u8; 100 * 1024];
+    for _ in 0..40 {
+        db.put(b"hot", &churn).unwrap();
+    }
+    let final_value = vec![0x44u8; 100 * 1024];
     db.put(b"hot", &final_value).unwrap();
 
-    // The metadata-driven waste ratio is the exact signal the background GC
-    // worker triggers on — it must now exceed the default 30% threshold.
-    let waste_threshold = 30.0;
     let before = db.stats();
-    assert!(
-        db.waste_ratio() >= waste_threshold,
-        "waste ratio {} should cross the GC trigger threshold {}",
-        db.waste_ratio(),
-        waste_threshold
-    );
+    let files_before = segment_files(dir.path()).len();
     assert!(before.garbage_size > 0, "expected accumulated garbage");
+    assert!(db.waste_ratio() >= 30.0, "expected enough waste to be worth collecting");
 
-    assert!(find_value_log(dir.path()).is_some(), "value_log_0.log should exist before GC");
-
-    // Run value-log GC.
     let gc = db.garbage_collect().unwrap();
-    assert!(gc.bytes_reclaimed > 0, "GC should reclaim garbage bytes");
+    assert!(gc.bytes_reclaimed > 0, "GC should reclaim whole segments");
 
     let after = db.stats();
-
-    // The garbage is gone: the metadata no longer reports waste...
-    assert!(after.waste_ratio < before.waste_ratio, "waste ratio should drop after GC");
-    assert!(after.garbage_size < before.garbage_size / 2, "garbage should be largely reclaimed");
-    assert_eq!(after.garbage_size, 0, "GC should clear metadata-tracked garbage");
+    assert!(after.garbage_size < before.garbage_size / 2, "most garbage should be gone");
     assert!(
-        after.live_bytes <= final_value.len() as u64 + 1024,
-        "only the final live value should remain logically live, got live_bytes={}",
-        after.live_bytes
+        segment_files(dir.path()).len() < files_before,
+        "GC should have unlinked segment files: {files_before} -> {}",
+        segment_files(dir.path()).len()
     );
-    assert!(
-        after.tail <= VALUE_LOG_PAGE_SIZE,
-        "GC should compact the single live value back into the first logical page, got tail={}",
-        after.tail
-    );
+    assert!(after.disk_bytes < before.disk_bytes, "on-disk footprint should shrink");
 
-    // The latest value survives the compaction.
-    assert_eq!(db.get(b"hot").unwrap(), Some(final_value));
+    // Both live values survive the relocation.
+    assert_eq!(db.get(b"hot").unwrap(), Some(final_value.clone()), "live value lost by GC");
+    assert_eq!(db.get(b"keep").unwrap(), Some(keep.clone()), "untouched value lost by GC");
 
+    // ...and they still resolve after a reopen, i.e. the re-pointed pointers are durable.
+    db.shutdown().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "relocated value lost across reopen");
+    assert_eq!(db.get(b"keep").unwrap(), Some(keep), "relocated value lost across reopen");
     db.shutdown().unwrap();
 }
 
-/// Regression: an overwrite-heavy bucket used to leak. GC rewrote survivors
-/// *past* `tail` each cycle, abandoning the low pages as holes; the page scan
-/// then stopped at the first hole, so after the first cycle GC reclaimed nothing
-/// and the value log grew without bound. GC must now stay bounded across cycles.
+/// GC must stay bounded across repeated cycles: the same churn, collected again and
+/// again, must not grow the on-disk footprint without limit.
 #[test]
-fn value_log_gc_stays_bounded_across_repeated_cycles() {
+fn gc_stays_bounded_across_repeated_cycles() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), one_bucket_config()).unwrap();
-    let blob = vec![0xAAu8; 8 * 1024 * 1024];
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
 
-    let mut live_each_cycle = Vec::new();
-    let mut tail_each_cycle = Vec::new();
-    for cycle in 0u8..3 {
-        for _ in 0..10 {
+    let blob = vec![0xAAu8; 100 * 1024];
+    let mut disk_each_cycle = Vec::new();
+
+    for cycle in 0u8..4 {
+        for _ in 0..20 {
             db.put(b"hot", &blob).unwrap();
         }
-        let final_value = vec![cycle; 8 * 1024 * 1024];
+        let final_value = vec![cycle; 100 * 1024];
         db.put(b"hot", &final_value).unwrap();
 
-        let gc = db.garbage_collect().unwrap();
-        assert!(gc.bytes_reclaimed > 0, "cycle {cycle}: GC must keep reclaiming garbage");
-        assert_eq!(db.stats().garbage_size, 0, "cycle {cycle}: garbage not fully reclaimed");
+        db.garbage_collect().unwrap();
         assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "cycle {cycle}: value lost");
-
-        let stats = db.stats();
-        live_each_cycle.push(stats.live_bytes);
-        tail_each_cycle.push(stats.tail);
+        disk_each_cycle.push(db.stats().disk_bytes);
     }
 
-    // The logical live footprint holds steady at one surviving value across
-    // cycles. Avoid asserting physical disk blocks here: sparse-hole accounting
-    // differs across Linux filesystems and WSL/native Ubuntu setups.
-    let expected_live = blob.len() as u64;
-    for (cycle, live) in live_each_cycle.into_iter().enumerate() {
+    // The live set is one value, so the footprint must settle rather than climb.
+    let first = disk_each_cycle[1];
+    for (cycle, &bytes) in disk_each_cycle.iter().enumerate().skip(1) {
         assert!(
-            live <= expected_live + 1024,
-            "cycle {cycle}: logical live bytes should stay bounded near one value, got {live}"
+            bytes <= first * 2,
+            "cycle {cycle}: disk footprint growing without bound ({disk_each_cycle:?})"
         );
     }
-    for (cycle, tail) in tail_each_cycle.into_iter().enumerate() {
-        assert!(
-            tail <= VALUE_LOG_PAGE_SIZE,
-            "cycle {cycle}: logical tail should stay within the first page after GC, got {tail}"
-        );
-    }
-
-    db.shutdown().unwrap();
-}
-
-/// `page_size_bytes` must actually reach the value log — it was parsed into
-/// `DbConfig` and then ignored, so pages were always 64 MiB no matter the config.
-/// Drive a configured page size end to end: writes must roll over at that size,
-/// GC must rewrite survivors into pages of that size, and every value must
-/// survive the compaction.
-#[test]
-fn configured_page_size_drives_layout_and_survives_gc() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = DbConfig {
-        num_buckets: 1,
-        page_size_bytes: CUSTOM_PAGE_SIZE,
-        ..DbConfig::default()
-    };
-    let db = Db::open_with_config(dir.path(), config).unwrap();
-
-    // Values large enough that a handful of them cannot share one 1 MiB page.
-    let blob = |b: u8| vec![b; 300 * 1024];
-
-    // Keep one key live; overwrite another repeatedly to pile up garbage.
-    db.put(b"keep", &blob(0x11)).unwrap();
-    for _ in 0..12 {
-        db.put(b"hot", &blob(0x22)).unwrap();
-    }
-    let final_value = blob(0x33);
-    db.put(b"hot", &final_value).unwrap();
-
-    // Pages are laid out at the CONFIGURED size, not the 64 MiB default — with a
-    // 64 MiB page all of this would still be sitting in page 0.
-    let pages = db.value_log_page_stats("default").unwrap();
-    let offsets: Vec<u64> = pages.iter().flat_map(|(_, ps)| ps.iter().map(|p| p.page_offset)).collect();
-    assert!(
-        offsets.iter().any(|&o| o > 0),
-        "expected writes to roll onto later pages at a {CUSTOM_PAGE_SIZE}-byte page size, got offsets {offsets:?}"
-    );
-    for o in &offsets {
-        assert!(
-            o.is_multiple_of(CUSTOM_PAGE_SIZE),
-            "page offset {o} is not aligned to the configured page size {CUSTOM_PAGE_SIZE}"
-        );
-    }
-
-    // GC must rewrite survivors using the same page size (its replacement file is
-    // opened with the bucket's size — a mismatch here would corrupt every pointer).
-    assert!(db.waste_ratio() >= 30.0, "expected enough garbage to trigger GC");
-    let gc = db.garbage_collect().unwrap();
-    assert!(gc.bytes_reclaimed > 0, "GC should reclaim garbage bytes");
-
-    for (_, ps) in db.value_log_page_stats("default").unwrap() {
-        for p in ps {
-            assert!(
-                p.page_offset.is_multiple_of(CUSTOM_PAGE_SIZE),
-                "GC produced a page at {} — not aligned to the configured page size",
-                p.page_offset
-            );
-        }
-    }
-
-    // Both values survive the compaction and still resolve through their pointers.
-    assert_eq!(db.get(b"hot").unwrap(), Some(final_value.clone()), "live value lost across GC");
-    assert_eq!(db.get(b"keep").unwrap(), Some(blob(0x11)), "untouched value lost across GC");
-
-    db.shutdown().unwrap();
-
-    // And the pointers still resolve after a reopen at the same page size.
-    let config = DbConfig {
-        num_buckets: 1,
-        page_size_bytes: CUSTOM_PAGE_SIZE,
-        ..DbConfig::default()
-    };
-    let db = Db::open_with_config(dir.path(), config).unwrap();
-    assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "value lost across reopen");
-    assert_eq!(db.get(b"keep").unwrap(), Some(blob(0x11)), "value lost across reopen");
-    db.shutdown().unwrap();
-}
-
-/// The page size is fixed at creation: reopening a database whose value log was
-/// written with a different page size must fail loudly rather than reinterpret
-/// every stored pointer (`page_offset` is page-aligned and a record's slot entry
-/// sits at `page_size - segment_id * 8`).
-#[test]
-fn reopening_with_a_different_page_size_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let db = Db::open_with_config(
-        dir.path(),
-        DbConfig {
-            num_buckets: 1,
-            page_size_bytes: CUSTOM_PAGE_SIZE,
-            ..DbConfig::default()
-        },
-    )
-    .unwrap();
-    db.put(b"k", b"v").unwrap();
-    db.shutdown().unwrap();
-
-    let Err(err) = Db::open_with_config(
-        dir.path(),
-        DbConfig {
-            num_buckets: 1,
-            page_size_bytes: CUSTOM_PAGE_SIZE * 2,
-            ..DbConfig::default()
-        },
-    ) else {
-        panic!("reopening with a different page size must fail");
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("page size"), "error should name the page-size mismatch, got: {msg}");
-
-    // The original database is untouched and still opens at its own page size.
-    let db = Db::open_with_config(
-        dir.path(),
-        DbConfig {
-            num_buckets: 1,
-            page_size_bytes: CUSTOM_PAGE_SIZE,
-            ..DbConfig::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     db.shutdown().unwrap();
 }
 
 /// Regression: GC used to leave sub-threshold garbage on disk **forever**.
 ///
 /// `value_log_waste_threshold` (the bucket trigger — "is this namespace worth
-/// collecting?") was passed straight through as the *per-page* dirty threshold
-/// ("is this page worth rewriting?"). Because they were the same number, garbage
-/// spread just *under* it could never be collected: those pages read as "clean",
-/// so GC copied them byte-for-byte into the compacted file with their garbage
-/// intact, reported success, and left the bucket still over its trigger — so the
-/// next pass copied everything again and still reclaimed nothing. A treadmill.
-///
-/// The page threshold is now a separate, lower knob (`page_gc_threshold`, 10% by
-/// default), so garbage below the bucket trigger is actually reclaimed.
+/// collecting?") was passed straight through as the per-*page* dirty threshold, so
+/// garbage spread just under it could never be collected. The page threshold is now a
+/// separate, lower knob (`page_gc_threshold`) that selects **segments**.
 #[test]
 fn gc_reclaims_garbage_below_the_bucket_trigger() {
     let dir = tempfile::tempdir().unwrap();
-    // 1 MiB pages: small enough that ~90 KiB values spread garbage across many
-    // pages, which is what creates the sub-threshold shape.
-    let config = DbConfig {
-        num_buckets: 1,
-        page_size_bytes: CUSTOM_PAGE_SIZE,
-        ..DbConfig::default()
-    };
-    // The bucket trigger stays at its default 30%; the page threshold is 10%.
+    let cfg = config(SEGMENT_SIZE);
     assert!(
-        config.threshold_config.page_gc_threshold < config.threshold_config.value_log_waste_threshold,
-        "the page threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
+        cfg.threshold_config.page_gc_threshold < cfg.threshold_config.value_log_waste_threshold,
+        "the segment threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
     );
-    let db = Db::open_with_config(dir.path(), config).unwrap();
+    let db = Db::open_with_config(dir.path(), cfg).unwrap();
 
     let value = vec![0x11u8; 90 * 1024];
-    let n = 200;
+    let n = 60;
     for i in 0..n {
         db.put(format!("key{i:04}").as_bytes(), &value).unwrap();
     }
-
-    // Overwrite a strided ~20% of the keys: garbage lands spread thinly across
-    // pages — enough to put the BUCKET over its 30% trigger once counted, but well
-    // under what the old coupled 30% *page* threshold demanded of any single page.
+    // Overwrite a strided ~20%: garbage lands thinly spread across segments — enough
+    // to put the bucket over its 30% trigger, but well under what a coupled 30%
+    // per-segment threshold would have demanded of any single segment.
     let overwrite = vec![0x22u8; 90 * 1024];
     for i in (0..n).step_by(5) {
         db.put(format!("key{i:04}").as_bytes(), &overwrite).unwrap();
@@ -310,18 +191,16 @@ fn gc_reclaims_garbage_below_the_bucket_trigger() {
     assert!(before.garbage_size > 0, "expected accumulated garbage");
 
     let gc = db.garbage_collect().unwrap();
-    let after = db.stats();
-
     assert!(gc.bytes_reclaimed > 0, "GC reclaimed nothing — sub-threshold garbage is stranded again");
+
+    let after = db.stats();
     assert!(
-        after.garbage_size * 4 < before.garbage_size,
-        "GC left most of the garbage behind: {} -> {} bytes. The page threshold is probably coupled \
-         to the bucket trigger again.",
+        after.garbage_size * 2 < before.garbage_size,
+        "GC left most of the garbage behind: {} -> {} bytes",
         before.garbage_size,
         after.garbage_size
     );
 
-    // ...and every value still reads back correctly after the compaction.
     for i in 0..n {
         let expected = if i % 5 == 0 { &overwrite } else { &value };
         assert_eq!(
@@ -330,6 +209,123 @@ fn gc_reclaims_garbage_below_the_bucket_trigger() {
             "value for key{i:04} lost or corrupted by GC"
         );
     }
+    db.shutdown().unwrap();
+}
 
+/// Segment ids are **monotone and never reused**, across restarts as well as within a
+/// process. This is the landmine of the whole design: if GC unlinks the highest
+/// segment and the next id were derived from `max(existing files) + 1`, that id would
+/// be handed out again — and a reader holding the old pointer would silently read a
+/// *different* key's record. A persisted high-water mark prevents it.
+#[test]
+fn segment_ids_never_repeat_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut seen: Vec<u32> = Vec::new();
+
+    for round in 0u8..4 {
+        let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+        // Churn enough to roll segments and give GC something to reclaim, including
+        // the newest segments — the case that would tempt id reuse.
+        let blob = vec![round; 100 * 1024];
+        for i in 0..15 {
+            db.put(format!("k{i}").as_bytes(), &blob).unwrap();
+        }
+        for _ in 0..15 {
+            db.put(b"hot", &blob).unwrap();
+        }
+        db.garbage_collect().unwrap();
+
+        for (_, segments) in db.value_log_segment_stats("default").unwrap() {
+            for s in segments {
+                assert!(
+                    !seen.contains(&s.id),
+                    "segment id {} was reused (already seen in an earlier round); \
+                     ids must come from a persisted monotone counter, never max(files)+1. seen={seen:?}",
+                    s.id
+                );
+                seen.push(s.id);
+            }
+        }
+        db.shutdown().unwrap();
+    }
+
+    assert!(seen.len() > 4, "expected several segments across the rounds, saw {seen:?}");
+}
+
+/// The segment size is **not** fixed at creation (unlike `num_buckets`): it is not
+/// encoded in any pointer, so existing segments keep the size they were written at and
+/// new ones use whatever is configured now. Reopening with a different size must work
+/// and must not lose a single value.
+#[test]
+fn segment_size_can_change_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let small = vec![0x55u8; 100 * 1024];
+    for i in 0..12 {
+        db.put(format!("a{i}").as_bytes(), &small).unwrap();
+    }
+    db.shutdown().unwrap();
+
+    // Reopen with 4x the segment size — the old segments are still readable.
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE * 4)).unwrap();
+    for i in 0..12 {
+        assert_eq!(
+            db.get(format!("a{i}").as_bytes()).unwrap(),
+            Some(small.clone()),
+            "a{i} unreadable after the segment size changed"
+        );
+    }
+    for i in 0..12 {
+        db.put(format!("b{i}").as_bytes(), &small).unwrap();
+    }
+    db.shutdown().unwrap();
+
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE * 4)).unwrap();
+    for i in 0..12 {
+        assert_eq!(db.get(format!("a{i}").as_bytes()).unwrap(), Some(small.clone()));
+        assert_eq!(db.get(format!("b{i}").as_bytes()).unwrap(), Some(small.clone()));
+    }
+    db.shutdown().unwrap();
+}
+
+/// A deleted key must stay deleted through a GC pass. GC's re-point is a
+/// compare-and-set against the LSM, so a key deleted since GC's scan is skipped rather
+/// than resurrected by having its old record copied forward.
+#[test]
+fn gc_does_not_resurrect_deleted_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+
+    let blob = vec![0x66u8; 100 * 1024];
+    for i in 0..20 {
+        db.put(format!("d{i}").as_bytes(), &blob).unwrap();
+    }
+    // Delete half of them, then churn so their segments become GC candidates.
+    for i in (0..20).step_by(2) {
+        db.delete(format!("d{i}").as_bytes()).unwrap();
+    }
+    for _ in 0..10 {
+        db.put(b"churn", &blob).unwrap();
+    }
+
+    db.garbage_collect().unwrap();
+
+    for i in 0..20 {
+        let key = format!("d{i}");
+        let got = db.get(key.as_bytes()).unwrap();
+        if i % 2 == 0 {
+            assert_eq!(got, None, "{key} was resurrected by GC");
+        } else {
+            assert_eq!(got, Some(blob.clone()), "{key} was lost by GC");
+        }
+    }
+
+    db.shutdown().unwrap();
+    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    for i in (0..20).step_by(2) {
+        assert_eq!(db.get(format!("d{i}").as_bytes()).unwrap(), None, "d{i} resurrected across reopen");
+    }
     db.shutdown().unwrap();
 }

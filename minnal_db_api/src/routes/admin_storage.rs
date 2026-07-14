@@ -8,8 +8,8 @@
 //! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
 //! GET  /admin/storage/wal                             → WAL metadata snapshot
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
-//! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ physical st_blocks bytes)
-//! GET  /admin/storage/value-log/{ns}/pages            → per-page garbage breakdown for one namespace (deep dive)
+//! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ on-disk bytes)
+//! GET  /admin/storage/value-log/{ns}/segments         → per-segment garbage breakdown for one namespace (deep dive)
 //! GET  /admin/storage/namespaces                      → doc-store namespace registry with field schemas
 //! GET  /admin/storage/namespaces/physical             → every physical engine namespace (incl. companions/system), each with a role
 //! GET  /admin/storage/stores/{ns}/kv-meta             → engine storage metadata for one store (doc or KV)
@@ -57,11 +57,12 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Serialize)]
 pub struct StatsResponse {
-    head: u64,
-    tail: u64,
+    /// Value-log segment files on disk across all buckets.
+    segment_count: u64,
+    /// Bytes those segment files occupy.
+    disk_bytes: u64,
     garbage_bytes: u64,
     waste_ratio_pct: f64,
-    free_space_ratio_pct: f64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
     live_bytes: u64,
@@ -70,11 +71,10 @@ pub struct StatsResponse {
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let s = state.store.db_stats();
     Json(StatsResponse {
-        head: s.head,
-        tail: s.tail,
+        segment_count: s.segment_count,
+        disk_bytes: s.disk_bytes,
         garbage_bytes: s.garbage_size,
         waste_ratio_pct: s.waste_ratio,
-        free_space_ratio_pct: s.free_space_ratio,
         total_gc_runs: s.total_gc_runs,
         total_bytes_reclaimed: s.total_bytes_reclaimed,
         live_bytes: s.live_bytes,
@@ -534,17 +534,22 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Serialize)]
 pub struct ValueLogShardInfo {
     bucket: u32,
-    head: u64,
-    tail: u64,
+    /// Segment files this shard currently holds.
+    segment_count: usize,
+    /// The shard's active tail — the only segment still being appended to.
+    active_segment_id: u32,
+    /// Next segment id to be handed out. Monotone and never reused, so it also
+    /// counts how many segments this shard has ever created.
+    next_segment_id: u64,
     live_bytes: u64,
     garbage_bytes: u64,
     waste_ratio_pct: f64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
-    /// Blocks actually allocated on disk (`st_blocks`); sparse GC holes excluded.
+    /// Bytes the shard's segment files occupy on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
     physical_bytes: Option<u64>,
-    /// File length including sparse holes (≥ `physical_bytes`).
+    /// Record bytes tracked (live + garbage), excluding segment file headers.
     #[serde(skip_serializing_if = "Option::is_none")]
     logical_bytes: Option<u64>,
 }
@@ -567,20 +572,23 @@ pub fn build_vlog_namespace_info(ns: String, buckets: Vec<(u32, ValueLogMetadata
     let shards: Vec<ValueLogShardInfo> = buckets
         .into_iter()
         .map(|(bucket, m)| {
-            total_live = total_live.saturating_add(m.live_bytes);
-            total_garbage = total_garbage.saturating_add(m.garbage_bytes);
-            let total_written = m.live_bytes.saturating_add(m.garbage_bytes);
+            let live = m.live_bytes();
+            let garbage = m.garbage_bytes();
+            total_live = total_live.saturating_add(live);
+            total_garbage = total_garbage.saturating_add(garbage);
+            let total_written = live.saturating_add(garbage);
             let waste_pct = if total_written > 0 {
-                (m.garbage_bytes as f64 / total_written as f64) * 100.0
+                (garbage as f64 / total_written as f64) * 100.0
             } else {
                 0.0
             };
             ValueLogShardInfo {
                 bucket,
-                head: m.head,
-                tail: m.tail,
-                live_bytes: m.live_bytes,
-                garbage_bytes: m.garbage_bytes,
+                segment_count: m.segments.len(),
+                active_segment_id: m.active_segment_id,
+                next_segment_id: m.next_segment_id,
+                live_bytes: live,
+                garbage_bytes: garbage,
                 waste_ratio_pct: waste_pct,
                 total_gc_runs: m.total_gc_runs,
                 total_bytes_reclaimed: m.total_bytes_reclaimed,
@@ -606,7 +614,7 @@ pub fn build_vlog_namespace_info(ns: String, buckets: Vec<(u32, ValueLogMetadata
 }
 
 pub async fn value_log(State(state): State<AppState>) -> impl IntoResponse {
-    // Physical (st_blocks) footprint per (namespace, bucket) — cheap stat, merged
+    // On-disk footprint per (namespace, bucket) — cheap stat, merged
     // into the logical metadata view so callers see the true on-disk usage.
     let physical: HashMap<String, HashMap<u32, minnal_db::ShardPhysicalStats>> = state
         .store
@@ -638,59 +646,63 @@ pub async fn value_log(State(state): State<AppState>) -> impl IntoResponse {
     Json(result)
 }
 
-// ── Value-log per-page garbage breakdown (deep dive, per namespace) ─────────────
+// ── Value-log per-segment garbage breakdown (deep dive, per namespace) ─────────
 
 #[derive(Serialize)]
-pub struct PageInfo {
-    page_offset: u64,
+pub struct SegmentInfo {
+    segment_id: u32,
+    total_bytes: u64,
     live_bytes: u64,
     garbage_bytes: u64,
     garbage_ratio_pct: f64,
-    total_records: u32,
-    garbage_records: u32,
+    /// Sealed segments are immutable and are what GC selects from; exactly one
+    /// segment per shard is unsealed (the active tail) and is never collected.
+    sealed: bool,
 }
 
 #[derive(Serialize)]
-pub struct ValueLogPagesShard {
+pub struct ValueLogSegmentsShard {
     bucket: u32,
-    page_count: usize,
-    pages: Vec<PageInfo>,
+    segment_count: usize,
+    segments: Vec<SegmentInfo>,
 }
 
 #[derive(Serialize)]
-pub struct ValueLogPagesResponse {
+pub struct ValueLogSegmentsResponse {
     namespace: String,
-    shards: Vec<ValueLogPagesShard>,
+    shards: Vec<ValueLogSegmentsShard>,
 }
 
-/// `GET /admin/storage/value-log/{ns}/pages` — per-page garbage breakdown for a
-/// single namespace's value-log shards: shows *where* reclaimable waste sits.
-/// This scans every page (O(pages × records)), so it is scoped to one namespace.
-pub async fn value_log_pages(
+/// `GET /admin/storage/value-log/{ns}/segments` — per-segment garbage breakdown for
+/// one namespace: shows *which* segments GC would collect next.
+///
+/// Cheap: the counters are maintained in memory by writers, so this reads no segment
+/// data at all. (The per-page version it replaces had to scan every record.)
+pub async fn value_log_segments(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    match state.store.value_log_page_stats(&ns) {
+    match state.store.value_log_segment_stats(&ns) {
         Ok(per_bucket) => {
             let shards = per_bucket
                 .into_iter()
-                .map(|(bucket, pages)| ValueLogPagesShard {
+                .map(|(bucket, segments)| ValueLogSegmentsShard {
                     bucket,
-                    page_count: pages.len(),
-                    pages: pages
+                    segment_count: segments.len(),
+                    segments: segments
                         .into_iter()
-                        .map(|p| PageInfo {
-                            garbage_ratio_pct: p.garbage_ratio_pct(),
-                            page_offset: p.page_offset,
-                            live_bytes: p.live_bytes,
-                            garbage_bytes: p.garbage_bytes,
-                            total_records: p.total_records,
-                            garbage_records: p.garbage_records,
+                        .map(|s| SegmentInfo {
+                            garbage_ratio_pct: s.garbage_ratio_pct(),
+                            segment_id: s.id,
+                            total_bytes: s.total_bytes,
+                            live_bytes: s.live_bytes,
+                            garbage_bytes: s.garbage_bytes,
+                            sealed: s.sealed,
                         })
                         .collect(),
                 })
                 .collect();
-            Ok(Json(ValueLogPagesResponse { namespace: ns, shards }))
+            Ok(Json(ValueLogSegmentsResponse { namespace: ns, shards }))
         }
         Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
     }
