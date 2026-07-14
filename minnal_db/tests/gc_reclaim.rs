@@ -262,3 +262,74 @@ fn reopening_with_a_different_page_size_is_refused() {
     assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     db.shutdown().unwrap();
 }
+
+/// Regression: GC used to leave sub-threshold garbage on disk **forever**.
+///
+/// `value_log_waste_threshold` (the bucket trigger — "is this namespace worth
+/// collecting?") was passed straight through as the *per-page* dirty threshold
+/// ("is this page worth rewriting?"). Because they were the same number, garbage
+/// spread just *under* it could never be collected: those pages read as "clean",
+/// so GC copied them byte-for-byte into the compacted file with their garbage
+/// intact, reported success, and left the bucket still over its trigger — so the
+/// next pass copied everything again and still reclaimed nothing. A treadmill.
+///
+/// The page threshold is now a separate, lower knob (`page_gc_threshold`, 10% by
+/// default), so garbage below the bucket trigger is actually reclaimed.
+#[test]
+fn gc_reclaims_garbage_below_the_bucket_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1 MiB pages: small enough that ~90 KiB values spread garbage across many
+    // pages, which is what creates the sub-threshold shape.
+    let config = DbConfig {
+        num_buckets: 1,
+        page_size_bytes: CUSTOM_PAGE_SIZE,
+        ..DbConfig::default()
+    };
+    // The bucket trigger stays at its default 30%; the page threshold is 10%.
+    assert!(
+        config.threshold_config.page_gc_threshold < config.threshold_config.value_log_waste_threshold,
+        "the page threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
+    );
+    let db = Db::open_with_config(dir.path(), config).unwrap();
+
+    let value = vec![0x11u8; 90 * 1024];
+    let n = 200;
+    for i in 0..n {
+        db.put(format!("key{i:04}").as_bytes(), &value).unwrap();
+    }
+
+    // Overwrite a strided ~20% of the keys: garbage lands spread thinly across
+    // pages — enough to put the BUCKET over its 30% trigger once counted, but well
+    // under what the old coupled 30% *page* threshold demanded of any single page.
+    let overwrite = vec![0x22u8; 90 * 1024];
+    for i in (0..n).step_by(5) {
+        db.put(format!("key{i:04}").as_bytes(), &overwrite).unwrap();
+    }
+
+    let before = db.stats();
+    assert!(before.garbage_size > 0, "expected accumulated garbage");
+
+    let gc = db.garbage_collect().unwrap();
+    let after = db.stats();
+
+    assert!(gc.bytes_reclaimed > 0, "GC reclaimed nothing — sub-threshold garbage is stranded again");
+    assert!(
+        after.garbage_size * 4 < before.garbage_size,
+        "GC left most of the garbage behind: {} -> {} bytes. The page threshold is probably coupled \
+         to the bucket trigger again.",
+        before.garbage_size,
+        after.garbage_size
+    );
+
+    // ...and every value still reads back correctly after the compaction.
+    for i in 0..n {
+        let expected = if i % 5 == 0 { &overwrite } else { &value };
+        assert_eq!(
+            db.get(format!("key{i:04}").as_bytes()).unwrap().as_ref(),
+            Some(expected),
+            "value for key{i:04} lost or corrupted by GC"
+        );
+    }
+
+    db.shutdown().unwrap();
+}

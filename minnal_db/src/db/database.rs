@@ -1710,11 +1710,16 @@ impl Database {
 
     // ── Value log GC (per namespace) ───────────────────────────────────
 
-    /// Run value log GC on a specific namespace
+    /// Run value log GC on a specific namespace.
+    ///
+    /// Note the threshold passed here is the **per-page** one, not the bucket-level
+    /// trigger: an explicit `garbage_collect()` call has already decided the
+    /// namespace is worth collecting, so what is left to decide is which *pages*
+    /// to rewrite.
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
-        let threshold = self.config.threshold_config.value_log_waste_threshold;
-        kv_store.garbage_collect_with_threshold(threshold)
+        let page_threshold = self.config.threshold_config.page_gc_threshold;
+        kv_store.garbage_collect_with_threshold(page_threshold)
     }
 
     /// Run value log GC on the default namespace
@@ -2242,12 +2247,21 @@ impl ValueLogGcTarget for Database {
         self.is_closed()
     }
 
+    /// `waste_threshold` decides **whether** a namespace is collected; the separate,
+    /// lower `page_gc_threshold` then decides **which pages** get rewritten. Passing
+    /// the trigger through as the page threshold (as this used to) makes garbage
+    /// sitting just under it uncollectable: those pages read as "clean", get copied
+    /// byte-for-byte into the compacted file with their garbage intact, and keep the
+    /// bucket over its trigger forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
+        let page_threshold = self.config.threshold_config.page_gc_threshold;
         info!(
-            "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold",
+            "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
+             (pages rewritten at >= {:.2}% garbage)",
             stores.len(),
-            waste_threshold
+            waste_threshold,
+            page_threshold
         );
         for (ns_id, kv_store) in stores.iter() {
             let waste_ratio = kv_store.get_waste_ratio();
@@ -2262,7 +2276,7 @@ impl ValueLogGcTarget for Database {
                 ns_id, waste_ratio, garbage_bytes, written_bytes, waste_threshold
             );
             let start = std::time::Instant::now();
-            match kv_store.garbage_collect_with_threshold(waste_threshold) {
+            match kv_store.garbage_collect_with_threshold(page_threshold) {
                 Ok(stats) => info!(
                     "[GCWorker] ns_id={} GC complete in {:?} — reclaimed {} bytes, live {} bytes, \
                      total reclaimed {} bytes across {} run(s)",

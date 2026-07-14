@@ -112,6 +112,8 @@ fn default_records_per_sync() -> usize {
 pub struct ThresholdSection {
     #[serde(default = "default_value_log_waste_threshold")]
     pub value_log_waste_threshold: f64,
+    #[serde(default = "default_page_gc_threshold")]
+    pub page_gc_threshold: f64,
     #[serde(default = "default_index_blob_waste_threshold")]
     pub index_blob_waste_threshold: f64,
 }
@@ -120,6 +122,7 @@ impl Default for ThresholdSection {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: default_value_log_waste_threshold(),
+            page_gc_threshold: default_page_gc_threshold(),
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
         }
     }
@@ -127,6 +130,10 @@ impl Default for ThresholdSection {
 
 fn default_value_log_waste_threshold() -> f64 {
     30.0
+}
+
+fn default_page_gc_threshold() -> f64 {
+    crate::db::config::DEFAULT_PAGE_GC_THRESHOLD
 }
 
 fn default_index_blob_waste_threshold() -> f64 {
@@ -240,6 +247,7 @@ impl MinnalTomlConfig {
     pub fn to_db_config(&self) -> DbConfig {
         DbConfig {
             threshold_config: ThresholdConfig::new(self.thresholds.value_log_waste_threshold)
+                .with_page_gc_threshold(self.thresholds.page_gc_threshold)
                 .with_index_blob_waste_threshold(self.thresholds.index_blob_waste_threshold),
             sync_config: SyncConfig::new(self.sync.records_per_sync),
             scheduled_task_config: ScheduledTaskConfig {

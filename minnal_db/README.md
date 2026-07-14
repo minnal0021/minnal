@@ -538,7 +538,8 @@ The knobs that most affect engine behaviour:
 | `memtable.max_capacity` | SkipList entry limit before a flush is triggered. |
 | `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
 | `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |
-| `thresholds.value_log_waste_threshold` | Waste ratio at which value-log GC compacts a bucket. |
+| `thresholds.value_log_waste_threshold` | Waste ratio at which value-log GC **triggers** on a bucket. |
+| `thresholds.page_gc_threshold` | Garbage ratio at which GC rewrites an individual **page** (default 10%). Keep it below the trigger: a page under this threshold is copied byte-for-byte into the compacted file *with its garbage intact*, so setting the two equal makes garbage just under the trigger uncollectable. |
 | `recovery.fail_log_dir` | Where recovery fail-log JSON files are written (defaults to `<db_path>/fail_logs`). |
 
 ---

@@ -93,8 +93,23 @@ records_per_sync = 1_000
 [thresholds]
 
 # Start a value-log GC cycle when the percentage of wasted space (dead records)
-# in any shard exceeds this value (0.0–100.0).
+# in any shard exceeds this value (0.0–100.0).  This is the TRIGGER: it decides
+# whether a namespace is worth collecting at all.
 value_log_waste_threshold = 30.0
+
+# Once a GC cycle is running, rewrite an individual value-log page when at least
+# this percentage of it is garbage (0.0–100.0).  This is the SELECTION rule, and
+# it is a different question from the trigger above.
+#
+# Keep it well BELOW value_log_waste_threshold.  A page under this threshold is
+# treated as clean and copied byte-for-byte into the compacted file — carrying
+# its garbage with it, unreclaimed.  If the two values were equal, garbage that
+# sits just under the trigger could never be collected: every pass would copy
+# those pages across intact, report success, and leave the shard still over its
+# trigger, so GC would run again and do exactly the same thing.  A lower page
+# threshold rewrites more surviving records per pass but actually finishes the
+# job.  Default: 10.0.
+page_gc_threshold = 10.0
 
 # Compact a field-index bitmap store at checkpoint when this percentage of its
 # value region is dead space (0.0–100.0). The bitmap store is append-only, so

@@ -44,9 +44,31 @@ pub struct ScheduledTaskConfig {
 /// space before checkpoint compacts it.
 pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 
+/// Default percentage of a *value-log page* that may be garbage before GC
+/// rewrites that page. Deliberately **lower** than the bucket-level
+/// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
+/// see [`ThresholdConfig::page_gc_threshold`] for why.
+pub const DEFAULT_PAGE_GC_THRESHOLD: f64 = 10.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ThresholdConfig {
+    /// Percentage (`0..100`) of a **bucket** that may be garbage before GC runs
+    /// on it at all. This is the *trigger*: it answers "is this namespace worth
+    /// collecting yet?"
     pub value_log_waste_threshold: f64,
+    /// Percentage (`0..100`) of an individual **page** that may be garbage before
+    /// GC rewrites that page. This is the *selection* rule, and it is a different
+    /// question from the trigger above.
+    ///
+    /// Keep it **well below** `value_log_waste_threshold`. A page under this
+    /// threshold is treated as "clean" and copied byte-for-byte into the
+    /// compacted file — carrying its garbage with it, unreclaimed. If the two
+    /// values were equal, garbage sitting just under the trigger could never be
+    /// collected at all: every pass would copy those pages across intact, report
+    /// success, and reclaim almost nothing, while the same bytes keep the bucket
+    /// over its trigger — GC on a treadmill. A lower page threshold rewrites more
+    /// survivors per pass but actually finishes the job.
+    pub page_gc_threshold: f64,
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
     /// append-only, so each per-document insert leaves a stale copy of that
@@ -58,8 +80,15 @@ impl ThresholdConfig {
     pub fn new(waste_threshold: f64) -> Self {
         Self {
             value_log_waste_threshold: waste_threshold,
+            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
         }
+    }
+
+    /// Override the per-page GC threshold (percentage `0..100`).
+    pub fn with_page_gc_threshold(mut self, threshold: f64) -> Self {
+        self.page_gc_threshold = threshold;
+        self
     }
 
     /// Override the field-index bitmap compaction threshold (percentage `0..100`).
@@ -73,6 +102,7 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: 30.0,
+            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
         }
     }
