@@ -176,6 +176,19 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// `read_exact_at`, mapping a short read (EOF before the buffer is filled) to
+/// [`ValueLogError::CorruptedLog`]. `FileExt::read_at` can return fewer bytes than
+/// requested and leave the tail of the buffer untouched; every caller here needs the
+/// *exact* bytes of a record the pointer says is present, so a short read means the
+/// record is truncated — corruption, not a benign torn tail (that case is handled
+/// inline by the record scanners, which stop rather than error).
+fn read_exact_or_corrupt(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    file.read_exact_at(buf, offset).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => ValueLogError::CorruptedLog,
+        _ => ValueLogError::Io(e),
+    })
+}
+
 /// 36 bytes, followed by the value bytes and then the key bytes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValueRecordHeader {
@@ -472,7 +485,12 @@ impl ValueLog {
         let mut offset = SEGMENT_HEADER_SIZE;
         while offset + ValueRecordHeader::SIZE as u64 <= len {
             let mut hdr_buf = [0u8; ValueRecordHeader::SIZE];
-            file.read_at(&mut hdr_buf, offset).map_err(ValueLogError::Io)?;
+            match file.read_exact_at(&mut hdr_buf, offset) {
+                Ok(()) => {}
+                // A short read here is a truncated tail — the clean end is what we have.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(ValueLogError::Io(e)),
+            }
             let Some(header) = ValueRecordHeader::from_bytes(&hdr_buf) else {
                 break;
             };
@@ -865,7 +883,7 @@ impl ValueLog {
             return Err(ValueLogError::InvalidLocation);
         }
         let mut buf = vec![0u8; ValueRecordHeader::SIZE + location.value_len as usize];
-        file.read_at(&mut buf, location.rec_offset as u64).map_err(ValueLogError::Io)?;
+        read_exact_or_corrupt(file, &mut buf, location.rec_offset as u64)?;
         self.parse_record(&buf, location)
     }
 
@@ -876,7 +894,7 @@ impl ValueLog {
         }
         let file = self.segment_file(location.segment_id)?;
         let mut buf = [0u8; ValueRecordHeader::SIZE];
-        file.read_at(&mut buf, location.rec_offset as u64).map_err(ValueLogError::Io)?;
+        read_exact_or_corrupt(&file, &mut buf, location.rec_offset as u64)?;
         let header = ValueRecordHeader::from_bytes(&buf).ok_or(ValueLogError::CorruptedLog)?;
         Ok(header.meta())
     }
@@ -985,7 +1003,13 @@ impl ValueLog {
 
         while offset + ValueRecordHeader::SIZE as u64 <= len {
             let mut hdr_buf = [0u8; ValueRecordHeader::SIZE];
-            file.read_at(&mut hdr_buf, offset).map_err(ValueLogError::Io)?;
+            match file.read_exact_at(&mut hdr_buf, offset) {
+                Ok(()) => {}
+                // A short read is a truncated tail — same "stop cleanly" case as a torn
+                // header below. Nothing references a record past here.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(ValueLogError::Io(e)),
+            }
             let Some(header) = ValueRecordHeader::from_bytes(&hdr_buf) else {
                 // A torn tail from a crash mid-append. Nothing references it — the LSM
                 // only ever learned about records whose append returned — so stopping
@@ -997,8 +1021,12 @@ impl ValueLog {
             }
             let body_len = header.total_len as usize - ValueRecordHeader::SIZE;
             let mut body = vec![0u8; body_len];
-            file.read_at(&mut body, offset + ValueRecordHeader::SIZE as u64)
-                .map_err(ValueLogError::Io)?;
+            match file.read_exact_at(&mut body, offset + ValueRecordHeader::SIZE as u64) {
+                Ok(()) => {}
+                // The header was whole but its body is truncated: still a torn tail, stop.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(ValueLogError::Io(e)),
+            }
             let (value, key) = body.split_at(header.value_len as usize);
 
             f(
@@ -1392,6 +1420,31 @@ mod tests {
         assert!(
             matches!(log.read_value(loc), Err(ValueLogError::CorruptedLog)),
             "a corrupted value must be rejected, not served"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_record_read_is_corruption_not_a_zero_filled_value() -> Result<()> {
+        // `FileExt::read_at` can return a short count near EOF and leave the tail of the
+        // buffer zeroed. A read of a record the pointer says is present must not serve
+        // those zero bytes as the value — a file truncated below the record is corruption,
+        // and must fail loudly rather than silently returning a wrong value.
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let loc = log.append(b"k", b"the-full-value-bytes", meta(1), true)?;
+
+        // Chop the last 8 bytes behind the log's back — no reopen, so the read path (not
+        // the on-open tail-truncation) is what has to catch the short read.
+        let path = ValueLog::segment_path(dir.path(), 0, loc.segment_id);
+        let full = std::fs::metadata(&path)?.len();
+        let f = OpenOptions::new().write(true).open(&path)?;
+        f.set_len(full - 8)?;
+        f.sync_all()?;
+
+        assert!(
+            matches!(log.read_value(loc), Err(ValueLogError::CorruptedLog)),
+            "a truncated record must fail with CorruptedLog, not return a zero-filled value"
         );
         Ok(())
     }
