@@ -454,6 +454,32 @@ impl ValueLog {
         Ok(())
     }
 
+    /// The offset at which this segment's last complete record ends — i.e. the length
+    /// the file would have with any torn tail from a crash mid-append removed.
+    ///
+    /// Only ever called on a not-full segment about to be **reused as the active
+    /// tail** on open. Resuming appends *past* a torn record is data loss waiting to
+    /// happen: the records appended after it would sit beyond a gap that GC's
+    /// sequential [`for_each_record`](Self::for_each_record) scan halts at, so GC
+    /// would relocate only the records before the gap and then unlink the whole
+    /// segment — dropping any live key after it. Reusing the segment therefore
+    /// truncates to this offset first. (Reads only headers, so it is cheap.)
+    fn valid_record_end(file: &File, len: u64) -> Result<u64> {
+        let mut offset = SEGMENT_HEADER_SIZE;
+        while offset + ValueRecordHeader::SIZE as u64 <= len {
+            let mut hdr_buf = [0u8; ValueRecordHeader::SIZE];
+            file.read_at(&mut hdr_buf, offset).map_err(ValueLogError::Io)?;
+            let Some(header) = ValueRecordHeader::from_bytes(&hdr_buf) else {
+                break;
+            };
+            if offset + header.total_len as u64 > len {
+                break;
+            }
+            offset += header.total_len as u64;
+        }
+        Ok(offset)
+    }
+
     /// Open (or create) the value log for `bucket`.
     ///
     /// The **files on disk** are the source of truth for what exists; the metadata
@@ -531,10 +557,32 @@ impl ValueLog {
         let (active_id, active_file, active_offset) = match reusable {
             Some((id, bytes)) => {
                 let file = OpenOptions::new().read(true).write(true).open(Self::segment_path(dir, bucket, id))?;
+                let physical_len = SEGMENT_HEADER_SIZE + bytes;
+                // A crash can leave a torn (partial) record at the tail. We are about to
+                // append *past* it, so truncate it away first — otherwise the records we
+                // append would sit beyond a gap that GC's sequential scan halts at, and
+                // GC could unlink the whole segment after relocating only the records
+                // before the gap, losing every live key after it.
+                let valid_end = Self::valid_record_end(&file, physical_len)?;
+                if valid_end < physical_len {
+                    file.set_len(valid_end)?;
+                    file.sync_all()?;
+                }
                 if let Some(s) = segments.get_mut(&id) {
                     s.sealed = false;
+                    let new_total = valid_end - SEGMENT_HEADER_SIZE;
+                    if s.total_bytes != new_total {
+                        // The persisted byte count disagrees with the segment's true tail
+                        // (a torn record, or records appended after the last metadata
+                        // flush), so its live/garbage split can't be trusted. Fix the
+                        // total and let the exact rebuild from the LSM recompute the split.
+                        s.total_bytes = new_total;
+                        s.live_bytes = new_total;
+                        s.garbage_bytes = 0;
+                        need_rebuild = true;
+                    }
                 }
-                (id, Arc::new(file), SEGMENT_HEADER_SIZE + bytes)
+                (id, Arc::new(file), valid_end)
             }
             None => {
                 let id = next_id as u32;
@@ -1322,6 +1370,51 @@ mod tests {
         // ...and both are still readable by pointer.
         assert_eq!(log.read_value(a)?, b"value-a");
         assert_eq!(log.read_value(b)?, b"value-b");
+        Ok(())
+    }
+
+    #[test]
+    fn records_appended_after_a_torn_tail_stay_visible_to_gc() -> Result<()> {
+        // The dangerous sequence: a crash leaves a torn record at the tail, then on
+        // reopen we resume appending into that same not-full segment. If the torn bytes
+        // were left in place, a record appended after them would sit beyond a gap that
+        // GC's sequential scan stops at — GC would relocate only the records before the
+        // gap and then unlink the segment, silently losing the later live record.
+        let dir = TempDir::new()?;
+        let (a, b) = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            let a = log.append(b"a", b"value-a", meta(1), true)?;
+            let b = log.append(b"b", b"value-b", meta(2), true)?;
+            (a, b)
+        };
+
+        // Simulate the torn write: partial bytes appended past the last good record.
+        let path = ValueLog::segment_path(dir.path(), 0, a.segment_id);
+        let mut bytes = std::fs::read(&path)?;
+        bytes.extend_from_slice(&[0xAB; 20]); // shorter than a header, and not one anyway
+        std::fs::write(&path, &bytes)?;
+
+        // Reopen (recovery) and resume appending into the reused tail.
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let c = log.append(b"c", b"value-c", meta(3), true)?;
+        assert_eq!(c.segment_id, a.segment_id, "c must land in the reused tail, exercising the torn-tail path");
+
+        // GC learns a segment's contents by scanning it. All three records — including
+        // the one appended after the torn tail — must be visited in order, or GC would
+        // drop c while unlinking the segment.
+        let mut seen = Vec::new();
+        log.for_each_record(a.segment_id, |key, _, _, _| seen.push(key.to_vec()))?;
+        assert_eq!(
+            seen,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the record appended after the torn tail must be visible to GC"
+        );
+
+        // The torn bytes were truncated, not skipped: c sits immediately after b, and
+        // every pointer still resolves to its own value.
+        assert_eq!(log.read_value(a)?, b"value-a");
+        assert_eq!(log.read_value(b)?, b"value-b");
+        assert_eq!(log.read_value(c)?, b"value-c");
         Ok(())
     }
 
