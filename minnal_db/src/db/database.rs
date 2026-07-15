@@ -3583,6 +3583,106 @@ mod tests {
     }
 
     #[test]
+    fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
+        // A crash can strike right after WAL replay re-appended values to the log but
+        // before the value-log metadata was flushed — leaving segment files longer than
+        // their recorded totals. The next open must reconcile that (rebuild stats from
+        // the LSM) and lose nothing, even across repeated crash/replay cycles. Crash is
+        // simulated with mem::forget, which skips Database::drop's clean flush.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.num_buckets = 1;
+        let keys: Vec<Vec<u8>> = (0..30u32).map(|i| format!("k{i:03}").into_bytes()).collect();
+
+        // Session 1: write, then crash before any clean flush.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                db.put(k, format!("v{i}").as_bytes()).unwrap();
+            }
+            std::mem::forget(db);
+        }
+
+        // Session 2: reopen replays the WAL (re-appending to the log), then crash again
+        // before the post-replay metadata is flushed.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            assert_eq!(db.get(b"k000").unwrap().as_deref(), Some(b"v0".as_slice()), "replay must restore the data");
+            std::mem::forget(db);
+        }
+
+        // Session 3: open cleanly. Everything is still readable, and the value-log
+        // accounting is self-consistent despite the stale metadata it started from.
+        let db = Database::open(dir.path(), config).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                db.get(k).unwrap().as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "key {i} lost across replay+crash cycles"
+            );
+        }
+        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total after recovery", s.id);
+            }
+        }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_torn_tail_survives_reopen_append_and_gc() {
+        // The full torn-tail hazard end to end: a crash leaves a partial record at the
+        // active tail; reopen truncates it and replays; we append past it, churn to make
+        // the segment collectable, then GC seals and relocates it. Records from BEFORE
+        // the torn tail and those appended AFTER it must all survive GC relocation.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.num_buckets = 1; // one bucket → one active-tail segment to tear
+        let value = vec![0x5Au8; 300];
+
+        // Session 1: write, crash before clean flush.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            for i in 0..40u32 {
+                db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+            }
+            std::mem::forget(db);
+        }
+
+        // Inject a torn write at the tail of bucket 0's active segment.
+        let seg = dir.path().join("ns_default").join("value_logs").join("value_log_0.seg000001");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes.extend_from_slice(&[0xAB; 20]); // partial, not a valid header
+        std::fs::write(&seg, &bytes).unwrap();
+
+        // Session 2: reopen (truncates the torn tail, replays), append MORE past it,
+        // overwrite the originals to pile up garbage, then GC.
+        let db = Database::open(dir.path(), config).unwrap();
+        for i in 40..60u32 {
+            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        for i in 0..40u32 {
+            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        db.garbage_collect().unwrap();
+
+        // All 60 keys survive — including those appended after the torn tail.
+        for i in 0..60u32 {
+            assert_eq!(
+                db.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i:03} lost across torn-tail reopen + GC"
+            );
+        }
+        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke the invariant after GC", s.id);
+            }
+        }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
     fn test_database_wal_gc() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
