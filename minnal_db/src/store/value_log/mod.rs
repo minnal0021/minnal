@@ -936,8 +936,8 @@ impl ValueLog {
     /// Cheap (in-memory counters) and exact enough to keep the GC worker from waking on a
     /// bucket whose garbage it cannot collect — which is what made a small, fully-deleted
     /// namespace log "starting GC ... reclaimed 0 bytes" on every tick.
-    pub fn has_gc_work(&self, page_threshold_pct: f64, tail_threshold_pct: f64) -> bool {
-        !self.gc_candidates(page_threshold_pct).is_empty() || self.tail_needs_sealing(tail_threshold_pct)
+    pub fn has_gc_work(&self, segment_threshold_pct: f64, tail_threshold_pct: f64) -> bool {
+        !self.gc_candidates(segment_threshold_pct).is_empty() || self.tail_needs_sealing(tail_threshold_pct)
     }
 
     /// The bucket's overall waste ratio `garbage / (live + garbage)`, as a percentage —

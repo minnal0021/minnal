@@ -99,8 +99,7 @@ value_log_waste_threshold = 30.0
 
 # Once a GC cycle is running, rewrite an individual sealed value-log SEGMENT when
 # at least this percentage of it is garbage (0.0–100.0).  This is the SELECTION
-# rule, and it is a different question from the trigger above.  (The key is named
-# `page_gc_threshold` for config compatibility; the value log is now segment-based.)
+# rule, and it is a different question from the trigger above.
 #
 # Keep it well BELOW value_log_waste_threshold.  A segment under this threshold is
 # treated as clean and left in place — its live records keep their pointers and its
@@ -109,7 +108,7 @@ value_log_waste_threshold = 30.0
 # segments, report success, and leave the shard still over its trigger, so GC would
 # run again and do exactly the same thing.  A lower threshold rewrites more segments
 # (and their survivors) per pass but actually finishes the job.  Default: 10.0.
-page_gc_threshold = 10.0
+segment_gc_threshold = 10.0
 
 # Garbage share (0.0–100.0) of a bucket's ACTIVE TAIL segment at which GC seals it
 # so it can be collected. A small or idle store keeps all its data in one tail

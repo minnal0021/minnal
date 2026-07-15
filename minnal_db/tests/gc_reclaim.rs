@@ -163,13 +163,13 @@ fn gc_stays_bounded_across_repeated_cycles() {
 /// `value_log_waste_threshold` (the bucket trigger — "is this namespace worth
 /// collecting?") was passed straight through as the per-*page* dirty threshold, so
 /// garbage spread just under it could never be collected. The page threshold is now a
-/// separate, lower knob (`page_gc_threshold`) that selects **segments**.
+/// separate, lower knob (`segment_gc_threshold`) that selects **segments**.
 #[test]
 fn gc_reclaims_garbage_below_the_bucket_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(SEGMENT_SIZE);
     assert!(
-        cfg.threshold_config.page_gc_threshold < cfg.threshold_config.value_log_waste_threshold,
+        cfg.threshold_config.segment_gc_threshold < cfg.threshold_config.value_log_waste_threshold,
         "the segment threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
     );
     let db = Db::open_with_config(dir.path(), cfg).unwrap();

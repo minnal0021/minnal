@@ -52,8 +52,8 @@ pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Default percentage of a *value-log segment* that may be garbage before GC
 /// rewrites it. Deliberately **lower** than the bucket-level
 /// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
-/// see [`ThresholdConfig::page_gc_threshold`] for why.
-pub const DEFAULT_PAGE_GC_THRESHOLD: f64 = 10.0;
+/// see [`ThresholdConfig::segment_gc_threshold`] for why.
+pub const DEFAULT_SEGMENT_GC_THRESHOLD: f64 = 10.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThresholdConfig {
@@ -65,9 +65,6 @@ pub struct ThresholdConfig {
     /// before GC rewrites it. This is the *selection* rule, and it is a different
     /// question from the trigger above.
     ///
-    /// (The name is `page_gc_threshold` for config compatibility; the value log is
-    /// now segment-based, so it selects segments, not the pages of the old format.)
-    ///
     /// Keep it **well below** `value_log_waste_threshold`. A segment under this
     /// threshold is treated as "clean" and left in place — its live records keep
     /// their pointers, and its garbage rides along, unreclaimed. If the two values
@@ -76,7 +73,7 @@ pub struct ThresholdConfig {
     /// nothing, while the same bytes keep the bucket over its trigger — GC on a
     /// treadmill. A lower threshold rewrites more segments (and their survivors) per
     /// pass but actually finishes the job.
-    pub page_gc_threshold: f64,
+    pub segment_gc_threshold: f64,
     /// Percentage (`0..100`) of garbage in a bucket's **active tail** segment at
     /// which GC seals the tail so it can be collected.
     ///
@@ -120,7 +117,7 @@ impl ThresholdConfig {
     pub fn new(waste_threshold: f64) -> Self {
         Self {
             value_log_waste_threshold: waste_threshold,
-            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
@@ -135,8 +132,8 @@ impl ThresholdConfig {
     }
 
     /// Override the per-segment GC selection threshold (percentage `0..100`).
-    pub fn with_page_gc_threshold(mut self, threshold: f64) -> Self {
-        self.page_gc_threshold = threshold;
+    pub fn with_segment_gc_threshold(mut self, threshold: f64) -> Self {
+        self.segment_gc_threshold = threshold;
         self
     }
 
@@ -164,7 +161,7 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: 30.0,
-            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,

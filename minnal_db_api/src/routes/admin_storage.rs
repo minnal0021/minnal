@@ -171,7 +171,7 @@ pub struct GcMetrics {
     /// `bytes_rewritten / bytes_reclaimed`: **GC's write amplification**, and the
     /// number to watch. Well below 1 is healthy — GC frees far more than it rewrites.
     /// Above 1 means it is relocating more data than it frees (the segments it picks
-    /// are mostly survivors); `thresholds.page_gc_threshold` is the knob for that.
+    /// are mostly survivors); `thresholds.segment_gc_threshold` is the knob for that.
     /// `null` until GC has reclaimed anything.
     vlog_gc_write_amplification: Option<f64>,
     wal_gc_runs: u64,

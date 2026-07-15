@@ -1840,9 +1840,9 @@ impl Database {
     /// to rewrite.
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
-        let page_threshold = self.config.threshold_config.page_gc_threshold;
+        let segment_threshold = self.config.threshold_config.segment_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
-        kv_store.garbage_collect_with_thresholds(page_threshold, tail_threshold)
+        kv_store.garbage_collect_with_thresholds(segment_threshold, tail_threshold)
     }
 
     /// Run value log GC on the default namespace
@@ -2372,21 +2372,21 @@ impl ValueLogGcTarget for Database {
     }
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
-    /// lower `page_gc_threshold` then decides **which sealed segments** get rewritten.
+    /// lower `segment_gc_threshold` then decides **which sealed segments** get rewritten.
     /// Passing the trigger through as the selection threshold (as this used to) makes
     /// garbage sitting just under it uncollectable: those segments read as "clean", are
     /// left in place with their garbage intact, and keep the bucket over its trigger
     /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
-        let page_threshold = self.config.threshold_config.page_gc_threshold;
+        let segment_threshold = self.config.threshold_config.segment_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
         info!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
              (segments rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),
             waste_threshold,
-            page_threshold,
+            segment_threshold,
             tail_threshold
         );
         for (ns_id, kv_store) in stores.iter() {
@@ -2405,7 +2405,7 @@ impl ValueLogGcTarget for Database {
             // a bucket's active tail is not, until the tail is either filled or sealed — so
             // without this check a small, fully-deleted namespace would sit at 100% waste
             // and make the worker log "starting GC ... reclaimed 0 bytes" on every tick.
-            if !kv_store.has_gc_work(page_threshold, tail_threshold) {
+            if !kv_store.has_gc_work(segment_threshold, tail_threshold) {
                 debug!(
                     "[GCWorker] ns_id={} waste {:.2}% is over the trigger but no segment is collectable yet, skipping",
                     ns_id, waste_ratio
@@ -2419,7 +2419,7 @@ impl ValueLogGcTarget for Database {
                 ns_id, waste_ratio, garbage_bytes, written_bytes, waste_threshold
             );
             let start = std::time::Instant::now();
-            match kv_store.garbage_collect_with_thresholds(page_threshold, tail_threshold) {
+            match kv_store.garbage_collect_with_thresholds(segment_threshold, tail_threshold) {
                 Ok(stats) => info!(
                     "[GCWorker] ns_id={} GC complete in {:?} — reclaimed {} bytes, live {} bytes, \
                      total reclaimed {} bytes across {} run(s)",

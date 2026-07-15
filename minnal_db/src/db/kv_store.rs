@@ -1252,7 +1252,7 @@ impl KVStore {
     ///
     /// The old segment is deliberately **not** unlinked here — see
     /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
-    fn compact_bucket(&self, bucket: u32, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<BucketGCResult> {
+    fn compact_bucket(&self, bucket: u32, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<BucketGCResult> {
         let log = self.value_log.get_bucket_log(bucket)?;
         let mut result = BucketGCResult {
             bucket,
@@ -1275,7 +1275,7 @@ impl KVStore {
             }
         }
 
-        let candidates = log.gc_candidates(page_gc_threshold_pct);
+        let candidates = log.gc_candidates(segment_gc_threshold_pct);
         if candidates.is_empty() {
             return Ok(result);
         }
@@ -1327,7 +1327,7 @@ impl KVStore {
 
     /// Run value-log GC across every bucket.
     ///
-    /// `page_gc_threshold_pct` selects **segments** (`ThresholdConfig::page_gc_threshold`).
+    /// `segment_gc_threshold_pct` selects **segments** (`ThresholdConfig::segment_gc_threshold`).
     /// The bucket-level `value_log_waste_threshold` decides whether a namespace is
     /// collected at all, and is applied by the caller.
     ///
@@ -1350,8 +1350,8 @@ impl KVStore {
     /// **Unlinking before step 3 would be data loss**: the durable LSM would point into
     /// a segment that no longer exists, and the WAL entries that could replay those
     /// writes are long gone.
-    pub fn garbage_collect_with_threshold(&self, page_gc_threshold_pct: f64) -> Result<GCStats> {
-        self.garbage_collect_with_thresholds(page_gc_threshold_pct, TAIL_GC_MIN_GARBAGE_PCT)
+    pub fn garbage_collect_with_threshold(&self, segment_gc_threshold_pct: f64) -> Result<GCStats> {
+        self.garbage_collect_with_thresholds(segment_gc_threshold_pct, TAIL_GC_MIN_GARBAGE_PCT)
     }
 
     /// As [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold), but
@@ -1360,7 +1360,7 @@ impl KVStore {
     /// worker passes the configured
     /// [`effective_tail_gc_min_garbage_pct`](crate::db::config::ThresholdConfig::effective_tail_gc_min_garbage_pct),
     /// which by default tracks the waste trigger so no garbage strands between the two.
-    pub fn garbage_collect_with_thresholds(&self, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<GCStats> {
+    pub fn garbage_collect_with_thresholds(&self, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<GCStats> {
         let start_time = std::time::Instant::now();
 
         if self
@@ -1383,7 +1383,7 @@ impl KVStore {
         let bucket_count = self.value_log.num_buckets();
         let results: Vec<BucketGCResult> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..bucket_count as u32)
-                .map(|bucket| s.spawn(move || self.compact_bucket(bucket, page_gc_threshold_pct, tail_gc_threshold_pct)))
+                .map(|bucket| s.spawn(move || self.compact_bucket(bucket, segment_gc_threshold_pct, tail_gc_threshold_pct)))
                 .collect();
             handles
                 .into_iter()
@@ -1488,11 +1488,11 @@ impl KVStore {
     /// active tail is not collectable until the tail is sealed, so a small, fully-deleted
     /// namespace could show 100% waste while GC had nothing to do — and the worker would
     /// wake, log "starting GC", reclaim nothing, and repeat on every tick.
-    pub(crate) fn has_gc_work(&self, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> bool {
+    pub(crate) fn has_gc_work(&self, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> bool {
         (0..self.value_log.num_buckets() as u32).any(|b| {
             self.value_log
                 .get_bucket_log(b)
-                .is_ok_and(|log| log.has_gc_work(page_gc_threshold_pct, tail_gc_threshold_pct))
+                .is_ok_and(|log| log.has_gc_work(segment_gc_threshold_pct, tail_gc_threshold_pct))
         })
     }
 

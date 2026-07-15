@@ -270,7 +270,7 @@ impl DocStoreApiConfig {
         DbConfig {
             threshold_config: ThresholdConfig {
                 value_log_waste_threshold: self.thresholds.value_log_waste_threshold,
-                page_gc_threshold: self.thresholds.page_gc_threshold,
+                segment_gc_threshold: self.thresholds.segment_gc_threshold,
                 tail_gc_min_garbage_pct: self.thresholds.tail_gc_min_garbage_pct,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
                 index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
@@ -443,8 +443,8 @@ fn default_records_per_sync() -> usize {
 pub struct ThresholdSection {
     #[serde(default = "default_waste_threshold")]
     pub value_log_waste_threshold: f64,
-    #[serde(default = "default_page_gc_threshold")]
-    pub page_gc_threshold: f64,
+    #[serde(default = "default_segment_gc_threshold")]
+    pub segment_gc_threshold: f64,
     /// Garbage share at which a bucket's active tail is sealed for GC. Omit to track
     /// `value_log_waste_threshold` (the recommended default).
     #[serde(default)]
@@ -459,7 +459,7 @@ impl Default for ThresholdSection {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: default_waste_threshold(),
-            page_gc_threshold: default_page_gc_threshold(),
+            segment_gc_threshold: default_segment_gc_threshold(),
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
@@ -471,8 +471,8 @@ fn default_waste_threshold() -> f64 {
     30.0
 }
 
-fn default_page_gc_threshold() -> f64 {
-    minnal_db::DEFAULT_PAGE_GC_THRESHOLD
+fn default_segment_gc_threshold() -> f64 {
+    minnal_db::DEFAULT_SEGMENT_GC_THRESHOLD
 }
 
 fn default_index_blob_waste_threshold() -> f64 {
