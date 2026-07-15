@@ -524,8 +524,30 @@ impl ValueLog {
         let mut need_rebuild = !stats_loaded;
         let mut segments: BTreeMap<u32, SegmentStats> = BTreeMap::new();
         for stats in &persisted.segments {
-            if on_disk.contains_key(&stats.id) {
+            let Some(&physical) = on_disk.get(&stats.id) else {
+                // File is gone (GC unlinked it) — drop its accounting with it.
+                continue;
+            };
+            if stats.total_bytes == physical {
                 segments.insert(stats.id, *stats);
+            } else {
+                // Metadata is not flushed on every append, so a crash can leave a
+                // segment file longer than its persisted byte count (records appended
+                // after the last flush) — or, for the active tail, shorter once its torn
+                // tail is trimmed below. Trust the file, not the stale count: take the
+                // on-disk length and let the exact rebuild from the LSM recompute the
+                // live/garbage split.
+                need_rebuild = true;
+                segments.insert(
+                    stats.id,
+                    SegmentStats {
+                        id: stats.id,
+                        total_bytes: physical,
+                        live_bytes: physical,
+                        garbage_bytes: 0,
+                        sealed: stats.sealed,
+                    },
+                );
             }
         }
         for (&id, &total) in &on_disk {
@@ -605,6 +627,16 @@ impl ValueLog {
             }
         };
 
+        // After a restart exactly one segment — the active tail — is being appended to;
+        // every other segment is immutable. Persisted `sealed` flags can disagree (a
+        // segment that was active when metadata was last flushed, then rolled before a
+        // crash, is recorded unsealed), and a non-active segment left unsealed would
+        // never be a GC candidate. Reconstruct the flag from reality instead of trusting
+        // the stale metadata.
+        for (&id, s) in segments.iter_mut() {
+            s.sealed = id != active_id;
+        }
+
         let mut fd_cache = FdCache::new(MAX_OPEN_SEGMENTS_PER_BUCKET);
         fd_cache.insert(active_id, Arc::clone(&active_file));
 
@@ -625,7 +657,15 @@ impl ValueLog {
             verify_checksums_on_read: AtomicBool::new(false),
             stats_need_rebuild: AtomicBool::new(need_rebuild),
         };
-        log.flush_metadata()?;
+        // Don't persist this view while a rebuild is still pending: the live/garbage
+        // split is a conservative placeholder (everything live), and flushing it now
+        // would let a crash-before-rebuild make the placeholder look authoritative on the
+        // next open (metadata present, byte counts already matching → nothing re-flagged).
+        // `KVStore::open` runs the exact rebuild and flushes the corrected metadata; if we
+        // crash before it does, the still-stale on-disk metadata re-triggers the rebuild.
+        if !need_rebuild {
+            log.flush_metadata()?;
+        }
         Ok(log)
     }
 
@@ -1370,6 +1410,73 @@ mod tests {
         // ...and both are still readable by pointer.
         assert_eq!(log.read_value(a)?, b"value-a");
         assert_eq!(log.read_value(b)?, b"value-b");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_but_present_metadata_is_rebuilt_not_trusted() -> Result<()> {
+        // Metadata is not flushed on every append. A crash can leave the metadata file
+        // present and parseable but describing FEWER bytes than a segment actually
+        // holds: a segment that was the active tail when metadata was last flushed can
+        // take more records and then *seal* (roll) before the crash. Trusting the stale
+        // count undercounts that segment's garbage — and the from-LSM rebuild multiplies
+        // the error, since it derives `garbage = total_bytes - live`. Open must reconcile
+        // total_bytes to the file length, and re-seal the rolled segment, before the
+        // rebuild runs. (The existing rebuild test only covers a *missing* metadata file,
+        // where the whole persisted view is discarded.)
+        let dir = TempDir::new()?;
+        let value = vec![0x42; 20 * 1024];
+        let rec = ValueRecordHeader::record_len(b"k0".len(), value.len());
+
+        let locs = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            // One record, then flush: metadata records this segment as the active tail
+            // holding a single record.
+            let r0 = log.append(b"k0", &value, meta(0), true)?;
+            log.flush_metadata()?;
+            // Two more fill it and a fourth rolls into a new segment — sealing the first
+            // with three records, two of which the stale metadata never learned about.
+            // Dropped without another flush = the crash state (no flush-on-drop).
+            let r1 = log.append(b"k1", &value, meta(1), true)?;
+            let r2 = log.append(b"k2", &value, meta(2), true)?;
+            let r3 = log.append(b"k3", &value, meta(3), true)?;
+            vec![r0, r1, r2, r3]
+        };
+        let sealed_seg = locs[0].segment_id;
+        assert!(
+            locs[1].segment_id == sealed_seg && locs[2].segment_id == sealed_seg,
+            "k0..k2 must share the first segment for this test to exercise a sealed stale segment"
+        );
+        assert_ne!(locs[3].segment_id, sealed_seg, "k3 must have rolled into a new segment, sealing the first");
+
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert!(
+            log.stats_need_rebuild(),
+            "a segment file longer than its persisted total_bytes must be flagged for rebuild"
+        );
+
+        let seg = log.segment_stats().into_iter().find(|s| s.id == sealed_seg).unwrap();
+        assert_eq!(seg.total_bytes, 3 * rec, "total_bytes must reflect the file (three records), not the stale one-record count");
+        assert!(
+            seg.sealed,
+            "a segment that rolled before the crash must be re-sealed on reopen, or GC would never collect it"
+        );
+
+        // Rebuild from the LSM: only k0 (here) and k3 (in the next segment) are still
+        // live; k1 and k2 are garbage. The garbage must count both records beyond the
+        // stale one-record total — only possible once total_bytes was corrected.
+        let mut live = HashMap::new();
+        live.insert(sealed_seg, rec); // k0
+        live.insert(locs[3].segment_id, rec); // k3
+        log.rebuild_stats(&live);
+        let seg = log.segment_stats().into_iter().find(|s| s.id == sealed_seg).unwrap();
+        assert_eq!(seg.live_bytes, rec);
+        assert_eq!(seg.garbage_bytes, 2 * rec, "both records past the stale count must be reclaimable garbage");
+
+        // Nothing was lost — every record still reads back.
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(log.read_value(*loc)?, value, "record {i} unreadable after stale-metadata recovery");
+        }
         Ok(())
     }
 
