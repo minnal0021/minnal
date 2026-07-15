@@ -601,19 +601,28 @@ impl Database {
         Ok(db)
     }
 
-    /// Detect existing bucket count by counting value_log_*.log files.
+    /// Detect an existing database's bucket count from its value-log filenames.
+    ///
+    /// Both the segment files (`value_log_{bucket}.seg000123`) and the per-bucket
+    /// metadata (`value_log_{bucket}.metadata`) name their bucket right after the
+    /// `value_log_` prefix. A bucket now owns **many** segment files, so a plain file
+    /// count over-reports; instead take the highest bucket id seen and add one. Buckets
+    /// are numbered `0..num_buckets`, so that is the original count — and it stays
+    /// correct even if one bucket's files are momentarily absent.
     fn detect_bucket_count(vlog_dir: &Path) -> usize {
         let Ok(entries) = std::fs::read_dir(vlog_dir) else {
             return 0;
         };
-        entries
+        let highest = entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
+            .filter_map(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                name.starts_with("value_log_") && name.ends_with(".log") && !name.ends_with(".old")
+                let rest = name.strip_prefix("value_log_")?;
+                rest.split('.').next()?.parse::<u32>().ok()
             })
-            .count()
+            .max();
+        highest.map_or(0, |b| b as usize + 1)
     }
 
     /// Wire up LSM flush observers for all KVStores
@@ -3418,6 +3427,48 @@ mod tests {
         // Unknown namespace errors rather than panicking.
         assert!(db.value_log_segment_stats("nope").is_err());
 
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn existing_bucket_count_is_detected_from_segmented_value_logs() {
+        // num_buckets is locked at creation: reopening with a different configured
+        // value must NOT re-shard. detect_bucket_count reads the count back from the
+        // value-log filenames — which are now `value_log_{bucket}.segNNNNNN`, not the
+        // old `value_log_{bucket}.log`. A stale matcher would see zero buckets and
+        // silently honour the new config, corrupting key→bucket sharding.
+        let dir = TempDir::new().unwrap();
+        let original_buckets = 3;
+
+        {
+            let mut config = create_db_config();
+            config.num_buckets = original_buckets;
+            let db = Database::open(dir.path(), config).unwrap();
+            for i in 0..30u32 {
+                db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(db.config.num_buckets, original_buckets);
+            db.shutdown().unwrap();
+        }
+
+        // Reopen asking for a DIFFERENT bucket count.
+        let mut config = create_db_config();
+        config.num_buckets = original_buckets + 3;
+        let db = Database::open(dir.path(), config).unwrap();
+        assert_eq!(
+            db.config.num_buckets, original_buckets,
+            "the original bucket count must be detected from the segment files and preserved, not the newly configured one"
+        );
+
+        // Every value is still readable — keys resolved to the same buckets they were
+        // written to, which they only can if the original count was honoured.
+        for i in 0..30u32 {
+            assert_eq!(
+                db.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes()),
+                "value k{i} unreadable after reopen with a mismatched num_buckets"
+            );
+        }
         db.shutdown().unwrap();
     }
 
