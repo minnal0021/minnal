@@ -1,6 +1,6 @@
 [package]
 name = "minnal_db"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Embeddable Minnal database: an LSM + value-log KV engine with optional RoaringBitmap field indexing, a JSON document store, and quantised ANN semantic search — selectable via cargo features"
 license = "Apache-2.0"

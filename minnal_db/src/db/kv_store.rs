@@ -6,16 +6,16 @@
 //! Database coordinator.
 
 use crate::db::error::{KVError, Result};
+use crate::db::index_checkpoint_worker::IndexCheckpointTrigger;
 use crate::db::stats::{GCStats, Stats};
-use crate::store::gc_journal::{GCJournal, fsync_dir};
 use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver};
 use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
-use crate::store::value_log::{ValueLog, ValueLogMetadata, ValueRecordMeta};
+use crate::store::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
-use std::fs::File;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -31,19 +31,21 @@ use std::time::Duration;
 /// A resolved key/value pair: both the key and the value bytes read from the value log.
 pub(crate) type KeyValue = (Vec<u8>, Vec<u8>);
 
-/// A key paired with its encoded value-log pointer and the LSM write `seq` (low
-/// u32) of that pointer — the seq lets the value read verify the pointer's slot
-/// was not recycled by GC for a different write (stale-pointer detection).
+/// A key paired with its encoded value-log pointer and the LSM write `seq` (low u32).
 pub(crate) type KeyPointer = (Vec<u8>, u128, u32);
 
 /// One page of a cursor scan: the resolved pairs plus the next cursor
 /// (`None` when the scan is exhausted).
 pub(crate) type ScanPage = (Vec<KeyValue>, Option<Vec<u8>>);
 
-/// A scan entry resolved to everything needed to read its value: the key, its
-/// value-log pointer, a pinned handle to the bucket file it lives in, and the
-/// LSM write `seq` (low u32) used to validate the value record on read.
-pub(crate) type ResolvedEntry = (Vec<u8>, ShardedValuePointer, Arc<File>, u32);
+/// A scan entry resolved to what is needed to read its value: the key and its
+/// value-log pointer.
+///
+/// No file handle is pinned any more. Segments are immutable and their ids are
+/// never reused, so a pointer stays meaningful however long it is held: it either
+/// resolves to the same record or its segment is gone (`SegmentMissing`) and the
+/// key is re-resolved through the LSM.
+pub(crate) type ResolvedEntry = (Vec<u8>, ShardedValuePointer);
 
 /// A key tagged with the prefix ID it was found under — used to carry keys that
 /// need a single-key retry back to their originating prefix bucket.
@@ -58,8 +60,10 @@ fn current_epoch_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// Decode a stored pointer. `segment_id == 0` is the "no value" sentinel.
 fn decode_sharded_pointer(offset_u128: u128) -> Option<ShardedValuePointer> {
-    ShardedValuePointer::from_u128(offset_u128).ok()
+    let p = ShardedValuePointer::from_u128(offset_u128);
+    (p.location.segment_id != 0).then_some(p)
 }
 
 /// Per-namespace key-value store with its own LSM tree and value log.
@@ -74,13 +78,12 @@ pub struct KVStore {
     #[allow(dead_code)]
     pub(crate) lsm_path: PathBuf,
 
-    // Sharded value log (16 buckets)
+    // Sharded value log: one series of segment files per bucket. The value log owns
+    // its own durable metadata (segment inventory + id high-water mark) per bucket,
+    // so the store keeps no separate metadata file of its own.
     pub(crate) value_log: ShardedValueLog,
+    #[allow(dead_code)]
     pub(crate) value_log_path: PathBuf,
-    pub(crate) metadata_path: PathBuf,
-
-    // Value log metadata
-    pub(crate) metadata: Arc<RwLock<ValueLogMetadata>>,
 
     // Sync configuration
     pub(crate) sync_config: SyncConfig,
@@ -91,11 +94,13 @@ pub struct KVStore {
     // Flag to prevent concurrent value log GC operations
     pub(crate) value_log_gc_in_progress: Arc<AtomicBool>,
 
-    // Track old log files pending deletion
-    pub(crate) value_pending_old_logs: Arc<RwLock<Vec<PathBuf>>>,
-
     // LSM compaction trigger channel
     pub(crate) lsm_compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
+
+    // Index-checkpoint backpressure valve: requests an early checkpoint when a
+    // field index accumulates too much reclaimable dead blob space. `None` until
+    // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
+    pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
 
     // Optional TTL for automatic record expiry
     pub(crate) ttl: Option<Duration>,
@@ -129,22 +134,25 @@ pub struct KVStore {
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
     pub(crate) metrics: OnceLock<Arc<crate::db::metrics::Metrics>>,
+
+    /// Test-only crash point: when set, a GC pass returns the moment its segments are
+    /// unlinked, skipping everything after. It exists to prove the *ordering* of
+    /// `flush → unlink` is what makes GC crash-safe: with the flush first (correct), a
+    /// crash here is harmless; if the two were ever swapped, this window would lose the
+    /// re-point along with the segments it referred to, and the guard test would fail.
+    #[cfg(test)]
+    pub(crate) gc_crash_after_unlink: AtomicBool,
 }
 
-/// Result of compacting a single value log bucket.
+/// What one bucket's GC pass did.
 struct BucketGCResult {
-    bytes_reclaimed: u64,
-    bytes_live: u64,
-    old_path: Option<PathBuf>,
-    new_metadata: ValueLogMetadata,
-    old_metadata: ValueLogMetadata,
     bucket: u32,
-    /// True if at least one page in this bucket crossed the page-GC threshold
-    /// and was selected for rewriting.  False means the bucket was a no-op.
-    had_dirty_pages: bool,
-    /// True if a GCJournal was written for this bucket and has not yet been deleted.
-    /// The journal is deleted by the caller after the memtable is flushed to disk.
-    had_journal: bool,
+    /// Bytes of survivors rewritten into the active tail — the *cost* of the pass.
+    /// Compare against the bytes reclaimed for write amplification.
+    bytes_rewritten: u64,
+    /// Segments whose survivors have been relocated, but which cannot be unlinked
+    /// until the LSM re-point is durable (see `garbage_collect_with_threshold`).
+    pending_unlink: Vec<u32>,
 }
 
 impl KVStore {
@@ -157,97 +165,66 @@ impl KVStore {
     /// Open a KVStore for the given namespace at the specified base directory.
     /// The directory will contain `lsm/` and `value_logs/` subdirectories.
     ///
-    /// `page_size_bytes` is the value log's page size (`DbConfig::page_size_bytes`).
-    /// It is fixed when a namespace's value log is first created — see
-    /// [`ValueLog::open_with_page_size`].
+    /// `segment_size_bytes` is the size at which a value-log segment is sealed and a
+    /// new one opened. Unlike the page size it replaces, it is **not** fixed at
+    /// creation: a segment's size is not encoded in any pointer, so existing segments
+    /// keep theirs and new ones use whatever is configured now.
     pub fn open(
         namespace_id: u32,
         name: &str,
         base_path: &Path,
         lsm_config: LSMConfig,
         sync_config: SyncConfig,
-        page_size_bytes: u64,
+        segment_size_bytes: u64,
     ) -> Result<Self> {
-        Self::open_with_ttl(namespace_id, name, base_path, lsm_config, sync_config, page_size_bytes, None)
+        Self::open_with_ttl(namespace_id, name, base_path, lsm_config, sync_config, segment_size_bytes, None)
     }
 
     /// Open a KVStore with an optional TTL for automatic record expiry.
+    ///
+    /// There is no GC recovery step. GC writes survivors to a *new* segment, re-points
+    /// the keys, makes that durable, and only then unlinks the old segment — so at
+    /// every crash point the durable LSM still refers to a segment that exists. There
+    /// is nothing to roll forward or back, which is why the GC journal, its commit
+    /// marker and the `.log.new`/`.log.old` dance are all gone.
     pub fn open_with_ttl(
         namespace_id: u32,
         name: &str,
         base_path: &Path,
         lsm_config: LSMConfig,
         sync_config: SyncConfig,
-        page_size_bytes: u64,
+        segment_size_bytes: u64,
         ttl: Option<Duration>,
     ) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
 
         let lsm_path = base_path.join("lsm");
         let value_log_path = base_path.join("value_logs");
-        let metadata_path = base_path.join("metadata");
 
-        // Open LSM tree
         let mut lsm_cfg = lsm_config;
         lsm_cfg.data_dir = lsm_path.clone();
         let num_buckets = lsm_cfg.num_buckets;
         let lsm = Arc::new(LSMTree::open(&lsm_path, lsm_cfg)?);
 
-        // Recover any interrupted GC value-log swap at the FILE level BEFORE the
-        // value log opens the bucket files — a revert (restoring the old file)
-        // must happen before the fd is bound to the new inode. Completes a
-        // committed swap forward, or reverts one whose journal is unreadable.
-        Self::recover_gc_swaps(&value_log_path, num_buckets)?;
-
-        // Open sharded value log. The page size is fixed at creation: if these
-        // buckets already hold data written with a different one, this fails
-        // rather than reinterpreting every stored pointer.
-        let value_log = ShardedValueLog::open_with_page_size(&value_log_path, num_buckets, page_size_bytes).map_err(|e| {
-            // Display, not Debug: a page-size mismatch is a user-facing config
-            // error whose message explains itself.
+        let value_log = ShardedValueLog::open(&value_log_path, num_buckets, segment_size_bytes).map_err(|e| {
             KVError::Io(std::io::Error::other(format!(
                 "Failed to open sharded value log for namespace '{}': {}",
                 name, e
             )))
         })?;
 
-        // Replay any GC journals left from a prior crash (before anything else reads the LSM).
-        let gc_replayed = Self::recover_gc_journals(&lsm, &value_log_path, num_buckets)?;
-        if gc_replayed > 0 {
-            info!("[KVStore '{}'] Recovered {} stale LSM pointers from GC journal", name, gc_replayed);
-        }
-
-        // Load or initialize value log metadata
-        let metadata = if metadata_path.exists() {
-            let data = std::fs::read(&metadata_path)?;
-            match ValueLogMetadata::from_file_bytes(&data, page_size_bytes) {
-                Ok(m) => m,
-                Err(_) => {
-                    let backup = metadata_path.with_extension("corrupt");
-                    let _ = std::fs::rename(&metadata_path, &backup);
-                    ValueLogMetadata::new(page_size_bytes)
-                }
-            }
-        } else {
-            ValueLogMetadata::new(page_size_bytes)
-        };
-
-        let lsm_compaction_trigger = Arc::new(RwLock::new(None));
-
-        Ok(Self {
+        let store = Self {
             namespace_id,
             name: name.to_string(),
             lsm,
             lsm_path,
             value_log,
             value_log_path,
-            metadata_path,
-            metadata: Arc::new(RwLock::new(metadata)),
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
-            value_pending_old_logs: Arc::new(RwLock::new(Vec::new())),
-            lsm_compaction_trigger,
+            lsm_compaction_trigger: Arc::new(RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(RwLock::new(None)),
             ttl,
             namespace_index: Arc::new(RwLock::new(NamespaceIndexSet::new())),
             row_id_fn: Arc::new(RwLock::new(None)),
@@ -255,7 +232,47 @@ impl KVStore {
             rowmap: Arc::new(RwLock::new(None)),
             seq_counter: RwLock::new(Arc::new(AtomicU64::new(1))),
             metrics: OnceLock::new(),
-        })
+            #[cfg(test)]
+            gc_crash_after_unlink: AtomicBool::new(false),
+        };
+
+        // A bucket whose metadata file was lost has no live/garbage accounting, so GC
+        // would never trigger on it. Recompute it exactly from the LSM's pointers —
+        // the LSM is the authority on liveness anyway, so this is not a heuristic.
+        store.rebuild_missing_segment_stats()?;
+
+        Ok(store)
+    }
+
+    /// Recompute per-segment live/garbage byte counts from the LSM's pointers, for any
+    /// bucket whose accounting could not be loaded.
+    ///
+    /// Exact, not conservative: a record is live iff the LSM still points at it, and
+    /// every other byte in the segment is garbage. Costs one LSM key+pointer scan.
+    fn rebuild_missing_segment_stats(&self) -> Result<()> {
+        let buckets = self.value_log.buckets_needing_stat_rebuild();
+        if buckets.is_empty() {
+            return Ok(());
+        }
+        info!(
+            "[KVStore '{}'] rebuilding value-log segment accounting for {} bucket(s) from the LSM",
+            self.name,
+            buckets.len()
+        );
+
+        let mut live: HashMap<u32, HashMap<u32, u64>> = HashMap::new(); // bucket -> segment -> bytes
+        for (key, offset_u128) in self.lsm.key_pointer_pairs(None)? {
+            if let Some(pointer) = decode_sharded_pointer(offset_u128) {
+                *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key.len());
+            }
+        }
+        let empty = HashMap::new();
+        for bucket in buckets {
+            let per_segment = live.get(&bucket).unwrap_or(&empty);
+            self.value_log.rebuild_bucket_stats(bucket, per_segment)?;
+        }
+        self.value_log.flush_all_metadata()?;
+        Ok(())
     }
 
     /// Attach the engine-wide operational counters, propagating them to the LSM
@@ -395,146 +412,6 @@ impl KVStore {
         Ok(())
     }
 
-    /// Pre-value-log-open recovery of an interrupted GC swap (file level only).
-    ///
-    /// MUST run before [`ShardedValueLog::open`] opens the bucket files: once a
-    /// file's fd is bound to its inode, a later rename of `bucket_path` would not
-    /// be observed, so any *revert* has to happen here, before the open.
-    ///
-    /// Drives the swap to a consistent on-disk state using the commit marker as
-    /// the durable "swap committed" signal (see [`GCJournal::commit_marker_path`]):
-    /// - **marker present + journal readable** → the swap committed; complete the
-    ///   file rename *forward* idempotently so `bucket_path` is the new file. The
-    ///   journal + marker are left for [`recover_gc_journals`] to apply the LSM
-    ///   pointer updates and clean up.
-    /// - **marker present + journal unreadable** → the swap committed but its LSM
-    ///   updates cannot be reconstructed; **revert** to the preserved old file so
-    ///   the (still-stale) LSM pointers match it again. The GC run is undone and a
-    ///   future GC retries.
-    /// - **marker absent** → the swap never committed (crash before the marker) or
-    ///   fully finalized (marker dropped after the LSM flush). `bucket_path` is
-    ///   authoritative either way; discard staged leftovers and any journal — a
-    ///   journal without a marker must **not** be replayed (its pointers do not
-    ///   match `bucket_path`).
-    ///
-    /// Invariant after this pass: `bucket_path` is fully old or fully new, and a
-    /// journal survives to [`recover_gc_journals`] only when its swap committed
-    /// and `bucket_path` is the new file — so replay is always safe.
-    fn recover_gc_swaps(value_log_path: &Path, num_buckets: usize) -> Result<()> {
-        if !value_log_path.exists() {
-            return Ok(());
-        }
-
-        for bucket in 0..num_buckets as u32 {
-            let journal_path = GCJournal::journal_path(value_log_path, bucket);
-            let marker_present = GCJournal::commit_marker_exists(value_log_path, bucket);
-            let has_journal = journal_path.exists();
-            if !marker_present && !has_journal {
-                continue;
-            }
-
-            let bucket_path = value_log_path.join(format!("value_log_{}.log", bucket));
-            let new_path = value_log_path.join(format!("value_log_{}.log.new", bucket));
-            let old_path = value_log_path.join(format!("value_log_{}.log.old", bucket));
-
-            if marker_present {
-                let journal_ok = has_journal && GCJournal::read(&journal_path).is_some();
-                if journal_ok {
-                    // Complete the swap forward so `bucket_path` is the new file.
-                    // Idempotent: if the renames already finished, `new_path` is
-                    // gone and this is a no-op.
-                    if new_path.exists() {
-                        if bucket_path.exists() && !old_path.exists() {
-                            std::fs::rename(&bucket_path, &old_path)?;
-                        }
-                        std::fs::rename(&new_path, &bucket_path)?;
-                    }
-                    // Journal + marker kept for recover_gc_journals.
-                } else {
-                    // Revert to the preserved old file; the stale LSM pointers
-                    // match it. Restores `bucket_path` whether the renames were
-                    // done (old_path holds the old file) or not (bucket_path is
-                    // already old; old_path absent → nothing to restore).
-                    if old_path.exists() {
-                        std::fs::rename(&old_path, &bucket_path)?;
-                    }
-                    let _ = std::fs::remove_file(&new_path);
-                    let _ = std::fs::remove_file(&journal_path);
-                    GCJournal::delete_commit_marker(value_log_path, bucket)?;
-                }
-            } else {
-                // No commit marker — discard staged leftovers and any journal.
-                let _ = std::fs::remove_file(&new_path);
-                let _ = std::fs::remove_file(&journal_path);
-            }
-
-            fsync_dir(value_log_path)?;
-        }
-
-        Ok(())
-    }
-
-    /// Replay GC journals left by a crash, applying their LSM pointer updates.
-    ///
-    /// Runs *after* [`recover_gc_swaps`] (and after the value log is open), so by
-    /// here every surviving journal belongs to a committed swap whose `bucket_path`
-    /// is already the new file — replaying its new pointers is therefore safe. We
-    /// fix the LSM pointer for each key, then delete the journal and its commit
-    /// marker. This is O(journal entries), not O(all keys).
-    fn recover_gc_journals(lsm: &LSMTree, value_log_path: &Path, num_buckets: usize) -> Result<usize> {
-        let journals = GCJournal::find_journals(value_log_path);
-        if journals.is_empty() {
-            return Ok(0);
-        }
-
-        let mut total_replayed = 0usize;
-
-        for journal_path in &journals {
-            let (bucket, entries) = match GCJournal::read(journal_path) {
-                Some(parsed) => parsed,
-                None => {
-                    // Should be unreachable: recover_gc_swaps already reverted or
-                    // discarded every unreadable journal. Defensively drop it.
-                    let _ = std::fs::remove_file(journal_path);
-                    continue;
-                }
-            };
-
-            // Replay each entry: fix the LSM pointer for this key to its new
-            // (post-swap) location — but ONLY if the key currently still has a
-            // live pointer. If the key was deleted before the crash (its
-            // tombstone is now the live state), re-inserting the journalled
-            // pointer would resurrect it. The journal exists to repair *stale*
-            // pointers into the swapped-away file, not to revive deletions, so a
-            // key that reads as absent is left deleted.
-            for entry in &entries {
-                // Skip keys that are now absent/deleted (don't resurrect), and
-                // re-point survivors under their *existing* sequence so the
-                // relocation preserves the key's version.
-                let Some((_, seq)) = lsm.get_with_seq(&entry.key)? else {
-                    continue;
-                };
-                let new_ptr = ShardedValuePointer::new(entry.new_bucket, entry.new_page_offset, entry.new_segment_id, num_buckets);
-                if let Ok(ptr) = new_ptr {
-                    lsm.insert_with_seq(&entry.key, ptr.to_u128(), seq)?;
-                }
-            }
-
-            total_replayed += entries.len();
-
-            // Journal replayed — drop it and its commit marker.
-            let _ = std::fs::remove_file(journal_path);
-            let _ = GCJournal::delete_commit_marker(value_log_path, bucket);
-        }
-
-        if total_replayed > 0 {
-            // Flush LSM to ensure replayed pointers are persisted.
-            lsm.flush_and_compact_all()?;
-        }
-
-        Ok(total_replayed)
-    }
-
     /// Set the LSM flush observer (used to wire up WAL persistence callbacks)
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
         self.lsm.set_flush_observer(observer);
@@ -543,6 +420,11 @@ impl KVStore {
     /// Set the LSM compaction trigger channel
     pub fn set_compaction_trigger(&self, sender: tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>) {
         *self.lsm_compaction_trigger.write() = Some(sender);
+    }
+
+    /// Set (or clear) the index-checkpoint backpressure valve for this store.
+    pub(crate) fn set_index_checkpoint_trigger(&self, trigger: Option<Arc<IndexCheckpointTrigger>>) {
+        *self.index_checkpoint_trigger.write() = trigger;
     }
 
     // ── Core data operations ───────────────────────────────────────────
@@ -573,40 +455,54 @@ impl KVStore {
         // (targeted at the old value's bucket) instead of scanning every bucket.
         // Only worth a value-log read when the namespace actually has indexes.
         let want_old_for_index = !self.namespace_index.read().is_empty();
+
+        // Hold the bucket lock across the existing-pointer read, the value-log append,
+        // AND the LSM insert. Reading the displaced pointer *inside* the lock is
+        // load-bearing for garbage accounting: two racing same-key writers must not both
+        // observe the same old pointer and each mark it displaced (double-counting it and
+        // leaking the intermediate record). GC re-point is excluded for the same reason.
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let displaced = existing_u128.and_then(decode_sharded_pointer);
         let mut old_value: Option<Vec<u8>> = None;
-        let mut key_existed = false;
-        if let Some(existing) = self.lsm.get(key)?
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
-        {
-            key_existed = true;
+        if let Some(existing_ptr) = displaced {
             if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
                 next_version = meta.version.saturating_add(1);
             }
             if want_old_for_index {
                 old_value = self.value_log.read_value(existing_ptr).ok();
             }
-            let _ = self.value_log.update_record_meta(existing_ptr, None, Some(true), Some(epoch));
         }
 
         let record_meta = ValueRecordMeta {
             version: next_version,
-            tombstone: false,
-            updated: false,
             epoch,
             seq,
         };
+        let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
+        self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
 
-        // Hold the bucket lock across the value-log write AND the LSM insert so that
-        // GC cannot swap the file between the two operations and produce a stale pointer.
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-        let sharded_pointer = self.value_log.write_record_to_locked_bucket(bucket, value, record_meta, false)?;
-        let offset_u128 = sharded_pointer.to_u128();
-        self.lsm.insert_with_seq(key, offset_u128, seq as u32)?;
+        // Account the record that is now garbage — accounting only, no I/O and no
+        // in-place edit (the old record's segment may be sealed and immutable). If this
+        // write won, that is the record it displaced; if it *lost* to a concurrent
+        // higher-sequence write (so the LSM dropped our insert), our own just-appended
+        // record is the dead one instead.
+        if wins {
+            if let Some(old) = displaced {
+                self.value_log.note_displaced(old, key.len());
+            }
+        } else {
+            self.value_log.note_displaced(pointer, key.len());
+        }
         drop(_bucket_guard);
 
-        // Update in-memory field indices
-        self.update_indices_on_put(key, value, old_value.as_deref(), key_existed);
+        // Update in-memory field indices. A lost write is not the key's current value,
+        // so it must not touch the indices.
+        if wins {
+            self.update_indices_on_put(key, value, old_value.as_deref(), displaced.is_some());
+        }
 
         Ok(())
     }
@@ -652,9 +548,23 @@ impl KVStore {
                     }
                 },
             };
+            let dead_bytes = idx.reclaimable_dead_bytes();
+            drop(idx);
             if let Err(e) = result {
                 warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
             }
+            // Backpressure: if this field's append-only blob has piled up enough
+            // dead space, ask the checkpoint worker to compact early instead of
+            // waiting ~15 min (debounced inside the trigger).
+            self.request_checkpoint_if_over_cap(dead_bytes);
+        }
+    }
+
+    /// Signal the index-checkpoint backpressure valve, if wired, with a field's
+    /// current reclaimable dead blob bytes. O(1) and non-blocking.
+    fn request_checkpoint_if_over_cap(&self, dead_bytes: u64) {
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            trigger.request_if_over_cap(dead_bytes);
         }
     }
 
@@ -696,29 +606,26 @@ impl KVStore {
         Ok(FieldReindexOutcome::Reindexed)
     }
 
-    /// Maximum number of generation-stable read attempts before falling back to
-    /// a lock-serialised read. A read only loops when a GC file swap lands in
-    /// the exact window between sampling the LSM pointer and the value, so in
-    /// practice it succeeds on the first attempt; the cap only bounds the
-    /// pathological case of GC churning a single bucket continuously.
-    const MAX_GENERATION_READ_ATTEMPTS: usize = 8;
+    /// Read attempts before falling back to a lock-serialised read. A read only loops
+    /// when GC unlinks a segment in the exact window between resolving the pointer and
+    /// reading it, so in practice it succeeds first time; the cap only bounds the
+    /// pathological case of GC churning one bucket continuously.
+    const MAX_READ_ATTEMPTS: usize = 8;
 
     /// Get a value by key.
     ///
-    /// Reads are lock-free on the common path. Concurrent GC mutates two
-    /// structures the read depends on — the value-log file (swapped under the
-    /// bucket lock, bumping the bucket `generation`)
-    /// and the LSM's SSTable files (swapped during L0→L1 compaction). Either can
-    /// momentarily make a freshly-read pointer inconsistent with the file it is
-    /// read from, surfacing as a transient error or a stale value.
+    /// Two steps: ask the LSM where the value is, then read it there. GC can relocate
+    /// a value between those steps — but it cannot make this read *wrong*. Segments
+    /// are immutable and their ids are never reused, so a pointer GC has superseded
+    /// still resolves to **this key's own bytes** (GC re-points under the key's
+    /// existing sequence, so the relocated record is the same write). The only thing
+    /// that can go wrong is arriving after GC unlinked the segment, which fails
+    /// loudly as [`ValueLogError::SegmentMissing`] — never silently as another key's
+    /// record. So the read simply re-resolves through the LSM (which by then holds the
+    /// new pointer) and retries.
     ///
-    /// The fast path is therefore *optimistic*: we sample the bucket generation
-    /// before and after the pointer+value read and only trust a clean success
-    /// when the generation is unchanged. Any error, or a generation change, is
-    /// treated as a transient race and retried. After
-    /// `MAX_GENERATION_READ_ATTEMPTS` we fall back to a read that holds the
-    /// bucket lock (excluding value-log GC) — the authoritative path that
-    /// guarantees forward progress and surfaces genuine corruption.
+    /// This is what replaced the old generation seqlock, the per-record sequence
+    /// validity check, and their retry ladder.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let result = self.get_inner(key);
         if let Some(m) = self.metrics() {
@@ -729,63 +636,52 @@ impl KVStore {
     }
 
     fn get_inner(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let bucket = self.value_log.bucket_for_key(key);
-
-        for _ in 0..Self::MAX_GENERATION_READ_ATTEMPTS {
-            let gen_before = self.value_log.bucket_generation(bucket);
-            // Odd generation = a GC swap is in progress on this bucket, so the
-            // LSM pointer and the value-log file may disagree right now. Retry.
-            if !gen_before.is_multiple_of(2) {
-                continue;
-            }
-
-            // A transient I/O error from the LSM (e.g. an SSTable file being
-            // swapped by compaction) is retryable, not fatal. Resolve the pointer
-            // together with its write `seq` so we can verify the value record
-            // still belongs to this write.
-            let (offset_u128, lsm_seq) = match self.lsm.get_with_seq(key) {
-                Ok(Some((o, s))) => (o, s),
-                Ok(None) => return Ok(None),
-                Err(_) => continue,
-            };
-            let pointer = match decode_sharded_pointer(offset_u128) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-
-            match self.value_log.read_value_with_seq(pointer) {
-                // Authoritative when: the generation was even and unchanged across
-                // the read (no GC swap raced it) AND the value record's seq matches
-                // the LSM's seq (the slot was not recycled by GC for a different
-                // write). A seq mismatch means a stale/recycled pointer → retry.
-                Ok((value, rec_seq)) if self.value_log.bucket_generation(bucket) == gen_before && (rec_seq as u32) == lsm_seq => {
-                    return Ok(Some(value));
-                }
-                _ => continue,
-            }
-        }
-
-        // Pathological churn: serialise against value-log GC for a consistent
-        // read. Holding the bucket lock means no value-log swap can invalidate
-        // the pointer we read. The LSM's own SSTable compaction is not covered by
-        // this lock (it opens L0 files by path, which a concurrent compaction may
-        // remove), so we still tolerate a transient LSM error here by retrying;
-        // a value-log read error under the lock, by contrast, is genuine.
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         let mut last_err: Option<KVError> = None;
-        for _ in 0..Self::MAX_GENERATION_READ_ATTEMPTS {
-            match self.lsm.get(key) {
-                Ok(Some(offset_u128)) => {
-                    return match decode_sharded_pointer(offset_u128) {
-                        Some(pointer) => Ok(Some(self.value_log.read_value(pointer)?)),
-                        None => Ok(None),
-                    };
-                }
+
+        for _ in 0..Self::MAX_READ_ATTEMPTS {
+            // A transient LSM error (an SSTable being swapped by compaction) is
+            // retryable, not fatal.
+            let offset_u128 = match self.lsm.get(key) {
+                Ok(Some(o)) => o,
                 Ok(None) => return Ok(None),
-                Err(e) => last_err = Some(e.into()),
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let Some(pointer) = decode_sharded_pointer(offset_u128) else {
+                return Ok(None);
+            };
+
+            match self.value_log.read_value(pointer) {
+                Ok(value) => return Ok(Some(value)),
+                // GC reclaimed the segment after relocating this record; the LSM now
+                // holds the new pointer. Re-resolve and read again. This is the ONLY
+                // retryable read error.
+                Err(e) if e.is_segment_missing() => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+                // Corruption or an IO fault is real: surface it immediately instead of
+                // spinning the retry ladder (which is for reclaimed segments) or letting
+                // a caller mistake it for a missing key.
+                Err(e) => return Err(e.into()),
             }
         }
-        Err(last_err.unwrap_or(KVError::CorruptedLog))
+
+        // Pathological GC churn. Holding the bucket write lock excludes GC from this
+        // bucket entirely, so the pointer we resolve cannot be invalidated under us —
+        // this guarantees forward progress and surfaces genuine corruption.
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        match self.lsm.get(key)? {
+            Some(offset_u128) => match decode_sharded_pointer(offset_u128) {
+                Some(pointer) => Ok(Some(self.value_log.read_value(pointer)?)),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+        .map_err(|e: KVError| last_err.unwrap_or(e))
     }
 
     /// Delete a key from storage (creates tombstone in LSM).
@@ -819,17 +715,23 @@ impl KVStore {
         // every bucket. Only when the namespace has indexes to update.
         let want_old_for_index = !self.namespace_index.read().is_empty();
         let mut old_value: Option<Vec<u8>> = None;
+        let mut displaced: Option<ShardedValuePointer> = None;
         if let Some(existing) = self.lsm.get(key)?
             && let Some(existing_ptr) = decode_sharded_pointer(existing)
         {
+            displaced = Some(existing_ptr);
             if want_old_for_index {
                 old_value = self.value_log.read_value(existing_ptr).ok();
             }
-            let _ = self
-                .value_log
-                .update_record_meta(existing_ptr, Some(true), None, Some(current_epoch_millis()));
         }
         self.lsm.delete_with_seq(key, seq as u32)?;
+
+        // The deleted key's record is garbage now. Accounting only — the record itself
+        // is never touched (its segment may be sealed and immutable), and liveness was
+        // never read from the record anyway: the LSM is the authority.
+        if let Some(old) = displaced {
+            self.value_log.note_displaced(old, key.len());
+        }
         drop(_bucket_guard);
 
         // Remove row from all field indices
@@ -866,6 +768,11 @@ impl KVStore {
                 // Prior bytes unavailable → scan to be safe.
                 None => idx.remove_all_for_row(row_id),
             }
+            // A removal also rewrites the value's bitmap append-only, so it adds
+            // to the field's dead space — signal backpressure like the put path.
+            let dead_bytes = idx.reclaimable_dead_bytes();
+            drop(idx);
+            self.request_checkpoint_if_over_cap(dead_bytes);
         }
     }
 
@@ -882,69 +789,13 @@ impl KVStore {
     }
 
     pub fn sync_value_log(&self) -> Result<()> {
-        self.value_log.sync().map_err(|e| {
+        self.value_log.sync_all().map_err(|e| {
             warn!("[KVStore:{}] Value log sync failed: {:?}", self.name, e);
             KVError::from(e)
         })
     }
 
     // ── Iterator support ───────────────────────────────────────────────
-
-    /// Snapshot the GC swap generation of every value-log bucket.
-    fn snapshot_bucket_generations(&self) -> Vec<u64> {
-        (0..self.value_log.num_buckets() as u32)
-            .map(|b| self.value_log.bucket_generation(b))
-            .collect()
-    }
-
-    /// True unless every bucket was demonstrably swap-free for the whole window
-    /// the `snapshot` brackets: each sampled generation must have been **even**
-    /// (no swap in progress when sampled) and **unchanged** now (no swap since).
-    /// An odd sample or any change means a GC swap raced the operation.
-    fn bucket_generations_unstable(&self, snapshot: &[u64]) -> bool {
-        snapshot
-            .iter()
-            .enumerate()
-            .any(|(b, &g)| !g.is_multiple_of(2) || self.value_log.bucket_generation(b as u32) != g)
-    }
-
-    /// Run a batch read closure so its result is consistent with a single
-    /// value-log generation across every bucket it touched.
-    ///
-    /// The batch paths sample `(key, pointer)` from the LSM and *then* capture
-    /// each bucket's current file handle, so a GC swap landing in between could
-    /// pair a pre-swap pointer with the post-swap file and read the wrong record.
-    /// We bracket the whole closure with the per-bucket seqlock generation:
-    /// snapshot every bucket before it runs, re-check after, and trust the result
-    /// only if every sample was **even** (no swap in progress) and **unchanged**
-    /// (no swap completed since) — see [`bucket_generations_unstable`](Self::bucket_generations_unstable).
-    /// On instability we retry; after [`MAX_GENERATION_READ_ATTEMPTS`](Self::MAX_GENERATION_READ_ATTEMPTS)
-    /// we run once more holding every bucket write lock, which excludes GC and so
-    /// is guaranteed swap-free.
-    ///
-    /// This closes the *silent-wrong-value* window (a stale pointer that happens
-    /// to decode to a valid record). The complementary *failed-read* window (a
-    /// stale pointer that fails to decode) is handled by the callers, which
-    /// re-resolve any resolved-but-unreadable key through the single-key
-    /// [`get`](Self::get) *outside* this bracket (calling `get` inside would
-    /// deadlock against the lock-all fallback).
-    fn read_generation_stable<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
-        for _ in 0..Self::MAX_GENERATION_READ_ATTEMPTS {
-            let gens = self.snapshot_bucket_generations();
-            let result = op()?;
-            if !self.bucket_generations_unstable(&gens) {
-                return Ok(result);
-            }
-        }
-        // Pathological GC churn: serialise against GC by holding every bucket
-        // write lock (ascending order — GC only ever holds one bucket lock at a
-        // time, so this cannot deadlock) so no file swap can race the final run.
-        let mut _guards = Vec::with_capacity(self.value_log.num_buckets());
-        for b in 0..self.value_log.num_buckets() as u32 {
-            _guards.push(self.value_log.lock_bucket_for_write(b)?);
-        }
-        op()
-    }
 
     pub fn keys(&self) -> Result<Vec<Vec<u8>>> {
         self.lsm.keys().map_err(KVError::from)
@@ -967,12 +818,10 @@ impl KVStore {
     pub fn resolve_entries(&self, keys: Vec<Vec<u8>>) -> Result<Vec<ResolvedEntry>> {
         let mut entries = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some((offset_u128, seq)) = self.lsm.get_with_seq(&key)?
+            if let Some(offset_u128) = self.lsm.get(&key)?
                 && let Some(pointer) = decode_sharded_pointer(offset_u128)
             {
-                let log = self.value_log.get_bucket_log(pointer.bucket)?;
-                let file = log.get_file();
-                entries.push((key, pointer, file, seq));
+                entries.push((key, pointer));
             }
         }
         Ok(entries)
@@ -980,26 +829,21 @@ impl KVStore {
 
     pub fn resolve_entries_from_pointers(&self, key_pointers: Vec<KeyPointer>) -> Result<Vec<ResolvedEntry>> {
         let mut entries = Vec::with_capacity(key_pointers.len());
-        for (key, offset_u128, seq) in key_pointers {
+        for (key, offset_u128, _seq) in key_pointers {
             if let Some(pointer) = decode_sharded_pointer(offset_u128) {
-                let log = self.value_log.get_bucket_log(pointer.bucket)?;
-                let file = log.get_file();
-                entries.push((key, pointer, file, seq));
+                entries.push((key, pointer));
             }
         }
         Ok(entries)
     }
 
-    /// Tombstone records whose creation epoch is older than `ttl`.
+    /// Delete records whose creation epoch is older than `ttl`.
     ///
-    /// Scans live keys, reads each record's `epoch` straight from the value log,
-    /// and deletes those that have aged past `ttl` (already-tombstoned records are
-    /// skipped). At most `max_deletes_per_run` records are removed per call so a
-    /// single pass can't stall on a huge backlog; the value-log GC reclaims the
-    /// physical space afterwards. Returns the number of records tombstoned.
-    ///
-    /// This is the work the global TTL worker schedules for each TTL-enabled
-    /// namespace; the expiry policy lives here on the store that owns the data.
+    /// Scans live keys and reads each record's `epoch` straight from the value log
+    /// (a 36-byte header read — no value bytes). At most `max_deletes_per_run`
+    /// records are removed per call so a single pass can't stall on a huge backlog;
+    /// value-log GC reclaims the physical space afterwards. Returns the number
+    /// deleted.
     pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
@@ -1008,27 +852,15 @@ impl KVStore {
         let entries = self.resolve_entries(keys)?;
 
         let mut deleted = 0usize;
-
-        for (key, pointer, file, _seq) in entries {
+        for (key, pointer) in entries {
             if deleted >= max_deletes_per_run {
                 break;
             }
-
-            let bucket_log = match self.value_log.get_bucket_log(pointer.bucket) {
-                Ok(log) => log,
-                Err(_) => continue,
-            };
-
-            let meta = match bucket_log.read_record_meta_from_file(&file, pointer.location) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            // Skip already-tombstoned records.
-            if meta.tombstone {
+            // The LSM listed this key, so it is live by definition — there is no
+            // "already tombstoned" record state to skip any more.
+            let Ok(meta) = self.value_log.read_record_meta(pointer) else {
                 continue;
-            }
-
+            };
             if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
                 self.delete_from_storage(&key)?;
                 deleted += 1;
@@ -1047,23 +879,21 @@ impl KVStore {
     /// Returns one `Option<Vec<u8>>` per input key in the same order.
     /// Missing keys and I/O errors both produce `None`.
     pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        // Bracket the resolve-then-read against GC file swaps (see
-        // `read_generation_stable`); the inner read
-        // is infallible, so the wrapper only ever errors from the lock fallback,
-        // which we treat as "all missing" to preserve the infallible signature.
-        let (mut results, retry) = self
-            .read_generation_stable(|| Ok(self.get_multiple_inner(keys)))
-            .unwrap_or_else(|_| (vec![None; keys.len()], Vec::new()));
+        let (mut results, retry) = self.get_multiple_inner(keys);
 
-        // A key that `lsm.get_multiple` resolved to a pointer but whose value read
-        // came back `None` hit the brief GC window where the LSM pointer and the
-        // value-log file momentarily disagree. Re-resolve those — and only those —
-        // through the single-key `get`, which retries the resolve+read together
-        // and falls back to a lock-held read, so it sees a consistent pair. This
-        // runs OUTSIDE the generation bracket: `get` may take a bucket lock, which
-        // would deadlock against the bracket's lock-all fallback.
+        // Keys that resolved to a pointer but whose value could not be read: usually GC
+        // reclaimed the segment between the LSM lookup and the read, and the LSM now
+        // holds the new pointer, so re-resolving through the single-key `get` succeeds.
+        // But `get` can also return a *hard* error (corruption, IO fault) — which the
+        // reclaimed-segment retry inside `get` no longer masks. This method's public
+        // signature is `Vec<Option>`, so it cannot surface a per-key error; log it so a
+        // genuine corruption is visible rather than silently indistinguishable from a
+        // missing key.
         for idx in retry {
-            results[idx] = self.get(&keys[idx]).ok().flatten();
+            match self.get(&keys[idx]) {
+                Ok(value) => results[idx] = value,
+                Err(e) => warn!("[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}", self.name, e),
+            }
         }
         results
     }
@@ -1080,95 +910,63 @@ impl KVStore {
             return (results, Vec::new());
         };
 
-        struct Entry {
-            orig_idx: usize,
-            pointer: ShardedValuePointer,
-            file: Arc<File>,
-            /// LSM's seq for this key — the value record must carry the same low
-            /// u32, or the slot was recycled (stale pointer) and must be refetched.
-            lsm_seq: u32,
-        }
-        let mut found: Vec<Entry> = Vec::new();
+        // ── Step 2: group the pointers by value-log bucket ────────────────────
+        let num_buckets = self.value_log.num_buckets();
+        let mut bucket_work: Vec<Vec<(usize, ValueLocation)>> = (0..num_buckets).map(|_| Vec::new()).collect();
+        let mut resolved: Vec<usize> = Vec::new();
         for (orig_idx, pointer_opt) in pointers.into_iter().enumerate() {
-            if let Some((offset_u128, lsm_seq)) = pointer_opt
+            if let Some((offset_u128, _seq)) = pointer_opt
                 && let Some(pointer) = decode_sharded_pointer(offset_u128)
-                && let Ok(log) = self.value_log.get_bucket_log(pointer.bucket)
+                && (pointer.bucket as usize) < num_buckets
             {
-                found.push(Entry {
-                    orig_idx,
-                    pointer,
-                    file: log.get_file(),
-                    lsm_seq,
-                });
+                bucket_work[pointer.bucket as usize].push((orig_idx, pointer.location));
+                resolved.push(orig_idx);
             }
         }
-
-        if found.is_empty() {
+        if resolved.is_empty() {
             return (results, Vec::new());
         }
-        // Expected seq per original index, to validate each value read against.
-        let mut expected_seq: Vec<Option<u32>> = vec![None; keys.len()];
-        for e in &found {
-            expected_seq[e.orig_idx] = Some(e.lsm_seq);
-        }
 
-        // ── Step 2: group by value-log bucket ────────────────────────────────
-        let num_buckets = self.value_log.num_buckets();
-        let mut bucket_work: Vec<Vec<(usize, ShardedValuePointer, Arc<File>)>> = (0..num_buckets).map(|_| Vec::new()).collect();
-        for entry in &found {
-            bucket_work[entry.pointer.bucket as usize].push((entry.orig_idx, entry.pointer, entry.file.clone()));
-        }
-
-        // ── Step 3: parallel reads per bucket ────────────────────────────────
-        // A read counts only if the record's seq matches the LSM's seq for that
-        // key; a mismatch means GC recycled the slot for a different write, so we
-        // leave the slot `None` and let the caller refetch it via single `get`.
+        // ── Step 3: read each bucket's values in parallel ─────────────────────
+        // No sequence validation: a segment id is never reused, so a pointer cannot
+        // resolve to another key's record. A read can only fail outright — its
+        // segment was reclaimed by GC — and those keys are re-resolved below.
         std::thread::scope(|s| {
             let handles: Vec<_> = bucket_work
                 .iter()
-                .filter(|b| !b.is_empty())
-                .map(|bucket| s.spawn(|| self.value_log.read_values_batch(bucket)))
+                .enumerate()
+                .filter(|(_, work)| !work.is_empty())
+                .map(|(bucket, work)| s.spawn(move || self.value_log.read_values_batch(bucket as u32, work)))
                 .collect();
             for handle in handles {
                 if let Ok(batch) = handle.join() {
                     for (idx, val) in batch {
-                        if let Some((bytes, rec_seq)) = val
-                            && expected_seq[idx] == Some(rec_seq as u32)
-                        {
-                            results[idx] = Some(bytes);
-                        }
+                        results[idx] = val;
                     }
                 }
             }
         });
 
-        // Entries we resolved to a pointer but couldn't read, or whose value
-        // record's seq did not match (recycled slot) → re-resolve via the
-        // single-key `get`, which retries the resolve+read together (and itself
-        // validates the seq) under the generation/lock fallback.
-        let retry: Vec<usize> = found.iter().map(|e| e.orig_idx).filter(|&idx| results[idx].is_none()).collect();
+        // Keys we resolved to a pointer but could not read: GC reclaimed the segment
+        // between the LSM lookup and the read. The LSM now holds the new pointer, so
+        // the caller re-resolves them through the single-key `get`.
+        let retry: Vec<usize> = resolved.into_iter().filter(|&idx| results[idx].is_none()).collect();
 
         (results, retry)
     }
 
     /// Scan multiple 4-byte BE cluster prefixes in a single pass.
     ///
-    /// Uses `lsm.scan_prefixes` to read each bucket's level1
-    /// SSTable **once** into memory and check all cluster prefixes in a single
-    /// in-memory pass — replacing N_clusters × num_buckets full linear scans
-    /// (each with per-entry pread() syscalls) with exactly num_buckets large
-    /// reads followed by CPU-only work.
+    /// Uses `lsm.scan_prefixes` to read each bucket's level1 SSTable **once** into
+    /// memory and check all cluster prefixes in a single in-memory pass — replacing
+    /// N_clusters × num_buckets full linear scans with exactly num_buckets large reads
+    /// followed by CPU-only work.
     ///
-    /// Returns a map from `prefix_id` to `(key_bytes, value_bytes)` pairs.
-    /// Keys shorter than 4 bytes or with no matching pointer are silently skipped.
-    ///
-    /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads (here in `scan_prefixes_batch_inner`) must stay inside
-    /// `read_generation_stable`.
+    /// Returns a map from `prefix_id` to `(key_bytes, value_bytes)` pairs. Keys
+    /// shorter than 4 bytes or with no matching pointer are silently skipped.
     pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<PrefixBatchResult> {
-        let (mut result, retry) = self.read_generation_stable(|| self.scan_prefixes_batch_inner(prefix_ids))?;
-        // Re-resolve keys dropped to a transient GC race via the single-key path
-        // (outside the bracket — see [`refetch_dropped`](Self::refetch_dropped)).
+        let (mut result, retry) = self.scan_prefixes_batch_inner(prefix_ids)?;
+        // Keys whose segment GC reclaimed mid-scan: re-resolve through the LSM.
         for (prefix_id, key) in retry {
             if let Some(v) = self.get(&key)? {
                 result.entry(prefix_id).or_default().push((key, v));
@@ -1178,67 +976,49 @@ impl KVStore {
     }
 
     fn scan_prefixes_batch_inner(&self, prefix_ids: &[u32]) -> Result<(PrefixBatchResult, Vec<PrefixIdKey>)> {
-        // ── Step 1: single-pass LSM scan across all prefixes ──────────────────
-        // Reads each bucket's level1 file ONCE instead of once per prefix.
         let prefix_id_set: std::collections::HashSet<u32> = prefix_ids.iter().copied().collect();
         struct Entry {
             prefix_id: u32,
             key: Vec<u8>,
             pointer: ShardedValuePointer,
-            file: Arc<File>,
         }
         let mut all_entries: Vec<Entry> = Vec::new();
-        let key_pointers = self.lsm.scan_prefixes(&prefix_id_set)?;
-        for (key, offset_u128) in key_pointers {
+        for (key, offset_u128) in self.lsm.scan_prefixes(&prefix_id_set)? {
             if key.len() < 4 {
                 continue;
             }
             let prefix_id = u32::from_be_bytes(key[..4].try_into().unwrap());
             if let Some(pointer) = decode_sharded_pointer(offset_u128) {
-                let log = self.value_log.get_bucket_log(pointer.bucket)?;
-                let file = log.get_file();
-                all_entries.push(Entry {
-                    prefix_id,
-                    key,
-                    pointer,
-                    file,
-                });
+                all_entries.push(Entry { prefix_id, key, pointer });
             }
         }
-
         if all_entries.is_empty() {
             return Ok((std::collections::HashMap::new(), Vec::new()));
         }
 
-        // ── Step 2: group ALL entries across all prefixes by value-log bucket ──
         let num_buckets = self.value_log.num_buckets();
-        let mut bucket_work: Vec<Vec<(usize, ShardedValuePointer, Arc<File>)>> = (0..num_buckets).map(|_| Vec::new()).collect();
+        let mut bucket_work: Vec<Vec<(usize, ValueLocation)>> = (0..num_buckets).map(|_| Vec::new()).collect();
         for (idx, entry) in all_entries.iter().enumerate() {
-            bucket_work[entry.pointer.bucket as usize].push((idx, entry.pointer, entry.file.clone()));
+            bucket_work[entry.pointer.bucket as usize].push((idx, entry.pointer.location));
         }
 
-        // ── Step 3: exactly num_buckets threads read all values ───────────────
         let mut values: Vec<Option<Vec<u8>>> = vec![None; all_entries.len()];
         std::thread::scope(|s| {
             let handles: Vec<_> = bucket_work
                 .iter()
-                .filter(|b| !b.is_empty())
-                .map(|bucket| s.spawn(|| self.value_log.read_values_batch(bucket)))
+                .enumerate()
+                .filter(|(_, work)| !work.is_empty())
+                .map(|(bucket, work)| s.spawn(move || self.value_log.read_values_batch(bucket as u32, work)))
                 .collect();
             for handle in handles {
                 if let Ok(results) = handle.join() {
                     for (idx, val) in results {
-                        // TODO(scan seq-check): validate val's seq against the LSM seq
-                        // once scan resolution carries it (INC2 step 5). For now take
-                        // the value; correctness for scans still relies on the
-                        // generation bracket until then.
-                        values[idx] = val.map(|(bytes, _seq)| bytes);
+                        values[idx] = val;
                     }
                 }
             }
         });
 
-        // ── Step 4: group by prefix_id; entries that read None → retry ────────
         let mut result: PrefixBatchResult = std::collections::HashMap::new();
         let mut retry: Vec<(u32, Vec<u8>)> = Vec::new();
         for (entry, val_opt) in all_entries.into_iter().zip(values) {
@@ -1252,48 +1032,41 @@ impl KVStore {
 
     /// Parallel value-log reads for a pre-built entry list.
     ///
-    /// Groups entries by value-log bucket and reads each bucket in a dedicated
-    /// scoped thread, then zips keys back with their values. Returns
-    /// `(pairs, retry_keys)`: `retry_keys` are keys that had a pointer but read
-    /// `None` — a transient GC race the caller re-resolves via [`get`](Self::get).
+    /// Groups entries by value-log bucket and reads each bucket in a scoped thread.
+    /// Returns `(pairs, retry_keys)`: `retry_keys` are keys whose pointer resolved but
+    /// whose segment GC reclaimed before the read — the caller re-resolves them via
+    /// [`get`](Self::get).
     fn batch_read_from_entries(&self, entries: Vec<ResolvedEntry>) -> Result<(Vec<KeyValue>, Vec<Vec<u8>>)> {
         if entries.is_empty() {
             return Ok((vec![], vec![]));
         }
         let n = entries.len();
         let num_buckets = self.value_log.num_buckets();
-        let mut bucket_work: Vec<Vec<(usize, ShardedValuePointer, Arc<File>)>> = (0..num_buckets).map(|_| Vec::new()).collect();
-        // Expected seq per entry index, to validate the value record against.
-        let mut expected_seq: Vec<u32> = vec![0; n];
-        for (idx, (_, pointer, file, seq)) in entries.iter().enumerate() {
-            bucket_work[pointer.bucket as usize].push((idx, *pointer, file.clone()));
-            expected_seq[idx] = *seq;
+        let mut bucket_work: Vec<Vec<(usize, ValueLocation)>> = (0..num_buckets).map(|_| Vec::new()).collect();
+        for (idx, (_, pointer)) in entries.iter().enumerate() {
+            bucket_work[pointer.bucket as usize].push((idx, pointer.location));
         }
+
         let mut values: Vec<Option<Vec<u8>>> = vec![None; n];
         std::thread::scope(|s| {
             let handles: Vec<_> = bucket_work
                 .iter()
-                .filter(|b| !b.is_empty())
-                .map(|bucket| s.spawn(|| self.value_log.read_values_batch(bucket)))
+                .enumerate()
+                .filter(|(_, work)| !work.is_empty())
+                .map(|(bucket, work)| s.spawn(move || self.value_log.read_values_batch(bucket as u32, work)))
                 .collect();
             for handle in handles {
                 if let Ok(results) = handle.join() {
                     for (idx, val) in results {
-                        // A value counts only if its record seq matches the LSM
-                        // seq; a mismatch means GC recycled the slot for a different
-                        // write → leave None so `refetch_dropped` re-resolves it.
-                        if let Some((bytes, rec_seq)) = val
-                            && rec_seq as u32 == expected_seq[idx]
-                        {
-                            values[idx] = Some(bytes);
-                        }
+                        values[idx] = val;
                     }
                 }
             }
         });
+
         let mut pairs = Vec::with_capacity(n);
         let mut retry = Vec::new();
-        for ((key, _, _, _), val) in entries.into_iter().zip(values) {
+        for ((key, _), val) in entries.into_iter().zip(values) {
             match val {
                 Some(v) => pairs.push((key, v)),
                 None => retry.push(key),
@@ -1302,6 +1075,9 @@ impl KVStore {
         Ok((pairs, retry))
     }
 
+    /// Re-resolve keys whose segment was reclaimed between the LSM scan and the value
+    /// read, through the single-key [`get`](Self::get). A key that now reads as absent
+    /// was concurrently deleted and is correctly left out.
     /// Re-resolve keys a batch read dropped due to a transient GC race, via the
     /// single-key [`get`](Self::get) (which retries resolve+read together and
     /// falls back to a lock-held read). Must be called OUTSIDE the generation
@@ -1323,16 +1099,12 @@ impl KVStore {
     /// `lsm.get()` re-lookup — then values are read in parallel per bucket.
     ///
     /// INVARIANT: the LSM scan, the file-handle capture, and the value reads MUST all
-    /// stay inside the `read_generation_stable`
-    /// closure. Resolving a pointer outside the bracket reopens the wrong-file window
     /// closed in 420ac8e — the LSM scan's own snapshot does not protect against
     /// value-log GC.
     pub fn scan_prefix_batch(&self, prefix: &[u8]) -> Result<Vec<KeyValue>> {
-        let (mut pairs, retry) = self.read_generation_stable(|| {
-            let key_pointers = self.lsm.scan_prefix(prefix)?;
-            let entries = self.resolve_entries_from_pointers(key_pointers)?;
-            self.batch_read_from_entries(entries)
-        })?;
+        let key_pointers = self.lsm.scan_prefix(prefix)?;
+        let entries = self.resolve_entries_from_pointers(key_pointers)?;
+        let (mut pairs, retry) = self.batch_read_from_entries(entries)?;
         self.refetch_dropped(&mut pairs, retry)?;
         if let Some(m) = self.metrics() {
             m.record_scan(pairs.len() as u64);
@@ -1346,13 +1118,10 @@ impl KVStore {
     /// `lsm.get()` that the old `range_keys` + `collect_kv_pairs` path performed.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_range_batch(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<KeyValue>> {
-        let (mut pairs, retry) = self.read_generation_stable(|| {
-            let key_pointers = self.lsm.range_pointers_bounded(start, end, usize::MAX)?;
-            let entries = self.resolve_entries_from_pointers(key_pointers)?;
-            self.batch_read_from_entries(entries)
-        })?;
+        let key_pointers = self.lsm.range_pointers_bounded(start, end, usize::MAX)?;
+        let entries = self.resolve_entries_from_pointers(key_pointers)?;
+        let (mut pairs, retry) = self.batch_read_from_entries(entries)?;
         self.refetch_dropped(&mut pairs, retry)?;
         if let Some(m) = self.metrics() {
             m.record_scan(pairs.len() as u64);
@@ -1370,18 +1139,14 @@ impl KVStore {
     /// page's keys (not the whole tail of the keyspace) are resolved.
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
-    /// LSM scan + value reads must stay inside `read_generation_stable`.
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
         let start = cursor.unwrap_or(&[]);
-        let ((mut pairs, retry), next_cursor) = self.read_generation_stable(|| {
-            let key_pointers = self.lsm.range_pointers_bounded(start, end, limit + 1)?;
-            let has_more = key_pointers.len() > limit;
-            let next_cursor = if has_more { Some(key_pointers[limit].0.clone()) } else { None };
-            let page_kps: Vec<_> = key_pointers.into_iter().take(limit).collect();
-            let entries = self.resolve_entries_from_pointers(page_kps)?;
-            let pairs_retry = self.batch_read_from_entries(entries)?;
-            Ok((pairs_retry, next_cursor))
-        })?;
+        let key_pointers = self.lsm.range_pointers_bounded(start, end, limit + 1)?;
+        let has_more = key_pointers.len() > limit;
+        let next_cursor = if has_more { Some(key_pointers[limit].0.clone()) } else { None };
+        let page_kps: Vec<_> = key_pointers.into_iter().take(limit).collect();
+        let entries = self.resolve_entries_from_pointers(page_kps)?;
+        let (mut pairs, retry) = self.batch_read_from_entries(entries)?;
         self.refetch_dropped(&mut pairs, retry)?;
         if let Some(m) = self.metrics() {
             m.record_scan(pairs.len() as u64);
@@ -1391,67 +1156,16 @@ impl KVStore {
 
     // ── Startup / cleanup ──────────────────────────────────────────────
 
-    /// Cleanup old files from previous runs
+    /// Remove stale LSM files left by an interrupted compaction.
+    ///
+    /// The value log needs no startup cleanup any more: GC never writes a shadow file
+    /// and never swaps one in, so there is nothing half-finished to roll forward or
+    /// back. Its only mutation of existing state is unlinking a segment, which only
+    /// happens after the re-point is durable.
     pub fn cleanup_old_files_on_startup(&self) -> Result<()> {
-        // Cleanup LSM old SSTable files
         self.lsm
             .cleanup_old_files_on_startup()
-            .map_err(|e| KVError::Io(std::io::Error::other(format!("Failed to cleanup LSM old files: {:?}", e))))?;
-
-        // Cleanup ValueLog old files (16 buckets)
-        for bucket in 0u32..self.value_log.num_buckets() as u32 {
-            let active_path = self.value_log_path.join(format!("value_log_{}.log", bucket));
-            let old_value_log = self.value_log_path.join(format!("value_log_{}.log.old", bucket));
-            if !old_value_log.exists() {
-                continue;
-            }
-
-            let probe_ok = self.probe_bucket_readable(bucket);
-            if probe_ok {
-                match std::fs::remove_file(&old_value_log) {
-                    Ok(_) => info!("[STARTUP:{}] Cleaned up old value log: value_log_{}.log.old", self.name, bucket),
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        warn!("[STARTUP:{}] Failed to cleanup old value log: {:?}", self.name, e);
-                    }
-                    _ => {}
-                }
-            } else {
-                info!("[STARTUP:{}] GC was interrupted for bucket {}; rolling back", self.name, bucket);
-                if let Err(e) = std::fs::remove_file(&active_path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("[STARTUP:{}] Failed to remove partial GC file: {:?}", self.name, e);
-                    continue;
-                }
-                if let Err(e) = std::fs::rename(&old_value_log, &active_path) {
-                    warn!("[STARTUP:{}] Failed to restore old value log: {:?}", self.name, e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn probe_bucket_readable(&self, bucket: u32) -> bool {
-        let keys = match self.lsm.keys() {
-            Ok(k) => k,
-            Err(_) => return true,
-        };
-        for key in keys {
-            let u128_val = match self.lsm.get(&key) {
-                Ok(Some(v)) => v,
-                _ => continue,
-            };
-            let ptr = match decode_sharded_pointer(u128_val) {
-                Some(p) => p,
-                None => continue,
-            };
-            if ptr.bucket != bucket {
-                continue;
-            }
-            return self.value_log.read_value(ptr).is_ok();
-        }
-        true
+            .map_err(|e| KVError::Io(std::io::Error::other(format!("Failed to cleanup LSM old files: {:?}", e))))
     }
 
     // ── Recovery (replay WAL entries into this namespace) ──────────────
@@ -1462,526 +1176,305 @@ impl KVStore {
     pub fn replay_upsert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
         let mut next_version = 1u32;
-        if let Ok(Some(existing)) = self.lsm.get(key)
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
+
+        // Read the displaced pointer and decide the winner inside the bucket lock, as
+        // the live put path does — replay reuses that path's accounting exactly.
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let displaced = existing_u128.and_then(decode_sharded_pointer);
+        if let Some(existing_ptr) = displaced
+            && let Ok(meta) = self.value_log.read_record_meta(existing_ptr)
         {
-            if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
-                next_version = meta.version.saturating_add(1);
-            }
-            let _ = self.value_log.update_record_meta(existing_ptr, None, Some(true), Some(epoch));
+            next_version = meta.version.saturating_add(1);
         }
 
         let record_meta = ValueRecordMeta {
             version: next_version,
-            tombstone: false,
-            updated: false,
             epoch,
             seq,
         };
-
-        let sharded_pointer = self
-            .value_log
-            .write_record(key, value, record_meta, false)
-            .map_err(|e| KVError::Io(std::io::Error::other(format!("Failed to write to value log during recovery: {:?}", e))))?;
-        let offset_u128 = sharded_pointer.to_u128();
-        self.lsm.insert_with_seq(key, offset_u128, seq as u32)?;
-        Ok(())
-    }
-
-    /// Replay a delete WAL entry into this namespace's storage, stamped with the
-    /// entry's original WAL sequence (see [`replay_upsert`](Self::replay_upsert)).
-    pub fn replay_delete(&self, key: &[u8], seq: u64) -> Result<()> {
-        if let Ok(Some(existing)) = self.lsm.get(key)
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
-        {
-            let _ = self
-                .value_log
-                .update_record_meta(existing_ptr, Some(true), None, Some(current_epoch_millis()));
+        let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
+        self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
+        if wins {
+            if let Some(old) = displaced {
+                self.value_log.note_displaced(old, key.len());
+            }
+        } else {
+            self.value_log.note_displaced(pointer, key.len());
         }
-        self.lsm.delete_with_seq(key, seq as u32)?;
+        drop(_bucket_guard);
+
+        if wins {
+            self.update_indices_on_put(key, value, None, displaced.is_some());
+        }
         Ok(())
     }
 
-    /// Flush all recovered entries to SSTables
+    /// Replay a WAL delete into this namespace's storage, under the entry's original
+    /// sequence (see [`replay_upsert`](Self::replay_upsert)).
+    pub fn replay_delete(&self, key: &[u8], seq: u64) -> Result<()> {
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        let displaced = self.lsm.get(key).ok().flatten().and_then(decode_sharded_pointer);
+        self.lsm.delete_with_seq(key, seq as u32)?;
+        if let Some(old) = displaced {
+            self.value_log.note_displaced(old, key.len());
+        }
+        drop(_bucket_guard);
+
+        self.update_indices_on_delete(key, None);
+        Ok(())
+    }
+
     pub fn flush_and_compact_all(&self) -> Result<()> {
         self.lsm.flush_and_compact_all().map_err(KVError::from)
     }
 
     // ── Garbage collection ─────────────────────────────────────────────
 
-    /// Compact a single bucket with selective page compaction (Optimization 4).
+    /// GC one bucket: rewrite the survivors of its worst segments, and hand back the
+    /// segments that become safe to unlink *once the re-point is durable*.
     ///
-    /// Scans per-page garbage stats. Clean pages (garbage < 50%) are block-copied
-    /// to the new file at the same offset — their pointers remain valid, so no LSM
-    /// updates are needed. Dirty pages are rewritten with only live records into
-    /// fresh pages appended at the end, requiring LSM pointer updates.
-    fn compact_single_bucket(&self, bucket: u32, reclaim_cutoff_epoch: u64, page_gc_threshold_pct: f64) -> Result<BucketGCResult> {
-        let old_meta = self.value_log.get_bucket_metadata(bucket)?;
-
-        let bucket_path = self.value_log.base_path().join(format!("value_log_{}.log", bucket));
-        let new_path = self.value_log.base_path().join(format!("value_log_{}.log.new", bucket));
-        let old_path = bucket_path.with_extension("log.old");
-
-        if old_path.exists() {
-            let _ = std::fs::remove_file(&old_path);
-        }
-
-        // Acquire the bucket lock before scanning LSM so that no concurrent write
-        // can write to the value log and update the LSM between the two steps.
-        // Any write that already holds this lock will complete (both value-log write
-        // and LSM insert) before we proceed, giving us a consistent snapshot.
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-
-        // Scan LSM for entries belonging to this bucket under the lock. We keep
-        // the *original* encoded pointer (`offset_u128`) alongside the decoded
-        // form: the reinsert step below uses it as a compare-and-set witness so
-        // a key that was deleted or overwritten since this snapshot is not
-        // resurrected by GC's relocation.
-        let kv_pairs = self.lsm.key_pointer_pairs(None)?;
-        let entries: Vec<(Vec<u8>, u128, ShardedValuePointer)> = kv_pairs
-            .into_iter()
-            .filter_map(|(key, offset_u128)| {
-                decode_sharded_pointer(offset_u128)
-                    .filter(|p| p.bucket == bucket)
-                    .map(|p| (key, offset_u128, p))
-            })
-            .collect();
+    /// **Phase 1 (no lock):** read the segment sequentially. Every record carries its
+    /// **key**, so liveness is one LSM point-get per record — a record survives iff the
+    /// LSM still points at exactly this location. This is why GC's cost is proportional
+    /// to the segment rather than to the whole bucket or the whole key set. The segment
+    /// is sealed and immutable, so nothing can change it under us.
+    ///
+    /// **Phase 2 (bucket lock):** relocate each survivor as a **compare-and-set** —
+    /// append it to the active tail and update the LSM only if the key *still* maps to
+    /// the old location. Phase 1 was not atomic with concurrent writers, so a key
+    /// deleted since then must stay deleted and one overwritten since then must keep
+    /// its newer value. The relocation re-inserts under the key's **existing sequence**,
+    /// so moving a record never changes its version.
+    ///
+    /// The old segment is deliberately **not** unlinked here — see
+    /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
+    fn compact_bucket(&self, bucket: u32, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<BucketGCResult> {
         let log = self.value_log.get_bucket_log(bucket)?;
-        let old_file = log.get_file();
-
-        let page_stats = log.scan_all_page_stats(&old_file, &old_meta)?;
-
-        // Classify pages as dirty (needs rewrite) or clean (copy as-is)
-        let mut dirty_pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for stats in &page_stats {
-            if stats.garbage_ratio_pct() >= page_gc_threshold_pct {
-                dirty_pages.insert(stats.page_offset);
-            }
-        }
-
-        // If no pages are dirty, skip this bucket entirely
-        if dirty_pages.is_empty() {
-            drop(_bucket_guard);
-            return Ok(BucketGCResult {
-                bytes_reclaimed: 0,
-                bytes_live: old_meta.live_bytes,
-                old_path: None,
-                new_metadata: old_meta.clone(),
-                old_metadata: old_meta,
-                bucket,
-                had_dirty_pages: false,
-                had_journal: false,
-            });
-        }
-
-        // The replacement file MUST use the bucket's page size: clean pages are
-        // copied to identical offsets and their pointers are left untouched, so a
-        // different page size here would reinterpret every one of them.
-        let page_size = self.value_log.page_size();
-        let new_log = ValueLog::open_with_page_size(&new_path, page_size)?;
-        let new_file = new_log.get_file();
-
-        // Track live/garbage bytes for the new file
-        let mut new_live_bytes = 0u64;
-        let mut new_garbage_bytes = 0u64;
-
-        // Step 1: Copy clean pages as-is at their original offsets.
-        // Pointers (page_offset + segment_id) remain valid → no LSM updates needed.
-        for stats in &page_stats {
-            if !dirty_pages.contains(&stats.page_offset) {
-                ValueLog::copy_page_raw(&old_file, &new_file, stats.page_offset, page_size)?;
-                new_live_bytes += stats.live_bytes;
-                new_garbage_bytes += stats.garbage_bytes;
-            }
-        }
-
-        // Step 2: Rewrite dirty page records into fresh pages.
-        //
-        // Start the rewrite just past the highest CLEAN page we copied in step 1
-        // (or at offset 0 when every page is dirty). This is safe — every clean
-        // copy sits at or below that offset, so the survivors can never collide
-        // with one — and it keeps the file compact: the survivors reuse the freed
-        // pages above the clean region each cycle instead of being appended past
-        // `tail` forever. Appending at `tail` (the old behaviour) made an
-        // overwrite/delete-heavy value log grow without bound — every GC
-        // abandoned the vacated pages as holes and pushed `tail` up by the churn.
-        let fresh_page_start = page_stats
-            .iter()
-            .filter(|s| !dirty_pages.contains(&s.page_offset))
-            .map(|s| s.page_offset)
-            .max()
-            .map(|highest_clean| highest_clean.saturating_add(page_size))
-            .unwrap_or(0);
-        let mut new_meta = ValueLogMetadata {
-            head: 0,
-            // tail must always be current_page_offset + one page. Initialising it
-            // equal to current_page_offset causes write_record to overwrite the
-            // current page when the page boundary is first crossed.
-            tail: fresh_page_start.saturating_add(page_size),
-            current_page_offset: fresh_page_start,
-            current_page_free_offset: 0, // will be set by ensure_current_page
-            current_page_table_offset: page_size as u32,
-            current_page_next_segment_id: 1,
-            total_gc_runs: 0,
-            total_bytes_reclaimed: 0,
-            live_bytes: 0,
-            garbage_bytes: 0,
-        };
-        // Initialize the first fresh page
-        new_log.ensure_current_page(&mut new_meta)?;
-
-        // Each entry: (key, old encoded pointer, new pointer). The old pointer is
-        // the compare-and-set witness used at reinsert time.
-        let mut lsm_updates: Vec<(Vec<u8>, u128, ShardedValuePointer)> = Vec::new();
-
-        for (key, old_u128, pointer) in entries.iter() {
-            // Only process entries that point to dirty pages
-            if !dirty_pages.contains(&pointer.location.page_offset) {
-                continue;
-            }
-
-            let value = match self.value_log.read_value_with_file(*pointer, &old_file) {
-                Ok(v) => v,
-                Err(_) => {
-                    let latest = self.lsm.get(key)?.ok_or(KVError::KeyNotFound)?;
-                    let resolved = ShardedValuePointer::from_u128(latest).map_err(|e| {
-                        KVError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Invalid sharded pointer: {:?}", e),
-                        ))
-                    })?;
-                    match self.value_log.read_value(resolved) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    }
-                }
-            };
-
-            let record_meta = self.value_log.read_record_meta(*pointer).unwrap_or(ValueRecordMeta {
-                version: 1,
-                tombstone: false,
-                updated: false,
-                epoch: current_epoch_millis(),
-                seq: 0,
-            });
-
-            if (record_meta.tombstone || record_meta.updated) && record_meta.epoch <= reclaim_cutoff_epoch {
-                continue;
-            }
-
-            // Write live record to fresh pages in the new file
-            let new_location = new_log.write_record(&value, record_meta, &mut new_meta, false)?;
-            let new_sharded = ShardedValuePointer::new(bucket, new_location.page_offset, new_location.segment_id, self.value_log.num_buckets())?;
-            lsm_updates.push((key.clone(), *old_u128, new_sharded));
-        }
-
-        // Combine byte counts: clean pages (copied) + fresh pages (rewritten live records)
-        new_meta.live_bytes += new_live_bytes;
-        new_meta.garbage_bytes += new_garbage_bytes;
-
-        new_log.sync()?;
-
-        // Write GC journal BEFORE the file swap. If we crash after the swap
-        // but before LSM updates, the journal is replayed at startup.
-        let journal_entries: Vec<(Vec<u8>, u32, u64, u32)> = lsm_updates
-            .iter()
-            .map(|(key, _old, ptr)| (key.clone(), ptr.bucket, ptr.location.page_offset, ptr.location.segment_id))
-            .collect();
-        if !journal_entries.is_empty() {
-            GCJournal::write(self.value_log.base_path(), bucket, &journal_entries)?;
-            // Commit point: the marker makes the swap recoverable. Present at
-            // startup ⇒ the swap committed but its LSM pointer updates are not
-            // yet durable, so recovery completes the swap forward (replaying the
-            // journal) or, if the journal is unreadable, reverts to the preserved
-            // old file. It is deleted only after the LSM updates are flushed.
-            // Written BEFORE the rename so a crash mid-rename is still recoverable.
-            GCJournal::write_commit_marker(self.value_log.base_path(), bucket)?;
-        }
-
-        // Open a swap epoch: the bucket generation goes odd here and back to even
-        // when `_swap_epoch` drops at the end of this function — AFTER the LSM
-        // re-point below. Readers observe the file swap and the re-point as one
-        // atomic step (odd generation = "don't trust a read of this bucket"),
-        // closing the window where the file is new but the LSM pointer is stale.
-        // The guard's Drop runs even on an early `?` return, so the generation
-        // can never get stuck odd.
-        let _swap_epoch = log.begin_swap();
-
-        // File swap — the dangerous operation. After this point, the old file
-        // is gone and the new file is live. If we crash here, the journal
-        // will replay the LSM updates at startup.
-        if bucket_path.exists() {
-            std::fs::rename(&bucket_path, &old_path)?;
-        }
-        std::fs::rename(&new_path, &bucket_path)?;
-        log.swap_file(new_log.get_file());
-
-        // Apply LSM pointer updates immediately after file swap, as a
-        // compare-and-set: only re-point a key if it STILL maps to the exact
-        // pointer we copied. GC's scan (`key_pointer_pairs`) is a non-atomic
-        // multi-layer read, so it can momentarily miss a tombstone that a
-        // concurrent delete flushed between layers — without this guard GC would
-        // re-insert that key's old value and resurrect the deletion. Validating
-        // against the authoritative point-query `get_with_seq` (which honours
-        // tombstones across all layers, newest-first) closes that gap: a key that
-        // was deleted (None) or overwritten (a different pointer) since the scan
-        // is left untouched. We re-point under the key's *existing* sequence so
-        // the relocation preserves its version (highest-sequence-wins).
-        for (key, old_u128, new_sharded) in &lsm_updates {
-            if let Some((cur, seq)) = self.lsm.get_with_seq(key)?
-                && cur == *old_u128
-            {
-                self.lsm.insert_with_seq(key, new_sharded.to_u128(), seq)?;
-            }
-        }
-
-        // Close the swap epoch (generation → even) now that the file swap AND the
-        // LSM re-point are both done — while still under the bucket lock, so the
-        // "consistent" publish is serialised against the next swap. Explicit so it
-        // happens before the lock is released below rather than at function exit.
-        drop(_swap_epoch);
-
-        // The GCJournal is intentionally NOT deleted here.  Deleting it now would
-        // be premature: the lsm.insert calls above only updated the in-memory
-        // memtable, and a crash before the next memtable flush would lose those
-        // updates, leaving stale value-log pointers.
-        //
-        // The caller (garbage_collect_with_threshold) flushes the memtable to level-0
-        // SSTables for all buckets in one shot, and then deletes all journals.
-
-        drop(_bucket_guard);
-
-        let result_old_path = if old_path.exists() { Some(old_path) } else { None };
-
-        Ok(BucketGCResult {
-            // Garbage bytes dropped = old total garbage - garbage remaining in clean pages.
-            // (fresh pages contain only live records so they contribute 0 garbage.)
-            bytes_reclaimed: old_meta.garbage_bytes.saturating_sub(new_meta.garbage_bytes),
-            bytes_live: new_meta.live_bytes,
-            old_path: result_old_path,
-            new_metadata: new_meta,
-            old_metadata: old_meta,
+        let mut result = BucketGCResult {
             bucket,
-            had_dirty_pages: true,
-            had_journal: !journal_entries.is_empty(),
-        })
+            bytes_rewritten: 0,
+            pending_unlink: Vec::new(),
+        };
+
+        // The active tail is normally off-limits, but a small or idle namespace may never
+        // fill a segment — so its garbage would be uncollectable forever while the waste
+        // trigger kept firing. If the tail is garbage enough (>= `tail_gc_threshold_pct`),
+        // seal it (under the bucket lock, since this rolls the segment writers append to)
+        // so it can be collected in this same pass. See `TAIL_GC_MIN_GARBAGE_PCT`.
+        {
+            let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+            if let Some(sealed) = log.seal_tail_for_gc(tail_gc_threshold_pct)? {
+                debug!(
+                    "[KVStore '{}'] bucket {}: sealed the active tail (segment {}) — it was mostly garbage",
+                    self.name, bucket, sealed
+                );
+            }
+        }
+
+        let candidates = log.gc_candidates(segment_gc_threshold_pct);
+        if candidates.is_empty() {
+            return Ok(result);
+        }
+
+        for segment in candidates {
+            // ── Phase 1: what is still live in this segment? ──────────────────
+            let mut survivors: Vec<(Vec<u8>, Vec<u8>, ValueRecordMeta, u128)> = Vec::new();
+            let mut scan_err: Option<KVError> = None;
+            log.for_each_record(segment.id, |key, value, meta, location| {
+                if scan_err.is_some() {
+                    return;
+                }
+                let Ok(pointer) = ShardedValuePointer::new(bucket, location, self.value_log.num_buckets()) else {
+                    return;
+                };
+                let old_u128 = pointer.to_u128();
+                match self.lsm.get(key) {
+                    // Live iff the LSM still points at exactly this record.
+                    Ok(Some(current)) if current == old_u128 => survivors.push((key.to_vec(), value, meta, old_u128)),
+                    Ok(_) => {}
+                    Err(e) => scan_err = Some(e.into()),
+                }
+            })?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
+
+            // ── Phase 2: relocate survivors, re-point by compare-and-set ──────
+            {
+                let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+                for (key, value, meta, old_u128) in &survivors {
+                    let Some((current, seq)) = self.lsm.get_with_seq(key)? else {
+                        continue; // deleted since phase 1 — do not resurrect
+                    };
+                    if current != *old_u128 {
+                        continue; // overwritten since phase 1 — do not revert
+                    }
+                    let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, value, *meta, false)?;
+                    self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq)?;
+                    result.bytes_rewritten += new_pointer.record_len(key.len());
+                }
+            }
+
+            result.pending_unlink.push(segment.id);
+        }
+
+        Ok(result)
     }
 
-    /// Value log garbage collection.
+    /// Run value-log GC across every bucket.
     ///
-    /// `page_gc_threshold_pct` is the **per-page** selection rule — a page is
-    /// rewritten only if at least this share of it is garbage — and it is NOT the
-    /// bucket-level trigger (`value_log_waste_threshold`, which decides whether GC
-    /// runs at all). Pass `ThresholdConfig::page_gc_threshold`, which defaults well
-    /// below the trigger.
+    /// `segment_gc_threshold_pct` selects **segments** (`ThresholdConfig::segment_gc_threshold`).
+    /// The bucket-level `value_log_waste_threshold` decides whether a namespace is
+    /// collected at all, and is applied by the caller.
     ///
-    /// Keeping these distinct is load-bearing. A page below this threshold is
-    /// "clean": it is copied byte-for-byte into the compacted file **with its
-    /// garbage intact**, because its records' pointers must stay valid at their
-    /// original offsets. So if this were set to the bucket trigger, garbage sitting
-    /// just under that value could never be reclaimed — every pass would copy those
-    /// pages across, report success, and leave the bucket over its trigger, so GC
-    /// would run again and do the same thing. Measured on a bucket with garbage
-    /// spread just below a 30% page threshold: 14.6x write amplification with 11.8
-    /// MiB of garbage left behind; at a 10% page threshold the same workload drops
-    /// to 5.3x with 1.1 MiB left.
-    pub fn garbage_collect_with_threshold(&self, page_gc_threshold_pct: f64) -> Result<GCStats> {
-        let reclaim_cutoff_epoch = current_epoch_millis();
+    /// # The ordering IS the crash-safety story
+    ///
+    /// ```text
+    /// 1. append survivors into the active segment
+    /// 2. CAS re-point the keys            (bucket lock)
+    /// 3. flush the memtable to L0         ← the re-point is now DURABLE
+    /// 4. unlink the old segments          ← only now
+    /// ```
+    ///
+    /// At every crash point the durable LSM still refers to a segment that exists. Die
+    /// before 3 and the keys still point at the old segment, which is still there; die
+    /// between 3 and 4 and they point at the new one while the old segment is merely
+    /// dead weight, which the next pass reclaims. Nothing has to be rolled forward or
+    /// back — which is why there is no GC journal, no commit marker and no `.new`/`.old`
+    /// files any more.
+    ///
+    /// **Unlinking before step 3 would be data loss**: the durable LSM would point into
+    /// a segment that no longer exists, and the WAL entries that could replay those
+    /// writes are long gone.
+    pub fn garbage_collect_with_threshold(&self, segment_gc_threshold_pct: f64) -> Result<GCStats> {
+        self.garbage_collect_with_thresholds(segment_gc_threshold_pct, TAIL_GC_MIN_GARBAGE_PCT)
+    }
+
+    /// As [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold), but
+    /// with an explicit tail-seal bar (`tail_gc_threshold_pct`) — the garbage share at
+    /// which a bucket's never-filled active tail is sealed so it can be collected. The GC
+    /// worker passes the configured
+    /// [`effective_tail_gc_min_garbage_pct`](crate::db::config::ThresholdConfig::effective_tail_gc_min_garbage_pct),
+    /// which by default tracks the waste trigger so no garbage strands between the two.
+    pub fn garbage_collect_with_thresholds(&self, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<GCStats> {
+        let start_time = std::time::Instant::now();
 
         if self
             .value_log_gc_in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            let (total_gc_runs, total_bytes_reclaimed, bytes_live) = self.aggregate_value_log_stats();
-            return Ok(GCStats {
-                bytes_reclaimed: 0,
-                bytes_live,
-                gc_run_count: total_gc_runs,
-                total_bytes_reclaimed,
-                gc_duration_ms: 0,
-            });
+            return Ok(self.gc_stats_now(0, start_time));
         }
-
-        struct GcGuard<'a>(&'a AtomicBool);
-        impl<'a> Drop for GcGuard<'a> {
+        struct InProgressGuard<'a>(&'a AtomicBool);
+        impl Drop for InProgressGuard<'_> {
             fn drop(&mut self) {
                 self.0.store(false, Ordering::SeqCst);
             }
         }
-        let _guard = GcGuard(&self.value_log_gc_in_progress);
-        self.cleanup_pending_logs();
+        let _in_progress = InProgressGuard(&self.value_log_gc_in_progress);
 
-        let start_time = std::time::Instant::now();
+        // Steps 1-2, per bucket, in parallel: buckets are independent, each with its
+        // own lock.
         let bucket_count = self.value_log.num_buckets();
-
-        // ── Optimization 2: Pre-compute qualifying buckets before LSM scan ──
-        const GC_MIN_GARBAGE_RATIO_PCT: f64 = 10.0;
-        let mut qualifying_buckets = vec![false; bucket_count];
-        let mut any_qualifying = false;
-
-        for bucket in 0u32..bucket_count as u32 {
-            let meta = self.value_log.get_bucket_metadata(bucket)?;
-            let total_bytes = meta.live_bytes.saturating_add(meta.garbage_bytes);
-            if total_bytes > 0 {
-                let garbage_pct = (meta.garbage_bytes as f64 / total_bytes as f64) * 100.0;
-                if garbage_pct >= GC_MIN_GARBAGE_RATIO_PCT {
-                    qualifying_buckets[bucket as usize] = true;
-                    any_qualifying = true;
-                }
-            }
-        }
-
-        // Early return if no buckets need GC
-        if !any_qualifying {
-            if let Some(m) = self.metrics() {
-                Metrics::bump(&m.vlog_gc_runs);
-                Metrics::add(&m.vlog_gc_duration_ms, start_time.elapsed().as_millis() as u64);
-            }
-            let (total_gc_runs, total_bytes_reclaimed, bytes_live) = self.aggregate_value_log_stats();
-            return Ok(GCStats {
-                bytes_reclaimed: 0,
-                bytes_live,
-                gc_run_count: total_gc_runs,
-                total_bytes_reclaimed,
-                gc_duration_ms: start_time.elapsed().as_millis(),
-            });
-        }
-
-        // ── Parallel bucket compaction using std::thread::scope ──
-        // Each thread acquires its own bucket lock and scans the LSM inside it, so
-        // there is no pre-scan race between enumeration and compaction.
-        let qualifying_indices: Vec<u32> = (0u32..bucket_count as u32).filter(|b| qualifying_buckets[*b as usize]).collect();
-
-        let results: Vec<Result<BucketGCResult>> = std::thread::scope(|s| {
-            let handles: Vec<_> = qualifying_indices
-                .iter()
-                .map(|&bucket| s.spawn(move || self.compact_single_bucket(bucket, reclaim_cutoff_epoch, page_gc_threshold_pct)))
+        let results: Vec<BucketGCResult> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..bucket_count as u32)
+                .map(|bucket| s.spawn(move || self.compact_bucket(bucket, segment_gc_threshold_pct, tail_gc_threshold_pct)))
                 .collect();
-
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .filter_map(|h| match h.join() {
+                    Ok(Ok(r)) => Some(r),
+                    Ok(Err(e)) => {
+                        error!("[KVStore '{}'] value-log GC failed for a bucket: {:?}", self.name, e);
+                        None
+                    }
+                    Err(_) => {
+                        error!("[KVStore '{}'] value-log GC thread panicked", self.name);
+                        None
+                    }
+                })
+                .collect()
         });
 
-        // ── Aggregate results and apply LSM updates sequentially ──
+        if results.iter().all(|r| r.pending_unlink.is_empty()) {
+            return Ok(self.gc_stats_now(0, start_time));
+        }
+
+        // Step 3: make the re-points durable BEFORE unlinking anything. Load-bearing —
+        // `test_gc_crash_the_instant_segments_are_unlinked_loses_nothing` fails if these
+        // two steps are ever swapped.
+        self.lsm.flush_memtable_to_level0()?;
+
+        // Step 4: the old segments are now unreferenced by anything durable.
         let mut bytes_reclaimed = 0u64;
-        let mut bytes_live = 0u64;
-        let mut total_gc_runs = 0u64;
-        let mut total_bytes_reclaimed = 0u64;
-        let mut old_paths_to_delete: Vec<PathBuf> = Vec::new();
-        let mut journal_buckets: Vec<u32> = Vec::new();
-        let mut buckets_compacted = 0usize;
-        let mut buckets_below_page_threshold = 0usize;
-
-        for result in results {
-            let gc_result = result?;
-
-            if gc_result.had_dirty_pages {
-                buckets_compacted += 1;
-            } else {
-                buckets_below_page_threshold += 1;
-            }
-
-            if gc_result.had_journal {
-                journal_buckets.push(gc_result.bucket);
-            }
-
-            // LSM updates were already applied inside compact_single_bucket
-            // (right after file swap, under bucket lock) for crash safety.
-
-            // Update bucket metadata
-            let updated_meta = ValueLogMetadata {
-                head: 0,
-                tail: gc_result.new_metadata.tail,
-                current_page_offset: gc_result.new_metadata.current_page_offset,
-                current_page_free_offset: gc_result.new_metadata.current_page_free_offset,
-                current_page_table_offset: gc_result.new_metadata.current_page_table_offset,
-                current_page_next_segment_id: gc_result.new_metadata.current_page_next_segment_id,
-                total_gc_runs: gc_result.old_metadata.total_gc_runs.saturating_add(1),
-                total_bytes_reclaimed: gc_result.old_metadata.total_bytes_reclaimed.saturating_add(gc_result.bytes_reclaimed),
-                live_bytes: gc_result.new_metadata.live_bytes,
-                garbage_bytes: gc_result.new_metadata.garbage_bytes,
+        let mut bytes_rewritten = 0u64;
+        let mut segments_reclaimed = 0usize;
+        for result in &results {
+            let Ok(log) = self.value_log.get_bucket_log(result.bucket) else {
+                continue;
             };
-            self.value_log.update_bucket_metadata(gc_result.bucket, updated_meta)?;
-
-            bytes_reclaimed = bytes_reclaimed.saturating_add(gc_result.bytes_reclaimed);
-            bytes_live = bytes_live.saturating_add(gc_result.bytes_live);
-            total_gc_runs = total_gc_runs.saturating_add(1);
-            total_bytes_reclaimed = total_bytes_reclaimed.saturating_add(gc_result.bytes_reclaimed);
-
-            if let Some(old_path) = gc_result.old_path {
-                old_paths_to_delete.push(old_path);
+            let mut reclaimed_here = 0u64;
+            for &segment_id in &result.pending_unlink {
+                match log.unlink_segment(segment_id) {
+                    Ok(bytes) => {
+                        reclaimed_here += bytes;
+                        segments_reclaimed += 1;
+                    }
+                    Err(e) => warn!(
+                        "[KVStore '{}'] could not unlink value-log segment {} of bucket {}: {:?}",
+                        self.name, segment_id, result.bucket, e
+                    ),
+                }
             }
+            log.record_gc_run(reclaimed_here);
+            bytes_reclaimed += reclaimed_here;
+            bytes_rewritten += result.bytes_rewritten;
         }
 
-        // Flush in-memory LSM pointer updates to level-0 SSTables before
-        // deleting the GCJournals.  This ensures a crash after journal deletion
-        // but before the next memtable flush cannot produce stale value-log
-        // pointers (InvalidLocation on the subsequent restart).
-        if !journal_buckets.is_empty() {
-            self.lsm
-                .flush_memtable_to_level0()
-                .map_err(|e| KVError::Io(std::io::Error::other(format!("GC: LSM flush failed: {:?}", e))))?;
-            // The LSM pointer updates are now durable, so the swap is complete.
-            // Drop the commit marker FIRST (its absence is what tells recovery the
-            // updates are durable), then the journal.
-            for bucket in &journal_buckets {
-                let _ = GCJournal::delete_commit_marker(self.value_log.base_path(), *bucket);
-                let _ = GCJournal::delete(self.value_log.base_path(), *bucket);
-            }
+        // Test-only crash point (see `gc_crash_after_unlink`): the segments are gone, and
+        // nothing after this line has run.
+        #[cfg(test)]
+        if self.gc_crash_after_unlink.load(Ordering::SeqCst) {
+            return Ok(self.gc_stats_now(bytes_reclaimed, start_time));
         }
 
-        if !old_paths_to_delete.is_empty() {
-            self.lsm
-                .flush_and_compact_all()
-                .map_err(|e| KVError::Io(std::io::Error::other(format!("GC: LSM flush failed, old value log files kept: {:?}", e))))?;
-        }
-
-        for old_path in old_paths_to_delete {
-            if let Err(e) = std::fs::remove_file(&old_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                self.value_pending_old_logs.write().push(old_path);
-            }
-        }
-
-        // Value-log metadata is flushed last (and is NOT rebuilt during GC-swap
-        // recovery), so a crash between a swap and this flush leaves the new file
-        // paired with the old file's metadata. That is safe, not merely
-        // slack-free: on open `ValueLog::ensure_current_page` re-reads the live
-        // page header for the within-page cursors, and a compacted file only
-        // shrinks, so the stale `current_page_offset` is >= the new file's last
-        // page — a subsequent write can never land on a live record. Stale byte
-        // accounting only nudges GC trigger timing and is recomputed by the next
-        // GC scan; reads ignore these cursors and resolve pointers directly.
         self.value_log.flush_all_metadata()?;
 
-        if buckets_below_page_threshold > 0 && buckets_compacted == 0 {
-            info!(
-                "[GCWorker] ns='{}' — {} bucket(s) qualified on namespace waste (garbage / total written bytes) \
-                 but no single page reached the {:.0}% per-page rewrite threshold (a page is rewritten only when \
-                 its own garbage / page bytes crosses it); the dead bytes are spread across pages, none dense \
-                 enough to rewrite, so 0 bytes reclaimed this run",
-                self.name, buckets_below_page_threshold, page_gc_threshold_pct,
-            );
-        } else if buckets_below_page_threshold > 0 {
-            debug!(
-                "[GCWorker] ns='{}' — {} bucket(s) compacted, {} bucket(s) skipped (page threshold not met)",
-                self.name, buckets_compacted, buckets_below_page_threshold,
-            );
-        }
-
+        info!(
+            "[KVStore '{}'] value-log GC: reclaimed {} bytes across {} segment(s), rewrote {} bytes of survivors, in {:?}",
+            self.name,
+            bytes_reclaimed,
+            segments_reclaimed,
+            bytes_rewritten,
+            start_time.elapsed()
+        );
         if let Some(m) = self.metrics() {
             Metrics::bump(&m.vlog_gc_runs);
             Metrics::add(&m.vlog_gc_duration_ms, start_time.elapsed().as_millis() as u64);
+            Metrics::add(&m.vlog_segments_reclaimed, segments_reclaimed as u64);
+            Metrics::add(&m.vlog_gc_bytes_reclaimed, bytes_reclaimed);
+            // Together with bytes_reclaimed this is GC's write amplification — the cost
+            // of a pass against what it actually freed.
+            Metrics::add(&m.vlog_gc_bytes_rewritten, bytes_rewritten);
         }
 
-        Ok(GCStats {
+        Ok(self.gc_stats_now(bytes_reclaimed, start_time))
+    }
+
+    fn gc_stats_now(&self, bytes_reclaimed: u64, start_time: std::time::Instant) -> GCStats {
+        let (total_gc_runs, total_bytes_reclaimed, bytes_live) = self.aggregate_value_log_stats();
+        GCStats {
             bytes_reclaimed,
             bytes_live,
             gc_run_count: total_gc_runs,
             total_bytes_reclaimed,
             gc_duration_ms: start_time.elapsed().as_millis(),
-        })
+        }
     }
 
     #[allow(dead_code)]
@@ -1989,88 +1482,92 @@ impl KVStore {
         self.garbage_collect_with_threshold(crate::db::config::ThresholdConfig::default().value_log_waste_threshold)
     }
 
-    pub fn get_waste_ratio(&self) -> f64 {
-        self.value_log.get_total_garbage_ratio()
+    /// Does this namespace have value-log garbage GC can actually collect right now?
+    ///
+    /// The bucket-level waste ratio alone is not enough: garbage sitting in a bucket's
+    /// active tail is not collectable until the tail is sealed, so a small, fully-deleted
+    /// namespace could show 100% waste while GC had nothing to do — and the worker would
+    /// wake, log "starting GC", reclaim nothing, and repeat on every tick.
+    pub(crate) fn has_gc_work(&self, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> bool {
+        (0..self.value_log.num_buckets() as u32).any(|b| {
+            self.value_log
+                .get_bucket_log(b)
+                .is_ok_and(|log| log.has_gc_work(segment_gc_threshold_pct, tail_gc_threshold_pct))
+        })
     }
 
-    /// Aggregate `(garbage_bytes, written_bytes)` across all value-log buckets,
-    /// where `written = live + garbage`. The waste ratio reported by
-    /// [`get_waste_ratio`](Self::get_waste_ratio) is `garbage / written` — these
-    /// are the raw counts behind that percentage, useful for logging so a high
-    /// ratio over a tiny absolute volume is obvious.
+    /// Waste across the whole namespace: `garbage / (live + garbage)`, as a percentage.
+    /// This is the **trigger** the GC worker compares against `value_log_waste_threshold`.
+    pub fn get_waste_ratio(&self) -> f64 {
+        self.value_log.total_garbage_ratio()
+    }
+
+    /// True when at least one bucket is at or above `threshold_pct` waste. The GC worker
+    /// checks this alongside the namespace-average [`get_waste_ratio`](Self::get_waste_ratio),
+    /// so a hot bucket over the trigger is collected even when near-empty buckets drag the
+    /// average below it.
+    pub(crate) fn has_bucket_over_waste(&self, threshold_pct: f64) -> bool {
+        self.value_log.any_bucket_over_waste(threshold_pct)
+    }
+
+    /// The raw `(garbage_bytes, written_bytes)` behind [`get_waste_ratio`](Self::get_waste_ratio),
+    /// where `written = live + garbage` — useful in logs, so a high ratio over a tiny
+    /// absolute volume is obvious.
     pub(crate) fn waste_bytes(&self) -> (u64, u64) {
-        let mut garbage = 0u64;
-        let mut written = 0u64;
-        for (_bucket, metadata) in self.value_log.get_all_bucket_stats() {
-            garbage = garbage.saturating_add(metadata.garbage_bytes);
-            written = written.saturating_add(metadata.live_bytes).saturating_add(metadata.garbage_bytes);
-        }
-        (garbage, written)
+        let garbage = self.value_log.total_garbage_bytes();
+        (garbage, garbage.saturating_add(self.value_log.total_live_bytes()))
     }
 
     #[allow(dead_code)]
     pub fn get_garbage_ratio(&self) -> f64 {
-        self.value_log.get_total_garbage_ratio()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_free_space_ratio(&self) -> f64 {
-        self.value_log.get_total_free_space_ratio()
+        self.value_log.total_garbage_ratio()
     }
 
     pub(crate) fn aggregate_value_log_stats(&self) -> (u64, u64, u64) {
         let mut total_gc_runs = 0u64;
         let mut total_bytes_reclaimed = 0u64;
         let mut bytes_live = 0u64;
-
-        for (_bucket, metadata) in self.value_log.get_all_bucket_stats() {
+        for (_bucket, metadata) in self.value_log.all_bucket_metadata() {
             total_gc_runs = total_gc_runs.saturating_add(metadata.total_gc_runs);
             total_bytes_reclaimed = total_bytes_reclaimed.saturating_add(metadata.total_bytes_reclaimed);
-            bytes_live = bytes_live.saturating_add(metadata.live_bytes);
+            bytes_live = bytes_live.saturating_add(metadata.live_bytes());
         }
-
         (total_gc_runs, total_bytes_reclaimed, bytes_live)
     }
 
     #[allow(dead_code)]
     pub fn stats(&self) -> Stats {
-        let mut head = 0u64;
-        let mut tail = 0u64;
         let mut total_gc_runs = 0u64;
         let mut total_bytes_reclaimed = 0u64;
-        let mut total_live_bytes = 0u64;
-        let mut total_garbage_bytes = 0u64;
-
-        for (_bucket, metadata) in self.value_log.get_all_bucket_stats() {
-            head = head.saturating_add(metadata.head);
-            tail = tail.saturating_add(metadata.tail);
+        let mut live_bytes = 0u64;
+        let mut garbage_bytes = 0u64;
+        let mut segment_count = 0u64;
+        for (_bucket, metadata) in self.value_log.all_bucket_metadata() {
             total_gc_runs = total_gc_runs.saturating_add(metadata.total_gc_runs);
             total_bytes_reclaimed = total_bytes_reclaimed.saturating_add(metadata.total_bytes_reclaimed);
-            total_live_bytes = total_live_bytes.saturating_add(metadata.live_bytes);
-            total_garbage_bytes = total_garbage_bytes.saturating_add(metadata.garbage_bytes);
+            live_bytes = live_bytes.saturating_add(metadata.live_bytes());
+            garbage_bytes = garbage_bytes.saturating_add(metadata.garbage_bytes());
+            segment_count = segment_count.saturating_add(metadata.segments.len() as u64);
         }
 
-        let total_written = total_live_bytes.saturating_add(total_garbage_bytes);
-        let garbage_ratio = if total_written > 0 {
-            (total_garbage_bytes as f64 / total_written as f64) * 100.0
+        let written = live_bytes.saturating_add(garbage_bytes);
+        let waste_ratio = if written > 0 {
+            (garbage_bytes as f64 / written as f64) * 100.0
         } else {
             0.0
         };
-        let free_space_ratio = self.value_log.get_total_free_space_ratio();
+        let disk_bytes: u64 = self.value_log.physical_stats().iter().map(|s| s.physical_bytes).sum();
 
         Stats {
-            head,
-            tail,
-            garbage_size: total_garbage_bytes,
-            waste_ratio: garbage_ratio,
-            free_space_ratio,
+            segment_count,
+            disk_bytes,
+            garbage_size: garbage_bytes,
+            waste_ratio,
             total_gc_runs,
             total_bytes_reclaimed,
-            live_bytes: total_live_bytes,
+            live_bytes,
         }
     }
-
-    // ── LSM compaction ─────────────────────────────────────────────────
 
     pub fn compact_lsm(&self) -> Result<()> {
         if !self.lsm.has_compaction_work() {
@@ -2083,42 +1580,25 @@ impl KVStore {
         self.lsm.has_compaction_work()
     }
 
-    // ── Metadata flush ─────────────────────────────────────────────────
-
-    pub fn flush_metadata(&self) -> Result<()> {
-        let metadata = self.metadata.read();
-        let bytes = metadata.to_file_bytes()?;
-        crate::support::write_atomic_durable(&self.metadata_path, &bytes)?;
-        Ok(())
-    }
-
     // ── Shutdown ──────────────────────────────────────────────────────────
 
-    /// Flush and sync all data for this namespace
+    /// Flush and sync all data for this namespace.
     pub fn shutdown(&self) -> Result<()> {
-        self.cleanup_pending_logs();
         self.lsm.cleanup_pending_memtables_on_close();
         self.lsm.flush_and_compact_all()?;
-        self.flush_metadata()?;
-        self.value_log.sync()?;
-        // Persist per-bucket live/garbage byte counters so they survive restart.
-        // Without this, no-WAL bulk loads report 0 bytes after reopen because
-        // there is no WAL replay to restore the in-memory counters.
+        self.value_log.sync_all()?;
+        // Persist each bucket's segment inventory, its live/garbage counters and its
+        // segment-id high-water mark. The high-water mark is what keeps ids unique
+        // across restarts; the counters keep GC from under-triggering after a reopen.
         self.value_log.flush_all_metadata()?;
         Ok(())
-    }
-
-    fn cleanup_pending_logs(&self) {
-        let mut pending = self.value_pending_old_logs.write();
-        pending.retain(|path| std::fs::remove_file(path).is_err());
     }
 }
 
 impl Drop for KVStore {
     fn drop(&mut self) {
         let _ = self.lsm.flush_and_compact_all();
-        let _ = self.flush_metadata();
-        let _ = self.value_log.sync();
+        let _ = self.value_log.sync_all();
         let _ = self.value_log.flush_all_metadata();
     }
 }
@@ -2126,7 +1606,7 @@ impl Drop for KVStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::value_log::DEFAULT_PAGE_SIZE_BYTES;
+    use crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
     use tempfile::TempDir;
 
     fn default_lsm_config() -> LSMConfig {
@@ -2139,182 +1619,6 @@ mod tests {
     // ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────
     //
     // These exercise the FILE-level pass directly with distinct "OLD"/"NEW"
-    // contents in the .log files, asserting which file lands at `bucket_path`
-    // and how the journal/marker are disposed of. They do not need a real
-    // value-log format — only which inode becomes live and whether a journal
-    // survives to be replayed.
-    mod gc_swap_recovery {
-        use super::super::*;
-
-        fn lpath(dir: &Path, b: u32) -> PathBuf {
-            dir.join(format!("value_log_{}.log", b))
-        }
-        fn npath(dir: &Path, b: u32) -> PathBuf {
-            dir.join(format!("value_log_{}.log.new", b))
-        }
-        fn opath(dir: &Path, b: u32) -> PathBuf {
-            dir.join(format!("value_log_{}.log.old", b))
-        }
-        fn valid_journal(dir: &Path, b: u32) {
-            GCJournal::write(dir, b, &[(b"k".to_vec(), b, 0u64, 1u32)]).unwrap();
-        }
-        fn corrupt_journal(dir: &Path, b: u32) {
-            std::fs::write(GCJournal::journal_path(dir, b), b"not a valid GC journal").unwrap();
-        }
-        fn read(p: &Path) -> Option<Vec<u8>> {
-            std::fs::read(p).ok()
-        }
-
-        #[test]
-        fn forward_completes_swap_when_renames_unfinished() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"OLD").unwrap(); // swap not started: live = old
-            std::fs::write(npath(d, 0), b"NEW").unwrap();
-            valid_journal(d, 0);
-            GCJournal::write_commit_marker(d, 0).unwrap();
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"NEW".as_ref()), "bucket must be the new file");
-            assert_eq!(read(&opath(d, 0)).as_deref(), Some(b"OLD".as_ref()), "old preserved at .old");
-            assert!(!npath(d, 0).exists(), ".new consumed");
-            assert!(GCJournal::journal_path(d, 0).exists(), "journal kept for replay");
-            assert!(GCJournal::commit_marker_exists(d, 0), "marker kept for replay");
-        }
-
-        #[test]
-        fn forward_is_noop_when_renames_already_done() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"NEW").unwrap(); // renames already finished
-            std::fs::write(opath(d, 0), b"OLD").unwrap();
-            valid_journal(d, 0);
-            GCJournal::write_commit_marker(d, 0).unwrap();
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"NEW".as_ref()));
-            assert!(GCJournal::journal_path(d, 0).exists(), "journal kept for replay");
-            assert!(GCJournal::commit_marker_exists(d, 0));
-        }
-
-        #[test]
-        fn reverts_on_corrupt_journal_after_renames() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"NEW").unwrap(); // swap done, live = new
-            std::fs::write(opath(d, 0), b"OLD").unwrap();
-            corrupt_journal(d, 0);
-            GCJournal::write_commit_marker(d, 0).unwrap();
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"OLD".as_ref()), "reverted to old file");
-            assert!(!opath(d, 0).exists(), ".old consumed by revert");
-            assert!(!GCJournal::journal_path(d, 0).exists(), "corrupt journal dropped");
-            assert!(!GCJournal::commit_marker_exists(d, 0), "marker dropped on revert");
-        }
-
-        #[test]
-        fn reverts_on_corrupt_journal_before_renames() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"OLD").unwrap(); // swap not started, live still old
-            std::fs::write(npath(d, 0), b"NEW").unwrap();
-            corrupt_journal(d, 0);
-            GCJournal::write_commit_marker(d, 0).unwrap();
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"OLD".as_ref()), "stays old");
-            assert!(!npath(d, 0).exists(), ".new discarded");
-            assert!(!GCJournal::journal_path(d, 0).exists());
-            assert!(!GCJournal::commit_marker_exists(d, 0));
-        }
-
-        #[test]
-        fn no_marker_discards_staged_and_does_not_replay_journal() {
-            // Finding 2: a valid journal with no commit marker (swap never
-            // committed) must NOT survive to replay — its pointers would be
-            // applied against the un-swapped old file.
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"OLD").unwrap();
-            std::fs::write(npath(d, 0), b"NEW").unwrap();
-            valid_journal(d, 0); // valid, but uncommitted
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"OLD".as_ref()), "old stays live");
-            assert!(!npath(d, 0).exists(), "uncommitted .new discarded");
-            assert!(!GCJournal::journal_path(d, 0).exists(), "uncommitted journal NOT replayed");
-        }
-
-        #[test]
-        fn no_marker_finalized_drops_stray_journal() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-            std::fs::write(lpath(d, 0), b"NEW").unwrap(); // finalized: live = new, no marker
-            valid_journal(d, 0); // marker already deleted, journal not yet
-
-            KVStore::recover_gc_swaps(d, 1).unwrap();
-
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"NEW".as_ref()), "new stays live");
-            assert!(!GCJournal::journal_path(d, 0).exists(), "stray journal dropped");
-        }
-
-        // A single recovery pass must handle several buckets in different crash
-        // states independently (the real GC swaps up to num_buckets per run).
-        #[test]
-        fn multi_bucket_mixed_states_recover_independently() {
-            let dir = tempfile::tempdir().unwrap();
-            let d = dir.path();
-
-            // bucket 0: forward-complete (renames unfinished)
-            std::fs::write(lpath(d, 0), b"OLD0").unwrap();
-            std::fs::write(npath(d, 0), b"NEW0").unwrap();
-            valid_journal(d, 0);
-            GCJournal::write_commit_marker(d, 0).unwrap();
-
-            // bucket 1: revert (renames done, corrupt journal)
-            std::fs::write(lpath(d, 1), b"NEW1").unwrap();
-            std::fs::write(opath(d, 1), b"OLD1").unwrap();
-            corrupt_journal(d, 1);
-            GCJournal::write_commit_marker(d, 1).unwrap();
-
-            // bucket 2: no marker, uncommitted (valid journal must NOT be replayed)
-            std::fs::write(lpath(d, 2), b"OLD2").unwrap();
-            std::fs::write(npath(d, 2), b"NEW2").unwrap();
-            valid_journal(d, 2);
-
-            // bucket 3: untouched — no journal or marker at all
-            std::fs::write(lpath(d, 3), b"LIVE3").unwrap();
-
-            KVStore::recover_gc_swaps(d, 4).unwrap();
-
-            // bucket 0 → forward to new, journal+marker kept
-            assert_eq!(read(&lpath(d, 0)).as_deref(), Some(b"NEW0".as_ref()));
-            assert_eq!(read(&opath(d, 0)).as_deref(), Some(b"OLD0".as_ref()));
-            assert!(!npath(d, 0).exists());
-            assert!(GCJournal::journal_path(d, 0).exists());
-            assert!(GCJournal::commit_marker_exists(d, 0));
-
-            // bucket 1 → reverted to old, journal+marker dropped
-            assert_eq!(read(&lpath(d, 1)).as_deref(), Some(b"OLD1".as_ref()));
-            assert!(!GCJournal::journal_path(d, 1).exists());
-            assert!(!GCJournal::commit_marker_exists(d, 1));
-
-            // bucket 2 → stays old, staged + journal discarded (not replayed)
-            assert_eq!(read(&lpath(d, 2)).as_deref(), Some(b"OLD2".as_ref()));
-            assert!(!npath(d, 2).exists());
-            assert!(!GCJournal::journal_path(d, 2).exists());
-
-            // bucket 3 → completely untouched
-            assert_eq!(read(&lpath(d, 3)).as_deref(), Some(b"LIVE3".as_ref()));
-        }
-    }
-
     #[test]
     fn test_kvstore_basic_operations() {
         let dir = TempDir::new().unwrap();
@@ -2324,7 +1628,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2339,6 +1643,57 @@ mod tests {
     }
 
     #[test]
+    fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
+        // A small store keeps all its data in one active-tail segment per bucket that
+        // never fills a 64 MiB segment, so tail-sealing is its only path to collection.
+        // With the tail-seal bar tracking the trigger, garbage in the 30-50% band — which
+        // sat stranded below the old hardcoded 50% bar — is reclaimed.
+        let dir = TempDir::new().unwrap();
+        let lsm_config = LSMConfig {
+            num_buckets: 1, // one bucket → one active tail holds everything
+            ..LSMConfig::default()
+        };
+        let store = KVStore::open(0, "default", dir.path(), lsm_config, SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+
+        let value = vec![0x5Au8; 400];
+        for i in 0..100u32 {
+            store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        // Overwrite 70 keys: their old records become garbage — ~41% of the single tail
+        // segment (70 dead of 170 total), squarely in the old dead zone.
+        for i in 0..70u32 {
+            store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        let waste_before = store.get_waste_ratio();
+        assert!(
+            (30.0..50.0).contains(&waste_before),
+            "test needs tail garbage in the 30-50% band, got {waste_before:.1}%"
+        );
+
+        // Old behavior (50% tail bar): the sub-50% tail is not sealed, nothing collectable.
+        let stats = store.garbage_collect_with_thresholds(10.0, 50.0).unwrap();
+        assert_eq!(stats.bytes_reclaimed, 0, "at a 50% tail bar a 41%-garbage tail must stay uncollected");
+
+        // Bar tracking the 30% trigger: the tail is sealed and its garbage reclaimed.
+        let stats = store.garbage_collect_with_thresholds(10.0, 30.0).unwrap();
+        assert!(stats.bytes_reclaimed > 0, "at a 30% tail bar the tail must be sealed and collected");
+        assert!(
+            store.get_waste_ratio() < waste_before,
+            "waste must drop after collection (was {waste_before:.1}%, now {:.1}%)",
+            store.get_waste_ratio()
+        );
+
+        // Every live key survived the relocation into the fresh tail.
+        for i in 0..100u32 {
+            assert_eq!(
+                store.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i:03} lost during tail GC"
+            );
+        }
+    }
+
+    #[test]
     fn test_kvstore_update() {
         let dir = TempDir::new().unwrap();
         let store = KVStore::open(
@@ -2347,7 +1702,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2359,6 +1714,106 @@ mod tests {
     }
 
     #[test]
+    fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
+        // A put that loses to a higher-sequence write for the same key (the LSM drops
+        // its insert under highest-sequence-wins) must account ITS OWN freshly-appended
+        // record as garbage — not displace the record that is still live. This is the
+        // deterministic form of the concurrent-put accounting race: the old code read
+        // the displaced pointer before the bucket lock and always marked it displaced,
+        // so this lower-seq put marked the LIVE record garbage (accounting would call the
+        // live value dead — GC could then reclaim it, losing data) and left its own dead
+        // record counted live.
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
+
+        let winner = vec![0x11u8; 400];
+        let loser = vec![0x22u8; 900]; // a different size, so a mis-charge can't cancel
+
+        // Higher sequence lands first and wins; the lower sequence arrives after and is
+        // dropped by the LSM.
+        store.put_to_storage_seq(b"k", &winner, 10).unwrap();
+        store.put_to_storage_seq(b"k", &loser, 5).unwrap();
+
+        assert_eq!(store.get(b"k").unwrap(), Some(winner.clone()), "highest-seq write must win the read");
+
+        let winner_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), winner.len());
+        let loser_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
+        let (mut live, mut garbage) = (0u64, 0u64);
+        for (_bucket, segs) in store.value_log.all_segment_stats() {
+            for s in segs {
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke live+garbage==total",
+                    s.id
+                );
+                live += s.live_bytes;
+                garbage += s.garbage_bytes;
+            }
+        }
+        assert_eq!(live, winner_len, "only the winning record's bytes may be counted live");
+        assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
+    }
+
+    #[test]
+    fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
+        // A value-log read error in the batch path used to be swallowed by
+        // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
+        // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
+        // and `get_multiple` still returns the readable keys — dropping (and logging) only
+        // the corrupt one rather than silently reporting it absent.
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+
+        let keys: Vec<Vec<u8>> = (0..5u32).map(|i| format!("k{i}").into_bytes()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            store.put_to_storage(k, format!("value-{i}-payload").as_bytes()).unwrap();
+        }
+
+        // Flip a byte in k2's value payload, in place (behind the log's back — the cached
+        // fd reads the modified file, and the in-memory LSM keeps k2's pointer).
+        let ptr = decode_sharded_pointer(store.lsm.get(b"k2").unwrap().unwrap()).unwrap();
+        let seg_path = dir
+            .path()
+            .join("value_logs")
+            .join(format!("value_log_{}.seg{:06}", ptr.bucket, ptr.location.segment_id));
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        bytes[ptr.location.rec_offset as usize + crate::store::value_log::ValueRecordHeader::SIZE] ^= 0xFF;
+        std::fs::write(&seg_path, &bytes).unwrap();
+
+        // With checksum verification on, the flipped payload is detected.
+        store.set_verify_checksums_on_read(true);
+
+        // Single-key get surfaces the corruption rather than looping or returning None.
+        assert!(
+            matches!(store.get(b"k2"), Err(KVError::ShardedValueLogError(_))),
+            "corruption must surface as an error, not a missing key"
+        );
+
+        // get_multiple returns every readable key and drops only the corrupt one.
+        let got = store.get_multiple(&keys);
+        for (i, k) in keys.iter().enumerate() {
+            if k.as_slice() == b"k2" {
+                assert!(got[i].is_none(), "the corrupt key must not be returned as a value");
+            } else {
+                assert_eq!(
+                    got[i].as_deref(),
+                    Some(format!("value-{i}-payload").as_bytes()),
+                    "readable key {i} must still be returned"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_kvstore_recovery_replay() {
         let dir = TempDir::new().unwrap();
         let store = KVStore::open(
@@ -2367,7 +1822,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2388,7 +1843,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2414,162 +1869,17 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_leaves_no_stray_journal_or_marker_and_reopens() {
+    fn test_get_multiple_matches_individual_get() {
         let dir = TempDir::new().unwrap();
-        let num_buckets = default_lsm_config().num_buckets as u32;
-        {
-            let store = KVStore::open(
-                0,
-                "default",
-                dir.path(),
-                default_lsm_config(),
-                SyncConfig::default(),
-                DEFAULT_PAGE_SIZE_BYTES,
-            )
-            .unwrap();
-            for i in 0..5 {
-                store.put_to_storage(&format!("key{i}").into_bytes(), &[0u8; 50]).unwrap();
-            }
-            for round in 0..3u8 {
-                for i in 0..5 {
-                    store.put_to_storage(&format!("key{i}").into_bytes(), &[round + 1; 50]).unwrap();
-                }
-            }
-            store.garbage_collect().unwrap();
-
-            // A normal (finalized) GC run must leave no journal and no commit
-            // marker — both are deleted after the LSM pointer updates are flushed.
-            let vlp = dir.path().join("value_logs");
-            assert!(GCJournal::find_journals(&vlp).is_empty(), "stray journal after a finalized GC");
-            for b in 0..num_buckets {
-                assert!(!GCJournal::commit_marker_exists(&vlp, b), "stray commit marker for bucket {b}");
-            }
-        }
-
-        // Reopen: recover_gc_swaps + recover_gc_journals run over the finalized
-        // state and must be a clean no-op (no panic / error, data intact).
         let store = KVStore::open(
             0,
-            "default",
+            "ns",
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
-        for i in 0..5 {
-            assert!(
-                store.get(&format!("key{i}").into_bytes()).unwrap().is_some(),
-                "key{i} lost after GC+reopen"
-            );
-        }
-    }
-
-    // End-to-end: a committed swap whose journal then bit-rots must REVERT to the
-    // preserved old file so the key reads its correct (old) value. Exercises the
-    // real value-log + LSM, not just file disposition.
-    #[test]
-    fn test_revert_restores_correct_value_end_to_end() {
-        let dir = TempDir::new().unwrap();
-        let cfg = LSMConfig {
-            num_buckets: 1,
-            ..LSMConfig::default()
-        }; // force key into bucket 0
-        {
-            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
-            store.put_to_storage(b"k", b"value_v1").unwrap();
-            store.flush_and_compact_all().unwrap(); // persist the LSM pointer (KVStore has no WAL)
-            assert_eq!(store.get(b"k").unwrap(), Some(b"value_v1".to_vec()));
-        }
-
-        // Reproduce the committed-swap-with-corrupt-journal state: the real file
-        // becomes .old (the swap's first rename), bucket_path holds an unrelated
-        // "new" file, plus a corrupt journal and a commit marker.
-        let vlp = dir.path().join("value_logs");
-        let bucket_path = vlp.join("value_log_0.log");
-        let old_path = vlp.join("value_log_0.log.old");
-        std::fs::rename(&bucket_path, &old_path).unwrap();
-        std::fs::write(&bucket_path, b"bogus new compacted file").unwrap();
-        std::fs::write(GCJournal::journal_path(&vlp, 0), b"not a valid GC journal").unwrap();
-        GCJournal::write_commit_marker(&vlp, 0).unwrap();
-
-        // Reopen: recover_gc_swaps reverts (renames .old back over bucket_path),
-        // so the LSM pointer for "k" resolves against the restored file.
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
-        assert_eq!(
-            store.get(b"k").unwrap(),
-            Some(b"value_v1".to_vec()),
-            "revert must restore the correct value"
-        );
-        assert!(!GCJournal::journal_path(&vlp, 0).exists());
-        assert!(!GCJournal::commit_marker_exists(&vlp, 0));
-    }
-
-    // End-to-end: a committed swap whose LSM pointer update was lost (not flushed)
-    // must be repaired by replaying the journal, so the key resolves to its NEW
-    // location in the new file. The new file holds a padding record before the
-    // value, so a missed replay (still pointing at the old location) would read
-    // the wrong record — distinguishing replay from no-op.
-    #[test]
-    fn test_forward_replay_repoints_to_new_location_end_to_end() {
-        use crate::store::value_log::{ValueLog, ValueLogMetadata, ValueRecordMeta};
-        let dir = TempDir::new().unwrap();
-        let cfg = LSMConfig {
-            num_buckets: 1,
-            ..LSMConfig::default()
-        };
-        {
-            let store = KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
-            store.put_to_storage(b"k", b"value_v1").unwrap(); // → old file, segment 1
-            store.flush_and_compact_all().unwrap(); // persist old pointer
-        }
-
-        let vlp = dir.path().join("value_logs");
-        let bucket_path = vlp.join("value_log_0.log");
-        let old_path = vlp.join("value_log_0.log.old");
-        let build_path = vlp.join("value_log_0.log.build");
-
-        // Build the "compacted" new file: a pad record (segment 1) then k's value
-        // (segment 2), so the new location differs from the old one.
-        let meta_rec = ValueRecordMeta {
-            version: 1,
-            tombstone: false,
-            updated: false,
-            epoch: 0,
-            seq: 0,
-        };
-        let new_loc = {
-            let vl = ValueLog::open(&build_path).unwrap();
-            let mut m = ValueLogMetadata::new(DEFAULT_PAGE_SIZE_BYTES);
-            vl.ensure_current_page(&mut m).unwrap();
-            vl.write_record(b"pad_record", meta_rec, &mut m, true).unwrap(); // segment 1
-            vl.write_record(b"value_v1", meta_rec, &mut m, true).unwrap() // segment 2 (the live one)
-        };
-
-        // Swap the files into the committed state; LSM still holds the OLD pointer.
-        std::fs::rename(&bucket_path, &old_path).unwrap();
-        std::fs::rename(&build_path, &bucket_path).unwrap();
-        // Valid journal repointing k to its new location, plus the commit marker.
-        GCJournal::write(&vlp, 0, &[(b"k".to_vec(), 0u32, new_loc.page_offset, new_loc.segment_id)]).unwrap();
-        GCJournal::write_commit_marker(&vlp, 0).unwrap();
-
-        // Reopen: recover_gc_journals replays, repointing k to the new location.
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
-        assert_eq!(
-            store.get(b"k").unwrap(),
-            Some(b"value_v1".to_vec()),
-            "replay must repoint k to the new file location"
-        );
-        assert!(!GCJournal::journal_path(&vlp, 0).exists(), "journal dropped after replay");
-        assert!(!GCJournal::commit_marker_exists(&vlp, 0), "marker dropped after replay");
-    }
-
-    // ── get_multiple ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_multiple_matches_individual_get() {
-        let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
 
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..20).map(|i| (format!("doc:{i:03}").into_bytes(), vec![i; 64])).collect();
         for (k, v) in &pairs {
@@ -2589,7 +1899,15 @@ mod tests {
     #[test]
     fn test_get_multiple_missing_keys_are_none() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
+        let store = KVStore::open(
+            0,
+            "ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
 
         store.put_to_storage(b"exists", b"val").unwrap();
 
@@ -2603,7 +1921,15 @@ mod tests {
     #[test]
     fn test_get_multiple_after_flush_to_sstable() {
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "ns", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
+        let store = KVStore::open(
+            0,
+            "ns",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
 
         for i in 0u8..10 {
             store.put_to_storage(&[i], &[i; 32]).unwrap();
@@ -2636,7 +1962,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2670,7 +1996,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
         for i in 0u32..10 {
@@ -2693,7 +2019,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
         for i in 0u32..10 {
@@ -2725,7 +2051,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2744,7 +2070,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2768,11 +2094,165 @@ mod tests {
     // acquiring the bucket lock.  Any write that completed its value-log write
     // but had not yet updated the LSM in that window was permanently lost:
     // GC deleted the old file without copying the record, leaving a stale
-    // LSM pointer into a zero-filled page (→ CorruptedLog on the next read).
+    // LSM pointer into a reclaimed segment (→ CorruptedLog on the next read).
     //
     // The fix: writes hold the bucket lock across the value-log write AND
     // the LSM insert; GC scans the LSM inside the same lock, guaranteeing a
     // consistent snapshot.
+
+    // ── GC crash-safety ordering ────────────────────────────────────────────
+    //
+    // The load-bearing invariant of the segmented value log:
+    //
+    //     relocate survivors → CAS re-point → FLUSH to L0 → unlink the old segment
+    //
+    // Unlinking before the flush is silent data loss: the durable LSM would point
+    // into a file that no longer exists, and the WAL entries that could replay those
+    // writes are long gone. These tests pin both halves of that ordering.
+
+    /// A crash between GC's re-point and its unlink must lose nothing: the old segment
+    /// is still on disk, and the durable LSM still points into it.
+    ///
+    /// `compact_bucket` deliberately does NOT unlink — it only hands back the segments
+    /// that *become* safe to unlink once the re-point is durable. So calling it and then
+    /// dropping the store without flushing simulates exactly that crash window.
+    #[test]
+    fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
+        let dir = TempDir::new().unwrap();
+        // Small segments so a few values roll several of them.
+        let segment_size = 64 * 1024;
+        let value = vec![0xC3u8; 8 * 1024];
+
+        let pending = {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            // Churn one key so its old records become garbage worth collecting.
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+            // Make the WRITES durable first. (A standalone KVStore has no WAL — the
+            // Database coordinator owns that — so without this the crash below would
+            // simply lose the writes themselves, which is not what we are testing.)
+            store.lsm.flush_memtable_to_level0().unwrap();
+
+            // Phases 1-2 only: survivors relocated and keys re-pointed in the MEMTABLE,
+            // but nothing flushed and nothing unlinked.
+            let mut pending = Vec::new();
+            for bucket in 0..store.value_log.num_buckets() as u32 {
+                let result = store.compact_bucket(bucket, 10.0, TAIL_GC_MIN_GARBAGE_PCT).unwrap();
+                pending.extend(result.pending_unlink.iter().map(|id| (bucket, *id)));
+            }
+            assert!(!pending.is_empty(), "expected GC to have relocated at least one segment");
+
+            // The old segments MUST still be on disk at this point.
+            for (bucket, segment_id) in &pending {
+                let log = store.value_log.get_bucket_log(*bucket).unwrap();
+                assert!(
+                    log.segment_stats().iter().any(|s| s.id == *segment_id),
+                    "segment {segment_id} was unlinked before the re-point was durable — that is data loss"
+                );
+            }
+            // A faithful crash: `mem::forget` skips `Drop`, which would otherwise flush
+            // the LSM and make this a graceful close instead of the crash we mean to test.
+            std::mem::forget(store);
+            pending
+        };
+        assert!(!pending.is_empty());
+
+        // Reopen. The re-point may have been lost with the memtable, in which case the
+        // keys still point at the OLD segments — which is exactly why they must not have
+        // been unlinked. Either way every value must still read back.
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost across a crash between GC's re-point and its unlink"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value), "hot key lost across the same crash");
+    }
+
+    /// **The data-loss guard.** Crash at the worst possible instant: the moment GC has
+    /// unlinked the old segments.
+    ///
+    /// With the correct order (flush to L0, *then* unlink), the re-point is already
+    /// durable when the segments go, so this crash is harmless. Swap the two — unlink
+    /// first, flush second — and this same crash loses the re-point *and* the segments
+    /// it pointed into: the durable LSM would reference files that no longer exist, and
+    /// the WAL entries that could replay those writes are long gone. This test fails
+    /// outright in that world, which is the whole point of it.
+    #[test]
+    fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = 64 * 1024;
+        let value = vec![0xE5u8; 8 * 1024];
+
+        {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+
+            // Arm the crash point: GC will return the instant its segments are unlinked.
+            store.gc_crash_after_unlink.store(true, Ordering::SeqCst);
+            let stats = store.garbage_collect_with_threshold(10.0).unwrap();
+            assert!(stats.bytes_reclaimed > 0, "expected GC to have unlinked at least one segment");
+
+            // Crash: skip Drop, so nothing beyond what GC itself made durable survives.
+            std::mem::forget(store);
+        }
+
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost when GC crashed the instant it unlinked — the re-point was not durable first"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value), "hot key lost to the same crash");
+    }
+
+    /// The full pass, then a crash: after `garbage_collect_with_threshold` returns, the
+    /// re-point IS durable (it flushed to L0 before unlinking), so a crash immediately
+    /// afterwards must still resolve every key — now through the *new* segments.
+    #[test]
+    fn test_gc_survives_a_crash_immediately_after_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let segment_size = 64 * 1024;
+        let value = vec![0xD4u8; 8 * 1024];
+
+        {
+            let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+            for i in 0..12 {
+                store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
+            }
+            for _ in 0..12 {
+                store.put_to_storage(b"hot", &value).unwrap();
+            }
+            let stats = store.garbage_collect_with_threshold(10.0).unwrap();
+            assert!(stats.bytes_reclaimed > 0, "expected GC to reclaim at least one segment");
+            // A faithful crash right after the pass: skip `Drop` (which would flush the
+            // LSM), so only what GC itself made durable survives.
+            std::mem::forget(store);
+        }
+
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i} lost across a crash right after a GC pass — the re-point was not durable before the unlink"
+            );
+        }
+        assert_eq!(store.get(b"hot").unwrap(), Some(value));
+    }
 
     #[test]
     fn test_gc_write_before_gc_survives() {
@@ -2784,7 +2264,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2818,7 +2298,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2873,7 +2353,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2906,7 +2386,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -2940,14 +2420,14 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
         const N: u32 = 120;
 
-        // Overwrite each key several times to pile up garbage on its pages, then
-        // settle on the canonical value so GC has dirty pages to compact.
+        // Overwrite each key several times to pile up garbage in its segments, then
+        // settle on the canonical value so GC has dirty segments to compact.
         for round in 0..5u8 {
             for i in 0..N {
                 store.put_to_storage(&format!("k:{i:04}").into_bytes(), &[round; 48]).unwrap();
@@ -3001,7 +2481,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -3025,7 +2505,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -3043,7 +2523,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -3063,7 +2543,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
         const N: u32 = 120;
@@ -3100,7 +2580,7 @@ mod tests {
             dir.path(),
             default_lsm_config(),
             SyncConfig::default(),
-            DEFAULT_PAGE_SIZE_BYTES,
+            DEFAULT_SEGMENT_SIZE_BYTES,
         )
         .unwrap();
 
@@ -3159,20 +2639,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = default_lsm_config();
         cfg.num_buckets = 1; // concentrate every key in one bucket
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
 
         const N: u32 = 200;
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
         let expected = |i: u32| {
             // Distinct prefix per key (catches cross-key misreads), padded so
-            // records are large enough to span pages and force relocation.
+            // records are large enough to span segments and force relocation.
             let mut v = format!("val:{i:06}:").into_bytes();
             v.resize(100, b'.');
             v
         };
 
         // Seed live keys plus junk; deleting the junk leaves garbage interleaved
-        // with the survivors, so GC must rewrite dirty pages and relocate them.
+        // with the survivors, so GC must rewrite dirty segments and relocate them.
         for i in 0..N {
             store.put_to_storage(&live_key(i), &expected(i)).unwrap();
             store.put_to_storage(&format!("junk:{i:06}").into_bytes(), &[0xAB; 100]).unwrap();
@@ -3277,18 +2757,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = default_lsm_config();
         cfg.num_buckets = 1; // concentrate every key in one bucket
-        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_PAGE_SIZE_BYTES).unwrap();
+        let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
 
         const N: u32 = 200;
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
         let expected = |i: u32| {
             let mut v = format!("val:{i:06}:").into_bytes();
-            v.resize(100, b'.'); // large enough to span pages and force relocation
+            v.resize(100, b'.'); // large enough to span segments and force relocation
             v
         };
 
         // Live keys plus junk; deleting the junk leaves garbage interleaved with the
-        // survivors so GC must rewrite dirty pages and relocate live records.
+        // survivors so GC must rewrite dirty segments and relocate live records.
         for i in 0..N {
             store.put_to_storage(&live_key(i), &expected(i)).unwrap();
             store.put_to_storage(&format!("junk:{i:06}").into_bytes(), &[0xAB; 100]).unwrap();

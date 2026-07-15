@@ -1965,8 +1965,8 @@ impl DocStore {
     }
 
     /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_page_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::PageGarbageStats>)>, DocStoreError> {
-        self.db.value_log_page_stats(namespace).map_err(DocStoreError::from)
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::SegmentStats>)>, DocStoreError> {
+        self.db.value_log_segment_stats(namespace).map_err(DocStoreError::from)
     }
 
     /// Run value-log GC on every namespace and return per-namespace results.

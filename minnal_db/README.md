@@ -101,13 +101,13 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 │                               │     │                                  │
 │  ┌─────────────────────────┐  │     │  Bucket 0   Bucket 1  ... B15   │
 │  │ MemTable (SkipList)     │  │     │  ┌───────┐  ┌───────┐   ┌────┐ │
-│  │ • Max 100k entries      │  │     │  │ 64 MB │  │ 64 MB │   │... │ │
-│  │ • Arena-allocated       │  │     │  │ pages │  │ pages │   │    │ │
+│  │ • Max 100k entries      │  │     │  │ 256MB │  │ 256MB │   │... │ │
+│  │ • Arena-allocated       │  │     │  │ segs  │  │ segs  │   │    │ │
 │  │ • SIMD key comparison   │  │     │  └───────┘  └───────┘   └────┘ │
-│  └────────────┬────────────┘  │     │  Append-only, page-structured   │
-│               │ flush         │     │  Per-bucket GC journal           │
-│  ┌────────────▼────────────┐  │     │  Record: len+version+flags+      │
-│  │ L0 Files (per bucket)   │  │     │         epoch+value+CRC32        │
+│  └────────────┬────────────┘  │     │  Immutable, append-only segments│
+│               │ flush         │     │  Ids monotone, never reused     │
+│  ┌────────────▼────────────┐  │     │  Record: hdr+value+key (+CRC32) │
+│  │ L0 Files (per bucket)   │  │     │  GC = rewrite a segment, unlink │
 │  │ Staged before L1 merge  │  │     └─────────────────────────────────┘
 │  └────────────┬────────────┘  │
 │               │ compact       │
@@ -131,7 +131,7 @@ A few things are worth pulling out of the diagram, because they shape everything
 - **A write fans out into two stores.** The LSM tree records the *key* and a pointer; the value log holds the *value*. A read reverses this: find the pointer in the LSM, then follow it into the value log.
 - **Background workers do the slow work off the critical path** — compaction, garbage collection, WAL cleanup, and TTL expiry all run on their own schedules so foreground reads and writes stay fast.
 
-> **A note on bucket count.** Throughout this document we use **16 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "16-wide" here — the value-log shards, the L1 SSTables, the GC journals, and bucket routing — scales to whatever you configure.
+> **A note on bucket count.** Throughout this document we use **16 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "16-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
 
 ---
 
@@ -157,52 +157,71 @@ Because the same key can exist in several tiers at once, a read must decide whic
 
 Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
-Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32-bit) | page_offset (64-bit) | segment_id (32-bit)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
+Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
 
 ### Value Log
 
-If the LSM tree holds the keys, the value log holds the bytes. It is the heart of the WiscKey design: **values never enter the LSM at all**, so compaction never has to move them. Each shard bucket gets its own append-only file, divided into fixed-size pages (`value_log.page_size_bytes`, 64 MB by default, and fixed once the value log exists).
+If the LSM tree holds the keys, the value log holds the bytes. It is the heart of the WiscKey design: **values never enter the LSM at all**, so compaction never has to move them. Each shard bucket owns a series of **segment files** (`value_log_3.seg000012`), sealed at `value_log.segment_size_bytes` (256 MB by default).
 
-#### A page and its slot table
+Two properties make everything else fall out:
 
-A page has a 32-byte header (`magic="VPG1"`, `version`, `free_offset`, `table_offset`, `next_segment_id`, `page_size`), and then grows from **both ends**: value records append forward from the header, while an 8-byte **slot entry** per record — `(segment_id, record_offset)` — is written backward from the page's end. When the two regions meet, the page is closed and a new one opens at the file's tail.
+- **A sealed segment is immutable.** Only the bucket's *active tail* is ever appended to; once it fills it is sealed and never modified again.
+- **Segment ids are monotone and never reused** — not within a process, and not across restarts (a high-water mark is persisted alongside the segment inventory).
 
-![Animated diagram of a value-log page: a record is appended at free_offset while an 8-byte slot entry is written at the page end, so records are addressed by segment id rather than byte offset; a read follows the slot table to the record, and when the two regions meet a new page opens and segment ids restart](docs/vlog-page.svg)
+![Animated diagram of the segmented value log: records are appended to the active tail segment; an update appends a new record and only adds the old one's size to a garbage counter; GC rewrites one segment's survivors into a new segment, re-points the keys, flushes, and unlinks the old file — while a reader holding an old pointer either reads the same record or gets a clean not-found and re-resolves](docs/vlog-segments.svg)
 
-The slot table is the load-bearing indirection. A key's pointer is **`(page_offset, segment_id)`** — never a raw byte offset — so a read is "look up the slot, follow it to the record", and GC is free to move a record's bytes within a page as long as the slot agrees. The LSM packs the whole address into one `u128`: `bucket (32b) | page_offset (64b) | segment_id (32b)`. Each record carries a 36-byte header (`total_len`, `version`, `flags`, `epoch_ms`, `value_len`, CRC32 of the value, and the write `seq`) followed by the value bytes.
+#### A record
+
+```
+segment file:  [file header 16B] [record] [record] ...
+
+record:        [header 36B][value bytes][key bytes]
+                ^ rec_offset
+```
+
+The header holds `total_len`, `version`, `epoch_ms`, the write `seq`, `key_len`, `value_len`, and a CRC32 of the value. A key's pointer — the `u128` the LSM stores — is:
+
+```
+ 127            96 95            64 63            32 31             0
+┌────────────────┬────────────────┬────────────────┬────────────────┐
+│  bucket (32)   │ segment_id(32) │ rec_offset(32) │  value_len(32) │
+└────────────────┴────────────────┴────────────────┴────────────────┘
+```
+
+Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `36 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
+
+Every record also carries an **`epoch_ms` timestamp**. This is what makes TTL cheap: the TTL worker reads a record's creation time straight from its 36-byte header, without touching the value or the LSM.
 
 #### Writes, deletes, and garbage
 
-Writes only ever append, which turns all value writes into sequential I/O — exactly what SSDs and NVMe drives are fastest at. Records are never modified in place; instead, two **flags** mark records that are no longer current:
+Writes only ever append, which turns all value writes into sequential I/O — exactly what SSDs and NVMe drives are fastest at. Nothing is ever rewritten in place, and — unlike most log-structured stores — **records carry no tombstone or "superseded" flags at all**. The LSM is the sole authority on what is live.
 
-- `0x01` **Tombstone** — a logical delete. The bytes stay until garbage collection reclaims the space.
-- `0x02` **Updated** — superseded by a newer write, and therefore treated as garbage.
+So an update appends a *new* record and a delete writes an LSM tombstone; in both cases the displaced record is simply **added to its segment's garbage counter**. That accounting costs **zero I/O**: the writer already holds the old pointer, and the pointer carries `value_len`, so the record's size is known without reading it. (The alternative — flipping a flag inside the old record — is a read-modify-write of a header at a random, possibly-cold offset on *every* overwrite and delete, and it cannot work at all when the record lives in a sealed, immutable segment.)
 
-So an update appends a *new* record and flags the old one; a delete flags the record and writes an LSM tombstone. Neither reclaims a byte — that is GC's job, and it only runs once a bucket's waste ratio crosses the threshold (30% by default):
+#### Garbage collection
 
-![Animated diagram of value-log writes and GC: an insert appends a live record, an update appends a new record and flags the old one Updated, a delete flags the record Tombstone; once garbage passes the waste threshold, GC rewrites the surviving records into a new file, writes a journal and commit marker, then swaps the file inside a swap epoch and re-points each key by compare-and-set](docs/vlog-write-gc.svg)
+GC's unit is a **segment**, never the whole bucket:
 
-GC is a **copying** collector, and its ordering is what makes it crash-safe. It takes the bucket write lock (the same one `put`/`delete` hold, so its scan and re-point are atomic against them), rewrites the survivors of the dirty pages into a new file — pages *below* the waste threshold are copied byte-for-byte, so their pointers stay valid and need no LSM update — and then fsyncs a **GC journal** (`key → new pointer`) plus a **commit marker** *before* swapping the file in. If a crash lands after the swap, startup replays the journal; if the journal is unreadable, it reverts to the preserved old file. The re-point itself is a compare-and-set: a key is only moved if it still maps to the exact pointer GC copied, and it is re-inserted under its **existing sequence**, so a relocation can neither resurrect a deleted key nor change a key's version.
+1. **Pick** the sealed segments whose garbage ratio is over `thresholds.page_gc_threshold`, worst first. The active tail is never a candidate.
+2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so liveness is one LSM point-get: a record survives iff the LSM still points at exactly this location.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert preserves the key's existing sequence, so relocating a record never changes its version.
+4. **Flush** the memtable to L0, making the re-point durable.
+5. **Unlink** the old segment file.
 
-Every record also carries an **`epoch_ms` timestamp** (its creation time in Unix milliseconds). This is what makes TTL cheap: the TTL worker can find and tombstone expired records straight from the value log, without ever scanning the LSM tree.
+The cost of a pass is therefore proportional to *one segment's survivors*, not to the size of the bucket. Segments GC didn't select are never read or written.
+
+**The ordering of steps 4 and 5 is the entire crash-safety story.** At every crash point the durable LSM still refers to a segment that exists: die before step 4 and the keys still point at the old segment, which is still there; die between 4 and 5 and they point at the new one, while the old segment is merely dead weight that the next pass reclaims. Nothing has to be rolled forward or back — which is why the value log has **no GC journal, no commit marker, and no `.new`/`.old` shadow files**. Unlinking *before* step 4 would be data loss, and is the one invariant to protect.
 
 #### Reading while GC moves the bytes
 
-A read happens in two steps: first ask the LSM where the value is, then go read it there. GC is what makes that risky — between those two steps it can rewrite the file and move the value somewhere else. A reader that is unlucky enough to land in that window is holding a pointer into a file that no longer exists, or worse, into a slot that now belongs to a *different* record. Reads never take the bucket lock (that would put them behind GC), so instead they **detect** the race and retry:
+A read is two steps — ask the LSM where the value is, then read it there — and GC can relocate the value in between. It cannot, however, make the read *wrong*:
 
-![Animated diagram of value-log reads under GC: a get reads the bucket generation counter, resolves a pointer and sequence from the LSM, reads the record, and trusts the value only if the generation is unchanged and the record's sequence matches; scans do all of this inside one generation-stable bracket; batch gets group reads by bucket and validate every record's sequence the same way](docs/vlog-read-gc.svg)
+- A pointer GC has already superseded still resolves to **that key's own bytes**. The record is still sitting in the old segment, and GC re-points under the key's existing sequence, so the relocated copy is the same write.
+- A pointer into a segment GC has already **unlinked** fails loudly (`SegmentMissing`) — never silently against some other key's record, because that id will never be handed out again. The reader re-resolves through the LSM, which by then holds the new pointer, and retries.
 
-**Check 1 — did GC touch this bucket while I was reading?** Every bucket has a counter that GC bumps when it starts a swap and again when it finishes, so an **odd** value means "a swap is happening right now" and an **even** value means "the file and the pointers agree". A reader reads the counter before it starts and again after it finishes. If it was odd, or if it changed in between, GC ran underneath the read — the result is thrown away and the read starts over.
+That is the whole protocol. There is **no seqlock, no generation counter, and no per-record sequence check on the read path** — a stale pointer is *stale*, never *wrong*. A read that keeps losing the race falls back, after a few attempts, to a read holding the bucket write lock, which excludes GC entirely and guarantees progress.
 
-**Check 2 — is this still the record I asked for?** The counter catches a swap in progress, but not a read that arrives *after* one finished and follows a pointer GC has since reused for someone else's value. So every value record also stores the **sequence number** of the write that created it, and the LSM stores the same number next to the pointer. If the record's sequence isn't the one the LSM expected, this slot was recycled and the bytes belong to another key — throw it away and retry.
-
-Both checks are cheap, and together they mean a stale read is always *caught*, never served. A reader that keeps losing the race isn't stuck retrying forever, either: after a few attempts, `get` falls back to reading while holding the bucket write lock, which locks GC out of that bucket and guarantees the read completes.
-
-The three read paths run exactly these checks; they differ only in how much work they batch behind them:
-
-- **`get`** — the walk-through above: one key, one pointer, one record.
-- **Scans** — the LSM pass, the file handles, and the value reads all happen *inside* one before/after counter check covering every bucket, so the whole page is either consistent or retried as a unit. (Resolving a pointer outside that window is precisely the bug the window exists to prevent.) A key that resolved but came back empty is re-read afterwards through single-key `get`.
-- **`get_multiple`** — resolves every key in one LSM pass, groups the pointers by bucket, and reads each bucket in parallel with batched `pread`s (roughly `2 + N` syscalls per page rather than four per key), checking each record's sequence just as `get` does.
+Batch reads (`get_multiple`, scans) group their pointers by bucket and read each bucket in parallel; any key whose segment vanished mid-batch is simply re-resolved through the single-key path. A reader that is *already inside* a segment when GC unlinks it keeps reading safely, because on POSIX an open file descriptor outlives the unlink.
 
 ### Write-Ahead Log (WAL)
 
@@ -296,9 +315,10 @@ Using a fixed-length prefix has a useful consequence: **keys that share an 8-byt
 The location a bucket assignment ultimately produces is encoded in the `u128` value pointer stored in the LSM:
 
 ```
-bits 96–127  bucket_id       (u32)
-bits 32–95   page_offset     (u64, byte offset within value-log file)
-bits 0–31    segment_id      (u32, record index within page)
+bits 96–127  bucket_id     (u32)
+bits 64–95   segment_id    (u32, which segment file — monotone, never reused)
+bits 32–63   rec_offset    (u32, byte offset of the record within that segment)
+bits  0–31   value_len     (u32, so a read is one exactly-sized pread)
 ```
 
 ### Namespaces
@@ -356,10 +376,10 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │
 ├── ns_default/                 # Default namespace (always present)
 │   ├── value_logs/
-│   │   ├── value_log_0.log     # Value log bucket 0 (64 MB pages)
-│   │   ├── value_log_0.metadata
-│   │   ├── ...                 # Buckets 0–15
-│   │   └── gc_journal_0.bin    # GC crash-recovery journal for bucket 0
+│   │   ├── value_log_0.seg000007   # Bucket 0, sealed segment (immutable)
+│   │   ├── value_log_0.seg000008   # Bucket 0, active tail
+│   │   ├── value_log_0.metadata    # Segment inventory + id high-water mark
+│   │   ├── ...                     # Buckets 0–15
 │   ├── lsm_data/
 │   │   ├── level0/
 │   │   │   ├── level0_0/       # L0 files for bucket 0
@@ -423,7 +443,7 @@ get(key)
         │                                            │
         │                    tombstone ──► None      │ pointer
         │                                            ▼
-        │                                 ValueLog.read(bucket, offset)
+        │                            ValueLog.read(segment, offset, len)
         │                                     └─► value bytes
         │
         └──► no candidate → return None
@@ -450,17 +470,16 @@ The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush
 
 ### Value Log GC
 
-Value-log GC runs when a bucket's waste ratio (garbage bytes ÷ total bytes) exceeds 30% (configurable). The tricky part is doing this safely while writes and deletes are landing in the same bucket, so the whole compaction holds the **per-bucket write lock** that `put` and `delete` also take — making the scan and the subsequent LSM update atomic with respect to concurrent mutations.
+Value-log GC runs when a namespace's waste ratio (garbage bytes ÷ total bytes) crosses `thresholds.value_log_waste_threshold` (30% by default). That is the **trigger**; a second, lower knob — `thresholds.page_gc_threshold` (10%) — then selects **which segments** are worth rewriting.
 
-1. Acquire the bucket lock and scan the LSM for that bucket's live keys, remembering each key's current pointer.
-2. Compute per-page waste and select the pages that exceed the threshold.
-3. Copy the live records into fresh, compacted pages.
-4. Write a **GC journal** for crash recovery (see below).
-5. Atomically swap the old file for the compacted one with `rename()`, bumping the bucket's **swap generation**.
-6. Re-point each relocated key in the LSM as a **compare-and-set**: a key is only updated if it still maps to the exact pointer that was copied. A key deleted or overwritten since the scan is left alone, so GC never resurrects a deletion or reverts a newer write.
-7. Delete the GC journal. (If a crash interrupts the swap, the journal replay on startup applies the same "skip keys that are now deleted" rule.)
+Keeping those two separate is load-bearing. A segment below the selection threshold is left alone with its garbage intact, so if the two values were equal, garbage sitting just under the trigger could never be collected at all: every pass would skip those segments, report success, and leave the namespace still over its trigger. (That is not hypothetical — it is exactly the treadmill the engine used to be on, when one config value did both jobs.)
 
-Readers stay correct throughout *without* taking the bucket lock. A reader samples the bucket's swap generation before and after it reads the pointer and value, and only trusts the result if the generation is unchanged; otherwise it retries and, if needed, falls back to a lock-held read. This guarantees a reader can never pair a stale pointer with a freshly-swapped file. The [Value Log](#value-log) section animates both sides of this — the swap protocol and what each read path does while it runs.
+The pass itself is described in full under [Value Log](#value-log): pick the worst sealed segments, scan each one *without a lock* (every record carries its key, so liveness is one LSM point-get), relocate the survivors under a compare-and-set that respects concurrent writes and deletes, flush the re-point to L0, and only then unlink the old files.
+
+Two consequences worth stating plainly:
+
+- **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
+- **There is no journal, no commit marker, and no shadow file.** The flush-before-unlink ordering means the durable LSM always points at a segment that still exists, at every crash point, so there is nothing to roll forward or back on startup.
 
 ### WAL GC
 
@@ -482,7 +501,7 @@ The components above were each designed with one shared goal: surviving a crash 
 |---|---|
 | Process crash after `put()` | WAL is fsynced on every append; recovery replays the WAL on startup |
 | Crash after `put()` returns, before in-memory apply | The op is durable in the WAL and replayed on next startup |
-| Crash mid-GC (value-log file swap incomplete) | GC journal is written before the swap; replayed at startup to fix LSM pointers |
+| Crash mid-GC (value-log) | Nothing to repair: GC only unlinks a segment *after* the re-point is flushed to L0, so the durable LSM always points at a segment that still exists |
 | Corrupt metadata file | CRC32 mismatch is detected; the file is recovered or the error reported |
 | Crash between L0 flush and WAL mark-Persisted | WAL entries remain `Inserted` and are replayed on next open |
 | Recovery apply failure (transient error) | Each entry is retried once; persistent failures are written to a timestamped fail-log |
@@ -492,12 +511,13 @@ The components above were each designed with one shared goal: surviving a crash 
 1. Load the namespace registry.
 2. Load WAL metadata and scan all WAL segments.
 3. Load the LSM manifest and reopen the L0/L1 SSTables.
-4. Load value-log metadata and reopen the shard files.
-5. Scan for GC journals and replay any incomplete value-log file swaps.
-6. Replay the WAL entries that aren't yet `Persisted`:
+4. Open each bucket's value-log segments: reconcile the segment files on disk against the recorded inventory, and seed the segment-id allocator from `max(persisted high-water mark, highest existing id + 1)` so an id is never reused. A bucket whose metadata was lost has its live/garbage accounting recomputed exactly from the LSM's pointers.
+5. Replay the WAL entries that aren't yet `Persisted`:
    - Sort all eligible entries by sequence number and apply them in that one global order — so writes to the same key resolve to whichever was written last — retrying each once on failure.
    - Any entry that fails both attempts is written to `fail_logs/<timestamp>.json` and marked `Persisted`, so WAL GC can still make progress.
-7. Spawn the background workers (GC, LSM compaction, WAL GC, TTL).
+6. Spawn the background workers (GC, LSM compaction, WAL GC, TTL).
+
+There is deliberately **no value-log GC recovery step**. GC unlinks a segment only after its re-point is durable, so a crash can leave dead weight (a segment nothing points at) or an orphan, but never a dangling pointer — and the next GC pass reclaims both.
 
 **The fail log** is the operator's escape hatch. When recovery cannot apply an entry even after a retry, it writes a human-readable JSON file to `<db_path>/fail_logs/` (configurable via `[recovery] fail_log_dir`). The file records each failed op with its `name`, `operation`, `namespace_id`, key/value (rendered as nested JSON when the payload is JSON, hex otherwise), and the `error` — so the affected records can be replayed, deleted, or ignored deliberately rather than silently lost.
 
@@ -534,7 +554,7 @@ The knobs that most affect engine behaviour:
 | Key | Effect |
 |---|---|
 | `sharding.num_buckets` | Value-log / L1 shard count. **Fixed at creation** — it cannot change once data exists. |
-| `value_log.page_size_bytes` | Value-log page size (default 64 MiB; multiple of 4096, ≥ 64 KiB, < 4 GiB). **Fixed at creation** — a page's size is encoded in every stored value pointer, so opening a database whose value log used a different size fails. |
+| `value_log.segment_size_bytes` | Size at which a value-log segment is sealed (default 256 MiB; multiple of 4096, ≥ 64 KiB, ≤ 4 GiB). Bigger segments mean fewer files but coarser GC. **Not** fixed at creation — the size is not encoded in any pointer. |
 | `memtable.max_capacity` | SkipList entry limit before a flush is triggered. |
 | `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
 | `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |

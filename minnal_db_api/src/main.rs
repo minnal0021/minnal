@@ -1,4 +1,5 @@
 mod config;
+mod config_report;
 mod error;
 mod id;
 mod routes;
@@ -64,7 +65,7 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load_config();
+    let (cfg, raw_toml) = load_config();
 
     let log_dir = cfg.log_dir();
     std::fs::create_dir_all(&log_dir)?;
@@ -93,6 +94,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen     = %cfg.listen_addr(),
         "starting minnal_db_api",
     );
+
+    // Dump the effective configuration (with per-value source) so a deployment can be
+    // debugged from the log without guessing which knob actually took effect.
+    config_report::log_config_table(&cfg, raw_toml.as_ref());
 
     let db_config = cfg.to_db_config();
     let store = DocStore::open_with_config(cfg.db_path(), cfg.schema_dir(), db_config).await?;
@@ -256,7 +261,11 @@ async fn shutdown_signal() {
 /// 1. First positional CLI argument: `minnal_db_api /path/to/config.toml`
 /// 2. `MINNAL_CONFIG_FILE` environment variable
 /// 3. All built-in defaults (no file required)
-fn load_config() -> DocStoreApiConfig {
+///
+/// Returns the resolved config plus the file parsed as a plain [`toml::Table`] (the
+/// second element is `None` when no file was given, or if the raw re-parse fails),
+/// used by [`config_report`] to report each value's source.
+fn load_config() -> (DocStoreApiConfig, Option<toml::Table>) {
     let config_path = std::env::args().nth(1).or_else(|| std::env::var("MINNAL_CONFIG_FILE").ok());
 
     match config_path {
@@ -265,7 +274,10 @@ fn load_config() -> DocStoreApiConfig {
             match DocStoreApiConfig::from_file(p) {
                 Ok(cfg) => {
                     info!("loaded config from '{path}'");
-                    cfg
+                    // Re-parse the raw file to a plain table so the startup report can
+                    // tell which keys were actually set vs left at their default.
+                    let raw = std::fs::read_to_string(p).ok().and_then(|s| toml::from_str::<toml::Table>(&s).ok());
+                    (cfg, raw)
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -275,7 +287,7 @@ fn load_config() -> DocStoreApiConfig {
         }
         None => {
             info!("no config file specified — using built-in defaults");
-            DocStoreApiConfig::default()
+            (DocStoreApiConfig::default(), None)
         }
     }
 }

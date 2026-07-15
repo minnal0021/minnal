@@ -44,11 +44,16 @@ pub struct ScheduledTaskConfig {
 /// space before checkpoint compacts it.
 pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 
-/// Default percentage of a *value-log page* that may be garbage before GC
-/// rewrites that page. Deliberately **lower** than the bucket-level
+/// Default absolute cap (bytes) on a single field index's reclaimable dead blob
+/// bytes before the write path requests an early index checkpoint. 64 MiB. See
+/// [`ThresholdConfig::index_blob_backpressure_bytes`].
+pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default percentage of a *value-log segment* that may be garbage before GC
+/// rewrites it. Deliberately **lower** than the bucket-level
 /// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
-/// see [`ThresholdConfig::page_gc_threshold`] for why.
-pub const DEFAULT_PAGE_GC_THRESHOLD: f64 = 10.0;
+/// see [`ThresholdConfig::segment_gc_threshold`] for why.
+pub const DEFAULT_SEGMENT_GC_THRESHOLD: f64 = 10.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThresholdConfig {
@@ -56,38 +61,85 @@ pub struct ThresholdConfig {
     /// on it at all. This is the *trigger*: it answers "is this namespace worth
     /// collecting yet?"
     pub value_log_waste_threshold: f64,
-    /// Percentage (`0..100`) of an individual **page** that may be garbage before
-    /// GC rewrites that page. This is the *selection* rule, and it is a different
+    /// Percentage (`0..100`) of an individual **sealed segment** that may be garbage
+    /// before GC rewrites it. This is the *selection* rule, and it is a different
     /// question from the trigger above.
     ///
-    /// Keep it **well below** `value_log_waste_threshold`. A page under this
-    /// threshold is treated as "clean" and copied byte-for-byte into the
-    /// compacted file — carrying its garbage with it, unreclaimed. If the two
-    /// values were equal, garbage sitting just under the trigger could never be
-    /// collected at all: every pass would copy those pages across intact, report
-    /// success, and reclaim almost nothing, while the same bytes keep the bucket
-    /// over its trigger — GC on a treadmill. A lower page threshold rewrites more
-    /// survivors per pass but actually finishes the job.
-    pub page_gc_threshold: f64,
+    /// Keep it **well below** `value_log_waste_threshold`. A segment under this
+    /// threshold is treated as "clean" and left in place — its live records keep
+    /// their pointers, and its garbage rides along, unreclaimed. If the two values
+    /// were equal, garbage sitting just under the trigger could never be collected at
+    /// all: every pass would skip those segments, report success, and reclaim almost
+    /// nothing, while the same bytes keep the bucket over its trigger — GC on a
+    /// treadmill. A lower threshold rewrites more segments (and their survivors) per
+    /// pass but actually finishes the job.
+    pub segment_gc_threshold: f64,
+    /// Percentage (`0..100`) of garbage in a bucket's **active tail** segment at
+    /// which GC seals the tail so it can be collected.
+    ///
+    /// The tail is normally off-limits (it is still being appended to). A large or
+    /// busy namespace fills and rolls its tail on its own, sealing it; but a small
+    /// or idle one may never fill a segment, so its garbage would sit in the tail
+    /// forever — the waste trigger fires every interval, GC finds no *sealed*
+    /// candidate, and reclaims nothing. Sealing the tail early costs a one-time
+    /// rewrite of whatever is still live in it: at G% garbage it rewrites `(100-G)%`
+    /// to free `G%`, so the breakeven (rewrite == freed) is 50%.
+    ///
+    /// `None` (the default) tracks [`value_log_waste_threshold`](Self::value_log_waste_threshold)
+    /// — the same bar that decides a bucket is worth collecting also decides its tail
+    /// is worth sealing, so garbage never strands between the two. Set `Some(pct)` to
+    /// pin it (e.g. `50.0` to favour write-amplification over space). Resolve it with
+    /// [`effective_tail_gc_min_garbage_pct`](Self::effective_tail_gc_min_garbage_pct).
+    pub tail_gc_min_garbage_pct: Option<f64>,
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
     /// append-only, so each per-document insert leaves a stale copy of that
     /// field-value's bitmap behind; compaction reclaims it.
     pub index_blob_waste_threshold: f64,
+    /// Absolute cap (bytes) on a single field index's reclaimable dead blob
+    /// bytes before the write path proactively requests an index checkpoint,
+    /// instead of waiting for the periodic (~15 min) tick.
+    ///
+    /// This is **backpressure**, and it is an absolute byte cap on purpose — a
+    /// *ratio* trigger is useless here because a low-cardinality, high-churn
+    /// field (e.g. a boolean over many docs) crosses any ratio almost
+    /// immediately and stays pinned near 100%, so it would fire on nearly every
+    /// write. Capping absolute dead bytes bounds the transient on-disk
+    /// amplification to roughly this value per field, and it self-debounces:
+    /// compaction resets the field's dead-byte count to 0, so the next request
+    /// only fires after another `index_blob_backpressure_bytes` accumulate.
+    /// The dead-byte count is O(1) to read, so the check is cheap on the hot
+    /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
+    pub index_blob_backpressure_bytes: u64,
 }
 
 impl ThresholdConfig {
     pub fn new(waste_threshold: f64) -> Self {
         Self {
             value_log_waste_threshold: waste_threshold,
-            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
+            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }
     }
 
-    /// Override the per-page GC threshold (percentage `0..100`).
-    pub fn with_page_gc_threshold(mut self, threshold: f64) -> Self {
-        self.page_gc_threshold = threshold;
+    /// The effective tail-seal bar: the explicit
+    /// [`tail_gc_min_garbage_pct`](Self::tail_gc_min_garbage_pct) if set, otherwise the
+    /// [`value_log_waste_threshold`](Self::value_log_waste_threshold) trigger it tracks.
+    pub fn effective_tail_gc_min_garbage_pct(&self) -> f64 {
+        self.tail_gc_min_garbage_pct.unwrap_or(self.value_log_waste_threshold)
+    }
+
+    /// Override the per-segment GC selection threshold (percentage `0..100`).
+    pub fn with_segment_gc_threshold(mut self, threshold: f64) -> Self {
+        self.segment_gc_threshold = threshold;
+        self
+    }
+
+    /// Override the tail-seal bar (percentage `0..100`); `None` tracks the trigger.
+    pub fn with_tail_gc_min_garbage_pct(mut self, threshold: Option<f64>) -> Self {
+        self.tail_gc_min_garbage_pct = threshold;
         self
     }
 
@@ -96,14 +148,23 @@ impl ThresholdConfig {
         self.index_blob_waste_threshold = threshold;
         self
     }
+
+    /// Override the index-checkpoint backpressure cap (bytes). See
+    /// [`index_blob_backpressure_bytes`](Self::index_blob_backpressure_bytes).
+    pub fn with_index_blob_backpressure_bytes(mut self, bytes: u64) -> Self {
+        self.index_blob_backpressure_bytes = bytes;
+        self
+    }
 }
 
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: 30.0,
-            page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
+            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }
     }
 }
@@ -146,19 +207,26 @@ pub struct DbConfig {
     pub num_buckets: usize,
     /// Maximum number of entries (including tombstones) in the in-memory skip list.
     pub skip_list_capacity: usize,
-    /// WAL segment size in bytes.
+    /// WAL segment size in bytes (default 64 MiB).
+    ///
+    /// **Fixed at creation.** Unlike [`segment_size_bytes`](Self::segment_size_bytes)
+    /// for the value log, a WAL segment id is `offset / wal_segment_size`, so this
+    /// cannot change once the WAL holds data — a different size would map stored
+    /// offsets to the wrong segment files. It is honoured only for a brand-new WAL
+    /// and then recorded in a `wal_segment_size` marker; on an existing WAL the
+    /// recorded size wins and a differing config value is ignored with a warning.
     pub wal_segment_size: u64,
-    /// Value log page size in bytes (default 64 MiB).
+    /// Size at which a value-log segment is sealed and a new one opened
+    /// (default 256 MiB).
     ///
-    /// **Fixed when a namespace's value log is created and cannot be changed
-    /// afterwards** — like [`num_buckets`](Self::num_buckets). A page's size
-    /// determines the page-aligned `page_offset` in every stored value pointer
-    /// and where a record's slot entry lives, so reopening existing data with a
-    /// different size would reinterpret every pointer. Opening a namespace whose
-    /// value log was written with a different page size fails.
+    /// Unlike the page size it replaces, this is **not** fixed at creation: a
+    /// segment's size is not encoded in any value pointer (only its id and a byte
+    /// offset are), so existing segments keep the size they were written at and new
+    /// ones simply use whatever is configured now.
     ///
-    /// Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
-    pub page_size_bytes: u64,
+    /// Must be a multiple of 4096, at least 64 KiB, and at most 4 GiB (a record's
+    /// offset within its segment is a `u32`).
+    pub segment_size_bytes: u64,
     /// Directory for recovery fail-log files.
     /// `None` defaults to `<db_path>/fail_logs` at open time.
     pub fail_log_dir: Option<PathBuf>,
@@ -183,7 +251,7 @@ impl Default for DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: 64 * 1024 * 1024,
-            page_size_bytes: 64 * 1024 * 1024,
+            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }
@@ -205,7 +273,7 @@ impl DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: 64 * 1024 * 1024,
-            page_size_bytes: 64 * 1024 * 1024,
+            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }

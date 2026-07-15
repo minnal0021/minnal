@@ -47,7 +47,7 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
                   BlobStore::upsert(slot_id, serialize(bm))  ← APPEND-ONLY: old copy orphaned
          (index mutation is mmap-only here — NOT yet fsynced; rebuilt from WAL on recovery)
 
-CHECKPOINT (background, every ~15 min / shutdown / Db::checkpoint_index)   [minnal_db]
+CHECKPOINT (background, every ~15 min / BACKPRESSURE / shutdown / Db::checkpoint_index)   [minnal_db]
   IndexCheckpointWorker → Database::run_index_checkpoint   (database.rs)
     per active field:
       ── under entry.index.READ lock ──   flush() mmap;  waste = bitmap_waste_ratio()
@@ -55,6 +55,15 @@ CHECKPOINT (background, every ~15 min / shutdown / Db::checkpoint_index)   [minn
         ── under entry.index.WRITE lock ──  maybe_compact() → BlobStore::compact();  flush()
                                             (stalls THIS field's reads+writes for the I/O)
     checkpoint_fields(wal_tail)            ← records WAL offset now reflected on disk (tmp+rename)
+
+  BACKPRESSURE (write-path valve — bounds transient disk between the ~15 min ticks):
+    the ingest path checks the field's O(1) DynFieldIndex::reclaimable_dead_bytes()
+    after each update; when it reaches thresholds.index_blob_backpressure_bytes
+    (default 64 MiB) it fires IndexCheckpointTrigger → an immediate checkpoint
+    (debounced via a shared `pending` flag; cap 0 disables). This is an absolute
+    BYTE cap, not a ratio: a low-cardinality field crosses any ratio in a handful
+    of writes and stays ~100%, so a ratio trigger would fire almost every write.
+    The cap self-debounces because compaction resets dead_bytes to 0.
 
 COMPACTION (staged, crash-safe swap)                       [index/blob_store.rs]
   build compacted val_buf + key table in memory (~1× live size, read from mmap)
@@ -90,6 +99,8 @@ Index snapshots are written to the database directory alongside the LSM/value-lo
 `FieldIndex` holds each distinct value's `RoaringBitmap` as a single blob in `BlobStore` (`blobs.keys` open-addressing table + `blobs.vals` append-only value region). **`insert` re-serialises the *whole* bitmap and `upsert`s it on every document** — and `upsert` always appends the new blob, orphaning the previous copy (`value_write_pos` only advances; nothing is reclaimed in place). So a field value shared by N documents leaves N−1 stale bitmap copies. This is O(N²) cumulative bytes per value and is **catastrophic for low-cardinality fields** (few distinct values, each covering many docs) — e.g. a boolean over 40k docs can bloat to multiple GB. The random u128 row IDs compound it: bitmaps are pathologically sparse (≈one container per doc), so each rewrite is large.
 
 `BlobStore::compact()` rebuilds the value region from live slots only (dropping dead space), clears tombstones, and shrinks the file. `BlobStore::waste_ratio()` reports the reclaimable fraction (alignment padding counts as live, so it reads ≈0 right after a compaction). The index checkpoint (`run_index_checkpoint`) calls `DynFieldIndex::maybe_compact` per field, compacting any store whose waste crosses `ThresholdConfig::index_blob_waste_threshold` (percent, default 50; TOML `thresholds.index_blob_waste_threshold`). `Db::checkpoint_index()` forces a flush+compaction on demand.
+
+**Backpressure — don't rely on the ~15 min tick alone.** Between checkpoints a low-cardinality high-churn field can amplify to gigabytes (measured: a boolean over 12k docs bloated to ~1 GB before the timer fired). So the write path also carries a valve: it reads `BlobStore::dead_bytes()` — an **O(1)** running counter of reclaimable bytes (incremented on each `upsert`-replace / `remove_key`, reset by `compact`, seeded from `logical-live` at `open`) — surfaced as `DynFieldIndex::reclaimable_dead_bytes()`, and when a field crosses `ThresholdConfig::index_blob_backpressure_bytes` (default 64 MiB; TOML `thresholds.index_blob_backpressure_bytes`, 0 disables) it fires an `IndexCheckpointTrigger` to run a checkpoint immediately. The trigger is threaded to each `KVStore` like the LSM compaction trigger (set when the checkpoint worker is enabled; inherited by namespaces opened later) and is debounced through a shared `pending` flag so a hot field enqueues at most one checkpoint at a time. **It is an absolute byte cap, not a ratio** — a ratio hits ~100% almost immediately for exactly these fields, so it would fire nearly every write and cost O(capacity) per check; the byte cap bounds peak disk to ~cap per field and self-debounces (compaction zeroes the count). See `db/index_checkpoint_worker.rs`.
 
 `maybe_compact` covers **both** of a field's BlobStores. The bitmap store bloats per **document** (whole-bitmap rewrite per insert). The `keymap/` store (slot_id → value) is written once per distinct value, so a fixed value set never bloats it — but under **distinct-value churn** (values that appear and are later fully removed, freeing their slot) it accumulates dead entries, so it is compacted on its own `keymap_waste_ratio()` crossing the same threshold. The two stores key on the same slot IDs and tombstone the same slots together (a value's slot is freed in both when its bitmap empties), so they are compacted independently while staying consistent.
 

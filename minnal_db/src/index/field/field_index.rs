@@ -299,6 +299,13 @@ impl<V: Ord + Clone> FieldIndex<V> {
         (self.bitmaps.logical_bytes(), self.bitmaps.live_bytes())
     }
 
+    /// Reclaimable dead bytes in the bitmap value region — **O(1)** (see
+    /// `BlobStore::dead_bytes`). Used to drive checkpoint backpressure without a
+    /// per-write waste-ratio scan.
+    pub fn bitmap_dead_bytes(&self) -> u64 {
+        self.bitmaps.dead_bytes()
+    }
+
     /// Compact the bitmap value region, reclaiming dead space left by the
     /// per-insert whole-bitmap rewrites. See `BlobStore::compact`.
     pub fn compact_bitmaps(&mut self) -> std::io::Result<u64> {

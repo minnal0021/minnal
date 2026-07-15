@@ -12,11 +12,12 @@ pub struct GCStats {
 #[derive(Debug, serde::Serialize)]
 #[allow(dead_code)]
 pub struct Stats {
-    pub head: u64,
-    pub tail: u64,
+    /// Value-log segment files currently on disk across all buckets.
+    pub segment_count: u64,
+    /// Bytes those segment files occupy on disk.
+    pub disk_bytes: u64,
     pub garbage_size: u64,
     pub waste_ratio: f64,
-    pub free_space_ratio: f64,
     pub total_gc_runs: u64,
     pub total_bytes_reclaimed: u64,
     pub live_bytes: u64,

@@ -270,8 +270,10 @@ impl DocStoreApiConfig {
         DbConfig {
             threshold_config: ThresholdConfig {
                 value_log_waste_threshold: self.thresholds.value_log_waste_threshold,
-                page_gc_threshold: self.thresholds.page_gc_threshold,
+                segment_gc_threshold: self.thresholds.segment_gc_threshold,
+                tail_gc_min_garbage_pct: self.thresholds.tail_gc_min_garbage_pct,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
+                index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
             },
             sync_config: SyncConfig {
                 records_per_sync: self.sync.records_per_sync,
@@ -282,7 +284,7 @@ impl DocStoreApiConfig {
             num_buckets: self.sharding.num_buckets,
             skip_list_capacity: self.memtable.max_capacity,
             wal_segment_size: self.wal.segment_size_bytes,
-            page_size_bytes: self.value_log.page_size_bytes,
+            segment_size_bytes: self.value_log.segment_size_bytes,
             fail_log_dir: None,
             verify_checksums_on_read: self.value_log.verify_checksums_on_read,
         }
@@ -441,18 +443,26 @@ fn default_records_per_sync() -> usize {
 pub struct ThresholdSection {
     #[serde(default = "default_waste_threshold")]
     pub value_log_waste_threshold: f64,
-    #[serde(default = "default_page_gc_threshold")]
-    pub page_gc_threshold: f64,
+    #[serde(default = "default_segment_gc_threshold")]
+    pub segment_gc_threshold: f64,
+    /// Garbage share at which a bucket's active tail is sealed for GC. Omit to track
+    /// `value_log_waste_threshold` (the recommended default).
+    #[serde(default)]
+    pub tail_gc_min_garbage_pct: Option<f64>,
     #[serde(default = "default_index_blob_waste_threshold")]
     pub index_blob_waste_threshold: f64,
+    #[serde(default = "default_index_blob_backpressure_bytes")]
+    pub index_blob_backpressure_bytes: u64,
 }
 
 impl Default for ThresholdSection {
     fn default() -> Self {
         Self {
             value_log_waste_threshold: default_waste_threshold(),
-            page_gc_threshold: default_page_gc_threshold(),
+            segment_gc_threshold: default_segment_gc_threshold(),
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
+            index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
         }
     }
 }
@@ -461,12 +471,16 @@ fn default_waste_threshold() -> f64 {
     30.0
 }
 
-fn default_page_gc_threshold() -> f64 {
-    minnal_db::DEFAULT_PAGE_GC_THRESHOLD
+fn default_segment_gc_threshold() -> f64 {
+    minnal_db::DEFAULT_SEGMENT_GC_THRESHOLD
 }
 
 fn default_index_blob_waste_threshold() -> f64 {
     minnal_db::DEFAULT_INDEX_BLOB_WASTE_THRESHOLD
+}
+
+fn default_index_blob_backpressure_bytes() -> u64 {
+    minnal_db::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,8 +533,8 @@ fn default_wal_segment_size() -> u64 {
 
 #[derive(Debug, Deserialize)]
 pub struct ValueLogSection {
-    #[serde(default = "default_page_size")]
-    pub page_size_bytes: u64,
+    #[serde(default = "default_segment_size")]
+    pub segment_size_bytes: u64,
     /// Re-verify each value's CRC32 on every read. Defaults to `false`
     /// (latency first); see `DbConfig::verify_checksums_on_read`.
     #[serde(default)]
@@ -530,14 +544,14 @@ pub struct ValueLogSection {
 impl Default for ValueLogSection {
     fn default() -> Self {
         Self {
-            page_size_bytes: default_page_size(),
+            segment_size_bytes: default_segment_size(),
             verify_checksums_on_read: false,
         }
     }
 }
 
-fn default_page_size() -> u64 {
-    64 * 1024 * 1024
+fn default_segment_size() -> u64 {
+    minnal_db::DEFAULT_SEGMENT_SIZE_BYTES
 }
 
 // ── Vector index worker section ───────────────────────────────────────────────

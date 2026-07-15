@@ -303,8 +303,8 @@ impl Db {
     }
 
     /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_page_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::PageGarbageStats>)>> {
-        self.inner.value_log_page_stats(namespace)
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
+        self.inner.value_log_segment_stats(namespace)
     }
 
     /// Run value-log garbage collection on the default namespace.
@@ -860,6 +860,8 @@ impl AsyncDb {
     /// Start the index checkpoint background worker.
     pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
         let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
+        // Wire the write-path backpressure valve to this worker before publishing it.
+        self.inner.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
         info!("[AsyncDb] Index checkpoint worker enabled with {}s interval", interval.as_secs());
         Ok(())
@@ -1182,8 +1184,8 @@ impl AsyncDb {
     }
 
     /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_page_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::PageGarbageStats>)>> {
-        self.inner.value_log_page_stats(namespace)
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
+        self.inner.value_log_segment_stats(namespace)
     }
 
     pub fn waste_ratio(&self) -> f64 {

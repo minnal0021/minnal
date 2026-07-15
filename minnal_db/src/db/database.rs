@@ -5,7 +5,7 @@
 
 use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
@@ -21,7 +21,7 @@ use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCom
 use crate::store::value_log::ValueLogMetadata;
 
 use log::{debug, error, info, warn};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +43,14 @@ pub(crate) struct WalPersistObserver {
     wal_metadata_path: PathBuf,
     pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
     last_persisted_offset: Arc<RwLock<u64>>,
+    /// Serializes every persisted-marking operation (`mark_persisted_range`,
+    /// `mark_namespace_persisted`). These do a non-atomic scan → check status →
+    /// flip → count over a WAL offset range; run concurrently they would flip and
+    /// **count the same entry twice**, driving `persisted_entries` past
+    /// `total_entries` and permanently wedging WAL GC (whose deletion gate is
+    /// `persisted >= total`). Holding this across the whole operation makes the
+    /// on-disk `status == Persisted` check a reliable per-entry dedup.
+    persist_lock: Mutex<()>,
 }
 
 impl WalPersistObserver {
@@ -59,10 +67,20 @@ impl WalPersistObserver {
             wal_metadata_path,
             pending,
             last_persisted_offset,
+            persist_lock: Mutex::new(()),
         }
     }
 
     pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
+        // Serialize with every other persisted-marking operation so no entry is
+        // scanned+flipped+counted concurrently (see `persist_lock`).
+        let _persist = self.persist_lock.lock();
+
+        // Re-read the authoritative watermark under the lock: the caller's `start`
+        // may be stale if another persist advanced past it while we waited, and
+        // processing an already-counted range would double-count it. `start` is
+        // kept as a floor (it only ever equals the watermark at call sites).
+        let start = (*self.last_persisted_offset.read()).max(start);
         if end <= start {
             return;
         }
@@ -132,6 +150,12 @@ impl WalPersistObserver {
         if end <= start {
             return;
         }
+
+        // Serialize with `mark_persisted_range` (same `persist_lock`): both flip and
+        // count entries in overlapping windows, so running concurrently they could
+        // count the same entry twice. Under the lock, whichever flips an entry first
+        // marks it `Persisted` on disk and the other skips it uncounted.
+        let _persist = self.persist_lock.lock();
 
         let entries = match self.wal.scan_entries(start, end) {
             Ok(entries) => entries,
@@ -313,6 +337,10 @@ pub struct Database {
     // Shared LSM compaction sender — stored so newly-opened namespaces can be wired up.
     pub(crate) lsm_compaction_sender: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 
+    // Shared index-checkpoint backpressure valve — stored so newly-opened
+    // namespaces inherit it. `None` until the checkpoint worker is enabled.
+    pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
     // namespace is registered. The per-namespace (ttl, max_deletes) config it
@@ -339,6 +367,52 @@ pub struct Database {
 }
 
 impl Database {
+    /// Resolve the WAL segment size to open with, locking it at creation.
+    ///
+    /// Precedence:
+    /// 1. An existing `wal_segment_size` marker wins — the size is fixed for the
+    ///    life of the WAL, because a segment id is `offset / segment_size` and a
+    ///    different size would map stored offsets to the wrong segment files.
+    /// 2. No marker but the WAL already holds data (a metadata file, or a
+    ///    non-empty `wal.log`): a pre-marker WAL, which was written at the
+    ///    historical [`DEFAULT_SEGMENT_SIZE`]. Use that and stamp the marker.
+    /// 3. Brand-new WAL: honour `configured` and stamp the marker.
+    ///
+    /// The marker write is best-effort; if it fails the effective size is still
+    /// correct for this run (it just re-resolves the same way next open).
+    fn resolve_wal_segment_size(db_path: &Path, wal_path: &Path, wal_metadata_path: &Path, configured: u64) -> u64 {
+        let marker = db_path.join("wal_segment_size");
+
+        if let Ok(bytes) = std::fs::read(&marker)
+            && let Ok(arr) = <[u8; 8]>::try_from(bytes.as_slice())
+        {
+            let recorded = u64::from_le_bytes(arr);
+            if recorded != 0 {
+                if configured != recorded {
+                    warn!(
+                        "[WAL] Configured wal.segment_size_bytes={} but this WAL was created at {}. \
+                         The segment size is fixed at creation and cannot change on existing data; \
+                         the configured value will NOT be applied.",
+                        configured, recorded,
+                    );
+                }
+                return recorded;
+            }
+        }
+
+        let preexisting = wal_metadata_path.exists() || std::fs::metadata(wal_path).map(|m| m.len() > 0).unwrap_or(false);
+        let size = if preexisting {
+            crate::db::wal::DEFAULT_SEGMENT_SIZE
+        } else {
+            configured.max(crate::db::wal::MIN_SEGMENT_SIZE)
+        };
+
+        if let Err(e) = crate::support::write_atomic_durable(&marker, &size.to_le_bytes()) {
+            warn!("[WAL] Failed to record WAL segment-size marker at {}: {:?}", marker.display(), e);
+        }
+        size
+    }
+
     /// Open a multi-namespace database at the given path
     pub fn open(db_path: &Path, mut config: DbConfig) -> Result<Self> {
         std::fs::create_dir_all(db_path)?;
@@ -367,8 +441,16 @@ impl Database {
         let wal_path = db_path.join("wal.log");
         let wal_metadata_path = db_path.join("wal_metadata");
 
+        // The WAL segment size is fixed at creation and honoured from config only
+        // for a brand-new WAL. It cannot change on existing data: a segment id is
+        // `offset / segment_size`, so a different size re-buckets every stored
+        // offset into the wrong segment file. The chosen size is recorded in a
+        // marker so it survives restarts; a pre-marker WAL falls back to the
+        // historical 64 MiB it was written at. (`wal.segment_size_bytes` in config.)
+        let wal_segment_size = Self::resolve_wal_segment_size(db_path, &wal_path, &wal_metadata_path, config.wal_segment_size);
+
         // Open WAL
-        let wal = Arc::new(Wal::open(&wal_path)?);
+        let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
 
         // Load or initialize WAL metadata
         let mut wal_metadata = if wal_metadata_path.exists() {
@@ -446,7 +528,7 @@ impl Database {
                 &ns_path,
                 config.lsm_config.clone(),
                 config.sync_config,
-                config.page_size_bytes,
+                config.segment_size_bytes,
                 ttl,
             )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
@@ -486,6 +568,7 @@ impl Database {
             lsm_compaction_worker: Arc::new(tokio::sync::RwLock::new(None)),
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -518,19 +601,28 @@ impl Database {
         Ok(db)
     }
 
-    /// Detect existing bucket count by counting value_log_*.log files.
+    /// Detect an existing database's bucket count from its value-log filenames.
+    ///
+    /// Both the segment files (`value_log_{bucket}.seg000123`) and the per-bucket
+    /// metadata (`value_log_{bucket}.metadata`) name their bucket right after the
+    /// `value_log_` prefix. A bucket now owns **many** segment files, so a plain file
+    /// count over-reports; instead take the highest bucket id seen and add one. Buckets
+    /// are numbered `0..num_buckets`, so that is the original count — and it stays
+    /// correct even if one bucket's files are momentarily absent.
     fn detect_bucket_count(vlog_dir: &Path) -> usize {
         let Ok(entries) = std::fs::read_dir(vlog_dir) else {
             return 0;
         };
-        entries
+        let highest = entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
+            .filter_map(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                name.starts_with("value_log_") && name.ends_with(".log") && !name.ends_with(".old")
+                let rest = name.strip_prefix("value_log_")?;
+                rest.split('.').next()?.parse::<u32>().ok()
             })
-            .count()
+            .max();
+        highest.map_or(0, |b| b as usize + 1)
     }
 
     /// Wire up LSM flush observers for all KVStores
@@ -543,6 +635,22 @@ impl Database {
             ));
             kv_store.set_flush_observer(Some(observer));
         }
+    }
+
+    /// Build the index-checkpoint backpressure valve for `worker` (using the
+    /// configured `index_blob_backpressure_bytes` cap), wire it into every
+    /// existing store, and record it centrally so namespaces opened later inherit
+    /// it. Called when the checkpoint worker is enabled.
+    pub(crate) fn wire_index_checkpoint_trigger(&self, worker: &IndexCheckpointWorker) {
+        let cap = self.config.threshold_config.index_blob_backpressure_bytes;
+        let trigger = worker.backpressure_trigger(cap);
+        {
+            let stores = self.stores.read();
+            for kv_store in stores.values() {
+                kv_store.set_index_checkpoint_trigger(Some(Arc::clone(&trigger)));
+            }
+        }
+        *self.index_checkpoint_trigger.write() = Some(trigger);
     }
 
     // ── Core data operations (default namespace shortcuts) ─────────────
@@ -670,7 +778,7 @@ impl Database {
     /// This skips the fsync that normally accompanies every WAL entry, giving
     /// much higher throughput at the cost of crash safety: any data written
     /// via this method is unrecoverable if the process crashes before the
-    /// value-log page is flushed.  Only use this for bulk-loading scenarios
+    /// value-log segment is flushed.  Only use this for bulk-loading scenarios
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
@@ -766,7 +874,7 @@ impl Database {
             &ns_path,
             self.config.lsm_config.clone(),
             self.config.sync_config,
-            self.config.page_size_bytes,
+            self.config.segment_size_bytes,
         )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
@@ -784,6 +892,10 @@ impl Database {
         // Wire compaction trigger if a worker is already running
         if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
             kv_store.set_compaction_trigger(sender.clone());
+        }
+        // Inherit the index-checkpoint backpressure valve if the worker is running.
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
         }
 
         self.stores.write().insert(ns_id, Arc::new(kv_store));
@@ -805,7 +917,7 @@ impl Database {
             &ns_path,
             self.config.lsm_config.clone(),
             self.config.sync_config,
-            self.config.page_size_bytes,
+            self.config.segment_size_bytes,
             ttl,
         )?;
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
@@ -824,6 +936,10 @@ impl Database {
         // Wire compaction trigger if a worker is already running
         if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
             kv_store.set_compaction_trigger(sender.clone());
+        }
+        // Inherit the index-checkpoint backpressure valve if the worker is running.
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
         }
 
         self.stores.write().insert(ns_id, Arc::new(kv_store));
@@ -1630,7 +1746,10 @@ impl Database {
         let current = self.wal.segment_id_for_offset(wal_metadata.tail - 1);
         wal_metadata.tracked_segments().take_while(|&s| s < current).any(|s| {
             let t = wal_metadata.segment_total(s);
-            t > 0 && t == wal_metadata.segment_persisted(s)
+            // `>=` rather than `==`: a fully-persisted segment has persisted == total;
+            // accepting `>` too keeps GC unwedged if a persisted counter is ever
+            // over-reported, instead of stranding the segment forever.
+            t > 0 && wal_metadata.segment_persisted(s) >= t
         })
     }
 
@@ -1670,7 +1789,10 @@ impl Database {
         for segment_id in candidates {
             let total = wal_metadata.segment_total(segment_id);
             let persisted = wal_metadata.segment_persisted(segment_id);
-            if total > 0 && total == persisted && self.wal.delete_segment_file(segment_id).is_ok() {
+            // `persisted >= total` (not `==`): a segment is reclaimable once every
+            // entry is persisted; `>=` also unwedges GC if a counter was ever
+            // over-reported (see `has_deletable_wal_segments`).
+            if total > 0 && persisted >= total && self.wal.delete_segment_file(segment_id).is_ok() {
                 bytes_reclaimed = bytes_reclaimed.saturating_add(self.wal.segment_size());
                 segments_deleted += 1;
                 wal_metadata.total_entries = wal_metadata.total_entries.saturating_sub(total);
@@ -1712,14 +1834,15 @@ impl Database {
 
     /// Run value log GC on a specific namespace.
     ///
-    /// Note the threshold passed here is the **per-page** one, not the bucket-level
-    /// trigger: an explicit `garbage_collect()` call has already decided the
-    /// namespace is worth collecting, so what is left to decide is which *pages*
+    /// Note the threshold passed here is the **per-segment** selection one, not the
+    /// bucket-level trigger: an explicit `garbage_collect()` call has already decided
+    /// the namespace is worth collecting, so what is left to decide is which *segments*
     /// to rewrite.
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
-        let page_threshold = self.config.threshold_config.page_gc_threshold;
-        kv_store.garbage_collect_with_threshold(page_threshold)
+        let segment_threshold = self.config.threshold_config.segment_gc_threshold;
+        let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
+        kv_store.garbage_collect_with_thresholds(segment_threshold, tail_threshold)
     }
 
     /// Run value log GC on the default namespace
@@ -1747,11 +1870,10 @@ impl Database {
 
     pub fn stats(&self) -> Stats {
         self.default_store().map(|s| s.stats()).unwrap_or_else(|_| Stats {
-            head: 0,
-            tail: 0,
+            segment_count: 0,
+            disk_bytes: 0,
             garbage_size: 0,
             waste_ratio: 0.0,
-            free_space_ratio: 0.0,
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
             live_bytes: 0,
@@ -1770,7 +1892,7 @@ impl Database {
         let stores = self.stores.read();
         namespaces
             .into_iter()
-            .filter_map(|(name, ns_id)| stores.get(&ns_id).map(|s| (name, s.value_log.get_all_bucket_stats())))
+            .filter_map(|(name, ns_id)| stores.get(&ns_id).map(|s| (name, s.value_log.all_bucket_metadata())))
             .collect()
     }
 
@@ -1785,16 +1907,13 @@ impl Database {
             .collect()
     }
 
-    /// Per-page garbage breakdown for one namespace's value-log shards. Cost is
-    /// O(pages × records), so it is scoped to a single namespace (by name).
-    pub fn value_log_page_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::PageGarbageStats>)>> {
+    /// Per-segment live/garbage breakdown for one namespace's value-log shards.
+    ///
+    /// Cheap: the counters are maintained in memory by writers, so this reads no
+    /// segment data at all (the old per-page version had to scan every record).
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
         let store = self.get_store_by_name(namespace)?;
-        let mut out = Vec::new();
-        for bucket in 0..store.value_log.num_buckets() as u32 {
-            let pages = store.value_log.page_stats(bucket).map_err(KVError::from)?;
-            out.push((bucket, pages));
-        }
-        Ok(out)
+        Ok(store.value_log.all_segment_stats())
     }
 
     /// Run value-log GC on every namespace and return per-namespace results.
@@ -1944,6 +2063,10 @@ impl Database {
         let wal_path = db_path.join("wal.log");
         let wal_metadata_path = db_path.join("wal_metadata");
 
+        // Record the forced size so a later production `open` of this dir honours
+        // it rather than re-resolving to the default (mirrors `open`).
+        let _ = crate::support::write_atomic_durable(&db_path.join("wal_segment_size"), &wal_segment_size.to_le_bytes());
+
         let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
 
         let mut wal_metadata = if wal_metadata_path.exists() {
@@ -2015,7 +2138,7 @@ impl Database {
                 &ns_path,
                 config.lsm_config.clone(),
                 config.sync_config,
-                config.page_size_bytes,
+                config.segment_size_bytes,
             )?;
             kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
             kv_store.cleanup_old_files_on_startup()?;
@@ -2047,6 +2170,7 @@ impl Database {
             lsm_compaction_worker: Arc::new(tokio::sync::RwLock::new(None)),
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2248,25 +2372,44 @@ impl ValueLogGcTarget for Database {
     }
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
-    /// lower `page_gc_threshold` then decides **which pages** get rewritten. Passing
-    /// the trigger through as the page threshold (as this used to) makes garbage
-    /// sitting just under it uncollectable: those pages read as "clean", get copied
-    /// byte-for-byte into the compacted file with their garbage intact, and keep the
-    /// bucket over its trigger forever.
+    /// lower `segment_gc_threshold` then decides **which sealed segments** get rewritten.
+    /// Passing the trigger through as the selection threshold (as this used to) makes
+    /// garbage sitting just under it uncollectable: those segments read as "clean", are
+    /// left in place with their garbage intact, and keep the bucket over its trigger
+    /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
-        let page_threshold = self.config.threshold_config.page_gc_threshold;
+        let segment_threshold = self.config.threshold_config.segment_gc_threshold;
+        let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
         info!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
-             (pages rewritten at >= {:.2}% garbage)",
+             (segments rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),
             waste_threshold,
-            page_threshold
+            segment_threshold,
+            tail_threshold
         );
         for (ns_id, kv_store) in stores.iter() {
             let waste_ratio = kv_store.get_waste_ratio();
-            if waste_ratio < waste_threshold {
-                debug!("[GCWorker] ns_id={} waste {:.2}% below threshold, skipping", ns_id, waste_ratio);
+            // The namespace-average waste is over the trigger, OR some single bucket is —
+            // the average alone hides a hot bucket behind near-empty ones, so a bucket well
+            // over the trigger would never be collected. Check both.
+            if waste_ratio < waste_threshold && !kv_store.has_bucket_over_waste(waste_threshold) {
+                debug!(
+                    "[GCWorker] ns_id={} waste {:.2}% below threshold (no bucket over it), skipping",
+                    ns_id, waste_ratio
+                );
+                continue;
+            }
+            // Over the trigger, but is any of that garbage actually collectable? Garbage in
+            // a bucket's active tail is not, until the tail is either filled or sealed — so
+            // without this check a small, fully-deleted namespace would sit at 100% waste
+            // and make the worker log "starting GC ... reclaimed 0 bytes" on every tick.
+            if !kv_store.has_gc_work(segment_threshold, tail_threshold) {
+                debug!(
+                    "[GCWorker] ns_id={} waste {:.2}% is over the trigger but no segment is collectable yet, skipping",
+                    ns_id, waste_ratio
+                );
                 continue;
             }
             let (garbage_bytes, written_bytes) = kv_store.waste_bytes();
@@ -2276,7 +2419,7 @@ impl ValueLogGcTarget for Database {
                 ns_id, waste_ratio, garbage_bytes, written_bytes, waste_threshold
             );
             let start = std::time::Instant::now();
-            match kv_store.garbage_collect_with_threshold(page_threshold) {
+            match kv_store.garbage_collect_with_thresholds(segment_threshold, tail_threshold) {
                 Ok(stats) => info!(
                     "[GCWorker] ns_id={} GC complete in {:?} — reclaimed {} bytes, live {} bytes, \
                      total reclaimed {} bytes across {} run(s)",
@@ -2508,6 +2651,8 @@ impl AsyncDatabase {
     /// only needs to replay a bounded WAL tail.
     pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
         let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
+        // Wire the write-path backpressure valve to this worker before publishing it.
+        self.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
         info!("[AsyncDatabase] Index checkpoint worker enabled with {}s interval", interval.as_secs());
         Ok(())
@@ -2688,6 +2833,91 @@ mod tests {
         let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
         config.num_buckets = crate::support::TEST_NUM_BUCKETS;
         config
+    }
+
+    #[test]
+    fn test_concurrent_mark_persisted_never_overcounts() {
+        // Regression: `mark_persisted_range` is a non-atomic scan → flip → count.
+        // Run concurrently by multiple writers reaching the sync point at once, two
+        // threads would flip and BOTH count the same entry, pushing
+        // `persisted_entries` past `total_entries`. Because the WAL GC deletion gate
+        // was exact equality (`total == persisted`), that impossible state wedged
+        // WAL GC forever (segments never became deletable → unbounded WAL growth).
+        // `persist_lock` must serialize the flip+count so no entry is counted twice.
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+
+        // Append a batch of entries (default records_per_sync is high, so these do
+        // not auto-persist during the writes).
+        let n = 500u64;
+        for i in 0..n {
+            db.put(format!("key{i}").as_bytes(), b"value").unwrap();
+        }
+        let tail = db.wal_metadata.read().tail;
+        let total = db.wal_metadata.read().total_entries;
+        assert!(total >= n, "expected at least {n} entries, got {total}");
+
+        // Hammer the same range from many threads at once.
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    for _ in 0..8 {
+                        db.wal_flush_observer.mark_persisted_range(0, tail);
+                    }
+                });
+            }
+        });
+
+        let meta = db.wal_metadata.read();
+        // The invariant the bug violated: persisted can never exceed total.
+        assert!(
+            meta.persisted_entries <= meta.total_entries,
+            "persisted_entries ({}) exceeded total_entries ({}) — over-count race",
+            meta.persisted_entries,
+            meta.total_entries,
+        );
+        // The whole range was covered, so every entry is persisted exactly once.
+        assert_eq!(meta.persisted_entries, meta.total_entries);
+        // Per-segment invariant holds too.
+        for seg in meta.tracked_segments() {
+            assert!(
+                meta.segment_persisted(seg) <= meta.segment_total(seg),
+                "segment {seg}: persisted {} > total {}",
+                meta.segment_persisted(seg),
+                meta.segment_total(seg),
+            );
+        }
+        drop(meta);
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_wal_segment_size_is_locked_at_creation() {
+        // The configured WAL segment size applies only to a brand-new WAL, and is
+        // then fixed: reopening with a different config value must NOT change it
+        // (a segment id is offset / segment_size, so a change would re-bucket
+        // stored offsets into the wrong files).
+        let dir = TempDir::new().unwrap();
+        let small = 64 * 1024; // 64 KiB
+        {
+            let mut cfg = create_db_config();
+            cfg.wal_segment_size = small;
+            let db = Database::open(dir.path(), cfg).unwrap();
+            assert_eq!(db.wal.segment_size(), small, "fresh WAL should honour config");
+            db.put(b"k", b"v").unwrap();
+            db.shutdown().unwrap();
+        }
+        // A marker must have been recorded.
+        assert!(dir.path().join("wal_segment_size").exists());
+        {
+            // Reopen with a DIFFERENT configured size — the created size must win.
+            let mut cfg = create_db_config();
+            cfg.wal_segment_size = 8 * 1024 * 1024;
+            let db = Database::open(dir.path(), cfg).unwrap();
+            assert_eq!(db.wal.segment_size(), small, "existing WAL size must be locked");
+            assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+            db.shutdown().unwrap();
+        }
     }
 
     #[test]
@@ -3177,7 +3407,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_log_physical_and_page_stats() {
+    fn test_value_log_physical_and_segment_stats() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
@@ -3192,15 +3422,263 @@ mod tests {
         let total_physical: u64 = shards.iter().map(|s| s.physical_bytes).sum();
         assert!(total_physical > 0, "physical bytes should be non-zero after writes");
 
-        // Page stats: per-bucket page breakdown, with live records counted.
-        let pages = db.value_log_page_stats("default").unwrap();
-        assert_eq!(pages.len(), db.config.num_buckets, "one entry per bucket");
-        let total_records: u32 = pages.iter().flat_map(|(_, ps)| ps.iter()).map(|p| p.total_records).sum();
-        assert!(total_records >= 50, "every written record should appear in a page, got {}", total_records);
+        // Segment stats: per-bucket segment breakdown, with live bytes accounted.
+        let segments = db.value_log_segment_stats("default").unwrap();
+        assert_eq!(segments.len(), db.config.num_buckets, "one entry per bucket");
+        let live: u64 = segments.iter().flat_map(|(_, ss)| ss.iter()).map(|s| s.live_bytes).sum();
+        assert!(live > 0, "written records should be accounted as live bytes, got {live}");
+        // Every bucket has exactly one active tail (unsealed) segment.
+        for (bucket, ss) in &segments {
+            let unsealed = ss.iter().filter(|s| !s.sealed).count();
+            assert_eq!(unsealed, 1, "bucket {bucket} must have exactly one active tail segment");
+        }
 
         // Unknown namespace errors rather than panicking.
-        assert!(db.value_log_page_stats("nope").is_err());
+        assert!(db.value_log_segment_stats("nope").is_err());
 
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
+        // Under real concurrency, racing writers to the same keys must not drift the
+        // value-log accounting GC selection relies on: total live bytes must equal
+        // exactly one live record per distinct key. (The deterministic form of the
+        // underlying bug is `a_lower_seq_put_charges_its_own_record_not_the_live_one`
+        // in kv_store; this guards the invariant end-to-end under load.)
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+
+        let keys: Vec<Vec<u8>> = (0..4u32).map(|k| format!("hot-key-{k}").into_bytes()).collect();
+        let mut handles = Vec::new();
+        for t in 0..4usize {
+            let (db, keys) = (Arc::clone(&db), keys.clone());
+            handles.push(thread::spawn(move || {
+                for i in 0..100usize {
+                    // Vary the value size per write so a mis-charged displacement can't
+                    // cancel in the aggregate byte count.
+                    let len = 64 + (t * 37 + i * 101) % 1024;
+                    db.put(&keys[(t + i) % keys.len()], &vec![0xACu8; len]).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Expected live bytes: one record per distinct key, sized by that key's current
+        // (winning) value. Database::open starts no GC worker, so nothing reclaims
+        // concurrently and the live set is exactly the winning records.
+        let expected_live: u64 = keys
+            .iter()
+            .map(|k| {
+                let v = db.get(k).unwrap().expect("key present after the race");
+                crate::store::value_log::ValueRecordHeader::record_len(k.len(), v.len())
+            })
+            .sum();
+
+        let stats = db.value_log_segment_stats("default").unwrap();
+        let mut total_live = 0u64;
+        for (_bucket, segs) in &stats {
+            for s in segs {
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke live+garbage==total",
+                    s.id
+                );
+                total_live += s.live_bytes;
+            }
+        }
+        assert_eq!(
+            total_live, expected_live,
+            "accounted live bytes must equal exactly one record per live key, not leak intermediate records"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn existing_bucket_count_is_detected_from_segmented_value_logs() {
+        // num_buckets is locked at creation: reopening with a different configured
+        // value must NOT re-shard. detect_bucket_count reads the count back from the
+        // value-log filenames — which are now `value_log_{bucket}.segNNNNNN`, not the
+        // old `value_log_{bucket}.log`. A stale matcher would see zero buckets and
+        // silently honour the new config, corrupting key→bucket sharding.
+        let dir = TempDir::new().unwrap();
+        let original_buckets = 3;
+
+        {
+            let mut config = create_db_config();
+            config.num_buckets = original_buckets;
+            let db = Database::open(dir.path(), config).unwrap();
+            for i in 0..30u32 {
+                db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(db.config.num_buckets, original_buckets);
+            db.shutdown().unwrap();
+        }
+
+        // Reopen asking for a DIFFERENT bucket count.
+        let mut config = create_db_config();
+        config.num_buckets = original_buckets + 3;
+        let db = Database::open(dir.path(), config).unwrap();
+        assert_eq!(
+            db.config.num_buckets, original_buckets,
+            "the original bucket count must be detected from the segment files and preserved, not the newly configured one"
+        );
+
+        // Every value is still readable — keys resolved to the same buckets they were
+        // written to, which they only can if the original count was honoured.
+        for i in 0..30u32 {
+            assert_eq!(
+                db.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes()),
+                "value k{i} unreadable after reopen with a mismatched num_buckets"
+            );
+        }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
+        use crate::store::gc_value_log_worker::ValueLogGcTarget;
+        // The GC trigger is per-bucket, not just the namespace average: a bucket over the
+        // trigger must be collected even when near-empty buckets drag the average below it.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.threshold_config.value_log_waste_threshold = 30.0; // tail bar tracks this
+        let db = Database::open(dir.path(), config).unwrap();
+
+        let value = vec![0x33u8; 300];
+        // Live data spread across buckets keeps the namespace average low...
+        for i in 0..800u32 {
+            db.put(format!("k{i:04}").as_bytes(), &value).unwrap();
+        }
+        // ...then hammer a single key so ITS bucket alone piles up garbage.
+        for _ in 0..250u32 {
+            db.put(b"k0000", &value).unwrap();
+        }
+
+        let store = db.get_store(DEFAULT_NAMESPACE_ID).unwrap();
+        let avg = store.get_waste_ratio();
+        assert!(avg < 30.0, "precondition: namespace average must be below the trigger, got {avg:.1}%");
+        assert!(store.has_bucket_over_waste(30.0), "precondition: some bucket must be over the trigger");
+
+        // The per-bucket-aware trigger runs GC where the old average-only gate would have
+        // skipped the whole namespace.
+        ValueLogGcTarget::run_gc_if_needed(&db, 30.0);
+
+        let after = store.get_waste_ratio();
+        assert!(
+            after < avg,
+            "the hot bucket's garbage must be reclaimed, dropping overall waste (was {avg:.1}%, now {after:.1}%)"
+        );
+        assert_eq!(db.get(b"k0000").unwrap(), Some(value.clone()), "the hammered key must survive collection");
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
+        // A crash can strike right after WAL replay re-appended values to the log but
+        // before the value-log metadata was flushed — leaving segment files longer than
+        // their recorded totals. The next open must reconcile that (rebuild stats from
+        // the LSM) and lose nothing, even across repeated crash/replay cycles. Crash is
+        // simulated with mem::forget, which skips Database::drop's clean flush.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.num_buckets = 1;
+        let keys: Vec<Vec<u8>> = (0..30u32).map(|i| format!("k{i:03}").into_bytes()).collect();
+
+        // Session 1: write, then crash before any clean flush.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                db.put(k, format!("v{i}").as_bytes()).unwrap();
+            }
+            std::mem::forget(db);
+        }
+
+        // Session 2: reopen replays the WAL (re-appending to the log), then crash again
+        // before the post-replay metadata is flushed.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            assert_eq!(db.get(b"k000").unwrap().as_deref(), Some(b"v0".as_slice()), "replay must restore the data");
+            std::mem::forget(db);
+        }
+
+        // Session 3: open cleanly. Everything is still readable, and the value-log
+        // accounting is self-consistent despite the stale metadata it started from.
+        let db = Database::open(dir.path(), config).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                db.get(k).unwrap().as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "key {i} lost across replay+crash cycles"
+            );
+        }
+        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total after recovery", s.id);
+            }
+        }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_torn_tail_survives_reopen_append_and_gc() {
+        // The full torn-tail hazard end to end: a crash leaves a partial record at the
+        // active tail; reopen truncates it and replays; we append past it, churn to make
+        // the segment collectable, then GC seals and relocates it. Records from BEFORE
+        // the torn tail and those appended AFTER it must all survive GC relocation.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.num_buckets = 1; // one bucket → one active-tail segment to tear
+        let value = vec![0x5Au8; 300];
+
+        // Session 1: write, crash before clean flush.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            for i in 0..40u32 {
+                db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+            }
+            std::mem::forget(db);
+        }
+
+        // Inject a torn write at the tail of bucket 0's active segment.
+        let seg = dir.path().join("ns_default").join("value_logs").join("value_log_0.seg000001");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes.extend_from_slice(&[0xAB; 20]); // partial, not a valid header
+        std::fs::write(&seg, &bytes).unwrap();
+
+        // Session 2: reopen (truncates the torn tail, replays), append MORE past it,
+        // overwrite the originals to pile up garbage, then GC.
+        let db = Database::open(dir.path(), config).unwrap();
+        for i in 40..60u32 {
+            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        for i in 0..40u32 {
+            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        db.garbage_collect().unwrap();
+
+        // All 60 keys survive — including those appended after the torn tail.
+        for i in 0..60u32 {
+            assert_eq!(
+                db.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i:03} lost across torn-tail reopen + GC"
+            );
+        }
+        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke the invariant after GC", s.id);
+            }
+        }
         db.shutdown().unwrap();
     }
 

@@ -2,14 +2,14 @@
 //!
 //! ```text
 //! GET  /admin/storage/health                          → server liveness + uptime
-//! GET  /admin/storage/stats                           → engine-wide value-log statistics
+//! GET  /admin/storage/stats                           → value-log statistics across all namespaces
 //! GET  /admin/storage/ops-metrics                      → engine-wide operational counters (reads/writes/compaction/GC + read-path efficiency)
 //! GET  /admin/storage/ops-metrics/by-namespace         → the same counters, broken out per namespace
 //! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
 //! GET  /admin/storage/wal                             → WAL metadata snapshot
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
-//! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization (+ physical st_blocks bytes)
-//! GET  /admin/storage/value-log/{ns}/pages            → per-page garbage breakdown for one namespace (deep dive)
+//! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization + every segment file (like /wal)
+//! GET  /admin/storage/value-log/{ns}/segments         → per-segment garbage breakdown for one namespace (deep dive)
 //! GET  /admin/storage/namespaces                      → doc-store namespace registry with field schemas
 //! GET  /admin/storage/namespaces/physical             → every physical engine namespace (incl. companions/system), each with a role
 //! GET  /admin/storage/stores/{ns}/kv-meta             → engine storage metadata for one store (doc or KV)
@@ -57,28 +57,61 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Serialize)]
 pub struct StatsResponse {
-    head: u64,
-    tail: u64,
+    /// Value-log segment files on disk across **every** namespace.
+    segment_count: u64,
+    /// Bytes those segment files occupy.
+    disk_bytes: u64,
     garbage_bytes: u64,
+    live_bytes: u64,
     waste_ratio_pct: f64,
-    free_space_ratio_pct: f64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
-    live_bytes: u64,
+    /// How many namespaces are included in the figures above.
+    namespaces: usize,
 }
 
+/// `GET /admin/storage/stats` — value-log statistics aggregated across **all**
+/// namespaces.
+///
+/// (It used to report only the *default* namespace while being documented as
+/// engine-wide, which made a busy database look empty.)
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    let s = state.store.db_stats();
-    Json(StatsResponse {
-        head: s.head,
-        tail: s.tail,
-        garbage_bytes: s.garbage_size,
-        waste_ratio_pct: s.waste_ratio,
-        free_space_ratio_pct: s.free_space_ratio,
-        total_gc_runs: s.total_gc_runs,
-        total_bytes_reclaimed: s.total_bytes_reclaimed,
-        live_bytes: s.live_bytes,
-    })
+    let disk_bytes: u64 = state
+        .store
+        .value_log_physical_stats()
+        .into_iter()
+        .flat_map(|(_ns, shards)| shards.into_iter().map(|s| s.physical_bytes))
+        .sum();
+
+    let mut out = StatsResponse {
+        segment_count: 0,
+        disk_bytes,
+        garbage_bytes: 0,
+        live_bytes: 0,
+        waste_ratio_pct: 0.0,
+        total_gc_runs: 0,
+        total_bytes_reclaimed: 0,
+        namespaces: 0,
+    };
+
+    let per_ns = state.store.value_log_shard_stats();
+    out.namespaces = per_ns.len();
+    for (_ns, buckets) in per_ns {
+        for (_bucket, m) in buckets {
+            out.segment_count = out.segment_count.saturating_add(m.segments.len() as u64);
+            out.live_bytes = out.live_bytes.saturating_add(m.live_bytes());
+            out.garbage_bytes = out.garbage_bytes.saturating_add(m.garbage_bytes());
+            out.total_gc_runs = out.total_gc_runs.saturating_add(m.total_gc_runs);
+            out.total_bytes_reclaimed = out.total_bytes_reclaimed.saturating_add(m.total_bytes_reclaimed);
+        }
+    }
+    let written = out.live_bytes.saturating_add(out.garbage_bytes);
+    out.waste_ratio_pct = if written > 0 {
+        (out.garbage_bytes as f64 / written as f64) * 100.0
+    } else {
+        0.0
+    };
+    Json(out)
 }
 
 // ── Operational metrics ────────────────────────────────────────────────────────
@@ -128,6 +161,19 @@ pub struct CompactionMetrics {
 pub struct GcMetrics {
     vlog_gc_runs: u64,
     vlog_gc_duration_ms: u64,
+    /// Value-log segment files unlinked by GC.
+    vlog_segments_reclaimed: u64,
+    /// Bytes handed back to the filesystem by unlinking those segments.
+    vlog_gc_bytes_reclaimed: u64,
+    /// Bytes of survivors GC rewrote to relocate them out of those segments — the
+    /// cost of the work.
+    vlog_gc_bytes_rewritten: u64,
+    /// `bytes_rewritten / bytes_reclaimed`: **GC's write amplification**, and the
+    /// number to watch. Well below 1 is healthy — GC frees far more than it rewrites.
+    /// Above 1 means it is relocating more data than it frees (the segments it picks
+    /// are mostly survivors); `thresholds.segment_gc_threshold` is the knob for that.
+    /// `null` until GC has reclaimed anything.
+    vlog_gc_write_amplification: Option<f64>,
     wal_gc_runs: u64,
     wal_segments_deleted: u64,
 }
@@ -200,6 +246,10 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
         gc: GcMetrics {
             vlog_gc_runs: m.vlog_gc_runs,
             vlog_gc_duration_ms: m.vlog_gc_duration_ms,
+            vlog_segments_reclaimed: m.vlog_segments_reclaimed,
+            vlog_gc_bytes_reclaimed: m.vlog_gc_bytes_reclaimed,
+            vlog_gc_bytes_rewritten: m.vlog_gc_bytes_rewritten,
+            vlog_gc_write_amplification: (m.vlog_gc_bytes_reclaimed > 0).then(|| m.vlog_gc_bytes_rewritten as f64 / m.vlog_gc_bytes_reclaimed as f64),
             wal_gc_runs: m.wal_gc_runs,
             wal_segments_deleted: m.wal_segments_deleted,
         },
@@ -531,20 +581,59 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
 
 // ── Value-log utilization ─────────────────────────────────────────────────────
 
+/// One value-log segment file. Mirrors the per-segment breakdown the WAL exposes.
+#[derive(Serialize, Clone)]
+pub struct SegmentInfo {
+    segment_id: u32,
+    /// The file's size on disk (16-byte header + records). Segments are dense
+    /// append-only files, so this is exact — there are no sparse holes.
+    file_bytes: u64,
+    /// Record bytes in the file (live + garbage), excluding the header.
+    total_bytes: u64,
+    live_bytes: u64,
+    garbage_bytes: u64,
+    garbage_ratio_pct: f64,
+    /// Sealed segments are immutable and are what GC selects from. Exactly one
+    /// segment per shard is unsealed — the active tail — and it is never collected.
+    sealed: bool,
+}
+
+fn segment_info(s: &minnal_db::SegmentStats) -> SegmentInfo {
+    SegmentInfo {
+        segment_id: s.id,
+        file_bytes: s.file_bytes(),
+        total_bytes: s.total_bytes,
+        live_bytes: s.live_bytes,
+        garbage_bytes: s.garbage_bytes,
+        garbage_ratio_pct: s.garbage_ratio_pct(),
+        sealed: s.sealed,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ValueLogShardInfo {
     bucket: u32,
-    head: u64,
-    tail: u64,
+    /// Segment files this shard currently holds.
+    segment_count: usize,
+    /// The shard's active tail — the only segment still being appended to.
+    active_segment_id: u32,
+    /// Next segment id to be handed out. Monotone and never reused, so it also
+    /// counts how many segments this shard has ever created.
+    next_segment_id: u64,
+    /// Sealed (immutable) segments — the ones GC can select from.
+    sealed_segment_count: usize,
     live_bytes: u64,
     garbage_bytes: u64,
     waste_ratio_pct: f64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
-    /// Blocks actually allocated on disk (`st_blocks`); sparse GC holes excluded.
+    /// Every segment file in this shard, newest id last — the same per-segment
+    /// breakdown `/admin/storage/wal` gives for WAL segments.
+    segments: Vec<SegmentInfo>,
+    /// Bytes the shard's segment files occupy on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
     physical_bytes: Option<u64>,
-    /// File length including sparse holes (≥ `physical_bytes`).
+    /// Record bytes tracked (live + garbage), excluding segment file headers.
     #[serde(skip_serializing_if = "Option::is_none")]
     logical_bytes: Option<u64>,
 }
@@ -567,23 +656,30 @@ pub fn build_vlog_namespace_info(ns: String, buckets: Vec<(u32, ValueLogMetadata
     let shards: Vec<ValueLogShardInfo> = buckets
         .into_iter()
         .map(|(bucket, m)| {
-            total_live = total_live.saturating_add(m.live_bytes);
-            total_garbage = total_garbage.saturating_add(m.garbage_bytes);
-            let total_written = m.live_bytes.saturating_add(m.garbage_bytes);
+            let live = m.live_bytes();
+            let garbage = m.garbage_bytes();
+            total_live = total_live.saturating_add(live);
+            total_garbage = total_garbage.saturating_add(garbage);
+            let total_written = live.saturating_add(garbage);
             let waste_pct = if total_written > 0 {
-                (m.garbage_bytes as f64 / total_written as f64) * 100.0
+                (garbage as f64 / total_written as f64) * 100.0
             } else {
                 0.0
             };
+            let mut segments: Vec<SegmentInfo> = m.segments.iter().map(segment_info).collect();
+            segments.sort_by_key(|s| s.segment_id);
             ValueLogShardInfo {
                 bucket,
-                head: m.head,
-                tail: m.tail,
-                live_bytes: m.live_bytes,
-                garbage_bytes: m.garbage_bytes,
+                segment_count: m.segments.len(),
+                active_segment_id: m.active_segment_id,
+                next_segment_id: m.next_segment_id,
+                sealed_segment_count: m.segments.iter().filter(|s| s.sealed).count(),
+                live_bytes: live,
+                garbage_bytes: garbage,
                 waste_ratio_pct: waste_pct,
                 total_gc_runs: m.total_gc_runs,
                 total_bytes_reclaimed: m.total_bytes_reclaimed,
+                segments,
                 physical_bytes: None,
                 logical_bytes: None,
             }
@@ -606,7 +702,7 @@ pub fn build_vlog_namespace_info(ns: String, buckets: Vec<(u32, ValueLogMetadata
 }
 
 pub async fn value_log(State(state): State<AppState>) -> impl IntoResponse {
-    // Physical (st_blocks) footprint per (namespace, bucket) — cheap stat, merged
+    // On-disk footprint per (namespace, bucket) — cheap stat, merged
     // into the logical metadata view so callers see the true on-disk usage.
     let physical: HashMap<String, HashMap<u32, minnal_db::ShardPhysicalStats>> = state
         .store
@@ -638,59 +734,41 @@ pub async fn value_log(State(state): State<AppState>) -> impl IntoResponse {
     Json(result)
 }
 
-// ── Value-log per-page garbage breakdown (deep dive, per namespace) ─────────────
+// ── Value-log per-segment garbage breakdown (deep dive, per namespace) ─────────
 
 #[derive(Serialize)]
-pub struct PageInfo {
-    page_offset: u64,
-    live_bytes: u64,
-    garbage_bytes: u64,
-    garbage_ratio_pct: f64,
-    total_records: u32,
-    garbage_records: u32,
-}
-
-#[derive(Serialize)]
-pub struct ValueLogPagesShard {
+pub struct ValueLogSegmentsShard {
     bucket: u32,
-    page_count: usize,
-    pages: Vec<PageInfo>,
+    segment_count: usize,
+    segments: Vec<SegmentInfo>,
 }
 
 #[derive(Serialize)]
-pub struct ValueLogPagesResponse {
+pub struct ValueLogSegmentsResponse {
     namespace: String,
-    shards: Vec<ValueLogPagesShard>,
+    shards: Vec<ValueLogSegmentsShard>,
 }
 
-/// `GET /admin/storage/value-log/{ns}/pages` — per-page garbage breakdown for a
-/// single namespace's value-log shards: shows *where* reclaimable waste sits.
-/// This scans every page (O(pages × records)), so it is scoped to one namespace.
-pub async fn value_log_pages(
+/// `GET /admin/storage/value-log/{ns}/segments` — per-segment garbage breakdown for
+/// one namespace: shows *which* segments GC would collect next.
+///
+/// Cheap: the counters are maintained in memory by writers, so this reads no segment
+/// data at all. (The per-page version it replaces had to scan every record.)
+pub async fn value_log_segments(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    match state.store.value_log_page_stats(&ns) {
+    match state.store.value_log_segment_stats(&ns) {
         Ok(per_bucket) => {
             let shards = per_bucket
                 .into_iter()
-                .map(|(bucket, pages)| ValueLogPagesShard {
+                .map(|(bucket, segments)| ValueLogSegmentsShard {
                     bucket,
-                    page_count: pages.len(),
-                    pages: pages
-                        .into_iter()
-                        .map(|p| PageInfo {
-                            garbage_ratio_pct: p.garbage_ratio_pct(),
-                            page_offset: p.page_offset,
-                            live_bytes: p.live_bytes,
-                            garbage_bytes: p.garbage_bytes,
-                            total_records: p.total_records,
-                            garbage_records: p.garbage_records,
-                        })
-                        .collect(),
+                    segment_count: segments.len(),
+                    segments: segments.iter().map(segment_info).collect(),
                 })
                 .collect();
-            Ok(Json(ValueLogPagesResponse { namespace: ns, shards }))
+            Ok(Json(ValueLogSegmentsResponse { namespace: ns, shards }))
         }
         Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
     }

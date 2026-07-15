@@ -317,6 +317,14 @@ pub(crate) struct BlobStore {
     /// Used by [`compact`](BlobStore::compact) to stage and atomically swap in
     /// the rewritten `blobs.keys` / `blobs.vals` files.
     dir: Option<PathBuf>,
+    /// Running count of reclaimable dead value-region bytes (blobs orphaned by
+    /// `upsert`/`remove_key` since the last [`compact`](BlobStore::compact)).
+    /// Maintained incrementally so it is O(1) to read on the hot write path —
+    /// `waste_ratio`/`live_bytes` are O(capacity) and too costly per write. It is
+    /// an **in-memory hint** for the checkpoint-backpressure trigger, not
+    /// persisted: seeded from the on-disk state at [`open`](BlobStore::open) and
+    /// reset to 0 by `compact`. Equals `logical_bytes() - live_bytes()`.
+    dead_bytes: u64,
 }
 
 impl BlobStore {
@@ -327,7 +335,12 @@ impl BlobStore {
         let mut key = GrowableMmap::new_anon(INITIAL_KEY_SIZE).expect("anon key mmap alloc failed");
         init_header(key.as_mut_slice(), INITIAL_CAPACITY);
         let val = GrowableMmap::new_anon(INITIAL_VAL_SIZE).expect("anon val mmap alloc failed");
-        Self { key, val, dir: None }
+        Self {
+            key,
+            val,
+            dir: None,
+            dead_bytes: 0,
+        }
     }
 
     /// Create a new persistent store in `dir`, creating `blobs.keys` and
@@ -341,6 +354,7 @@ impl BlobStore {
             key,
             val,
             dir: Some(dir.to_path_buf()),
+            dead_bytes: 0,
         })
     }
 
@@ -352,11 +366,17 @@ impl BlobStore {
         let key = GrowableMmap::open_file(&dir.join("blobs.keys"))?;
         let val = GrowableMmap::open_file(&dir.join("blobs.vals"))?;
         validate_open(key.as_slice(), val.as_slice().len())?;
-        Ok(Self {
+        let mut store = Self {
             key,
             val,
             dir: Some(dir.to_path_buf()),
-        })
+            dead_bytes: 0,
+        };
+        // Seed the dead-bytes hint from the loaded state (one O(capacity) scan at
+        // open) so backpressure is accurate immediately, even for a store that
+        // was already bloated when the process started.
+        store.dead_bytes = store.logical_bytes().saturating_sub(store.live_bytes());
+        Ok(store)
     }
 
     /// Returns `true` if persistent store files exist in `dir`.
@@ -404,6 +424,19 @@ impl BlobStore {
     /// [`compact`]: BlobStore::compact
     pub fn live_bytes(&self) -> u64 {
         self.compacted_value_bytes()
+    }
+
+    /// Reclaimable dead value-region bytes since the last [`compact`], tracked
+    /// incrementally so this is **O(1)** — unlike [`waste_ratio`] / [`live_bytes`]
+    /// which scan every slot. Used by the write path to decide whether to request
+    /// an early index checkpoint (backpressure) without a per-write O(capacity)
+    /// scan. Equal in value to `logical_bytes() - live_bytes()`.
+    ///
+    /// [`compact`]: BlobStore::compact
+    /// [`waste_ratio`]: BlobStore::waste_ratio
+    /// [`live_bytes`]: BlobStore::live_bytes
+    pub fn dead_bytes(&self) -> u64 {
+        self.dead_bytes
     }
 
     /// Size the value region would shrink to if compacted now: each live blob's
@@ -545,6 +578,14 @@ impl BlobStore {
 
         let (idx, found) = self.probe(key);
 
+        // Replacing an existing key orphans its previous blob — account those
+        // aligned bytes as reclaimable dead space (read the old slot before it is
+        // overwritten). This keeps `dead_bytes` O(1) and exact-since-compaction.
+        if found {
+            let old = read_slot(self.key.as_slice(), idx);
+            self.dead_bytes = self.dead_bytes.saturating_add(align_up(old.len as usize, VALUE_ALIGNMENT) as u64);
+        }
+
         write_slot(
             self.key.as_mut_slice(),
             idx,
@@ -572,6 +613,10 @@ impl BlobStore {
         if !found {
             return;
         }
+        // The removed key's blob is now dead — account it (aligned) as reclaimable.
+        let dead = align_up(read_slot(self.key.as_slice(), idx).len as usize, VALUE_ALIGNMENT) as u64;
+        self.dead_bytes = self.dead_bytes.saturating_add(dead);
+
         let kdata = self.key.as_mut_slice();
         kdata[slot_byte_offset(idx)] = STATE_TOMBSTONE;
 
@@ -671,6 +716,9 @@ impl BlobStore {
             // — there is nothing on disk to make crash-safe.
             None => self.rewrite_in_place(&key_buf, &val_buf)?,
         }
+
+        // The value region now holds live blobs only; reset the reclaimable hint.
+        self.dead_bytes = 0;
 
         Ok(before.saturating_sub(write_pos as u64))
     }
@@ -953,6 +1001,38 @@ mod tests {
             "waste must read ≈0 after compaction, got {}",
             store.waste_ratio()
         );
+    }
+
+    #[test]
+    fn dead_bytes_tracks_reclaimable_space_and_resets_on_compact() {
+        // The O(1) `dead_bytes` hint must agree with the O(capacity)
+        // `logical_bytes - live_bytes` computation across overwrites and removes,
+        // and reset to 0 after compaction — it drives checkpoint backpressure.
+        let mut store = BlobStore::new_anon();
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Fresh inserts add no dead space.
+        store.upsert(1, &[0xAAu8; 40]);
+        store.upsert(2, &[0xBBu8; 24]);
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Overwrites orphan the previous copies → dead space accrues.
+        for n in 1..=20usize {
+            store.upsert(1, &vec![0xCCu8; n * 8]);
+        }
+        // A remove tombstones a live blob → also reclaimable.
+        store.remove_key(2);
+
+        let expected = store.logical_bytes().saturating_sub(store.live_bytes());
+        assert_eq!(
+            store.dead_bytes(),
+            expected,
+            "incremental dead_bytes must match logical-live ({expected})"
+        );
+        assert!(store.dead_bytes() > 0);
+
+        store.compact().unwrap();
+        assert_eq!(store.dead_bytes(), 0, "compaction resets the dead-bytes hint");
     }
 
     #[test]

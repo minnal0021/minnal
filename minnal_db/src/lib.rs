@@ -99,7 +99,8 @@ pub use db::config::DbConfig;
 pub use db::config::ThresholdConfig;
 
 /// Default field-index bitmap compaction threshold (percentage of dead space).
-pub use db::config::{DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_PAGE_GC_THRESHOLD};
+pub use db::config::{DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_SEGMENT_GC_THRESHOLD};
+pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
 
 /// Intervals at which the background workers run.
 pub use db::config::ScheduledTaskConfig;
@@ -188,7 +189,7 @@ pub use store::value_log::ValueLogMetadata;
 pub use store::value_log::sharded::ShardPhysicalStats;
 
 /// Per-page value-log garbage breakdown, returned by [`Db::value_log_page_stats`].
-pub use store::value_log::PageGarbageStats;
+pub use store::value_log::SegmentStats;
 
 // ── Document store (folded layer) ─────────────────────────────────────────────
 //

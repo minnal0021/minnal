@@ -97,19 +97,30 @@ records_per_sync = 1_000
 # whether a namespace is worth collecting at all.
 value_log_waste_threshold = 30.0
 
-# Once a GC cycle is running, rewrite an individual value-log page when at least
-# this percentage of it is garbage (0.0–100.0).  This is the SELECTION rule, and
-# it is a different question from the trigger above.
+# Once a GC cycle is running, rewrite an individual sealed value-log SEGMENT when
+# at least this percentage of it is garbage (0.0–100.0).  This is the SELECTION
+# rule, and it is a different question from the trigger above.
 #
-# Keep it well BELOW value_log_waste_threshold.  A page under this threshold is
-# treated as clean and copied byte-for-byte into the compacted file — carrying
-# its garbage with it, unreclaimed.  If the two values were equal, garbage that
-# sits just under the trigger could never be collected: every pass would copy
-# those pages across intact, report success, and leave the shard still over its
-# trigger, so GC would run again and do exactly the same thing.  A lower page
-# threshold rewrites more surviving records per pass but actually finishes the
-# job.  Default: 10.0.
-page_gc_threshold = 10.0
+# Keep it well BELOW value_log_waste_threshold.  A segment under this threshold is
+# treated as clean and left in place — its live records keep their pointers and its
+# garbage rides along, unreclaimed.  If the two values were equal, garbage that sits
+# just under the trigger could never be collected: every pass would skip those
+# segments, report success, and leave the shard still over its trigger, so GC would
+# run again and do exactly the same thing.  A lower threshold rewrites more segments
+# (and their survivors) per pass but actually finishes the job.  Default: 10.0.
+segment_gc_threshold = 10.0
+
+# Garbage share (0.0–100.0) of a bucket's ACTIVE TAIL segment at which GC seals it
+# so it can be collected. A small or idle store keeps all its data in one tail
+# segment per bucket that never fills — so tail-sealing is its only path to
+# collection. Sealing costs a one-time rewrite of the tail's live remainder: at G%
+# garbage it rewrites (100-G)% to free G%, so 50 is the breakeven.
+#
+# Leave this UNSET to track value_log_waste_threshold — the same bar that decides a
+# bucket is worth collecting also seals its tail, so garbage never strands between
+# the two. Set it (e.g. 50.0) to pin the bar higher and favour write-amplification
+# over reclaimed space.
+# tail_gc_min_garbage_pct = 50.0
 
 # Compact a field-index bitmap store at checkpoint when this percentage of its
 # value region is dead space (0.0–100.0). The bitmap store is append-only, so
@@ -117,6 +128,18 @@ page_gc_threshold = 10.0
 # behind; compaction reclaims it. Lower = reclaim sooner (more compaction work),
 # higher = let more dead space accumulate first. Default 50.
 index_blob_waste_threshold = 50.0
+
+# Backpressure: when a single field index accumulates this many reclaimable dead
+# blob bytes, the write path requests an index checkpoint immediately instead of
+# waiting for the periodic (~15 min) tick. This bounds the transient on-disk
+# amplification of low-cardinality, high-churn fields (a boolean over many docs
+# rewrites its whole bitmap per document and can bloat to gigabytes between
+# ticks) to roughly this cap per field. It is an absolute BYTE cap, not a ratio:
+# such a field crosses any waste ratio almost immediately and stays near 100%, so
+# a ratio trigger would fire on nearly every write. Self-debounces — compaction
+# resets the field's dead-byte count, so the next request needs another full cap.
+# Default: 67108864 (64 MiB).
+index_blob_backpressure_bytes = 67_108_864
 
 # ---------------------------------------------------------------------------
 # [scheduled_tasks] — background worker intervals
@@ -142,22 +165,31 @@ ttl_cleanup_interval_secs = 3_600
 
 # Maximum size of a single WAL segment file in bytes before a new segment
 # is created.  Default: 64 MiB.
+#
+# Fixed at creation: a WAL segment id is offset / segment_size, so this cannot
+# change once the WAL holds data (it would map stored offsets to the wrong
+# segment files). It is applied only to a brand-new WAL and then recorded in a
+# `wal_segment_size` marker; on an existing WAL the recorded size wins and a
+# differing value here is ignored with a warning.
 segment_size_bytes = 67_108_864   # 64 MiB
 
 # ---------------------------------------------------------------------------
-# [value_log] — value-log page size
+# [value_log] — value-log segment files
 # ---------------------------------------------------------------------------
 [value_log]
 
-# Size of each page within the value log in bytes.
-# Larger pages improve sequential read throughput; smaller pages reduce
-# space amplification for small values.  Default: 64 MiB.
+# Size at which a value-log segment file is sealed and a new one opened.
+# Default: 256 MiB.  Must be a multiple of 4096, at least 64 KiB, and at most
+# 4 GiB (a record's offset within its segment is stored as a u32).
 #
-# Must be a multiple of 4096, at least 64 KiB, and under 4 GiB.
-# Fixed at creation: a page's size is encoded in every stored value pointer, so
-# changing it after data exists is not supported — opening a database whose value
-# log was written with a different page size fails.
-page_size_bytes = 67_108_864   # 64 MiB
+# Larger segments mean fewer files (and fewer open file descriptors) but coarser
+# GC: a segment is the unit GC reclaims, so its size bounds how much survivor
+# data a single pass may have to rewrite.
+#
+# Unlike sharding.num_buckets, this is NOT fixed at creation: a segment's size is
+# not encoded in any value pointer, so existing segments keep the size they were
+# written at and new ones simply use whatever is configured now.
+segment_size_bytes = 268_435_456   # 256 MiB
 
 # Re-verify each value's CRC32 checksum on every read.
 # Values always carry a CRC on disk; this controls whether reads re-check it.

@@ -1219,6 +1219,24 @@ impl LSMTree {
         Ok(best.and_then(|(value, seq)| value.map(|ptr| (ptr, seq))))
     }
 
+    /// The pointer currently referenced for `key` (highest sequence across all
+    /// layers), and whether a write carrying `new_seq` would become that key's
+    /// winner under highest-sequence-wins resolution.
+    ///
+    /// The write path needs both, under the bucket write lock, to account value-log
+    /// garbage correctly when same-key writes race: the winner displaces the existing
+    /// record, but a **loser** (a lower-sequence write that arrived at the lock after a
+    /// higher-sequence one) does not — its own freshly-appended record is the garbage
+    /// instead. Deciding this from a pre-lock read (as the old code did) let two writers
+    /// see the same old pointer and both mark it displaced, double-counting it while
+    /// leaking the loser's record. `true` when the key is currently absent.
+    pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u32) -> Result<(Option<u128>, bool)> {
+        match self.get_with_seq(key)? {
+            Some((ptr, existing_seq)) => Ok((Some(ptr), seq_newer_or_eq(new_seq, existing_seq))),
+            None => Ok((None, true)),
+        }
+    }
+
     /// Insert/update a value carrying an explicit global write sequence, with
     /// highest-sequence-wins conflict resolution (see
     /// [`SkipList::try_insert_with_seq`]). This is the production write path; it
