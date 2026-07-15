@@ -11,7 +11,7 @@ use crate::db::stats::{GCStats, Stats};
 use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver};
 use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
-use crate::store::value_log::{ValueLocation, ValueRecordMeta};
+use crate::store::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
@@ -1239,7 +1239,7 @@ impl KVStore {
     ///
     /// The old segment is deliberately **not** unlinked here — see
     /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
-    fn compact_bucket(&self, bucket: u32, page_gc_threshold_pct: f64) -> Result<BucketGCResult> {
+    fn compact_bucket(&self, bucket: u32, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<BucketGCResult> {
         let log = self.value_log.get_bucket_log(bucket)?;
         let mut result = BucketGCResult {
             bucket,
@@ -1249,12 +1249,12 @@ impl KVStore {
 
         // The active tail is normally off-limits, but a small or idle namespace may never
         // fill a segment — so its garbage would be uncollectable forever while the waste
-        // trigger kept firing. If the tail is mostly garbage, seal it (under the bucket
-        // lock, since this rolls the segment writers append to) so it can be collected in
-        // this same pass. See `TAIL_GC_MIN_GARBAGE_PCT`.
+        // trigger kept firing. If the tail is garbage enough (>= `tail_gc_threshold_pct`),
+        // seal it (under the bucket lock, since this rolls the segment writers append to)
+        // so it can be collected in this same pass. See `TAIL_GC_MIN_GARBAGE_PCT`.
         {
             let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-            if let Some(sealed) = log.seal_tail_for_gc()? {
+            if let Some(sealed) = log.seal_tail_for_gc(tail_gc_threshold_pct)? {
                 debug!(
                     "[KVStore '{}'] bucket {}: sealed the active tail (segment {}) — it was mostly garbage",
                     self.name, bucket, sealed
@@ -1338,6 +1338,16 @@ impl KVStore {
     /// a segment that no longer exists, and the WAL entries that could replay those
     /// writes are long gone.
     pub fn garbage_collect_with_threshold(&self, page_gc_threshold_pct: f64) -> Result<GCStats> {
+        self.garbage_collect_with_thresholds(page_gc_threshold_pct, TAIL_GC_MIN_GARBAGE_PCT)
+    }
+
+    /// As [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold), but
+    /// with an explicit tail-seal bar (`tail_gc_threshold_pct`) — the garbage share at
+    /// which a bucket's never-filled active tail is sealed so it can be collected. The GC
+    /// worker passes the configured
+    /// [`effective_tail_gc_min_garbage_pct`](crate::db::config::ThresholdConfig::effective_tail_gc_min_garbage_pct),
+    /// which by default tracks the waste trigger so no garbage strands between the two.
+    pub fn garbage_collect_with_thresholds(&self, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> Result<GCStats> {
         let start_time = std::time::Instant::now();
 
         if self
@@ -1360,7 +1370,7 @@ impl KVStore {
         let bucket_count = self.value_log.num_buckets();
         let results: Vec<BucketGCResult> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..bucket_count as u32)
-                .map(|bucket| s.spawn(move || self.compact_bucket(bucket, page_gc_threshold_pct)))
+                .map(|bucket| s.spawn(move || self.compact_bucket(bucket, page_gc_threshold_pct, tail_gc_threshold_pct)))
                 .collect();
             handles
                 .into_iter()
@@ -1465,14 +1475,26 @@ impl KVStore {
     /// active tail is not collectable until the tail is sealed, so a small, fully-deleted
     /// namespace could show 100% waste while GC had nothing to do — and the worker would
     /// wake, log "starting GC", reclaim nothing, and repeat on every tick.
-    pub(crate) fn has_gc_work(&self, page_gc_threshold_pct: f64) -> bool {
-        (0..self.value_log.num_buckets() as u32).any(|b| self.value_log.get_bucket_log(b).is_ok_and(|log| log.has_gc_work(page_gc_threshold_pct)))
+    pub(crate) fn has_gc_work(&self, page_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> bool {
+        (0..self.value_log.num_buckets() as u32).any(|b| {
+            self.value_log
+                .get_bucket_log(b)
+                .is_ok_and(|log| log.has_gc_work(page_gc_threshold_pct, tail_gc_threshold_pct))
+        })
     }
 
     /// Waste across the whole namespace: `garbage / (live + garbage)`, as a percentage.
     /// This is the **trigger** the GC worker compares against `value_log_waste_threshold`.
     pub fn get_waste_ratio(&self) -> f64 {
         self.value_log.total_garbage_ratio()
+    }
+
+    /// True when at least one bucket is at or above `threshold_pct` waste. The GC worker
+    /// checks this alongside the namespace-average [`get_waste_ratio`](Self::get_waste_ratio),
+    /// so a hot bucket over the trigger is collected even when near-empty buckets drag the
+    /// average below it.
+    pub(crate) fn has_bucket_over_waste(&self, threshold_pct: f64) -> bool {
+        self.value_log.any_bucket_over_waste(threshold_pct)
     }
 
     /// The raw `(garbage_bytes, written_bytes)` behind [`get_waste_ratio`](Self::get_waste_ratio),
@@ -1608,6 +1630,57 @@ mod tests {
     }
 
     #[test]
+    fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
+        // A small store keeps all its data in one active-tail segment per bucket that
+        // never fills a 64 MiB segment, so tail-sealing is its only path to collection.
+        // With the tail-seal bar tracking the trigger, garbage in the 30-50% band — which
+        // sat stranded below the old hardcoded 50% bar — is reclaimed.
+        let dir = TempDir::new().unwrap();
+        let lsm_config = LSMConfig {
+            num_buckets: 1, // one bucket → one active tail holds everything
+            ..LSMConfig::default()
+        };
+        let store = KVStore::open(0, "default", dir.path(), lsm_config, SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+
+        let value = vec![0x5Au8; 400];
+        for i in 0..100u32 {
+            store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        // Overwrite 70 keys: their old records become garbage — ~41% of the single tail
+        // segment (70 dead of 170 total), squarely in the old dead zone.
+        for i in 0..70u32 {
+            store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
+        }
+        let waste_before = store.get_waste_ratio();
+        assert!(
+            (30.0..50.0).contains(&waste_before),
+            "test needs tail garbage in the 30-50% band, got {waste_before:.1}%"
+        );
+
+        // Old behavior (50% tail bar): the sub-50% tail is not sealed, nothing collectable.
+        let stats = store.garbage_collect_with_thresholds(10.0, 50.0).unwrap();
+        assert_eq!(stats.bytes_reclaimed, 0, "at a 50% tail bar a 41%-garbage tail must stay uncollected");
+
+        // Bar tracking the 30% trigger: the tail is sealed and its garbage reclaimed.
+        let stats = store.garbage_collect_with_thresholds(10.0, 30.0).unwrap();
+        assert!(stats.bytes_reclaimed > 0, "at a 30% tail bar the tail must be sealed and collected");
+        assert!(
+            store.get_waste_ratio() < waste_before,
+            "waste must drop after collection (was {waste_before:.1}%, now {:.1}%)",
+            store.get_waste_ratio()
+        );
+
+        // Every live key survived the relocation into the fresh tail.
+        for i in 0..100u32 {
+            assert_eq!(
+                store.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(value.clone()),
+                "k{i:03} lost during tail GC"
+            );
+        }
+    }
+
+    #[test]
     fn test_kvstore_update() {
         let dir = TempDir::new().unwrap();
         let store = KVStore::open(
@@ -1638,7 +1711,15 @@ mod tests {
         // live value dead — GC could then reclaim it, losing data) and left its own dead
         // record counted live.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
 
         let winner = vec![0x11u8; 400];
         let loser = vec![0x22u8; 900]; // a different size, so a mis-charge can't cancel
@@ -1655,7 +1736,12 @@ mod tests {
         let (mut live, mut garbage) = (0u64, 0u64);
         for (_bucket, segs) in store.value_log.all_segment_stats() {
             for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total", s.id);
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke live+garbage==total",
+                    s.id
+                );
                 live += s.live_bytes;
                 garbage += s.garbage_bytes;
             }
@@ -1992,7 +2078,7 @@ mod tests {
             // but nothing flushed and nothing unlinked.
             let mut pending = Vec::new();
             for bucket in 0..store.value_log.num_buckets() as u32 {
-                let result = store.compact_bucket(bucket, 10.0).unwrap();
+                let result = store.compact_bucket(bucket, 10.0, TAIL_GC_MIN_GARBAGE_PCT).unwrap();
                 pending.extend(result.pending_unlink.iter().map(|id| (bucket, *id)));
             }
             assert!(!pending.is_empty(), "expected GC to have relocated at least one segment");

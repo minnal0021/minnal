@@ -113,7 +113,12 @@ const SEGMENT_HEADER_SIZE: u64 = 16;
 const VALUE_LOG_METADATA_MAGIC: [u8; 4] = *b"VLOG";
 const VALUE_LOG_METADATA_VERSION: u32 = 3;
 
-/// Garbage share at which GC will **seal the active tail** so it can be collected.
+/// Default garbage share at which GC seals the active tail so it can be collected,
+/// used when a caller does not supply one (tests, manual single-threshold GC). The
+/// production path derives the bar from config instead
+/// ([`ThresholdConfig::effective_tail_gc_min_garbage_pct`](crate::db::config::ThresholdConfig::effective_tail_gc_min_garbage_pct)),
+/// which by default tracks the waste trigger so garbage never strands between the
+/// two.
 ///
 /// The tail is normally off-limits (it is still being appended to), which is fine while
 /// it keeps filling: it seals on its own and becomes collectable. But a small or idle
@@ -121,10 +126,9 @@ const VALUE_LOG_METADATA_VERSION: u32 = 3;
 /// unreclaimable *forever* — while the bucket-level waste trigger keeps firing, so GC
 /// wakes every interval, finds no candidate, and reclaims nothing.
 ///
-/// Sealing the tail early costs a rewrite of whatever is still live in it, so it is only
-/// worth doing when garbage **dominates**. At 50% the pass rewrites at most as much as it
-/// frees; the common case that motivates this — a store whose keys were all deleted or
-/// overwritten — is at or near 100%, where there is nothing to rewrite at all.
+/// Sealing the tail early costs a rewrite of whatever is still live in it: at `G%`
+/// garbage it rewrites `(100-G)%` to free `G%`, so `50` is the breakeven (rewrite ==
+/// freed). A lower bar reclaims more of the tail sooner at the cost of more rewriting.
 pub const TAIL_GC_MIN_GARBAGE_PCT: f64 = 50.0;
 
 /// How many segment files a bucket keeps open at once.
@@ -914,18 +918,28 @@ impl ValueLog {
     /// Cheap (in-memory counters) and exact enough to keep the GC worker from waking on a
     /// bucket whose garbage it cannot collect — which is what made a small, fully-deleted
     /// namespace log "starting GC ... reclaimed 0 bytes" on every tick.
-    pub fn has_gc_work(&self, threshold_pct: f64) -> bool {
-        !self.gc_candidates(threshold_pct).is_empty() || self.tail_needs_sealing()
+    pub fn has_gc_work(&self, page_threshold_pct: f64, tail_threshold_pct: f64) -> bool {
+        !self.gc_candidates(page_threshold_pct).is_empty() || self.tail_needs_sealing(tail_threshold_pct)
     }
 
-    /// True when the active tail is mostly garbage and should be sealed so GC can collect
-    /// it (see [`TAIL_GC_MIN_GARBAGE_PCT`]).
-    fn tail_needs_sealing(&self) -> bool {
+    /// The bucket's overall waste ratio `garbage / (live + garbage)`, as a percentage —
+    /// the per-bucket analogue of the namespace trigger, so a hot bucket can be spotted
+    /// even when the namespace average is low.
+    pub fn waste_ratio_pct(&self) -> f64 {
+        let inner = self.inner.read();
+        let garbage: u64 = inner.segments.values().map(|s| s.garbage_bytes).sum();
+        let total: u64 = inner.segments.values().map(|s| s.total_bytes).sum();
+        if total == 0 { 0.0 } else { (garbage as f64 / total as f64) * 100.0 }
+    }
+
+    /// True when the active tail holds at least `threshold_pct` garbage and should be
+    /// sealed so GC can collect it (see [`TAIL_GC_MIN_GARBAGE_PCT`]).
+    fn tail_needs_sealing(&self, threshold_pct: f64) -> bool {
         let inner = self.inner.read();
         inner
             .segments
             .get(&inner.active_id)
-            .is_some_and(|s| s.garbage_bytes > 0 && s.garbage_ratio_pct() >= TAIL_GC_MIN_GARBAGE_PCT)
+            .is_some_and(|s| s.garbage_bytes > 0 && s.garbage_ratio_pct() >= threshold_pct)
     }
 
     /// Seal the active tail if it is mostly garbage, opening a fresh one in its place, and
@@ -934,8 +948,8 @@ impl ValueLog {
     /// The caller must hold the bucket write lock: this rolls the segment writers append
     /// to. A record appended just before the roll is simply live data in the sealed
     /// segment, and GC will relocate it like any other survivor.
-    pub fn seal_tail_for_gc(&self) -> Result<Option<u32>> {
-        if !self.tail_needs_sealing() {
+    pub fn seal_tail_for_gc(&self, threshold_pct: f64) -> Result<Option<u32>> {
+        if !self.tail_needs_sealing(threshold_pct) {
             return Ok(None);
         }
         let mut inner = self.inner.write();
@@ -1447,7 +1461,10 @@ mod tests {
             locs[1].segment_id == sealed_seg && locs[2].segment_id == sealed_seg,
             "k0..k2 must share the first segment for this test to exercise a sealed stale segment"
         );
-        assert_ne!(locs[3].segment_id, sealed_seg, "k3 must have rolled into a new segment, sealing the first");
+        assert_ne!(
+            locs[3].segment_id, sealed_seg,
+            "k3 must have rolled into a new segment, sealing the first"
+        );
 
         let log = ValueLog::open(dir.path(), 0, SEG)?;
         assert!(
@@ -1456,7 +1473,11 @@ mod tests {
         );
 
         let seg = log.segment_stats().into_iter().find(|s| s.id == sealed_seg).unwrap();
-        assert_eq!(seg.total_bytes, 3 * rec, "total_bytes must reflect the file (three records), not the stale one-record count");
+        assert_eq!(
+            seg.total_bytes,
+            3 * rec,
+            "total_bytes must reflect the file (three records), not the stale one-record count"
+        );
         assert!(
             seg.sealed,
             "a segment that rolled before the crash must be re-sealed on reopen, or GC would never collect it"
@@ -1471,7 +1492,11 @@ mod tests {
         log.rebuild_stats(&live);
         let seg = log.segment_stats().into_iter().find(|s| s.id == sealed_seg).unwrap();
         assert_eq!(seg.live_bytes, rec);
-        assert_eq!(seg.garbage_bytes, 2 * rec, "both records past the stale count must be reclaimable garbage");
+        assert_eq!(
+            seg.garbage_bytes,
+            2 * rec,
+            "both records past the stale count must be reclaimable garbage"
+        );
 
         // Nothing was lost — every record still reads back.
         for (i, loc) in locs.iter().enumerate() {
@@ -1504,7 +1529,10 @@ mod tests {
         // Reopen (recovery) and resume appending into the reused tail.
         let log = ValueLog::open(dir.path(), 0, SEG)?;
         let c = log.append(b"c", b"value-c", meta(3), true)?;
-        assert_eq!(c.segment_id, a.segment_id, "c must land in the reused tail, exercising the torn-tail path");
+        assert_eq!(
+            c.segment_id, a.segment_id,
+            "c must land in the reused tail, exercising the torn-tail path"
+        );
 
         // GC learns a segment's contents by scanning it. All three records — including
         // the one appended after the torn tail — must be visited in order, or GC would

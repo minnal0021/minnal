@@ -111,6 +111,18 @@ value_log_waste_threshold = 30.0
 # job.  Default: 10.0.
 page_gc_threshold = 10.0
 
+# Garbage share (0.0–100.0) of a bucket's ACTIVE TAIL segment at which GC seals it
+# so it can be collected. A small or idle store keeps all its data in one tail
+# segment per bucket that never fills — so tail-sealing is its only path to
+# collection. Sealing costs a one-time rewrite of the tail's live remainder: at G%
+# garbage it rewrites (100-G)% to free G%, so 50 is the breakeven.
+#
+# Leave this UNSET to track value_log_waste_threshold — the same bar that decides a
+# bucket is worth collecting also seals its tail, so garbage never strands between
+# the two. Set it (e.g. 50.0) to pin the bar higher and favour write-amplification
+# over reclaimed space.
+# tail_gc_min_garbage_pct = 50.0
+
 # Compact a field-index bitmap store at checkpoint when this percentage of its
 # value region is dead space (0.0–100.0). The bitmap store is append-only, so
 # each indexed-document write leaves a stale copy of that field-value's bitmap

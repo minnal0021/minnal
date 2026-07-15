@@ -74,6 +74,23 @@ pub struct ThresholdConfig {
     /// over its trigger — GC on a treadmill. A lower page threshold rewrites more
     /// survivors per pass but actually finishes the job.
     pub page_gc_threshold: f64,
+    /// Percentage (`0..100`) of garbage in a bucket's **active tail** segment at
+    /// which GC seals the tail so it can be collected.
+    ///
+    /// The tail is normally off-limits (it is still being appended to). A large or
+    /// busy namespace fills and rolls its tail on its own, sealing it; but a small
+    /// or idle one may never fill a segment, so its garbage would sit in the tail
+    /// forever — the waste trigger fires every interval, GC finds no *sealed*
+    /// candidate, and reclaims nothing. Sealing the tail early costs a one-time
+    /// rewrite of whatever is still live in it: at G% garbage it rewrites `(100-G)%`
+    /// to free `G%`, so the breakeven (rewrite == freed) is 50%.
+    ///
+    /// `None` (the default) tracks [`value_log_waste_threshold`](Self::value_log_waste_threshold)
+    /// — the same bar that decides a bucket is worth collecting also decides its tail
+    /// is worth sealing, so garbage never strands between the two. Set `Some(pct)` to
+    /// pin it (e.g. `50.0` to favour write-amplification over space). Resolve it with
+    /// [`effective_tail_gc_min_garbage_pct`](Self::effective_tail_gc_min_garbage_pct).
+    pub tail_gc_min_garbage_pct: Option<f64>,
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
     /// append-only, so each per-document insert leaves a stale copy of that
@@ -101,14 +118,28 @@ impl ThresholdConfig {
         Self {
             value_log_waste_threshold: waste_threshold,
             page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }
     }
 
+    /// The effective tail-seal bar: the explicit
+    /// [`tail_gc_min_garbage_pct`](Self::tail_gc_min_garbage_pct) if set, otherwise the
+    /// [`value_log_waste_threshold`](Self::value_log_waste_threshold) trigger it tracks.
+    pub fn effective_tail_gc_min_garbage_pct(&self) -> f64 {
+        self.tail_gc_min_garbage_pct.unwrap_or(self.value_log_waste_threshold)
+    }
+
     /// Override the per-page GC threshold (percentage `0..100`).
     pub fn with_page_gc_threshold(mut self, threshold: f64) -> Self {
         self.page_gc_threshold = threshold;
+        self
+    }
+
+    /// Override the tail-seal bar (percentage `0..100`); `None` tracks the trigger.
+    pub fn with_tail_gc_min_garbage_pct(mut self, threshold: Option<f64>) -> Self {
+        self.tail_gc_min_garbage_pct = threshold;
         self
     }
 
@@ -131,6 +162,7 @@ impl Default for ThresholdConfig {
         Self {
             value_log_waste_threshold: 30.0,
             page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }

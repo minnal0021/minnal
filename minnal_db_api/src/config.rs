@@ -271,6 +271,7 @@ impl DocStoreApiConfig {
             threshold_config: ThresholdConfig {
                 value_log_waste_threshold: self.thresholds.value_log_waste_threshold,
                 page_gc_threshold: self.thresholds.page_gc_threshold,
+                tail_gc_min_garbage_pct: self.thresholds.tail_gc_min_garbage_pct,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
                 index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
             },
@@ -444,6 +445,10 @@ pub struct ThresholdSection {
     pub value_log_waste_threshold: f64,
     #[serde(default = "default_page_gc_threshold")]
     pub page_gc_threshold: f64,
+    /// Garbage share at which a bucket's active tail is sealed for GC. Omit to track
+    /// `value_log_waste_threshold` (the recommended default).
+    #[serde(default)]
+    pub tail_gc_min_garbage_pct: Option<f64>,
     #[serde(default = "default_index_blob_waste_threshold")]
     pub index_blob_waste_threshold: f64,
     #[serde(default = "default_index_blob_backpressure_bytes")]
@@ -455,6 +460,7 @@ impl Default for ThresholdSection {
         Self {
             value_log_waste_threshold: default_waste_threshold(),
             page_gc_threshold: default_page_gc_threshold(),
+            tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
         }

@@ -1841,7 +1841,8 @@ impl Database {
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
         let page_threshold = self.config.threshold_config.page_gc_threshold;
-        kv_store.garbage_collect_with_threshold(page_threshold)
+        let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
+        kv_store.garbage_collect_with_thresholds(page_threshold, tail_threshold)
     }
 
     /// Run value log GC on the default namespace
@@ -2379,24 +2380,32 @@ impl ValueLogGcTarget for Database {
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
         let page_threshold = self.config.threshold_config.page_gc_threshold;
+        let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
         info!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
-             (pages rewritten at >= {:.2}% garbage)",
+             (pages rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),
             waste_threshold,
-            page_threshold
+            page_threshold,
+            tail_threshold
         );
         for (ns_id, kv_store) in stores.iter() {
             let waste_ratio = kv_store.get_waste_ratio();
-            if waste_ratio < waste_threshold {
-                debug!("[GCWorker] ns_id={} waste {:.2}% below threshold, skipping", ns_id, waste_ratio);
+            // The namespace-average waste is over the trigger, OR some single bucket is —
+            // the average alone hides a hot bucket behind near-empty ones, so a bucket well
+            // over the trigger would never be collected. Check both.
+            if waste_ratio < waste_threshold && !kv_store.has_bucket_over_waste(waste_threshold) {
+                debug!(
+                    "[GCWorker] ns_id={} waste {:.2}% below threshold (no bucket over it), skipping",
+                    ns_id, waste_ratio
+                );
                 continue;
             }
             // Over the trigger, but is any of that garbage actually collectable? Garbage in
             // a bucket's active tail is not, until the tail is either filled or sealed — so
             // without this check a small, fully-deleted namespace would sit at 100% waste
             // and make the worker log "starting GC ... reclaimed 0 bytes" on every tick.
-            if !kv_store.has_gc_work(page_threshold) {
+            if !kv_store.has_gc_work(page_threshold, tail_threshold) {
                 debug!(
                     "[GCWorker] ns_id={} waste {:.2}% is over the trigger but no segment is collectable yet, skipping",
                     ns_id, waste_ratio
@@ -2410,7 +2419,7 @@ impl ValueLogGcTarget for Database {
                 ns_id, waste_ratio, garbage_bytes, written_bytes, waste_threshold
             );
             let start = std::time::Instant::now();
-            match kv_store.garbage_collect_with_threshold(page_threshold) {
+            match kv_store.garbage_collect_with_thresholds(page_threshold, tail_threshold) {
                 Ok(stats) => info!(
                     "[GCWorker] ns_id={} GC complete in {:?} — reclaimed {} bytes, live {} bytes, \
                      total reclaimed {} bytes across {} run(s)",
@@ -3475,7 +3484,12 @@ mod tests {
         let mut total_live = 0u64;
         for (_bucket, segs) in &stats {
             for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total", s.id);
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke live+garbage==total",
+                    s.id
+                );
                 total_live += s.live_bytes;
             }
         }
@@ -3526,6 +3540,45 @@ mod tests {
                 "value k{i} unreadable after reopen with a mismatched num_buckets"
             );
         }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
+        use crate::store::gc_value_log_worker::ValueLogGcTarget;
+        // The GC trigger is per-bucket, not just the namespace average: a bucket over the
+        // trigger must be collected even when near-empty buckets drag the average below it.
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.threshold_config.value_log_waste_threshold = 30.0; // tail bar tracks this
+        let db = Database::open(dir.path(), config).unwrap();
+
+        let value = vec![0x33u8; 300];
+        // Live data spread across buckets keeps the namespace average low...
+        for i in 0..800u32 {
+            db.put(format!("k{i:04}").as_bytes(), &value).unwrap();
+        }
+        // ...then hammer a single key so ITS bucket alone piles up garbage.
+        for _ in 0..250u32 {
+            db.put(b"k0000", &value).unwrap();
+        }
+
+        let store = db.get_store(DEFAULT_NAMESPACE_ID).unwrap();
+        let avg = store.get_waste_ratio();
+        assert!(avg < 30.0, "precondition: namespace average must be below the trigger, got {avg:.1}%");
+        assert!(store.has_bucket_over_waste(30.0), "precondition: some bucket must be over the trigger");
+
+        // The per-bucket-aware trigger runs GC where the old average-only gate would have
+        // skipped the whole namespace.
+        ValueLogGcTarget::run_gc_if_needed(&db, 30.0);
+
+        let after = store.get_waste_ratio();
+        assert!(
+            after < avg,
+            "the hot bucket's garbage must be reclaimed, dropping overall waste (was {avg:.1}%, now {after:.1}%)"
+        );
+        assert_eq!(db.get(b"k0000").unwrap(), Some(value.clone()), "the hammered key must survive collection");
+
         db.shutdown().unwrap();
     }
 

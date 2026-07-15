@@ -280,4 +280,11 @@ impl ShardedValueLog {
         }
         (garbage as f64 / total as f64) * 100.0
     }
+
+    /// True if **any single bucket** is at or above `threshold_pct` waste. The
+    /// cross-bucket [`total_garbage_ratio`](Self::total_garbage_ratio) is an average, so a
+    /// bucket well over the trigger can hide behind near-empty ones; this catches that.
+    pub fn any_bucket_over_waste(&self, threshold_pct: f64) -> bool {
+        self.logs.iter().any(|l| l.waste_ratio_pct() >= threshold_pct)
+    }
 }
