@@ -778,7 +778,7 @@ impl Database {
     /// This skips the fsync that normally accompanies every WAL entry, giving
     /// much higher throughput at the cost of crash safety: any data written
     /// via this method is unrecoverable if the process crashes before the
-    /// value-log page is flushed.  Only use this for bulk-loading scenarios
+    /// value-log segment is flushed.  Only use this for bulk-loading scenarios
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
@@ -1834,9 +1834,9 @@ impl Database {
 
     /// Run value log GC on a specific namespace.
     ///
-    /// Note the threshold passed here is the **per-page** one, not the bucket-level
-    /// trigger: an explicit `garbage_collect()` call has already decided the
-    /// namespace is worth collecting, so what is left to decide is which *pages*
+    /// Note the threshold passed here is the **per-segment** selection one, not the
+    /// bucket-level trigger: an explicit `garbage_collect()` call has already decided
+    /// the namespace is worth collecting, so what is left to decide is which *segments*
     /// to rewrite.
     pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
@@ -2372,18 +2372,18 @@ impl ValueLogGcTarget for Database {
     }
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
-    /// lower `page_gc_threshold` then decides **which pages** get rewritten. Passing
-    /// the trigger through as the page threshold (as this used to) makes garbage
-    /// sitting just under it uncollectable: those pages read as "clean", get copied
-    /// byte-for-byte into the compacted file with their garbage intact, and keep the
-    /// bucket over its trigger forever.
+    /// lower `page_gc_threshold` then decides **which sealed segments** get rewritten.
+    /// Passing the trigger through as the selection threshold (as this used to) makes
+    /// garbage sitting just under it uncollectable: those segments read as "clean", are
+    /// left in place with their garbage intact, and keep the bucket over its trigger
+    /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
         let stores = self.stores.read();
         let page_threshold = self.config.threshold_config.page_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
         info!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
-             (pages rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
+             (segments rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),
             waste_threshold,
             page_threshold,

@@ -49,8 +49,8 @@ pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 /// [`ThresholdConfig::index_blob_backpressure_bytes`].
 pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Default percentage of a *value-log page* that may be garbage before GC
-/// rewrites that page. Deliberately **lower** than the bucket-level
+/// Default percentage of a *value-log segment* that may be garbage before GC
+/// rewrites it. Deliberately **lower** than the bucket-level
 /// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
 /// see [`ThresholdConfig::page_gc_threshold`] for why.
 pub const DEFAULT_PAGE_GC_THRESHOLD: f64 = 10.0;
@@ -61,18 +61,21 @@ pub struct ThresholdConfig {
     /// on it at all. This is the *trigger*: it answers "is this namespace worth
     /// collecting yet?"
     pub value_log_waste_threshold: f64,
-    /// Percentage (`0..100`) of an individual **page** that may be garbage before
-    /// GC rewrites that page. This is the *selection* rule, and it is a different
+    /// Percentage (`0..100`) of an individual **sealed segment** that may be garbage
+    /// before GC rewrites it. This is the *selection* rule, and it is a different
     /// question from the trigger above.
     ///
-    /// Keep it **well below** `value_log_waste_threshold`. A page under this
-    /// threshold is treated as "clean" and copied byte-for-byte into the
-    /// compacted file — carrying its garbage with it, unreclaimed. If the two
-    /// values were equal, garbage sitting just under the trigger could never be
-    /// collected at all: every pass would copy those pages across intact, report
-    /// success, and reclaim almost nothing, while the same bytes keep the bucket
-    /// over its trigger — GC on a treadmill. A lower page threshold rewrites more
-    /// survivors per pass but actually finishes the job.
+    /// (The name is `page_gc_threshold` for config compatibility; the value log is
+    /// now segment-based, so it selects segments, not the pages of the old format.)
+    ///
+    /// Keep it **well below** `value_log_waste_threshold`. A segment under this
+    /// threshold is treated as "clean" and left in place — its live records keep
+    /// their pointers, and its garbage rides along, unreclaimed. If the two values
+    /// were equal, garbage sitting just under the trigger could never be collected at
+    /// all: every pass would skip those segments, report success, and reclaim almost
+    /// nothing, while the same bytes keep the bucket over its trigger — GC on a
+    /// treadmill. A lower threshold rewrites more segments (and their survivors) per
+    /// pass but actually finishes the job.
     pub page_gc_threshold: f64,
     /// Percentage (`0..100`) of garbage in a bucket's **active tail** segment at
     /// which GC seals the tail so it can be collected.
@@ -131,7 +134,7 @@ impl ThresholdConfig {
         self.tail_gc_min_garbage_pct.unwrap_or(self.value_log_waste_threshold)
     }
 
-    /// Override the per-page GC threshold (percentage `0..100`).
+    /// Override the per-segment GC selection threshold (percentage `0..100`).
     pub fn with_page_gc_threshold(mut self, threshold: f64) -> Self {
         self.page_gc_threshold = threshold;
         self

@@ -2094,7 +2094,7 @@ mod tests {
     // acquiring the bucket lock.  Any write that completed its value-log write
     // but had not yet updated the LSM in that window was permanently lost:
     // GC deleted the old file without copying the record, leaving a stale
-    // LSM pointer into a zero-filled page (→ CorruptedLog on the next read).
+    // LSM pointer into a reclaimed segment (→ CorruptedLog on the next read).
     //
     // The fix: writes hold the bucket lock across the value-log write AND
     // the LSM insert; GC scans the LSM inside the same lock, guaranteeing a
@@ -2426,8 +2426,8 @@ mod tests {
 
         const N: u32 = 120;
 
-        // Overwrite each key several times to pile up garbage on its pages, then
-        // settle on the canonical value so GC has dirty pages to compact.
+        // Overwrite each key several times to pile up garbage in its segments, then
+        // settle on the canonical value so GC has dirty segments to compact.
         for round in 0..5u8 {
             for i in 0..N {
                 store.put_to_storage(&format!("k:{i:04}").into_bytes(), &[round; 48]).unwrap();
@@ -2645,14 +2645,14 @@ mod tests {
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
         let expected = |i: u32| {
             // Distinct prefix per key (catches cross-key misreads), padded so
-            // records are large enough to span pages and force relocation.
+            // records are large enough to span segments and force relocation.
             let mut v = format!("val:{i:06}:").into_bytes();
             v.resize(100, b'.');
             v
         };
 
         // Seed live keys plus junk; deleting the junk leaves garbage interleaved
-        // with the survivors, so GC must rewrite dirty pages and relocate them.
+        // with the survivors, so GC must rewrite dirty segments and relocate them.
         for i in 0..N {
             store.put_to_storage(&live_key(i), &expected(i)).unwrap();
             store.put_to_storage(&format!("junk:{i:06}").into_bytes(), &[0xAB; 100]).unwrap();
@@ -2763,12 +2763,12 @@ mod tests {
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
         let expected = |i: u32| {
             let mut v = format!("val:{i:06}:").into_bytes();
-            v.resize(100, b'.'); // large enough to span pages and force relocation
+            v.resize(100, b'.'); // large enough to span segments and force relocation
             v
         };
 
         // Live keys plus junk; deleting the junk leaves garbage interleaved with the
-        // survivors so GC must rewrite dirty pages and relocate live records.
+        // survivors so GC must rewrite dirty segments and relocate live records.
         for i in 0..N {
             store.put_to_storage(&live_key(i), &expected(i)).unwrap();
             store.put_to_storage(&format!("junk:{i:06}").into_bytes(), &[0xAB; 100]).unwrap();
