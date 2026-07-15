@@ -656,11 +656,16 @@ impl KVStore {
             match self.value_log.read_value(pointer) {
                 Ok(value) => return Ok(Some(value)),
                 // GC reclaimed the segment after relocating this record; the LSM now
-                // holds the new pointer. Re-resolve and read again.
-                Err(e) => {
+                // holds the new pointer. Re-resolve and read again. This is the ONLY
+                // retryable read error.
+                Err(e) if e.is_segment_missing() => {
                     last_err = Some(e.into());
                     continue;
                 }
+                // Corruption or an IO fault is real: surface it immediately instead of
+                // spinning the retry ladder (which is for reclaimed segments) or letting
+                // a caller mistake it for a missing key.
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -876,11 +881,19 @@ impl KVStore {
     pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
         let (mut results, retry) = self.get_multiple_inner(keys);
 
-        // Keys that resolved to a pointer but whose value could not be read: GC
-        // reclaimed the segment between the LSM lookup and the read. The LSM now holds
-        // the new pointer, so re-resolve just those through the single-key `get`.
+        // Keys that resolved to a pointer but whose value could not be read: usually GC
+        // reclaimed the segment between the LSM lookup and the read, and the LSM now
+        // holds the new pointer, so re-resolving through the single-key `get` succeeds.
+        // But `get` can also return a *hard* error (corruption, IO fault) — which the
+        // reclaimed-segment retry inside `get` no longer masks. This method's public
+        // signature is `Vec<Option>`, so it cannot surface a per-key error; log it so a
+        // genuine corruption is visible rather than silently indistinguishable from a
+        // missing key.
         for idx in retry {
-            results[idx] = self.get(&keys[idx]).ok().flatten();
+            match self.get(&keys[idx]) {
+                Ok(value) => results[idx] = value,
+                Err(e) => warn!("[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}", self.name, e),
+            }
         }
         results
     }
@@ -1748,6 +1761,56 @@ mod tests {
         }
         assert_eq!(live, winner_len, "only the winning record's bytes may be counted live");
         assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
+    }
+
+    #[test]
+    fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
+        // A value-log read error in the batch path used to be swallowed by
+        // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
+        // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
+        // and `get_multiple` still returns the readable keys — dropping (and logging) only
+        // the corrupt one rather than silently reporting it absent.
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+
+        let keys: Vec<Vec<u8>> = (0..5u32).map(|i| format!("k{i}").into_bytes()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            store.put_to_storage(k, format!("value-{i}-payload").as_bytes()).unwrap();
+        }
+
+        // Flip a byte in k2's value payload, in place (behind the log's back — the cached
+        // fd reads the modified file, and the in-memory LSM keeps k2's pointer).
+        let ptr = decode_sharded_pointer(store.lsm.get(b"k2").unwrap().unwrap()).unwrap();
+        let seg_path = dir
+            .path()
+            .join("value_logs")
+            .join(format!("value_log_{}.seg{:06}", ptr.bucket, ptr.location.segment_id));
+        let mut bytes = std::fs::read(&seg_path).unwrap();
+        bytes[ptr.location.rec_offset as usize + crate::store::value_log::ValueRecordHeader::SIZE] ^= 0xFF;
+        std::fs::write(&seg_path, &bytes).unwrap();
+
+        // With checksum verification on, the flipped payload is detected.
+        store.set_verify_checksums_on_read(true);
+
+        // Single-key get surfaces the corruption rather than looping or returning None.
+        assert!(
+            matches!(store.get(b"k2"), Err(KVError::ShardedValueLogError(_))),
+            "corruption must surface as an error, not a missing key"
+        );
+
+        // get_multiple returns every readable key and drops only the corrupt one.
+        let got = store.get_multiple(&keys);
+        for (i, k) in keys.iter().enumerate() {
+            if k.as_slice() == b"k2" {
+                assert!(got[i].is_none(), "the corrupt key must not be returned as a value");
+            } else {
+                assert_eq!(
+                    got[i].as_deref(),
+                    Some(format!("value-{i}-payload").as_bytes()),
+                    "readable key {i} must still be returned"
+                );
+            }
+        }
     }
 
     #[test]

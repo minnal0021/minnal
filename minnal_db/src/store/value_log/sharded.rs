@@ -22,6 +22,17 @@ pub enum ShardedValueLogError {
     InvalidBucket(u32),
 }
 
+impl ShardedValueLogError {
+    /// True only for the **transient** reclaimed-segment case: GC unlinked the segment
+    /// after relocating the record, so re-resolving the pointer through the LSM (which
+    /// now holds the new one) and retrying is the correct response. Every other error —
+    /// corruption, IO faults — is real and must be surfaced, not retried and not masked
+    /// as a missing key. See [`super::ValueLogError::SegmentMissing`].
+    pub fn is_segment_missing(&self) -> bool {
+        matches!(self, ShardedValueLogError::ValueLogError(super::ValueLogError::SegmentMissing(_)))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ShardedValueLogError>;
 
 /// A value's full address: its bucket plus its location within that bucket's
