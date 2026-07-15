@@ -116,6 +116,8 @@ pub struct ThresholdSection {
     pub page_gc_threshold: f64,
     #[serde(default = "default_index_blob_waste_threshold")]
     pub index_blob_waste_threshold: f64,
+    #[serde(default = "default_index_blob_backpressure_bytes")]
+    pub index_blob_backpressure_bytes: u64,
 }
 
 impl Default for ThresholdSection {
@@ -124,6 +126,7 @@ impl Default for ThresholdSection {
             value_log_waste_threshold: default_value_log_waste_threshold(),
             page_gc_threshold: default_page_gc_threshold(),
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
+            index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
         }
     }
 }
@@ -138,6 +141,10 @@ fn default_page_gc_threshold() -> f64 {
 
 fn default_index_blob_waste_threshold() -> f64 {
     crate::db::config::DEFAULT_INDEX_BLOB_WASTE_THRESHOLD
+}
+
+fn default_index_blob_backpressure_bytes() -> u64 {
+    crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +255,8 @@ impl MinnalTomlConfig {
         DbConfig {
             threshold_config: ThresholdConfig::new(self.thresholds.value_log_waste_threshold)
                 .with_page_gc_threshold(self.thresholds.page_gc_threshold)
-                .with_index_blob_waste_threshold(self.thresholds.index_blob_waste_threshold),
+                .with_index_blob_waste_threshold(self.thresholds.index_blob_waste_threshold)
+                .with_index_blob_backpressure_bytes(self.thresholds.index_blob_backpressure_bytes),
             sync_config: SyncConfig::new(self.sync.records_per_sync),
             scheduled_task_config: ScheduledTaskConfig {
                 value_log_gc_interval: Duration::from_secs(self.scheduled_tasks.value_log_gc_interval_secs),

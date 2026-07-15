@@ -272,6 +272,7 @@ impl DocStoreApiConfig {
                 value_log_waste_threshold: self.thresholds.value_log_waste_threshold,
                 page_gc_threshold: self.thresholds.page_gc_threshold,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
+                index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
             },
             sync_config: SyncConfig {
                 records_per_sync: self.sync.records_per_sync,
@@ -445,6 +446,8 @@ pub struct ThresholdSection {
     pub page_gc_threshold: f64,
     #[serde(default = "default_index_blob_waste_threshold")]
     pub index_blob_waste_threshold: f64,
+    #[serde(default = "default_index_blob_backpressure_bytes")]
+    pub index_blob_backpressure_bytes: u64,
 }
 
 impl Default for ThresholdSection {
@@ -453,6 +456,7 @@ impl Default for ThresholdSection {
             value_log_waste_threshold: default_waste_threshold(),
             page_gc_threshold: default_page_gc_threshold(),
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
+            index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
         }
     }
 }
@@ -467,6 +471,10 @@ fn default_page_gc_threshold() -> f64 {
 
 fn default_index_blob_waste_threshold() -> f64 {
     minnal_db::DEFAULT_INDEX_BLOB_WASTE_THRESHOLD
+}
+
+fn default_index_blob_backpressure_bytes() -> u64 {
+    minnal_db::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
 #[derive(Debug, Deserialize)]

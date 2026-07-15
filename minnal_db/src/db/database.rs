@@ -5,7 +5,7 @@
 
 use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
@@ -337,6 +337,10 @@ pub struct Database {
     // Shared LSM compaction sender — stored so newly-opened namespaces can be wired up.
     pub(crate) lsm_compaction_sender: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 
+    // Shared index-checkpoint backpressure valve — stored so newly-opened
+    // namespaces inherit it. `None` until the checkpoint worker is enabled.
+    pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
     // namespace is registered. The per-namespace (ttl, max_deletes) config it
@@ -564,6 +568,7 @@ impl Database {
             lsm_compaction_worker: Arc::new(tokio::sync::RwLock::new(None)),
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -621,6 +626,22 @@ impl Database {
             ));
             kv_store.set_flush_observer(Some(observer));
         }
+    }
+
+    /// Build the index-checkpoint backpressure valve for `worker` (using the
+    /// configured `index_blob_backpressure_bytes` cap), wire it into every
+    /// existing store, and record it centrally so namespaces opened later inherit
+    /// it. Called when the checkpoint worker is enabled.
+    pub(crate) fn wire_index_checkpoint_trigger(&self, worker: &IndexCheckpointWorker) {
+        let cap = self.config.threshold_config.index_blob_backpressure_bytes;
+        let trigger = worker.backpressure_trigger(cap);
+        {
+            let stores = self.stores.read();
+            for kv_store in stores.values() {
+                kv_store.set_index_checkpoint_trigger(Some(Arc::clone(&trigger)));
+            }
+        }
+        *self.index_checkpoint_trigger.write() = Some(trigger);
     }
 
     // ── Core data operations (default namespace shortcuts) ─────────────
@@ -863,6 +884,10 @@ impl Database {
         if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
             kv_store.set_compaction_trigger(sender.clone());
         }
+        // Inherit the index-checkpoint backpressure valve if the worker is running.
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
+        }
 
         self.stores.write().insert(ns_id, Arc::new(kv_store));
         Ok(ns_id)
@@ -902,6 +927,10 @@ impl Database {
         // Wire compaction trigger if a worker is already running
         if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
             kv_store.set_compaction_trigger(sender.clone());
+        }
+        // Inherit the index-checkpoint backpressure valve if the worker is running.
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
         }
 
         self.stores.write().insert(ns_id, Arc::new(kv_store));
@@ -2131,6 +2160,7 @@ impl Database {
             lsm_compaction_worker: Arc::new(tokio::sync::RwLock::new(None)),
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2603,6 +2633,8 @@ impl AsyncDatabase {
     /// only needs to replay a bounded WAL tail.
     pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
         let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
+        // Wire the write-path backpressure valve to this worker before publishing it.
+        self.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
         info!("[AsyncDatabase] Index checkpoint worker enabled with {}s interval", interval.as_secs());
         Ok(())

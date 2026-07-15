@@ -6,6 +6,7 @@
 //! Database coordinator.
 
 use crate::db::error::{KVError, Result};
+use crate::db::index_checkpoint_worker::IndexCheckpointTrigger;
 use crate::db::stats::{GCStats, Stats};
 use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver};
 use crate::store::lsm_worker::LsmCompactionCommand;
@@ -95,6 +96,11 @@ pub struct KVStore {
 
     // LSM compaction trigger channel
     pub(crate) lsm_compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
+
+    // Index-checkpoint backpressure valve: requests an early checkpoint when a
+    // field index accumulates too much reclaimable dead blob space. `None` until
+    // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
+    pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
 
     // Optional TTL for automatic record expiry
     pub(crate) ttl: Option<Duration>,
@@ -218,6 +224,7 @@ impl KVStore {
             write_count: Arc::new(AtomicU64::new(0)),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
+            index_checkpoint_trigger: Arc::new(RwLock::new(None)),
             ttl,
             namespace_index: Arc::new(RwLock::new(NamespaceIndexSet::new())),
             row_id_fn: Arc::new(RwLock::new(None)),
@@ -415,6 +422,11 @@ impl KVStore {
         *self.lsm_compaction_trigger.write() = Some(sender);
     }
 
+    /// Set (or clear) the index-checkpoint backpressure valve for this store.
+    pub(crate) fn set_index_checkpoint_trigger(&self, trigger: Option<Arc<IndexCheckpointTrigger>>) {
+        *self.index_checkpoint_trigger.write() = trigger;
+    }
+
     // ── Core data operations ───────────────────────────────────────────
 
     /// Put a key-value pair into storage (LSM + value log).
@@ -526,9 +538,23 @@ impl KVStore {
                     }
                 },
             };
+            let dead_bytes = idx.reclaimable_dead_bytes();
+            drop(idx);
             if let Err(e) = result {
                 warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
             }
+            // Backpressure: if this field's append-only blob has piled up enough
+            // dead space, ask the checkpoint worker to compact early instead of
+            // waiting ~15 min (debounced inside the trigger).
+            self.request_checkpoint_if_over_cap(dead_bytes);
+        }
+    }
+
+    /// Signal the index-checkpoint backpressure valve, if wired, with a field's
+    /// current reclaimable dead blob bytes. O(1) and non-blocking.
+    fn request_checkpoint_if_over_cap(&self, dead_bytes: u64) {
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            trigger.request_if_over_cap(dead_bytes);
         }
     }
 
@@ -727,6 +753,11 @@ impl KVStore {
                 // Prior bytes unavailable → scan to be safe.
                 None => idx.remove_all_for_row(row_id),
             }
+            // A removal also rewrites the value's bitmap append-only, so it adds
+            // to the field's dead space — signal backpressure like the put path.
+            let dead_bytes = idx.reclaimable_dead_bytes();
+            drop(idx);
+            self.request_checkpoint_if_over_cap(dead_bytes);
         }
     }
 

@@ -239,6 +239,22 @@ impl DynFieldIndex {
         self.keymap_store.as_ref().map_or(0.0, |ks| ks.waste_ratio())
     }
 
+    /// Total reclaimable dead bytes across this field's bitmap **and** keymap
+    /// stores — **O(1)** (incrementally tracked; see `BlobStore::dead_bytes`).
+    ///
+    /// This is the signal the write path checks against
+    /// `index_blob_backpressure_bytes` to request an early index checkpoint,
+    /// rather than the O(capacity) `bitmap_waste_ratio`. Both stores are summed
+    /// because `maybe_compact` reclaims both.
+    pub fn reclaimable_dead_bytes(&self) -> u64 {
+        let bitmap = match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.bitmap_dead_bytes(),
+            DynFieldIndexInner::Int(fi) => fi.bitmap_dead_bytes(),
+            DynFieldIndexInner::Str(fi) => fi.bitmap_dead_bytes(),
+        };
+        bitmap.saturating_add(self.keymap_store.as_ref().map_or(0, |ks| ks.dead_bytes()))
+    }
+
     /// Snapshot of this field's on-disk blob growth and reclaimable waste, for
     /// monitoring the append-only write amplification (worst for low-cardinality
     /// fields — see `index/CLAUDE.md`). Cheap: reads cached header fields and

@@ -118,6 +118,18 @@ page_gc_threshold = 10.0
 # higher = let more dead space accumulate first. Default 50.
 index_blob_waste_threshold = 50.0
 
+# Backpressure: when a single field index accumulates this many reclaimable dead
+# blob bytes, the write path requests an index checkpoint immediately instead of
+# waiting for the periodic (~15 min) tick. This bounds the transient on-disk
+# amplification of low-cardinality, high-churn fields (a boolean over many docs
+# rewrites its whole bitmap per document and can bloat to gigabytes between
+# ticks) to roughly this cap per field. It is an absolute BYTE cap, not a ratio:
+# such a field crosses any waste ratio almost immediately and stays near 100%, so
+# a ratio trigger would fire on nearly every write. Self-debounces — compaction
+# resets the field's dead-byte count, so the next request needs another full cap.
+# Default: 67108864 (64 MiB).
+index_blob_backpressure_bytes = 67_108_864
+
 # ---------------------------------------------------------------------------
 # [scheduled_tasks] — background worker intervals
 # ---------------------------------------------------------------------------

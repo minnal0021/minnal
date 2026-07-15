@@ -44,6 +44,11 @@ pub struct ScheduledTaskConfig {
 /// space before checkpoint compacts it.
 pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 
+/// Default absolute cap (bytes) on a single field index's reclaimable dead blob
+/// bytes before the write path requests an early index checkpoint. 64 MiB. See
+/// [`ThresholdConfig::index_blob_backpressure_bytes`].
+pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default percentage of a *value-log page* that may be garbage before GC
 /// rewrites that page. Deliberately **lower** than the bucket-level
 /// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
@@ -74,6 +79,21 @@ pub struct ThresholdConfig {
     /// append-only, so each per-document insert leaves a stale copy of that
     /// field-value's bitmap behind; compaction reclaims it.
     pub index_blob_waste_threshold: f64,
+    /// Absolute cap (bytes) on a single field index's reclaimable dead blob
+    /// bytes before the write path proactively requests an index checkpoint,
+    /// instead of waiting for the periodic (~15 min) tick.
+    ///
+    /// This is **backpressure**, and it is an absolute byte cap on purpose — a
+    /// *ratio* trigger is useless here because a low-cardinality, high-churn
+    /// field (e.g. a boolean over many docs) crosses any ratio almost
+    /// immediately and stays pinned near 100%, so it would fire on nearly every
+    /// write. Capping absolute dead bytes bounds the transient on-disk
+    /// amplification to roughly this value per field, and it self-debounces:
+    /// compaction resets the field's dead-byte count to 0, so the next request
+    /// only fires after another `index_blob_backpressure_bytes` accumulate.
+    /// The dead-byte count is O(1) to read, so the check is cheap on the hot
+    /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
+    pub index_blob_backpressure_bytes: u64,
 }
 
 impl ThresholdConfig {
@@ -82,6 +102,7 @@ impl ThresholdConfig {
             value_log_waste_threshold: waste_threshold,
             page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
+            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }
     }
 
@@ -96,6 +117,13 @@ impl ThresholdConfig {
         self.index_blob_waste_threshold = threshold;
         self
     }
+
+    /// Override the index-checkpoint backpressure cap (bytes). See
+    /// [`index_blob_backpressure_bytes`](Self::index_blob_backpressure_bytes).
+    pub fn with_index_blob_backpressure_bytes(mut self, bytes: u64) -> Self {
+        self.index_blob_backpressure_bytes = bytes;
+        self
+    }
 }
 
 impl Default for ThresholdConfig {
@@ -104,6 +132,7 @@ impl Default for ThresholdConfig {
             value_log_waste_threshold: 30.0,
             page_gc_threshold: DEFAULT_PAGE_GC_THRESHOLD,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
+            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
         }
     }
 }

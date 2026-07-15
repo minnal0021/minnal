@@ -860,6 +860,8 @@ impl AsyncDb {
     /// Start the index checkpoint background worker.
     pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
         let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
+        // Wire the write-path backpressure valve to this worker before publishing it.
+        self.inner.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
         info!("[AsyncDb] Index checkpoint worker enabled with {}s interval", interval.as_secs());
         Ok(())
