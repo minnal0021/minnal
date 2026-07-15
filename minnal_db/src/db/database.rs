@@ -3431,6 +3431,63 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
+        // Under real concurrency, racing writers to the same keys must not drift the
+        // value-log accounting GC selection relies on: total live bytes must equal
+        // exactly one live record per distinct key. (The deterministic form of the
+        // underlying bug is `a_lower_seq_put_charges_its_own_record_not_the_live_one`
+        // in kv_store; this guards the invariant end-to-end under load.)
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+
+        let keys: Vec<Vec<u8>> = (0..4u32).map(|k| format!("hot-key-{k}").into_bytes()).collect();
+        let mut handles = Vec::new();
+        for t in 0..4usize {
+            let (db, keys) = (Arc::clone(&db), keys.clone());
+            handles.push(thread::spawn(move || {
+                for i in 0..100usize {
+                    // Vary the value size per write so a mis-charged displacement can't
+                    // cancel in the aggregate byte count.
+                    let len = 64 + (t * 37 + i * 101) % 1024;
+                    db.put(&keys[(t + i) % keys.len()], &vec![0xACu8; len]).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Expected live bytes: one record per distinct key, sized by that key's current
+        // (winning) value. Database::open starts no GC worker, so nothing reclaims
+        // concurrently and the live set is exactly the winning records.
+        let expected_live: u64 = keys
+            .iter()
+            .map(|k| {
+                let v = db.get(k).unwrap().expect("key present after the race");
+                crate::store::value_log::ValueRecordHeader::record_len(k.len(), v.len())
+            })
+            .sum();
+
+        let stats = db.value_log_segment_stats("default").unwrap();
+        let mut total_live = 0u64;
+        for (_bucket, segs) in &stats {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total", s.id);
+                total_live += s.live_bytes;
+            }
+        }
+        assert_eq!(
+            total_live, expected_live,
+            "accounted live bytes must equal exactly one record per live key, not leak intermediate records"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    #[test]
     fn existing_bucket_count_is_detected_from_segmented_value_logs() {
         // num_buckets is locked at creation: reopening with a different configured
         // value must NOT re-shard. detect_bucket_count reads the count back from the

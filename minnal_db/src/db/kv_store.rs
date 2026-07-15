@@ -455,12 +455,19 @@ impl KVStore {
         // (targeted at the old value's bucket) instead of scanning every bucket.
         // Only worth a value-log read when the namespace actually has indexes.
         let want_old_for_index = !self.namespace_index.read().is_empty();
+
+        // Hold the bucket lock across the existing-pointer read, the value-log append,
+        // AND the LSM insert. Reading the displaced pointer *inside* the lock is
+        // load-bearing for garbage accounting: two racing same-key writers must not both
+        // observe the same old pointer and each mark it displaced (double-counting it and
+        // leaking the intermediate record). GC re-point is excluded for the same reason.
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let displaced = existing_u128.and_then(decode_sharded_pointer);
         let mut old_value: Option<Vec<u8>> = None;
-        let mut displaced: Option<ShardedValuePointer> = None;
-        if let Some(existing) = self.lsm.get(key)?
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
-        {
-            displaced = Some(existing_ptr);
+        if let Some(existing_ptr) = displaced {
             if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
                 next_version = meta.version.saturating_add(1);
             }
@@ -474,25 +481,28 @@ impl KVStore {
             epoch,
             seq,
         };
-
-        // Hold the bucket lock across the value-log append AND the LSM insert, so a
-        // GC pass on this bucket cannot re-point the key between the two (its CAS
-        // would then be validating against a pointer we are about to replace).
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
         self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
 
-        // The record we just replaced is now garbage. Accounting only — no I/O and no
-        // in-place edit of the old record (its segment may be sealed, and the old
-        // read-modify-write of a header at a random cold offset was pure cost).
-        if let Some(old) = displaced {
-            self.value_log.note_displaced(old, key.len());
+        // Account the record that is now garbage — accounting only, no I/O and no
+        // in-place edit (the old record's segment may be sealed and immutable). If this
+        // write won, that is the record it displaced; if it *lost* to a concurrent
+        // higher-sequence write (so the LSM dropped our insert), our own just-appended
+        // record is the dead one instead.
+        if wins {
+            if let Some(old) = displaced {
+                self.value_log.note_displaced(old, key.len());
+            }
+        } else {
+            self.value_log.note_displaced(pointer, key.len());
         }
         drop(_bucket_guard);
 
-        // Update in-memory field indices
-        self.update_indices_on_put(key, value, old_value.as_deref(), displaced.is_some());
+        // Update in-memory field indices. A lost write is not the key's current value,
+        // so it must not touch the indices.
+        if wins {
+            self.update_indices_on_put(key, value, old_value.as_deref(), displaced.is_some());
+        }
 
         Ok(())
     }
@@ -1153,14 +1163,18 @@ impl KVStore {
     pub fn replay_upsert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
         let mut next_version = 1u32;
-        let mut displaced: Option<ShardedValuePointer> = None;
-        if let Ok(Some(existing)) = self.lsm.get(key)
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
+
+        // Read the displaced pointer and decide the winner inside the bucket lock, as
+        // the live put path does — replay reuses that path's accounting exactly.
+        let bucket = self.value_log.bucket_for_key(key);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let displaced = existing_u128.and_then(decode_sharded_pointer);
+        if let Some(existing_ptr) = displaced
+            && let Ok(meta) = self.value_log.read_record_meta(existing_ptr)
         {
-            displaced = Some(existing_ptr);
-            if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
-                next_version = meta.version.saturating_add(1);
-            }
+            next_version = meta.version.saturating_add(1);
         }
 
         let record_meta = ValueRecordMeta {
@@ -1168,17 +1182,20 @@ impl KVStore {
             epoch,
             seq,
         };
-
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
         self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
-        if let Some(old) = displaced {
-            self.value_log.note_displaced(old, key.len());
+        if wins {
+            if let Some(old) = displaced {
+                self.value_log.note_displaced(old, key.len());
+            }
+        } else {
+            self.value_log.note_displaced(pointer, key.len());
         }
         drop(_bucket_guard);
 
-        self.update_indices_on_put(key, value, None, displaced.is_some());
+        if wins {
+            self.update_indices_on_put(key, value, None, displaced.is_some());
+        }
         Ok(())
     }
 
@@ -1608,6 +1625,43 @@ mod tests {
 
         store.put_to_storage(b"key1", b"v2").unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
+        // A put that loses to a higher-sequence write for the same key (the LSM drops
+        // its insert under highest-sequence-wins) must account ITS OWN freshly-appended
+        // record as garbage — not displace the record that is still live. This is the
+        // deterministic form of the concurrent-put accounting race: the old code read
+        // the displaced pointer before the bucket lock and always marked it displaced,
+        // so this lower-seq put marked the LIVE record garbage (accounting would call the
+        // live value dead — GC could then reclaim it, losing data) and left its own dead
+        // record counted live.
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+
+        let winner = vec![0x11u8; 400];
+        let loser = vec![0x22u8; 900]; // a different size, so a mis-charge can't cancel
+
+        // Higher sequence lands first and wins; the lower sequence arrives after and is
+        // dropped by the LSM.
+        store.put_to_storage_seq(b"k", &winner, 10).unwrap();
+        store.put_to_storage_seq(b"k", &loser, 5).unwrap();
+
+        assert_eq!(store.get(b"k").unwrap(), Some(winner.clone()), "highest-seq write must win the read");
+
+        let winner_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), winner.len());
+        let loser_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
+        let (mut live, mut garbage) = (0u64, 0u64);
+        for (_bucket, segs) in store.value_log.all_segment_stats() {
+            for s in segs {
+                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total", s.id);
+                live += s.live_bytes;
+                garbage += s.garbage_bytes;
+            }
+        }
+        assert_eq!(live, winner_len, "only the winning record's bytes may be counted live");
+        assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
     }
 
     #[test]
