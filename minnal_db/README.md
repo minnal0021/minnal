@@ -576,7 +576,7 @@ Each design choice in MinnalDB pays off as a specific performance property:
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
 | 16-bucket sharding | 16× parallel GC and compaction; 16× write parallelism |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
-| SIMD key comparison | Faster skip-list traversal on x86_64. See [SIMD coverage by architecture](#simd-coverage-by-architecture) below for the Apple Silicon story. |
+| SIMD key comparison | Faster skip-list traversal on x86_64 (AVX-512/AVX2) and Apple Silicon (NEON). See [SIMD coverage by architecture](#simd-coverage-by-architecture) below. |
 | Zero-copy serialization | No deserialization overhead on typed reads |
 | Epoch-based memory reclamation | Lock-free L0 cleanup without stopping readers |
 
@@ -588,10 +588,10 @@ minnal targets both x86_64 and Apple Silicon (aarch64/ARM64). Not every hot path
 |---|---|---|---|
 | Field-index bitmap operations (AND/OR/NOT, popcount, merge) | AVX-512 → AVX2 → scalar | NEON | Detected automatically at build/run time; both paths are unit-tested against a scalar reference |
 | Vector search distance math | AVX-512 / AVX2 | NEON / SVE | Provided by the `simsimd` library |
-| Skip-list key comparison | AVX-512 / AVX2 | Plain scalar loop | No NEON version yet — correct, just not vectorised on Apple Silicon |
+| Skip-list key comparison | AVX-512 / AVX2 | NEON | Compares 16 bytes/iteration via `vceqq_u8` + movemask emulation; unit-tested against `<[u8]>::cmp` |
 | Bucket-assignment hashing | AVX | Portable scalar path | From the `mm3h` hashing library |
 
-In short: on Apple Silicon, field-index queries and vector search get their full SIMD speed-up; ordinary key comparisons and hashing currently run the portable fallback. All fallback paths are correctness-equivalent — this is a speed difference, not a behavioural one.
+In short: on Apple Silicon, key comparison, field-index queries, and vector search all get a hand-written SIMD path; only bucket-assignment hashing currently runs the portable fallback. All fallback paths are correctness-equivalent — this is a speed difference, not a behavioural one.
 
 ### Expected throughput
 

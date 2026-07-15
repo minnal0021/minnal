@@ -3,6 +3,7 @@
 //! This module provides optimized comparison for byte arrays using:
 //! - AVX512 for x86_64 targets with avx512f support
 //! - AVX2 for x86_64 targets with avx2 but without avx512f
+//! - NEON for aarch64 targets (Advanced SIMD is baseline-mandatory on AArch64)
 //! - Fallback to scalar comparison for other targets
 //!
 //! The comparison maintains strict lexicographic byte order across all implementations.
@@ -28,9 +29,17 @@ pub mod simd_support {
             compare_bytes_avx2(a, b)
         }
 
+        // SAFETY: NEON (Advanced SIMD) is a baseline feature on all aarch64 targets,
+        // so the `target_feature(enable = "neon")` fn is always safe to call here.
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { compare_bytes_neon(a, b) }
+        }
+
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx512f"),
             all(target_arch = "x86_64", target_feature = "avx2"),
+            target_arch = "aarch64",
         )))]
         {
             a.cmp(b)
@@ -151,6 +160,57 @@ pub mod simd_support {
         }
 
         a.len().cmp(&b.len())
+    }
+
+    /// NEON path: compares 16 bytes per iteration using 128-bit Q registers.
+    ///
+    /// AArch64 has no direct `PMOVMSKB` equivalent, so the per-lane equality
+    /// result from `vceqq_u8` (0xFF in each lane where the bytes match) is
+    /// collapsed to a 16-bit mask — 1 bit per byte, set where equal — by ANDing
+    /// with per-lane bit weights and horizontally summing each 8-byte half
+    /// (`vaddv_u8`). All-equal therefore yields `0xFFFF`; the first differing
+    /// byte is `trailing_ones()` of that mask, mirroring the AVX2 path exactly.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn compare_bytes_neon(a: &[u8], b: &[u8]) -> Ordering {
+        use std::arch::aarch64::*;
+
+        unsafe {
+            let min_len = a.len().min(b.len());
+            let mut pos = 0;
+
+            // Per-byte bit weights for the movemask emulation (lane i → bit i).
+            let bit_weights =
+                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+
+            while pos + 16 <= min_len {
+                let a_vec = vld1q_u8(a.as_ptr().add(pos));
+                let b_vec = vld1q_u8(b.as_ptr().add(pos));
+                // 0xFF per lane where equal, 0x00 where different.
+                let eq = vceqq_u8(a_vec, b_vec);
+                let masked = vandq_u8(eq, bit_weights);
+                // Sum each 8-byte half into one bit-packed byte, combine to a u16.
+                let lo = vaddv_u8(vget_low_u8(masked)) as u16;
+                let hi = vaddv_u8(vget_high_u8(masked)) as u16;
+                let mask = lo | (hi << 8);
+                if mask != u16::MAX {
+                    // trailing_ones() = index of first 0 bit = first differing byte.
+                    let diff_pos = mask.trailing_ones() as usize;
+                    return a[pos + diff_pos].cmp(&b[pos + diff_pos]);
+                }
+                pos += 16;
+            }
+
+            // Scalar tail.
+            for i in pos..min_len {
+                match a[i].cmp(&b[i]) {
+                    Ordering::Equal => {}
+                    other => return other,
+                }
+            }
+
+            a.len().cmp(&b.len())
+        }
     }
 
     #[cfg(test)]
