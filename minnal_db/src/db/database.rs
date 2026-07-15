@@ -21,7 +21,7 @@ use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCom
 use crate::store::value_log::ValueLogMetadata;
 
 use log::{debug, error, info, warn};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +43,14 @@ pub(crate) struct WalPersistObserver {
     wal_metadata_path: PathBuf,
     pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
     last_persisted_offset: Arc<RwLock<u64>>,
+    /// Serializes every persisted-marking operation (`mark_persisted_range`,
+    /// `mark_namespace_persisted`). These do a non-atomic scan → check status →
+    /// flip → count over a WAL offset range; run concurrently they would flip and
+    /// **count the same entry twice**, driving `persisted_entries` past
+    /// `total_entries` and permanently wedging WAL GC (whose deletion gate is
+    /// `persisted >= total`). Holding this across the whole operation makes the
+    /// on-disk `status == Persisted` check a reliable per-entry dedup.
+    persist_lock: Mutex<()>,
 }
 
 impl WalPersistObserver {
@@ -59,10 +67,20 @@ impl WalPersistObserver {
             wal_metadata_path,
             pending,
             last_persisted_offset,
+            persist_lock: Mutex::new(()),
         }
     }
 
     pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
+        // Serialize with every other persisted-marking operation so no entry is
+        // scanned+flipped+counted concurrently (see `persist_lock`).
+        let _persist = self.persist_lock.lock();
+
+        // Re-read the authoritative watermark under the lock: the caller's `start`
+        // may be stale if another persist advanced past it while we waited, and
+        // processing an already-counted range would double-count it. `start` is
+        // kept as a floor (it only ever equals the watermark at call sites).
+        let start = (*self.last_persisted_offset.read()).max(start);
         if end <= start {
             return;
         }
@@ -132,6 +150,12 @@ impl WalPersistObserver {
         if end <= start {
             return;
         }
+
+        // Serialize with `mark_persisted_range` (same `persist_lock`): both flip and
+        // count entries in overlapping windows, so running concurrently they could
+        // count the same entry twice. Under the lock, whichever flips an entry first
+        // marks it `Persisted` on disk and the other skips it uncounted.
+        let _persist = self.persist_lock.lock();
 
         let entries = match self.wal.scan_entries(start, end) {
             Ok(entries) => entries,
@@ -339,6 +363,52 @@ pub struct Database {
 }
 
 impl Database {
+    /// Resolve the WAL segment size to open with, locking it at creation.
+    ///
+    /// Precedence:
+    /// 1. An existing `wal_segment_size` marker wins — the size is fixed for the
+    ///    life of the WAL, because a segment id is `offset / segment_size` and a
+    ///    different size would map stored offsets to the wrong segment files.
+    /// 2. No marker but the WAL already holds data (a metadata file, or a
+    ///    non-empty `wal.log`): a pre-marker WAL, which was written at the
+    ///    historical [`DEFAULT_SEGMENT_SIZE`]. Use that and stamp the marker.
+    /// 3. Brand-new WAL: honour `configured` and stamp the marker.
+    ///
+    /// The marker write is best-effort; if it fails the effective size is still
+    /// correct for this run (it just re-resolves the same way next open).
+    fn resolve_wal_segment_size(db_path: &Path, wal_path: &Path, wal_metadata_path: &Path, configured: u64) -> u64 {
+        let marker = db_path.join("wal_segment_size");
+
+        if let Ok(bytes) = std::fs::read(&marker)
+            && let Ok(arr) = <[u8; 8]>::try_from(bytes.as_slice())
+        {
+            let recorded = u64::from_le_bytes(arr);
+            if recorded != 0 {
+                if configured != recorded {
+                    warn!(
+                        "[WAL] Configured wal.segment_size_bytes={} but this WAL was created at {}. \
+                         The segment size is fixed at creation and cannot change on existing data; \
+                         the configured value will NOT be applied.",
+                        configured, recorded,
+                    );
+                }
+                return recorded;
+            }
+        }
+
+        let preexisting = wal_metadata_path.exists() || std::fs::metadata(wal_path).map(|m| m.len() > 0).unwrap_or(false);
+        let size = if preexisting {
+            crate::db::wal::DEFAULT_SEGMENT_SIZE
+        } else {
+            configured.max(crate::db::wal::MIN_SEGMENT_SIZE)
+        };
+
+        if let Err(e) = crate::support::write_atomic_durable(&marker, &size.to_le_bytes()) {
+            warn!("[WAL] Failed to record WAL segment-size marker at {}: {:?}", marker.display(), e);
+        }
+        size
+    }
+
     /// Open a multi-namespace database at the given path
     pub fn open(db_path: &Path, mut config: DbConfig) -> Result<Self> {
         std::fs::create_dir_all(db_path)?;
@@ -367,8 +437,16 @@ impl Database {
         let wal_path = db_path.join("wal.log");
         let wal_metadata_path = db_path.join("wal_metadata");
 
+        // The WAL segment size is fixed at creation and honoured from config only
+        // for a brand-new WAL. It cannot change on existing data: a segment id is
+        // `offset / segment_size`, so a different size re-buckets every stored
+        // offset into the wrong segment file. The chosen size is recorded in a
+        // marker so it survives restarts; a pre-marker WAL falls back to the
+        // historical 64 MiB it was written at. (`wal.segment_size_bytes` in config.)
+        let wal_segment_size = Self::resolve_wal_segment_size(db_path, &wal_path, &wal_metadata_path, config.wal_segment_size);
+
         // Open WAL
-        let wal = Arc::new(Wal::open(&wal_path)?);
+        let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
 
         // Load or initialize WAL metadata
         let mut wal_metadata = if wal_metadata_path.exists() {
@@ -1630,7 +1708,10 @@ impl Database {
         let current = self.wal.segment_id_for_offset(wal_metadata.tail - 1);
         wal_metadata.tracked_segments().take_while(|&s| s < current).any(|s| {
             let t = wal_metadata.segment_total(s);
-            t > 0 && t == wal_metadata.segment_persisted(s)
+            // `>=` rather than `==`: a fully-persisted segment has persisted == total;
+            // accepting `>` too keeps GC unwedged if a persisted counter is ever
+            // over-reported, instead of stranding the segment forever.
+            t > 0 && wal_metadata.segment_persisted(s) >= t
         })
     }
 
@@ -1670,7 +1751,10 @@ impl Database {
         for segment_id in candidates {
             let total = wal_metadata.segment_total(segment_id);
             let persisted = wal_metadata.segment_persisted(segment_id);
-            if total > 0 && total == persisted && self.wal.delete_segment_file(segment_id).is_ok() {
+            // `persisted >= total` (not `==`): a segment is reclaimable once every
+            // entry is persisted; `>=` also unwedges GC if a counter was ever
+            // over-reported (see `has_deletable_wal_segments`).
+            if total > 0 && persisted >= total && self.wal.delete_segment_file(segment_id).is_ok() {
                 bytes_reclaimed = bytes_reclaimed.saturating_add(self.wal.segment_size());
                 segments_deleted += 1;
                 wal_metadata.total_entries = wal_metadata.total_entries.saturating_sub(total);
@@ -1939,6 +2023,10 @@ impl Database {
 
         let wal_path = db_path.join("wal.log");
         let wal_metadata_path = db_path.join("wal_metadata");
+
+        // Record the forced size so a later production `open` of this dir honours
+        // it rather than re-resolving to the default (mirrors `open`).
+        let _ = crate::support::write_atomic_durable(&db_path.join("wal_segment_size"), &wal_segment_size.to_le_bytes());
 
         let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
 
@@ -2695,6 +2783,91 @@ mod tests {
         let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
         config.num_buckets = crate::support::TEST_NUM_BUCKETS;
         config
+    }
+
+    #[test]
+    fn test_concurrent_mark_persisted_never_overcounts() {
+        // Regression: `mark_persisted_range` is a non-atomic scan → flip → count.
+        // Run concurrently by multiple writers reaching the sync point at once, two
+        // threads would flip and BOTH count the same entry, pushing
+        // `persisted_entries` past `total_entries`. Because the WAL GC deletion gate
+        // was exact equality (`total == persisted`), that impossible state wedged
+        // WAL GC forever (segments never became deletable → unbounded WAL growth).
+        // `persist_lock` must serialize the flip+count so no entry is counted twice.
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+
+        // Append a batch of entries (default records_per_sync is high, so these do
+        // not auto-persist during the writes).
+        let n = 500u64;
+        for i in 0..n {
+            db.put(format!("key{i}").as_bytes(), b"value").unwrap();
+        }
+        let tail = db.wal_metadata.read().tail;
+        let total = db.wal_metadata.read().total_entries;
+        assert!(total >= n, "expected at least {n} entries, got {total}");
+
+        // Hammer the same range from many threads at once.
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    for _ in 0..8 {
+                        db.wal_flush_observer.mark_persisted_range(0, tail);
+                    }
+                });
+            }
+        });
+
+        let meta = db.wal_metadata.read();
+        // The invariant the bug violated: persisted can never exceed total.
+        assert!(
+            meta.persisted_entries <= meta.total_entries,
+            "persisted_entries ({}) exceeded total_entries ({}) — over-count race",
+            meta.persisted_entries,
+            meta.total_entries,
+        );
+        // The whole range was covered, so every entry is persisted exactly once.
+        assert_eq!(meta.persisted_entries, meta.total_entries);
+        // Per-segment invariant holds too.
+        for seg in meta.tracked_segments() {
+            assert!(
+                meta.segment_persisted(seg) <= meta.segment_total(seg),
+                "segment {seg}: persisted {} > total {}",
+                meta.segment_persisted(seg),
+                meta.segment_total(seg),
+            );
+        }
+        drop(meta);
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_wal_segment_size_is_locked_at_creation() {
+        // The configured WAL segment size applies only to a brand-new WAL, and is
+        // then fixed: reopening with a different config value must NOT change it
+        // (a segment id is offset / segment_size, so a change would re-bucket
+        // stored offsets into the wrong files).
+        let dir = TempDir::new().unwrap();
+        let small = 64 * 1024; // 64 KiB
+        {
+            let mut cfg = create_db_config();
+            cfg.wal_segment_size = small;
+            let db = Database::open(dir.path(), cfg).unwrap();
+            assert_eq!(db.wal.segment_size(), small, "fresh WAL should honour config");
+            db.put(b"k", b"v").unwrap();
+            db.shutdown().unwrap();
+        }
+        // A marker must have been recorded.
+        assert!(dir.path().join("wal_segment_size").exists());
+        {
+            // Reopen with a DIFFERENT configured size — the created size must win.
+            let mut cfg = create_db_config();
+            cfg.wal_segment_size = 8 * 1024 * 1024;
+            let db = Database::open(dir.path(), cfg).unwrap();
+            assert_eq!(db.wal.segment_size(), small, "existing WAL size must be locked");
+            assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+            db.shutdown().unwrap();
+        }
     }
 
     #[test]

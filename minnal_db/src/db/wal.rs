@@ -32,7 +32,14 @@ pub enum WalError {
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
-const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+/// Default WAL segment size (64 MiB). Also the size every pre-marker ("legacy")
+/// WAL was created at, so it is the fallback when no creation-time size is
+/// recorded — see `Database::resolve_wal_segment_size`.
+pub(crate) const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Floor for a WAL segment size. Matches the guard in
+/// [`Wal::open_with_options_and_segment_size`].
+pub(crate) const MIN_SEGMENT_SIZE: u64 = 256;
 const WAL_METADATA_MAGIC: [u8; 4] = *b"WALM";
 const WAL_METADATA_VERSION: u32 = 1;
 
@@ -305,7 +312,12 @@ impl WalMetadata {
 
     pub fn add_segment_persisted(&mut self, segment_id: u64, n: u64) {
         if let Some(idx) = self.grow_to(segment_id) {
-            self.segment_persisted_entries[idx] = self.segment_persisted_entries[idx].saturating_add(n);
+            // Clamp to the segment's total. Persisted entries are a subset of the
+            // total by construction, so this only ever fires if a caller
+            // double-counts — a defensive floor against the class of bug where an
+            // over-count would push persisted past total and wedge WAL GC.
+            let total = self.segment_total_entries[idx];
+            self.segment_persisted_entries[idx] = self.segment_persisted_entries[idx].saturating_add(n).min(total);
         }
     }
 
@@ -543,7 +555,7 @@ impl Wal {
         Ok(Self {
             handle: Atomic::new(handle),
             path,
-            segment_size: segment_size.max(256),
+            segment_size: segment_size.max(MIN_SEGMENT_SIZE),
             current_segment_id: AtomicU64::new(0),
         })
     }

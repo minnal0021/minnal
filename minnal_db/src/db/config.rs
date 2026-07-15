@@ -146,7 +146,14 @@ pub struct DbConfig {
     pub num_buckets: usize,
     /// Maximum number of entries (including tombstones) in the in-memory skip list.
     pub skip_list_capacity: usize,
-    /// WAL segment size in bytes.
+    /// WAL segment size in bytes (default 64 MiB).
+    ///
+    /// **Fixed at creation.** Unlike [`segment_size_bytes`](Self::segment_size_bytes)
+    /// for the value log, a WAL segment id is `offset / wal_segment_size`, so this
+    /// cannot change once the WAL holds data — a different size would map stored
+    /// offsets to the wrong segment files. It is honoured only for a brand-new WAL
+    /// and then recorded in a `wal_segment_size` marker; on an existing WAL the
+    /// recorded size wins and a differing config value is ignored with a warning.
     pub wal_segment_size: u64,
     /// Size at which a value-log segment is sealed and a new one opened
     /// (default 256 MiB).

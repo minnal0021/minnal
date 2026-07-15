@@ -142,6 +142,12 @@ ttl_cleanup_interval_secs = 3_600
 
 # Maximum size of a single WAL segment file in bytes before a new segment
 # is created.  Default: 64 MiB.
+#
+# Fixed at creation: a WAL segment id is offset / segment_size, so this cannot
+# change once the WAL holds data (it would map stored offsets to the wrong
+# segment files). It is applied only to a brand-new WAL and then recorded in a
+# `wal_segment_size` marker; on an existing WAL the recorded size wins and a
+# differing value here is ignored with a warning.
 segment_size_bytes = 67_108_864   # 64 MiB
 
 # ---------------------------------------------------------------------------
