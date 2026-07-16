@@ -225,8 +225,51 @@ pub mod skip_list {
                 return Ok(Some(old));
             }
 
+            self.splice_new_node(key, value, false, seq, update)?;
+            self.no_live_nodes += 1;
+            Ok(None)
+        }
+
+        /// Insert a tombstone for `key` using an explicit sequence, with
+        /// **highest-sequence-wins** resolution. This is the production delete
+        /// path: unlike a value insert followed by a remove, the node is created
+        /// *directly* as a tombstone — no transient live state (and no
+        /// placeholder value) ever exists, even within the caller's lock.
+        ///
+        /// - Key absent → a new node is allocated already tombstoned (its value
+        ///   is `0`, never readable: tombstone value bits are meaningless).
+        /// - Key present with an older/equal sequence → flipped to a tombstone
+        ///   in place; its stored value is left untouched.
+        /// - Key present with a newer sequence → this delete is stale (a newer
+        ///   write superseded it) and is dropped.
+        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u32) -> Result<(), InsertError> {
+            let (found, update) = self.find_path(key);
+
+            if let Some(idx) = found {
+                let node = &mut self.nodes[idx as usize];
+                if !Self::seq_is_newer_or_equal(seq, node.sequence) {
+                    // A newer write already won for this key; drop the stale delete.
+                    return Ok(());
+                }
+                node.sequence = seq;
+                if !node.tombstone {
+                    node.tombstone = true;
+                    self.no_live_nodes -= 1;
+                    self.no_tombstone_nodes += 1;
+                }
+                return Ok(());
+            }
+
+            self.splice_new_node(key, 0, true, seq, update)?;
+            self.no_tombstone_nodes += 1;
+            Ok(())
+        }
+
+        /// Allocate a node with a freshly drawn height and splice it in at every
+        /// level it owns. `update` is the predecessor array from `find_path` for
+        /// the same key; the caller is responsible for the live/tombstone counters.
+        fn splice_new_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u32, mut update: [u32; MAX_LEVEL]) -> Result<(), InsertError> {
             let node_level = self.random_level();
-            let mut update = update;
             if node_level > self.level {
                 #[allow(clippy::needless_range_loop)]
                 for lvl in self.level as usize..node_level as usize {
@@ -235,7 +278,7 @@ pub mod skip_list {
             }
 
             let new_idx = self
-                .allocate_node(key, value, false, seq, node_level)
+                .allocate_node(key, value, tombstone, seq, node_level)
                 .ok_or(InsertError::CapacityExceeded)?;
 
             #[allow(clippy::needless_range_loop)]
@@ -248,30 +291,7 @@ pub mod skip_list {
             if node_level > self.level {
                 self.level = node_level;
             }
-            self.no_live_nodes += 1;
-            Ok(None)
-        }
-
-        /// Tombstone using an explicit sequence, with highest-sequence-wins
-        /// resolution: a tombstone older than the node's current sequence is
-        /// dropped (a newer write has superseded the delete). Returns
-        /// `Some(old_value)` only if a live node was actually tombstoned.
-        pub fn remove_with_seq(&mut self, key: &[u8], seq: u32) -> Option<u128> {
-            let (found, _) = self.find_path(key);
-            let idx = found?;
-            let node = &mut self.nodes[idx as usize];
-            if node.tombstone {
-                return None;
-            }
-            if !Self::seq_is_newer_or_equal(seq, node.sequence) {
-                return None;
-            }
-            let old = node.value;
-            node.tombstone = true;
-            node.sequence = seq;
-            self.no_live_nodes -= 1;
-            self.no_tombstone_nodes += 1;
-            Some(old)
+            Ok(())
         }
 
         /// Physically purges a tombstoned key by unlinking it from the list.
@@ -731,7 +751,14 @@ pub mod skip_list {
         }
 
         pub fn remove(&mut self, key: &[u8]) -> Option<u128> {
-            self.remove_with_seq(key, Self::next_test_seq())
+            // Report the displaced live value (model semantics), then delete via
+            // the production tombstone path.
+            let old = match self.entry(key) {
+                Some((v, _, false)) => Some(v),
+                _ => None,
+            };
+            self.insert_tombstone_with_seq(key, Self::next_test_seq()).unwrap();
+            old
         }
     }
 
@@ -759,18 +786,157 @@ pub mod skip_list {
         }
 
         #[test]
-        fn remove_with_seq_respects_sequence() {
+        fn insert_tombstone_for_absent_key_creates_tombstone_node() {
+            // The production delete path must be able to tombstone a key that is
+            // not in the memtable at all (it may be live in a lower LSM layer):
+            // the node is created directly as a tombstone, never live.
+            let mut sl = SkipList::new();
+            sl.insert_tombstone_with_seq(b"k", 4).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((0, 4, true)), "tombstone node carrying the delete's seq");
+            assert_eq!(sl.get_value(b"k"), None);
+            assert_eq!(sl.number_of_live_nodes(), 0);
+            assert_eq!(sl.number_of_tombstone_nodes(), 1);
+            sl.validate_insert();
+        }
+
+        #[test]
+        fn insert_tombstone_flips_live_node_in_place_and_preserves_value_bits() {
             let mut sl = SkipList::new();
             sl.try_insert_with_seq(b"k", 100, 5).unwrap();
-            // A delete older than the live write is dropped (the write supersedes).
-            sl.remove_with_seq(b"k", 3);
-            assert_eq!(sl.get_value(b"k"), Some(100), "older-sequence delete must not tombstone");
-            // A newer delete tombstones.
-            sl.remove_with_seq(b"k", 7);
+            sl.insert_tombstone_with_seq(b"k", 7).unwrap();
+            // Tombstoned in place: the stored value bits are untouched (they are
+            // meaningless for a tombstone), the sequence is the delete's.
+            assert_eq!(sl.entry(b"k"), Some((100, 7, true)));
             assert_eq!(sl.get_value(b"k"), None);
-            // A write newer than the tombstone resurrects (un-deletes) the key.
-            sl.try_insert_with_seq(b"k", 400, 9).unwrap();
-            assert_eq!(sl.get_value(b"k"), Some(400));
+            assert_eq!(sl.number_of_live_nodes(), 0);
+            assert_eq!(sl.number_of_tombstone_nodes(), 1);
+        }
+
+        #[test]
+        fn insert_tombstone_older_than_live_write_is_dropped() {
+            // A delete racing a newer write to the same key must lose, matching
+            // recovery's sequence-ordered replay.
+            let mut sl = SkipList::new();
+            sl.try_insert_with_seq(b"k", 100, 5).unwrap();
+            sl.insert_tombstone_with_seq(b"k", 3).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((100, 5, false)), "stale delete must not tombstone");
+            assert_eq!(sl.number_of_live_nodes(), 1);
+            assert_eq!(sl.number_of_tombstone_nodes(), 0);
+        }
+
+        #[test]
+        fn write_older_than_tombstone_is_dropped() {
+            // The shadow-protection case: the delete wins the sequence race, so a
+            // stale write must not resurrect the key.
+            let mut sl = SkipList::new();
+            sl.insert_tombstone_with_seq(b"k", 10).unwrap();
+            sl.try_insert_with_seq(b"k", 999, 5).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((0, 10, true)), "stale write must not resurrect a tombstone");
+            assert_eq!(sl.get_value(b"k"), None);
+        }
+
+        #[test]
+        fn write_newer_than_tombstone_resurrects() {
+            let mut sl = SkipList::new();
+            sl.insert_tombstone_with_seq(b"k", 3).unwrap();
+            sl.try_insert_with_seq(b"k", 42, 5).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((42, 5, false)));
+            assert_eq!(sl.number_of_live_nodes(), 1);
+            assert_eq!(sl.number_of_tombstone_nodes(), 0);
+        }
+
+        #[test]
+        fn re_tombstone_bumps_sequence_without_touching_counters() {
+            let mut sl = SkipList::new();
+            sl.insert_tombstone_with_seq(b"k", 2).unwrap();
+            // Deleting an already-deleted key advances the tombstone's sequence...
+            sl.insert_tombstone_with_seq(b"k", 6).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((0, 6, true)));
+            // ...and an older re-delete is dropped.
+            sl.insert_tombstone_with_seq(b"k", 4).unwrap();
+            assert_eq!(sl.entry(b"k"), Some((0, 6, true)));
+            assert_eq!(sl.number_of_live_nodes(), 0);
+            assert_eq!(sl.number_of_tombstone_nodes(), 1);
+            // The seq bump matters: a write between the two delete seqs stays dead.
+            sl.try_insert_with_seq(b"k", 7, 5).unwrap();
+            assert_eq!(sl.get_value(b"k"), None);
+        }
+
+        #[test]
+        fn insert_tombstone_seq_comparison_handles_u32_wraparound() {
+            let mut sl = SkipList::new();
+            let big = u32::MAX - 2;
+            sl.insert_tombstone_with_seq(b"k", big).unwrap();
+            // A write whose seq wraps past 0 is still newer: it must resurrect.
+            sl.try_insert_with_seq(b"k", 1, big.wrapping_add(3)).unwrap();
+            assert_eq!(sl.get_value(b"k"), Some(1), "newer write across a wrap boundary must beat the tombstone");
+            // And a delete that wraps further is newer still.
+            sl.insert_tombstone_with_seq(b"k", big.wrapping_add(6)).unwrap();
+            assert_eq!(sl.get_value(b"k"), None);
+        }
+
+        #[test]
+        fn absent_key_tombstones_are_ordered_and_invisible_to_iter() {
+            // Tombstones created from nothing must still be properly spliced at
+            // every level: ordering, linkage, and counters all hold.
+            let mut sl = SkipList::new();
+            assert!(sl.insert(b"b", 2));
+            assert!(sl.insert(b"d", 4));
+            sl.insert_tombstone_with_seq(b"a", 100).unwrap();
+            sl.insert_tombstone_with_seq(b"c", 101).unwrap();
+            sl.insert_tombstone_with_seq(b"e", 102).unwrap();
+            sl.validate_insert();
+
+            // iter() skips tombstones...
+            let items: Vec<(Vec<u8>, u128)> = sl.iter().map(|(k, v)| (k.to_vec(), v)).collect();
+            assert_eq!(items, vec![(b"b".to_vec(), 2), (b"d".to_vec(), 4)]);
+            // ...but entry() reports them (the LSM shadow contract).
+            assert_eq!(sl.entry(b"a").map(|(_, _, t)| t), Some(true));
+            assert_eq!(sl.entry(b"c").map(|(_, _, t)| t), Some(true));
+            assert_eq!(sl.entry(b"e").map(|(_, _, t)| t), Some(true));
+            assert_eq!(sl.number_of_live_nodes(), 2);
+            assert_eq!(sl.number_of_tombstone_nodes(), 3);
+        }
+
+        #[test]
+        fn randomized_tombstone_inserts_match_model() {
+            // Interleave live writes and direct tombstones on a colliding key
+            // space and check the final live set + tombstone set against a model.
+            // All ops use strictly increasing sequences, so last-op-wins is the
+            // expected outcome for every key.
+            let mut sl = SkipList::new();
+            let mut model = BTreeMap::<Vec<u8>, Option<u128>>::new(); // None = tombstone
+
+            let mut s: u64 = 0xDEAD_BEEF_0BAD_F00D;
+            let mut next = || {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                s
+            };
+
+            for seq in 1..=4000u32 {
+                let r = next();
+                let key = format!("key{:03}", r % 500).into_bytes(); // heavy collisions
+                if r % 3 == 0 {
+                    sl.insert_tombstone_with_seq(&key, seq).unwrap();
+                    model.insert(key, None);
+                } else {
+                    let val = r as u128;
+                    sl.try_insert_with_seq(&key, val, seq).unwrap();
+                    model.insert(key, Some(val));
+                }
+            }
+            sl.validate_insert();
+
+            let live_expected: Vec<(Vec<u8>, u128)> = model.iter().filter_map(|(k, v)| v.map(|v| (k.clone(), v))).collect();
+            let live_actual: Vec<(Vec<u8>, u128)> = sl.iter().map(|(k, v)| (k.to_vec(), v)).collect();
+            assert_eq!(live_actual, live_expected, "live set must match the model in key order");
+
+            for (k, v) in &model {
+                let (_, _, tomb) = sl.entry(k).expect("every touched key must have a node");
+                assert_eq!(tomb, v.is_none(), "tombstone flag mismatch for {:?}", String::from_utf8_lossy(k));
+            }
+            assert_eq!(sl.number_of_live_nodes(), live_expected.len());
+            assert_eq!(sl.number_of_tombstone_nodes(), model.len() - live_expected.len());
         }
 
         #[test]
@@ -791,7 +957,7 @@ pub mod skip_list {
             assert_eq!(sl.entry(b"k"), None, "absent key");
             sl.try_insert_with_seq(b"k", 7, 1).unwrap();
             assert_eq!(sl.entry(b"k"), Some((7, 1, false)));
-            sl.remove_with_seq(b"k", 2);
+            sl.insert_tombstone_with_seq(b"k", 2).unwrap();
             assert_eq!(sl.entry(b"k"), Some((7, 2, true)), "tombstone must be reported, not None");
         }
 

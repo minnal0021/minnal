@@ -1271,13 +1271,13 @@ impl LSMTree {
         }
 
         let mut memtable = self.memtable.write();
-        // Ensure the node exists so a delete of a key not currently in the
-        // memtable still records a tombstone, then tombstone it — both honour
-        // the sequence guard, so a newer write to this key is left untouched.
-        let _ = memtable.skip_list.try_insert_with_seq(key, 1, seq);
-        memtable.skip_list.remove_with_seq(key, seq);
-
-        Ok(())
+        // Record the tombstone directly — creating the node if the key is not
+        // currently in the memtable, so the delete still shadows lower layers.
+        // Honours the sequence guard: a newer write to this key is left untouched.
+        match memtable.skip_list.insert_tombstone_with_seq(key, seq) {
+            Ok(()) => Ok(()),
+            Err(super::skip_list::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
+        }
     }
 
     /// Fold a sequence into the lower-layer bound (serial-max), used whenever
