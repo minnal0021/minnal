@@ -18,7 +18,6 @@ MinnalDB is an embedded, high-performance key-value store written in Rust. Its d
   - [LSM Tree](#lsm-tree)
   - [Value Log](#value-log)
   - [Write-Ahead Log (WAL)](#write-ahead-log-wal)
-  - [Skip List](#skip-list)
   - [Sharding](#sharding)
   - [Namespaces](#namespaces)
   - [Background Workers](#background-workers)
@@ -137,7 +136,7 @@ A few things are worth pulling out of the diagram, because they shape everything
 
 ## Component Deep Dives
 
-With the overall shape in mind, this section examines each component in turn: the two storage structures that a write fans out into (the LSM tree and the value log), the WAL that protects them, the skip list that backs the in-memory tier, and finally the cross-cutting concerns of sharding, namespaces, and background work.
+With the overall shape in mind, this section examines each component in turn: the two storage structures that a write fans out into (the LSM tree — including the skip list that backs its in-memory tier — and the value log), the WAL that protects them, and finally the cross-cutting concerns of sharding, namespaces, and background work.
 
 ### LSM Tree
 
@@ -158,6 +157,39 @@ Because the same key can exist in several tiers at once, a read must decide whic
 Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
 Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
+
+#### Skip List
+
+**New to skip lists?** A skip list is an ordered data structure that delivers the `O(log n)` search, insert, and delete of a balanced tree — but without any rebalancing. Picture a sorted linked list with **express lanes stacked on top of it**: the bottom level links every element in order, and each level above links a random subset (~half) of the level below. A search rides the highest lane, skipping over long stretches in a single hop, and only drops to a finer lane as it closes in on the target — so it touches `O(log n)` nodes instead of walking the whole list. The lane heights are decided by a **coin flip** at insert time rather than maintained by tree rotations, which is what makes inserts cheap and the implementation far simpler than a red-black or B-tree. That combination — ordered, `O(log n)`, and simple to mutate — is exactly what a hot, write-heavy in-memory tier wants. For a fuller walkthrough see [Wikipedia's *Skip list*](https://en.wikipedia.org/wiki/Skip_list), or William Pugh's original 1990 paper that introduced them, [*Skip Lists: A Probabilistic Alternative to Balanced Trees*](https://dl.acm.org/doi/10.1145/78973.78977).
+
+The MemTable — the in-memory tier of every LSM tree — is a custom **arena-allocated skip list** tuned for CPU cache efficiency. Rather than allocating each node on the heap (which scatters related data across memory), it packs everything into three flat, contiguous buffers:
+
+```
+nodes[]   — Node structs (height, key_offset, key_len, value, tombstone, seq)
+keys[]    — Raw key bytes, packed contiguously (nodes index by offset+len)
+links[]   — Forward pointer arrays (u32 node indices, packed per-node)
+```
+
+Keeping nodes, keys, and forward links in separate flat arrays means that walking the list touches cache-local memory, which makes traversal markedly faster than a pointer-chasing node graph. A node is referred to by its **`u32` index into `nodes[]`**, not by a pointer.
+
+Here is the whole structure under the four operations that touch it:
+
+![Animated diagram of the skip list under create, read, update and delete: an insert allocates a node whose height is coin-flipped and links it in at each level; a search starts at the head's top level, hops right while the next key is smaller, and drops a level when it would overshoot; an update rewrites a node's value and sequence in place while a write carrying an older sequence is dropped; a delete flags the node as a tombstone without unlinking it](docs/skiplist-crud.svg)
+
+Each operation earns its keep differently:
+
+- **Create.** A new node's height is decided by a coin flip (geometric, `p = 0.5`, capped at 32 levels), then it is linked in at every level it reaches. Tall nodes are the express lanes — level 0 is the complete sorted list, and each level above it is a shortcut over the level below.
+- **Read.** Start at the head's top level and hop right while the next key is still smaller than the target; when the next hop would overshoot, drop a level and continue. That is the `O(log n)` search, and every hop is an array index rather than a pointer dereference.
+- **Update.** If the key is already present, its value and sequence are overwritten **in place** — no new node, no relinking. A write whose sequence is *older* than the node's is **dropped** (highest-sequence-wins), which is what makes the winner of two racing same-key writes identical to the one WAL recovery would replay.
+- **Delete.** The node is **not** unlinked; it is flagged as a **tombstone** and stays in the list. That is deliberate: a search must be able to report "deleted" as distinct from "absent", because a delete recorded here has to shadow any older copy of the key still sitting in an L0 file or the L1 SSTable.
+
+The structure's other properties:
+
+- Up to **32 levels**, with probabilistic height assignment.
+- Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
+- **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
+- Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
+- A monotonic **`u32` sequence counter** records insertion order within the table.
 
 ### Value Log
 
@@ -264,39 +296,6 @@ Three rules set the shape of that curve:
 - **The head only moves forward over contiguous deletions.** After deleting segments, GC advances `head` past the consecutively deleted ones, so recovery's `scan_entries(head, tail)` always starts at a file that still exists.
 
 The steady-state footprint therefore isn't "everything ever written" but roughly *the entries not yet flushed to L0, plus the active segment*. A large memtable (or a stalled flush) widens the sawtooth by holding more segments un-persisted; a database that stops writing settles at a single active segment once the last flush lands, with all earlier segments reclaimed.
-
-### Skip List
-
-**New to skip lists?** A skip list is an ordered data structure that delivers the `O(log n)` search, insert, and delete of a balanced tree — but without any rebalancing. Picture a sorted linked list with **express lanes stacked on top of it**: the bottom level links every element in order, and each level above links a random subset (~half) of the level below. A search rides the highest lane, skipping over long stretches in a single hop, and only drops to a finer lane as it closes in on the target — so it touches `O(log n)` nodes instead of walking the whole list. The lane heights are decided by a **coin flip** at insert time rather than maintained by tree rotations, which is what makes inserts cheap and the implementation far simpler than a red-black or B-tree. That combination — ordered, `O(log n)`, and simple to mutate — is exactly what a hot, write-heavy in-memory tier wants. For a fuller walkthrough see [Wikipedia's *Skip list*](https://en.wikipedia.org/wiki/Skip_list), or William Pugh's original 1990 paper that introduced them, [*Skip Lists: A Probabilistic Alternative to Balanced Trees*](https://dl.acm.org/doi/10.1145/78973.78977).
-
-The MemTable — the in-memory tier of every LSM tree — is a custom **arena-allocated skip list** tuned for CPU cache efficiency. Rather than allocating each node on the heap (which scatters related data across memory), it packs everything into three flat, contiguous buffers:
-
-```
-nodes[]   — Node structs (height, key_offset, key_len, value, tombstone, seq)
-keys[]    — Raw key bytes, packed contiguously (nodes index by offset+len)
-links[]   — Forward pointer arrays (u32 node indices, packed per-node)
-```
-
-Keeping nodes, keys, and forward links in separate flat arrays means that walking the list touches cache-local memory, which makes traversal markedly faster than a pointer-chasing node graph. A node is referred to by its **`u32` index into `nodes[]`**, not by a pointer.
-
-Here is the whole structure under the four operations that touch it:
-
-![Animated diagram of the skip list under create, read, update and delete: an insert allocates a node whose height is coin-flipped and links it in at each level; a search starts at the head's top level, hops right while the next key is smaller, and drops a level when it would overshoot; an update rewrites a node's value and sequence in place while a write carrying an older sequence is dropped; a delete flags the node as a tombstone without unlinking it](docs/skiplist-crud.svg)
-
-Each operation earns its keep differently:
-
-- **Create.** A new node's height is decided by a coin flip (geometric, `p = 0.5`, capped at 32 levels), then it is linked in at every level it reaches. Tall nodes are the express lanes — level 0 is the complete sorted list, and each level above it is a shortcut over the level below.
-- **Read.** Start at the head's top level and hop right while the next key is still smaller than the target; when the next hop would overshoot, drop a level and continue. That is the `O(log n)` search, and every hop is an array index rather than a pointer dereference.
-- **Update.** If the key is already present, its value and sequence are overwritten **in place** — no new node, no relinking. A write whose sequence is *older* than the node's is **dropped** (highest-sequence-wins), which is what makes the winner of two racing same-key writes identical to the one WAL recovery would replay.
-- **Delete.** The node is **not** unlinked; it is flagged as a **tombstone** and stays in the list. That is deliberate: a search must be able to report "deleted" as distinct from "absent", because a delete recorded here has to shadow any older copy of the key still sitting in an L0 file or the L1 SSTable.
-
-The structure's other properties:
-
-- Up to **32 levels**, with probabilistic height assignment.
-- Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
-- **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
-- Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
-- A monotonic **`u32` sequence counter** records insertion order within the table.
 
 ### Sharding
 
