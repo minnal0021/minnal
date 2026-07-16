@@ -176,6 +176,8 @@ Here is the whole structure under the four operations that touch it:
 
 ![Animated diagram of the skip list under create, read, update and delete: an insert allocates a node whose height is coin-flipped and links it in at each level; a search starts at the head's top level, hops right while the next key is smaller, and drops a level when it would overshoot; an update rewrites a node's value and sequence in place while a write carrying an older sequence is dropped; a delete flags the node as a tombstone without unlinking it](docs/skiplist-crud.svg)
 
+> 🖱️ Prefer to go at your own pace? Open the **[interactive walkthrough](docs/skiplist-crud.html)** — click (or use the arrow keys) to step through one stage at a time. *(Open it in a browser; GitHub shows the raw source unless the page is served via GitHub Pages.)*
+
 Each operation earns its keep differently:
 
 - **Create.** A new node's height is decided by a coin flip (geometric, `p = 0.5`, capped at 32 levels), then it is linked in at every level it reaches. Tall nodes are the express lanes — level 0 is the complete sorted list, and each level above it is a shortcut over the level below.
