@@ -267,6 +267,8 @@ The steady-state footprint therefore isn't "everything ever written" but roughly
 
 ### Skip List
 
+**New to skip lists?** A skip list is an ordered data structure that delivers the `O(log n)` search, insert, and delete of a balanced tree — but without any rebalancing. Picture a sorted linked list with **express lanes stacked on top of it**: the bottom level links every element in order, and each level above links a random subset (~half) of the level below. A search rides the highest lane, skipping over long stretches in a single hop, and only drops to a finer lane as it closes in on the target — so it touches `O(log n)` nodes instead of walking the whole list. The lane heights are decided by a **coin flip** at insert time rather than maintained by tree rotations, which is what makes inserts cheap and the implementation far simpler than a red-black or B-tree. That combination — ordered, `O(log n)`, and simple to mutate — is exactly what a hot, write-heavy in-memory tier wants. For a fuller walkthrough see [Wikipedia's *Skip list*](https://en.wikipedia.org/wiki/Skip_list), or William Pugh's original 1990 paper that introduced them, [*Skip Lists: A Probabilistic Alternative to Balanced Trees*](https://dl.acm.org/doi/10.1145/78973.78977).
+
 The MemTable — the in-memory tier of every LSM tree — is a custom **arena-allocated skip list** tuned for CPU cache efficiency. Rather than allocating each node on the heap (which scatters related data across memory), it packs everything into three flat, contiguous buffers:
 
 ```
@@ -293,7 +295,7 @@ The structure's other properties:
 - Up to **32 levels**, with probabilistic height assignment.
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
 - **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
-- Key ordering uses **SIMD-accelerated byte comparison** on x86_64 (a plain scalar comparison on Apple Silicon — see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
+- Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
 - A monotonic **`u32` sequence counter** records insertion order within the table.
 
 ### Sharding
