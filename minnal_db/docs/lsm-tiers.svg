@@ -164,7 +164,7 @@
 <text class="t3" x="662.0" y="494" font-size="9" text-anchor="middle">compact</text>
 <text class="t3" x="728.7" y="494" font-size="9" text-anchor="middle">compact</text>
 <text class="t3" x="795.3" y="494" font-size="9" text-anchor="middle">compact</text>
-<text class="t3" x="862.0" y="494" font-size="9" text-anchor="middle"></text>
+<text class="t3" x="862.0" y="494" font-size="9" text-anchor="middle">put</text>
 <text class="t3" x="896" y="512" font-size="10" text-anchor="end">time →</text>
 <text class="t3 mono" x="44" y="520" font-size="10">MemTable keys</text>
 <text class="t1 mono" x="44" y="540" font-size="16" font-weight="600"><animate attributeName="opacity" calcMode="discrete" values="1;0;0;0;0;0;0;0;0;0;0;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/>1</text>

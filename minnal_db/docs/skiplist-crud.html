@@ -1,4 +1,67 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 600" width="940" height="600" role="img" aria-label="Animated diagram of the arena-allocated skip list backing the MemTable: inserts allocate a node with a coin-flipped height and link it in at each level; a search starts at the head's top level and drops down when a hop would overshoot; an update rewrites a node's value in place and drops writes with an older sequence; a delete flags the node as a tombstone without unlinking it.">
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skip list — interactive walkthrough</title>
+<!--
+  Built by inlining skiplist-crud.svg (the auto-playing version embedded in the
+  README) and driving its SMIL timeline (pauseAnimations + setCurrentTime) with
+  the controls below. If you change the SVG's frames, re-inline it here — the
+  SVG stays the single source of truth for the diagram itself.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #fafafa; color: #141414;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 56px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .hint { color: #666; font-size: 13px; margin: 0 0 16px; }
+  kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; padding: 1px 5px; border: 1px solid #ccc; border-bottom-width: 2px;
+    border-radius: 5px; background: #fff;
+  }
+  #stage { cursor: pointer; -webkit-user-select: none; user-select: none; }
+  #stage svg { width: 100%; height: auto; display: block; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 14px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #ccc; background: #fff; color: #141414; cursor: pointer;
+  }
+  button:hover { border-color: #888; }
+  button:focus-visible { outline: 2px solid #3987e5; outline-offset: 2px; }
+  #counter { font-variant-numeric: tabular-nums; font-size: 14px; min-width: 92px; text-align: center; }
+  #dots { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+  .dot {
+    width: 12px; height: 12px; border-radius: 50%; border: 1px solid #bbb;
+    background: transparent; padding: 0; cursor: pointer;
+  }
+  .dot.active { background: #3987e5; border-color: #3987e5; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #121214; color: #ececec; }
+    .hint { color: #9a9a9a; }
+    kbd { background: #1e1e22; border-color: #3a3a40; }
+    button { background: #1e1e22; color: #ececec; border-color: #3a3a40; }
+    button:hover { border-color: #666; }
+    .dot { border-color: #555; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Skip list: create, read, update, delete</h1>
+  <p class="hint">
+    Click the diagram (or press <kbd>&rarr;</kbd> / <kbd>Space</kbd>) to step forward,
+    <kbd>&larr;</kbd> to step back, <kbd>Home</kbd> to restart. Or hit <em>Auto-play</em>.
+  </p>
+
+  <div id="stage" role="group" aria-label="Interactive skip list walkthrough. Use the buttons or arrow keys to step through each stage.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 600" role="img" aria-label="Animated diagram of the arena-allocated skip list backing the MemTable: inserts allocate a node with a coin-flipped height and link it in at each level; a search starts at the head's top level and drops down when a hop would overshoot; an update rewrites a node's value in place and drops writes with an older sequence; a delete flags the node as a tombstone without unlinking it.">
 <style>
   .surface { fill: #fcfcfb; }
   .frame   { stroke: #e3e2dd; }
@@ -186,3 +249,88 @@
 <text class="t1 mono" x="614" y="522" font-size="15" font-weight="600"><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;0;0;0;1" keyTimes="0.00000;0.07692;0.15385;0.23077;0.30769;0.38462;0.46154;0.53846;0.61538;0.69231;0.76923;0.84615;0.92308" dur="24.7s" repeatCount="indefinite"/>3 / 100,000</text>
 <text class="t3" x="896" y="520" font-size="10" text-anchor="end">Heights are coin-flipped (p = 0.5, max 32). Only 3 levels are drawn.</text>
 </svg>
+
+  </div>
+
+  <div class="controls">
+    <button id="prev" type="button">&#9664; Prev</button>
+    <span id="counter">Step 1 / 13</span>
+    <button id="next" type="button">Next &#9654;</button>
+    <button id="auto" type="button">Auto-play</button>
+  </div>
+
+  <div id="dots" role="tablist" aria-label="Jump to a stage"></div>
+</main>
+
+<script>
+(function () {
+  var FRAMES = 13, DUR = 24.7;
+  var svg = document.querySelector('#stage svg');
+  var counter = document.getElementById('counter');
+  var dotsWrap = document.getElementById('dots');
+  var autoBtn = document.getElementById('auto');
+  var frame = 0, playing = false, raf = null;
+
+  var dots = [];
+  for (var i = 0; i < FRAMES; i++) {
+    (function (idx) {
+      var b = document.createElement('button');
+      b.className = 'dot';
+      b.type = 'button';
+      b.setAttribute('aria-label', 'Go to step ' + (idx + 1));
+      b.addEventListener('click', function (e) { e.stopPropagation(); stop(); frame = idx; render(); });
+      dotsWrap.appendChild(b);
+      dots.push(b);
+    })(i);
+  }
+
+  function timeFor(i) { return (i + 0.5) / FRAMES * DUR; }
+
+  function paint() {
+    counter.textContent = 'Step ' + (frame + 1) + ' / ' + FRAMES;
+    for (var i = 0; i < dots.length; i++) dots[i].classList.toggle('active', i === frame);
+  }
+
+  function render() { svg.setCurrentTime(timeFor(frame)); paint(); }
+
+  function go(d) { stop(); frame = (frame + d + FRAMES) % FRAMES; render(); }
+
+  function stop() {
+    if (!playing) return;
+    playing = false;
+    autoBtn.textContent = 'Auto-play';
+    if (raf) cancelAnimationFrame(raf);
+    try { svg.pauseAnimations(); } catch (e) {}
+  }
+
+  function play() {
+    playing = true;
+    autoBtn.textContent = 'Pause';
+    svg.setCurrentTime(timeFor(frame));
+    svg.unpauseAnimations();
+    (function tick() {
+      if (!playing) return;
+      var t = svg.getCurrentTime() % DUR;
+      var f = Math.min(FRAMES - 1, Math.floor(t / DUR * FRAMES));
+      if (f !== frame) { frame = f; paint(); }
+      raf = requestAnimationFrame(tick);
+    })();
+  }
+
+  document.getElementById('prev').addEventListener('click', function (e) { e.stopPropagation(); go(-1); });
+  document.getElementById('next').addEventListener('click', function (e) { e.stopPropagation(); go(1); });
+  autoBtn.addEventListener('click', function (e) { e.stopPropagation(); playing ? stop() : play(); });
+  document.getElementById('stage').addEventListener('click', function () { go(1); });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+    else if (e.key === 'Home') { e.preventDefault(); stop(); frame = 0; render(); }
+  });
+
+  function init() { try { svg.pauseAnimations(); } catch (e) {} render(); }
+  if (document.readyState !== 'loading') init();
+  else window.addEventListener('DOMContentLoaded', init);
+})();
+</script>
+</body>
+</html>
