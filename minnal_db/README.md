@@ -482,7 +482,7 @@ The pass itself is described in full under [Value Log](#value-log): pick the wor
 Two consequences worth stating plainly:
 
 - **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
-- **There is no journal, no commit marker, and no shadow file.** The flush-before-unlink ordering means the durable LSM always points at a segment that still exists, at every crash point, so there is nothing to roll forward or back on startup.
+- **A crash mid-GC needs no repair.** Because the old segment is unlinked only *after* the re-point has been flushed to durable L0 storage, at every point a crash could interrupt the pass the on-disk LSM still points at a segment that exists on disk. The worst a crash can leave behind is an already-copied old segment that nothing points at any more — dead weight the next pass reclaims — never a pointer into a missing file. That single ordering rule is the whole crash-safety story, which is why GC keeps none of the recovery bookkeeping such schemes usually need: no write-ahead journal, no commit marker, and no `.new`/`.old` shadow files to replay or clean up on startup.
 
 ### WAL GC
 
