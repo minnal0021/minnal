@@ -3,6 +3,13 @@
 //
 // Measures the overhead of the *_typed() convenience layer which adds rkyv
 // serialization on write and deserialization on read, compared to raw bytes.
+//
+// Read-side cases (get/iter/keys/range/scan_prefix) are measured on both the
+// active memtable and the on-disk L1 SSTable tier (`TIERS` in common.rs) —
+// memtable-only numbers are cheap but not representative of steady-state
+// reads once data ages onto disk. Write-side cases (put/delete) are NOT
+// tiered: a write always lands in the active memtable regardless of what's
+// already on disk, so tier doesn't apply to their cost the same way.
 
 #[path = "common.rs"]
 mod common;
@@ -41,11 +48,29 @@ impl Drop for AutoCloseDb {
     }
 }
 
+impl AutoCloseDb {
+    /// Compact + shutdown + reopen so subsequent reads hit the on-disk L1
+    /// SSTable rather than the active memtable. Consumes `self` to match
+    /// `push_to_l1`'s ownership shape (the old handle is closed as part of
+    /// the push, not left dangling).
+    fn push_to_l1(mut self, dir: &Path) -> Self {
+        let db = self.0.take().expect("AutoCloseDb already closed");
+        Self(Some(push_to_l1(db, dir)))
+    }
+}
+
+// `prefix` is declared FIRST: `put_typed` uses the raw rkyv-archived bytes of
+// the key directly as the on-disk key, and archived struct layout follows
+// declaration order — so `prefix` must lead for `scan_prefix_typed(b"bench_kk")`
+// to actually match anything. With `id` first (the original field order),
+// the archived key started with `id`'s bytes and "bench_kk" landed at
+// offset 8, so every prefix scan matched zero entries and reported a
+// near-instant, meaningless latency instead of a real scan cost.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 struct BenchKey {
-    id: u64,
     prefix: [u8; 8],
+    id: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -59,7 +84,7 @@ impl BenchKey {
     fn new(seq: u64) -> Self {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(b"bench_kk");
-        Self { id: seq, prefix }
+        Self { prefix, id: seq }
     }
 }
 
@@ -107,23 +132,30 @@ fn bench_get_typed(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for value_size in [128usize, 4_096] {
-        let temp = bench_tempdir();
-        let db = AutoCloseDb::open(temp.path());
         let value = BenchValue::new(value_size);
 
-        for seq in 0..NUM_KEYS {
-            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-        }
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let mut db = AutoCloseDb::open(temp.path());
 
-        group.throughput(Throughput::Elements(1));
-        let mut idx: u64 = 0;
-        group.bench_with_input(BenchmarkId::new("value_size", format!("{value_size}B")), &value_size, |b, _| {
-            b.iter(|| {
-                idx = idx.wrapping_add(104_729) % NUM_KEYS;
-                let key = BenchKey::new(idx);
-                black_box(db.db().get_typed::<BenchKey, BenchValue>(&key)).unwrap()
+            for seq in 0..NUM_KEYS {
+                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
+            }
+            if tier == "l1" {
+                db = db.push_to_l1(temp.path());
+            }
+
+            group.throughput(Throughput::Elements(1));
+            let mut idx: u64 = 0;
+            let label = format!("{tier}_value_size");
+            group.bench_with_input(BenchmarkId::new(label, format!("{value_size}B")), &value_size, |b, _| {
+                b.iter(|| {
+                    idx = idx.wrapping_add(104_729) % NUM_KEYS;
+                    let key = BenchKey::new(idx);
+                    black_box(db.db().get_typed::<BenchKey, BenchValue>(&key)).unwrap()
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -162,21 +194,28 @@ fn bench_iter_typed(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for num_keys in [100u64, 1_000] {
-        let temp = bench_tempdir();
-        let db = AutoCloseDb::open(temp.path());
         let value = BenchValue::new(128);
 
-        for seq in 0..num_keys {
-            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-        }
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let mut db = AutoCloseDb::open(temp.path());
 
-        group.throughput(Throughput::Elements(num_keys));
-        group.bench_with_input(BenchmarkId::new("keys", num_keys), &num_keys, |b, _| {
-            b.iter(|| {
-                let pairs = db.db().iter_typed::<BenchKey, BenchValue>().unwrap();
-                black_box(pairs.len())
+            for seq in 0..num_keys {
+                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
+            }
+            if tier == "l1" {
+                db = db.push_to_l1(temp.path());
+            }
+
+            group.throughput(Throughput::Elements(num_keys));
+            let label = format!("{tier}_keys");
+            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
+                b.iter(|| {
+                    let pairs = db.db().iter_typed::<BenchKey, BenchValue>().unwrap();
+                    black_box(pairs.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -186,21 +225,28 @@ fn bench_keys_typed(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for num_keys in [100u64, 1_000] {
-        let temp = bench_tempdir();
-        let db = AutoCloseDb::open(temp.path());
         let value = BenchValue::new(128);
 
-        for seq in 0..num_keys {
-            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-        }
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let mut db = AutoCloseDb::open(temp.path());
 
-        group.throughput(Throughput::Elements(num_keys));
-        group.bench_with_input(BenchmarkId::new("keys", num_keys), &num_keys, |b, _| {
-            b.iter(|| {
-                let keys = db.db().keys_typed::<BenchKey>().unwrap();
-                black_box(keys.len())
+            for seq in 0..num_keys {
+                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
+            }
+            if tier == "l1" {
+                db = db.push_to_l1(temp.path());
+            }
+
+            group.throughput(Throughput::Elements(num_keys));
+            let label = format!("{tier}_keys");
+            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
+                b.iter(|| {
+                    let keys = db.db().keys_typed::<BenchKey>().unwrap();
+                    black_box(keys.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -210,25 +256,31 @@ fn bench_range_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("typed/range");
     group.measurement_time(Duration::from_secs(10));
 
-    let temp = bench_tempdir();
-    let db = AutoCloseDb::open(temp.path());
-    let value = BenchValue::new(128);
+    for tier in TIERS {
+        let temp = bench_tempdir();
+        let mut db = AutoCloseDb::open(temp.path());
+        let value = BenchValue::new(128);
 
-    for seq in 0..TOTAL_KEYS {
-        db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-    }
+        for seq in 0..TOTAL_KEYS {
+            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
+        }
+        if tier == "l1" {
+            db = db.push_to_l1(temp.path());
+        }
 
-    for result_count in [100u64, 500, 1_000] {
-        let start = BenchKey::new(0);
-        let end = BenchKey::new(result_count);
+        for result_count in [100u64, 500, 1_000] {
+            let start = BenchKey::new(0);
+            let end = BenchKey::new(result_count);
 
-        group.throughput(Throughput::Elements(result_count));
-        group.bench_with_input(BenchmarkId::new("result_count", result_count), &result_count, |b, _| {
-            b.iter(|| {
-                let pairs = db.db().range_typed::<BenchKey, BenchValue>(&start, Some(&end)).unwrap();
-                black_box(pairs.len())
+            group.throughput(Throughput::Elements(result_count));
+            let label = format!("{tier}_result_count");
+            group.bench_with_input(BenchmarkId::new(label, result_count), &result_count, |b, _| {
+                b.iter(|| {
+                    let pairs = db.db().range_typed::<BenchKey, BenchValue>(&start, Some(&end)).unwrap();
+                    black_box(pairs.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -238,21 +290,28 @@ fn bench_scan_prefix_typed(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for num_keys in [100u64, 1_000] {
-        let temp = bench_tempdir();
-        let db = AutoCloseDb::open(temp.path());
         let value = BenchValue::new(128);
 
-        for seq in 0..num_keys {
-            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-        }
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let mut db = AutoCloseDb::open(temp.path());
 
-        group.throughput(Throughput::Elements(num_keys));
-        group.bench_with_input(BenchmarkId::new("keys", num_keys), &num_keys, |b, _| {
-            b.iter(|| {
-                let pairs = db.db().scan_prefix_typed::<BenchKey, BenchValue>(b"bench_kk").unwrap();
-                black_box(pairs.len())
+            for seq in 0..num_keys {
+                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
+            }
+            if tier == "l1" {
+                db = db.push_to_l1(temp.path());
+            }
+
+            group.throughput(Throughput::Elements(num_keys));
+            let label = format!("{tier}_keys");
+            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
+                b.iter(|| {
+                    let pairs = db.db().scan_prefix_typed::<BenchKey, BenchValue>(b"bench_kk").unwrap();
+                    black_box(pairs.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }

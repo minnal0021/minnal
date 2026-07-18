@@ -598,17 +598,17 @@ In short: on Apple Silicon, key comparison, field-index queries, and vector sear
 
 ### Expected throughput
 
-These are single-threaded ballpark figures with a configurable sync cadence; treat them as orders of magnitude rather than guarantees.
+These are single-threaded ballpark figures; treat them as orders of magnitude rather than guarantees. Note that only the *value log's* fsync cadence is configurable (`records_per_sync`) — the WAL is fsynced on every single write regardless, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so `put` throughput is fsync-latency-bound, not something a sync-cadence setting can raise.
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values, deferred value-log sync) | 100k–500k ops/s |
+| `put` (small values, single writer) | ~400–500 ops/s on NVMe without power-loss protection, bound by the per-write WAL fsync; scales roughly with concurrent writers spread across `num_buckets` |
 | `get` (cache-warm) | 500k–1M ops/s |
 | `get` (cold, hits L1 SSTable) | 100k–300k ops/s |
 | Range / prefix scan | Bounded by result-set size |
 | Value-log GC throughput | 100–500 MB/s |
 
-Actual numbers depend heavily on value size, the `records_per_sync` setting, and the underlying storage hardware.
+Actual numbers depend heavily on value size, the underlying storage hardware's fsync latency, and (for `put`) how many buckets are being written concurrently. See [`benchmark.md`](benchmark.md) for a dated, full measurement run (hardware spec, per-suite tables, and charts) that this table is checked against — the previous `put` figure here (100k–500k ops/s) was an unverified aspirational number that undercounted the per-write fsync cost by roughly 1000x.
 
 ---
 

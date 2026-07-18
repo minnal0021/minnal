@@ -7,10 +7,22 @@
 #![allow(dead_code)]
 
 use minnal_db::lsm::LSMConfig;
-use minnal_db::{Db, DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
+use minnal_db::{AsyncDb, Db, DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// The two storage tiers most benchmarks in this suite compare. Memtable-only
+/// numbers are cheap but not representative of steady-state reads once data
+/// ages out of the memtable; L1 exercises the real on-disk lookup path
+/// (`lookup_level1`: min/max range check, bloom filter, sparse-index bounded
+/// scan — see `bench_sstable_lookup.rs`). L0 is intentionally not a separate
+/// tier here: there is no public API path to observe an on-disk "flushed but
+/// not yet compacted" L0 state — the only way to write an L0 file
+/// (`compact_all`, reached via `compact()` or the background
+/// `LsmCompactionWorker`) unconditionally merges every L0 file into L1 in
+/// that same call, so it can't be held open long enough to benchmark.
+pub const TIERS: [&str; 2] = ["memtable", "l1"];
 
 /// Create a TempDir under `target/bench_tmp/` instead of `/tmp`.
 ///
@@ -40,6 +52,52 @@ pub fn bench_config() -> DbConfig {
 
 pub fn open_store(dir: &Path) -> Db {
     Db::open_with_config(dir, bench_config()).expect("failed to open Db")
+}
+
+/// Like `bench_config()` but with a custom memtable (skip-list) capacity.
+/// `DbConfig::skip_list_capacity` is public and is propagated into the
+/// internal `LSMConfig` on `Db::open` — this is the only way a bench (an
+/// external compilation unit) can control memtable size, since `LSMConfig`
+/// itself only exposes it as `pub(crate)`. Useful for keeping a `num_keys`
+/// sweep entirely inside one active memtable (set capacity comfortably above
+/// the largest `num_keys`) so the benchmark doesn't cross the default 100k
+/// threshold and spill into a sealed read-only memtable mid-sweep.
+pub fn bench_config_with_capacity(capacity: usize) -> DbConfig {
+    let mut config = bench_config();
+    config.skip_list_capacity = capacity;
+    config
+}
+
+pub fn open_store_with_capacity(dir: &Path, capacity: usize) -> Db {
+    Db::open_with_config(dir, bench_config_with_capacity(capacity)).expect("failed to open Db")
+}
+
+/// Push an already-populated store's data down to the on-disk L1 SSTable
+/// (compact + shutdown + reopen), so subsequent reads hit the real,
+/// accelerated `lookup_level1` path instead of the active memtable. Consumes
+/// `store` and returns a fresh handle reopened over the same directory.
+///
+/// The explicit `drop(store)` before reopening is load-bearing: `KVStore`'s
+/// `Drop` impl re-runs `flush_and_compact_all()` (harmless on its own, but it
+/// touches on-disk L0/L1 files). Reopening a second `Db` over the same
+/// directory before the first one drops leaves both instances alive at once
+/// — the old instance's deferred Drop cleanup can then race the new
+/// instance's first reads and manifest load, surfacing as a spurious
+/// `NotFound` on a file the new instance expected to still be there. Always
+/// drop the old handle first.
+pub fn push_to_l1(store: Db, dir: &Path) -> Db {
+    store.compact().expect("compact failed");
+    store.shutdown().expect("shutdown failed");
+    drop(store);
+    open_store(dir)
+}
+
+/// Async counterpart of `push_to_l1` — same drop-before-reopen requirement.
+pub async fn push_to_l1_async(store: AsyncDb, dir: &Path) -> AsyncDb {
+    store.compact().await.expect("compact failed");
+    store.shutdown().await.expect("shutdown failed");
+    drop(store);
+    AsyncDb::open_with_config(dir.to_path_buf(), bench_config()).await.expect("failed to reopen Db")
 }
 
 /// Wrapper that calls `Db::shutdown()` on drop to release file handles
