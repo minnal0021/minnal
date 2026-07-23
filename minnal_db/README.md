@@ -236,7 +236,7 @@ So an update appends a *new* record and a delete writes an LSM tombstone; in bot
 
 GC's unit is a **segment**, never the whole bucket:
 
-1. **Pick** the sealed segments whose garbage ratio is over `thresholds.page_gc_threshold`, worst first. The active tail is never a candidate.
+1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so liveness is one LSM point-get: a record survives iff the LSM still points at exactly this location.
 3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert preserves the key's existing sequence, so relocating a record never changes its version.
 4. **Flush** the memtable to L0, making the re-point durable.
@@ -473,16 +473,16 @@ The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush
 
 ### Value Log GC
 
-Value-log GC runs when a namespace's waste ratio (garbage bytes ÷ total bytes) crosses `thresholds.value_log_waste_threshold` (30% by default). That is the **trigger**; a second, lower knob — `thresholds.page_gc_threshold` (10%) — then selects **which segments** are worth rewriting.
+Value-log GC is gated by two separate bars. A **trigger** decides whether a namespace is worth collecting at all: it fires once the namespace's overall waste (garbage bytes ÷ total bytes) climbs past 30%. Once triggered, a lower **per-segment selection** bar (10%) picks *which* sealed segments are dirty enough to be worth rewriting — a segment cleaner than that is left in place.
 
-Keeping those two separate is load-bearing. A segment below the selection threshold is left alone with its garbage intact, so if the two values were equal, garbage sitting just under the trigger could never be collected at all: every pass would skip those segments, report success, and leave the namespace still over its trigger. (That is not hypothetical — it is exactly the treadmill the engine used to be on, when one config value did both jobs.)
+Keeping those two bars separate is load-bearing. A segment below the selection bar keeps its garbage, so if the two were equal, garbage sitting just under the trigger could never be collected at all: every pass would skip those segments, report success, and leave the namespace still over its trigger. (That is not hypothetical — it is exactly the treadmill the engine used to be on, when one value did both jobs.)
 
 The pass itself is described in full under [Value Log](#value-log): pick the worst sealed segments, scan each one *without a lock* (every record carries its key, so liveness is one LSM point-get), relocate the survivors under a compare-and-set that respects concurrent writes and deletes, flush the re-point to L0, and only then unlink the old files.
 
 Two consequences worth stating plainly:
 
 - **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
-- **There is no journal, no commit marker, and no shadow file.** The flush-before-unlink ordering means the durable LSM always points at a segment that still exists, at every crash point, so there is nothing to roll forward or back on startup.
+- **A crash mid-GC needs no repair.** Because the old segment is unlinked only *after* the re-point has been flushed to durable L0 storage, at every point a crash could interrupt the pass the on-disk LSM still points at a segment that exists on disk. The worst a crash can leave behind is an already-copied old segment that nothing points at any more — dead weight the next pass reclaims — never a pointer into a missing file. That single ordering rule is the whole crash-safety story, which is why GC keeps none of the recovery bookkeeping such schemes usually need: no write-ahead journal, no commit marker, and no `.new`/`.old` shadow files to replay or clean up on startup.
 
 ### WAL GC
 
@@ -562,7 +562,7 @@ The knobs that most affect engine behaviour:
 | `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
 | `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |
 | `thresholds.value_log_waste_threshold` | Waste ratio at which value-log GC **triggers** on a bucket. |
-| `thresholds.page_gc_threshold` | Garbage ratio at which GC rewrites an individual **page** (default 10%). Keep it below the trigger: a page under this threshold is copied byte-for-byte into the compacted file *with its garbage intact*, so setting the two equal makes garbage just under the trigger uncollectable. |
+| `thresholds.segment_gc_threshold` | Garbage ratio at which GC rewrites an individual **sealed segment** (default 10%). Keep it below the trigger: a segment under this threshold is left in place *with its garbage intact*, so setting the two equal makes garbage just under the trigger uncollectable. |
 | `recovery.fail_log_dir` | Where recovery fail-log JSON files are written (defaults to `<db_path>/fail_logs`). |
 
 ---
@@ -598,17 +598,17 @@ In short: on Apple Silicon, key comparison, field-index queries, and vector sear
 
 ### Expected throughput
 
-These are single-threaded ballpark figures with a configurable sync cadence; treat them as orders of magnitude rather than guarantees.
+These are single-threaded ballpark figures; treat them as orders of magnitude rather than guarantees. Note that only the *value log's* fsync cadence is configurable (`records_per_sync`) — the WAL is fsynced on every single write regardless, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so `put` throughput is fsync-latency-bound, not something a sync-cadence setting can raise.
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values, deferred value-log sync) | 100k–500k ops/s |
+| `put` (small values, single writer) | ~400–500 ops/s on NVMe without power-loss protection, bound by the per-write WAL fsync; scales roughly with concurrent writers spread across `num_buckets` |
 | `get` (cache-warm) | 500k–1M ops/s |
 | `get` (cold, hits L1 SSTable) | 100k–300k ops/s |
 | Range / prefix scan | Bounded by result-set size |
 | Value-log GC throughput | 100–500 MB/s |
 
-Actual numbers depend heavily on value size, the `records_per_sync` setting, and the underlying storage hardware.
+Actual numbers depend heavily on value size, the underlying storage hardware's fsync latency, and (for `put`) how many buckets are being written concurrently. See [`benchmark.md`](benchmark.md) for a dated, full measurement run (hardware spec, per-suite tables, and charts) that this table is checked against — the previous `put` figure here (100k–500k ops/s) was an unverified aspirational number that undercounted the per-write fsync cost by roughly 1000x.
 
 ---
 

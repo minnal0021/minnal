@@ -1,5 +1,17 @@
 // Scan benchmarks: prefix scan, range scan, cursor pagination, iter_stream
 //   cargo bench --bench bench_scan
+//
+// Every group is measured on both the active memtable and the on-disk L1
+// SSTable tier (`memtable_*` / `l1_*`, see `TIERS` in common.rs) —
+// memtable-only latency is cheap but not representative of steady-state
+// reads once data ages onto disk. NOTE for `bench_cursor_scan`/`bench_iter`:
+// prior to this file adding an explicit tier split, both already only ever
+// measured the L1 tier by accident — their setup populated via a sync `Db`
+// then called `.shutdown()` before reopening as `AsyncDb`, and `shutdown()`
+// unconditionally flushes+compacts everything to L1 (`flush_and_compact_all`
+// in `kv_store.rs`), regardless of whether anything explicitly called
+// `.compact()` first. Both now populate directly through `AsyncDb` so the
+// memtable tier is genuinely memtable-resident.
 
 #[path = "common.rs"]
 mod common;
@@ -31,27 +43,33 @@ fn bench_prefix_scan(c: &mut Criterion) {
     ];
 
     for &(n_keys, key_len) in cases {
-        let temp = bench_tempdir();
-        let store = open_store(temp.path());
         let value = vec![0u8; 64];
 
-        // Fill target prefix
-        for seq in 0..n_keys {
-            store.put(&make_long_key("pfx:", seq, key_len), &value).unwrap();
-        }
-        // Fill noise keys with a different prefix
-        for seq in 0..n_keys {
-            store.put(&make_long_key("other:", seq, key_len), &value).unwrap();
-        }
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let mut store = open_store(temp.path());
 
-        let label = format!("{n_keys}_keys_{}B", key_len);
-        group.throughput(Throughput::Elements(n_keys));
-        group.bench_function(&label, |b| {
-            b.iter(|| {
-                let results = store.scan_prefix(b"pfx:").unwrap();
-                black_box(results.len())
+            // Fill target prefix
+            for seq in 0..n_keys {
+                store.put(&make_long_key("pfx:", seq, key_len), &value).unwrap();
+            }
+            // Fill noise keys with a different prefix
+            for seq in 0..n_keys {
+                store.put(&make_long_key("other:", seq, key_len), &value).unwrap();
+            }
+            if tier == "l1" {
+                store = push_to_l1(store, temp.path());
+            }
+
+            let label = format!("{tier}_{n_keys}_keys_{key_len}B");
+            group.throughput(Throughput::Elements(n_keys));
+            group.bench_function(&label, |b| {
+                b.iter(|| {
+                    let results = store.scan_prefix(b"pfx:").unwrap();
+                    black_box(results.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -66,25 +84,31 @@ fn bench_range_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan/range");
     group.measurement_time(Duration::from_secs(10));
 
-    let temp = bench_tempdir();
-    let store = open_store(temp.path());
-    let value = vec![0u8; 256];
+    for tier in TIERS {
+        let temp = bench_tempdir();
+        let mut store = open_store(temp.path());
+        let value = vec![0u8; 256];
 
-    for seq in 0..TOTAL_KEYS {
-        store.put(&make_key("rng:", seq), &value).unwrap();
-    }
+        for seq in 0..TOTAL_KEYS {
+            store.put(&make_key("rng:", seq), &value).unwrap();
+        }
+        if tier == "l1" {
+            store = push_to_l1(store, temp.path());
+        }
 
-    for result_count in [100u64, 500, 1_000] {
-        let start = make_key("rng:", 0);
-        let end = make_key("rng:", result_count);
+        for result_count in [100u64, 500, 1_000] {
+            let start = make_key("rng:", 0);
+            let end = make_key("rng:", result_count);
 
-        group.throughput(Throughput::Elements(result_count));
-        group.bench_with_input(BenchmarkId::new("result_count", result_count), &result_count, |b, _| {
-            b.iter(|| {
-                let results = store.range(start.as_slice(), Some(end.as_slice())).unwrap();
-                black_box(results.len())
+            group.throughput(Throughput::Elements(result_count));
+            let label = format!("{tier}_result_count");
+            group.bench_with_input(BenchmarkId::new(label, result_count), &result_count, |b, _| {
+                b.iter(|| {
+                    let results = store.range(start.as_slice(), Some(end.as_slice())).unwrap();
+                    black_box(results.len())
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -101,35 +125,42 @@ fn bench_cursor_scan(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-
-    let temp = bench_tempdir();
-    let sync_store = open_store(temp.path());
     let value = vec![0u8; 256];
-    for seq in 0..TOTAL_KEYS {
-        sync_store.put(&make_key("cur:", seq), &value).unwrap();
-    }
-    sync_store.shutdown().unwrap();
 
-    // `AsyncDb::open_with_config` requires an owned (`'static`) path because it
-    // offloads the open via `spawn_blocking`; hand it an owned copy of the temp
-    // dir path (the `TempDir` itself still owns/cleans up the directory).
-    let db_path = temp.path().to_path_buf();
-    let store = Arc::new(rt.block_on(async move { AsyncDb::open_with_config(db_path, bench_config()).await.unwrap() }));
-
-    for page_size in [100usize, 500, 1_000] {
-        let s = store.clone();
-        group.throughput(Throughput::Elements(page_size as u64));
-        group.bench_with_input(BenchmarkId::new("page_size", page_size), &page_size, |b, &ps| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let (page, next) = s.scan(None, None, ps).await.unwrap();
-                    black_box((page.len(), next.is_some()))
-                })
-            });
+    for tier in TIERS {
+        let temp = bench_tempdir();
+        // `AsyncDb::open_with_config` requires an owned (`'static`) path because it
+        // offloads the open via `spawn_blocking`; hand it an owned copy of the temp
+        // dir path (the `TempDir` itself still owns/cleans up the directory).
+        let db_path = temp.path().to_path_buf();
+        let mut store = rt.block_on(async {
+            let store = AsyncDb::open_with_config(db_path.clone(), bench_config()).await.unwrap();
+            for seq in 0..TOTAL_KEYS {
+                store.put(make_key("cur:", seq), value.clone()).await.unwrap();
+            }
+            store
         });
-    }
+        if tier == "l1" {
+            store = rt.block_on(async { push_to_l1_async(store, &db_path).await });
+        }
+        let store = Arc::new(store);
 
-    rt.block_on(async { store.shutdown().await.unwrap() });
+        for page_size in [100usize, 500, 1_000] {
+            let s = store.clone();
+            group.throughput(Throughput::Elements(page_size as u64));
+            let label = format!("{tier}_page_size");
+            group.bench_with_input(BenchmarkId::new(label, page_size), &page_size, |b, &ps| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let (page, next) = s.scan(None, None, ps).await.unwrap();
+                        black_box((page.len(), next.is_some()))
+                    })
+                });
+            });
+        }
+
+        rt.block_on(async { store.shutdown().await.unwrap() });
+    }
     group.finish();
 }
 
@@ -145,30 +176,37 @@ fn bench_iter(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     for value_size in [128usize, 4_096] {
-        let temp = bench_tempdir();
-        let sync_store = open_store(temp.path());
         let value = vec![0u8; value_size];
 
-        for seq in 0..NUM_KEYS {
-            sync_store.put(&make_key("st:", seq), &value).unwrap();
-        }
-        sync_store.shutdown().unwrap();
-
-        let db_path = temp.path().to_path_buf();
-        let store = Arc::new(rt.block_on(async move { AsyncDb::open_with_config(db_path, bench_config()).await.unwrap() }));
-
-        let s = store.clone();
-        group.throughput(Throughput::Elements(NUM_KEYS));
-        group.bench_with_input(BenchmarkId::new("value_size", format!("{value_size}B")), &value_size, |b, _| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let count = s.iter().await.unwrap().len();
-                    black_box(count)
-                })
+        for tier in TIERS {
+            let temp = bench_tempdir();
+            let db_path = temp.path().to_path_buf();
+            let mut store = rt.block_on(async {
+                let store = AsyncDb::open_with_config(db_path.clone(), bench_config()).await.unwrap();
+                for seq in 0..NUM_KEYS {
+                    store.put(make_key("st:", seq), value.clone()).await.unwrap();
+                }
+                store
             });
-        });
+            if tier == "l1" {
+                store = rt.block_on(async { push_to_l1_async(store, &db_path).await });
+            }
+            let store = Arc::new(store);
 
-        rt.block_on(async { store.shutdown().await.unwrap() });
+            let s = store.clone();
+            group.throughput(Throughput::Elements(NUM_KEYS));
+            let label = format!("{tier}_value_size");
+            group.bench_with_input(BenchmarkId::new(label, format!("{value_size}B")), &value_size, |b, _| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let count = s.iter().await.unwrap().len();
+                        black_box(count)
+                    })
+                });
+            });
+
+            rt.block_on(async { store.shutdown().await.unwrap() });
+        }
     }
     group.finish();
 }
