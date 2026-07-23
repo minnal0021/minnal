@@ -319,12 +319,7 @@ thousand, scaling linearly, and roughly the same whether it's the coarse first
 pass or the more precise second pass. The extra precision of the second pass
 costs nothing extra at this scale. Picking out which few clusters are worth
 searching, the equivalent of choosing the right shelf before scanning it, takes
-under 10 µs and barely changes whether 8 or 128 clusters are requested. On a
-small one-off query that's about as fast as the older, simpler approach of
-sorting every cluster from scratch; the smarter approach pulls ahead once
-queries get more realistic — a batched version of the same cluster selection
-runs a consistent 15-20% faster than the version it replaced across the query
-sizes tested.
+under 10 µs and barely changes whether 8 or 128 clusters are requested.
 
 A full end-to-end search's cost tracks how long the *query* is, not how many
 clusters get probed (that's held fixed). A query ten times longer costs only
@@ -337,21 +332,22 @@ pass scans all of them rather than capping.
 
 ![Semantic search latency by stage](docs/benchmarks/distance_estimation.png)
 
-*Bar labels: `single_bit`/`multi_bit` = the coarse first pass vs. the more
-precise second pass. `top_n_cluster_selection`'s `select_nth` is the current
-cluster-picking algorithm, `full_sort` the older sort-everything baseline
-it's compared against. `coarse_assignment` compares two ways of assigning a
-multi-chunk query to its nearest clusters: `serial_hashmap` loops over the
-query's chunks one at a time, looking each one up individually in a scattered
-`HashMap` of clusters; `batched_matrix` is the current approach — it scores
-all of a query's chunks at once against one contiguous matrix of cluster
-centroids, which is what actually produces the speedup (better cache
-locality, more vectorizable). `pass1_scoring` breaks the first pass into
-cumulative layers: `dot_arithmetic` (just the distance math), `plus_archived`
-(+ reading the on-disk format), `plus_hashmap` (+ the real scoring data
-structure — closest to what production actually pays). `end_to_end_search`
-and `end_to_end_multichunk` are full searches, varying query length and
-per-document chunk count respectively.*
+*A guide to the bars. `single_bit` and `multi_bit` are the coarse first pass
+and the more precise second pass. Under `top_n_cluster_selection`, `select_nth`
+is the current cluster-picking algorithm and `full_sort` is the older
+sort-everything baseline it is measured against. `coarse_assignment` contrasts
+two ways of assigning a multi-chunk query to its nearest clusters: `serial_hashmap`
+walks the query's chunks one at a time, looking each one up individually in a
+scattered `HashMap` of clusters, while `batched_matrix` — the current approach —
+scores all of a query's chunks at once against a single contiguous matrix of
+cluster centroids. That contiguity is what produces the speedup, through better
+cache locality and more vectorizable math. `pass1_scoring` peels the first pass
+apart into cumulative layers, starting from the bare distance math
+(`dot_arithmetic`), then adding the cost of reading the on-disk format
+(`plus_archived`), and finally the real scoring data structure (`plus_hashmap`),
+which is the closest of the three to what production actually pays. Finally,
+`end_to_end_search` and `end_to_end_multichunk` are complete searches that vary
+the query length and the per-document chunk count respectively.*
 
 ---
 
