@@ -39,8 +39,8 @@ For running minnal as a REST **service** instead, see
 > 2. a **cluster-centroid file** — pre-computed IVF centroids, downloaded
 >    separately (they are data, not code, and are not inside the published
 >    crate). Two are available, one per supported model:
->    [gemma](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json)
->    and [qwen](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/qwen/clusters.json).
+>    [gemma](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json)
+>    and [qwen](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json).
 >    Use the one matching the model your service serves.
 >
 > Both are set up in [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
@@ -49,60 +49,80 @@ For running minnal as a REST **service** instead, see
 
 ## 1. Select your features
 
-Capabilities are opt-in through cargo features, so you only compile (and only
-pull dependencies for) what you use. **Field indexing is always included** in
-the base engine; `doc-store` and `semantic-search` are independent knobs.
+Capabilities are opt-in through cargo features, so you compile — and pull
+dependencies for — only what you actually use. There are three to choose from.
 
-### Individual features
+**`kv-store`** is the default, and it is really a name for the base engine: the
+LSM tree and value log, namespaces, TTL expiry, typed zero-copy values, and
+RoaringBitmap field indexing with its predicate query DSL. The engine and the
+field index are compiled in no matter which features you pick, so this one adds
+nothing beyond the base dependencies — it exists so you can name the default
+explicitly.
 
-| Feature | Default | What it adds | Extra dependencies pulled in |
-|---|:---:|---|---|
-| `kv-store` | ✅ | LSM + value-log KV engine, namespaces, TTL, typed (zero-copy) values, **RoaringBitmap field indexing + predicate query DSL** | — (base only) |
-| `doc-store` | | JSON document store: schema, document CRUD, background index builders, cursor pagination | `json_dotpath` |
-| `semantic-search` | | Quantised IVF + RaBitQ ANN vector search over stored vectors, usable on **raw KV namespaces** (`vector_kv::DbVectorStore`), plus the embedding-service client | `reqwest`, `simsimd`, `rayon`, `futures` |
+**`doc-store`** puts a JSON document layer on top of that engine: document
+schemas, document CRUD, background index builders, and cursor pagination. It
+pulls in one small dependency, `json_dotpath`.
 
-### How they combine (storage layer × semantic search)
+**`semantic-search`** adds quantised IVF + RaBitQ approximate-nearest-neighbour
+vector search over stored vectors, along with the client that talks to the
+embedding service. It works on raw KV namespaces through
+`vector_kv::DbVectorStore`, so you do not need the document store to use it. This
+is the only feature with a meaningful dependency cost — `reqwest`, `simsimd` and
+`rayon` — and the only one that needs anything external at runtime.
 
-| Cargo features | Capability | Vector deps compiled in? |
-|---|---|:---:|
-| *(default)* `kv-store` | KV engine + field indexing | ❌ none |
-| `kv-store` + `semantic-search` | + vector search on raw namespaces | ✅ yes |
-| `doc-store` | JSON documents + field-index queries | ❌ none |
-| `doc-store` + `semantic-search` | full: documents + embed-on-write + vector search | ✅ yes |
+### How they combine
 
-Notes:
+The storage layer and semantic search are independent choices, which gives you
+four useful combinations. On its own, the default `kv-store` is the leanest
+build: the KV engine and field indexing, no vector dependencies compiled in.
+Adding `semantic-search` to it gives you vector search over raw namespaces while
+staying below the document layer. Choosing `doc-store` instead gets you JSON
+documents with field-index queries and still no vector dependencies. Enabling
+`doc-store` and `semantic-search` together is the full build: documents,
+embed-on-write, and vector search over them.
 
-- `semantic-search` is **orthogonal** — it works on top of either a raw KV store
-  or the document store.
-- With `doc-store` but **not** `semantic-search`, requesting a semantic-search
-  store is **rejected at runtime** (`DocStoreError::SemanticSearchNotCompiled`)
-  rather than silently ignored.
-- `semantic-search` requires an **external embedding service** at query/index
-  time (default `http://localhost:8001`); nothing else needs anything external.
+If you enable `doc-store` without `semantic-search`, asking for a
+semantic-search-enabled store is **rejected at runtime**
+(`DocStoreError::SemanticSearchNotCompiled`) rather than silently ignored, so a
+missing feature surfaces as a clear error instead of a store that quietly never
+indexes anything.
 
 ---
 
 ## 2. Add the dependency
 
+Pick the line below that matches the build you settled on above and drop it into
+your `Cargo.toml`. The default needs no `features` key at all; everything else is
+one or two feature names.
+
 ```toml
 # Lean KV engine + field indexing (default)
-minnal_db = "0.1"
+minnal_db = "0.2"
 
 # JSON document store, no vector dependencies
-minnal_db = { version = "0.1", features = ["doc-store"] }
+minnal_db = { version = "0.2", features = ["doc-store"] }
 
 # Document store + semantic search (full)
-minnal_db = { version = "0.1", features = ["doc-store", "semantic-search"] }
+minnal_db = { version = "0.2", features = ["doc-store", "semantic-search"] }
 
 # Raw KV + semantic search, without the document layer
-minnal_db = { version = "0.1", features = ["semantic-search"] }
+minnal_db = { version = "0.2", features = ["semantic-search"] }
 ```
 
 ---
 
-## 3. Key-value usage (default `kv-store`)
+## 3. Using the key-value engine (default `kv-store`)
 
-### Synchronous
+`Db` (and its async twin, `AsyncDb`) is the entry point: you open a database
+directory, and from there put, get, delete, scan by prefix, or walk a key range.
+Keys and values are plain bytes — minnal does not interpret them. A database also
+carries any number of **namespaces**, each an isolated keyspace of its own, which
+is how you keep unrelated data apart inside one database.
+
+Whichever API you use, call `shutdown()` when you are done: it stops the
+background workers and flushes buffered writes.
+
+### The synchronous API
 
 ```rust
 use minnal_db::Db;
@@ -123,7 +143,10 @@ ns.put(b"o1", b"shipped")?;
 db.shutdown()?;
 ```
 
-### Asynchronous
+### The asynchronous API
+
+`AsyncDb` mirrors the same operations for a tokio runtime. The shape is
+identical; the calls take owned buffers and are awaited.
 
 ```rust
 use minnal_db::AsyncDb;
@@ -136,13 +159,18 @@ db.shutdown().await?;
 
 ---
 
-## 4. Field indexing + predicate queries (default `kv-store`)
+## 4. Indexing fields and querying them (default `kv-store`)
 
-`minnal_db` stores **opaque value bytes** — the field index is driven by an
-*extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide
-how to pull an indexed field out of your own value encoding (JSON, a fixed
-binary layout, …). Indexing runs **inline on every `put`**, so a query
-immediately after a write sees it.
+Because minnal stores opaque value bytes, it cannot know where a field lives
+inside your values — so you tell it. You supply an *extractor closure*
+(`&[u8] -> Option<IndexValue>`) per indexed field, which pulls that field out of
+whatever encoding you use, be it JSON, a fixed binary layout, or anything else.
+From then on, indexing runs inline on every `put`, so a query issued immediately
+after a write already sees that write.
+
+Setting this up is four steps, shown in full below: declare the fields you want
+indexed, activate each one with its extractor, write records as usual, and query
+with the predicate DSL.
 
 ```rust
 use std::sync::Arc;
@@ -187,19 +215,24 @@ fn main() -> Result<(), KVError> {
 }
 ```
 
-The `IndexValue` your extractor returns must match the registered
-`IndexValueType` (`Bool`, `Int` (i64), or `Str`). For large result sets use
-`query_index_paginated(ns, predicate, offset, limit)` with a `RowToKeyFn`
-registered via `set_row_id_fn` so only `offset + limit` keys are resolved.
+Two things are worth knowing before you build on this. The `IndexValue` your
+extractor returns has to match the type you registered the field with — one of
+`Bool`, `Int` (an `i64`), or `Str`. And when a query can match a large number of
+records, reach for `query_index_paginated(ns, predicate, offset, limit)` instead:
+paired with a `RowToKeyFn` registered through `set_row_id_fn`, it resolves only
+`offset + limit` keys rather than the whole match set.
 
 ---
 
-## 5. Document store (`doc-store` feature)
+## 5. Storing JSON documents (`doc-store` feature)
 
-With `features = ["doc-store"]`, the `DocStore` handle adds a JSON document
-model — typed IDs, declarative schemas, and background index builds — on top of
-the same engine. The schema mirrors the REST create payload documented in
-[`minnal_db_api`](../minnal_db_api/README.md).
+With `features = ["doc-store"]` you get the `DocStore` handle, which puts a JSON
+document model over the same engine: typed document IDs, declarative schemas, and
+index builds that run in the background. Rather than registering extractors
+yourself as in §4, you name the fields you want indexed in the schema and the
+store wires up the rest. The schema is the same shape as the REST create payload
+documented in [`minnal_db_api`](../minnal_db_api/README.md), so what you learn
+here carries over to the server.
 
 ```rust
 use minnal_db::{DocId, DocStore, DocStoreSchema, IndexSpec, IndexType, KeyType, Pagination, StoreType};
@@ -255,50 +288,55 @@ a **document** store or a **KV store whose value type is `str`**
 2. a **cluster-centroid file** — the pre-computed IVF centroids the coarse
    quantiser assigns chunks to. See below.
 
-### The cluster file (required — download it)
+### Getting the cluster-centroid file
 
-The centroid file is **data, not code, and is not shipped inside the crate** —
-`cargo add minnal_db` will not put one on your disk. Download the one matching
-the embedding model your service serves and point `ClusterIndex::load_with_dim`
-(embedded) or `semantic_search.cluster_path` (REST server) at the downloaded
-path.
+The centroid file is data, not code, and it is **not shipped inside the crate** —
+`cargo add minnal_db` will not put one on your disk. You download it yourself and
+point `ClusterIndex::load_with_dim` (when embedding) or
+`semantic_search.cluster_path` (when running the REST server) at wherever you put
+it.
 
 Two ready-made centroid sets live in the minnal repository, one per supported
 model:
 
-| Model | Download (raw) | View on GitHub | Centroids | Dim |
-|---|---|---|:---:|:---:|
-| **gemma** (used by the reference embedding service) | [`gemma/clusters.json`](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 |
-| **qwen** | [`qwen/clusters.json`](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/qwen/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/qwen/clusters.json) | 256 | 768 |
+| Model | Download | View on GitHub | Centroids | Dim | Size |
+|---|---|---|:---:|:---:|:---:|
+| **gemma** (used by the reference embedding service) | [`gemma/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 | 4.4 MB |
+| **qwen** | [`qwen/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/qwen/clusters.json) | 256 | 768 | 4.4 MB |
 
 ```sh
-# Fetch the gemma centroids next to your application (≈4.4 MB)
-mkdir -p clusters
-curl -L -o clusters/clusters.json \
-  https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json
+# Fetch the gemma centroids next to your application (~4.4 MB)
+curl -L --create-dirs -o clusters/clusters.json \
+  https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json
 ```
 
-Notes:
+Pick the file that matches the model your embedding service serves. Both sets are
+768-dimensional, so minnal cannot tell them apart: `load_with_dim` checks the
+dimension and nothing more. Pair the wrong file with your service and startup
+succeeds, queries return results, and recall is quietly worse — you get no error
+at any point. Matching the two is on you.
 
-- **Pick the file that matches the model your embedding service actually
-  serves.** Both files are 768-dimensional, so a mismatched pair passes every
-  startup check (`load_with_dim` only validates dimensionality) and degrades
-  recall *silently* — nothing errors. Model pinning is an operational
-  guarantee, not an enforced one.
-- The format is **JSONL**: one `{"cluster_id": <u32>, "centroid": [f32; dim]}`
-  object per line. You can generate your own (e.g. k-means over a sample of your
-  corpus's embeddings) and load it the same way — nothing is special about the
-  two published files beyond the model they were fitted on.
-- The whole index is loaded into memory once at startup and never mutated
-  (~750 KB resident for 256×768 `f32` centroids).
+Neither file is privileged: they are ordinary JSONL, one
+`{"cluster_id": <u32>, "centroid": [f32; dim]}` object per line, and the only
+thing special about them is the model they were fitted on. If you serve a
+different model, run k-means over a sample of your own corpus's embeddings and
+load the result exactly the same way. Whichever file you use, it is read into
+memory once at startup and never mutated afterwards — around 750 KB resident for
+256 centroids of 768 `f32`.
 
-Indexing is **asynchronous**: a write returns immediately after enqueuing an
-embed job; a background worker (started by `with_semantic_search`) calls the
-service, quantises the result, and stores the vector. So a query right after a
-write may not see it yet, and if the service is down, writes still succeed and
-the worker retries — only vector *indexing* lags and semantic *queries* error.
+One last thing to expect before the code: indexing is **asynchronous**. A write
+returns as soon as the embed job is enqueued, and a background worker — started
+for you by `with_semantic_search` — calls the service, quantises the result and
+stores the vector. A query issued immediately after a write may therefore not see
+it yet. If the service is down, writes still succeed and the worker keeps
+retrying; only vector *indexing* falls behind, while semantic *queries* error.
 
-### Shared setup — attach a `SemanticSearchContext`
+### Shared setup: attaching a `SemanticSearchContext`
+
+Both storage layers are driven the same way. You load the cluster index, build a
+`SemanticSearchConfig`, and hand both to the store as a `SemanticSearchContext`.
+Attach it once, at startup — it is also what spawns the embed-worker and the
+one-shot reconciliation pass.
 
 ```rust
 use std::sync::Arc;
@@ -335,7 +373,13 @@ let store = DocStore::open("/tmp/sem", "/tmp/sem/schemas")
     .with_semantic_search(SemanticSearchContext { config, cluster_index });
 ```
 
-### Document store
+### Searching a document store
+
+For documents you mark the store as semantic-search-enabled in its schema and
+list which fields should be embedded. Every write to those fields then enqueues
+an embed job automatically, and `search_semantic` runs the two-pass ANN search
+over what has been indexed so far. Results come back with the document's key
+bytes in `document_id`.
 
 ```rust
 // A doc store whose `body` field is embedded (semantic_search_enabled + embedding_fields).
@@ -363,7 +407,12 @@ for r in hits.results {
 }
 ```
 
-### KV store
+### Searching a KV store
+
+A KV store works the same way with less ceremony: declare it with
+`value_type = "str"` and semantic search enabled, and every string value you
+write gets embedded. Here `document_id` in the results is the raw string key
+rather than encoded key bytes.
 
 ```rust
 // A KV store whose string values are embedded (value_type = str + semantic_search_enabled).
@@ -389,10 +438,3 @@ for r in hits.results {
 store.shutdown().await?; // stops the embed-worker cleanly
 # Ok(()) }
 ```
-
-The cluster file and `embedding_dim` must match the embedding model the service
-actually serves — `load_with_dim` catches a *dimension* mismatch at startup, but
-nothing catches a same-dimension *model* mismatch (see the model-pinning notes
-in `src/semantic_search/CLAUDE.md`). To run vector search over the **REST** API
-instead, use [`minnal_db_api`](../minnal_db_api/README.md), which takes the same
-file as `semantic_search.cluster_path` in its TOML config.

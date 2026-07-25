@@ -554,6 +554,12 @@ holds **256 centroids for 768-dimensional embeddings** (~4.4 MB of JSONL on disk
 | **gemma** (served by the companion embedding service) | [`service/embedding_support/gemma/clusters.json`](service/embedding_support/gemma/clusters.json) |
 | **qwen** | [`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) |
 
+Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
+132-byte pointer stubs rather than the centroids — run `git lfs install` and
+`git lfs pull` if `clusters.json` is tiny and starts with
+`version https://git-lfs.github.com/spec/v1`. (The bulk-load sample data,
+`minnal_tools/sample_data/sample_data.jsonl`, is tracked the same way.)
+
 Point the server at the one matching the model your embedding service actually
 serves, via `[semantic_search] cluster_path`. The cluster index is loaded once at
 startup and never mutated. Both files are 768-dimensional, so pairing the wrong
