@@ -28,7 +28,7 @@
 //!
 //! [semantic_search]
 //! number_of_bits_for_dense_quantisation = 8
-//! # cluster_path = "service/embedding_support/qwen/clusters.json"
+//! # cluster_path = "service/embedding_support/qwen/clusters.json"   # {model}/clusters.json — must match `model` below
 //! embedding_dim = 768
 //! n_probes = 32
 //! embedding_service_url = "http://192.168.1.155:8001"

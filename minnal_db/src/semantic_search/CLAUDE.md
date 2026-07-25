@@ -76,7 +76,7 @@ A whole-text ("single") embedding is just a one-element `payloads` array; chunke
 
 ## Cluster centroids
 
-Pre-built centroids are at `service/embedding_support/qwen/clusters.json`. Set `semantic_search.cluster_path` in config to point at this file. The file is ~784 KB of JSON — do not read it; it is data, not code.
+Pre-built centroids ship per model at `service/embedding_support/{model}/clusters.json` — currently **gemma** (what the companion embedding service serves) and **qwen**, each 256 centroids × 768 dims. Set `semantic_search.cluster_path` to the one matching the model the service actually serves; both are 768-dim, so a mismatch passes `load_with_dim` and degrades recall silently. Each file is ~4.4 MB of JSONL — do not read it; it is data, not code.
 
 ## Configuration (from TOML)
 
@@ -86,7 +86,7 @@ Pre-built centroids are at `service/embedding_support/qwen/clusters.json`. Set `
 # 4 = compact, 8 = better recall (default).
 number_of_bits_for_dense_quantisation = 8
 
-cluster_path = "service/embedding_support/qwen/clusters.json"
+cluster_path = "service/embedding_support/gemma/clusters.json"
 
 # embedding_service_url = "http://localhost:8001"
 

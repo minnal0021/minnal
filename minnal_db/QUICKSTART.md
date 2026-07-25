@@ -6,22 +6,39 @@ features — a JSON document store and quantised ANN semantic search. Link it
 directly into your Rust process: no server, no network hop, all background
 workers (compaction, value-log GC, WAL GC, TTL) run in-process.
 
+The one exception is **semantic search**: the ANN index, quantisation and search
+all run in-process too, but turning text into vectors does not — that calls out
+to an external embedding service over HTTP, and the IVF centroids it quantises
+against are a data file you download separately. Both are covered in
+[§6](#6-semantic-search-doc-store--kv-store--semantic-search).
+
 For running minnal as a REST **service** instead, see
 [`minnal_db_api`](../minnal_db_api/README.md).
 
 > **Platform:** Linux and macOS only — the engine uses `pread`/`pwrite`.
 
-> **Semantic search needs an embedding service.** The default `kv-store` and
-> `doc-store` features have **no external dependencies**. But the moment you
-> enable `semantic-search`, indexing and querying vectors require an external
-> **embedding service** reachable over HTTP (default `http://localhost:8001`) —
-> minnal calls it to turn text into vectors. To get started, run the companion
-> reference service, [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
-> which serves the **gemma** embedding model, then point
-> `SemanticSearchConfig::embedding_service_url` (embedded) or
-> `semantic_search.embedding_service_url` (REST server) at it. Without a service
-> reachable, writes still succeed but vector indexing lags and semantic
-> *queries* error. See [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
+> **Semantic search needs two things this crate does not ship: an embedding
+> service and a cluster-centroid file.** The default `kv-store` and `doc-store`
+> features have **no external dependencies** — but the moment you enable
+> `semantic-search`, indexing and querying vectors need both of these in place:
+>
+> 1. an **embedding service** reachable over HTTP (default
+>    `http://localhost:8001`), which minnal calls to turn text into vectors. To
+>    get started, run the companion reference service,
+>    [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
+>    which serves the **gemma** embedding model, then point
+>    `SemanticSearchConfig::embedding_service_url` (embedded) or
+>    `semantic_search.embedding_service_url` (REST server) at it. Without a
+>    service reachable, writes still succeed but vector indexing lags and
+>    semantic *queries* error.
+> 2. a **cluster-centroid file** — pre-computed IVF centroids, downloaded
+>    separately (they are data, not code, and are not inside the published
+>    crate). Two are available, one per supported model:
+>    [gemma](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json)
+>    and [qwen](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/qwen/clusters.json).
+>    Use the one matching the model your service serves.
+>
+> Both are set up in [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
 
 ---
 
@@ -224,9 +241,51 @@ search on document (or `value_type = "str"` KV) stores — see §6.
 ## 6. Semantic search (`doc-store` / `kv-store` + `semantic-search`)
 
 With `semantic-search` enabled you can run quantised ANN vector search on either
-a **document** store or a **`value_type = "str"` KV** store. It needs an external
-**embedding service** (default `http://localhost:8001`) and a set of pre-computed
-IVF cluster centroids (bundled at `service/embedding_support/qwen/clusters.json`).
+a **document** store or a **KV store whose value type is `str`**
+(`value_type = "str"`). It needs two things you must supply:
+
+1. an external **embedding service** (default `http://localhost:8001`) — run the
+   companion [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
+   which serves the **gemma** model; and
+2. a **cluster-centroid file** — the pre-computed IVF centroids the coarse
+   quantiser assigns chunks to. See below.
+
+### The cluster file (required — download it)
+
+The centroid file is **data, not code, and is not shipped inside the crate** —
+`cargo add minnal_db` will not put one on your disk. Download the one matching
+the embedding model your service serves and point `ClusterIndex::load_with_dim`
+(embedded) or `semantic_search.cluster_path` (REST server) at the downloaded
+path.
+
+Two ready-made centroid sets live in the minnal repository, one per supported
+model:
+
+| Model | Download (raw) | View on GitHub | Centroids | Dim |
+|---|---|---|:---:|:---:|
+| **gemma** (used by the reference embedding service) | [`gemma/clusters.json`](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 |
+| **qwen** | [`qwen/clusters.json`](https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/qwen/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/qwen/clusters.json) | 256 | 768 |
+
+```sh
+# Fetch the gemma centroids next to your application (≈4.4 MB)
+mkdir -p clusters
+curl -L -o clusters/clusters.json \
+  https://raw.githubusercontent.com/minnal0021/minnal/main/service/embedding_support/gemma/clusters.json
+```
+
+Notes:
+
+- **Pick the file that matches the model your embedding service actually
+  serves.** Both files are 768-dimensional, so a mismatched pair passes every
+  startup check (`load_with_dim` only validates dimensionality) and degrades
+  recall *silently* — nothing errors. Model pinning is an operational
+  guarantee, not an enforced one.
+- The format is **JSONL**: one `{"cluster_id": <u32>, "centroid": [f32; dim]}`
+  object per line. You can generate your own (e.g. k-means over a sample of your
+  corpus's embeddings) and load it the same way — nothing is special about the
+  two published files beyond the model they were fitted on.
+- The whole index is loaded into memory once at startup and never mutated
+  (~750 KB resident for 256×768 `f32` centroids).
 
 Indexing is **asynchronous**: a write returns immediately after enqueuing an
 embed job; a background worker (started by `with_semantic_search`) calls the
@@ -247,11 +306,22 @@ use minnal_db::semantic_search::service::SemanticSearchConfig;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let embedding_dim = 768; // must match the model the embedding service serves
+// Path to the centroid file you downloaded above — gemma and qwen centroids are
+// both published in the minnal repo under service/embedding_support/{model}/.
 let cluster_index = Arc::new(ClusterIndex::load_with_dim(
-    "service/embedding_support/qwen/clusters.json",
+    "clusters/clusters.json",
     embedding_dim,
 )?);
-let config = SemanticSearchConfig { embedding_dim, ..Default::default() };
+// `embedding_dim` (768) is already the default; it is spelled out here because it
+// must agree with both the centroid file and the model the service serves.
+// `model_name` is inert when embedded — nothing is sent to the service, and it is
+// not used to pick the cluster file (that is the `ClusterIndex` above) — but set it
+// to match, since it defaults to "qwen".
+let config = SemanticSearchConfig {
+    embedding_dim,
+    model_name: "gemma".into(),
+    ..Default::default()
+};
 
 // `with_semantic_search` also starts the background embed-worker + a one-shot
 // startup reconciliation, so attach it once, up front.
@@ -315,7 +385,9 @@ store.shutdown().await?; // stops the embed-worker cleanly
 # Ok(()) }
 ```
 
-The `cluster_path` and `embedding_dim` must match the embedding model the
-service actually serves (see the model-pinning notes in
-`src/semantic_search/CLAUDE.md`). To run vector search over the **REST** API
-instead, use [`minnal_db_api`](../minnal_db_api/README.md).
+The cluster file and `embedding_dim` must match the embedding model the service
+actually serves — `load_with_dim` catches a *dimension* mismatch at startup, but
+nothing catches a same-dimension *model* mismatch (see the model-pinning notes
+in `src/semantic_search/CLAUDE.md`). To run vector search over the **REST** API
+instead, use [`minnal_db_api`](../minnal_db_api/README.md), which takes the same
+file as `semantic_search.cluster_path` in its TOML config.
