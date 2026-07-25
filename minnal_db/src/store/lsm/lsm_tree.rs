@@ -85,25 +85,29 @@ impl LSMConfig {
     }
 }
 
-/// Metadata for an SSTable file
-#[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize)]
+/// In-memory summary of a bucket's Level-1 SSTable, rebuilt by scanning the file
+/// at open — it is never serialised, so it has no on-disk format of its own.
+///
+/// Deliberately only what readers consume: `min_key`/`max_key` bound the range
+/// check that lets a lookup skip the file entirely, and `entry_count` distinguishes
+/// a populated bucket from an empty one. It previously also carried `bucket`,
+/// `min_key_prefix`, `max_key_prefix`, `data_offset` and `data_size`, none of which
+/// were ever read — `bucket` duplicates the index into `sstable_metadata`, and
+/// `data_offset`/`data_size` were an accident waiting to happen: `data_offset` was
+/// hard-coded to `0` while its doc claimed "offset where entries data starts"
+/// (which is [`SSTABLE_DATA_START`] since the header landed), and `data_size`
+/// counts entry bytes only, so using it as a file position lands 16 bytes short.
+/// The dead fields were masked from the `dead_code` lint by `rkyv` derives that
+/// nothing exercised; those are gone too. **Do not add a field here without a
+/// reader** — the lint is the only thing keeping this honest.
+#[derive(Clone, Debug)]
 struct SStableMetadata {
-    /// Bucket index (0-15)
-    bucket: u32,
     /// Minimum key in this SSTable
     min_key: Vec<u8>,
     /// Maximum key in this SSTable
     max_key: Vec<u8>,
-    /// Minimum key prefix (first 8 bytes as u64)
-    min_key_prefix: u64,
-    /// Maximum key prefix (first 8 bytes as u64)
-    max_key_prefix: u64,
     /// Number of entries in this SSTable
     entry_count: u64,
-    /// Offset where entries data starts
-    data_offset: u64,
-    /// Total size of entries data
-    data_size: u64,
 }
 
 /// Magic identifying an SSTable file, written at offset 0 of every **non-empty**
@@ -276,7 +280,8 @@ fn verify_sstable_payload(framed: &[u8]) -> Result<&[u8]> {
 }
 
 /// Result of writing a merged SSTable: `(min_key, max_key, entry_count,
-/// data_size, sparse_index)`.
+/// data_size, sparse_index)`. `data_size` is entry bytes only — it excludes the
+/// header, so it is a size for metrics, never a file position.
 type MergedSstableInfo = (Vec<u8>, Vec<u8>, u64, u64, SparseIndex);
 
 /// Result of scanning an existing SSTable file at open time:
@@ -813,7 +818,7 @@ impl LSMTree {
             let mut bloom = None;
             let mut index = None;
             if file_len > 0
-                && let Ok((meta, built_bloom, built_index, file_max_seq)) = Self::load_metadata_from_file(&level1_path, bucket)
+                && let Ok((meta, built_bloom, built_index, file_max_seq)) = Self::load_metadata_from_file(&level1_path)
             {
                 metadata.push(meta);
                 bloom = built_bloom.map(Arc::new);
@@ -1300,8 +1305,9 @@ impl LSMTree {
         let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         file.write_all(&sstable_header_bytes())?;
 
-        // Counts entry bytes only (it becomes `SStableMetadata::data_size`); the
-        // sparse index adds `SSTABLE_DATA_START` so its offsets stay absolute.
+        // Counts entry bytes only — it is returned as the merge's `bytes_merged`
+        // metric, not as a file position. The sparse index adds `SSTABLE_DATA_START`
+        // so its offsets stay absolute.
         let mut total_size = 0u64;
         let min_key = entries[0].key.clone();
         let max_key = entries[entries.len() - 1].key.clone();
@@ -1621,7 +1627,7 @@ impl LSMTree {
     /// Load metadata from an existing SSTable file by scanning it, and build the
     /// L1 Bloom filter from the same pass (no extra I/O). Returns `None` for the
     /// bloom when the file has no entries.
-    fn load_metadata_from_file(path: &Path, bucket: u32) -> Result<LoadedSstable> {
+    fn load_metadata_from_file(path: &Path) -> Result<LoadedSstable> {
         let mut file = open_sstable_for_scan(path)?;
         // Bound for `check_frame_len`: a frame can never be longer than its file.
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1680,14 +1686,9 @@ impl LSMTree {
 
         Ok((
             SStableMetadata {
-                bucket,
-                min_key_prefix: key_prefix_of(&min_key),
-                max_key_prefix: key_prefix_of(&max_key),
                 min_key,
                 max_key,
                 entry_count,
-                data_offset: 0,
-                data_size,
             },
             bloom,
             index,
@@ -1856,14 +1857,9 @@ impl LSMTree {
             let mut metadata_guard = self.sstable_metadata[bucket_idx].write();
             metadata_guard.clear();
             metadata_guard.push(SStableMetadata {
-                bucket,
-                min_key_prefix: key_prefix_of(&min_key),
-                max_key_prefix: key_prefix_of(&max_key),
                 min_key,
                 max_key,
                 entry_count,
-                data_offset: 0,
-                data_size,
             });
 
             // Rebuild the L1 bloom from the merged entries (in memory, no extra
