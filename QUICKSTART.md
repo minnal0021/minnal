@@ -249,7 +249,9 @@ concurrency = 4
 
 [semantic_search]
 # Path to the JSONL cluster centroids file (one {"cluster_id":…,"centroid":[…]} per line).
-cluster_path = "service/embedding_support/qwen/clusters.json"
+# One set per model ships under service/embedding_support/{gemma,qwen}/ — use the
+# one matching the model your embedding service serves.
+cluster_path = "service/embedding_support/gemma/clusters.json"
 # Bits per dimension for the dense (multi-bit) Pass 2 quantisation. 4 = compact, 8 = high recall.
 number_of_bits_for_dense_quantisation = 8
 # IVF clusters probed in the sparse first pass (higher = better recall, slower).
@@ -543,9 +545,27 @@ Run any script against a running server:
 
 ### Cluster centroids
 
-[`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) contains 50 pre-computed cluster centroids for 768-dimensional embeddings, for the **Qwen Embedding model**. The cluster index is loaded once at startup and held in memory (negligible — ~150 KB for 50 clusters of 768 dimensions).
+Two pre-computed centroid files ship in the repo, one per supported model — each
+holds **256 centroids for 768-dimensional embeddings** (~4.4 MB of JSONL on disk,
+~750 KB resident once loaded):
 
-To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at the file via `[semantic_search] cluster_path`. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
+| Model | File |
+|---|---|
+| **gemma** (served by the companion embedding service) | [`service/embedding_support/gemma/clusters.json`](service/embedding_support/gemma/clusters.json) |
+| **qwen** | [`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) |
+
+Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
+132-byte pointer stubs rather than the centroids — run `git lfs install` and
+`git lfs pull` if `clusters.json` is tiny and starts with
+`version https://git-lfs.github.com/spec/v1`. (The bulk-load sample data,
+`minnal_tools/sample_data/sample_data.jsonl`, is tracked the same way.)
+
+Point the server at the one matching the model your embedding service actually
+serves, via `[semantic_search] cluster_path`. The cluster index is loaded once at
+startup and never mutated. Both files are 768-dimensional, so pairing the wrong
+one with your service passes every startup check and degrades recall *silently*.
+
+To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at that file instead. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
 
 ### Sample config
 

@@ -59,7 +59,7 @@ A health endpoint is also expected: `GET {base_url}/healthcheck` should return a
 
 ### Embedding dimension
 
-The expected embedding size is configurable via `embedding_dim` under `[semantic_search]` and **defaults to 768**. The bundled cluster-centroid file (`service/embedding_support/qwen/clusters.json`) contains **768-dimensional** centroids, so the default works out of the box.
+The expected embedding size is configurable via `embedding_dim` under `[semantic_search]` and **defaults to 768**. Both bundled cluster-centroid files (`service/embedding_support/{gemma,qwen}/clusters.json`) contain **768-dimensional** centroids, so the default works out of the box.
 
 > ⚠️ **Changing `embedding_dim` requires regenerating the cluster-centroid file.** The centroids in `clusters.json` must have the *same dimensionality* as the embeddings the service returns — IVF cluster assignment computes Euclidean distance between an embedding and each centroid, which is only defined for equal-length vectors. If you point minnal at a service that produces a different embedding size, you **must** also supply a matching `clusters.json` (see [§3](#3-ivf-index-structure)) whose centroids have that dimensionality, and re-index the corpus. The default 768-dimensional centroids shipped in `clusters.json` are only valid for 768-dimensional embeddings.
 

@@ -238,7 +238,9 @@ number_of_bits_for_dense_quantisation = 8
 
 # Path to the IVF cluster centroids file.
 # In the Docker image the file is copied to the container root at build time.
-# For local development use: service/embedding_support/qwen/clusters.json
+# One centroid set ships per supported model under
+# service/embedding_support/{model}/clusters.json (gemma, qwen) — use the one
+# matching `model` below. For local development: service/embedding_support/gemma/clusters.json
 cluster_path = "./clusters.json"
 
 # Base URL of the embedding service.
