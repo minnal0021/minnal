@@ -1,16 +1,21 @@
 # minnal_db — Embedded Quickstart
 
-`minnal_db` is a **single embeddable crate**. It ships an LSM + value-log
-key-value engine with RoaringBitmap field indexing, and — behind cargo
-features — a JSON document store and quantised ANN semantic search. Link it
-directly into your Rust process: no server, no network hop, all background
-workers (compaction, value-log GC, WAL GC, TTL) run in-process.
+`minnal_db` is a **single embeddable crate** you link directly into your Rust
+process — no server to run, no network hop. It gives you:
 
-The one exception is **semantic search**: the ANN index, quantisation and search
-all run in-process too, but turning text into vectors does not — that calls out
-to an external embedding service over HTTP, and the IVF centroids it quantises
-against are a data file you download separately. Both are covered in
-[§6](#6-semantic-search-doc-store--kv-store--semantic-search).
+- an **LSM + value-log key-value engine** (WiscKey-style), always compiled in;
+- **RoaringBitmap field indexing** with a predicate query DSL, also always in;
+- a **JSON document store**, behind the `doc-store` cargo feature;
+- **quantised ANN semantic search**, behind the `semantic-search` cargo feature.
+
+Everything runs in your process, background workers included — compaction,
+value-log GC, WAL GC and TTL expiry all tick along inside your binary.
+
+**Semantic search is the one part that reaches outside.** Its ANN index,
+quantisation and search run in-process like the rest, but turning text into
+vectors does not: that calls an external embedding service over HTTP, and the
+IVF centroids it quantises against are a data file you download separately.
+[§6](#6-semantic-search-doc-store--kv-store--semantic-search) covers both.
 
 For running minnal as a REST **service** instead, see
 [`minnal_db_api`](../minnal_db_api/README.md).
