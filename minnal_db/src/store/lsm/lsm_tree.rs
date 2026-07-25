@@ -19,12 +19,12 @@ use log::{info, warn};
 use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use thiserror::Error;
 
 use crate::db::metrics::Metrics;
@@ -106,6 +106,134 @@ struct SStableMetadata {
     data_size: u64,
 }
 
+/// Magic identifying an SSTable file, written at offset 0 of every **non-empty**
+/// SSTable (L0 and L1 alike). A freshly created, never-written L1 file is 0 bytes
+/// and carries no header — `file_len == 0` means "no entries", which stays valid.
+const SSTABLE_MAGIC: [u8; 4] = *b"MSST";
+
+/// On-disk format version for the entry encoding that follows the header.
+///
+/// Bump this whenever the `SStableEntry` layout changes in a way that makes old
+/// files unreadable. Version 1 is the first versioned format; it carries a `u64`
+/// write sequence. Files written before headers existed had a `u32` sequence and
+/// no magic, so they are rejected by [`validate_sstable_header`] rather than
+/// silently misread — the entry CRC covers only the body and cannot catch a
+/// layout change, since the bytes are unchanged and only their interpretation
+/// differs.
+const SSTABLE_FORMAT_VERSION: u32 = 1;
+
+/// Byte offset at which entry frames begin: `magic(4) | version(4) | reserved(8)`.
+///
+/// The reserved tail keeps the header 16-byte aligned and leaves room to add
+/// fields without moving the data start again. Sparse-index offsets are absolute
+/// file positions and are seeded with this, so seek-based readers need no
+/// adjustment; only scans that start at the head of the file begin here.
+const SSTABLE_DATA_START: u64 = 16;
+
+/// The header bytes written at offset 0 of a non-empty SSTable file.
+fn sstable_header_bytes() -> [u8; SSTABLE_DATA_START as usize] {
+    let mut header = [0u8; SSTABLE_DATA_START as usize];
+    header[0..4].copy_from_slice(&SSTABLE_MAGIC);
+    header[4..8].copy_from_slice(&SSTABLE_FORMAT_VERSION.to_le_bytes());
+    header
+}
+
+/// Verify that `file` begins with a header this build can read.
+///
+/// Returns [`LSMError::Corruption`] for a truncated header, a bad magic (which is
+/// what a pre-header file looks like), or a format version this build does not
+/// understand.
+fn validate_sstable_header(file: &File, path: &Path) -> Result<()> {
+    let mut header = [0u8; SSTABLE_DATA_START as usize];
+    file.read_exact_at(&mut header, 0)
+        .map_err(|e| LSMError::Corruption(format!("SSTable {} has no readable header: {e}", path.display())))?;
+    if header[0..4] != SSTABLE_MAGIC {
+        return Err(LSMError::Corruption(format!(
+            "SSTable {} is not a recognised SSTable (bad magic {:02x?}). A database written before SSTable \
+             headers existed used a narrower write sequence and cannot be read by this build; recreate it.",
+            path.display(),
+            &header[0..4]
+        )));
+    }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if version != SSTABLE_FORMAT_VERSION {
+        return Err(LSMError::Corruption(format!(
+            "SSTable {} has format version {version}, but this build reads version {SSTABLE_FORMAT_VERSION}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Open an SSTable for a head-of-file scan, **validating its header**, and leave
+/// the read cursor at [`SSTABLE_DATA_START`] so sequential readers can keep using
+/// `read_exact` unchanged.
+///
+/// This is the *first-touch* opener: use it where the file has not been vetted
+/// yet — the L1 files and on-disk L0 files inspected during [`LSMTree::open`].
+/// Files already in the Level-0 registry are opened with
+/// [`open_registered_l0_for_scan`] instead; see it for why re-validating is
+/// redundant there.
+fn open_sstable_for_scan(path: &Path) -> Result<File> {
+    let mut file = File::open(path)?;
+    validate_sstable_header(&file, path)?;
+    file.seek(SeekFrom::Start(SSTABLE_DATA_START))?;
+    Ok(file)
+}
+
+/// Reject a frame whose declared payload length cannot fit in the file holding it,
+/// **before** that length is used to allocate.
+///
+/// The 4-byte length prefix sits *outside* the entry CRC — which covers only the
+/// body — so a flipped bit there is undetectable until after the payload has been
+/// read. Allocating first meant a corrupt length could request up to 4 GiB from a
+/// file of a few hundred bytes. A frame can never be longer than its file, so that
+/// is the bound; `valid_scan_start` already applies the same reasoning to a sparse
+/// hint, and this brings the sequential readers in line.
+///
+/// Zero is rejected too: a body is `crc32(4) + rkyv payload`, so it is never empty.
+#[inline]
+fn check_frame_len(size: u64, file_len: u64) -> Result<()> {
+    if size == 0 || size > file_len {
+        return Err(LSMError::Corruption(format!(
+            "SSTable frame declares a {size}-byte payload in a {file_len}-byte file"
+        )));
+    }
+    Ok(())
+}
+
+/// Open a **registered** Level-0 file — one reachable from `level0_files` — for a
+/// positional reader, skipping header validation.
+///
+/// # Why skipping is sound
+///
+/// A file's format version is fixed when it is written and cannot change
+/// afterwards: L0 files are write-once (never mutated in place) and are unlinked
+/// only once `readers() == 0`. So the header is a property to check when a file
+/// *enters* the registry, not on every read. Both entry points establish it:
+/// [`LSMTree::open`] validates every on-disk L0 file it loads
+/// (`load_existing_level0_files` → `level0_file_max_seq`), and
+/// [`register_level0_file`](LSMTree::register_level0_file) only ever receives a
+/// file this process just wrote with a header. Re-validating on each read bought
+/// nothing and cost a `pread` per L0 file on every point get —
+/// `search_level0_files` opens *every* L0 file in the bucket.
+///
+/// **Precondition:** `path` comes from an `L0FileEntry`. Opening an unvetted file
+/// with this would parse a foreign layout as entries — use
+/// [`open_sstable_for_scan`] there.
+fn open_registered_l0(path: &Path) -> Result<File> {
+    Ok(File::open(path)?)
+}
+
+/// [`open_registered_l0`] for a sequential reader: leaves the cursor at
+/// [`SSTABLE_DATA_START`]. Same precondition — the caller's path must come from
+/// an `L0FileEntry`.
+fn open_registered_l0_for_scan(path: &Path) -> Result<File> {
+    let mut file = open_registered_l0(path)?;
+    file.seek(SeekFrom::Start(SSTABLE_DATA_START))?;
+    Ok(file)
+}
+
 /// On disk, each SSTable entry is framed as:
 ///
 /// ```text
@@ -154,19 +282,19 @@ type MergedSstableInfo = (Vec<u8>, Vec<u8>, u64, u64, SparseIndex);
 /// Result of scanning an existing SSTable file at open time:
 /// `(metadata, bloom, sparse_index, max_seq)`. The bloom/index/max_seq are
 /// `None` when the file has no entries.
-type LoadedSstable = (SStableMetadata, Option<BloomFilter>, Option<SparseIndex>, Option<u32>);
+type LoadedSstable = (SStableMetadata, Option<BloomFilter>, Option<SparseIndex>, Option<u64>);
 
 /// A prefix/range scan layer result: `(key, Some((pointer, seq)))` for a live
 /// entry or `(key, None)` for a tombstone — `seq` is the LSM write sequence used
 /// for the read-time value validity check.
-type ScanEntry = (Vec<u8>, Option<(u128, u32)>);
+type ScanEntry = (Vec<u8>, Option<(u128, u64)>);
 
 /// A batched point-lookup result slot: `(original_index, Some((pointer, seq)))`.
-type IdxEntry = (usize, Option<(u128, u32)>);
+type IdxEntry = (usize, Option<(u128, u64)>);
 
 /// A liveness-scan entry from `key_pointer_pairs`' L0 read: `(key, value-or-None
 /// for a tombstone, write seq)`, used for the seq-aware GC liveness merge.
-type KpScanEntry = (Vec<u8>, Option<u128>, u32);
+type KpScanEntry = (Vec<u8>, Option<u128>, u64);
 
 /// A single entry in the SSTable
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -175,7 +303,7 @@ struct SStableEntry {
     key_prefix: u64, // First 8 bytes of key as u64 for fast prefix matching
     value: u128,
     tombstone: bool,
-    seq: u32,
+    seq: u64,
 }
 
 /// In-memory component of LSM tree
@@ -381,19 +509,29 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Whether `a` is a strictly-newer write sequence than `b`, using the same
-/// wraparound-aware serial-number comparison as the memtable
-/// (`SkipList::seq_is_newer_or_equal`). Resolution across layers picks the entry
-/// with the newest sequence, so order of inspection only breaks exact ties.
+/// Whether `a` is a strictly-newer write sequence than `b`, matching the
+/// memtable's comparison (`SkipList::seq_is_newer_or_equal`). Resolution across
+/// layers picks the entry with the newest sequence, so order of inspection only
+/// breaks exact ties.
+///
+/// Sequences are the global `u64` counter (`Database::next_seq`) at full width,
+/// so this is a plain comparison. It was previously a `u32` truncation compared
+/// with wrapping serial-number arithmetic, which silently inverts once two
+/// sequences differ by more than 2^31 — reachable here because an L1 entry keeps
+/// its original sequence for the lifetime of the database, so the gap to a later
+/// write of the same key is unbounded (~2.1B writes, ~2.5 days at 10k writes/s).
+/// The effect was a stale read that `merge_level0_to_level1` then baked into L1
+/// permanently. **Do not narrow the sequence again** — see
+/// `test_write_after_huge_seq_gap_beats_cold_l1_entry`.
 #[inline]
-fn seq_newer(a: u32, b: u32) -> bool {
-    a != b && a.wrapping_sub(b) < 0x8000_0000
+fn seq_newer(a: u64, b: u64) -> bool {
+    a > b
 }
 
-/// Whether `a` is newer than *or equal to* `b` (same serial-number comparison).
+/// Whether `a` is newer than *or equal to* `b` (see [`seq_newer`]).
 #[inline]
-fn seq_newer_or_eq(a: u32, b: u32) -> bool {
-    a.wrapping_sub(b) < 0x8000_0000
+fn seq_newer_or_eq(a: u64, b: u64) -> bool {
+    a >= b
 }
 
 /// Outcome of looking a key up in a single SSTable layer, carrying the matched
@@ -403,16 +541,16 @@ fn seq_newer_or_eq(a: u32, b: u32) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum SsLookup {
     /// Live value pointer found in this layer, with its stored sequence.
-    Found(u128, u32),
+    Found(u128, u64),
     /// An explicit tombstone for the key was found, with its stored sequence.
-    Deleted(u32),
+    Deleted(u64),
     /// The key is simply not present in this layer.
     Missing,
 }
 
 impl SsLookup {
     /// The matched entry's sequence, or `None` for [`SsLookup::Missing`].
-    fn seq(&self) -> Option<u32> {
+    fn seq(&self) -> Option<u64> {
         match self {
             SsLookup::Found(_, seq) | SsLookup::Deleted(seq) => Some(*seq),
             SsLookup::Missing => None,
@@ -454,7 +592,7 @@ pub(crate) struct LSMTree {
     /// re-inserted into the active memtable) fails the bound and falls through to
     /// the full seq-aware scan. Folded (serial-max) on every memtable flush and
     /// from the L1 files loaded at open.
-    max_lower_seq: AtomicU32,
+    max_lower_seq: AtomicU64,
 
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` until set (e.g. a standalone
@@ -526,15 +664,17 @@ impl LSMTree {
     /// *any* valid frame boundary with key `<= key` still finds `key` if present;
     /// this makes a stale hint a performance issue, never a correctness one.
     fn lookup_in_sstable_file_from(&self, file: &File, key: &[u8], start_offset: u64) -> Result<SsLookup> {
+        // Also the bound for `check_frame_len` below: a frame can never be longer
+        // than its file.
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut offset = if start_offset != 0 {
-            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
             if Self::valid_scan_start(file, start_offset, file_len, key) {
                 start_offset
             } else {
-                0
+                SSTABLE_DATA_START
             }
         } else {
-            0
+            SSTABLE_DATA_START
         };
 
         loop {
@@ -544,6 +684,7 @@ impl LSMTree {
             }
 
             let size = u32::from_le_bytes(size_buf);
+            check_frame_len(u64::from(size), file_len)?;
             let mut entry_bytes = vec![0u8; size as usize];
             Self::read_exact_at(file, &mut entry_bytes, &mut offset)?;
 
@@ -597,7 +738,9 @@ impl LSMTree {
 
     fn read_sstable_entries_from_file(&self, file: &File) -> Result<Vec<SStableEntry>> {
         let mut entries = Vec::new();
-        let mut offset = 0u64;
+        // Bound for `check_frame_len`: a frame can never be longer than its file.
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut offset = SSTABLE_DATA_START;
 
         loop {
             let mut size_buf = [0u8; 4];
@@ -606,6 +749,7 @@ impl LSMTree {
             }
 
             let size = u32::from_le_bytes(size_buf);
+            check_frame_len(u64::from(size), file_len)?;
             let mut entry_bytes = vec![0u8; size as usize];
             Self::read_exact_at(file, &mut entry_bytes, &mut offset)?;
 
@@ -641,7 +785,7 @@ impl LSMTree {
         let mut sstable_indexes_vec: Vec<Arc<RwLock<Option<Arc<SparseIndex>>>>> = Vec::with_capacity(num_buckets);
         // Newest sequence across all loaded L1 files — the initial lower-layer
         // bound for the read fast path.
-        let mut max_lower_seq_init: Option<u32> = None;
+        let mut max_lower_seq_init: Option<u64> = None;
 
         // Open or create Level 1 SSTable files per bucket (similar to sharded value log)
         for bucket in 0u32..num_buckets as u32 {
@@ -652,12 +796,22 @@ impl LSMTree {
                 .create(true)
                 .truncate(false)
                 .open(&level1_path)?;
+
+            let file_len = std::fs::metadata(&level1_path)?.len();
+            // Reject an unreadable on-disk format loudly, before anything tries to
+            // interpret the file. The metadata load below is deliberately lenient
+            // (a partially-written tail leaves the bucket without a sparse index
+            // rather than failing open), but that leniency must not extend to a
+            // file this build cannot parse at all — scanning it would yield
+            // garbage entries instead of an error.
+            if file_len > 0 {
+                validate_sstable_header(&file, &level1_path)?;
+            }
             sstable_files_vec.push(Arc::new(RwLock::new(Arc::new(file))));
 
             let mut metadata = Vec::new();
             let mut bloom = None;
             let mut index = None;
-            let file_len = std::fs::metadata(&level1_path)?.len();
             if file_len > 0
                 && let Ok((meta, built_bloom, built_index, file_max_seq)) = Self::load_metadata_from_file(&level1_path, bucket)
             {
@@ -701,7 +855,7 @@ impl LSMTree {
             sstable_metadata,
             sstable_blooms,
             sstable_indexes,
-            max_lower_seq: AtomicU32::new(max_lower_seq_init.unwrap_or(0)),
+            max_lower_seq: AtomicU64::new(max_lower_seq_init.unwrap_or(0)),
             metrics: OnceLock::new(),
             config,
             compaction_in_progress,
@@ -805,12 +959,15 @@ impl LSMTree {
 
     /// Scan a Level-0 file and return the newest write sequence it contains
     /// (`None` if empty/unreadable). Used at open to fold L0 into `max_lower_seq`.
-    fn level0_file_max_seq(path: &Path) -> Result<Option<u32>> {
-        let mut file = match File::open(path) {
+    fn level0_file_max_seq(path: &Path) -> Result<Option<u64>> {
+        let mut file = match open_sstable_for_scan(path) {
             Ok(f) => f,
-            Err(_) => return Ok(None),
+            Err(LSMError::Io(_)) => return Ok(None),
+            Err(e) => return Err(e),
         };
-        let mut max_seq: Option<u32> = None;
+        // Bound for `check_frame_len`: a frame can never be longer than its file.
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut max_seq: Option<u64> = None;
         loop {
             let mut size_buf = [0u8; 4];
             match file.read_exact(&mut size_buf) {
@@ -819,6 +976,7 @@ impl LSMTree {
                 Err(e) => return Err(LSMError::Io(e)),
             }
             let size = u32::from_le_bytes(size_buf);
+            check_frame_len(u64::from(size), file_len)?;
             let mut entry_bytes = vec![0u8; size as usize];
             file.read_exact(&mut entry_bytes)?;
             let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes)?) };
@@ -836,8 +994,8 @@ impl LSMTree {
     /// than L1, so omitting it would leave the bound too low after a restart (a
     /// low-seq active entry could then wrongly short-circuit above a higher-seq
     /// L0 tombstone).
-    fn load_existing_level0_files(base_path: &Path, level0_files: &[Arc<RwLock<Vec<Arc<L0FileEntry>>>>]) -> Result<Option<u32>> {
-        let mut max_seq: Option<u32> = None;
+    fn load_existing_level0_files(base_path: &Path, level0_files: &[Arc<RwLock<Vec<Arc<L0FileEntry>>>>]) -> Result<Option<u64>> {
+        let mut max_seq: Option<u64> = None;
         for bucket in 0u32..level0_files.len() as u32 {
             let dir = Self::level0_bucket_dir_from(base_path, bucket);
             if !dir.exists() {
@@ -848,6 +1006,20 @@ impl LSMTree {
                 let entry = entry?;
                 let path = entry.path();
                 if path.extension().map(|ext| ext == "dat").unwrap_or(false) {
+                    // L0 files are written in place (no temp+rename, unlike L1), so a
+                    // crash mid-flush can leave one too short to hold a header. That is
+                    // incomplete crash debris, not a format mismatch: skip it entirely
+                    // rather than registering it, or every later scan would fail header
+                    // validation on it. Its records are still in the WAL — the flush marks
+                    // them persisted only after the file is durable — so replay restores
+                    // them, exactly as it already does for a torn *tail* (which the frame
+                    // loop has always truncated silently). A file long enough to have a
+                    // header still goes through validation, so a pre-header database is
+                    // rejected rather than quietly skipped.
+                    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < SSTABLE_DATA_START {
+                        warn!("skipping incomplete Level-0 file {} (shorter than an SSTable header)", path.display());
+                        continue;
+                    }
                     if let Some(seq) = Self::level0_file_max_seq(&path)?
                         && max_seq.is_none_or(|m| seq_newer(seq, m))
                     {
@@ -861,6 +1033,15 @@ impl LSMTree {
         Ok(max_seq)
     }
 
+    /// Add a Level-0 file to the in-memory registry.
+    ///
+    /// One of the two points that establish "a registered L0 file has a valid
+    /// header" — the invariant [`open_registered_l0`] relies on to skip
+    /// re-validation on every read. Here it holds by construction: the only caller
+    /// is `create_level0_file_for_records`, which just wrote the header and
+    /// fsynced. The other point is `load_existing_level0_files` at open, which
+    /// validates what it finds on disk. **Do not register a file from anywhere
+    /// else without validating its header first.**
     fn register_level0_file(&self, bucket: u32, path: PathBuf, created_at_ms: u128) {
         let mut guard = self.level0_files[bucket as usize].write();
         if guard.iter().any(|entry| entry.path == path) {
@@ -961,6 +1142,7 @@ impl LSMTree {
         let level0_path = level0_dir.join(format!("{}.dat", timestamp_ms));
 
         let mut file = std::fs::File::create(&level0_path)?;
+        file.write_all(&sstable_header_bytes())?;
         for entry in bucket_records {
             let key_prefix = key_prefix_of(&entry.key);
             let entry_obj = SStableEntry {
@@ -986,14 +1168,19 @@ impl LSMTree {
         self.read_sstable_entries_from_file(&file)
     }
 
-    /// Read SSTable entries from a specific file path
+    /// Read SSTable entries from a specific file path.
+    ///
+    /// Called by the L0→L1 merge with a registered `L0FileEntry`'s path, so it uses
+    /// the registered-file opener (see [`open_registered_l0`]).
     fn read_sstable_entries_from_path(&self, path: &Path) -> Result<Vec<SStableEntry>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
 
         let mut entries = Vec::new();
-        let mut file = File::open(path)?;
+        let mut file = open_registered_l0_for_scan(path)?;
+        // Bound for `check_frame_len`: a frame can never be longer than its file.
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         loop {
             let mut size_buf = [0u8; 4];
@@ -1004,6 +1191,7 @@ impl LSMTree {
             }
 
             let size = u32::from_le_bytes(size_buf);
+            check_frame_len(u64::from(size), file_len)?;
             let mut entry_bytes = vec![0u8; size as usize];
             file.read_exact(&mut entry_bytes)?;
 
@@ -1110,7 +1298,10 @@ impl LSMTree {
         }
 
         let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        file.write_all(&sstable_header_bytes())?;
 
+        // Counts entry bytes only (it becomes `SStableMetadata::data_size`); the
+        // sparse index adds `SSTABLE_DATA_START` so its offsets stay absolute.
         let mut total_size = 0u64;
         let min_key = entries[0].key.clone();
         let max_key = entries[entries.len() - 1].key.clone();
@@ -1118,7 +1309,7 @@ impl LSMTree {
 
         for (i, entry) in entries.iter().enumerate() {
             if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
-                index.push(entry.key.clone(), total_size);
+                index.push(entry.key.clone(), SSTABLE_DATA_START + total_size);
             }
             let payload = encode_sstable_entry(entry)?;
             let size = payload.len() as u32;
@@ -1152,7 +1343,7 @@ impl LSMTree {
     /// Fold a candidate `(value-or-tombstone, seq)` into the running best,
     /// keeping the newest sequence. Callers feed candidates newest-layer-first so
     /// an exact sequence tie stays with the newer copy.
-    fn merge_candidate(best: &mut Option<(Option<u128>, u32)>, value: Option<u128>, seq: u32) {
+    fn merge_candidate(best: &mut Option<(Option<u128>, u64)>, value: Option<u128>, seq: u64) {
         if best.is_none_or(|(_, b)| seq_newer(seq, b)) {
             *best = Some((value, seq));
         }
@@ -1162,7 +1353,7 @@ impl LSMTree {
     /// value. Used by GC / journal replay to relocate a value's pointer while
     /// preserving its sequence, so the relocation neither loses to nor blocks a
     /// real write under highest-sequence-wins resolution.
-    pub(crate) fn get_with_seq(&self, key: &[u8]) -> Result<Option<(u128, u32)>> {
+    pub(crate) fn get_with_seq(&self, key: &[u8]) -> Result<Option<(u128, u64)>> {
         // Resolve by highest write sequence across ALL layers. Layer order is no
         // longer assumed to imply recency — a GC re-point can re-insert a value at
         // its old (low) sequence into a newer layer, above a deleting tombstone in
@@ -1170,7 +1361,7 @@ impl LSMTree {
         // the key. We inspect every layer and keep the newest-sequence entry; a
         // tombstone winning means the key is deleted. Layers are visited
         // newest-first so an exact sequence tie resolves to the newer copy.
-        let mut best: Option<(Option<u128>, u32)> = None;
+        let mut best: Option<(Option<u128>, u64)> = None;
 
         if let Some(m) = self.metrics() {
             Metrics::bump(&m.lookups);
@@ -1230,7 +1421,7 @@ impl LSMTree {
     /// instead. Deciding this from a pre-lock read (as the old code did) let two writers
     /// see the same old pointer and both mark it displaced, double-counting it while
     /// leaking the loser's record. `true` when the key is currently absent.
-    pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u32) -> Result<(Option<u128>, bool)> {
+    pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u64) -> Result<(Option<u128>, bool)> {
         match self.get_with_seq(key)? {
             Some((ptr, existing_seq)) => Ok((Some(ptr), seq_newer_or_eq(new_seq, existing_seq))),
             None => Ok((None, true)),
@@ -1242,7 +1433,7 @@ impl LSMTree {
     /// [`SkipList::try_insert_with_seq`]). This is the production write path; it
     /// makes the in-memory winner for racing same-key writes match the winner
     /// recovery would pick (recovery replays in sequence order).
-    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u32) -> Result<()> {
+    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u64) -> Result<()> {
         {
             let memtable = self.memtable.read();
             if memtable.should_flush(self.config.compaction_threshold_percent) {
@@ -1261,7 +1452,7 @@ impl LSMTree {
     /// Tombstone a key carrying an explicit global write sequence, with
     /// highest-sequence-wins resolution: a delete older than a concurrent write
     /// to the same key is dropped, matching recovery's sequence-ordered replay.
-    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: u32) -> Result<()> {
+    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: u64) -> Result<()> {
         {
             let memtable = self.memtable.read();
             if memtable.should_flush(self.config.compaction_threshold_percent) {
@@ -1282,7 +1473,7 @@ impl LSMTree {
 
     /// Fold a sequence into the lower-layer bound (serial-max), used whenever
     /// entries move from the active memtable into a lower layer.
-    fn note_lower_seq(&self, seq: u32) {
+    fn note_lower_seq(&self, seq: u64) {
         let mut cur = self.max_lower_seq.load(Ordering::Relaxed);
         while seq_newer(seq, cur) {
             match self.max_lower_seq.compare_exchange_weak(cur, seq, Ordering::Relaxed, Ordering::Relaxed) {
@@ -1420,7 +1611,10 @@ impl LSMTree {
 
     /// Tri-state lookup of a key in a specific SSTable file (by path).
     fn lookup_in_sstable_file_path(&self, path: std::path::PathBuf, key: &[u8]) -> Result<SsLookup> {
-        let file = File::open(&path)?;
+        // The hot path: `search_level0_files` calls this for *every* L0 file in the
+        // bucket on every point get that reaches L0. Reads below are positional, so
+        // no cursor seek, and the file is registered, so no header re-validation.
+        let file = open_registered_l0(&path)?;
         self.lookup_in_sstable_file(&file, key)
     }
 
@@ -1428,7 +1622,9 @@ impl LSMTree {
     /// L1 Bloom filter from the same pass (no extra I/O). Returns `None` for the
     /// bloom when the file has no entries.
     fn load_metadata_from_file(path: &Path, bucket: u32) -> Result<LoadedSstable> {
-        let mut file = File::open(path)?;
+        let mut file = open_sstable_for_scan(path)?;
+        // Bound for `check_frame_len`: a frame can never be longer than its file.
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         let mut min_key: Option<Vec<u8>> = None;
         let mut max_key: Option<Vec<u8>> = None;
@@ -1436,12 +1632,12 @@ impl LSMTree {
         let mut data_size = 0u64;
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut index = SparseIndex::new();
-        let mut max_seq: Option<u32> = None;
+        let mut max_seq: Option<u64> = None;
 
         loop {
-            // `data_size` is the cumulative byte length read so far == the offset
-            // of the frame we are about to read.
-            let frame_offset = data_size;
+            // `data_size` counts entry bytes only; the frame's absolute file
+            // offset is that plus the header the scan started after.
+            let frame_offset = SSTABLE_DATA_START + data_size;
 
             let mut size_buf = [0u8; 4];
             match file.read_exact(&mut size_buf) {
@@ -1451,6 +1647,7 @@ impl LSMTree {
             }
 
             let size = u32::from_le_bytes(size_buf);
+            check_frame_len(u64::from(size), file_len)?;
             let mut entry_bytes = vec![0u8; size as usize];
             file.read_exact(&mut entry_bytes)?;
 
@@ -1624,12 +1821,33 @@ impl LSMTree {
             {
                 let mut file_guard = self.sstable_files[bucket_idx].write();
 
-                if level1_path.exists() {
-                    let old_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.old", bucket));
-                    std::fs::rename(&level1_path, &old_path)?;
-                }
-
+                // Publish with a SINGLE atomic rename. `rename(2)` replaces the
+                // destination atomically, so the bucket's L1 path always names a
+                // complete SSTable — the old one before this call, the new one after,
+                // never nothing.
+                //
+                // This deliberately does NOT move the old file aside first. Doing so
+                // (`rename(level1 -> .old)` then `rename(.tmp -> level1)`) opened a
+                // crash window in which the L1 path did not exist at all: `LSMTree::open`
+                // would then `create(true)` a 0-byte file, `file_len == 0` would
+                // short-circuit the metadata load into "empty bucket", and
+                // `cleanup_old_files_on_startup` would delete the `.old` holding the only
+                // surviving copy. Every key that lived only in L1 was lost — silently,
+                // and with both a complete `.old` and a complete `.tmp` sitting on disk
+                // unread. Regression test: `test_crash_between_l1_publish_steps_keeps_l1`.
+                //
+                // Readers holding the previous `Arc<File>` keep reading the old inode
+                // until they drop it, which is unchanged from before.
                 std::fs::rename(&temp_path, &level1_path)?;
+
+                // Make the rename itself durable: without an fsync of the containing
+                // directory the swap can be lost on power failure, silently reverting
+                // to the pre-merge L1. That is consistent (the L0 inputs are still
+                // there, so it only costs the merge work) but it is not what the code
+                // above just reported as done.
+                if let Ok(dir) = File::open(Self::level1_dir_from(&self.base_path)) {
+                    let _ = dir.sync_all();
+                }
 
                 let new_file = OpenOptions::new().read(true).write(true).open(&level1_path)?;
                 *file_guard = Arc::new(new_file);
@@ -1657,10 +1875,9 @@ impl LSMTree {
             // written, so it matches the file just installed.
             *self.sstable_indexes[bucket_idx].write() = (!index.is_empty()).then(|| Arc::new(index));
 
-            let old_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.old", bucket));
-            if old_path.exists() {
-                let _ = std::fs::remove_file(old_path);
-            }
+            // No `.old` to clean up — the publish above is a single atomic rename and
+            // never creates one. `cleanup_old_files_on_startup` still sweeps any left
+            // by a database written before that change.
         }
 
         for entry in entries {
@@ -1836,7 +2053,7 @@ impl LSMTree {
     /// the value-log bucket write lock (GC compaction). This snapshot does NOT
     /// extend value-log GC protection — resolving a returned pointer outside that
     /// bracket reopens the wrong-file window closed in commit 420ac8e.
-    pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, u32)>> {
+    pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, u64)>> {
         // Merge stays oldest→newest into a BTreeMap<key, Option<(pointer, seq)>> with
         // overwrite, so active-memtable tombstones still shadow stale SSTable
         // entries (the precedence the tombstone fixes established).
@@ -1852,7 +2069,7 @@ impl LSMTree {
         // not captured yet, so it is never absent from every captured layer at
         // once. We capture cheap, frozen handles (active+RO snapshot, L0 read
         // guards, L1 `Arc<File>`) up front and do the I/O afterwards, then merge.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u32)>> = std::collections::BTreeMap::new();
+        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u64)>> = std::collections::BTreeMap::new();
 
         // Capture the memtable layers (newest) first: snapshot the active
         // memtable's matching records and clone the read-only list under a single
@@ -2019,7 +2236,7 @@ impl LSMTree {
         let mut offset = if start_offset != 0 && Self::valid_scan_start(file, start_offset, file_len, start) {
             start_offset
         } else {
-            0
+            SSTABLE_DATA_START
         };
 
         let mut live_seen = 0usize;
@@ -2030,6 +2247,7 @@ impl LSMTree {
                 break;
             }
             let size = u32::from_le_bytes(size_buf) as usize;
+            check_frame_len(size as u64, file_len)?;
             entry_bytes.resize(size, 0);
             Self::read_exact_at(file, &mut entry_bytes[..size], &mut offset)?;
             let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
@@ -2111,7 +2329,9 @@ impl LSMTree {
 
         // Then the captured Level 0 files oldest-first.
         for guard in &l0_guards {
-            let mut file = File::open(&guard.entry.path)?;
+            let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+            // Bound for `check_frame_len`: a frame can never be longer than its file.
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
             loop {
                 let mut size_buf = [0u8; 4];
                 match file.read_exact(&mut size_buf) {
@@ -2121,6 +2341,7 @@ impl LSMTree {
                 }
 
                 let size = u32::from_le_bytes(size_buf) as usize;
+                check_frame_len(size as u64, file_len)?;
                 entry_bytes.resize(size, 0);
                 file.read_exact(&mut entry_bytes[..size])?;
 
@@ -2262,7 +2483,9 @@ impl LSMTree {
                         s.spawn(move || -> Result<Vec<(Vec<u8>, Option<u128>)>> {
                             let mut bucket_entries = Vec::new();
                             for guard in guards {
-                                let mut file = File::open(&guard.entry.path)?;
+                                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+                                // Bound for `check_frame_len`: a frame can never be longer than its file.
+                                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                                 let mut entry_bytes: Vec<u8> = Vec::new();
                                 loop {
                                     let mut size_buf = [0u8; 4];
@@ -2272,6 +2495,7 @@ impl LSMTree {
                                         Err(e) => return Err(LSMError::Io(e)),
                                     }
                                     let size = u32::from_le_bytes(size_buf) as usize;
+                                    check_frame_len(size as u64, file_len)?;
                                     entry_bytes.resize(size, 0);
                                     file.read_exact(&mut entry_bytes[..size])?;
                                     let archived =
@@ -2342,12 +2566,12 @@ impl LSMTree {
     ///
     /// Returns one `Option<u128>` per input key in the same order.
     /// `None` means the key does not exist or was deleted (tombstone).
-    pub(crate) fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<(u128, u32)>>> {
+    pub(crate) fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<(u128, u64)>>> {
         let n = keys.len();
-        // Each resolved key carries its write `seq` (low u32) so the caller can
+        // Each resolved key carries its full-width write `seq` so the caller can
         // verify the value record still belongs to this write (stale-pointer /
         // recycled-slot detection — see `KVStore::get_multiple_inner`).
-        let mut results: Vec<Option<(u128, u32)>> = vec![None; n];
+        let mut results: Vec<Option<(u128, u64)>> = vec![None; n];
         let mut resolved: Vec<bool> = vec![false; n];
 
         // ── 1. Active memtable ────────────────────────────────────────────────
@@ -2423,7 +2647,9 @@ impl LSMTree {
                                 if lookup.is_empty() {
                                     break;
                                 }
-                                let mut file = File::open(&guard.entry.path)?;
+                                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+                                // Bound for `check_frame_len`: a frame can never be longer than its file.
+                                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                                 let mut entry_bytes: Vec<u8> = Vec::new();
                                 loop {
                                     let mut size_buf = [0u8; 4];
@@ -2433,6 +2659,7 @@ impl LSMTree {
                                         Err(e) => return Err(LSMError::Io(e)),
                                     }
                                     let size = u32::from_le_bytes(size_buf) as usize;
+                                    check_frame_len(size as u64, file_len)?;
                                     entry_bytes.resize(size, 0);
                                     file.read_exact(&mut entry_bytes[..size])?;
                                     let archived =
@@ -2508,7 +2735,7 @@ impl LSMTree {
                                 }
                             }
                             let file_content = &file_buf[..total_read];
-                            let mut pos = 0usize;
+                            let mut pos = SSTABLE_DATA_START as usize;
                             while pos + 4 <= file_content.len() && !lookup.is_empty() {
                                 let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
                                 pos += 4;
@@ -2599,10 +2826,10 @@ impl LSMTree {
         // wins only if its seq is newer-or-equal. The *capture* order stays
         // newest-first (memtables before SSTables) so a concurrent flush/compaction
         // cannot drop a live key; only the conflict *resolution* is seq-based.
-        let mut all_entries = std::collections::BTreeMap::<Vec<u8>, (Option<u128>, u32)>::new();
+        let mut all_entries = std::collections::BTreeMap::<Vec<u8>, (Option<u128>, u64)>::new();
         // Seq-aware merge: keep the newest-seq view of each key (ties keep the
         // later insert, i.e. the newer capture layer).
-        fn merge_kp(map: &mut std::collections::BTreeMap<Vec<u8>, (Option<u128>, u32)>, key: Vec<u8>, value: Option<u128>, seq: u32) {
+        fn merge_kp(map: &mut std::collections::BTreeMap<Vec<u8>, (Option<u128>, u64)>, key: Vec<u8>, value: Option<u128>, seq: u64) {
             match map.entry(key) {
                 std::collections::btree_map::Entry::Occupied(mut e) => {
                     if seq_newer_or_eq(seq, e.get().1) {
@@ -2691,7 +2918,9 @@ impl LSMTree {
                         s.spawn(move || -> Result<Vec<KpScanEntry>> {
                             let mut out = Vec::new();
                             for guard in &l0_ref[bucket as usize] {
-                                let mut file = File::open(&guard.entry.path)?;
+                                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+                                // Bound for `check_frame_len`: a frame can never be longer than its file.
+                                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                                 let mut entry_bytes: Vec<u8> = Vec::new();
                                 loop {
                                     let mut size_buf = [0u8; 4];
@@ -2701,6 +2930,7 @@ impl LSMTree {
                                         Err(e) => return Err(LSMError::Io(e)),
                                     }
                                     let size = u32::from_le_bytes(size_buf) as usize;
+                                    check_frame_len(size as u64, file_len)?;
                                     entry_bytes.resize(size, 0);
                                     file.read_exact(&mut entry_bytes[..size])?;
                                     let archived =
@@ -2769,9 +2999,11 @@ impl LSMTree {
     /// (pre-captured) Level-1 file. Tombstones are skipped: a seq-aware merge
     /// (`merge_level0_to_level1`) never writes a tombstone into L1, so an L1 entry
     /// is always live; a newer layer carrying the key shadows it by seq.
-    fn scan_bucket_key_pointers(&self, level1_file: &File) -> Result<Vec<(Vec<u8>, u128, u32)>> {
+    fn scan_bucket_key_pointers(&self, level1_file: &File) -> Result<Vec<(Vec<u8>, u128, u64)>> {
         let mut kvs = Vec::new();
-        let mut offset = 0u64;
+        // Bound for `check_frame_len`: a frame can never be longer than its file.
+        let file_len = level1_file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut offset = SSTABLE_DATA_START;
         let mut entry_bytes = Vec::new();
 
         loop {
@@ -2781,6 +3013,7 @@ impl LSMTree {
             }
 
             let size = u32::from_le_bytes(size_buf) as usize;
+            check_frame_len(size as u64, file_len)?;
             entry_bytes.resize(size, 0);
             Self::read_exact_at(level1_file, &mut entry_bytes[..size], &mut offset)?;
 
@@ -2844,7 +3077,9 @@ impl LSMTree {
         let read_l0_bucket = |bucket: usize| -> Result<Vec<(Vec<u8>, bool)>> {
             let mut bucket_entries = Vec::new();
             for guard in &l0_guards[bucket] {
-                let mut file = File::open(&guard.entry.path)?;
+                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+                // Bound for `check_frame_len`: a frame can never be longer than its file.
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut entry_bytes: Vec<u8> = Vec::new();
                 loop {
                     let mut size_buf = [0u8; 4];
@@ -2854,6 +3089,7 @@ impl LSMTree {
                         Err(e) => return Err(LSMError::Io(e)),
                     }
                     let size = u32::from_le_bytes(size_buf) as usize;
+                    check_frame_len(size as u64, file_len)?;
                     entry_bytes.resize(size, 0);
                     file.read_exact(&mut entry_bytes[..size])?;
                     let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
@@ -2990,7 +3226,7 @@ impl LSMTree {
     /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
     /// returned pointers are LSM-complete but must be resolved against the value log
     /// only inside the value-log generation bracket / GC bucket lock.
-    pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u32)>> {
+    pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u64)>> {
         // Merge stays oldest→newest with overwrite (L1 → L0 → RO → active) so
         // tombstone precedence is unchanged; only the *capture* order is reversed to
         // newest-first so a concurrent flush/compaction cannot drop a live key. See
@@ -2999,7 +3235,7 @@ impl LSMTree {
         // `end` (exclusive) bounds the scan to `[start, end)`; entries `>= end` are
         // never inserted so the merge map and the resulting page stay within the
         // requested key window.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u32)>> = std::collections::BTreeMap::new();
+        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u64)>> = std::collections::BTreeMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()` guard
         // so a flush cannot split a key between active and RO.
@@ -3038,7 +3274,9 @@ impl LSMTree {
         let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
             let mut bucket_entries = Vec::new();
             for guard in &l0_guards[bucket] {
-                let mut file = File::open(&guard.entry.path)?;
+                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
+                // Bound for `check_frame_len`: a frame can never be longer than its file.
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut entry_bytes: Vec<u8> = Vec::new();
                 loop {
                     let mut size_buf = [0u8; 4];
@@ -3048,6 +3286,7 @@ impl LSMTree {
                         Err(e) => return Err(LSMError::Io(e)),
                     }
                     let size = u32::from_le_bytes(size_buf) as usize;
+                    check_frame_len(size as u64, file_len)?;
                     entry_bytes.resize(size, 0);
                     file.read_exact(&mut entry_bytes[..size])?;
                     let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
@@ -3246,9 +3485,9 @@ impl LSMTree {
 /// counter gives every call a strictly higher sequence than any prior one.
 #[cfg(test)]
 impl LSMTree {
-    fn next_test_seq() -> u32 {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(1);
+    fn next_test_seq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
         SEQ.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -3290,6 +3529,283 @@ mod tests {
             num_buckets: crate::support::TEST_NUM_BUCKETS,
             ..LSMConfig::default()
         }
+    }
+
+    // The entry CRC covers only the body, so it cannot detect a *layout* change:
+    // the bytes are identical and only their interpretation differs. That is why
+    // SSTable files carry a magic + format version — without one, a database
+    // written before the `seq` widening would pass CRC and then be reinterpreted
+    // under the new layout, yielding garbage pointers instead of an error.
+    // These pin the guard that makes such a file fail loudly.
+    #[test]
+    fn test_pre_header_sstable_is_rejected_not_misread() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("legacy.dat");
+
+        // A file in the old headerless format: entry frames straight from offset 0.
+        {
+            let entry = SStableEntry {
+                key: b"k".to_vec(),
+                key_prefix: key_prefix_of(b"k"),
+                value: 42,
+                tombstone: false,
+                seq: 7,
+            };
+            let payload = encode_sstable_entry(&entry)?;
+            let mut f = File::create(&path)?;
+            f.write_all(&(payload.len() as u32).to_le_bytes())?;
+            f.write_all(&payload)?;
+            f.sync_all()?;
+        }
+
+        let err = open_sstable_for_scan(&path).expect_err("a pre-header SSTable must be rejected, not parsed");
+        assert!(
+            matches!(err, LSMError::Corruption(ref m) if m.contains("magic")),
+            "expected a bad-magic corruption error, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_with_unknown_format_version_is_rejected() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("future.dat");
+
+        // Correct magic, but a version this build does not know how to read.
+        let mut header = sstable_header_bytes();
+        header[4..8].copy_from_slice(&(SSTABLE_FORMAT_VERSION + 1).to_le_bytes());
+        let mut f = File::create(&path)?;
+        f.write_all(&header)?;
+        f.sync_all()?;
+        drop(f);
+
+        let err = open_sstable_for_scan(&path).expect_err("an unknown format version must be rejected");
+        assert!(
+            matches!(err, LSMError::Corruption(ref m) if m.contains("format version")),
+            "expected a format-version corruption error, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    // The guard is only useful if it fires on the path a real database takes at
+    // startup — `LSMTree::open` deliberately tolerates a partial metadata load, so
+    // this checks that leniency does not swallow an unreadable format.
+    #[test]
+    fn test_open_rejects_l1_file_written_in_an_older_format() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        {
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            lsm.insert_with_seq(b"k", 0xAAAA, 1)?;
+            lsm.flush_memtable_to_level0()?;
+            lsm.compact_all()?; // → a real, header-bearing L1 file
+        }
+
+        // Strip the header to simulate a file written before headers existed.
+        let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+        let l1 = LSMTree::level1_path_from(temp_dir.path(), bucket);
+        let body = std::fs::read(&l1)?;
+        assert!(body.len() as u64 > SSTABLE_DATA_START, "setup: L1 file should hold entries");
+        std::fs::write(&l1, &body[SSTABLE_DATA_START as usize..])?;
+
+        // `LSMTree` is not `Debug`, so match on the result rather than `expect_err`.
+        match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+            Ok(_) => panic!("open must reject an unreadable L1 format, but it succeeded"),
+            Err(LSMError::Corruption(m)) => assert!(m.contains("magic"), "expected a bad-magic corruption error, got: {m}"),
+            Err(e) => panic!("expected a corruption error, got: {e:?}"),
+        }
+        Ok(())
+    }
+
+    // A frame's 4-byte length prefix sits *outside* the entry CRC (which covers only
+    // the body), so a flipped bit there is undetectable until after the payload has
+    // been read — and the readers used to allocate from it first. A corrupt length
+    // could therefore request up to 4 GiB from a file of a few dozen bytes.
+    //
+    // Both the old and new code end in an error here, so the assertion has to be on
+    // *which* error: the guard reports the impossible length itself, whereas an
+    // unguarded reader allocates, tries to fill the buffer, and surfaces an unrelated
+    // `Io(UnexpectedEof)` — having already committed the allocation.
+    #[test]
+    fn test_corrupt_frame_length_is_rejected_before_allocating() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+
+        for bogus in [u32::MAX, 1 << 30, 0] {
+            let path = temp_dir.path().join(format!("frame_{bogus}.dat"));
+            let mut f = File::create(&path)?;
+            f.write_all(&sstable_header_bytes())?;
+            f.write_all(&bogus.to_le_bytes())?; // claims `bogus` bytes…
+            f.write_all(&[0xABu8; 8])?; // …but the file holds 8
+            f.sync_all()?;
+            drop(f);
+
+            let file_len = std::fs::metadata(&path)?.len();
+            assert!(file_len < 64, "setup: the file must be far smaller than the claimed frame");
+
+            let err = LSMTree::level0_file_max_seq(&path).expect_err("a frame longer than its file must be rejected");
+            match err {
+                LSMError::Corruption(m) => assert!(
+                    m.contains("declares"),
+                    "expected the frame-length guard to fire, got a different corruption: {m}"
+                ),
+                other => panic!("expected the frame-length guard to fire before allocating, got: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    // The L1 publish must never leave the bucket's L1 path missing. It used to move the
+    // live file aside (`rename(level1 -> .old)`) before renaming the new one in, and a
+    // crash in between was silent, permanent loss of every key that lived only in L1:
+    // `LSMTree::open` created a 0-byte L1, `file_len == 0` short-circuited the metadata
+    // load into "empty bucket", and `cleanup_old_files_on_startup` then deleted the
+    // `.old` that still held the data.
+    //
+    // The fix is structural — one atomic `rename(2)`, which replaces the destination —
+    // so the property to pin is that no reachable intermediate state has the L1 path
+    // absent or empty while data lives only there.
+    //
+    // Note the setup must call `cleanup_obsolete_level0_files()`: without it the merged
+    // L0 file is still on disk and answers the read, masking the loss entirely.
+    #[test]
+    fn test_crash_between_l1_publish_steps_keeps_l1() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+        let l1 = LSMTree::level1_path_from(temp_dir.path(), bucket);
+        {
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            lsm.insert_with_seq(b"k", 0xAAAA, 1)?;
+            lsm.flush_memtable_to_level0()?;
+            lsm.compact_all()?;
+            lsm.cleanup_obsolete_level0_files();
+            assert_eq!(lsm.get(b"k")?, Some(0xAAAA), "setup: key should be readable from L1");
+        }
+
+        // The key must now live *only* in L1, or this test cannot observe the bug.
+        let l0_dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
+        let l0_files = std::fs::read_dir(&l0_dir).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(l0_files, 0, "setup: no L0 file may remain, or it would mask the loss");
+        assert!(std::fs::metadata(&l1)?.len() > SSTABLE_DATA_START, "setup: L1 must hold the entry");
+
+        // The window is only visible *during* a publish — a completed merge removed its
+        // `.old`, so inspecting the final state proves nothing (an earlier version of
+        // this test asserted exactly that and passed against the bug). Watch the L1 path
+        // from another thread while compactions run, and assert it is never absent: that
+        // is precisely the state a crash would freeze, and the state `LSMTree::open`
+        // turns into an empty bucket.
+        let lsm = Arc::new(LSMTree::open(temp_dir.path(), test_lsm_config())?);
+        let stop = Arc::new(AtomicBool::new(false));
+        let vanished = Arc::new(AtomicUsize::new(0));
+
+        let observer = {
+            let (l1, stop, vanished) = (l1.clone(), Arc::clone(&stop), Arc::clone(&vanished));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // "Absent" and "present but 0 bytes" are the same failure: both make
+                    // `LSMTree::open` short-circuit into an empty bucket.
+                    match std::fs::metadata(&l1) {
+                        Err(_) => {
+                            vanished.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(m) if m.len() == 0 => {
+                            vanished.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(_) => {}
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        // seq 1 belongs to the key seeded above, so these start at 2.
+        for round in 0..200u64 {
+            lsm.insert_with_seq(format!("k{round:04}").as_bytes(), 0xCCCC + round as u128, 2 + round)?;
+            lsm.flush_memtable_to_level0()?;
+            lsm.compact_bucket(bucket)?;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        observer.join().expect("observer thread panicked");
+
+        assert_eq!(
+            vanished.load(Ordering::Relaxed),
+            0,
+            "the L1 path was absent/empty mid-publish — a crash in that window makes \
+             LSMTree::open create a 0-byte L1 and lose every key that lived only in L1"
+        );
+        assert_eq!(lsm.get(b"k")?, Some(0xAAAA), "the original L1-only key must survive the merges");
+        Ok(())
+    }
+
+    // Reads of a *registered* L0 file skip header validation (`open_registered_l0`),
+    // so `LSMTree::open` is the only thing standing between a pre-header database and
+    // a garbage reinterpretation of its L0 files. This pins that single guard: without
+    // it, the stripped file would be loaded and its entries parsed under the wrong
+    // layout, with nothing downstream to notice.
+    #[test]
+    fn test_open_rejects_l0_file_written_in_an_older_format() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        {
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            lsm.insert_with_seq(b"k", 0xAAAA, 1)?;
+            lsm.flush_memtable_to_level0()?; // → a real, header-bearing L0 file
+        }
+
+        let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+        let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
+        let l0 = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
+        let body = std::fs::read(&l0)?;
+        // Strip the header, leaving enough bytes that this is a *format* mismatch and
+        // not the sub-header "incomplete debris" case, which is skipped by design.
+        let stripped = &body[SSTABLE_DATA_START as usize..];
+        assert!(
+            stripped.len() as u64 > SSTABLE_DATA_START,
+            "setup: stripped L0 body must stay longer than a header"
+        );
+        std::fs::write(&l0, stripped)?;
+
+        match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+            Ok(_) => panic!("open must reject an unreadable L0 format, but it succeeded"),
+            Err(LSMError::Corruption(m)) => assert!(m.contains("magic"), "expected a bad-magic corruption error, got: {m}"),
+            Err(e) => panic!("expected a corruption error, got: {e:?}"),
+        }
+        Ok(())
+    }
+
+    // The L0 counterpart of the check above, and the case where the two levels must
+    // behave *differently*. L1 is written to a temp file and renamed, so an L1 file at
+    // its final path is always complete; L0 is written in place, so a crash mid-flush
+    // can leave one shorter than a header. That is incomplete debris, not a stale
+    // format, and the records are still in the WAL — so open must skip it and carry on
+    // rather than refusing to start the database.
+    #[test]
+    fn test_open_skips_a_crash_truncated_level0_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        {
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            lsm.insert_with_seq(b"survivor", 0xAAAA, 1)?;
+            lsm.insert_with_seq(b"k", 0xBBBB, 2)?;
+            lsm.flush_memtable_to_level0()?;
+        }
+
+        let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+        let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
+        let torn = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
+        // A crash between `File::create` and the header write leaves 0 bytes.
+        std::fs::write(&torn, b"")?;
+
+        let lsm = match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+            Ok(lsm) => lsm,
+            Err(e) => panic!("open must skip an incomplete L0 file, not fail the whole database: {e:?}"),
+        };
+        // Reads must still work — the torn file must not be registered, or every later
+        // scan would fail header validation on it.
+        assert_eq!(
+            lsm.get(b"k")?,
+            None,
+            "the torn file's records are gone from L0 (WAL replay restores them)"
+        );
+        lsm.scan_prefix(b"")?;
+        Ok(())
     }
 
     #[test]
@@ -3524,6 +4040,63 @@ mod tests {
         Ok(())
     }
 
+    // Regression: a cold key's L1 entry keeps its original seq forever, so the
+    // gap between it and a much-later write to the same key is unbounded. The
+    // sequence width must therefore cover the database's whole lifetime — a
+    // 32-bit seq with RFC-1982 serial comparison silently inverts once the gap
+    // exceeds 2^31 (~2.1B writes, ~2.5 days at 10k writes/s), making the *newer*
+    // write compare as older. The skip list's own justification for a narrow seq
+    // ("the memtable flushes long before 2 billion writes accumulate") holds only
+    // for the memtable and must not be extended to the SSTable levels.
+    //
+    // Symptoms this pins: `get` returns the stale L1 value, and
+    // `merge_level0_to_level1` then bakes it into L1 permanently.
+    #[test]
+    fn test_write_after_huge_seq_gap_beats_cold_l1_entry() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+
+        // A cold key written early in the database's life, compacted down to L1
+        // where it keeps seq 1000 indefinitely.
+        const OLD_SEQ: u64 = 1_000;
+        lsm.insert_with_seq(b"cold", 0xAAAA, OLD_SEQ)?;
+        // `compact_all` only drains read-only memtables, so seal the active one
+        // first — otherwise the entry never leaves the memtable and this exercises
+        // the skip list instead of the L1 path it is meant to cover.
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        let bucket = get_bucket_for_key(b"cold", crate::support::TEST_NUM_BUCKETS);
+        let l1_len = std::fs::metadata(LSMTree::level1_path_from(temp_dir.path(), bucket))?.len();
+        assert!(
+            l1_len > SSTABLE_DATA_START,
+            "setup: the cold entry must actually be in L1, not still in memory"
+        );
+        assert_eq!(lsm.get(b"cold")?, Some(0xAAAA), "setup: cold value should read back from L1");
+
+        // ~3B writes later the same key is updated. The gap exceeds 2^31, which
+        // is exactly what a 32-bit serial comparison cannot represent.
+        const NEW_SEQ: u64 = OLD_SEQ + 3_000_000_000;
+        assert!(NEW_SEQ - OLD_SEQ > u64::from(u32::MAX) / 2, "test premise: gap must exceed 2^31");
+        lsm.insert_with_seq(b"cold", 0xBBBB, NEW_SEQ)?;
+
+        assert_eq!(
+            lsm.get(b"cold")?,
+            Some(0xBBBB),
+            "a newer write lost to a cold L1 entry — sequence comparison inverted across the gap"
+        );
+
+        // The inversion is permanent once the merge resolves the conflict, so
+        // check the post-compaction state too.
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        assert_eq!(
+            lsm.get(b"cold")?,
+            Some(0xBBBB),
+            "the stale value was baked into L1 — the merge resolved the conflict backwards"
+        );
+        Ok(())
+    }
+
     // Regression: the read fast-path bound `max_lower_seq` must be initialized
     // from L0 files (not just L1) at open. L0 is newer than L1, so an L0-only
     // tombstone's seq would otherwise be missing from the bound after a restart,
@@ -3686,6 +4259,11 @@ mod tests {
         // follow, so the merge's read_sstable_entries_from_path fails on
         // read_exact. (A *missing* file is treated as empty, not an error, so the
         // file must exist but be malformed.)
+        //
+        // The corruption must keep a **valid SSTable header** — these files stay in
+        // the L0 registry, and registered files are opened without re-validating
+        // (see `open_registered_l0`). A headerless body would just read as EOF past
+        // `SSTABLE_DATA_START`, i.e. an empty file, and the merge would succeed.
         let mut corrupted = 0;
         for bucket in 0..lsm.config.num_buckets as u32 {
             let bucket_dir = LSMTree::level0_bucket_dir_from(&lsm.base_path, bucket);
@@ -3693,7 +4271,8 @@ mod tests {
             for entry in rd {
                 let path = entry?.path();
                 if path.is_file() {
-                    let mut bad = 100u32.to_le_bytes().to_vec(); // claims a 100-byte entry…
+                    let mut bad = sstable_header_bytes().to_vec();
+                    bad.extend_from_slice(&100u32.to_le_bytes()); // claims a 100-byte entry…
                     bad.extend_from_slice(&[0xABu8; 10]); // …but only 10 bytes follow
                     std::fs::write(&path, &bad)?;
                     corrupted += 1;
@@ -4268,7 +4847,7 @@ mod tests {
     }
 
     /// Sort scan output to `(key, pointer)` for order-insensitive comparison.
-    fn kv_sorted(v: Vec<(Vec<u8>, u128, u32)>) -> Vec<(Vec<u8>, u128)> {
+    fn kv_sorted(v: Vec<(Vec<u8>, u128, u64)>) -> Vec<(Vec<u8>, u128)> {
         let mut r: Vec<(Vec<u8>, u128)> = v.into_iter().map(|(k, val, _)| (k, val)).collect();
         r.sort();
         r

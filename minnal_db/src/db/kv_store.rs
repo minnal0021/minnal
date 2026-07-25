@@ -31,8 +31,8 @@ use std::time::Duration;
 /// A resolved key/value pair: both the key and the value bytes read from the value log.
 pub(crate) type KeyValue = (Vec<u8>, Vec<u8>);
 
-/// A key paired with its encoded value-log pointer and the LSM write `seq` (low u32).
-pub(crate) type KeyPointer = (Vec<u8>, u128, u32);
+/// A key paired with its encoded value-log pointer and the full-width LSM write `seq`.
+pub(crate) type KeyPointer = (Vec<u8>, u128, u64);
 
 /// One page of a cursor scan: the resolved pairs plus the next cursor
 /// (`None` when the scan is exhausted).
@@ -295,10 +295,15 @@ impl KVStore {
         *self.seq_counter.write() = counter;
     }
 
-    /// Allocate the next write sequence (truncated to the skip list's `u32`
-    /// sequence width; serial-number comparison tolerates the truncation).
-    pub(crate) fn alloc_seq(&self) -> u32 {
-        self.seq_counter.read().fetch_add(1, Ordering::Relaxed) as u32
+    /// Allocate the next write sequence at full `u64` width.
+    ///
+    /// Must not be narrowed: the LSM compares a fresh write's sequence against
+    /// entries that can be arbitrarily old (an L1 entry keeps its sequence for
+    /// the lifetime of the database), so the width has to span the whole
+    /// sequence space, not just a recent window. See [`crate::store::lsm::lsm_tree`]'s
+    /// `seq_newer`.
+    pub(crate) fn alloc_seq(&self) -> u64 {
+        self.seq_counter.read().fetch_add(1, Ordering::Relaxed)
     }
 
     // ── Row-ID resolution ──────────────────────────────────────────────
@@ -437,7 +442,7 @@ impl KVStore {
     /// uses [`put_to_storage_seq`](Self::put_to_storage_seq) so the conflict-
     /// resolution sequence equals the WAL append order (live == recovery).
     pub fn put_to_storage(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_to_storage_inner(key, value, self.alloc_seq() as u64)
+        self.put_to_storage_inner(key, value, self.alloc_seq())
     }
 
     /// Put a key-value pair carrying an explicit global write sequence, so
@@ -464,7 +469,7 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
         let displaced = existing_u128.and_then(decode_sharded_pointer);
         let mut old_value: Option<Vec<u8>> = None;
         if let Some(existing_ptr) = displaced {
@@ -482,7 +487,7 @@ impl KVStore {
             seq,
         };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
+        self.lsm.insert_with_seq(key, pointer.to_u128(), seq)?;
 
         // Account the record that is now garbage — accounting only, no I/O and no
         // in-place edit (the old record's segment may be sealed and immutable). If this
@@ -689,7 +694,7 @@ impl KVStore {
     /// store's counter (used by TTL expiry / standalone tests); the WAL-backed
     /// path uses [`delete_from_storage_seq`](Self::delete_from_storage_seq).
     pub fn delete_from_storage(&self, key: &[u8]) -> Result<()> {
-        self.delete_from_storage_inner(key, self.alloc_seq() as u64)
+        self.delete_from_storage_inner(key, self.alloc_seq())
     }
 
     /// Delete carrying an explicit global write sequence, so a delete racing a
@@ -724,7 +729,7 @@ impl KVStore {
                 old_value = self.value_log.read_value(existing_ptr).ok();
             }
         }
-        self.lsm.delete_with_seq(key, seq as u32)?;
+        self.lsm.delete_with_seq(key, seq)?;
 
         // The deleted key's record is garbage now. Accounting only — the record itself
         // is never touched (its segment may be sealed and immutable), and liveness was
@@ -1182,7 +1187,7 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq as u32)?;
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
         let displaced = existing_u128.and_then(decode_sharded_pointer);
         if let Some(existing_ptr) = displaced
             && let Ok(meta) = self.value_log.read_record_meta(existing_ptr)
@@ -1196,7 +1201,7 @@ impl KVStore {
             seq,
         };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        self.lsm.insert_with_seq(key, pointer.to_u128(), seq as u32)?;
+        self.lsm.insert_with_seq(key, pointer.to_u128(), seq)?;
         if wins {
             if let Some(old) = displaced {
                 self.value_log.note_displaced(old, key.len());
@@ -1218,7 +1223,7 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         let displaced = self.lsm.get(key).ok().flatten().and_then(decode_sharded_pointer);
-        self.lsm.delete_with_seq(key, seq as u32)?;
+        self.lsm.delete_with_seq(key, seq)?;
         if let Some(old) = displaced {
             self.value_log.note_displaced(old, key.len());
         }
