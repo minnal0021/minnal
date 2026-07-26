@@ -1191,9 +1191,48 @@ impl Database {
         {
             let wal_tail = self.wal_metadata.read().tail;
             if wal_tail > 0 {
-                let checkpoint_offset = self.index_manager.read_checkpoint(namespace_id, field_id, wal_tail);
+                let checkpoint_state = self.index_manager.read_checkpoint_state(namespace_id, field_id, wal_tail);
+                let checkpoint_offset = checkpoint_state.replay_offset();
                 if checkpoint_offset < wal_tail {
                     let wal_head = self.wal_metadata.read().head;
+
+                    // Report — but do not act on — a replay window the WAL can no
+                    // longer satisfy. WAL GC reclaims a segment once its entries are
+                    // persisted to the *LSM*; it never consults these checkpoint
+                    // markers, so the segments that would heal this field's index may
+                    // already be gone. `scan_entries` skips a missing segment as a
+                    // hole and returns what it can, silently, which is exactly how
+                    // this stayed invisible. Checking segment *presence* rather than
+                    // `checkpoint_offset < wal_head` matters: GC reclaims
+                    // fully-persisted segments out of order, so a hole can sit in the
+                    // middle of the window while `head` is still below the checkpoint.
+                    //
+                    // Detection only — the replay below is unchanged, and the missing
+                    // updates are unrecoverable from here. Recording, surfacing and
+                    // repairing this is tracked in
+                    // `docs/feature-requests/index-replay-gap-remediation.md`.
+                    if let Some(gap) = crate::db::index_manager::detect_replay_gap(
+                        checkpoint_state,
+                        dyn_index.distinct_count() == 0,
+                        wal_tail,
+                        self.wal.missing_segments(checkpoint_offset, wal_tail),
+                    ) {
+                        error!(
+                            "[activate_field_index] ns={} field={}: field index is INCOMPLETE and cannot be repaired \
+                             by WAL replay — {} WAL segment(s) covering the replay window [{}, {}) have been reclaimed \
+                             (missing segment ids: {:?}, checkpoint marker: {:?}). Every write recorded in those \
+                             segments is absent from this field index, so queries on it will return incomplete \
+                             results until the index is rebuilt. Re-index this field to restore full coverage.",
+                            namespace_id,
+                            field_id,
+                            gap.missing_segments.len(),
+                            gap.from,
+                            gap.to,
+                            gap.missing_segments,
+                            checkpoint_state,
+                        );
+                    }
+
                     let entries = self.wal.scan_entries(wal_head.max(checkpoint_offset), wal_tail)?;
                     let mut affected_keys = std::collections::BTreeSet::<Vec<u8>>::new();
                     for (_, wal_entry) in &entries {
@@ -4374,6 +4413,84 @@ mod tests {
 
         // Persisted data is still readable after the segments were deleted.
         assert_eq!(db.get(b"wal_0000")?, Some(vec![b'v'; 64]));
+        Ok(())
+    }
+
+    /// The replay-gap condition is reachable through the ordinary write → persist
+    /// → WAL-GC path, with nothing corrupted or hand-punched.
+    ///
+    /// WAL GC reclaims a segment once its entries are persisted to the **LSM**;
+    /// it never consults the field-index checkpoint markers. So a field whose
+    /// checkpoint still points into a reclaimed segment can no longer be repaired
+    /// by replay — `scan_entries` skips the missing segments as holes and returns
+    /// a partial result with no error, which is how this stayed invisible.
+    ///
+    /// This pins the *detectability* of that condition (the logging added at
+    /// `activate_field_index` keys on exactly these two inputs), not a fix.
+    /// Remediation is tracked in
+    /// `docs/feature-requests/index-replay-gap-remediation.md`.
+    #[test]
+    fn wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable() -> Result<()> {
+        use crate::db::index_manager::{CheckpointState, detect_replay_gap};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
+
+        // A field index checkpointed early: its marker records the WAL tail as of
+        // now, which is what the crash-recovery replay would start from.
+        for i in 0..40u32 {
+            db.put(format!("gap_{:04}", i).as_bytes(), &[b'v'; 64])?;
+        }
+        let checkpoint_offset = db.wal_metadata.read().tail;
+        assert!(checkpoint_offset > 0, "expected writes to have advanced the WAL tail");
+
+        // More writes, then persist them to the LSM. That is all WAL GC looks at.
+        for i in 40..400u32 {
+            db.put(format!("gap_{:04}", i).as_bytes(), &[b'v'; 64])?;
+        }
+        db.flush_all_namespaces()?;
+
+        let wal_tail = db.wal_metadata.read().tail;
+        assert!(
+            db.wal.segment_id_for_offset(wal_tail - 1) > 1,
+            "test needs several WAL segments, tail is {wal_tail}"
+        );
+        assert!(
+            db.wal.missing_segments(checkpoint_offset, wal_tail).is_empty(),
+            "no segment should be missing before GC runs"
+        );
+
+        let (reclaimed, _) = db.garbage_collect_wal()?;
+        assert!(reclaimed > 0, "WAL GC should have reclaimed fully-persisted segments");
+
+        // The segments that would have healed a field index checkpointed at
+        // `checkpoint_offset` are now gone — through nothing but normal operation.
+        let missing = db.wal.missing_segments(checkpoint_offset, wal_tail);
+        assert!(
+            !missing.is_empty(),
+            "WAL GC reclaimed past a field checkpoint at {checkpoint_offset}, so segments in \
+             [{checkpoint_offset}, {wal_tail}) should be gone"
+        );
+
+        // ...and replay from that offset silently returns a partial result rather
+        // than reporting the hole — the silence this detection exists to break.
+        let wal_head = db.wal_metadata.read().head;
+        let replayed = db.wal.scan_entries(wal_head.max(checkpoint_offset), wal_tail)?;
+        // Observed: 10 segments reclaimed, head forced from the 4,671-byte
+        // checkpoint up to 45,056, and only 15 of the ~360 writes in the window
+        // still replayable. The other ~345 are gone from the field index for good.
+        assert!(
+            replayed.len() < 100,
+            "replay should be short by the reclaimed segments' entries, got {} of ~360",
+            replayed.len()
+        );
+
+        // Which is exactly what the detector reports on.
+        let gap = detect_replay_gap(CheckpointState::At(checkpoint_offset), false, wal_tail, missing).expect("replay gap should be detected");
+        assert_eq!(gap.from, checkpoint_offset);
+        assert_eq!(gap.to, wal_tail);
+
+        db.shutdown()?;
         Ok(())
     }
 

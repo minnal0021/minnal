@@ -680,6 +680,33 @@ impl Wal {
         Ok(())
     }
 
+    /// Segment ids covering `[head, tail)` whose files are **absent**.
+    ///
+    /// A caller that scans this range gets no error for a missing segment —
+    /// [`scan_entries`](Self::scan_entries) deliberately treats one as a hole and
+    /// skips it, because aborting there would stall `mark_persisted_range` and
+    /// wedge WAL GC. That is correct for the LSM recovery path (those entries are
+    /// persisted by definition, which is why GC reclaimed them) but it means any
+    /// *other* consumer replaying this range is silently handed an incomplete
+    /// result. This reports the holes so such a consumer can say so.
+    ///
+    /// Presence is checked against the filesystem rather than inferred from
+    /// `WalMetadata`'s per-segment counters, which are trimmed and zeroed on
+    /// reclamation and so cannot distinguish "deleted" from "untracked".
+    ///
+    /// Note WAL GC reclaims fully-persisted segments **out of order** (see
+    /// `Database::garbage_collect_wal`), so a hole can sit in the middle of the
+    /// range while `WalMetadata::head` is still below it — comparing an offset
+    /// against `head` alone under-reports.
+    pub fn missing_segments(&self, head: u64, tail: u64) -> Vec<u64> {
+        if tail <= head {
+            return Vec::new();
+        }
+        let first = self.segment_id_for(head);
+        let last = self.segment_id_for(tail - 1);
+        (first..=last).filter(|&id| !self.segment_path_for(id).exists()).collect()
+    }
+
     /// Scan all entries from head to tail, filtering by status
     pub fn scan_entries(&self, head: u64, tail: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
         let mut entries = Vec::new();
@@ -1289,6 +1316,44 @@ mod tests {
         assert!(segment_path.exists());
         wal.delete_segment_file(1)?;
         assert!(!segment_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_segments_reports_a_hole_in_the_middle_of_the_range() -> Result<()> {
+        // WAL GC reclaims fully-persisted segments out of *segment* order, so a
+        // hole can sit in the middle of a replay window while `head` is still
+        // below it. `scan_entries` skips such a hole silently, which is why a
+        // consumer replaying the range needs this to know its result is partial.
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("holes.wal");
+        let wal = Wal::open_with_options_and_segment_size(&path, false, 256)?;
+
+        let mut tail = 0u64;
+        for i in 0..50u32 {
+            let key = format!("k{}", i).into_bytes();
+            wal.append_entry(&WalEntry::new_upsert(key, vec![b'x'; 40]), &mut tail, false)?;
+        }
+        assert!(wal.segment_id_for_offset(tail - 1) >= 3, "test needs several segments, got {tail} bytes");
+
+        assert_eq!(wal.missing_segments(0, tail), Vec::<u64>::new(), "nothing deleted yet");
+
+        // Reclaim an interior segment, leaving 0 and everything above it in place.
+        wal.delete_segment_file(1)?;
+        assert_eq!(wal.missing_segments(0, tail), vec![1]);
+
+        // A window that does not cover the hole is unaffected.
+        let seg2_start = 2 * wal.segment_size();
+        assert_eq!(wal.missing_segments(seg2_start, tail), Vec::<u64>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_segments_is_empty_for_an_empty_range() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("empty.wal"), false, 256)?;
+        assert_eq!(wal.missing_segments(0, 0), Vec::<u64>::new());
+        assert_eq!(wal.missing_segments(500, 100), Vec::<u64>::new(), "tail <= head");
         Ok(())
     }
 
