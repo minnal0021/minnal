@@ -9,6 +9,7 @@
 //! POST   /stores/{ns}/query                    → index predicate query
 //! ```
 
+use crate::limits::Limit;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -136,14 +137,8 @@ pub async fn delete_doc(State(state): State<AppState>, Path((ns, id_str)): Path<
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn default_page_size() -> usize {
-    20
-}
 fn default_page_no() -> usize {
     1
-}
-fn default_limit() -> usize {
-    20
 }
 
 /// Query parameters for the range scan endpoint.
@@ -151,8 +146,8 @@ fn default_limit() -> usize {
 pub struct RangeParams {
     start: String,
     end: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
 }
@@ -162,12 +157,12 @@ pub async fn range_query(
     Path(ns): Path<String>,
     Query(params): Query<RangeParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    debug!(namespace = %ns, start = %params.start, end = ?params.end, limit = params.limit, "range query");
+    debug!(namespace = %ns, start = %params.start, end = ?params.end, limit = %params.limit, "range query");
     let key_type = key_type_for(&state, &ns).await?;
     let start = parse_doc_id(&params.start, key_type)?;
     let end = params.end.as_deref().map(|s| parse_doc_id(s, key_type)).transpose()?;
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-    let page = state.store.scan_range(&ns, start, end, cursor, params.limit).await?;
+    let page = state.store.scan_range(&ns, start, end, cursor, params.limit.get()).await?;
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -206,8 +201,8 @@ pub struct PrefixScanParams {
     /// starts with those 8 bytes.  For U64/U128 stores, supply the big-endian
     /// hex representation of the desired prefix.
     prefix: String,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
 }
@@ -217,10 +212,10 @@ pub async fn prefix_scan(
     Path(ns): Path<String>,
     Query(params): Query<PrefixScanParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    debug!(namespace = %ns, prefix = %params.prefix, limit = params.limit, "prefix scan");
+    debug!(namespace = %ns, prefix = %params.prefix, limit = %params.limit, "prefix scan");
     let prefix_bytes = parse_hex_prefix(&params.prefix)?;
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-    let page = state.store.scan_prefix(&ns, prefix_bytes, cursor, params.limit).await?;
+    let page = state.store.scan_prefix(&ns, prefix_bytes, cursor, params.limit.get()).await?;
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -238,18 +233,18 @@ pub async fn prefix_scan(
 #[derive(Deserialize)]
 pub struct QueryPaginationParams {
     page_no: Option<usize>,
-    page_size: Option<usize>,
+    page_size: Option<Limit>,
     /// Alias for `page_size` so `limit` works uniformly with the cursor-paginated
     /// scan endpoints. `page_size` wins if both are given.
-    limit: Option<usize>,
+    limit: Option<Limit>,
 }
 
 /// Request body for `POST /stores/{ns}/query`.
 #[derive(Deserialize)]
 pub struct QueryRequest {
     predicate: String,
-    #[serde(default = "default_page_size")]
-    page_size: usize,
+    #[serde(default)]
+    page_size: Limit,
     #[serde(default = "default_page_no")]
     page_no: usize,
 }
@@ -263,7 +258,7 @@ pub async fn index_query(
     debug!(namespace = %ns, predicate = %req.predicate, "index query");
     let (ns_id, key_type) = ns_schema_for(&state, &ns).await?;
     let page_no = qp.page_no.unwrap_or(req.page_no);
-    let page_size = qp.page_size.or(qp.limit).unwrap_or(req.page_size);
+    let page_size = qp.page_size.or(qp.limit).unwrap_or(req.page_size).get();
     let pagination = Pagination::new(page_no, page_size);
     let page = state.store.query_resolved(&ns, &req.predicate, pagination, ns_id, key_type).await?;
     let results: Vec<serde_json::Value> = page

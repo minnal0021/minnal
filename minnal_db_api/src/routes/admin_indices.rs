@@ -23,6 +23,7 @@
 //! POST   /admin/indices/{ns}/vector/queue/{doc_id}/retry  → retry one exhausted entry
 //! ```
 
+use crate::limits::Limit;
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
@@ -752,15 +753,12 @@ pub struct QueueListResponse {
 pub struct QueuePaginationParams {
     #[serde(default = "default_page_no")]
     page_no: usize,
-    #[serde(default = "default_page_size")]
-    page_size: usize,
+    #[serde(default)]
+    page_size: Limit,
 }
 
 fn default_page_no() -> usize {
     1
-}
-fn default_page_size() -> usize {
-    20
 }
 
 fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> QueueListResponse {
@@ -776,7 +774,7 @@ fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> Que
 /// `GET /admin/indices/vector/queue/retried` — entries retried at least once (all namespaces).
 pub async fn vector_queue_retried(State(state): State<AppState>, Query(params): Query<QueuePaginationParams>) -> impl IntoResponse {
     let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.retry_count > 0).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/vector/queue/summary` — global queue depth and lag.
@@ -847,7 +845,7 @@ pub async fn vector_queue_by_namespace(
     Query(params): Query<QueuePaginationParams>,
 ) -> impl IntoResponse {
     let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.namespace == ns).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/retried` — retried entries for one namespace.
@@ -863,7 +861,7 @@ pub async fn vector_queue_retried_by_namespace(
         .into_iter()
         .filter(|e| e.namespace == ns && e.retry_count > 0)
         .collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/{doc_id}` — look up one queue entry.

@@ -19,6 +19,7 @@
 //! - `f32`    → JSON number (float)
 //! - `vec_f32`→ JSON array of numbers
 
+use crate::limits::Limit;
 use std::sync::Arc;
 
 use axum::{
@@ -98,8 +99,8 @@ pub async fn delete_kv(State(state): State<AppState>, Path((ns, key)): Path<(Str
 pub struct KvRangeParams {
     start: String,
     end: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
 }
@@ -113,7 +114,7 @@ pub async fn range_kv(
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
     let page = state
         .store
-        .kv_scan_range(&ns, &params.start, params.end.as_deref(), cursor, params.limit)
+        .kv_scan_range(&ns, &params.start, params.end.as_deref(), cursor, params.limit.get())
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let results: Vec<serde_json::Value> = page
@@ -132,8 +133,8 @@ pub async fn range_kv(
 #[derive(Deserialize)]
 pub struct KvPrefixScanParams {
     prefix: String,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
 }
@@ -147,7 +148,7 @@ pub async fn prefix_scan_kv(
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
     let page = state
         .store
-        .kv_scan_prefix(&ns, &params.prefix, cursor, params.limit)
+        .kv_scan_prefix(&ns, &params.prefix, cursor, params.limit.get())
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let results: Vec<serde_json::Value> = page
@@ -163,31 +164,25 @@ pub async fn prefix_scan_kv(
 
 // ── POST /stores/{ns}/kv/semantic-search ─────────────────────────────────────
 
-fn default_page_size() -> usize {
-    20
-}
 fn default_page_no() -> usize {
     1
-}
-fn default_limit() -> usize {
-    20
 }
 
 #[derive(Deserialize)]
 pub struct SemanticSearchParams {
     page_no: Option<usize>,
-    page_size: Option<usize>,
+    page_size: Option<Limit>,
     /// Alias for `page_size` so `limit` works uniformly with the cursor-paginated
     /// scan endpoints. `page_size` wins if both are given.
-    limit: Option<usize>,
+    limit: Option<Limit>,
 }
 
 #[derive(Deserialize)]
 pub struct KvSemanticSearchRequest {
     pub query: String,
-    pub top_k: Option<usize>,
-    #[serde(default = "default_page_size")]
-    pub page_size: usize,
+    pub top_k: Option<Limit>,
+    #[serde(default)]
+    pub page_size: Limit,
     #[serde(default = "default_page_no")]
     pub page_no: usize,
 }
@@ -213,11 +208,14 @@ pub async fn search_kv_semantic(
     debug!(namespace = %ns, top_k = ?req.top_k, "KV semantic search");
 
     let key_type = kv_key_type_for(&state, &ns).await?;
-    let pagination = Pagination::new(qp.page_no.unwrap_or(req.page_no), qp.page_size.or(qp.limit).unwrap_or(req.page_size));
+    let pagination = Pagination::new(
+        qp.page_no.unwrap_or(req.page_no),
+        qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
+    );
 
     let page = state
         .store
-        .kv_search_semantic(&ns, &req.query, req.top_k, pagination)
+        .kv_search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
 

@@ -52,6 +52,7 @@
 //! | Embedding service unreachable / returned an error  | 500    |
 //! | Predicate references an un-indexed field (filtered)| 500    |
 
+use crate::limits::Limit;
 use std::sync::Arc;
 
 use axum::{
@@ -69,9 +70,6 @@ use crate::{AppState, error::AppError, id::doc_id_to_value};
 
 // ── Request / response types ──────────────────────────────────────────────────
 
-fn default_page_size() -> usize {
-    20
-}
 fn default_page_no() -> usize {
     1
 }
@@ -80,10 +78,10 @@ fn default_page_no() -> usize {
 #[derive(serde::Deserialize)]
 pub struct PaginationParams {
     page_no: Option<usize>,
-    page_size: Option<usize>,
+    page_size: Option<Limit>,
     /// Alias for `page_size` so `limit` works uniformly with the cursor-paginated
     /// scan endpoints. `page_size` wins if both are given.
-    limit: Option<usize>,
+    limit: Option<Limit>,
 }
 
 /// Request body for `POST /stores/{ns}/semantic-search`.
@@ -93,9 +91,9 @@ pub struct SemanticSearchRequest {
     pub query: String,
     /// Override the number of results returned for this request only.
     /// When `None`, the value from the server-side TOML config is used.
-    pub top_k: Option<usize>,
-    #[serde(default = "default_page_size")]
-    pub page_size: usize,
+    pub top_k: Option<Limit>,
+    #[serde(default)]
+    pub page_size: Limit,
     #[serde(default = "default_page_no")]
     pub page_no: usize,
 }
@@ -111,9 +109,9 @@ pub struct SemanticSearchFilteredRequest {
     pub predicate: String,
     /// Override the number of results returned for this request only.
     /// When `None`, the value from the server-side TOML config is used.
-    pub top_k: Option<usize>,
-    #[serde(default = "default_page_size")]
-    pub page_size: usize,
+    pub top_k: Option<Limit>,
+    #[serde(default)]
+    pub page_size: Limit,
     #[serde(default = "default_page_no")]
     pub page_no: usize,
 }
@@ -146,10 +144,13 @@ pub async fn query(
 ) -> Result<impl IntoResponse, AppError> {
     debug!(namespace = %ns, top_k = ?req.top_k, "semantic search");
     let key_type = key_type_for(&state, &ns).await?;
-    let pagination = Pagination::new(qp.page_no.unwrap_or(req.page_no), qp.page_size.or(qp.limit).unwrap_or(req.page_size));
+    let pagination = Pagination::new(
+        qp.page_no.unwrap_or(req.page_no),
+        qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
+    );
     let page = state
         .store
-        .search_semantic(&ns, &req.query, req.top_k, pagination)
+        .search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
@@ -178,10 +179,13 @@ pub async fn query_filtered(
 ) -> Result<impl IntoResponse, AppError> {
     debug!(namespace = %ns, predicate = %req.predicate, top_k = ?req.top_k, "filtered semantic search");
     let key_type = key_type_for(&state, &ns).await?;
-    let pagination = Pagination::new(qp.page_no.unwrap_or(req.page_no), qp.page_size.or(qp.limit).unwrap_or(req.page_size));
+    let pagination = Pagination::new(
+        qp.page_no.unwrap_or(req.page_no),
+        qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
+    );
     let page = state
         .store
-        .search_semantic_filtered(&ns, &req.query, &req.predicate, req.top_k, pagination)
+        .search_semantic_filtered(&ns, &req.query, &req.predicate, req.top_k.map(Limit::get), pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
