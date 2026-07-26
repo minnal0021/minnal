@@ -1209,8 +1209,7 @@ impl Database {
                     //
                     // Detection only — the replay below is unchanged, and the missing
                     // updates are unrecoverable from here. Recording, surfacing and
-                    // repairing this is tracked in
-                    // `docs/feature-requests/index-replay-gap-remediation.md`.
+                    // repairing this is tracked in `FEATURE-REQUEST.md` (FR-001).
                     if let Some(gap) = crate::db::index_manager::detect_replay_gap(
                         checkpoint_state,
                         dyn_index.distinct_count() == 0,
@@ -4427,8 +4426,7 @@ mod tests {
     ///
     /// This pins the *detectability* of that condition (the logging added at
     /// `activate_field_index` keys on exactly these two inputs), not a fix.
-    /// Remediation is tracked in
-    /// `docs/feature-requests/index-replay-gap-remediation.md`.
+    /// Remediation is tracked in `FEATURE-REQUEST.md` (FR-001).
     #[test]
     fn wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable() -> Result<()> {
         use crate::db::index_manager::{CheckpointState, detect_replay_gap};

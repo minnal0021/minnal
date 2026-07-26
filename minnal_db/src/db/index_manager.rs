@@ -60,7 +60,7 @@ impl CheckpointState {
 ///
 /// The field index is missing every update recorded in the absent segments, and
 /// **cannot recover them** — the entries are gone. Restoring full coverage needs
-/// a re-index; see `docs/feature-requests/index-replay-gap-remediation.md`.
+/// a re-index; see `FEATURE-REQUEST.md` (FR-001).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayGap {
     /// Offset replay was to start from (the field's recorded checkpoint, or 0).
