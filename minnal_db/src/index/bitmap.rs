@@ -708,6 +708,84 @@ mod tests {
         assert_eq!(from_zero, full);
     }
 
+    /// Assert the two iteration paths agree at *every* rank.
+    ///
+    /// This is the load-bearing check for `iter_from_rank`: `iter` derives from
+    /// container **contents**, while `iter_from_rank` trusts each slot's cached
+    /// **cardinality** to decide what to skip. Any drift between the two — a
+    /// `card` not refreshed on some mutation path — makes the fast path silently
+    /// return the wrong window while the slow path stays correct.
+    fn assert_ranks_agree(bm: &RoaringBitmap, label: &str) {
+        let all: Vec<u128> = bm.iter().collect();
+        assert_eq!(all.len(), bm.len(), "{label}: cached cardinality disagrees with iteration");
+        for k in 0..all.len() + 2 {
+            let got: Vec<u128> = bm.iter_from_rank(k).collect();
+            assert_eq!(got, all[all.len().min(k)..], "{label}: rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_from_rank_survives_removal_and_reinsertion_churn() {
+        // Cached cardinalities are rewritten on every upsert and decremented on
+        // removal. Insert-only coverage would never catch a stale one.
+        let mut bm = RoaringBitmap::new();
+        for v in 0..300u128 {
+            bm.insert(v * 7);
+        }
+        assert_ranks_agree(&bm, "after inserts");
+
+        for v in (0..300u128).step_by(3) {
+            bm.remove(v * 7);
+        }
+        assert_ranks_agree(&bm, "after removals");
+
+        // Re-insert into containers that were partially emptied, and add a new
+        // one, so slots are rewritten rather than only created.
+        for v in (0..300u128).step_by(6) {
+            bm.insert(v * 7);
+        }
+        for low in 0..200u32 {
+            bm.insert(compose(9, low as u16));
+        }
+        assert_ranks_agree(&bm, "after reinsertion");
+
+        // Emptying a container entirely removes its slot.
+        for low in 0..200u32 {
+            bm.remove(compose(9, low as u16));
+        }
+        assert_ranks_agree(&bm, "after emptying a container");
+    }
+
+    #[test]
+    fn iter_from_rank_agrees_on_set_operation_results() {
+        // This is the shape that actually reaches `iter_from_rank` in
+        // production: `query_keys_paginated` pages over the bitmap returned by
+        // query evaluation, which is always built by and/or/and_not — never a
+        // directly-inserted bitmap like the other tests here use.
+        let a = multi_container_bitmap();
+        let mut b = RoaringBitmap::new();
+        for low in (0..10_000u32).step_by(3) {
+            b.insert(compose(1, low as u16));
+        }
+        for v in [1u128, 90, 60_000] {
+            b.insert(v);
+        }
+        for low in 500..1_500u32 {
+            b.insert(compose(2, low as u16));
+        }
+
+        assert_ranks_agree(&a.and(&b), "and");
+        assert_ranks_agree(&a.or(&b), "or");
+        assert_ranks_agree(&a.and_not(&b), "and_not");
+        assert_ranks_agree(&b.and_not(&a), "and_not reversed");
+
+        // Optimised results too — set ops can leave containers whose encoding
+        // `optimize` will change, which rewrites the slot.
+        let mut unioned = a.or(&b);
+        unioned.optimize();
+        assert_ranks_agree(&unioned, "or + optimize");
+    }
+
     #[test]
     fn insert_contains_remove() {
         let mut bm = RoaringBitmap::new();
