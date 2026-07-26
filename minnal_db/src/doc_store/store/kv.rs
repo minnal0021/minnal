@@ -1,0 +1,228 @@
+//! KV-store CRUD, scans, and KV semantic search.
+
+use super::*;
+
+impl DocStore {
+    // ── KV CRUD ────────────────────────────────────────────────────────────
+
+    /// Insert or replace a value in a KV namespace.
+    ///
+    /// `key` and `value` are JSON values typed according to the namespace schema.
+    /// When semantic search is configured and the namespace has
+    /// `semantic_search_enabled = true`, the KV value is written first, then a
+    /// pending embedding queue entry is enqueued.  The background
+    /// `VecIndexWorker` processes the queue asynchronously — the vector index
+    /// is eventually consistent with the KV store.  A crash between the two
+    /// writes leaves the value un-indexed until reconciliation re-enqueues it.
+    pub async fn kv_put(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value) -> Result<(), DocStoreError> {
+        self.kv_put_inner(namespace, key, value, false).await
+    }
+
+    /// Insert or replace a value in a KV namespace, **bypassing the WAL**.
+    ///
+    /// Identical to [`kv_put`](Self::kv_put) except the value write skips the WAL
+    /// for maximum throughput.  Data written this way is unrecoverable on a crash
+    /// — only use during bulk loading where re-running the load is acceptable.
+    /// The embed marker (when semantic search is enabled) is still enqueued
+    /// through the WAL, matching the document-store `put_no_wal` behaviour.
+    pub async fn kv_put_no_wal(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value) -> Result<(), DocStoreError> {
+        self.kv_put_inner(namespace, key, value, true).await
+    }
+
+    /// Shared body for [`kv_put`](Self::kv_put) and
+    /// [`kv_put_no_wal`](Self::kv_put_no_wal); `skip_wal` selects the value-write
+    /// durability path.
+    async fn kv_put_inner(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value, skip_wal: bool) -> Result<(), DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let key_bytes = schema.key_type.serialize_key(key)?;
+        let value_bytes = schema.value_type.serialize_value(value)?;
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+
+        if skip_wal {
+            ns.put_no_wal(key_bytes.clone(), value_bytes).await?;
+        } else {
+            ns.put(key_bytes.clone(), value_bytes).await?;
+        }
+
+        #[cfg(feature = "semantic-search")]
+        if let Some(notify) = &self.notify
+            && schema.is_semantic_search_enabled()
+            && let Some(text) = value.as_str()
+            && !text.is_empty()
+        {
+            // Enqueue the embed marker as a separate single op (no cross-namespace
+            // atomicity needed — see kv_put docs).
+            vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
+            notify.notify_one();
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve a value by key from a KV namespace.
+    ///
+    /// Returns `None` when the key does not exist.
+    pub async fn kv_get(&self, namespace: &str, key: &serde_json::Value) -> Result<Option<serde_json::Value>, DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let key_bytes = schema.key_type.serialize_key(key)?;
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        match ns.get(key_bytes).await? {
+            Some(bytes) => Ok(Some(schema.value_type.deserialize_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieve a value by its raw URL-path key string from a KV namespace.
+    ///
+    /// Convenience wrapper around [`kv_get`] for HTTP handlers that receive
+    /// the key as a URL path segment.
+    ///
+    /// [`kv_get`]: DocStore::kv_get
+    pub async fn kv_get_by_str(&self, namespace: &str, raw_key: &str) -> Result<Option<serde_json::Value>, DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        match ns.get(key_bytes).await? {
+            Some(bytes) => Ok(Some(schema.value_type.deserialize_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a key from a KV namespace.  No-op when the key does not exist.
+    ///
+    /// When semantic search is configured and the namespace has
+    /// `semantic_search_enabled = true`, the pending queue entry and the vector
+    /// index are removed first, then the KV value is deleted.  Each is a separate
+    /// single-op write; ordering derived data before the value means a crash
+    /// between them leaves an un-indexed value (reconciliation cleans it up),
+    /// never an orphaned vector.
+    pub async fn kv_delete(&self, namespace: &str, raw_key: &str) -> Result<(), DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
+
+        #[cfg(feature = "semantic-search")]
+        if schema.is_semantic_search_enabled() {
+            vector_kv::remove_queue_entry(&self.db, namespace, &key_bytes).await?;
+            vector_kv::delete_vector(&self.db, namespace, &key_bytes).await?;
+            let ns = self.db.namespace(namespace.to_owned()).await?;
+            ns.delete(key_bytes).await?;
+            return Ok(());
+        }
+
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        ns.delete(key_bytes).await?;
+        Ok(())
+    }
+
+    /// Return entries in `[start, end)` from a KV namespace, one cursor page at a time.
+    ///
+    /// Pass `end = None` for an open-ended scan to the last key, and `cursor = None`
+    /// for the first page; thereafter pass back the previous page's `next_cursor`.
+    /// Only the page's values are resolved from the value log — memory stays O(limit),
+    /// not O(total matches). Results are ordered by key ascending.
+    pub async fn kv_scan_range(
+        &self,
+        namespace: &str,
+        start: &str,
+        end: Option<&str>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<CursorPage<(serde_json::Value, serde_json::Value)>, DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let start_bytes = schema.key_type.serialize_key_from_str(start)?;
+        let end_bytes = end.map(|e| schema.key_type.serialize_key_from_str(e)).transpose()?;
+        let scan_start = cursor.unwrap_or(start_bytes);
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
+
+        let results = pairs
+            .into_iter()
+            .map(|(k, v)| -> Result<_, DocStoreError> {
+                let key = schema.key_type.deserialize_key(&k)?;
+                let value = schema.value_type.deserialize_value(&v)?;
+                Ok((key, value))
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(CursorPage::new(results, next_cursor))
+    }
+
+    /// Return entries whose key starts with `prefix` from a KV namespace, one cursor
+    /// page at a time.
+    ///
+    /// For `key_type = str` the prefix is a plain string matched against the
+    /// UTF-8 key bytes.  For `key_type = int` the prefix is a decimal integer
+    /// serialised as big-endian bytes (i.e. an exact-key prefix scan). The prefix
+    /// is scanned as the range `[prefix, prefix⁺)`, so only the page's keys (not the
+    /// whole keyspace tail) are resolved. Pass back `next_cursor` for the next page.
+    pub async fn kv_scan_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<CursorPage<(serde_json::Value, serde_json::Value)>, DocStoreError> {
+        let schema = self.load_kv_schema(namespace)?;
+        let prefix_bytes = schema.key_type.serialize_key_from_str(prefix)?;
+        let end_bytes = prefix_upper_bound(&prefix_bytes);
+        let scan_start = cursor.unwrap_or_else(|| prefix_bytes.clone());
+        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
+
+        let results = pairs
+            .into_iter()
+            .map(|(k, v)| -> Result<_, DocStoreError> {
+                let key = schema.key_type.deserialize_key(&k)?;
+                let value = schema.value_type.deserialize_value(&v)?;
+                Ok((key, value))
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(CursorPage::new(results, next_cursor))
+    }
+
+    /// Run an ANN semantic search against a KV namespace with `value_type = str`.
+    ///
+    /// Returns [`DocStoreError::EmbeddingFailed`] when no [`SemanticSearchContext`]
+    /// is configured, when the namespace does not have `semantic_search_enabled`,
+    /// or when the embedding service call fails.
+    #[cfg(feature = "semantic-search")]
+    pub async fn kv_search_semantic(
+        &self,
+        namespace: &str,
+        query_text: &str,
+        top_k: Option<usize>,
+        pagination: crate::doc_store::pagination::Pagination,
+    ) -> Result<crate::doc_store::pagination::Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
+        let ctx = self
+            .semantic_ctx
+            .as_ref()
+            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+
+        let schema = self.load_kv_schema(namespace)?;
+        if !schema.is_semantic_search_enabled() {
+            return Err(DocStoreError::EmbeddingFailed(format!(
+                "KV namespace '{namespace}' does not have semantic_search_enabled"
+            )));
+        }
+
+        let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;
+
+        let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
+            .await
+            .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+        let all = crate::semantic_search::service::search(
+            &ctx.config,
+            namespace,
+            &ctx.cluster_index,
+            &query_sparse,
+            &query_dense,
+            &db_store,
+            None::<fn(&[u8]) -> bool>,
+            top_k,
+        )
+        .await;
+
+        Ok(crate::doc_store::pagination::Page::from_vec(all, pagination))
+    }
+}
