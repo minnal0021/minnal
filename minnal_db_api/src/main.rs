@@ -51,9 +51,9 @@ pub struct AppState {
     pub started_at: Instant,
     /// Tracks namespaces with an active exclusive attribute-index operation
     /// (drop-all, reindex-all, or single-field cleanup).
-    pub attr_index_ops: Arc<std::sync::Mutex<HashSet<String>>>,
+    pub attr_index_ops: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Tracks namespaces whose vector index is currently being dropped (background cleanup).
-    pub vec_index_cleanup: Arc<std::sync::Mutex<HashSet<String>>>,
+    pub vec_index_cleanup: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Set while a (background) vector-index reconcile/validate pass is running, so
     /// the on-demand endpoint can reject overlapping runs instead of stacking
     /// expensive full scans.
@@ -209,8 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index_manager: Arc::clone(&index_manager),
         cluster_index: cluster_index_opt,
         started_at: Instant::now(),
-        attr_index_ops: Arc::new(std::sync::Mutex::new(HashSet::new())),
-        vec_index_cleanup: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        attr_index_ops: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        vec_index_cleanup: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         vec_reconcile_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };

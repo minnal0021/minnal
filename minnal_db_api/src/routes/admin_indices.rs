@@ -153,7 +153,7 @@ pub async fn attribute_reindex_all(
     Path(ns): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     {
-        let ops = state.attr_index_ops.lock().unwrap();
+        let ops = state.attr_index_ops.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -183,7 +183,7 @@ pub async fn attribute_reindex_all(
         ));
     }
 
-    state.attr_index_ops.lock().unwrap().insert(ns.clone());
+    state.attr_index_ops.lock().insert(ns.clone());
     info!(namespace = %ns, "attribute reindex-all accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -204,7 +204,7 @@ pub async fn attribute_reindex_all(
             Ok(()) => info!(namespace = %ns, "attribute reindex-all complete"),
             Err(e) => error!(namespace = %ns, error = %e, "attribute reindex-all failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -217,7 +217,7 @@ pub async fn attribute_reindex_all(
 /// Returns `409` when an operation is already active.
 pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     {
-        let ops = state.attr_index_ops.lock().unwrap();
+        let ops = state.attr_index_ops.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -247,7 +247,7 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
         ));
     }
 
-    state.attr_index_ops.lock().unwrap().insert(ns.clone());
+    state.attr_index_ops.lock().insert(ns.clone());
     info!(namespace = %ns, "attribute drop-all accepted — running in background");
 
     let state_c = state.clone();
@@ -265,7 +265,7 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
             }
             Err(e) => error!(namespace = %ns, error = %e, "attribute drop-all failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -389,7 +389,7 @@ pub async fn attribute_reindex_doc(
 pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Block if cleanup already running.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -424,7 +424,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
     })?;
 
     reload_schema(&state, &ns).await;
-    state.vec_index_cleanup.lock().unwrap().insert(ns.clone());
+    state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector drop-all accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -435,7 +435,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
             Ok(()) => info!(namespace = %ns, "vector drop-all cleanup complete"),
             Err(e) => error!(namespace = %ns, error = %e, "vector drop-all cleanup failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -451,7 +451,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
 pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Block if vector cleanup is in progress.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -587,7 +587,7 @@ pub async fn vector_reindex_failed(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Block if vector cleanup is in progress.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,

@@ -68,7 +68,7 @@ pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Js
 /// Returns `409` when an attribute index operation is already active for this namespace.
 pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(String, String)>) -> Result<impl IntoResponse, AppError> {
     {
-        let ops = state.attr_index_ops.lock().unwrap();
+        let ops = state.attr_index_ops.lock();
         if ops.contains(&ns) {
             return Err(DocStoreError::AttrIndexOpInProgress { namespace: ns }.into());
         }
@@ -78,7 +78,7 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
     state.store.get_schema(&ns).map_err(AppError::from)?;
 
     info!(namespace = %ns, field = %field, "dropping index — background cleanup");
-    state.attr_index_ops.lock().unwrap().insert(ns.clone());
+    state.attr_index_ops.lock().insert(ns.clone());
 
     let state_c = state.clone();
     let store = Arc::clone(&state.store);
@@ -99,7 +99,7 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
             }
             Err(e) => error!(namespace = %ns_c, field = %field_c, error = %e, "index drop failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns_c);
+        ops_ref.lock().remove(&ns_c);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -113,7 +113,7 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
 pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Block if cleanup already running.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -148,7 +148,7 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
     })?;
 
     reload_schema(&state, &ns).await;
-    state.vec_index_cleanup.lock().unwrap().insert(ns.clone());
+    state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector index drop accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -159,7 +159,7 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
             Ok(()) => info!(namespace = %ns, "vector index cleanup complete"),
             Err(e) => error!(namespace = %ns, error = %e, "vector index cleanup failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
