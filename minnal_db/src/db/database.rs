@@ -3655,7 +3655,11 @@ mod tests {
         // before the post-replay metadata is flushed.
         {
             let db = Database::open(dir.path(), config.clone()).unwrap();
-            assert_eq!(db.get(b"k000").unwrap().as_deref(), Some(b"v0".as_slice()), "replay must restore the data");
+            assert_eq!(
+                db.get(b"k000").unwrap().as_deref(),
+                Some(b"v0".as_slice()),
+                "replay must restore the data"
+            );
             std::mem::forget(db);
         }
 
@@ -3671,7 +3675,12 @@ mod tests {
         }
         for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
             for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total after recovery", s.id);
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke live+garbage==total after recovery",
+                    s.id
+                );
             }
         }
         db.shutdown().unwrap();
@@ -3724,7 +3733,12 @@ mod tests {
         }
         for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
             for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke the invariant after GC", s.id);
+                assert_eq!(
+                    s.live_bytes + s.garbage_bytes,
+                    s.total_bytes,
+                    "segment {} broke the invariant after GC",
+                    s.id
+                );
             }
         }
         db.shutdown().unwrap();

@@ -97,7 +97,9 @@ pub async fn push_to_l1_async(store: AsyncDb, dir: &Path) -> AsyncDb {
     store.compact().await.expect("compact failed");
     store.shutdown().await.expect("shutdown failed");
     drop(store);
-    AsyncDb::open_with_config(dir.to_path_buf(), bench_config()).await.expect("failed to reopen Db")
+    AsyncDb::open_with_config(dir.to_path_buf(), bench_config())
+        .await
+        .expect("failed to reopen Db")
 }
 
 /// Wrapper that calls `Db::shutdown()` on drop to release file handles

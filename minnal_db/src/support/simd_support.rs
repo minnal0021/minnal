@@ -180,8 +180,7 @@ pub mod simd_support {
             let mut pos = 0;
 
             // Per-byte bit weights for the movemask emulation (lane i → bit i).
-            let bit_weights =
-                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            let bit_weights = vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
 
             while pos + 16 <= min_len {
                 let a_vec = vld1q_u8(a.as_ptr().add(pos));

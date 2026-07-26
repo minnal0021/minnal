@@ -897,7 +897,10 @@ impl KVStore {
         for idx in retry {
             match self.get(&keys[idx]) {
                 Ok(value) => results[idx] = value,
-                Err(e) => warn!("[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}", self.name, e),
+                Err(e) => warn!(
+                    "[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}",
+                    self.name, e
+                ),
             }
         }
         results
@@ -1776,7 +1779,15 @@ mod tests {
         // and `get_multiple` still returns the readable keys — dropping (and logging) only
         // the corrupt one rather than silently reporting it absent.
         let dir = TempDir::new().unwrap();
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
+        let store = KVStore::open(
+            0,
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
 
         let keys: Vec<Vec<u8>> = (0..5u32).map(|i| format!("k{i}").into_bytes()).collect();
         for (i, k) in keys.iter().enumerate() {

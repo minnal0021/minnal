@@ -54,7 +54,13 @@ fn bench_mixed_workload(c: &mut Criterion) {
                         if tier == "l1" {
                             store = push_to_l1(store, temp.path());
                         }
-                        (AutoCloseStore(Some(store)), AtomicU64::new(SEED_KEYS), AtomicU64::new(0), AtomicU64::new(0), temp)
+                        (
+                            AutoCloseStore(Some(store)),
+                            AtomicU64::new(SEED_KEYS),
+                            AtomicU64::new(0),
+                            AtomicU64::new(0),
+                            temp,
+                        )
                     },
                     |(store, write_counter, read_idx, op_counter, _temp)| {
                         let op = op_counter.fetch_add(1, Ordering::Relaxed);
