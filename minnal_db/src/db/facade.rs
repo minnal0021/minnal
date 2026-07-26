@@ -73,6 +73,35 @@ where
 /// assert_eq!(db.get(b"hello").unwrap(), Some(b"world".to_vec()));
 /// db.shutdown().unwrap();
 /// ```
+///
+/// # Write durability
+///
+/// This contract applies to every write entry point on `Db`, [`Namespace`],
+/// [`AsyncDb`] and [`AsyncNamespace`] — `put`, `delete` and their `_typed`
+/// variants.
+///
+/// A write returns `Ok(())` once it is **durable**: its write-ahead-log entry
+/// has been fsynced to stable storage, so it survives power loss from that
+/// moment on.
+///
+/// `Ok(())` does **not** guarantee the write is immediately readable. After the
+/// WAL fsync the engine applies the operation to its in-memory structures, and
+/// that step is best-effort: it retries a bounded number of times, and if it
+/// still fails — a full disk, for instance — it logs at `ERROR`, increments the
+/// `apply_failures` metric, and returns `Ok(())` regardless. The data is
+/// already committed, so reporting an error would wrongly suggest it was lost.
+///
+/// In that rare window [`Db::get`] returns `None` for a key you successfully
+/// wrote. It is self-healing but not immediately so: the entry is replayed from
+/// the WAL on the next open, so state is correct again after a restart, and
+/// nothing repairs it while the process keeps running. `apply_failures` on
+/// [`Db::ops_metrics`] is how to detect it.
+///
+/// Every write is its own transaction and its own fsync. There is no batch or
+/// multi-key transaction primitive and no group commit, so write throughput is
+/// bounded by the storage's fsync rate. The `_no_wal` variants
+/// (e.g. [`AsyncNamespace::put_no_wal`]) skip the WAL entirely and give up this
+/// durability guarantee in exchange for speed.
 pub struct Db {
     inner: Database,
 }
@@ -130,6 +159,9 @@ impl Db {
     // ── CRUD (default namespace) ──────────────────────────────────────
 
     /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put(key, value)
     }
@@ -140,6 +172,9 @@ impl Db {
     }
 
     /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
     }
@@ -335,6 +370,9 @@ impl Db {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -360,6 +398,9 @@ impl Db {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -595,6 +636,9 @@ impl<'db> Namespace<'db> {
     // ── CRUD ──────────────────────────────────────────────────────────
 
     /// Insert or update a key-value pair in this namespace.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.db.put_ns(self.ns_id, key, value)
     }
@@ -605,6 +649,9 @@ impl<'db> Namespace<'db> {
     }
 
     /// Delete a key from this namespace.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.db.delete_ns(self.ns_id, key)
     }
@@ -655,6 +702,9 @@ impl<'db> Namespace<'db> {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -680,6 +730,9 @@ impl<'db> Namespace<'db> {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -942,6 +995,10 @@ impl AsyncDb {
 
     // ── CRUD ──────────────────────────────────────────────────────────
 
+    /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.put(&key, &value))
@@ -956,6 +1013,10 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.delete(&key))
@@ -1195,6 +1256,9 @@ impl AsyncDb {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1220,6 +1284,9 @@ impl AsyncDb {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1413,6 +1480,10 @@ impl AsyncNamespace {
         self.store.ttl
     }
 
+    /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
         let ns_id = self.ns_id;
@@ -1467,6 +1538,10 @@ impl AsyncNamespace {
             .unwrap_or_else(|_| vec![None; n])
     }
 
+    /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
         let ns_id = self.ns_id;
@@ -1537,6 +1612,9 @@ impl AsyncNamespace {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1562,6 +1640,9 @@ impl AsyncNamespace {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,

@@ -106,8 +106,9 @@ pub(super) const MAX_PARSE_NODES: u32 = 512;
 /// Parse a query string into a [`RawExpr`].
 ///
 /// Returns a `QueryError::Syntax` if the input does not conform to the grammar,
-/// or [`QueryError::TooComplex`] if it exceeds [`MAX_PARSE_DEPTH`] nesting
-/// levels or [`MAX_PARSE_NODES`] terms.
+/// or [`QueryError::TooComplex`] if it exceeds `MAX_PARSE_DEPTH` nesting levels
+/// or `MAX_PARSE_NODES` terms. Both limits are internal (see their definitions
+/// in this module for the rationale and the measurements behind the values).
 pub fn parse(input: &str) -> Result<RawExpr, QueryError> {
     let mut p = Parser::new(input)?;
     let expr = p.parse_expr()?;
