@@ -97,6 +97,10 @@ name = "bench_predicate"
 harness = false
 
 [[bench]]
+name = "bench_bitmap_paging"
+harness = false
+
+[[bench]]
 name = "bench_distance_estimation"
 harness = false
 required-features = ["semantic-search"]
