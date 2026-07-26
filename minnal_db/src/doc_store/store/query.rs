@@ -309,3 +309,355 @@ impl DocStore {
         Ok(self.db.query_index(ns_id, predicate.to_owned()).await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── scan_prefix after delete ─────────────────────────────────────────
+
+    /// Insert several documents, prefix-scan to verify them, delete one,
+    /// then prefix-scan again and assert the deleted document is gone.
+    #[tokio::test]
+    async fn test_scan_by_prefix_after_delete() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        // Insert 5 documents with sequential u64 IDs.
+        for i in 1u64..=5 {
+            store.put("docs", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+
+        // U64 keys are 8 bytes big-endian; an empty prefix matches all.
+        let before = store.scan_prefix("docs", vec![], None, 100).await.unwrap();
+        assert_eq!(before.results.len(), 5, "expected 5 docs before delete, got {}", before.results.len());
+
+        // Delete doc with id=3.
+        store.delete("docs", DocId::U64(3)).await.unwrap();
+
+        // Point-get must return None.
+        assert_eq!(store.get("docs", DocId::U64(3)).await.unwrap(), None, "doc 3 should be gone after delete");
+
+        // Prefix scan must now return 4 docs, without doc 3.
+        let after = store.scan_prefix("docs", vec![], None, 100).await.unwrap();
+        assert_eq!(after.results.len(), 4, "expected 4 docs after delete, got {}", after.results.len());
+        let ids_after: Vec<u64> = after
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!("unexpected DocId variant"),
+            })
+            .collect();
+        assert!(!ids_after.contains(&3), "deleted doc 3 must not appear in prefix scan");
+        assert_eq!(ids_after, vec![1, 2, 4, 5]);
+    }
+
+    /// Same scenario but with `semantic_search_enabled = true`, which makes
+    /// `delete()` take the semantic-search path (cancel pending embed + delete
+    /// vector + delete doc).  No actual embedding service is needed because
+    /// writes without `with_semantic_search()` attached fall back to the
+    /// regular `ns.put()` path, while deletes always go through the
+    /// semantic-search path when the schema flag is set.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_scan_by_prefix_after_delete_semantic_search_enabled() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Create a schema with semantic_search_enabled + embedding_fields so
+        // that `is_semantic_search_enabled()` returns true.
+        let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
+            namespace: "sem_docs".to_owned(),
+            ns_id: None,
+            key_type: KeyType::U64,
+            attributes: vec![crate::doc_store::schema::AttributeDef {
+                name: "title".to_owned(),
+                attr_type: AttributeType::Str,
+                description: None,
+            }],
+            indices: vec![],
+            semantic_search_enabled: true,
+            embedding_fields: vec!["title".to_owned()],
+        };
+        store.create(schema).await.unwrap();
+
+        // insert — self.notify is None (no SemanticSearchContext attached) so
+        // put() falls through to the regular ns.put() path.
+        for i in 1u64..=5 {
+            store
+                .put("sem_docs", DocId::U64(i), serde_json::json!({"title": format!("doc {}", i)}))
+                .await
+                .unwrap();
+        }
+
+        // Verify all 5 present.
+        let before = store.scan_prefix("sem_docs", vec![], None, 100).await.unwrap();
+        assert_eq!(before.results.len(), 5);
+
+        // delete — schema.is_semantic_search_enabled() is true so this takes
+        // the semantic-search path: remove_queue_entry + delete_vector +
+        // ns.delete.
+        store.delete("sem_docs", DocId::U64(2)).await.unwrap();
+
+        // Point-get must return None.
+        assert_eq!(
+            store.get("sem_docs", DocId::U64(2)).await.unwrap(),
+            None,
+            "doc 2 should be gone after delete"
+        );
+
+        // Prefix scan must reflect the deletion.
+        let after = store.scan_prefix("sem_docs", vec![], None, 100).await.unwrap();
+        assert_eq!(
+            after.results.len(),
+            4,
+            "expected 4 docs after deleting doc 2 (semantic path), got {}",
+            after.results.len()
+        );
+        let ids_after: Vec<u64> = after
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!("unexpected DocId variant"),
+            })
+            .collect();
+        assert!(!ids_after.contains(&2), "deleted doc 2 must not appear in prefix scan (semantic path)");
+        assert_eq!(ids_after, vec![1, 3, 4, 5]);
+    }
+
+    // ── Range query ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_query_range() {
+        // ...existing test...
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        for i in 1u64..=5 {
+            store.put("docs", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+
+        let result = store.scan_range("docs", DocId::U64(2), Some(DocId::U64(4)), None, 100).await.unwrap();
+        let ids: Vec<u64> = result
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    /// Walk a range scan page-by-page via `next_cursor` and confirm the union of
+    /// pages is the full, in-order result with no key dropped or duplicated.
+    #[tokio::test]
+    async fn test_query_range_cursor_pagination_walk() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        for i in 1u64..=5 {
+            store.put("docs", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut ids: Vec<u64> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = store.scan_range("docs", DocId::U64(1), None, cursor.clone(), 2).await.unwrap();
+            assert!(page.results.len() <= 2, "page must not exceed the limit");
+            pages += 1;
+            for (id, _) in &page.results {
+                match id {
+                    DocId::U64(v) => ids.push(*v),
+                    _ => panic!(),
+                }
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "cursor walk must return every doc once, in order");
+        assert_eq!(pages, 3, "5 docs at limit 2 → pages of 2, 2, 1");
+    }
+
+    /// Range scan must exclude a deleted document that falls within the range.
+    #[tokio::test]
+    async fn test_query_range_after_delete() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        for i in 1u64..=6 {
+            store.put("docs", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+
+        // Range [2, 6) before delete → 2, 3, 4, 5
+        let before = store.scan_range("docs", DocId::U64(2), Some(DocId::U64(6)), None, 100).await.unwrap();
+        let ids_before: Vec<u64> = before
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids_before, vec![2, 3, 4, 5]);
+
+        // Delete doc 3 (inside range) and doc 5 (inside range).
+        store.delete("docs", DocId::U64(3)).await.unwrap();
+        store.delete("docs", DocId::U64(5)).await.unwrap();
+
+        // Range [2, 6) after delete → 2, 4
+        let after = store.scan_range("docs", DocId::U64(2), Some(DocId::U64(6)), None, 100).await.unwrap();
+        let ids_after: Vec<u64> = after
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids_after, vec![2, 4]);
+
+        // Docs outside the deleted set are untouched.
+        assert!(store.get("docs", DocId::U64(1)).await.unwrap().is_some());
+        assert!(store.get("docs", DocId::U64(6)).await.unwrap().is_some());
+    }
+
+    /// Open-ended range scan (no upper bound) after deletion.
+    #[tokio::test]
+    async fn test_query_range_open_ended_after_delete() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        for i in 1u64..=4 {
+            store.put("docs", DocId::U64(i), serde_json::json!({"v": i})).await.unwrap();
+        }
+
+        store.delete("docs", DocId::U64(2)).await.unwrap();
+
+        // Open-ended range from 1 → should return 1, 3, 4
+        let result = store.scan_range("docs", DocId::U64(1), None, None, 100).await.unwrap();
+        let ids: Vec<u64> = result
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 3, 4]);
+    }
+
+    /// Range scan with `semantic_search_enabled` (semantic-search delete path).
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_query_range_after_delete_semantic_search_enabled() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
+            namespace: "sem_range".to_owned(),
+            ns_id: None,
+            key_type: KeyType::U64,
+            attributes: vec![crate::doc_store::schema::AttributeDef {
+                name: "title".to_owned(),
+                attr_type: AttributeType::Str,
+                description: None,
+            }],
+            indices: vec![],
+            semantic_search_enabled: true,
+            embedding_fields: vec!["title".to_owned()],
+        };
+        store.create(schema).await.unwrap();
+
+        for i in 1u64..=5 {
+            store
+                .put("sem_range", DocId::U64(i), serde_json::json!({"title": format!("doc {}", i)}))
+                .await
+                .unwrap();
+        }
+
+        // Delete via the semantic-search path.
+        store.delete("sem_range", DocId::U64(3)).await.unwrap();
+
+        // Range [1, 5) → should be 1, 2, 4
+        let result = store
+            .scan_range("sem_range", DocId::U64(1), Some(DocId::U64(5)), None, 100)
+            .await
+            .unwrap();
+        let ids: Vec<u64> = result
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 4], "deleted doc 3 must not appear in range scan (semantic path)");
+    }
+
+    // ── Index query ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_query_by_index() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        store
+            .create(make_schema(
+                "users",
+                vec![IndexSpec {
+                    field: "active".to_owned(),
+                    index_type: IndexType::Bool,
+                }],
+            ))
+            .await
+            .unwrap();
+
+        store
+            .put("users", DocId::U64(1), serde_json::json!({"active": true,  "name": "Alice"}))
+            .await
+            .unwrap();
+        store
+            .put("users", DocId::U64(2), serde_json::json!({"active": false, "name": "Bob"}))
+            .await
+            .unwrap();
+        store
+            .put("users", DocId::U64(3), serde_json::json!({"active": true,  "name": "Carol"}))
+            .await
+            .unwrap();
+
+        let active = store.query("users", "active = true", Pagination::default()).await.unwrap();
+        let mut ids: Vec<u64> = active
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::U64(v) => *v,
+                _ => panic!(),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3]);
+    }
+}

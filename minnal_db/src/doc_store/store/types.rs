@@ -238,3 +238,54 @@ pub struct ReindexStats {
     /// Number of documents enqueued for re-embedding.
     pub enqueued: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── DocId serialization ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_doc_id_u64_roundtrip() {
+        let id = DocId::U64(12345);
+        let bytes = id.to_bytes();
+        let restored = DocId::from_bytes(&bytes, KeyType::U64).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_doc_id_u128_roundtrip() {
+        let id = DocId::U128(u128::MAX / 2);
+        let bytes = id.to_bytes();
+        let restored = DocId::from_bytes(&bytes, KeyType::U128).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_doc_id_uuid_roundtrip() {
+        let id = DocId::Uuid(0xdeadbeef_cafebabe_12345678_9abcdef0);
+        let bytes = id.to_bytes();
+        let restored = DocId::from_bytes(&bytes, KeyType::Uuid).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_doc_id_ordering() {
+        // big-endian encoding means byte-level ordering == numeric ordering
+        let ids: Vec<DocId> = (0u64..5).map(DocId::U64).collect();
+        let encoded: Vec<Vec<u8>> = ids.iter().map(|id| id.to_bytes()).collect();
+        let sorted = {
+            let mut c = encoded.clone();
+            c.sort();
+            c
+        };
+        assert_eq!(encoded, sorted);
+    }
+
+    #[test]
+    fn test_invalid_key_size_rejected() {
+        assert!(DocId::from_bytes(&[0u8; 3], KeyType::U64).is_err());
+        assert!(DocId::from_bytes(&[0u8; 5], KeyType::U128).is_err());
+    }
+}

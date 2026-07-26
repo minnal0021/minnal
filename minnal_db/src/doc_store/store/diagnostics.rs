@@ -247,3 +247,61 @@ impl DocStore {
         self.db.ttl_config_for_ns(ns_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── count_docs ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_count_docs_empty_namespace() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("empty", vec![])).await.unwrap();
+
+        assert_eq!(store.count_docs("empty").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_docs_reflects_inserts() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("counting", vec![])).await.unwrap();
+
+        for i in 1u64..=5 {
+            store.put("counting", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+
+        assert_eq!(store.count_docs("counting").await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_count_docs_decrements_after_delete() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("del_count", vec![])).await.unwrap();
+
+        for i in 1u64..=3 {
+            store.put("del_count", DocId::U64(i), serde_json::json!({"n": i})).await.unwrap();
+        }
+        assert_eq!(store.count_docs("del_count").await.unwrap(), 3);
+
+        store.delete("del_count", DocId::U64(2)).await.unwrap();
+        assert_eq!(store.count_docs("del_count").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_count_docs_unknown_namespace_is_not_found() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        let err = store.count_docs("ghost").await.unwrap_err();
+        assert!(matches!(err, DocStoreError::NotFound { .. }));
+    }
+}

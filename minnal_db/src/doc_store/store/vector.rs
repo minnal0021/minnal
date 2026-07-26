@@ -767,3 +767,530 @@ async fn reconcile_kv_namespace_vectors(
     }
     Ok(enqueued)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── Vector-index queue methods ──────────────────────────────────────────
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_vector_index_max_retries_default() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        assert_eq!(store.vector_index_max_retries(), 5);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_with_vector_index_config_sets_max_retries() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path())
+            .await
+            .with_vector_index_config(VectorIndexConfig {
+                max_retries: 10,
+                retry_wait_secs: 1,
+                concurrency: 2,
+            });
+        assert_eq!(store.vector_index_max_retries(), 10);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_pending_vector_index_count_empty() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        assert_eq!(store.pending_vector_index_count().await, 0);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_list_pending_queue_entries_empty() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        assert!(store.list_queue_entries().await.is_empty());
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_pending_queue_count_and_list_after_enqueue() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Enqueue two entries directly via vector_kv primitives.
+        vector_kv::enqueue_embed(&store.db, "ns_a", b"doc1", "text a").await.unwrap();
+        vector_kv::enqueue_embed(&store.db, "ns_b", b"doc2", "text b").await.unwrap();
+
+        assert_eq!(store.pending_vector_index_count().await, 2);
+
+        let entries = store.list_queue_entries().await;
+        assert_eq!(entries.len(), 2);
+
+        let namespaces: std::collections::BTreeSet<_> = entries.iter().map(|e| e.namespace.as_str()).collect();
+        assert!(namespaces.contains("ns_a"));
+        assert!(namespaces.contains("ns_b"));
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_delete_pending_queue_entry_removes_entry() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        vector_kv::enqueue_embed(&store.db, "ns", b"doc1", "text").await.unwrap();
+
+        assert_eq!(store.pending_vector_index_count().await, 1);
+
+        store.delete_queue_entry("ns", b"doc1").await.unwrap();
+
+        assert_eq!(store.pending_vector_index_count().await, 0);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_delete_pending_queue_entry_noop_for_missing() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Deleting a non-existent entry should not error.
+        store.delete_queue_entry("ns", b"ghost").await.unwrap();
+        assert_eq!(store.pending_vector_index_count().await, 0);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_delete_pending_queue_entry_only_removes_target() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        vector_kv::enqueue_embed(&store.db, "ns", b"doc1", "t1").await.unwrap();
+        vector_kv::enqueue_embed(&store.db, "ns", b"doc2", "t2").await.unwrap();
+
+        store.delete_queue_entry("ns", b"doc1").await.unwrap();
+
+        let entries = store.list_queue_entries().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].doc_id_bytes, b"doc2");
+    }
+
+    // ── Vector-index reconciliation ─────────────────────────────────────────
+
+    /// Without the `semantic-search` feature, creating a semantic-search-enabled
+    /// store must be rejected at runtime rather than silently ignored.
+    #[cfg(not(feature = "semantic-search"))]
+    #[tokio::test]
+    async fn test_semantic_create_rejected_without_feature() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
+            namespace: "sem".to_owned(),
+            ns_id: None,
+            key_type: KeyType::U64,
+            attributes: vec![crate::doc_store::schema::AttributeDef {
+                name: "title".to_owned(),
+                attr_type: AttributeType::Str,
+                description: None,
+            }],
+            indices: vec![],
+            semantic_search_enabled: true,
+            embedding_fields: vec!["title".to_owned()],
+        };
+        let err = store.create(schema).await.unwrap_err();
+        assert!(matches!(err, DocStoreError::SemanticSearchNotCompiled), "got {err:?}");
+    }
+
+    /// Helper: create a semantic-search-enabled doc schema with a `title` field.
+    #[cfg(feature = "semantic-search")]
+    async fn create_semantic_schema(store: &DocStore, namespace: &str) {
+        let schema = DocStoreSchema {
+            store_type: StoreType::Doc,
+            namespace: namespace.to_owned(),
+            ns_id: None,
+            key_type: KeyType::U64,
+            attributes: vec![crate::doc_store::schema::AttributeDef {
+                name: "title".to_owned(),
+                attr_type: AttributeType::Str,
+                description: None,
+            }],
+            indices: vec![],
+            semantic_search_enabled: true,
+            embedding_fields: vec!["title".to_owned()],
+        };
+        store.create(schema).await.unwrap();
+    }
+
+    /// Helper: commit a *complete* vector index (sparse meta + dense) for a doc,
+    /// simulating a fully-indexed document. Reconciliation skips only documents
+    /// that have both halves, so tests asserting "already indexed → skip" must
+    /// write both.
+    #[cfg(feature = "semantic-search")]
+    async fn commit_complete_index(store: &DocStore, namespace: &str, key: &[u8]) {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let sparse = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
+        let dense = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.4, 0.0, 0.02, vec![]);
+        crate::vector_kv::upsert_vectors(&store.db, namespace, key, &[sparse, dense])
+            .await
+            .unwrap();
+    }
+
+    /// Documents written through the crash window (doc present, but no queue
+    /// entry and no vector index) must be re-enqueued by reconciliation.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_enqueues_missing_docs() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        // No SemanticSearchContext is attached, so put() does NOT enqueue —
+        // this is exactly the crash window (doc durable, embed marker lost).
+        for i in 1u64..=3 {
+            store
+                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.pending_vector_index_count().await, 0, "no enqueue happened on write");
+
+        let reconciled = store.reconcile_vector_indexes().await;
+        assert_eq!(reconciled, 3, "all three missing docs must be re-enqueued");
+        assert_eq!(store.pending_vector_index_count().await, 3);
+    }
+
+    /// A single-document vector reindex enqueues exactly that document, reports
+    /// `NotFound` for a missing id, and rejects a non-semantic namespace.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reindex_doc_vector_enqueues_single_doc() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        // No SemanticSearchContext attached, so put() does not enqueue.
+        for i in 1u64..=3 {
+            store
+                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.pending_vector_index_count().await, 0);
+
+        // Reindex just doc 2 → exactly one enqueue.
+        assert_eq!(
+            store.reindex_doc_vector("sem", DocId::U64(2)).await.unwrap(),
+            VectorReindexOutcome::Enqueued
+        );
+        assert_eq!(store.pending_vector_index_count().await, 1);
+
+        // A missing document reports NotFound and enqueues nothing more.
+        assert_eq!(
+            store.reindex_doc_vector("sem", DocId::U64(99)).await.unwrap(),
+            VectorReindexOutcome::NotFound
+        );
+        assert_eq!(store.pending_vector_index_count().await, 1);
+
+        // A namespace without semantic search is rejected.
+        store
+            .create(DocStoreSchema {
+                store_type: StoreType::Doc,
+                namespace: "plain".to_owned(),
+                ns_id: None,
+                key_type: KeyType::U64,
+                attributes: vec![],
+                indices: vec![],
+                semantic_search_enabled: false,
+                embedding_fields: vec![],
+            })
+            .await
+            .unwrap();
+        store.put("plain", DocId::U64(1), serde_json::json!({"title": "x"})).await.unwrap();
+        assert!(matches!(
+            store.reindex_doc_vector("plain", DocId::U64(1)).await,
+            Err(DocStoreError::SemanticSearchNotEnabled { .. })
+        ));
+    }
+
+    /// Reconciliation must skip documents that already have a pending queue
+    /// entry, and must be idempotent on a second run.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_skips_queued_and_is_idempotent() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        store.put("sem", DocId::U64(1), serde_json::json!({"title": "hello"})).await.unwrap();
+        store.put("sem", DocId::U64(2), serde_json::json!({"title": "world"})).await.unwrap();
+
+        // First pass enqueues both missing docs.
+        assert_eq!(store.reconcile_vector_indexes().await, 2);
+        assert_eq!(store.pending_vector_index_count().await, 2);
+
+        // Second pass is a no-op: both docs are already queued.
+        assert_eq!(store.reconcile_vector_indexes().await, 0);
+        assert_eq!(store.pending_vector_index_count().await, 2);
+    }
+
+    /// Reconciliation must skip documents that already have a committed vector
+    /// index entry.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_skips_already_indexed() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        let key = DocId::U64(1).to_bytes();
+        store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
+
+        // Simulate a complete committed vector index (sparse meta + dense) for doc 1.
+        commit_complete_index(&store, "sem", &key).await;
+
+        // Doc 1 is already indexed → reconciliation must not enqueue it.
+        assert_eq!(store.reconcile_vector_indexes().await, 0);
+        assert_eq!(store.pending_vector_index_count().await, 0);
+    }
+
+    /// The validating reconcile must NOT re-enqueue a document whose committed
+    /// vectors are present *and* deserialize (no false positives on healthy docs).
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_validating_reconcile_skips_valid_complete_index() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        let key = DocId::U64(1).to_bytes();
+        store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
+        commit_complete_index(&store, "sem", &key).await;
+
+        assert_eq!(
+            store.validate_and_reconcile_vector_indexes().await,
+            0,
+            "valid index must not be re-enqueued"
+        );
+        assert_eq!(store.pending_vector_index_count().await, 0);
+    }
+
+    /// A document whose committed vector bytes are *present but corrupt* is skipped
+    /// by the presence-only reconcile (both halves exist) yet re-enqueued by the
+    /// validating reconcile (the bytes fail to deserialize). Covers both the dense
+    /// and a sparse composite entry.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_validating_reconcile_reenqueues_present_but_corrupt() {
+        // Corrupt dense.
+        {
+            let db_dir = TempDir::new().unwrap();
+            let schema_dir = TempDir::new().unwrap();
+            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            create_semantic_schema(&store, "sem").await;
+            let key = DocId::U64(1).to_bytes();
+            store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
+            commit_complete_index(&store, "sem", &key).await;
+
+            // Overwrite the dense entry with bytes that are present but undeserializable.
+            let dense_ns = store.db.namespace(crate::vector_kv::dense_vectors_ns("sem")).await.unwrap();
+            dense_ns.put(key.clone(), b"not valid rkyv bytes".to_vec()).await.unwrap();
+
+            assert_eq!(store.reconcile_vector_indexes().await, 0, "presence check sees both halves → skips");
+            assert_eq!(store.pending_vector_index_count().await, 0);
+            assert_eq!(
+                store.validate_and_reconcile_vector_indexes().await,
+                1,
+                "corrupt dense must be re-enqueued"
+            );
+            assert_eq!(store.pending_vector_index_count().await, 1);
+        }
+
+        // Corrupt a sparse composite entry (commit_complete_index assigns cluster 1).
+        {
+            let db_dir = TempDir::new().unwrap();
+            let schema_dir = TempDir::new().unwrap();
+            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            create_semantic_schema(&store, "sem").await;
+            let key = DocId::U64(1).to_bytes();
+            store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
+            commit_complete_index(&store, "sem", &key).await;
+
+            let sparse_ns = store.db.namespace(crate::vector_kv::sparse_vectors_ns("sem")).await.unwrap();
+            sparse_ns
+                .put(crate::semantic_search::composite_key::encode(1, &key), b"garbage".to_vec())
+                .await
+                .unwrap();
+
+            assert_eq!(store.reconcile_vector_indexes().await, 0, "presence check skips");
+            assert_eq!(
+                store.validate_and_reconcile_vector_indexes().await,
+                1,
+                "corrupt sparse must be re-enqueued"
+            );
+            assert_eq!(store.pending_vector_index_count().await, 1);
+        }
+    }
+
+    /// KV-store namespaces are reconciled too: a string value written without a
+    /// queue entry or vector index must be re-enqueued.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_kv_namespace() {
+        use crate::doc_store::schema::{KvKeyType, KvStoreSchema, KvValueType};
+
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        let schema = KvStoreSchema {
+            store_type: StoreType::Kv,
+            namespace: "kv".to_owned(),
+            ns_id: None,
+            key_type: KvKeyType::Str,
+            value_type: KvValueType::Str,
+            semantic_search_enabled: true,
+        };
+        store.create_kv(schema).await.unwrap();
+
+        store
+            .kv_put("kv", &serde_json::json!("k1"), &serde_json::json!("some text"))
+            .await
+            .unwrap();
+        assert_eq!(store.pending_vector_index_count().await, 0, "no enqueue on write (no ctx)");
+
+        assert_eq!(store.reconcile_vector_indexes().await, 1);
+        assert_eq!(store.pending_vector_index_count().await, 1);
+    }
+
+    /// The count short-circuit must NOT fire when a namespace is only partially
+    /// indexed: one indexed doc + one missing doc means `indexed (1) < keys (2)`,
+    /// so the full scan runs and the missing doc is enqueued.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_partial_index_not_short_circuited() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        // Doc 1 is indexed; doc 2 is written but missing (the crash window).
+        store.put("sem", DocId::U64(1), serde_json::json!({"title": "one"})).await.unwrap();
+        store.put("sem", DocId::U64(2), serde_json::json!({"title": "two"})).await.unwrap();
+        commit_complete_index(&store, "sem", &DocId::U64(1).to_bytes()).await;
+
+        // indexed (1) < keys (2) → no short-circuit → doc 2 enqueued, doc 1 skipped.
+        assert_eq!(store.reconcile_vector_indexes().await, 1);
+        let pending = store.list_queue_entries().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].doc_id_bytes, DocId::U64(2).to_bytes());
+    }
+
+    /// A *partially* committed index counts as not-indexed: a doc with only the
+    /// sparse side (dense write lost) and a doc with only the dense side (sparse
+    /// write lost) must both be re-enqueued so the re-embed regenerates the
+    /// missing half. Guards the `meta AND dense` tightening in
+    /// [`vector_kv::has_complete_vector_index`] — under the old OR semantics
+    /// either of these would have been skipped as "indexed".
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_partial_index_is_reenqueued() {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        store
+            .put("sem", DocId::U64(1), serde_json::json!({"title": "sparse only"}))
+            .await
+            .unwrap();
+        store.put("sem", DocId::U64(2), serde_json::json!({"title": "dense only"})).await.unwrap();
+
+        // Doc 1: only the sparse meta committed — the dense write was lost.
+        let key1 = DocId::U64(1).to_bytes();
+        let sparse = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
+        crate::vector_kv::upsert_vectors(&store.db, "sem", &key1, &[sparse]).await.unwrap();
+
+        // Doc 2: only the dense entry committed — the sparse write was lost.
+        let key2 = DocId::U64(2).to_bytes();
+        let dense = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.4, 0.0, 0.02, vec![]);
+        crate::vector_kv::upsert_vectors(&store.db, "sem", &key2, &[dense]).await.unwrap();
+
+        // Both indexes are incomplete → both re-enqueued.
+        assert_eq!(store.reconcile_vector_indexes().await, 2);
+        let mut got: Vec<Vec<u8>> = store.list_queue_entries().await.into_iter().map(|e| e.doc_id_bytes).collect();
+        got.sort();
+        let mut want = vec![DocId::U64(1).to_bytes(), DocId::U64(2).to_bytes()];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// Regression for the in-flight enqueue race: a live write that enqueues a
+    /// document *while* the reconciliation pass is mid-scan must not produce a
+    /// duplicate queue entry. The embed queue is keyed by `(namespace, doc_id)`,
+    /// so a concurrent reconciliation re-enqueue and an in-flight write collapse
+    /// to a single entry. This is the invariant that keeps the queue bounded by
+    /// the number of distinct docs — without it, a racing writer could grow the
+    /// queue unboundedly and feed the worker an endless re-index loop.
+    ///
+    /// The assertion holds for every interleaving (idempotent-by-key enqueue),
+    /// so the test is deterministic despite running the two paths concurrently.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_reconcile_inflight_enqueue_does_not_duplicate() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        create_semantic_schema(&store, "sem").await;
+
+        // Five docs written through the crash window (durable, but no enqueue).
+        for i in 1u64..=5 {
+            store
+                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
+                .await
+                .unwrap();
+        }
+
+        // Race a live enqueue for every doc against the reconciliation pass: each
+        // direct enqueue stands in for a write that lands while reconciliation is
+        // scanning the same key. Both paths target the same queue key per doc.
+        let keys: Vec<Vec<u8>> = (1u64..=5).map(|i| DocId::U64(i).to_bytes()).collect();
+        let live = async {
+            for (i, key) in keys.iter().enumerate() {
+                crate::vector_kv::enqueue_embed(&store.db, "sem", key, &format!("live {}", i + 1))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (_, _reconciled) = tokio::join!(live, store.reconcile_vector_indexes());
+
+        // Idempotent by doc-id: exactly one entry per doc, never doubled —
+        // regardless of how the live enqueues and the reconcile pass interleaved.
+        assert_eq!(
+            store.pending_vector_index_count().await,
+            5,
+            "concurrent enqueue + reconcile must not duplicate queue entries"
+        );
+
+        // The queue is converging, not looping: a follow-up reconcile is a clean
+        // no-op because every doc now has a pending entry.
+        assert_eq!(store.reconcile_vector_indexes().await, 0);
+        assert_eq!(store.pending_vector_index_count().await, 5);
+    }
+}

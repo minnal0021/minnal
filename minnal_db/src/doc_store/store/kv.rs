@@ -226,3 +226,180 @@ impl DocStore {
         Ok(crate::doc_store::pagination::Page::from_vec(all, pagination))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── KV store helpers ────────────────────────────────────────────────────
+
+    // ── KV CRUD ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_kv_put_get_str_key_str_value() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let key = serde_json::json!("hello");
+        let val = serde_json::json!("world");
+        store.kv_put("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap();
+        assert_eq!(got, Some(val));
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_no_wal_get_round_trip() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let key = serde_json::json!("hello");
+        let val = serde_json::json!("world");
+        // The no-WAL path must be readable in-process exactly like the WAL path;
+        // only crash-durability differs.
+        store.kv_put_no_wal("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap();
+        assert_eq!(got, Some(val));
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_get_int_key_int_value() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Int)).await.unwrap();
+
+        let key = serde_json::json!(99i64);
+        let val = serde_json::json!(-42i64);
+        store.kv_put("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap();
+        assert_eq!(got, Some(val));
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_get_f32_value() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::F32)).await.unwrap();
+
+        let key = serde_json::json!("temp");
+        let val = serde_json::json!(98.5f32);
+        store.kv_put("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap().unwrap();
+        let diff = (got.as_f64().unwrap() as f32 - 98.5f32).abs();
+        assert!(diff < f32::EPSILON, "f32 value mismatch: {got}");
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_get_vec_f32_value() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::VecF32)).await.unwrap();
+
+        let key = serde_json::json!("embedding");
+        let val = serde_json::json!([1.0f32, 0.5f32, -1.0f32]);
+        store.kv_put("ns", &key, &val).await.unwrap();
+
+        let got = store.kv_get("ns", &key).await.unwrap().unwrap();
+        let arr = got.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        let expected = [1.0f32, 0.5, -1.0];
+        for (v, exp) in arr.iter().zip(expected.iter()) {
+            assert!((v.as_f64().unwrap() as f32 - exp).abs() < f32::EPSILON);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kv_put_overwrites_existing() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let key = serde_json::json!("k");
+        store.kv_put("ns", &key, &serde_json::json!("v1")).await.unwrap();
+        store.kv_put("ns", &key, &serde_json::json!("v2")).await.unwrap();
+
+        assert_eq!(store.kv_get("ns", &key).await.unwrap(), Some(serde_json::json!("v2")));
+    }
+
+    #[tokio::test]
+    async fn test_kv_get_missing_key_returns_none() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let got = store.kv_get("ns", &serde_json::json!("ghost")).await.unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn test_kv_delete_removes_entry() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        let key = serde_json::json!("gone");
+        store.kv_put("ns", &key, &serde_json::json!("value")).await.unwrap();
+        store.kv_delete("ns", "gone").await.unwrap();
+
+        assert_eq!(store.kv_get("ns", &key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_kv_get_by_str_str_key() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+
+        store
+            .kv_put("ns", &serde_json::json!("mykey"), &serde_json::json!("myval"))
+            .await
+            .unwrap();
+        let got = store.kv_get_by_str("ns", "mykey").await.unwrap();
+        assert_eq!(got, Some(serde_json::json!("myval")));
+    }
+
+    #[tokio::test]
+    async fn test_kv_get_by_str_int_key() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Str)).await.unwrap();
+
+        store.kv_put("ns", &serde_json::json!(7i64), &serde_json::json!("seven")).await.unwrap();
+        let got = store.kv_get_by_str("ns", "7").await.unwrap();
+        assert_eq!(got, Some(serde_json::json!("seven")));
+    }
+
+    #[tokio::test]
+    async fn test_kv_wrong_value_type_rejected() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Int)).await.unwrap();
+
+        // Put a string into an Int-typed namespace.
+        let err = store
+            .kv_put("ns", &serde_json::json!("k"), &serde_json::json!("not-int"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DocStoreError::Schema(crate::doc_store::error::SchemaError::KvValueTypeMismatch { .. })
+        ));
+    }
+}

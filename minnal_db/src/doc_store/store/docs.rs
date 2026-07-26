@@ -124,3 +124,50 @@ impl DocStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── CRUD ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_put_and_find_by_id() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        let id = DocId::U64(42);
+        let doc = serde_json::json!({"name": "Alice", "age": 30});
+        store.put("docs", id, doc.clone()).await.unwrap();
+
+        let found = store.get("docs", id).await.unwrap();
+        assert_eq!(found, Some(doc));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_id_missing_returns_none() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        let found = store.get("docs", DocId::U64(99)).await.unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_document() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+
+        let id = DocId::U64(1);
+        store.put("docs", id, serde_json::json!({"x": 1})).await.unwrap();
+        store.delete("docs", id).await.unwrap();
+        assert_eq!(store.get("docs", id).await.unwrap(), None);
+    }
+}

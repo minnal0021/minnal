@@ -276,7 +276,7 @@ impl DocStore {
 /// Number of `(key, value)` pairs fetched per cursor page during an index
 /// rebuild. Bounds peak memory to roughly one page of documents instead of the
 /// whole namespace, and matches the progress/yield cadence below.
-pub(super) const REBUILD_PAGE_SIZE: usize = 1_000;
+const REBUILD_PAGE_SIZE: usize = 1_000;
 
 /// Smallest key strictly greater than `key`, used to advance a (inclusive)
 /// scan cursor past an already-processed key. Appending a `0x00` byte yields a
@@ -380,4 +380,196 @@ async fn rebuild_index_for_namespace(
     );
     let _ = key_type;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_store::store::test_support::*;
+
+    // ── Drop / add index ────────────────────────────────────────────────────
+
+    /// `add_index` must enforce the per-namespace `MAX_INDICES` cap incrementally,
+    /// not just at create/import time (`schema.save()` does not validate).
+    #[tokio::test]
+    async fn test_add_index_enforces_max_indices() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        // Start at the cap with MAX_INDICES indices.
+        let indices = (0..crate::doc_store::schema::MAX_INDICES)
+            .map(|i| IndexSpec {
+                field: format!("f{i}"),
+                index_type: IndexType::Int,
+            })
+            .collect();
+        store.create(make_schema("ns", indices)).await.unwrap();
+
+        // One more must be rejected (not silently accepted past the cap).
+        let result = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "one_too_many".to_owned(),
+                    index_type: IndexType::Int,
+                },
+            )
+            .await;
+        match result {
+            Err(DocStoreError::Schema(crate::doc_store::error::SchemaError::TooManyIndices { max, .. })) => {
+                assert_eq!(max, crate::doc_store::schema::MAX_INDICES);
+            }
+            Ok(_) => panic!("expected TooManyIndices, got Ok"),
+            Err(e) => panic!("expected TooManyIndices, got {e:?}"),
+        }
+
+        // And the rejected field must not have been registered/persisted.
+        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        assert_eq!(loaded.indices.len(), crate::doc_store::schema::MAX_INDICES);
+        assert!(!loaded.indices.iter().any(|s| s.field == "one_too_many"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_index_demotes_to_attribute() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store
+            .create(make_schema(
+                "ns",
+                vec![IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                }],
+            ))
+            .await
+            .unwrap();
+
+        store.drop_index("ns", "status").unwrap();
+
+        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        // Index is gone
+        assert!(loaded.indices.is_empty(), "index should be removed");
+        // Field is preserved as a non-indexed attribute
+        assert_eq!(loaded.attributes.len(), 1);
+        assert_eq!(loaded.attributes[0].name, "status");
+        assert_eq!(loaded.attributes[0].attr_type, AttributeType::Str);
+    }
+
+    /// After `drop_index` the in-memory bitmap must be gone: predicate queries
+    /// on the dropped field must return an error in the same process, not stale
+    /// results from the previously-populated bitmap.
+    #[tokio::test]
+    async fn test_drop_index_deactivates_in_memory_index() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store
+            .create(make_schema(
+                "ns",
+                vec![IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                }],
+            ))
+            .await
+            .unwrap();
+
+        store.put("ns", DocId::U64(1), serde_json::json!({"status": "active"})).await.unwrap();
+        store.put("ns", DocId::U64(2), serde_json::json!({"status": "inactive"})).await.unwrap();
+
+        // Sanity: query works before drop.
+        let results = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap();
+        assert_eq!(results.results.len(), 1, "should find one active doc before drop");
+
+        store.drop_index("ns", "status").unwrap();
+
+        // After drop, the same query must fail — not silently return stale hits.
+        let err = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field 'status'"),
+            "expected unknown field 'status', got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_index_and_wait() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+
+        // Insert some documents before the index exists
+        for i in 0u64..5 {
+            store
+                .put("ns", DocId::U64(i), serde_json::json!({"status": "active", "n": i}))
+                .await
+                .unwrap();
+        }
+
+        // Add an index — background task builds it on existing data
+        let handle = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                },
+            )
+            .await
+            .unwrap();
+
+        handle.wait().await.unwrap();
+
+        // Schema must now include the index
+        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        assert_eq!(loaded.indices.len(), 1);
+        assert_eq!(loaded.indices[0].field, "status");
+
+        // Query must return all 5 docs
+        let result = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap();
+        assert_eq!(result.total, 5);
+    }
+
+    /// The rebuild walks the namespace one cursor page at a time; index more
+    /// documents than a single page so the page-boundary advancement (in both
+    /// the count pass and the rebuild pass) is exercised, with a partial final
+    /// page.
+    #[tokio::test]
+    async fn test_add_index_rebuild_spans_multiple_pages() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+
+        let n = REBUILD_PAGE_SIZE + 7; // > 1 page, partial last page
+        for i in 0..n {
+            let status = if i % 2 == 0 { "active" } else { "inactive" };
+            store
+                .put("ns", DocId::U64(i as u64), serde_json::json!({"status": status, "n": i}))
+                .await
+                .unwrap();
+        }
+
+        let handle = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                },
+            )
+            .await
+            .unwrap();
+        handle.wait().await.unwrap();
+
+        // Every document across the page boundary must be indexed, partitioned
+        // correctly — no key skipped or double-counted at a page edge.
+        let active = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap();
+        let inactive = store.query("ns", "status = \"inactive\"", Pagination::default()).await.unwrap();
+        assert_eq!(active.total + inactive.total, n, "all docs indexed");
+        assert_eq!(active.total, n.div_ceil(2), "even ids are active");
+        assert_eq!(inactive.total, n / 2, "odd ids are inactive");
+    }
 }
