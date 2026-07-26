@@ -440,6 +440,50 @@ impl RoaringBitmap {
         })
     }
 
+    /// Iterate values from rank `offset` onward, in ascending order.
+    ///
+    /// Equivalent to `iter().skip(offset)` but reaches the offset by **skipping
+    /// whole containers on their cardinality** instead of walking elements, so
+    /// the cost is `O(#containers + yielded)` rather than `O(offset + yielded)`.
+    ///
+    /// The difference matters because [`iter`](Self::iter) deserialises and
+    /// materialises every container it passes over — `.skip(offset)` therefore
+    /// allocates its way to the offset, making a full offset-paginated walk
+    /// quadratic. Here only [`sorted_key_cards`] is consulted up front (slot
+    /// table only, no container deserialisation), and containers before the
+    /// start point are never touched.
+    ///
+    /// An `offset` at or beyond the cardinality yields nothing.
+    ///
+    /// [`sorted_key_cards`]: crate::index::container_store::ContainerStore::sorted_key_cards
+    pub fn iter_from_rank(&self, offset: usize) -> impl Iterator<Item = u128> + '_ {
+        let key_cards = self.store.sorted_key_cards();
+
+        // Walk the per-container counts to find the container holding `offset`
+        // and how far into it the offset falls.
+        let mut containers_skipped = 0usize;
+        let mut within = offset;
+        for (_, card) in &key_cards {
+            let card = *card as usize;
+            if within < card {
+                break;
+            }
+            within -= card;
+            containers_skipped += 1;
+        }
+
+        key_cards
+            .into_iter()
+            .skip(containers_skipped)
+            .enumerate()
+            .flat_map(move |(i, (high, _))| {
+                // Only the first container yielded is entered part-way.
+                let skip_within = if i == 0 { within } else { 0 };
+                let lows: Vec<u16> = self.store.get(high).map(|c| c.iter().skip(skip_within).collect()).unwrap_or_default();
+                lows.into_iter().map(move |low| compose(high, low))
+            })
+    }
+
     // ── Optimization ────────────────────────────────────────────────
 
     /// Re-evaluate container types across the entire bitmap.
@@ -564,6 +608,107 @@ impl FromIterator<u128> for RoaringBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── iter_from_rank (offset paging without walking elements) ─────────────
+
+    /// A bitmap spanning three containers with a **different encoding in each**,
+    /// so the rank window exercises Array, Bitset and Run dispatch rather than
+    /// one path three times.
+    fn multi_container_bitmap() -> RoaringBitmap {
+        let mut bm = RoaringBitmap::new();
+        // high key 0 — sparse, stays an ArrayContainer.
+        for v in [1u128, 7, 90, 5_000, 60_000] {
+            bm.insert(v);
+        }
+        // high key 1 — dense enough to promote to a BitsetContainer (>= 4096
+        // values), and deliberately gappy so `optimize` does not prefer a Run:
+        // a consecutive stretch here would run-encode and never exercise Bitset.
+        for low in (0..10_000u32).step_by(2) {
+            bm.insert(compose(1, low as u16));
+        }
+        // high key 2 — one consecutive stretch, optimises to a RunContainer.
+        for low in 100..900u32 {
+            bm.insert(compose(2, low as u16));
+        }
+        bm.optimize();
+
+        // Assert the fixture actually is what it claims. Without this the test
+        // could silently degrade to covering ArrayContainer only.
+        let kinds: Vec<&str> = [0u128, 1, 2]
+            .iter()
+            .map(|&h| match bm.store.get(h).expect("container present") {
+                Container::Array(_) => "array",
+                Container::Bitset(_) => "bitset",
+                Container::Run(_) => "run",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["array", "bitset", "run"], "fixture must span all three encodings");
+        bm
+    }
+
+    #[test]
+    fn iter_from_rank_matches_iter_skip_at_every_rank() {
+        // Exhaustive over a small bitmap that still straddles container
+        // boundaries (65535 / 65536 sit either side of one).
+        let mut bm = RoaringBitmap::new();
+        for v in [0u128, 1, 5, 65_535, 65_536, 65_537, 200_000] {
+            bm.insert(v);
+        }
+        let n = bm.len();
+        for k in 0..n + 3 {
+            let got: Vec<u128> = bm.iter_from_rank(k).collect();
+            let want: Vec<u128> = bm.iter().skip(k).collect();
+            assert_eq!(got, want, "rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_from_rank_matches_iter_skip_across_container_encodings() {
+        let bm = multi_container_bitmap();
+        let all: Vec<u128> = bm.iter().collect();
+        let n = all.len();
+
+        // Container boundaries are where the cardinality-skipping arithmetic is
+        // most likely to be off by one, so probe around each of them explicitly
+        // rather than relying on a uniform sample.
+        let c0 = 5; // values in high key 0
+        let c1 = 5_000; // values in high key 1
+        let mut ranks: Vec<usize> = vec![0, 1, 2, n - 1, n, n + 1, n + 1_000];
+        for boundary in [c0, c0 + c1] {
+            ranks.extend([boundary - 1, boundary, boundary + 1]);
+        }
+        ranks.extend([c0 + 1, c0 + c1 / 2, c0 + c1 + 400]);
+
+        for k in ranks {
+            let got: Vec<u128> = bm.iter_from_rank(k).collect();
+            let want: Vec<u128> = all.iter().copied().skip(k).collect();
+            assert_eq!(got, want, "rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_from_rank_on_an_empty_bitmap_yields_nothing() {
+        let bm = RoaringBitmap::new();
+        assert_eq!(bm.iter_from_rank(0).count(), 0);
+        assert_eq!(bm.iter_from_rank(100).count(), 0);
+    }
+
+    #[test]
+    fn iter_from_rank_past_the_end_yields_nothing() {
+        let bm = multi_container_bitmap();
+        let n = bm.len();
+        assert_eq!(bm.iter_from_rank(n).count(), 0);
+        assert_eq!(bm.iter_from_rank(n + 1).count(), 0);
+        assert_eq!(bm.iter_from_rank(usize::MAX).count(), 0);
+    }
+
+    #[test]
+    fn iter_from_rank_zero_is_a_full_iteration() {
+        let bm = multi_container_bitmap();
+        let full: Vec<u128> = bm.iter().collect();
+        let from_zero: Vec<u128> = bm.iter_from_rank(0).collect();
+        assert_eq!(from_zero, full);
+    }
 
     #[test]
     fn insert_contains_remove() {

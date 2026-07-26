@@ -1447,17 +1447,22 @@ impl Database {
             return Ok((Vec::new(), 0));
         }
 
+        // Both fast paths window the bitmap with `iter_from_rank`, not
+        // `iter().skip(offset)`: the latter deserialises and materialises every
+        // container it passes over, so walking a full result set page by page
+        // costs O(n²). `iter_from_rank` reaches the offset by skipping whole
+        // containers on their cardinality instead.
+
         // Fast path: RowToKeyFn registered — resolve only the page window.
         if let Some(ref inv) = *store.row_to_key_fn.read() {
-            let keys: Vec<Vec<u8>> = bitmap.iter().skip(offset).take(limit).map(|row_id| inv(row_id)).collect();
+            let keys: Vec<Vec<u8>> = bitmap.iter_from_rank(offset).take(limit).map(|row_id| inv(row_id)).collect();
             return Ok((keys, total));
         }
 
         // Fast path: dense row map — resolve only the page window.
         if store.rowmap_active() {
             let keys: Vec<Vec<u8>> = bitmap
-                .iter()
-                .skip(offset)
+                .iter_from_rank(offset)
                 .take(limit)
                 .filter_map(|row_id| store.rowmap_key_for(row_id))
                 .collect();
@@ -1465,6 +1470,11 @@ impl Database {
         }
 
         // Fallback: scan all keys, filter by bitmap membership, then window.
+        // The `.skip(offset)` here walks *keys*, not the bitmap, so it gets no
+        // benefit from `iter_from_rank` — and it is not the bottleneck on this
+        // path anyway: `store.keys()` already materialises the whole namespace
+        // regardless of the page requested. Reached only when a namespace has
+        // neither a RowToKeyFn nor a loaded row map.
         let all_keys = store.keys()?;
         let keys: Vec<Vec<u8>> = all_keys
             .into_iter()
