@@ -9,7 +9,6 @@ pub enum KVError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
-    #[allow(dead_code)]
     Serialization(String),
     #[error("Key not found")]
     KeyNotFound,
@@ -21,9 +20,6 @@ pub enum KVError {
     ShardedValueLogError(#[from] ShardedValueLogError),
     #[error("WAL error: {0}")]
     WalError(#[from] WalError),
-    #[error("Value log corrupted")]
-    #[allow(dead_code)]
-    CorruptedLog,
     #[error("Database is closed")]
     DatabaseClosed,
     #[error("write too large: {0}")]

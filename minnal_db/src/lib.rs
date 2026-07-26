@@ -116,6 +116,21 @@ pub use db::toml_config::MinnalTomlConfig;
 /// The unified error type returned by all operations.
 pub use db::error::KVError;
 
+/// The subsystem errors carried by [`KVError`]'s variants.
+///
+/// These are re-exported so those variants are actually usable: `LSMError`,
+/// `ValueLogError` and `ShardedValueLogError` live inside the private `store`
+/// module, so without this a caller could match on `KVError::LsmError(_)` but
+/// never name or inspect the value inside it. `WalError` is reachable via
+/// `minnal_db::db::wal`, and is lifted here too so all four payloads are
+/// namable from one place.
+///
+/// Re-exporting the types does not open the `store` module itself.
+pub use db::wal::WalError;
+pub use store::lsm::lsm_tree::LSMError;
+pub use store::value_log::ValueLogError;
+pub use store::value_log::sharded::ShardedValueLogError;
+
 // ── Index types ───────────────────────────────────────────────────────────────
 
 /// Discriminant used when registering a field index.

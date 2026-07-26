@@ -449,13 +449,11 @@ impl RoaringBitmap {
     /// The difference matters because [`iter`](Self::iter) deserialises and
     /// materialises every container it passes over — `.skip(offset)` therefore
     /// allocates its way to the offset, making a full offset-paginated walk
-    /// quadratic. Here only [`sorted_key_cards`] is consulted up front (slot
-    /// table only, no container deserialisation), and containers before the
-    /// start point are never touched.
+    /// quadratic. Here only `ContainerStore::sorted_key_cards` is consulted up
+    /// front (slot table only, no container deserialisation), and containers
+    /// before the start point are never touched.
     ///
     /// An `offset` at or beyond the cardinality yields nothing.
-    ///
-    /// [`sorted_key_cards`]: crate::index::container_store::ContainerStore::sorted_key_cards
     pub fn iter_from_rank(&self, offset: usize) -> impl Iterator<Item = u128> + '_ {
         let key_cards = self.store.sorted_key_cards();
 
