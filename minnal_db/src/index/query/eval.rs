@@ -817,4 +817,35 @@ mod tests {
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![2]);
     }
+
+    #[test]
+    fn a_maximally_complex_accepted_query_evaluates_within_a_small_stack() {
+        // The parser's node budget is only a real guard if every query it
+        // *accepts* can be walked by the recursive consumers (validate →
+        // eval_expr → drop) without overflowing an ordinary stack. A max-size
+        // flat AND chain is the worst case: no parens, so tree depth equals
+        // node count. This test is the other half of the parser's
+        // `long_flat_and_chain_is_rejected_by_the_node_budget` — together they
+        // pin MAX_PARSE_NODES from both sides, so raising it fails here.
+        let terms = (super::super::parser::MAX_PARSE_NODES as usize).div_ceil(2);
+        let query = vec!["age = 25"; terms].join(" AND ");
+
+        // 2 MiB is Rust's default thread stack, well under the main thread's
+        // 8 MiB — so this catches a too-generous budget that the main thread
+        // would happily absorb.
+        let rows = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let age_idx = make_int_index(&[(25, 1), (30, 2)]);
+                let s = schema(&[("age", 0)]);
+                let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+                let bm = parse_and_evaluate(&query, &s, &get_index).unwrap();
+                bm.iter().collect::<Vec<u128>>()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(rows, vec![1]);
+    }
 }

@@ -29,6 +29,16 @@ pub enum QueryError {
     /// IN list is syntactically present but empty.
     #[error("IN value list must not be empty")]
     EmptyInList,
+
+    /// Expression exceeds the parser's complexity limits — too deeply nested,
+    /// or too many terms.
+    ///
+    /// Both limits exist to keep the expression tree walkable with bounded
+    /// stack: the parser, the evaluator and `RawExpr`'s own drop glue are all
+    /// recursive, and a stack overflow aborts the process rather than
+    /// unwinding. See `query::parser::MAX_PARSE_DEPTH` / `MAX_PARSE_NODES`.
+    #[error("query is too complex: {msg}")]
+    TooComplex { msg: String },
 }
 
 impl QueryError {
