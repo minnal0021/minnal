@@ -14,6 +14,7 @@ re-check them before starting work.
 | [FR-001](#fr-001--capture-surface-and-remediate-field-index-replay-gaps) | Capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | Proposed |
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
+| [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
 
 ---
 
@@ -324,3 +325,69 @@ documented.
 - If the return type changes, `doc_store` and `minnal_db_api` are updated to
   handle the new outcome rather than discarding it.
 - A test covers the failing-apply path and asserts the chosen contract.
+
+
+---
+
+## FR-004 — Let the API server talk to the engine directly
+
+**Filed:** 2026-07-26
+**Area:** `minnal_db_api`, `minnal_db` (`doc_store`)
+**Severity:** Low — layering; no defect, no user-visible symptom
+**Source:** engine correctness review 2026-07-25, item 5 (the half the
+decomposition could not reach)
+
+### Summary
+
+`DocStore` carries roughly 25 one-line passthroughs to the underlying `Db` —
+`db_stats`, `ops_metrics*`, `wal_metadata`, `lsm_manifests`, `lsm_runtime_stats`,
+`value_log_*_stats`, `garbage_collect_all`, `garbage_collect_wal`, `compact`,
+`checkpoint_index`, `index_blob_waste_threshold`, and others. They exist so the
+API server can hold one handle, and they drag the whole engine diagnostic
+surface up into the document layer.
+
+That cuts against the project's own rule — *edit the lowest layer that owns it,
+don't reach across modules* — because the API server reaches the engine
+**through** `DocStore` rather than alongside it. `routes/admin_storage.rs` is
+almost entirely calls of this shape.
+
+They are now collected in `doc_store/store/diagnostics.rs` with a module doc
+comment pointing here, so at least the coupling is visible in one place.
+
+### Why this is a feature, not a bug fix
+
+Removing a public method is a breaking change to the crate's API. The decision
+is not the engine's to make unilaterally: it needs a view on who consumes
+`minnal_db` besides this repo's own API server, and whether a major-version bump
+is acceptable. The 2026-07-26 decomposition was carried out under an explicit
+"no existing interface may break" constraint, which put this half out of reach
+by construction.
+
+### Scope
+
+#### Must have
+
+- **`AppState` holds an `Arc<AsyncDb>` alongside its `Arc<DocStore>`**, and the
+  admin/diagnostic routes use it directly. `DocStore` already owns an
+  `Arc<AsyncDb>`, so this is a wiring change at construction, not a second open.
+- **Delete the passthroughs** once no route calls them, in one commit, with the
+  breaking change called out in the changelog.
+
+#### Should have
+
+- An audit of the remaining `DocStore` surface for the same shape — the ~25
+  counted here are the obvious ones, but `list_kv_namespaces` and
+  `ttl_config_for_ns` are arguably in the same family.
+
+#### Could have
+
+- A deprecation cycle (`#[deprecated]` on the passthroughs for one release
+  before removal) if there are downstream consumers to warn.
+
+### Acceptance criteria
+
+- No route in `minnal_db_api` reaches the engine through `DocStore`.
+- `doc_store/store/diagnostics.rs` shrinks to the genuinely document-scoped
+  operations (`count_docs`, the `field_index_*` helpers, `reindex_doc_*`), or
+  disappears.
+- The removal is a single, clearly-labelled breaking commit.
