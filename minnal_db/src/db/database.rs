@@ -1439,7 +1439,7 @@ impl Database {
     /// Remove a previously-activated field index from the in-memory registry.
     ///
     /// After this call the field's bitmap is dropped and any predicate query
-    /// that references it returns [`KVError::Serialization`] wrapping
+    /// that references it returns [`KVError::Query`] carrying
     /// [`crate::index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
@@ -1464,8 +1464,8 @@ impl Database {
     ///
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
-    /// Unindexed fields in the predicate produce a [`KVError::Serialization`]
-    /// wrapping a [`crate::index::query::QueryError::InactiveField`].
+    /// Unindexed fields in the predicate produce a [`KVError::Query`]
+    /// carrying a [`crate::index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
         use crate::index::query::{SchemaMap, parse_and_evaluate};
 
@@ -1496,7 +1496,7 @@ impl Database {
         };
 
         // Evaluate the query → bitmap of matching row IDs
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index).map_err(|e| KVError::Serialization(e.to_string()))?;
+        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index)?;
 
         if bitmap.is_empty() {
             return Ok(Vec::new());
@@ -1559,7 +1559,7 @@ impl Database {
             ns_index.get(field_id).map(|e| Arc::clone(&e.index))
         };
 
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index).map_err(|e| KVError::Serialization(e.to_string()))?;
+        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index)?;
 
         let total = bitmap.len();
 

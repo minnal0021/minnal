@@ -24,6 +24,19 @@ pub enum KVError {
     DatabaseClosed,
     #[error("write too large: {0}")]
     WriteTooLarge(String),
+    /// The caller's query string is invalid — bad syntax, an unknown or
+    /// un-indexed field, a type mismatch, or past the parser's complexity
+    /// limits.
+    ///
+    /// Kept as its own variant rather than folded into [`Serialization`] so
+    /// callers can tell "the request was wrong" from "the database failed".
+    /// The API layer maps it to `400` and returns the message; a generic
+    /// internal error would be a `500` with the text withheld, leaving the
+    /// caller nothing to act on.
+    ///
+    /// [`Serialization`]: KVError::Serialization
+    #[error("{0}")]
+    Query(#[from] crate::index::query::QueryError),
 }
 
 pub type Result<T> = std::result::Result<T, KVError>;

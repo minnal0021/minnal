@@ -47,3 +47,58 @@ fn subsystem_errors_convert_into_kv_error() {
     let err = helper().unwrap_err();
     assert!(matches!(err, KVError::LsmError(_)), "got {err:?}");
 }
+
+/// An invalid predicate is reported as `KVError::Query`, carrying the parser's
+/// own error rather than a stringified one.
+///
+/// It used to be flattened into `KVError::Serialization(String)`, which the API
+/// layer could only treat as a generic engine failure — every bad query became a
+/// `500 {"error":"internal server error"}` with the useful text dropped. The
+/// variant is what lets a caller distinguish "your query is wrong" from "the
+/// database broke", so these assertions are on the *type*, not just the text.
+#[test]
+fn invalid_predicates_surface_as_query_errors() {
+    use minnal_db::index::query::QueryError;
+    use minnal_db::{DEFAULT_NAMESPACE_ID, Db, DbConfig, IndexValue, IndexValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = DbConfig {
+        num_buckets: 2,
+        ..DbConfig::default()
+    };
+    let db = Db::open_with_config(dir.path(), config).unwrap();
+
+    let field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str).unwrap();
+    db.activate_field_index(
+        DEFAULT_NAMESPACE_ID,
+        field,
+        IndexValueType::Str,
+        Arc::new(|bytes: &[u8]| Some(IndexValue::Str(String::from_utf8_lossy(bytes).into_owned()))),
+    )
+    .unwrap();
+    db.put(b"k1", b"active").unwrap();
+
+    // A field with no index cannot be queried...
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, r#"nosuchfield = "x""#).unwrap_err();
+    match err {
+        KVError::Query(inner) => {
+            let named: QueryError = inner;
+            assert!(matches!(named, QueryError::UnknownField { .. }), "expected UnknownField, got {named:?}");
+            assert!(named.to_string().contains("nosuchfield"), "message should name the field");
+        }
+        other => panic!("expected KVError::Query, got {other:?}"),
+    }
+
+    // ...nor is a syntactically broken predicate an engine failure.
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, "status === ").unwrap_err();
+    assert!(matches!(err, KVError::Query(QueryError::Syntax { .. })), "got {err:?}");
+
+    // The complexity bound reports itself as a query fault too, so the API can
+    // answer 400 instead of appearing to have crashed.
+    let deep = format!("{}status = \"active\"{}", "(".repeat(50_000), ")".repeat(50_000));
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, &deep).unwrap_err();
+    assert!(matches!(err, KVError::Query(QueryError::TooComplex { .. })), "got {err:?}");
+
+    db.shutdown().unwrap();
+}
