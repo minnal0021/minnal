@@ -125,6 +125,39 @@ impl WalPersistObserver {
         entry.last_write_offset = entry.last_write_offset.max(tail);
     }
 
+    /// Stop tracking a namespace that has been dropped.
+    ///
+    /// A dropped namespace's store is gone from the registry, so it can never
+    /// flush again and its `safe_offset` can never advance. Left in
+    /// `ns_progress` it reports [`has_unflushed`](NsFlushProgress::has_unflushed)
+    /// forever, which pins the global cut in [`try_advance_persisted`] at its
+    /// stale offset — and [`Database::flush_namespaces_pinning_wal`] cannot clear
+    /// it, because the store it would flush no longer exists. The watermark then
+    /// never advances, `persisted_entries` stops tracking `total_entries`, and
+    /// WAL GC's `persisted >= total` gate never fires again: unbounded WAL growth
+    /// after any namespace drop.
+    ///
+    /// Forgetting it is sound because `remove_namespace` has already flushed and
+    /// shut the store down and marked its WAL entries persisted
+    /// ([`mark_namespace_persisted`]) before calling this — those entries need no
+    /// further protection, and recovery skips entries for namespaces missing from
+    /// the registry anyway.
+    ///
+    /// [`try_advance_persisted`]: Self::try_advance_persisted
+    /// [`mark_namespace_persisted`]: Self::mark_namespace_persisted
+    pub(crate) fn forget_namespace(&self, namespace_id: u32) {
+        {
+            self.ns_progress.write().remove(&namespace_id);
+            // Seal records for memtables that will now never be flushed; left
+            // behind they would be folded into a future namespace's scan.
+            self.pending.write().retain(|(ns, _), _| *ns != namespace_id);
+        }
+        // Locks released: the dropped namespace was potentially the one holding
+        // the cut back, so re-evaluate it now rather than waiting for some other
+        // namespace to happen to flush.
+        self.try_advance_persisted();
+    }
+
     pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
         // Serialize with every other persisted-marking operation so no entry is
         // scanned+flipped+counted concurrently (see `persist_lock`).
@@ -1134,6 +1167,12 @@ impl Database {
         let start = *self.last_persisted_wal_offset.read();
         let tail = self.wal_metadata.read().tail;
         self.wal_flush_observer.mark_namespace_persisted(ns_id, start, tail);
+
+        // (3b) Stop tracking its flush progress. The store is gone, so it can
+        // never flush again — left in place it would report un-flushed writes
+        // forever, pinning the global persisted watermark (and therefore WAL GC)
+        // at a stale offset that nothing can ever advance.
+        self.wal_flush_observer.forget_namespace(ns_id);
 
         // (4) Reclaim disk. Best-effort and independent of the WAL.
         self.remove_namespace_storage(ns_id, name);
@@ -3154,6 +3193,46 @@ mod tests {
         assert!(
             db.wal_flush_observer.namespaces_with_unflushed().is_empty(),
             "nothing should still pin the watermark after the flush"
+        );
+    }
+
+    /// A namespace that is DROPPED must stop constraining the global watermark.
+    ///
+    /// `remove_namespace` flushes and shuts the store down and marks that
+    /// namespace's WAL entries persisted, but it leaves the namespace's entry in
+    /// `ns_progress` with `last_write_offset > safe_offset` — so it is reported
+    /// as pinning forever, and `flush_namespaces_pinning_wal` cannot clear it
+    /// (the store is gone, so the loop skips it). The global cut is then frozen
+    /// at the dead namespace's stale `safe_offset` and WAL GC never fires again.
+    #[test]
+    fn test_dropped_namespace_does_not_pin_the_wal_watermark() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let doomed = db.create_namespace("doomed").unwrap();
+        let keeper = db.create_namespace("keeper").unwrap();
+
+        // `doomed` writes and never fills its memtable, so it never flushes.
+        for i in 0..10u32 {
+            db.put_ns(doomed, format!("d{i}").as_bytes(), b"v").unwrap();
+        }
+        db.remove_namespace("doomed").unwrap();
+
+        // `keeper` writes and flushes — everything in the WAL is now durable.
+        for i in 0..10u32 {
+            db.put_ns(keeper, format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        db.get_store(keeper).unwrap().flush_memtable_to_level0().unwrap();
+        db.flush_namespaces_pinning_wal();
+
+        let pinning = db.wal_flush_observer.namespaces_with_unflushed();
+        let meta = db.wal_metadata.read();
+        let (total, persisted) = (meta.total_entries, meta.persisted_entries);
+        drop(meta);
+
+        assert!(
+            pinning.is_empty() && persisted == total,
+            "a dropped namespace still pins the watermark: pinning={pinning:?}, \
+             persisted={persisted} total={total} (WAL GC's gate is persisted >= total)"
         );
     }
 
