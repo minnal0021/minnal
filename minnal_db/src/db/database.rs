@@ -456,6 +456,23 @@ pub struct Database {
     // Namespace registry
     pub(crate) registry: RwLock<NamespaceRegistry>,
 
+    /// Serialises namespace creation, and lets a reader that lands mid-creation
+    /// wait it out.
+    ///
+    /// Creation is not atomic across the two maps below: the registry entry is
+    /// published (and persisted) before the `KVStore` is opened and inserted into
+    /// `stores`, so in between, a name resolves to an id that `get_store` does
+    /// not know. This lock is what makes creation appear atomic — held across the
+    /// whole of `create_namespace`, and taken by [`Database::get_store`] on a miss
+    /// so it blocks until any in-flight creation has finished.
+    ///
+    /// **Lock ordering: this is the outermost lock.** Never acquire it while
+    /// holding `registry` or `stores`. Making the two maps update atomically the
+    /// obvious way instead — holding `stores.write()` across the registry publish
+    /// — would deadlock against `metrics_snapshot_by_namespace`, which holds
+    /// `registry.read()` while taking `stores.read()`.
+    namespace_create_lock: Mutex<()>,
+
     // Per-namespace stores: namespace_id -> KVStore
     pub(crate) stores: RwLock<HashMap<u32, Arc<KVStore>>>,
 
@@ -695,6 +712,7 @@ impl Database {
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
+            namespace_create_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1021,6 +1039,18 @@ impl Database {
     pub fn create_namespace(&self, name: &str) -> Result<u32> {
         self.check_closed()?;
 
+        // Held until this function returns, so no one can observe the window
+        // between the registry publish below and the `stores` insert at the end.
+        let _create = self.namespace_create_lock.lock();
+
+        // Idempotent under the lock. Callers reach this through get-or-create
+        // (`Db::namespace`), which checks for the name and creates it if absent —
+        // two of them racing a brand-new name both see it absent, and without
+        // this the loser would get a spurious "already exists" from the registry.
+        if let Some(existing) = self.registry.read().get_id(name) {
+            return Ok(existing);
+        }
+
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = self.db_path.join(format!("ns_{}", name));
@@ -1064,6 +1094,12 @@ impl Database {
     /// the async facade's `namespace_with_ttl`) expires records older than it.
     pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<u32> {
         self.check_closed()?;
+
+        // Same contract as `create_namespace` — see its comments.
+        let _create = self.namespace_create_lock.lock();
+        if let Some(existing) = self.registry.read().get_id(name) {
+            return Ok(existing);
+        }
 
         let ns_id = self.registry.write().create(name)?;
 
@@ -1651,13 +1687,30 @@ impl Database {
 
     // ── Store access ───────────────────────────────────────────────────
 
-    /// Get a KVStore by namespace ID
+    /// Get a KVStore by namespace ID.
+    ///
+    /// A miss is not immediately an error. `create_namespace` publishes the
+    /// registry entry before it opens the store, so a caller that has just
+    /// resolved a *name* to this id — which is what every get-or-create path
+    /// does — can arrive while the store is still being opened. If the registry
+    /// knows the id, a creation is or was in flight: wait on the creation lock
+    /// and look once more. Ids the registry does not know fail straight away.
     fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
-        self.stores
-            .read()
-            .get(&namespace_id)
-            .cloned()
-            .ok_or_else(|| KVError::Serialization(format!("Namespace with ID {} not found", namespace_id)))
+        if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
+            return Ok(store);
+        }
+
+        if self.registry.read().get_name(namespace_id).is_some() {
+            // Blocks until any in-flight `create_namespace` has inserted its
+            // store. Taken only after both reads above are released — this lock
+            // is the outermost one (see `namespace_create_lock`).
+            let _create = self.namespace_create_lock.lock();
+            if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
+                return Ok(store);
+            }
+        }
+
+        Err(KVError::Serialization(format!("Namespace with ID {} not found", namespace_id)))
     }
 
     /// Get a KVStore by namespace name
@@ -2438,6 +2491,7 @@ impl Database {
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
+            namespace_create_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -3258,6 +3312,72 @@ mod tests {
         );
 
         db.shutdown().unwrap();
+    }
+
+    /// Regression (F6): concurrent first use of a namespace must not fail.
+    ///
+    /// `create_namespace` publishes the registry entry — and persists it —
+    /// before it opens the `KVStore` and inserts it into `stores`. Between those
+    /// two points the name resolves to an id that `get_store` does not know.
+    /// Every get-or-create caller (`Db::namespace`, `AsyncDb::namespace`, and so
+    /// the whole vector write path) does exactly `get_namespace_id` followed by
+    /// `get_store_by_name`, so it lands in that window and fails with
+    /// "Namespace with ID N not found". Separately, two callers that both see the
+    /// name as absent both try to create it, and the loser gets
+    /// "Namespace 'x' already exists" from the registry.
+    ///
+    /// Seen once in a live stress run, on a new store's first embed, where it
+    /// burned one of five retries. It is not rare: the probe this test came from
+    /// reproduced **167** "not found" and **13** "already exists" in 240 attempts.
+    #[test]
+    fn test_concurrent_first_use_of_a_namespace_does_not_race() {
+        use std::sync::Barrier;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+        let mut failures: Vec<String> = Vec::new();
+
+        for round in 0..25 {
+            let name = format!("ns_{round}");
+            // All four threads reach the get-or-create at once, on a name that
+            // does not exist yet.
+            let barrier = Arc::new(Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let db = Arc::clone(&db);
+                    let name = name.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        // Exactly what `Db::namespace` / `AsyncDb::namespace` do.
+                        match db.get_namespace_id(&name) {
+                            Some(id) => Ok(id),
+                            None => db.create_namespace(&name),
+                        }
+                        .and_then(|_| db.get_store_by_name(&name))
+                        .map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                if let Err(e) = handle.join().unwrap() {
+                    failures.push(e.to_string());
+                }
+            }
+
+            // All four must agree on one namespace, and it must be usable.
+            let id = db.get_namespace_id(&name).expect("the namespace should exist after the round");
+            db.put_ns(id, b"k", b"v").unwrap();
+            assert_eq!(db.get_ns(id, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of 100 concurrent first-use attempts failed: {:?}",
+            failures.len(),
+            // Distinct messages only — the same two repeat.
+            failures.iter().collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     /// Regression: syncing the value log must NOT advance the WAL persisted
