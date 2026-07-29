@@ -91,6 +91,12 @@ pub struct KVStore {
     // Counts writes for periodic sync
     pub(crate) write_count: Arc<AtomicU64>,
 
+    // Set by every no-WAL write, cleared when this namespace's memtable is
+    // flushed. No-WAL writes have no durable copy anywhere until that flush, so
+    // this is what tells the background flusher which namespaces are holding
+    // data a crash would destroy outright rather than merely delay.
+    pub(crate) unflushed_no_wal_writes: Arc<AtomicBool>,
+
     // Flag to prevent concurrent value log GC operations
     pub(crate) value_log_gc_in_progress: Arc<AtomicBool>,
 
@@ -222,6 +228,7 @@ impl KVStore {
             value_log_path,
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
+            unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
@@ -1247,7 +1254,22 @@ impl KVStore {
     /// (the WAL is shared), and flushing is what makes those entries durable
     /// on disk and therefore skippable by recovery.
     pub fn flush_memtable_to_level0(&self) -> Result<()> {
+        // Cleared before the flush, not after: a write landing mid-flush may or
+        // may not be included, so leaving the flag set costs one redundant flush
+        // next tick, whereas clearing afterwards could drop that write's only
+        // record of being unflushed.
+        self.unflushed_no_wal_writes.store(false, Ordering::Release);
         self.lsm.flush_memtable_to_level0().map_err(KVError::from)
+    }
+
+    /// Record that a no-WAL write landed in this namespace's memtable.
+    pub(crate) fn note_no_wal_write(&self) {
+        self.unflushed_no_wal_writes.store(true, Ordering::Release);
+    }
+
+    /// Whether this namespace holds no-WAL writes that exist nowhere but memory.
+    pub(crate) fn has_unflushed_no_wal_writes(&self) -> bool {
+        self.unflushed_no_wal_writes.load(Ordering::Acquire)
     }
 
     // ── Garbage collection ─────────────────────────────────────────────

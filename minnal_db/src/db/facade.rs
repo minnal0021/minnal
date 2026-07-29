@@ -578,6 +578,9 @@ impl LsmCompactionTarget for Db {
     fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+    fn flush_no_wal_memtables(&self) -> usize {
+        self.inner.flush_no_wal_memtables()
+    }
     fn has_lsm_compaction_work(&self) -> bool {
         self.inner.has_lsm_compaction_work()
     }

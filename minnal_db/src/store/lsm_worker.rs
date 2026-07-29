@@ -15,6 +15,9 @@ pub trait LsmCompactionTarget: Send + Sync + 'static {
     fn is_closed(&self) -> bool;
     fn has_lsm_compaction_work(&self) -> bool;
     fn compact_lsm(&self) -> Result<()>;
+    /// Flush namespaces whose no-WAL writes exist only in memory, bounding what
+    /// a crash destroys to one tick. Returns how many were flushed.
+    fn flush_no_wal_memtables(&self) -> usize;
 }
 
 /// Commands that can be sent to the LSM compaction worker
@@ -106,6 +109,15 @@ impl LsmCompactionWorker {
     fn perform_compaction_check<T: LsmCompactionTarget>(target: &Arc<T>) {
         if target.is_closed() {
             return;
+        }
+
+        // Before deciding there is nothing to do: no-WAL writes are unrecoverable
+        // once the process dies, so they must not be left sitting in a memtable
+        // until it happens to fill. Flushing here also means the L0 files this
+        // produces are compacted by the same tick.
+        let flushed = target.flush_no_wal_memtables();
+        if flushed > 0 {
+            info!("[LsmCompactionWorker] tick — flushed {flushed} namespace(s) holding un-flushed no-WAL writes");
         }
 
         if !target.has_lsm_compaction_work() {

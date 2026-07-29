@@ -901,6 +901,10 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
         }
+        // No WAL entry exists for this write, so until the memtable is flushed
+        // it lives only in memory — the background flusher uses this to bound
+        // how much a crash can destroy.
+        kv_store.note_no_wal_write();
         kv_store.put_to_storage(key, value)
     }
 
@@ -921,6 +925,7 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
         }
+        kv_store.note_no_wal_write();
         kv_store.delete_from_storage(key)
     }
 
@@ -1669,6 +1674,42 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    /// Flush every namespace holding no-WAL writes that exist only in memory.
+    ///
+    /// WAL-backed writes survive a crash because recovery replays them; no-WAL
+    /// writes have no such copy, so whatever sits in the memtable when the
+    /// process dies is gone. That is the intended trade for the vector index and
+    /// the query-embedding cache — both are bulky and re-derivable — but a
+    /// memtable is only flushed at capacity, so in practice a crash discarded
+    /// *everything* those namespaces had accumulated. Observed: a `SIGKILL` left
+    /// `stress_docs_sparse_vector` with 4 entries on disk against 6020 in
+    /// memory, and reconciliation re-enqueued ~18000 documents whose embeddings
+    /// had already been computed — hours of work against the embedding service.
+    ///
+    /// Running this on the compaction worker's tick bounds that loss to one tick
+    /// of writes instead of a whole memtable. Only namespaces with no-WAL writes
+    /// are flushed: WAL-backed ones are recoverable, are already flushed by
+    /// [`flush_namespaces_pinning_wal`], and forcing extra flushes on them would
+    /// buy no durability while adding L0 files for compaction to merge.
+    ///
+    /// Returns how many namespaces were flushed.
+    ///
+    /// [`flush_namespaces_pinning_wal`]: Self::flush_namespaces_pinning_wal
+    pub(crate) fn flush_no_wal_memtables(&self) -> usize {
+        let stores = self.stores.read();
+        let mut flushed = 0;
+        for (ns_id, kv_store) in stores.iter() {
+            if !kv_store.has_unflushed_no_wal_writes() {
+                continue;
+            }
+            match kv_store.flush_memtable_to_level0() {
+                Ok(()) => flushed += 1,
+                Err(e) => warn!("[LSM] Failed to flush no-WAL memtable for ns={}: {:?}", ns_id, e),
+            }
+        }
+        flushed
     }
 
     /// Flush every namespace that is holding the WAL persisted watermark back.
@@ -2551,6 +2592,10 @@ impl WalGcTarget for Database {
 impl LsmCompactionTarget for Database {
     fn is_closed(&self) -> bool {
         self.is_closed()
+    }
+
+    fn flush_no_wal_memtables(&self) -> usize {
+        self.flush_no_wal_memtables()
     }
 
     fn has_lsm_compaction_work(&self) -> bool {
@@ -3857,6 +3902,94 @@ mod tests {
         assert_eq!(db.get(b"k0000").unwrap(), Some(value.clone()), "the hammered key must survive collection");
 
         db.shutdown().unwrap();
+    }
+
+    /// No-WAL writes are unrecoverable by design — there is nothing to replay —
+    /// so leaving them in a memtable until it fills means a crash discards the
+    /// lot. This is what cost the stress run its whole vector index: a `SIGKILL`
+    /// left 4 sparse-vector entries on disk against 6020 in memory.
+    ///
+    /// The periodic flush is the bound. Both halves are asserted here, because
+    /// the second is what makes the first meaningful.
+    #[test]
+    fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
+        let dir = TempDir::new().unwrap();
+        let config = create_db_config();
+
+        // Session 1: no-WAL writes, a periodic flush, then a crash.
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            let ns = db.create_namespace("vectors").unwrap();
+            for i in 0..50u32 {
+                db.put_ns_no_wal(ns, format!("v{i:03}").as_bytes(), b"embedding").unwrap();
+            }
+
+            assert!(
+                db.get_store(ns).unwrap().has_unflushed_no_wal_writes(),
+                "no-WAL writes should mark the namespace as holding unflushed data"
+            );
+            assert_eq!(db.flush_no_wal_memtables(), 1, "the namespace should have been flushed");
+            assert!(
+                !db.get_store(ns).unwrap().has_unflushed_no_wal_writes(),
+                "the flag should clear once the memtable is flushed"
+            );
+            // Nothing new since the flush, so a second tick is a no-op.
+            assert_eq!(db.flush_no_wal_memtables(), 0, "an already-flushed namespace should not be re-flushed");
+
+            std::mem::forget(db);
+        }
+
+        {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            let ns = db.get_namespace_id("vectors").expect("namespace should still exist");
+            for i in 0..50u32 {
+                assert_eq!(
+                    db.get_ns(ns, format!("v{i:03}").as_bytes()).unwrap().as_deref(),
+                    Some(&b"embedding"[..]),
+                    "no-WAL write {i} was flushed before the crash and must survive it"
+                );
+            }
+            std::mem::forget(db);
+        }
+
+        // Without the flush the same writes are gone — no WAL entry exists to
+        // replay them. This is the loss the periodic flush bounds.
+        let dir2 = TempDir::new().unwrap();
+        {
+            let db = Database::open(dir2.path(), config.clone()).unwrap();
+            let ns = db.create_namespace("vectors").unwrap();
+            for i in 0..50u32 {
+                db.put_ns_no_wal(ns, format!("v{i:03}").as_bytes(), b"embedding").unwrap();
+            }
+            std::mem::forget(db);
+        }
+        {
+            let db = Database::open(dir2.path(), config).unwrap();
+            let ns = db.get_namespace_id("vectors").expect("namespace should still exist");
+            assert_eq!(
+                db.get_ns(ns, b"v000").unwrap(),
+                None,
+                "un-flushed no-WAL writes are expected to be lost — if this starts passing, \
+                 the flush test above is no longer proving anything"
+            );
+            std::mem::forget(db);
+        }
+    }
+
+    /// WAL-backed writes must not be dragged into the no-WAL flush: they are
+    /// recoverable, are already flushed by the WAL-watermark path, and forcing
+    /// extra flushes would only add L0 files for compaction to merge.
+    #[test]
+    fn wal_backed_writes_do_not_trigger_the_no_wal_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("docs").unwrap();
+        for i in 0..50u32 {
+            db.put_ns(ns, format!("k{i:03}").as_bytes(), b"value").unwrap();
+        }
+
+        assert!(!db.get_store(ns).unwrap().has_unflushed_no_wal_writes());
+        assert_eq!(db.flush_no_wal_memtables(), 0);
     }
 
     #[test]
