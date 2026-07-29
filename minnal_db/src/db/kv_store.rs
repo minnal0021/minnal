@@ -1333,32 +1333,82 @@ impl KVStore {
 
         for segment in candidates {
             // ── Phase 1: what is still live in this segment? ──────────────────
+            //
+            // Liveness is resolved for the whole segment in ONE batched lookup,
+            // not one point-get per record. A Level-0 file carries no bloom, no
+            // min/max and no sparse index, so a point-get that reaches L0 scans
+            // every entry of every L0 file in the bucket — and doing that per
+            // record makes GC O(records × total L0 entries), i.e. quadratic in
+            // churn. Measured at ~165 µs per record *per L0 file*, dead flat
+            // across 2→16 files: 8 000 records against 16 L0 files took 22 s,
+            // and a live run spent 484 s moving 9 MB on the vector-index queue,
+            // which churns hardest and so accumulates the most L0 files.
+            //
+            // `get_multiple` inverts the loop: each L0 file is opened and
+            // streamed once, matched against every pending key at once. The cost
+            // becomes one pass per file rather than one scan per key.
+            //
+            // The price is a second pass over the segment — pass A takes keys
+            // only, pass B re-reads to materialise just the survivors' values.
+            // That trades random LSM lookups for one extra sequential read of a
+            // file we are about to rewrite anyway, and keeps peak memory at
+            // keys + survivors rather than the whole segment.
+            // Pass A: the distinct keys this segment holds.
+            let keys: Vec<Vec<u8>> = {
+                let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+                log.for_each_record(segment.id, |key, _value, _meta, _location| {
+                    seen.insert(key.to_vec());
+                })?;
+                seen.into_iter().collect()
+            };
+
+            // Where the LSM currently points for each of them, if anywhere.
+            let resolved = self.lsm.get_multiple(&keys)?;
+            let live: std::collections::HashMap<&[u8], u128> = keys
+                .iter()
+                .zip(resolved.iter())
+                .filter_map(|(key, found)| found.map(|(pointer, _seq)| (key.as_slice(), pointer)))
+                .collect();
+
+            // Pass B: keep only the records the LSM still points at.
+            //
+            // Note this yields at most ONE survivor per key: two records for the
+            // same key in this segment have different locations, so only the one
+            // whose pointer matches can match. Phase 2 relies on that.
             let mut survivors: Vec<(Vec<u8>, Vec<u8>, ValueRecordMeta, u128)> = Vec::new();
-            let mut scan_err: Option<KVError> = None;
             log.for_each_record(segment.id, |key, value, meta, location| {
-                if scan_err.is_some() {
-                    return;
-                }
                 let Ok(pointer) = ShardedValuePointer::new(bucket, location, self.value_log.num_buckets()) else {
                     return;
                 };
                 let old_u128 = pointer.to_u128();
-                match self.lsm.get(key) {
-                    // Live iff the LSM still points at exactly this record.
-                    Ok(Some(current)) if current == old_u128 => survivors.push((key.to_vec(), value, meta, old_u128)),
-                    Ok(_) => {}
-                    Err(e) => scan_err = Some(e.into()),
+                // Live iff the LSM still points at exactly this record.
+                if live.get(key) == Some(&old_u128) {
+                    survivors.push((key.to_vec(), value, meta, old_u128));
                 }
             })?;
-            if let Some(e) = scan_err {
-                return Err(e);
-            }
 
             // ── Phase 2: relocate survivors, re-point by compare-and-set ──────
             {
                 let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-                for (key, value, meta, old_u128) in &survivors {
-                    let Some((current, seq)) = self.lsm.get_with_seq(key)? else {
+
+                // Batched for the same reason as phase 1 — a per-survivor
+                // `get_with_seq` pays the same full L0 scan, and here it is paid
+                // while holding the bucket write lock, which blocks every writer
+                // to this bucket (`put_to_storage` / `delete_from_storage` hold
+                // it across their value-log append *and* their LSM update). That
+                // is what starved writes in the live run while reads, which take
+                // no such lock, ran at full speed.
+                //
+                // Still a compare-and-set: holding that lock excludes every
+                // writer, so one batched read under it sees exactly what
+                // per-key reads under it would. The appends below do mutate the
+                // LSM as we go, but survivors carry no duplicate keys (see phase
+                // 1), so no entry can invalidate another's resolved answer.
+                let survivor_keys: Vec<Vec<u8>> = survivors.iter().map(|(key, _, _, _)| key.clone()).collect();
+                let current_pointers = self.lsm.get_multiple(&survivor_keys)?;
+
+                for ((key, value, meta, old_u128), current) in survivors.iter().zip(current_pointers) {
+                    let Some((current, seq)) = current else {
                         continue; // deleted since phase 1 — do not resurrect
                     };
                     if current != *old_u128 {
@@ -1670,6 +1720,93 @@ mod tests {
     // ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────
     //
     // These exercise the FILE-level pass directly with distinct "OLD"/"NEW"
+
+    /// Value-log GC must resolve liveness in BATCHES, not one point-get per
+    /// record.
+    ///
+    /// A Level-0 file carries no bloom, no min/max and no sparse index, so a
+    /// point-get reaching L0 scans every entry of every L0 file in the bucket.
+    /// Done per record, GC becomes O(records × total L0 entries) — quadratic in
+    /// churn. Measured before the fix at ~165 µs per record *per L0 file*, dead
+    /// flat from 2 to 16 files: 8 000 records against 16 L0 files took 22 s, and
+    /// a live run spent 484 s moving 9 MB on the vector-index queue.
+    ///
+    /// Asserted on `l0_probes` rather than on elapsed time, so it is a statement
+    /// about the algorithm and cannot flake on a slow machine. That counter is
+    /// bumped only by the per-key `search_level0_files` path, so the batched
+    /// path leaves it untouched while the per-record path bumps it once per
+    /// record.
+    #[test]
+    fn gc_resolves_liveness_in_batches_not_per_record() {
+        let lsm = LSMConfig {
+            // One bucket, so every key shares one L0 set — the shape a churning
+            // namespace degenerates into.
+            num_buckets: 1,
+            skip_list_capacity: 100_000,
+            ..LSMConfig::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(
+            0,
+            "queue",
+            dir.path(),
+            lsm,
+            SyncConfig::default(),
+            1024 * 1024, // small segments so they seal and become GC candidates
+        )
+        .unwrap();
+        store.set_metrics(Arc::new(crate::db::metrics::Metrics::default()));
+
+        // Four L0 files, each round overwriting the previous round's keys, so
+        // the log fills with garbage exactly like an enqueue/delete queue.
+        const ROUNDS: usize = 4;
+        const PER_ROUND: usize = 500;
+        let value = vec![b'x'; 256];
+        for round in 0..ROUNDS {
+            for i in 0..PER_ROUND {
+                store.put_to_storage(format!("k{:07}", round * PER_ROUND + i).as_bytes(), &value).unwrap();
+            }
+            if round > 0 {
+                for i in 0..PER_ROUND {
+                    store
+                        .delete_from_storage(format!("k{:07}", (round - 1) * PER_ROUND + i).as_bytes())
+                        .unwrap();
+                }
+            }
+            store.flush_memtable_to_level0().unwrap();
+        }
+
+        let before = store.metrics().unwrap().snapshot();
+        store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
+        let probes = store.metrics().unwrap().snapshot().l0_probes - before.l0_probes;
+
+        // The per-record path issued one probe per record scanned (thousands
+        // here); the batched path issues none at all. A tenth of one round is a
+        // wide margin either side.
+        assert!(
+            probes < (PER_ROUND / 10) as u64,
+            "GC issued {probes} per-key L0 probes — it is resolving liveness per record again, \
+             which is O(records × L0 entries) and made a live run take 484 s to move 9 MB"
+        );
+
+        // The batching must not change any liveness decision: the last round's
+        // keys are live, every earlier round's were deleted.
+        for i in 0..PER_ROUND {
+            let live = format!("k{:07}", (ROUNDS - 1) * PER_ROUND + i);
+            assert_eq!(
+                store.get(live.as_bytes()).unwrap().as_deref(),
+                Some(value.as_slice()),
+                "{live} must survive GC"
+            );
+        }
+        for round in 0..ROUNDS - 1 {
+            for i in 0..PER_ROUND {
+                let dead = format!("k{:07}", round * PER_ROUND + i);
+                assert_eq!(store.get(dead.as_bytes()).unwrap(), None, "{dead} was deleted and must stay deleted");
+            }
+        }
+    }
+
     #[test]
     fn test_kvstore_basic_operations() {
         let dir = TempDir::new().unwrap();
