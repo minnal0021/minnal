@@ -4055,6 +4055,59 @@ mod tests {
         }
     }
 
+    /// A *failed* flush must leave the no-WAL flag set.
+    ///
+    /// The flag is the only record that these writes exist nowhere but memory.
+    /// Clearing it on a flush that did not happen drops the namespace out of
+    /// `flush_no_wal_memtables` permanently — no later tick retries it — so the
+    /// next crash takes the whole memtable, which is exactly the loss the
+    /// periodic flush was added to bound.
+    #[test]
+    fn a_failed_flush_keeps_the_no_wal_flag_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("vectors").unwrap();
+        for i in 0..50u32 {
+            db.put_ns_no_wal(ns, format!("v{i:03}").as_bytes(), b"embedding").unwrap();
+        }
+        let store = db.get_store(ns).unwrap();
+        assert!(store.has_unflushed_no_wal_writes());
+
+        // Make the flush fail by taking write permission off the level-0 tree —
+        // it can then neither create a bucket directory nor write an SSTable
+        // into an existing one.
+        let level0 = store.lsm_path.join("level0");
+        std::fs::create_dir_all(&level0).unwrap();
+        let mut locked: Vec<(std::path::PathBuf, std::fs::Permissions)> = Vec::new();
+        for entry in std::fs::read_dir(&level0).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                locked.push((path.clone(), std::fs::metadata(&path).unwrap().permissions()));
+            }
+        }
+        locked.push((level0.clone(), std::fs::metadata(&level0).unwrap().permissions()));
+        for (path, perms) in &locked {
+            let mut readonly = perms.clone();
+            readonly.set_mode(0o555);
+            std::fs::set_permissions(path, readonly).unwrap();
+        }
+
+        let result = store.flush_memtable_to_level0();
+
+        // Restore before asserting so a failure still leaves a removable TempDir.
+        for (path, perms) in locked {
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        assert!(result.is_err(), "flush should fail on a read-only directory");
+        assert!(
+            store.has_unflushed_no_wal_writes(),
+            "a failed flush cleared the flag, so no later tick will retry this namespace"
+        );
+    }
+
     /// WAL-backed writes must not be dragged into the no-WAL flush: they are
     /// recoverable, are already flushed by the WAL-watermark path, and forcing
     /// extra flushes would only add L0 files for compaction to merge.

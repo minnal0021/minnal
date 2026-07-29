@@ -1258,8 +1258,19 @@ impl KVStore {
         // may not be included, so leaving the flag set costs one redundant flush
         // next tick, whereas clearing afterwards could drop that write's only
         // record of being unflushed.
-        self.unflushed_no_wal_writes.store(false, Ordering::Release);
-        self.lsm.flush_memtable_to_level0().map_err(KVError::from)
+        let was_set = self.unflushed_no_wal_writes.swap(false, Ordering::AcqRel);
+        let result = self.lsm.flush_memtable_to_level0().map_err(KVError::from);
+        if result.is_err() && was_set {
+            // The flush did not happen, so those no-WAL writes are still
+            // memory-only — and they have no WAL entry to replay, so nothing
+            // else will ever save them. Restoring the flag makes the next tick
+            // retry; leaving it clear would silently drop this namespace out of
+            // `flush_no_wal_memtables` for good and hand a crash the whole
+            // memtable. Only restore what we cleared: a failed flush on a
+            // WAL-backed namespace must not start claiming no-WAL writes.
+            self.unflushed_no_wal_writes.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Record that a no-WAL write landed in this namespace's memtable.
