@@ -15,6 +15,9 @@ use tokio::time;
 /// `Database` implements this, allowing `WalGcWorker` to drive GC.
 pub trait WalGcTarget: Send + Sync + 'static {
     fn is_closed(&self) -> bool;
+    /// Flush any namespace still holding un-flushed WAL-backed writes, so the
+    /// persisted watermark can advance past them. Returns how many were flushed.
+    fn flush_namespaces_pinning_wal(&self) -> usize;
     fn get_wal_gc_stats(&self) -> (u64, u64);
     /// Returns `true` if there is at least one fully-persisted WAL segment
     /// that is not the active (current) segment and can therefore be deleted.
@@ -119,6 +122,15 @@ impl WalGcWorker {
     fn perform_wal_gc_check<T: WalGcTarget>(target: &Arc<T>) {
         if target.is_closed() {
             return;
+        }
+
+        // The persisted watermark can only advance to the slowest namespace's
+        // flushed offset (the WAL is shared, memtables are not), so a namespace
+        // that writes a little and then goes idle would pin the WAL forever.
+        // Flush those memtables first, then reassess what is reclaimable.
+        let flushed = target.flush_namespaces_pinning_wal();
+        if flushed > 0 {
+            info!("[WalGcWorker] tick — flushed {} namespace(s) holding the WAL watermark", flushed);
         }
 
         // Only run GC when there is at least one fully-persisted non-current segment

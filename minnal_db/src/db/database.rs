@@ -35,13 +35,41 @@ struct WalFlushState {
     flushed: bool,
 }
 
+/// How far one namespace's writes have made it onto disk.
+///
+/// The WAL is global but memtables are per-namespace, so "this entry is durable
+/// in an SSTable" is a *per-namespace* question and the global watermark can only
+/// be the slowest namespace's answer.
+#[derive(Default, Clone, Copy)]
+struct NsFlushProgress {
+    /// WAL offset up to which every write by this namespace is in an SSTable.
+    safe_offset: u64,
+    /// WAL tail just after this namespace's most recent WAL append.
+    last_write_offset: u64,
+}
+
+impl NsFlushProgress {
+    /// Whether this namespace still holds WAL-backed writes that are not yet in
+    /// an SSTable, and so must hold the global watermark back.
+    fn has_unflushed(&self) -> bool {
+        self.last_write_offset > self.safe_offset
+    }
+}
+
 /// Observes LSM flush events and marks WAL entries as persisted.
 /// Shared across all namespaces since the WAL is global.
 pub(crate) struct WalPersistObserver {
     wal: Arc<Wal>,
     wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_metadata_path: PathBuf,
-    pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+    /// Keyed by `(namespace_id, memtable version)`. Memtable versions are
+    /// allocated **per KVStore**, so keying by version alone made namespace A's
+    /// version 7 and namespace B's version 7 the same entry — A's flush would
+    /// then satisfy B's pending record and advance the watermark past B's
+    /// un-flushed writes.
+    pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    /// Per-namespace flush progress — the input to the global watermark.
+    ns_progress: RwLock<std::collections::HashMap<u32, NsFlushProgress>>,
     last_persisted_offset: Arc<RwLock<u64>>,
     /// Serializes every persisted-marking operation (`mark_persisted_range`,
     /// `mark_namespace_persisted`). These do a non-atomic scan → check status →
@@ -58,7 +86,7 @@ impl WalPersistObserver {
         wal: Arc<Wal>,
         wal_metadata: Arc<RwLock<WalMetadata>>,
         wal_metadata_path: PathBuf,
-        pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+        pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
         last_persisted_offset: Arc<RwLock<u64>>,
     ) -> Self {
         Self {
@@ -66,9 +94,35 @@ impl WalPersistObserver {
             wal_metadata,
             wal_metadata_path,
             pending,
+            ns_progress: RwLock::new(std::collections::HashMap::new()),
             last_persisted_offset,
             persist_lock: Mutex::new(()),
         }
+    }
+
+    /// Namespaces holding WAL-backed writes that are not yet in an SSTable.
+    ///
+    /// These are what hold the global watermark — and therefore WAL GC — back.
+    /// A namespace that writes a little and then goes idle would pin the WAL
+    /// indefinitely, so the WAL GC worker flushes them on its tick.
+    pub(crate) fn namespaces_with_unflushed(&self) -> Vec<u32> {
+        self.ns_progress
+            .read()
+            .iter()
+            .filter(|(_, p)| p.has_unflushed())
+            .map(|(ns, _)| *ns)
+            .collect()
+    }
+
+    /// Record that `namespace_id` appended a WAL entry ending at `tail`.
+    ///
+    /// This is what lets the watermark tell "namespace has nothing outstanding"
+    /// apart from "namespace has not flushed yet": a namespace that never writes
+    /// must not hold the watermark — and therefore WAL GC — back forever.
+    pub(crate) fn note_write(&self, namespace_id: u32, tail: u64) {
+        let mut progress = self.ns_progress.write();
+        let entry = progress.entry(namespace_id).or_default();
+        entry.last_write_offset = entry.last_write_offset.max(tail);
     }
 
     pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
@@ -203,17 +257,23 @@ impl WalPersistObserver {
         }
     }
 
-    fn try_advance_persisted(&self) {
+    /// Fold `namespace_id`'s completed flushes into its `safe_offset`.
+    ///
+    /// Versions are consumed in order and only while flushed, so an out-of-order
+    /// flush cannot advance the namespace past a still-pending older memtable.
+    fn advance_namespace(&self, namespace_id: u32) {
+        let mut new_safe = 0u64;
         loop {
             let next = {
                 let pending = self.pending.read();
-                let Some((&version, state)) = pending.iter().next() else {
-                    return;
+                // BTreeMap ordering makes this the namespace's lowest version.
+                let Some((&key, state)) = pending.range((namespace_id, 0)..=(namespace_id, u64::MAX)).next() else {
+                    break;
                 };
                 if !state.flushed {
-                    return;
+                    break;
                 }
-                (version, state.tail)
+                (key, state.tail)
             };
 
             {
@@ -222,49 +282,89 @@ impl WalPersistObserver {
                     continue;
                 };
                 if !state.flushed {
-                    return;
+                    break;
                 }
                 pending.remove(&next.0);
             }
+            new_safe = new_safe.max(next.1);
+        }
 
-            let start = *self.last_persisted_offset.read();
-            self.mark_persisted_range(start, next.1);
+        if new_safe > 0 {
+            let mut progress = self.ns_progress.write();
+            let entry = progress.entry(namespace_id).or_default();
+            entry.safe_offset = entry.safe_offset.max(new_safe);
+        }
+    }
+
+    /// Advance the global watermark to the point every namespace has reached.
+    ///
+    /// A WAL entry may only be marked `Persisted` once the namespace that owns it
+    /// has flushed it to an SSTable, because recovery skips `Persisted` entries.
+    /// The WAL is shared, so the safe cut is the **minimum** `safe_offset` over
+    /// the namespaces that still hold un-flushed writes. Marking up to one
+    /// namespace's own tail — as this did before — declared every *other*
+    /// namespace's un-flushed entries persisted too, and a crash then lost them.
+    /// Namespaces with nothing outstanding do not constrain the cut; if none do,
+    /// everything written so far is durable and the cut is the current tail.
+    fn try_advance_persisted(&self) {
+        let cut = {
+            let progress = self.ns_progress.read();
+            let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
+            match slowest {
+                Some(offset) => offset,
+                None => self.wal_metadata.read().tail,
+            }
+        };
+
+        let start = *self.last_persisted_offset.read();
+        if cut > start {
+            self.mark_persisted_range(start, cut);
         }
     }
 }
 
-impl LsmFlushObserver for WalPersistObserver {
-    fn on_memtable_sealed(&self, version: u64) {
+impl WalPersistObserver {
+    fn on_memtable_sealed_ns(&self, namespace_id: u32, version: u64) {
         let tail = self.wal_metadata.read().tail;
         let mut pending = self.pending.write();
-        pending.entry(version).or_insert(WalFlushState { tail, flushed: false });
+        pending.entry((namespace_id, version)).or_insert(WalFlushState { tail, flushed: false });
     }
 
-    fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
+    fn on_ro_memtable_flushed_to_level0_ns(&self, namespace_id: u32, version: u64) {
         {
             let mut pending = self.pending.write();
-            let entry = pending.entry(version).or_insert(WalFlushState { tail: 0, flushed: false });
+            let entry = pending
+                .entry((namespace_id, version))
+                .or_insert(WalFlushState { tail: 0, flushed: false });
             if entry.tail == 0 {
                 entry.tail = self.wal_metadata.read().tail;
             }
             entry.flushed = true;
         }
+        self.advance_namespace(namespace_id);
         self.try_advance_persisted();
     }
 }
 
 /// Hub that fans out LSM flush events to the WAL observer and compaction trigger.
+///
+/// One hub per KVStore, which is what supplies the namespace id the shared
+/// [`WalPersistObserver`] needs: the LSM itself only knows memtable versions, and
+/// those are allocated per store.
 struct LsmFlushObserverHub {
+    namespace_id: u32,
     wal_observer: Arc<WalPersistObserver>,
     compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 }
 
 impl LsmFlushObserverHub {
     fn new(
+        namespace_id: u32,
         wal_observer: Arc<WalPersistObserver>,
         compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
     ) -> Self {
         Self {
+            namespace_id,
             wal_observer,
             compaction_trigger,
         }
@@ -279,12 +379,12 @@ impl LsmFlushObserverHub {
 
 impl LsmFlushObserver for LsmFlushObserverHub {
     fn on_memtable_sealed(&self, version: u64) {
-        self.wal_observer.on_memtable_sealed(version);
+        self.wal_observer.on_memtable_sealed_ns(self.namespace_id, version);
         self.trigger_compaction();
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
-        self.wal_observer.on_ro_memtable_flushed_to_level0(version);
+        self.wal_observer.on_ro_memtable_flushed_to_level0_ns(self.namespace_id, version);
     }
 }
 
@@ -316,7 +416,7 @@ pub struct Database {
     wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
-    pending_wal_flushes: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+    pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
     last_persisted_wal_offset: Arc<RwLock<u64>>,
     wal_gc_in_progress: Arc<AtomicBool>,
 
@@ -628,8 +728,9 @@ impl Database {
     /// Wire up LSM flush observers for all KVStores
     fn wire_up_flush_observers(&self) {
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for (ns_id, kv_store) in stores.iter() {
             let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+                *ns_id,
                 Arc::clone(&self.wal_flush_observer),
                 Arc::clone(&kv_store.lsm_compaction_trigger),
             ));
@@ -740,7 +841,13 @@ impl Database {
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
+        let wal_tail = wal_metadata.tail;
         drop(wal_metadata);
+
+        // This namespace now has a WAL-backed write that is not yet in an
+        // SSTable, so it holds the global persisted watermark back until it
+        // flushes (see `WalPersistObserver::try_advance_persisted`).
+        self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
         // Step 2: Apply to the namespace's in-memory store. The write is already
         // durable in the WAL, so this is best-effort with bounded retry: on
@@ -838,7 +945,11 @@ impl Database {
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
+        let wal_tail = wal_metadata.tail;
         drop(wal_metadata);
+
+        // As in `put_ns`: this namespace now holds an un-flushed WAL-backed write.
+        self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
         // Step 2: Apply the delete to the in-memory store (best-effort with
         // bounded retry; durable in the WAL — see `put_ns`).
@@ -891,6 +1002,7 @@ impl Database {
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+            ns_id,
             Arc::clone(&self.wal_flush_observer),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
@@ -935,6 +1047,7 @@ impl Database {
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+            ns_id,
             Arc::clone(&self.wal_flush_observer),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
@@ -1556,6 +1669,32 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    /// Flush every namespace that is holding the WAL persisted watermark back.
+    ///
+    /// The watermark can only advance to the slowest namespace's flushed offset,
+    /// so a namespace that writes a few records and then goes idle would pin the
+    /// whole WAL forever. Flushing those memtables to level 0 is what lets the
+    /// watermark — and WAL GC behind it — move again. Returns how many
+    /// namespaces were flushed.
+    pub(crate) fn flush_namespaces_pinning_wal(&self) -> usize {
+        let pinning = self.wal_flush_observer.namespaces_with_unflushed();
+        if pinning.is_empty() {
+            return 0;
+        }
+        let stores = self.stores.read();
+        let mut flushed = 0;
+        for ns_id in pinning {
+            let Some(kv_store) = stores.get(&ns_id) else {
+                continue;
+            };
+            match kv_store.flush_memtable_to_level0() {
+                Ok(()) => flushed += 1,
+                Err(e) => warn!("[WAL] Failed to flush ns={} while unpinning the WAL watermark: {:?}", ns_id, e),
+            }
+        }
+        flushed
     }
 
     fn flush_wal_metadata_internal(&self) -> Result<()> {
@@ -2390,6 +2529,10 @@ impl WalGcTarget for Database {
         self.is_closed()
     }
 
+    fn flush_namespaces_pinning_wal(&self) -> usize {
+        self.flush_namespaces_pinning_wal()
+    }
+
     fn get_wal_gc_stats(&self) -> (u64, u64) {
         self.get_wal_gc_stats()
     }
@@ -2888,6 +3031,85 @@ mod tests {
         let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
         config.num_buckets = crate::support::TEST_NUM_BUCKETS;
         config
+    }
+
+    /// Regression: one namespace's memtable flush must not mark ANOTHER
+    /// namespace's WAL entries persisted.
+    ///
+    /// The WAL is global, memtables are per-namespace. The observer used to
+    /// record the global WAL tail at seal time and, on flush, mark every entry
+    /// below it persisted — including entries owned by namespaces that had not
+    /// flushed. Recovery skips persisted entries, so those acknowledged writes
+    /// were silently lost on the next crash. Measured against a live server
+    /// before the fix: 0 of 200 keys in the quiet namespace survived a SIGKILL
+    /// after a second namespace flushed repeatedly.
+    ///
+    /// Asserting on `persisted_entries` rather than on post-crash reads keeps
+    /// this a unit test: an entry marked persisted is exactly the entry recovery
+    /// will refuse to replay.
+    #[test]
+    fn test_one_namespace_flush_does_not_persist_anothers_wal_entries() {
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        // Small memtable so `busy` seals and flushes repeatedly.
+        config.lsm_config.skip_list_capacity = 64;
+        let db = Database::open(dir.path(), config).unwrap();
+
+        let quiet = db.create_namespace("quiet").unwrap();
+        let busy = db.create_namespace("busy").unwrap();
+
+        // `quiet` writes a handful of records and then goes idle — they stay in
+        // its memtable, so none of them may be marked persisted.
+        for i in 0..10u32 {
+            db.put_ns(quiet, format!("q{i}").as_bytes(), b"quiet-value").unwrap();
+        }
+        let quiet_entries = 10u64;
+
+        // `busy` writes, then flushes to level 0 — the event that used to mark
+        // everything below the global WAL tail persisted. Flushed explicitly
+        // rather than by capacity so the test does not depend on the background
+        // workers running.
+        for i in 0..500u32 {
+            db.put_ns(busy, format!("b{i}").as_bytes(), b"busy-value").unwrap();
+        }
+        db.get_store(busy).unwrap().flush_memtable_to_level0().unwrap();
+
+        let meta = db.wal_metadata.read();
+        let (total, persisted) = (meta.total_entries, meta.persisted_entries);
+        drop(meta);
+
+        assert!(
+            persisted <= total.saturating_sub(quiet_entries),
+            "quiet namespace's {quiet_entries} un-flushed entries were marked persisted \
+             by busy's flushes: persisted={persisted} total={total}"
+        );
+    }
+
+    /// The flip side of the per-namespace watermark: an idle namespace holding
+    /// un-flushed writes pins the WAL, so the GC worker must flush it. Without
+    /// this the correctness fix above would trade data loss for unbounded WAL
+    /// growth.
+    #[test]
+    fn test_wal_gc_flushes_namespaces_pinning_the_watermark() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("idle").unwrap();
+        for i in 0..10u32 {
+            db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+
+        assert_eq!(
+            db.wal_flush_observer.namespaces_with_unflushed(),
+            vec![ns],
+            "a namespace with un-flushed WAL writes should be reported as pinning"
+        );
+
+        let flushed = db.flush_namespaces_pinning_wal();
+        assert_eq!(flushed, 1, "the pinning namespace should have been flushed");
+        assert!(
+            db.wal_flush_observer.namespaces_with_unflushed().is_empty(),
+            "nothing should still pin the watermark after the flush"
+        );
     }
 
     #[test]

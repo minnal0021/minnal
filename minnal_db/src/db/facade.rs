@@ -560,6 +560,9 @@ impl WalGcTarget for Db {
     fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+    fn flush_namespaces_pinning_wal(&self) -> usize {
+        self.inner.flush_namespaces_pinning_wal()
+    }
     fn get_wal_gc_stats(&self) -> (u64, u64) {
         self.inner.get_wal_gc_stats()
     }

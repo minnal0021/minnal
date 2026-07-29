@@ -1240,6 +1240,16 @@ impl KVStore {
         self.lsm.flush_and_compact_all().map_err(KVError::from)
     }
 
+    /// Seal and flush the active memtable to level 0 without compacting.
+    ///
+    /// Used to unpin the WAL persisted watermark: a namespace holding
+    /// un-flushed WAL-backed writes blocks reclamation for every namespace
+    /// (the WAL is shared), and flushing is what makes those entries durable
+    /// on disk and therefore skippable by recovery.
+    pub fn flush_memtable_to_level0(&self) -> Result<()> {
+        self.lsm.flush_memtable_to_level0().map_err(KVError::from)
+    }
+
     // ── Garbage collection ─────────────────────────────────────────────
 
     /// GC one bucket: rewrite the survivors of its worst segments, and hand back the
