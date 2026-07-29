@@ -763,11 +763,18 @@ impl Database {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
-        // Step 3: Maybe sync
-        if kv_store.should_sync() && kv_store.sync_value_log().is_ok() {
-            let start = *self.last_persisted_wal_offset.read();
-            let tail = self.wal_metadata.read().tail;
-            self.wal_flush_observer.mark_persisted_range(start, tail);
+        // Step 3: Maybe sync the value log.
+        //
+        // Syncing the value log does NOT make these WAL entries replaceable by
+        // what is on disk: the value is durable, but the key → pointer mapping
+        // still lives only in the LSM memtable until that memtable is flushed to
+        // an SSTable. Marking the WAL persisted here would tell recovery to skip
+        // entries whose keys exist nowhere on disk, silently losing acknowledged
+        // writes and stranding their values in the value log. The persisted
+        // watermark is advanced solely by `WalPersistObserver`, which waits for
+        // the memtable flush (`on_memtable_sealed` → `try_advance_persisted`).
+        if kv_store.should_sync() {
+            let _ = kv_store.sync_value_log();
         }
 
         Ok(())
@@ -849,11 +856,11 @@ impl Database {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
-        // Step 3: Maybe sync
-        if kv_store.should_sync() && kv_store.sync_value_log().is_ok() {
-            let start = *self.last_persisted_wal_offset.read();
-            let tail = self.wal_metadata.read().tail;
-            self.wal_flush_observer.mark_persisted_range(start, tail);
+        // Step 3: Maybe sync the value log. As in `put_ns`, syncing the value
+        // log must NOT advance the WAL persisted watermark — the tombstone still
+        // lives only in the memtable until it is flushed.
+        if kv_store.should_sync() {
+            let _ = kv_store.sync_value_log();
         }
 
         Ok(())
