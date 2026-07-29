@@ -817,6 +817,84 @@ mod vector_upsert_tests {
         assert!(decode_sparse_meta(&bad).is_none());
     }
 
+    // ── Durability of the vector write path ───────────────────────────────────
+
+    /// The vector index must genuinely use the no-WAL write path — and so be
+    /// covered by the periodic flush that bounds what a crash destroys.
+    ///
+    /// `f08108a` proves the *engine* half on a plain namespace: a namespace
+    /// holding no-WAL writes is flagged and flushed on the compaction tick.
+    /// Nothing connected the vector write path to it, so the only evidence that
+    /// the vector index actually benefits was one live stress run — which is
+    /// exactly how the whole index came to be discarded by a `SIGKILL`
+    /// (`stress_docs_sparse_vector`: 4 entries on disk against 6020 in memory,
+    /// ~18 000 documents re-enqueued, semantic search returning nothing for
+    /// hours). This pins both halves together.
+    ///
+    /// Deliberately service-free: it asserts on the durability flag, never on an
+    /// embedding, so it needs the `semantic-search` feature compiled but no
+    /// embedding service running.
+    #[tokio::test]
+    async fn test_vector_writes_use_the_no_wal_path_and_are_periodically_flushed() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        let ns = "docs";
+        let doc_id = b"doc-durability";
+
+        let vector_namespaces = [sparse_vectors_ns(ns), sparse_vectors_meta_ns(ns), dense_vectors_ns(ns)];
+
+        // Create the namespaces up front so the baseline below measures the
+        // vector writes alone, not namespace setup.
+        for name in &vector_namespaces {
+            db.namespace(name.clone()).await.unwrap();
+        }
+        let coordinator = db.coordinator_for_test();
+        for name in &vector_namespaces {
+            assert!(
+                !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
+                "{name} should start with nothing unflushed"
+            );
+        }
+
+        let before = db.ops_metrics();
+        let vi_sparse = VectorIndex::new(3, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
+        let vi_dense = VectorIndex::new(3, MULTI8, 0.3, 0.0, 0.01, vec![]);
+        upsert_vectors(&db, ns, doc_id, &[vi_sparse, vi_dense]).await.unwrap();
+        let after = db.ops_metrics();
+
+        // One sparse chunk + the sparse meta + the dense entry, all off the WAL.
+        assert_eq!(
+            after.no_wal_puts - before.no_wal_puts,
+            3,
+            "sparse chunk, sparse meta and dense entry should all be written with put_no_wal"
+        );
+        assert_eq!(after.puts - before.puts, 0, "no vector payload may take the WAL-backed put path");
+        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 0, "vector payload writes must add no WAL fsync");
+
+        // Being off the WAL means there is nothing to replay, so each namespace
+        // must now be flagged for the periodic flush — otherwise these writes
+        // exist only in memory until the memtable happens to fill.
+        for name in &vector_namespaces {
+            assert!(
+                coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
+                "{name} took a no-WAL write but is not flagged for the periodic flush — \
+                 a crash would discard it with nothing to replay"
+            );
+        }
+
+        // The compaction worker's tick is what bounds the loss.
+        assert!(
+            coordinator.flush_no_wal_memtables() >= vector_namespaces.len(),
+            "the periodic flush should have covered all three vector namespaces"
+        );
+        for name in &vector_namespaces {
+            assert!(
+                !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
+                "{name} should be clear once flushed"
+            );
+        }
+    }
+
     // ── delete_vector ─────────────────────────────────────────────────────────
 
     #[tokio::test]

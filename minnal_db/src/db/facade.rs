@@ -106,6 +106,22 @@ pub struct Db {
     inner: Database,
 }
 
+// Gated on `semantic-search` as well as `test` because that is the only feature
+// combination with a test that needs it; an unconditional `cfg(test)` is dead
+// code under the other combinations, which clippy rejects at `-D warnings`.
+#[cfg(all(test, feature = "semantic-search"))]
+impl Db {
+    /// Test-only access to the internal coordinator.
+    ///
+    /// Some durability behaviour is only observable as per-namespace engine
+    /// state — the no-WAL flush flag, for one — which the facade deliberately
+    /// does not expose. Tests in other modules of this crate need a way in
+    /// without that becoming public API.
+    pub(crate) fn coordinator_for_test(&self) -> &Database {
+        &self.inner
+    }
+}
+
 impl Db {
     // ── Open / Close ──────────────────────────────────────────────────
 
@@ -831,6 +847,15 @@ where
 #[derive(Clone)]
 pub struct AsyncDb {
     inner: Arc<Db>,
+}
+
+#[cfg(all(test, feature = "semantic-search"))]
+impl AsyncDb {
+    /// Test-only access to the internal coordinator. See
+    /// [`Db::coordinator_for_test`].
+    pub(crate) fn coordinator_for_test(&self) -> &Database {
+        self.inner.coordinator_for_test()
+    }
 }
 
 impl AsyncDb {
