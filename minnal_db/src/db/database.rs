@@ -3117,6 +3117,96 @@ mod tests {
         config
     }
 
+    /// Regression: syncing the value log must NOT advance the WAL persisted
+    /// watermark.
+    ///
+    /// A value-log fsync makes the *value* durable, but the key → pointer
+    /// mapping still lives solely in the LSM memtable until that memtable is
+    /// flushed to an SSTable. Recovery skips `Persisted` entries, so marking
+    /// them at sync time tells recovery to skip keys that exist nowhere on disk:
+    /// the writes are lost and their values sit orphaned in the value log.
+    /// Measured before the fix, against a stock-config server over the REST API:
+    /// **0 of 3000** acknowledged writes survived a `kill -9`, with
+    /// `persisted_entries` already equal to `total_entries` so recovery did not
+    /// even run.
+    ///
+    /// `records_per_sync = 1` puts every single write through the sync path, and
+    /// the memtable is left far from full so nothing legitimately flushes — any
+    /// entry marked persisted here can only have come from the sync.
+    #[test]
+    fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.sync_config = SyncConfig::new(1);
+        config.lsm_config.skip_list_capacity = 100_000;
+        let db = Database::open(dir.path(), config).unwrap();
+        let ns = db.create_namespace("data").unwrap();
+
+        for i in 0..200u32 {
+            db.put_ns(ns, format!("k{i:04}").as_bytes(), b"value").unwrap();
+        }
+        // Deletes take the same Step-3 sync path and had the same defect.
+        db.delete_ns(ns, b"k0000").unwrap();
+
+        let meta = db.wal_metadata.read();
+        let (total, persisted) = (meta.total_entries, meta.persisted_entries);
+        drop(meta);
+
+        assert_eq!(total, 201, "expected every write to be journalled, got total={total}");
+        assert_eq!(
+            persisted, 0,
+            "a value-log fsync marked {persisted} of {total} WAL entries persisted, but nothing \
+             has reached an SSTable — recovery would skip them and lose acknowledged writes"
+        );
+    }
+
+    /// Regression: `pending` flush records must be keyed by `(namespace,
+    /// version)`, not by version alone.
+    ///
+    /// Memtable versions are allocated per `KVStore` from a counter created as
+    /// `AtomicU64::new(0)` in the LSM tree's own constructor and never persisted,
+    /// so **every** namespace's first sealed memtable is version 0 — and so is
+    /// its first seal after any reopen. Keyed by version alone, namespace A's
+    /// seal record and namespace B's are literally the same map entry:
+    /// `or_insert` silently drops the second, and A's flush then satisfies B's
+    /// record, advancing the watermark past writes B has not flushed.
+    ///
+    /// This is the second of the two mechanisms behind the cross-namespace
+    /// data-loss bug. The per-namespace `safe_offset` minimum masks it today, so
+    /// nothing else fails if the key is collapsed back — which is exactly why it
+    /// needs pinning here.
+    #[test]
+    fn test_pending_flush_records_are_keyed_by_namespace_not_just_version() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let a = db.create_namespace("a").unwrap();
+        let b = db.create_namespace("b").unwrap();
+
+        for i in 0..5u32 {
+            db.put_ns(a, format!("a{i}").as_bytes(), b"v").unwrap();
+            db.put_ns(b, format!("b{i}").as_bytes(), b"v").unwrap();
+        }
+
+        // Both namespaces seal their first memtable — version 0 for each.
+        db.wal_flush_observer.on_memtable_sealed_ns(a, 0);
+        db.wal_flush_observer.on_memtable_sealed_ns(b, 0);
+        assert_eq!(
+            db.pending_wal_flushes.read().len(),
+            2,
+            "two namespaces sealing version 0 must record two pending flushes, not collide into one"
+        );
+
+        // A's flush may satisfy only A's record.
+        db.wal_flush_observer.on_ro_memtable_flushed_to_level0_ns(a, 0);
+
+        let pending = db.pending_wal_flushes.read();
+        assert!(!pending.contains_key(&(a, 0)), "A's own record should be consumed by A's flush");
+        let b_state = pending
+            .get(&(b, 0))
+            .expect("B's seal record must survive A's flush, not be satisfied by it");
+        assert!(!b_state.flushed, "A's flush must not mark B's memtable flushed");
+    }
+
     /// Regression: one namespace's memtable flush must not mark ANOTHER
     /// namespace's WAL entries persisted.
     ///
