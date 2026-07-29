@@ -36,6 +36,7 @@ use crate::doc_store::pagination::{CursorPage, Page, Pagination, prefix_upper_bo
 use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
+use crate::support::file_lock::{DirLock, LockError};
 #[cfg(feature = "semantic-search")]
 use crate::vector_kv;
 
@@ -70,7 +71,9 @@ pub struct DocStore {
     db: Arc<AsyncDb>,
     db_path: PathBuf,
     schema_dir: PathBuf,
-    lock_path: PathBuf,
+    /// Exclusive single-writer lock on `db_path`, released when this store is
+    /// dropped — or by the kernel if the process dies without unwinding.
+    _lock: DirLock,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -111,18 +114,25 @@ impl DocStore {
         std::fs::create_dir_all(&db_path)?;
         std::fs::create_dir_all(&schema_dir)?;
 
-        let lock_path = db_path.join(".lock");
-        if lock_path.exists() {
-            return Err(DocStoreError::StoreLocked { path: db_path });
-        }
-        std::fs::write(&lock_path, "")?;
+        // Held for the lifetime of this DocStore. Kept as a local until it is
+        // moved into the struct, so every early return below releases it.
+        let lock = match DirLock::acquire(&db_path) {
+            Ok(lock) => lock,
+            Err(LockError::Held { pid }) => {
+                return Err(DocStoreError::StoreLocked {
+                    path: db_path,
+                    owner_pid: pid,
+                });
+            }
+            Err(LockError::Io(e)) => return Err(DocStoreError::Io(e)),
+        };
 
         let db = Arc::new(AsyncDb::open_with_config(db_path.clone(), config.clone()).await?);
         let store = Self {
             db,
             db_path,
             schema_dir,
-            lock_path,
+            _lock: lock,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
             #[cfg(feature = "semantic-search")]
@@ -380,21 +390,55 @@ fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, Doc
     Ok(schemas)
 }
 
-// ── Lock-file cleanup ─────────────────────────────────────────────────────────
-
-impl Drop for DocStore {
-    fn drop(&mut self) {
-        if self.lock_path.exists() {
-            let _ = std::fs::remove_file(&self.lock_path);
-        }
-    }
-}
+// There is deliberately no `Drop` impl: the database lock is released by
+// dropping the `DirLock` field's file descriptor, and the lock file itself must
+// NOT be unlinked. Removing the path while another process holds it open would
+// leave that process locking an orphaned inode while a third process creates
+// and locks a fresh file at the same path — two owners at once. See
+// `support::file_lock`.
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::doc_store::store::test_support::*;
+
+    // ── Database lock ───────────────────────────────────────────────────────
+
+    /// A crash leaves the lock file on disk with no live owner. Recovery must
+    /// still be reachable: the previous existence-check scheme refused to open
+    /// here, so every `SIGKILL` needed a manual `rm db/.lock` before the WAL
+    /// could be replayed.
+    #[tokio::test]
+    async fn test_stale_lock_file_from_a_crash_does_not_block_open() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+
+        // Exactly what a killed process leaves behind.
+        std::fs::create_dir_all(db_dir.path()).unwrap();
+        std::fs::write(db_dir.path().join(".lock"), "999999\nminnal: stale\n").unwrap();
+
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap();
+    }
+
+    /// The other direction still holds: a second store on the same directory is
+    /// refused while the first is open, and the error names the holder.
+    #[tokio::test]
+    async fn test_second_open_of_the_same_directory_is_refused() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+
+        let _held = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        match DocStore::open_with_config(db_dir.path(), schema_dir.path(), crate::doc_store::test_db_config()).await {
+            Err(DocStoreError::StoreLocked { owner_pid, .. }) => {
+                assert_eq!(owner_pid, Some(std::process::id()));
+            }
+            Err(e) => panic!("expected StoreLocked, got {e:?}"),
+            Ok(_) => panic!("two DocStores opened the same directory at once"),
+        }
+    }
 
     // ── Restart persistence ─────────────────────────────────────────────────
 

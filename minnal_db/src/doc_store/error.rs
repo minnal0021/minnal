@@ -137,16 +137,17 @@ pub enum DocStoreError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The database directory is locked by another process.
+    /// The database directory is held open by another **live** process.
     ///
-    /// A `.lock` file exists at `{db_path}/.lock`, which means another
-    /// `DocStore` instance is already open against this path, or a previous
-    /// run did not shut down cleanly.  Remove the file manually to recover
-    /// from an unclean shutdown.
-    #[error(
-        "database at '{path}' is locked — another instance may be running, or the previous run did not shut down cleanly (remove '{path}/.lock' to recover)"
-    )]
-    StoreLocked { path: PathBuf },
+    /// The lock is an advisory `flock(2)` on `{db_path}/.lock`, which the kernel
+    /// releases when its owner exits — including on a crash. So this error means
+    /// a second instance really is running, not that a previous run left a file
+    /// behind; deleting the lock file will not help and risks two writers.
+    #[error("database at '{path}' is already open by another running instance ({})", match owner_pid {
+        Some(pid) => format!("pid {pid}"),
+        None => "pid unknown".to_owned(),
+    })]
+    StoreLocked { path: PathBuf, owner_pid: Option<u32> },
 
     /// The index build background task failed or was cancelled.
     #[error("index build failed: {0}")]
