@@ -257,6 +257,23 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
         return Ok(());
     }
 
+    // Never index into a store that no longer exists.
+    //
+    // The sidecar namespaces below are resolved with get-or-create, so writing
+    // for a dropped store silently **recreates** `{ns}_sparse_vector` and
+    // friends — orphaned namespaces that keep their on-disk data, return to the
+    // registry at every restart, and are never reclaimed. That is reachable
+    // whenever a delete races the vector worker: entries already dispatched for
+    // embedding land after the store is gone. Measured before this guard: a
+    // store deleted with 294 queue entries outstanding left all three sidecars
+    // behind even though the queue itself was cleared correctly.
+    //
+    // Dropping the work is right — the store it belongs to is gone.
+    if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
+        log::debug!("upsert_vectors: skipping '{namespace}' — the namespace no longer exists");
+        return Ok(());
+    }
+
     // ── Sparse (SingleBit) ────────────────────────────────────────────────────
     let sparse_vis: Vec<&VectorIndex> = vector_indexes
         .iter()
@@ -672,9 +689,15 @@ mod vector_upsert_tests {
     use tempfile::TempDir;
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
-        AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
             .await
-            .unwrap()
+            .unwrap();
+        // `upsert_vectors` refuses to index into a namespace that does not
+        // exist — it will not resurrect the sidecars of a dropped store. These
+        // tests address the sidecars directly, so create the parent namespace
+        // they name, exactly as a real store would.
+        db.namespace("docs".to_owned()).await.unwrap();
+        db
     }
 
     const MULTI8: QuantisationStyle = QuantisationStyle::MultiBit { number_of_bits: 8 };
@@ -1297,9 +1320,15 @@ mod dual_style_tests {
     const MULTI8: QuantisationStyle = QuantisationStyle::MultiBit { number_of_bits: 8 };
 
     async fn open_db(dir: &TempDir) -> AsyncDb {
-        AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
             .await
-            .unwrap()
+            .unwrap();
+        // `upsert_vectors` refuses to index into a namespace that does not
+        // exist — it will not resurrect the sidecars of a dropped store. These
+        // tests address the sidecars directly, so create the parent namespace
+        // they name, exactly as a real store would.
+        db.namespace("docs".to_owned()).await.unwrap();
+        db
     }
 
     /// One MultiBit + two SingleBit entries stored together. MultiBit goes to

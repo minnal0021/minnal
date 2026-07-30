@@ -309,6 +309,31 @@ impl DocStore {
 /// Shared by [`DocStore::drop`] and [`DocStore::drop_kv`] to
 /// eliminate the near-identical cleanup sequences in each method.
 async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str, ns_id: u32, schema_path: &Path) -> Result<(), DocStoreError> {
+    // Clear this namespace's pending embed-queue entries FIRST.
+    //
+    // The queue outlives the store otherwise, and the vector worker then embeds
+    // those entries — resolving `{ns}_sparse_vector` and friends through
+    // get-or-create, which **recreates the sidecar namespaces of the store we are
+    // deleting**. They survive on disk, return to the registry at every restart,
+    // and are never reclaimed: three orphaned namespaces per dropped semantic
+    // store. `drop_vector_index_data` has always cleared the queue; this path did
+    // not.
+    //
+    // Best-effort, and deliberately not the only guard: the worker may already be
+    // mid-entry, and a crash here would strand the rest. `VecIndexWorker` also
+    // discards queue entries whose namespace has gone.
+    #[cfg(feature = "semantic-search")]
+    match vector_kv::list_queue_entries(db).await {
+        Ok(entries) => {
+            for entry in entries.into_iter().filter(|e| e.namespace == namespace) {
+                if let Err(e) = vector_kv::remove_queue_entry(db, &entry.namespace, &entry.doc_id_bytes).await {
+                    warn!("cleanup_store_namespaces: could not clear queue entry for '{namespace}': {e}");
+                }
+            }
+        }
+        Err(e) => warn!("cleanup_store_namespaces: could not scan the embed queue for '{namespace}': {e}"),
+    }
+
     // Primary namespace must exist; propagate error before touching files.
     // Vector companions are optional — ignore errors on removal.
     db.remove_namespace(namespace.to_owned()).await?;
@@ -401,6 +426,58 @@ mod tests {
 
         store.remove("tmp").await.unwrap();
         assert!(!schema_dir.path().join("tmp.json").exists());
+    }
+
+    /// Regression: dropping a semantic store must clear its embed-queue entries.
+    ///
+    /// Left behind, the vector worker embeds them afterwards — and
+    /// `upsert_vectors` resolves `{ns}_sparse_vector` and friends through
+    /// get-or-create, so it **recreates the sidecar namespaces of the store that
+    /// was just deleted**. Seen in a stress run: a store at ns_id 22 was dropped
+    /// and its sidecars reappeared as ns_ids 30/34/38. Ids are monotonic and
+    /// never reused, so they were created after the drop; they then survive on
+    /// disk and return to the registry at every restart, forever.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn test_drop_store_clears_its_embed_queue() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+
+        let mut schema = make_schema("sem_docs", vec![]);
+        schema.attributes = vec![crate::doc_store::schema::AttributeDef {
+            name: "title".to_owned(),
+            attr_type: AttributeType::Str,
+            description: None,
+        }];
+        schema.semantic_search_enabled = true;
+        schema.embedding_fields = vec!["title".to_owned()];
+        store.create(schema).await.unwrap();
+
+        // Queue work for it, exactly as a write would. No embedding service is
+        // involved — enqueuing is a plain durable write.
+        for i in 0..5u32 {
+            vector_kv::enqueue_embed(&store.db, "sem_docs", format!("doc{i}").as_bytes(), "the quiet harbour")
+                .await
+                .unwrap();
+        }
+        let queued = vector_kv::list_queue_entries(&store.db).await.unwrap();
+        assert_eq!(
+            queued.iter().filter(|e| e.namespace == "sem_docs").count(),
+            5,
+            "the queue should hold the enqueued work before the drop"
+        );
+
+        store.remove("sem_docs").await.unwrap();
+
+        let after = vector_kv::list_queue_entries(&store.db).await.unwrap();
+        let stranded: Vec<_> = after.iter().filter(|e| e.namespace == "sem_docs").collect();
+        assert!(
+            stranded.is_empty(),
+            "{} queue entry/entries outlived the store they belong to — the worker will \
+             embed them and recreate its vector sidecar namespaces",
+            stranded.len()
+        );
     }
 
     // ── Schema amendment ────────────────────────────────────────────────────

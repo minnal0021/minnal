@@ -211,16 +211,49 @@ impl VecIndexWorker {
                 return;
             }
 
+            // Entries whose namespace no longer exists must be discarded, not
+            // embedded.
+            //
+            // Store deletion and the queue are separate writes, so a delete that
+            // races this worker — or a crash between the two — can strand entries
+            // for a namespace that is gone. Processing one calls `upsert_vectors`,
+            // which resolves `{ns}_sparse_vector` and friends through
+            // get-or-create, and so **recreates the dropped store's vector sidecar
+            // namespaces**. Observed in a stress run: a store at ns_id 22 was
+            // deleted and its sidecars reappeared as ns_ids 30/34/38 — ids are
+            // monotonic and never reused, so they were created after the drop.
+            // They then survive on disk, come back in the registry at every
+            // restart, and are never cleaned up.
+            let live_namespaces: std::collections::HashSet<String> = self.db.list_namespaces().into_iter().map(|(name, _)| name).collect();
+
             // Separate entries at max retries (leave in queue, admin must clear).
             let mut exhausted_count = 0usize;
+            let mut orphaned_count = 0usize;
             let mut by_namespace: BTreeMap<String, VecDeque<QueueEntry>> = BTreeMap::new();
 
             for entry in all_entries {
-                if entry.retry_count >= self.config.max_retries {
+                if !live_namespaces.contains(&entry.namespace) {
+                    orphaned_count += 1;
+                    if let Err(e) = vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await {
+                        warn!(
+                            "vec index worker: could not drop orphaned queue entry \
+                             ns='{}' doc='{}': {e}",
+                            entry.namespace,
+                            doc_id_display(&entry.doc_id_bytes),
+                        );
+                    }
+                } else if entry.retry_count >= self.config.max_retries {
                     exhausted_count += 1;
                 } else {
                     by_namespace.entry(entry.namespace.clone()).or_default().push_back(entry);
                 }
+            }
+
+            if orphaned_count > 0 {
+                info!(
+                    "vec index worker: discarded {orphaned_count} queue entry/entries for \
+                     namespaces that no longer exist"
+                );
             }
 
             let actionable_count: usize = by_namespace.values().map(|q| q.len()).sum();
