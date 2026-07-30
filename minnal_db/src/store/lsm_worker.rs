@@ -79,6 +79,9 @@ impl LsmCompactionWorker {
                         Some(t) => Self::perform_compaction_check(&t),
                         None => break,
                     }
+                    if Self::drain_self_triggers(&mut rx) {
+                        break;
+                    }
                 }
                 Some(cmd) = rx.recv() => {
                     match cmd {
@@ -87,6 +90,9 @@ impl LsmCompactionWorker {
                             match target.upgrade() {
                                 Some(t) => Self::perform_compaction_check(&t),
                                 None => break,
+                            }
+                            if Self::drain_self_triggers(&mut rx) {
+                                break;
                             }
                         }
                         LsmCompactionCommand::Shutdown => {
@@ -104,6 +110,31 @@ impl LsmCompactionWorker {
 
         info!("[LsmCompactionWorker] stopped");
         shutdown_notify.notify_one();
+    }
+
+    /// Discard `Trigger`s that this tick's own work produced. Returns whether a
+    /// `Shutdown` was seen, which must never be dropped.
+    ///
+    /// [`perform_compaction_check`] flushes no-WAL memtables, and sealing a
+    /// memtable fires the flush observer — which sends a `Trigger`. Left in the
+    /// channel, that makes the worker immediately re-run on its own side effect,
+    /// and while no-WAL writes keep arriving (the vector index, continuously) it
+    /// never stops: measured **147 ticks in 158 s against a 60 s interval**, each
+    /// one rewriting every bucket's whole L1.
+    ///
+    /// Dropping them is safe because the tick has just compacted: anything queued
+    /// during it is already done. A genuine seal that lands after this drain
+    /// still has its own `Trigger`, and the interval tick remains the backstop.
+    ///
+    /// [`perform_compaction_check`]: Self::perform_compaction_check
+    fn drain_self_triggers(rx: &mut mpsc::UnboundedReceiver<LsmCompactionCommand>) -> bool {
+        let mut shutdown = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, LsmCompactionCommand::Shutdown) {
+                shutdown = true;
+            }
+        }
+        shutdown
     }
 
     fn perform_compaction_check<T: LsmCompactionTarget>(target: &Arc<T>) {
@@ -163,6 +194,77 @@ mod tests {
 
         let worker = LsmCompactionWorker::new(db, Duration::from_secs(1));
         worker.shutdown().await;
+    }
+
+    /// Regression: the worker must not re-run on its own side effects.
+    ///
+    /// `perform_compaction_check` flushes no-WAL memtables; sealing a memtable
+    /// fires the flush observer, and the observer sends a `Trigger` — to this
+    /// very worker. Left in the channel, the worker picks it straight back up
+    /// and runs again, and while no-WAL writes keep arriving (the vector index
+    /// writes continuously) it never settles. Caught on a live server: **147
+    /// compaction ticks in 158 s against a 60 s interval**, each one rewriting
+    /// every bucket's whole L1.
+    ///
+    /// The target here does exactly what a real seal does — send a `Trigger`
+    /// back — so the loop is reproduced rather than imitated.
+    #[tokio::test]
+    async fn worker_does_not_retrigger_itself_after_a_no_wal_flush() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct SelfTriggering {
+            compactions: AtomicU64,
+            tx: mpsc::UnboundedSender<LsmCompactionCommand>,
+        }
+
+        impl LsmCompactionTarget for SelfTriggering {
+            fn is_closed(&self) -> bool {
+                false
+            }
+            fn has_lsm_compaction_work(&self) -> bool {
+                true
+            }
+            fn compact_lsm(&self) -> Result<()> {
+                self.compactions.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn flush_no_wal_memtables(&self) -> usize {
+                // What sealing a memtable really does: notify the observer,
+                // which triggers this worker.
+                let _ = self.tx.send(LsmCompactionCommand::Trigger);
+                1
+            }
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let target = Arc::new(SelfTriggering {
+            compactions: AtomicU64::new(0),
+            tx: tx.clone(),
+        });
+        let notify = Arc::new(Notify::new());
+        let interval = Duration::from_millis(50);
+        tokio::spawn(LsmCompactionWorker::worker_loop(
+            Arc::downgrade(&target),
+            rx,
+            Arc::clone(&notify),
+            interval,
+        ));
+
+        // Prime it once, as a write-path memtable seal would.
+        tx.send(LsmCompactionCommand::Trigger).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let ran = target.compactions.load(Ordering::SeqCst);
+
+        tx.send(LsmCompactionCommand::Shutdown).unwrap();
+        notify.notified().await;
+
+        // 500 ms at a 50 ms interval is ~10 ticks, plus the one explicit
+        // trigger. Self-retriggering makes this unbounded — thousands.
+        assert!(
+            ran <= 25,
+            "worker ran {ran} compactions in 500 ms at a 50 ms interval — it is re-running on \
+             its own side effects, which on a live server meant 147 ticks in 158 s"
+        );
     }
 
     #[tokio::test]
