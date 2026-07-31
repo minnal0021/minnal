@@ -507,6 +507,18 @@ impl Db {
         self.inner.deactivate_field_index(namespace_id, field_id)
     }
 
+    /// Permanently drop a field index: persist the drop, deregister it, and
+    /// delete its on-disk directory.
+    ///
+    /// Use this rather than [`deactivate_field_index`](Self::deactivate_field_index)
+    /// when the index is going away for good — the latter is an in-memory
+    /// deregister that leaves every file in place. The field keeps its
+    /// [`FieldId`] for reuse, but must be re-registered before it can be
+    /// activated again.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        self.inner.drop_field_index(namespace_id, field_id)
+    }
+
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
@@ -1398,6 +1410,16 @@ impl AsyncDb {
     /// `InactiveField` error.  The on-disk checkpoint files are not touched.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         self.inner.inner.deactivate_field_index(namespace_id, field_id)
+    }
+
+    /// Permanently drop a field index: persist the drop, deregister it, and
+    /// delete its on-disk directory.
+    ///
+    /// See [`Db::drop_field_index`] for the semantics and the ordering
+    /// guarantee. Synchronous — the work is a schema write plus a directory
+    /// removal, not a scan.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        self.inner.inner.drop_field_index(namespace_id, field_id)
     }
 
     /// Register a custom row-ID function (and optionally its inverse) for a namespace.

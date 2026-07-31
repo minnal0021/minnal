@@ -47,17 +47,25 @@ impl DocStore {
             });
         }
 
-        // Deactivate the in-memory bitmap and delete on-disk checkpoint files.
+        // Persist the schema BEFORE anything is deregistered or deleted.
+        //
+        // The reverse order (the original) had a crash window in which the files
+        // were gone but this schema still listed the index: the field would be
+        // re-activated at the next open, find no checkpoint and no data, and read
+        // as `Absent` + empty — the shape `detect_replay_gap` suppresses as a
+        // normal first build. The index would come up silently incomplete. See
+        // `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+        schema.save(&self.schema_dir)?;
+
+        // Drop through the engine, which owns the index paths: it persists the
+        // field's `dropped` flag, deregisters the in-memory bitmap, and deletes
+        // `index/{ns_id}/{field_id}/`. A crash part-way leaves the drop recorded,
+        // so the next open finishes it.
         let fields = self.db.list_index_fields(ns_id);
         if let Some(meta) = fields.iter().find(|f| f.field_name == field) {
-            self.db.deactivate_field_index(ns_id, meta.field_id)?;
-            let index_dir = self.db_path.join("index").join(ns_id.to_string()).join(meta.field_id.to_string());
-            if index_dir.exists() {
-                std::fs::remove_dir_all(&index_dir)?;
-            }
+            self.db.drop_field_index(ns_id, meta.field_id)?;
         }
 
-        schema.save(&self.schema_dir)?;
         info!("index '{}' dropped from namespace '{}'", field, namespace);
         Ok(())
     }

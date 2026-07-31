@@ -741,6 +741,10 @@ impl Database {
             }
         }
 
+        // Finish any field-index drop a crash interrupted, before recovery can
+        // replay into a directory that is meant to be gone.
+        db.complete_interrupted_field_drops();
+
         // Recover from WAL
         db.recover_from_wal()?;
 
@@ -1372,6 +1376,18 @@ impl Database {
                     meta.field_name, field_id, meta.field_type, value_type
                 )));
             }
+            // A dropped field's directory is gone (or is about to be), so
+            // activating it would open an empty index and silently serve
+            // incomplete results — `detect_replay_gap` suppresses exactly this
+            // shape (`Absent` + empty) as a normal first build. Fail loudly and
+            // make the caller re-register, which clears the flag and forces a
+            // rebuild. See `FEATURE-REQUEST.md` (FR-001).
+            if meta.dropped {
+                return Err(KVError::Serialization(format!(
+                    "Field '{}' (id {}) in namespace {} was dropped; re-register it before activating so the index is rebuilt",
+                    meta.field_name, field_id, namespace_id
+                )));
+            }
         }
 
         let store = self.get_store(namespace_id)?;
@@ -1525,6 +1541,76 @@ impl Database {
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         self.get_store(namespace_id)?.namespace_index.write().deregister(field_id);
         Ok(())
+    }
+
+    /// Drop a field index: persist the drop, deregister it, and delete its
+    /// on-disk directory.
+    ///
+    /// Unlike [`deactivate_field_index`](Self::deactivate_field_index) — which
+    /// is an in-memory deregister a caller may legitimately use while a field is
+    /// rebuilt — this is the permanent operation. The field's [`FieldMeta`] is
+    /// retained in the schema so a later `register_field` reuses the same
+    /// [`FieldId`], but it is marked `dropped`: excluded from the checkpoint
+    /// worker and refused by `activate_field_index`.
+    ///
+    /// **Step order is load-bearing** (mirrors `remove_namespace`):
+    ///
+    /// 1. persist `dropped` to `config.json`,
+    /// 2. deregister the in-memory index,
+    /// 3. delete `index/{ns_id}/{field_id}/`.
+    ///
+    /// A crash anywhere in that sequence leaves the drop *recorded*, so
+    /// [`complete_interrupted_field_drops`](Self::complete_interrupted_field_drops)
+    /// finishes it at the next open. The reverse order — files first — would
+    /// leave a live-looking field with no data, which reads as `Absent` + empty
+    /// and is suppressed by `detect_replay_gap` as a normal first build: a
+    /// silently incomplete index. See `FEATURE-REQUEST.md` (FR-001).
+    ///
+    /// Idempotent: dropping an already-dropped or unregistered field still
+    /// deregisters and reclaims any leftover directory.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        // (1) Persist the drop before anything becomes unreachable.
+        self.registry.write().mark_schema_field_dropped(namespace_id, field_id)?;
+
+        // (2) Deregister in memory. Best-effort on the store lookup: a namespace
+        // that is not open has no in-memory index to deregister, but its files
+        // still need reclaiming below.
+        if let Ok(store) = self.get_store(namespace_id) {
+            store.namespace_index.write().deregister(field_id);
+        }
+
+        // (3) Reclaim disk.
+        self.index_manager.remove_field_path(namespace_id, field_id)
+    }
+
+    /// Finish deleting the directories of field indices whose drop was
+    /// interrupted by a crash, and reclaim any that were dropped before this
+    /// cleanup existed.
+    ///
+    /// Runs at open, after the registry is loaded and before any field is
+    /// activated. Idempotent — `remove_field_path` treats a missing directory as
+    /// success — so the common case (nothing dropped, or every drop completed)
+    /// costs one `remove_dir_all` per dropped field and touches no disk.
+    ///
+    /// Failures are logged, not propagated: a leftover directory wastes disk but
+    /// cannot affect correctness, and refusing to open the database over it would
+    /// be a far worse outcome.
+    fn complete_interrupted_field_drops(&self) {
+        let dropped: Vec<(u32, FieldId)> = {
+            let registry = self.registry.read();
+            registry
+                .list()
+                .into_iter()
+                .filter_map(|(_, ns_id)| registry.schema(ns_id).map(|s| (ns_id, s.dropped_field_ids())))
+                .flat_map(|(ns_id, fields)| fields.into_iter().map(move |fid| (ns_id, fid)))
+                .collect()
+        };
+        for (ns_id, field_id) in dropped {
+            match self.index_manager.remove_field_path(ns_id, field_id) {
+                Ok(()) => debug!("[INDEX] reclaimed dropped field index ns={ns_id} field={field_id}"),
+                Err(e) => warn!("[INDEX] failed to reclaim dropped field index ns={ns_id} field={field_id}: {e:?}"),
+            }
+        }
     }
 
     // ── Query execution ────────────────────────────────────────────────
@@ -2518,6 +2604,7 @@ impl Database {
             }
         }
 
+        db.complete_interrupted_field_drops();
         db.recover_from_wal()?;
         let last_persisted = db.rebuild_wal_persisted_state()?;
         *db.last_persisted_wal_offset.write() = last_persisted;
@@ -5009,6 +5096,177 @@ mod tests {
             "expected UnknownField error after deactivation, got: {err}"
         );
 
+        db.shutdown().unwrap();
+    }
+
+    /// Build a namespace with one activated `status` field index and a couple of
+    /// documents. Returns the field id.
+    #[cfg(test)]
+    fn activate_status_index(db: &Database, ns: u32) -> FieldId {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+        field_id
+    }
+
+    /// FR-001 step 1: dropping a field index deletes its on-disk directory.
+    ///
+    /// Before this, `deactivate_field_index` was an in-memory deregister only, so
+    /// the bitmap blob, keymap and — the load-bearing part — the frozen
+    /// `checkpoint` marker survived until the whole namespace was dropped.
+    #[test]
+    fn test_drop_field_index_deletes_its_directory() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.run_index_checkpoint().unwrap();
+
+        let field_path = db.index_manager.field_path(ns, field_id);
+        assert!(field_path.join("checkpoint").exists(), "checkpoint marker should exist before the drop");
+
+        db.drop_field_index(ns, field_id).unwrap();
+        assert!(!field_path.exists(), "the field directory must be gone after a drop");
+
+        // The namespace's row map is a sibling of the field directories and must
+        // survive — other fields resolve their row IDs through it.
+        assert!(db.index_manager.rowmap_path(ns).exists(), "dropping a field must not touch the row map");
+
+        // Idempotent: dropping again is not an error.
+        db.drop_field_index(ns, field_id).unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: a dropped field is excluded from the checkpoint worker's
+    /// field set, so its frozen marker can never hold up WAL GC (and the
+    /// checkpoint does not try to write into a directory that is gone).
+    #[test]
+    fn test_dropped_field_is_excluded_from_checkpoint_fields() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+
+        assert!(db.registry.read().all_indexed_fields().contains(&(ns, field_id)));
+
+        db.drop_field_index(ns, field_id).unwrap();
+
+        assert!(
+            !db.registry.read().all_indexed_fields().contains(&(ns, field_id)),
+            "a dropped field must not appear in all_indexed_fields"
+        );
+        // Checkpointing after the drop must still succeed — the field directory
+        // no longer exists, so including it would fail the whole pass.
+        db.run_index_checkpoint().unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: the drop is persisted, so a drop interrupted after the
+    /// schema write but before the files were deleted is completed at the next
+    /// open rather than leaking until the namespace is dropped.
+    #[test]
+    fn test_interrupted_field_drop_is_completed_at_open() {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_path;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+            db.run_index_checkpoint().unwrap();
+            field_path = db.index_manager.field_path(ns, field_id);
+
+            // Simulate a crash between step (1) persist and step (3) delete:
+            // mark the field dropped durably, then leave every file in place.
+            db.registry.write().mark_schema_field_dropped(ns, field_id).unwrap();
+            assert!(field_path.exists(), "precondition: files still present at the crash point");
+            db.shutdown().unwrap();
+        }
+
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert!(!field_path.exists(), "open must finish the interrupted drop and reclaim the directory");
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: activating a dropped field must fail loudly.
+    ///
+    /// This is the guard that closes the silent-incomplete window directly: a
+    /// dropped field's directory is gone, so activation would open an empty index
+    /// whose `Absent` + empty shape `detect_replay_gap` deliberately suppresses as
+    /// a normal first build — an index that queries as complete while holding
+    /// nothing.
+    #[test]
+    fn test_activating_a_dropped_field_is_rejected() {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.drop_field_index(ns, field_id).unwrap();
+
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        let err = db.activate_field_index(ns, field_id, IndexValueType::Str, extractor.clone()).unwrap_err();
+        assert!(err.to_string().contains("was dropped"), "expected a dropped-field rejection, got: {err}");
+
+        // Re-registering clears the flag and reuses the same field id, so the
+        // documented add-after-drop path still works.
+        let reused = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        assert_eq!(reused, field_id, "re-registering a dropped field must reuse its id");
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: the `dropped` flag survives a restart. Without persistence
+    /// the drop could not be completed at open, and a dropped field would silently
+    /// become activatable again over an empty directory.
+    #[test]
+    fn test_dropped_flag_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+            db.drop_field_index(ns, field_id).unwrap();
+            db.shutdown().unwrap();
+            field_id
+        };
+
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let registry = db.registry.read();
+        let meta = registry
+            .schema(ns)
+            .unwrap()
+            .get_field(field_id)
+            .expect("field definition is retained for id reuse");
+        assert!(meta.dropped, "the dropped flag must survive a restart");
+        drop(registry);
         db.shutdown().unwrap();
     }
 

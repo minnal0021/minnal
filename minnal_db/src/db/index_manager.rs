@@ -161,6 +161,26 @@ impl IndexManager {
         }
     }
 
+    /// Remove the on-disk index subtree for a single field.
+    ///
+    /// Deletes `{index_base}/{namespace_id}/{field_id}/` and everything under it
+    /// (bitmap blob store, keymap store, `checkpoint` marker). Called when a
+    /// field index is dropped, and again at open to finish a drop that a crash
+    /// interrupted — so it is **idempotent**: a missing directory is success.
+    ///
+    /// Leaves the namespace directory and its sibling `rowmap/` untouched.
+    ///
+    /// The caller must have persisted the field's `dropped` flag first; see
+    /// `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+    pub fn remove_field_path(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        let path = self.field_path(namespace_id, field_id);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(KVError::Io(e)),
+        }
+    }
+
     /// Write a checkpoint marker for each `(namespace_id, field_id)` pair.
     ///
     /// Records `wal_tail` as an 8-byte little-endian value in
