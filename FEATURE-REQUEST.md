@@ -11,19 +11,24 @@ re-check them before starting work.
 
 | # | Title | Area | Severity | Status |
 |---|---|---|---|---|
-| [FR-001](#fr-001--capture-surface-and-remediate-field-index-replay-gaps) | Capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | Proposed |
+| [FR-001](#fr-001--prevent-capture-surface-and-remediate-field-index-replay-gaps) | Prevent, capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | **Planned — 2026-08-01** |
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
 
 ---
 
-## FR-001 — Capture, surface and remediate field-index replay gaps
+## FR-001 — Prevent, capture, surface and remediate field-index replay gaps
 
 **Filed:** 2026-07-26
+**Updated:** 2026-07-31 — prevention promoted from *Could have* to the first
+**Must have**, and full remediation scheduled alongside it. Scope is now
+*prevent **and** repair*, not repair alone.
 **Area:** `minnal_db` (WAL GC, index checkpoint), `minnal_db_api` (admin surface)
 **Severity:** High — silent incomplete query results
-**Related:** detection-only logging landed in `51ee29f` (see *What already exists*)
+**Related:** detection-only logging landed in `51ee29f` (see *What already
+exists*). Unblocks the persisted row-map slot table (see *Downstream: the row
+map* below).
 
 ### Summary
 
@@ -62,13 +67,31 @@ mechanisms it does not currently have:
    document** — which re-amplifies the WAL. There is no "repair this index" or
    "re-index these rows" entry point.
 
-Item 3 is the substantive one: knowing *when* to re-index is the open question,
-and it is what this request is really about.
+Item 3 is the substantive one: knowing *when* to re-index is the open question.
+
+**Updated 2026-07-31:** prevention (gating WAL GC on the index-replay watermark)
+now leads the work, which shrinks that open question rather than answering it —
+after prevention, the only gaps left come from the deliberate backstop path, so
+"when to re-index" narrows to "when the backstop fired". The remediation arms are
+still required; see *Implementation order*.
 
 ### Scope
 
 #### Must have
 
+- **Prevention: gate WAL GC on the index-replay watermark.** WAL GC must not
+  reclaim a segment the index checkpoint still needs. Full design in *Prevention*
+  below. This is the arm that removes the condition rather than reporting it:
+  once it lands, everything below becomes the rare backstop path instead of the
+  normal one. (Sequenced second, after dropped-index cleanup — see
+  *Implementation order*.)
+- **Dropping an index must delete its files and release the WAL.** Today
+  `deactivate_field_index` only deregisters the in-memory index; the whole
+  `index/{ns_id}/{field_id}/` subtree survives — bitmap blob, keymap **and a
+  frozen checkpoint marker**. That is both a disk leak (reclaimed only when the
+  entire namespace is dropped) and the thing that would poison the watermark
+  above. Dropping a field must reclaim its directory and stop it holding WAL GC.
+  Design in *Dropped-index cleanup* below.
 - **Persisted gap record.** When a replay gap is detected, record it durably
   alongside the field's checkpoint marker: namespace, field, the WAL range that
   could not be replayed, and when it was detected. Survives restart; cleared only
@@ -84,46 +107,132 @@ and it is what this request is really about.
 
 #### Should have
 
-- **Row-scoped re-index.** Repair specific keys rather than the whole namespace.
-  Viable when the gap's WAL range is still partially readable, or when an
-  external process knows which documents are suspect. Much cheaper than a full
-  rebuild on a large namespace.
-- **Detection at the moment of loss.** Detection currently fires at the next
-  `activate_field_index` (i.e. next open). Checking the index checkpoint
-  watermark inside WAL GC would catch it when it happens and let the admin UI
-  show it live.
+- *(**Row-scoped re-index** was here; promoted to Must have on 2026-07-31 — it is
+  now the chosen repair mode. See* Product decisions *below.)*
+- *(**Detection at the moment of loss** was here; promoted to Must have on
+  2026-07-31 — row-scoped repair depends on it. See* Product decisions *below.)*
 
 #### Could have
 
-- **Prevention: gate WAL GC on the index checkpoint.** Analysis below. Removes
-  most occurrences, but does not remove the need for remediation (the backstop
-  path still produces gaps by design).
+- *(Prevention was here until 2026-07-31; it is now the first Must have.)*
 
 ### Design notes from the investigation
 
 Recorded so the analysis is not repeated. None of it is implemented.
 
-#### Prevention (deferred, not obviously worth it alone)
+#### Prevention (promoted to Must have 2026-07-31 — full design)
 
-Hold WAL GC at an index-replay watermark: `min(read_checkpoint)` over fields, and
-refuse to reclaim segments above it.
+Hold WAL GC at an **index-replay watermark** and refuse to reclaim segments at or
+above it:
 
-The trap: it must be scoped to **currently active** fields, not
-`registry.all_indexed_fields()`. Registered-but-inactive fields — notably
-*dropped* indices, whose checkpoint files `deactivate_field_index` deliberately
-leaves on disk — have frozen markers. Pinning on those grows the WAL without
-bound, trading silent divergence for a disk-full outage.
+```text
+index_replay_watermark = min(checkpoint offset) over currently-active fields
+```
 
-It also needs a liveness story, because the WAL GC interval (60 s) and the index
-checkpoint interval (15 min) differ by 15×:
+##### A watermark, not a per-entry flag
 
-- Normal path: when GC finds segments blocked by the pin, fire the existing
+The obvious framing is "add an *index updated* flag next to *persisted* on each
+WAL entry". That is more machinery than the problem needs. Every field already
+records the WAL offset its persisted index reflects — the `checkpoint` file that
+`IndexManager::read_checkpoint_state` reads. GC only has to compare a segment id
+against the watermark's segment: O(1) per segment, no new per-entry state and no
+new per-segment counters alongside `segment_total` / `segment_persisted`.
+
+##### The trap: active fields only
+
+The watermark must be scoped to **currently active** fields, not
+`registry.all_indexed_fields()`. Two ways an inactive field poisons it:
+
+- **Dropped indices.** `deactivate_field_index` deliberately leaves their
+  checkpoint files on disk, so their markers are frozen at whenever they were
+  last checkpointed. Pinning on those grows the WAL without bound — trading
+  silent divergence for a disk-full outage.
+- **A field being built for the first time.** No marker, so it reads as "replay
+  from 0" and would pin the entire WAL. But a new index is populated by a
+  *build*, not by WAL replay. `detect_replay_gap` already suppresses exactly this
+  case (`CheckpointState::Absent` + empty index); the watermark must apply the
+  same suppression, or every `add_index` on an established database pins
+  everything.
+
+Active means present in `store.namespace_index` — the same test
+`run_index_checkpoint` uses to build its `active_fields` list.
+
+##### Dropped-index cleanup (root fix for the frozen marker)
+
+Filtering the watermark to active fields is a read-side guard. The write-side
+root cause is that dropping an index leaves everything behind:
+
+`deactivate_field_index` (`database.rs`) is a two-line in-memory deregister. It
+does not touch disk, and `IndexManager` has `remove_namespace_path` (whole
+namespace) but **no per-field removal**. So `index/{ns_id}/{field_id}/` — bitmap
+blob store, keymap store, `checkpoint` marker — survives a drop indefinitely,
+reclaimed only when the entire namespace is dropped.
+
+Required: dropping a field index deletes its directory, so there is no stale
+marker to pin WAL GC and no orphaned blob to leak. Add
+`IndexManager::remove_field_path(ns_id, field_id)` alongside the existing
+namespace-level call.
+
+**Ordering is load-bearing — deregister first, delete files second.** This
+mirrors `remove_namespace`, which persists the registry deletion before touching
+any file. Taken the other way round, a crash between "files deleted" and
+"registry updated" leaves a field that is still registered, still activated at
+the next open, and now finds no checkpoint and no data — which reads as
+`Absent` + empty index, exactly the state `detect_replay_gap` **suppresses** as a
+normal first build. The index would come up silently incomplete: precisely the
+failure this FR exists to remove. Registry-first instead leaves orphaned files
+after a crash, which is a bounded disk leak and nothing worse.
+
+Keep the active-fields filter on the watermark even once cleanup lands. A field
+can be inactive without being dropped, and cleanup can itself be interrupted;
+the filter is what makes the watermark correct rather than merely tidy.
+
+##### Liveness
+
+WAL GC runs every 60 s; the index checkpoint every 15 min (`DEFAULT_CHECKPOINT_INTERVAL`).
+Pinning naively would hold up to 15 minutes of WAL at all times.
+
+- **Normal path:** when GC finds segments blocked by the pin, fire the existing
   `IndexCheckpointTrigger` (already wired and debounced for blob-store
   backpressure) and defer those segments one tick. WAL retention then tracks
-  checkpoint latency rather than the 15-minute timer.
-- Backstop: cap pinned WAL by bytes/segments. If the checkpoint worker is
-  disabled or wedged, reclaim anyway, record the gap, and let remediation heal
-  it. **This is why prevention does not remove the need for this feature.**
+  *checkpoint latency* rather than the 15-minute timer. Needs one addition: an
+  uncapped `request()` on the trigger, because `request_if_over_cap` returns
+  early when `cap_bytes == 0` (valve disabled) and the pin must still drain.
+- **Backstop:** cap pinned WAL by **segment count** (decided 2026-07-31 — simpler
+  to reason about than a byte budget; revisit only if a configurable segment size
+  makes the disk cost misleading). If the checkpoint worker is
+  disabled or wedged, reclaim the oldest pinned segments anyway, record the gap,
+  and let remediation heal it. **This is why prevention does not remove the need
+  for the rest of this feature** — the backstop produces gaps by design, just
+  rarely.
+
+##### The row map comes along for free
+
+`run_index_checkpoint` flushes each namespace's `RowMap` **before** any field
+marker, both against the same `wal_tail`. So the row map's durable position is
+always at or ahead of `min(field offsets)`, and pinning on the fields covers it.
+No separate row-map watermark is needed.
+
+Related cleanup: the row-map marker *writes* a `wal_offset` (`rowmap.rs`, bytes
+32..40) that `read_marker` never reads back — it is write-only today. Either wire
+it up as part of this work or drop the field.
+
+#### Downstream: the row map
+
+Prevention is the missing precondition for persisting the `RowMap` slot table.
+
+The `key → id` slot table is currently anonymous memory rebuilt from the id array
+on every open — O(N distinct keys ever written), and ~57–114 bytes of
+unreclaimable RSS per key while open. Making it a file that can be *adopted* at
+open (rather than rebuilt) requires trusting it up to the checkpoint and letting
+WAL replay correct the tail. That is only sound if the WAL tail is guaranteed to
+still exist — which is precisely what this watermark guarantees and what its
+absence today makes unsafe.
+
+So the ordering is: **prevention first, then the persisted slot table.** Without
+the retention guarantee, adopting a slot file can hand back a row ID the id array
+never durably assigned, which is silent bitmap/key divergence — the same class of
+failure this FR exists to eliminate.
 
 #### Remediation strategies considered
 
@@ -159,15 +268,139 @@ middle of the replay window while `head` still sits below the checkpoint offset.
 Any future work here should keep that in mind — comparing against `head` alone
 under-reports.
 
+### Product decisions (2026-07-31)
+
+**A degraded index stays queryable.** Chosen over failing activation or blocking
+open on a full rebuild. Fast open, and a partially-complete index is more useful
+than none.
+
+**Repair is row-scoped**, not whole-namespace. Bounded work proportional to the
+damage rather than to the store.
+
+Each decision drags a requirement with it. Neither is optional.
+
+##### Queryable + degraded ⇒ the answer must say so
+
+The strategy table below already flags this: *"the query path must honour the
+stale flag or it recreates the silent-wrong-answer problem it is meant to fix."*
+Serving a degraded index while returning results that look complete **is the
+original bug**, just triggered by repair instead of by GC.
+
+So a query touching a field with an outstanding gap must carry that fact back to
+the caller. An operator polling the admin surface is not sufficient — the caller
+holding an incomplete result set is the one who needs to know.
+
+**Decided 2026-07-31: the engine returns it.** `query_keys` /
+`query_keys_paginated` change from `Vec<Vec<u8>>` to a type carrying the keys
+**and** the degraded status — roughly:
+
+```rust
+pub struct QueryOutcome {
+    pub keys: Vec<Vec<u8>>,
+    /// Fields referenced by the predicate that have an outstanding replay gap.
+    /// Empty ⇒ results are complete.
+    pub degraded_fields: Vec<FieldId>,
+}
+```
+
+The alternative — leaving the signature alone and flagging degradation only in
+the `doc_store` / REST response — was rejected. It would deliver the guarantee to
+HTTP callers and leave **embedders** exactly where they started: `db.query_index(..)`
+is a documented first-class path (it is the `QUICKSTART.md` field-index example),
+and it would keep returning a complete-looking `Vec` over an incomplete index.
+That is the same silence this FR exists to remove, relocated rather than fixed.
+
+The cost is a public API change on a hot path, touching every call site. That is
+accepted deliberately: the breakage is a **compile error**, not a silent
+behaviour change, so it is paid once and then the status cannot be ignored by
+construction.
+
+Note the required field set is already computed where it is needed —
+`query_keys` builds a `schema_map` and parses the predicate, so the fields a
+query actually touches are known at exactly the point the gap records must be
+consulted. Only fields referenced by *this* predicate count; an unrelated
+degraded field elsewhere in the namespace must not mark a query degraded.
+
+Propagation: `doc_store::query` / `query_resolved` carry it into their `Page`,
+and `POST /stores/{ns}/query` surfaces it in the JSON response.
+
+##### Row-scoped ⇒ detection must happen at the moment of loss
+
+This is the sharp consequence. Row-scoped repair needs the list of affected keys
+— and **those keys live in the very segments that were deleted**. The gap record
+as designed holds a WAL *range* and missing segment ids, from which the affected
+keys cannot be recovered. Detection at next open is therefore too late to ever
+support row-scoped repair: by then the evidence is gone.
+
+The only moment the keys are still knowable is inside WAL GC, immediately before
+the backstop reclaims a pinned segment. So:
+
+- When the backstop forces reclamation of a segment still needed by an active
+  field, **scan that segment first** and record the distinct keys it holds into
+  the gap record as a repair worklist, alongside the range and segment ids.
+- Repair then iterates that worklist: read each key's current value from the
+  store, run the field's extractor, insert the index entry — i.e.
+  `update_indices_on_put` minus the storage write. Bounded by the damage.
+- Clear the gap record once the worklist drains.
+
+The extra scan is I/O, but only on the backstop path, which prevention makes rare
+by construction.
+
+**Bound the worklist.** A wedged checkpoint worker could strand a very large key
+set. Cap the recorded worklist; past the cap, drop it and mark the field for a
+full rebuild instead. Repair then has two modes — row-scoped (normal) and full
+(cap exceeded) — and the gap record says which applies.
+
+### Implementation order (2026-08-01)
+
+Total remediation — prevention **and** repair, not prevention alone.
+
+1. **Dropped-index cleanup.** `remove_field_path` + deregister-then-delete
+   ordering. Independent of everything else and removes the frozen markers the
+   watermark would otherwise trip over.
+2. **Prevention.** Index-replay watermark gating WAL GC, active-fields scoped,
+   `IndexCheckpointTrigger::request()` for liveness, backstop cap.
+3. **Detection at the moment of loss + persisted gap record.** Scan a pinned
+   segment before the backstop reclaims it, record range, segment ids **and the
+   affected-key worklist** (capped). Must survive restart. This has to precede
+   repair — it is what makes row-scoped repair possible at all.
+4. **Admin surface + degraded-query signal.** Index health per namespace/field,
+   and the query response indicator so a caller reading a degraded index knows
+   its results are incomplete.
+5. **Row-scoped re-index entry point.** Walk the worklist, re-extract and insert
+   without re-putting documents; full-rebuild fallback when the cap was
+   exceeded; clears the gap record on success.
+
+Steps 1–2 make the condition rare; 3–4 make the remaining cases visible and
+fixable. Shipping 1–2 alone would leave the backstop path silent, which is the
+same failure mode in a smaller box — so this is not a stopping point.
+
+Once this lands, the persisted row-map slot table becomes sound; see *Downstream:
+the row map*.
+
 ### Acceptance criteria
 
+- WAL GC does not reclaim a segment that any active field index still needs for
+  replay, proven by the inverse of
+  `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`.
+- A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
+  does not pin WAL GC; a crash mid-drop never yields a registered field whose
+  data is gone.
+- Pinned WAL is bounded: with the checkpoint worker stopped, retention stops at
+  the backstop cap rather than growing without limit.
 - A replay gap detected at open is recorded durably and still visible after a
   restart.
 - The admin API reports outstanding gaps per namespace/field.
-- An operator can trigger a re-index (full, and ideally row-scoped) that clears
-  the gap record on success.
+- A gap recorded by the backstop names the affected keys, and a restart preserves
+  that worklist.
+- An operator can trigger a row-scoped re-index that repairs only those keys and
+  clears the gap record on success; the full-rebuild fallback is reachable when
+  the worklist cap was exceeded.
 - Re-indexing does not re-put documents through the WAL.
-- A namespace with no field indices is unaffected on every path.
+- A query against a field with an outstanding gap returns results **and** an
+  indication that the index is degraded — never a complete-looking result set.
+- A namespace with no field indices is unaffected on every path, and WAL
+  retention is unchanged for it.
 
 ---
 
