@@ -12,8 +12,9 @@ use crate::db::config::DbConfig;
 use crate::db::database::Database;
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_manager::FieldIndexHealth;
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
-use crate::db::namespace::{FieldId, FieldReindexOutcome};
+use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::db::namespace_index::ExtractorFn;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
@@ -559,20 +560,43 @@ impl Db {
         self.inner.index_blob_waste_threshold()
     }
 
+    /// Report the health of every registered field index in a namespace,
+    /// including any outstanding gap and what it would take to repair.
+    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+        self.inner.index_health(namespace_id)
+    }
+
+    /// Repair a degraded field index and clear its gap record.
+    ///
+    /// Row-scoped when the gap named the affected keys, a full rebuild
+    /// otherwise. Does not re-put documents. See
+    /// [`FieldRepairOutcome`](crate::FieldRepairOutcome).
+    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+        self.inner.repair_field_index(namespace_id, field_id)
+    }
+
     /// Evaluate a query string against the active field indices of a namespace
-    /// and return the raw keys of all matching documents.
-    pub fn query_index(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
+    /// and return the matching keys.
+    ///
+    /// Returns a [`QueryOutcome`], not a bare `Vec`: a field index can be
+    /// *degraded* (missing updates it can no longer recover) while still being
+    /// queryable, and serving results that look complete over one is the very
+    /// failure FR-001 exists to remove. Check
+    /// [`is_degraded`](QueryOutcome::is_degraded) — or `degraded_fields` for
+    /// which ones — before treating the result as exhaustive.
+    pub fn query_index(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
         self.inner.query_keys(namespace_id, query_str)
     }
 
-    /// Like [`query_index`] but returns only the `[offset, offset+limit)` window of
-    /// matching keys together with the full match count.
+    /// Like [`query_index`] but resolves only the `[offset, offset+limit)` window
+    /// of matching keys; [`QueryOutcome::total`] still carries the full match
+    /// count.
     ///
     /// Prefer this over `query_index` when serving a paginated API — with a
     /// registered `RowToKeyFn` only `offset + limit` keys need to be resolved.
     ///
     /// [`query_index`]: Db::query_index
-    pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
+    pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         self.inner.query_keys_paginated(namespace_id, query_str, offset, limit)
     }
 }
@@ -1472,6 +1496,25 @@ impl AsyncDb {
     /// Reindex a single field for a single key, re-deriving its value from the
     /// key's current stored bytes using the same logic as the put path. Touches
     /// only the named field. See [`crate::FieldReindexOutcome`].
+    /// Report the health of every registered field index in a namespace.
+    pub async fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.index_health(namespace_id))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Repair a degraded field index and clear its gap record.
+    ///
+    /// Offloaded to a blocking task: a full rebuild scans the namespace, so this
+    /// must not run on the async runtime's worker threads.
+    pub async fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.repair_field_index(namespace_id, field_id))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: Vec<u8>) -> Result<FieldReindexOutcome> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.reindex_field(namespace_id, field_id, &key))
@@ -1486,7 +1529,7 @@ impl AsyncDb {
 
     /// Evaluate a query string against the active field indices of a namespace
     /// and return the raw keys of all matching documents.
-    pub async fn query_index(&self, namespace_id: u32, query: impl Into<String> + Send + 'static) -> Result<Vec<Vec<u8>>> {
+    pub async fn query_index(&self, namespace_id: u32, query: impl Into<String> + Send + 'static) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
         tokio::task::spawn_blocking(move || db.inner.query_keys(namespace_id, &q))
@@ -1504,7 +1547,7 @@ impl AsyncDb {
         query: impl Into<String> + Send + 'static,
         offset: usize,
         limit: usize,
-    ) -> Result<(Vec<Vec<u8>>, usize)> {
+    ) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
         tokio::task::spawn_blocking(move || db.inner.query_keys_paginated(namespace_id, &q, offset, limit))

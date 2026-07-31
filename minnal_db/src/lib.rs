@@ -160,6 +160,17 @@ pub use db::namespace::FieldId;
 pub use db::namespace::FieldMeta;
 /// Outcome of a targeted single-field reindex ([`Db::reindex_field`]).
 pub use db::namespace::FieldReindexOutcome;
+/// What a field-index repair did ([`Db::repair_field_index`]).
+pub use db::namespace::FieldRepairOutcome;
+/// A field-index query result: matching keys plus whether the indices that
+/// produced them are known to be incomplete.
+pub use db::namespace::QueryOutcome;
+
+/// Health of one field index, including any outstanding gap
+/// ([`Db::index_health`]).
+pub use db::index_manager::FieldIndexHealth;
+/// Why a field index is incomplete, and what repair it needs.
+pub use db::index_manager::{GapCause, GapRecord, RepairMode};
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
 pub use db::namespace_index::ExtractorFn;

@@ -36,7 +36,7 @@ use minnal_db::doc_store::hex::hex_to_bytes;
 use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
 use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{AppState, id::parse_doc_id, routes::stores::reload_schema};
 
@@ -964,4 +964,79 @@ pub async fn vector_queue_retry_entry(
 
     info!(namespace = %ns, doc_id_hex = %doc_id_hex, "reset retry count for exhausted queue entry");
     Ok(Json(QueueEntryInfo::from(entry)))
+}
+
+/// `GET /admin/indices/{ns}/health`
+///
+/// Report every field index in the namespace: where its persisted state reaches,
+/// whether it is active, and any outstanding gap (what is missing and what
+/// repair it needs).
+///
+/// This is the operator-facing half of FR-001. The per-query `degraded_fields`
+/// field tells a *caller* their answer may be short; this tells an operator
+/// which indices to repair, and is what makes the condition alertable rather
+/// than something buried in a log line.
+pub async fn index_health(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    let health = state.store.index_health(&ns).await.map_err(|e| match e {
+        DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+
+    let degraded: Vec<&str> = health.iter().filter(|h| h.is_degraded()).map(|h| h.field_name.as_str()).collect();
+    if !degraded.is_empty() {
+        warn!(namespace = %ns, fields = ?degraded, "namespace has incomplete field indices");
+    }
+    Ok(Json(serde_json::json!({
+        "namespace": ns,
+        "degraded": !degraded.is_empty(),
+        "degraded_fields": degraded,
+        "fields": health,
+    })))
+}
+
+/// `POST /admin/indices/{ns}/attribute/{field}/repair`
+///
+/// Repair a degraded field index and clear its gap record.
+///
+/// Row-scoped when the gap named the affected keys (work proportional to the
+/// damage), a full rebuild when they could not be captured. Either way the
+/// documents themselves are not re-put, so this generates no WAL traffic and
+/// triggers no vector re-embedding.
+///
+/// Synchronous: row-scoped repair is bounded by the recorded worklist. A full
+/// rebuild scans the namespace, so it can take a while on a large store.
+pub async fn attribute_repair(
+    State(state): State<AppState>,
+    Path((ns, field)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    match state.store.repair_index(&ns, &field).await {
+        Ok(minnal_db::FieldRepairOutcome::NotDegraded) => Ok(Json(serde_json::json!({
+            "status": "not_degraded",
+            "namespace": ns,
+            "field": field,
+            "message": "the index has no outstanding gap; nothing to repair",
+        }))),
+        Ok(outcome) => {
+            info!(namespace = %ns, field = %field, outcome = ?outcome, "field index repaired");
+            Ok(Json(serde_json::json!({
+                "status": "repaired",
+                "namespace": ns,
+                "field": field,
+                "result": outcome,
+            })))
+        }
+        Err(DocStoreError::IndexNotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("'{field}' is not an indexed field of '{ns}'"))),
+        Err(DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        Err(e) => {
+            error!(namespace = %ns, field = %field, error = %e, "field index repair failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
 }

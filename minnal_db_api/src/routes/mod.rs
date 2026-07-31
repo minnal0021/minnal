@@ -89,6 +89,9 @@ pub fn router() -> Router<AppState> {
             post(admin_indices::attribute_reindex_doc),
         )
         .route("/admin/indices/{ns}/{field}/blob-stats", get(admin_indices::field_blob_stats))
+        // Admin / indices — field-index health and repair (FR-001)
+        .route("/admin/indices/{ns}/health", get(admin_indices::index_health))
+        .route("/admin/indices/{ns}/attribute/{field}/repair", post(admin_indices::attribute_repair))
         .route("/admin/indices/{ns}/vector/reindex-all", post(admin_indices::vector_reindex_all))
         .route("/admin/indices/{ns}/vector/reindex/{doc_id}", post(admin_indices::vector_reindex_doc))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))

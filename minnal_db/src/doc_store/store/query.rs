@@ -129,7 +129,10 @@ impl DocStore {
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
         // here — the full set is needed as an ANN filter before scoring).
-        let all_keys = self.query_all_keys(namespace, predicate).await?;
+        // A degraded predicate index means the candidate set itself is short, so
+        // the ANN results are filtered against an incomplete allow-list. That has
+        // to reach the caller just as it does for a plain query.
+        let (all_keys, degraded_fields) = self.query_all_keys(namespace, predicate).await?;
         let allowed_ids: std::collections::HashSet<Vec<u8>> = all_keys.into_iter().collect();
 
         // Phase 2: ANN search with the filter closure.
@@ -163,7 +166,7 @@ impl DocStore {
         )
         .await;
 
-        Ok(Page::from_vec(all, pagination))
+        Ok(Page::from_vec(all, pagination).with_degraded_fields(degraded_fields))
     }
 
     /// Return documents whose IDs fall in `[start, end)`, one cursor page at a time.
@@ -273,15 +276,22 @@ impl DocStore {
     ) -> Result<Page<(DocId, serde_json::Value)>, DocStoreError> {
         // Use the paginated variant so only the page window of keys is resolved
         // from the bitmap, not the full result set.
-        let (page_keys, total) = self
+        let outcome = self
             .db
             .query_index_paginated(ns_id, predicate.to_owned(), pagination.offset(), pagination.page_size)
             .await?;
 
+        // Resolve degraded field ids to names for the caller — the engine speaks
+        // in `FieldId`, but every doc-store surface above here speaks in field
+        // names, and an operator reading a response needs the name.
+        let degraded_fields = self.degraded_field_names(ns_id, &outcome.degraded_fields);
+        let total = outcome.total;
+
         if total == 0 {
-            return Ok(Page::from_slice(vec![], pagination, 0));
+            return Ok(Page::from_slice(vec![], pagination, 0).with_degraded_fields(degraded_fields));
         }
 
+        let page_keys = outcome.keys;
         let ns = self.db.namespace(namespace.to_owned()).await?;
         let values = ns.get_multiple(page_keys.clone()).await;
         let mut results = Vec::with_capacity(page_keys.len());
@@ -293,7 +303,29 @@ impl DocStore {
             }
         }
 
-        Ok(Page::from_slice(results, pagination, total))
+        Ok(Page::from_slice(results, pagination, total).with_degraded_fields(degraded_fields))
+    }
+
+    /// Map degraded `FieldId`s back to their field names for this namespace.
+    ///
+    /// An id with no matching registered field falls back to its numeric form
+    /// rather than being dropped — losing a degradation signal because a name
+    /// could not be resolved would be exactly the wrong failure mode.
+    fn degraded_field_names(&self, ns_id: u32, degraded: &[crate::db::namespace::FieldId]) -> Vec<String> {
+        if degraded.is_empty() {
+            return Vec::new();
+        }
+        let fields = self.db.list_index_fields(ns_id);
+        degraded
+            .iter()
+            .map(|&fid| {
+                fields
+                    .iter()
+                    .find(|f| f.field_id == fid)
+                    .map(|f| f.field_name.clone())
+                    .unwrap_or_else(|| fid.to_string())
+            })
+            .collect()
     }
 
     /// Collect all raw key bytes that match `predicate` without pagination.
@@ -301,12 +333,14 @@ impl DocStore {
     /// Used internally by [`search_semantic_filtered`] to build the full
     /// candidate ID set before ANN scoring.
     #[cfg(feature = "semantic-search")]
-    async fn query_all_keys(&self, namespace: &str, predicate: &str) -> Result<Vec<Vec<u8>>, DocStoreError> {
+    async fn query_all_keys(&self, namespace: &str, predicate: &str) -> Result<(Vec<Vec<u8>>, Vec<String>), DocStoreError> {
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        Ok(self.db.query_index(ns_id, predicate.to_owned()).await?)
+        let outcome = self.db.query_index(ns_id, predicate.to_owned()).await?;
+        let degraded = self.degraded_field_names(ns_id, &outcome.degraded_fields);
+        Ok((outcome.keys, degraded))
     }
 }
 

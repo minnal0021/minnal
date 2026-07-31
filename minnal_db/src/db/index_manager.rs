@@ -205,6 +205,34 @@ impl GapRecord {
     }
 }
 
+/// Health of one field index: where its persisted state reaches, and whether it
+/// is known to be incomplete.
+///
+/// Returned by `Db::index_health` and surfaced by the admin API so the condition
+/// is alertable instead of buried in a log line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FieldIndexHealth {
+    pub namespace_id: u32,
+    pub field_id: FieldId,
+    pub field_name: String,
+    /// WAL offset the field's persisted index reflects, if it has ever been
+    /// checkpointed.
+    pub checkpoint_offset: Option<u64>,
+    /// Whether the field is currently activated in memory. An inactive field is
+    /// not queryable, which is a different condition from a degraded one.
+    pub active: bool,
+    /// Set when the index is missing updates it cannot recover on its own.
+    /// `None` ⇒ healthy.
+    pub gap: Option<GapRecord>,
+}
+
+impl FieldIndexHealth {
+    /// Whether this field is missing updates and needs repair.
+    pub fn is_degraded(&self) -> bool {
+        self.gap.is_some()
+    }
+}
+
 /// Write-path sink for field-index updates that were **rejected**.
 ///
 /// A rejected update leaves the row silently absent from that field forever. The

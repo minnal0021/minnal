@@ -64,7 +64,7 @@ use axum::{
 use minnal_db::{DocId, DocStoreError, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{AppState, error::AppError, id::doc_id_to_value};
 
@@ -189,6 +189,10 @@ pub async fn query_filtered(
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
+    let degraded_fields = page.degraded_fields.clone();
+    if !degraded_fields.is_empty() {
+        warn!(namespace = %ns, fields = ?degraded_fields, "filtered semantic search used an incomplete index");
+    }
     debug!(namespace = %ns, total = total, "filtered semantic search complete");
     let results = decode_results(page.results, key_type, &state, &ns).await?;
     Ok((
@@ -198,6 +202,10 @@ pub async fn query_filtered(
             "page_no": pagination.page_no,
             "page_size": pagination.page_size,
             "total": total,
+            // The predicate narrows the ANN candidate set, so an incomplete
+            // predicate index means candidates were filtered against a short
+            // allow-list — the results may be missing documents.
+            "degraded_fields": degraded_fields,
         })),
     ))
 }

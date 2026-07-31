@@ -44,28 +44,29 @@ const PREDICATE: &str = r#"status = "active""#;
 /// and that the reported total is stable across every page.
 fn assert_paged_walk_matches_full_query(db: &Db, page_size: usize) -> Result<(), KVError> {
     let full = db.query_index(DEFAULT_NAMESPACE_ID, PREDICATE)?;
-    assert!(!full.is_empty(), "fixture should match something");
+    assert!(!full.keys.is_empty(), "fixture should match something");
+    assert!(!full.is_degraded(), "fixture index should be healthy");
 
     let mut walked: Vec<Vec<u8>> = Vec::new();
     let mut offset = 0usize;
     loop {
-        let (page, total) = db.query_index_paginated(DEFAULT_NAMESPACE_ID, PREDICATE, offset, page_size)?;
-        assert_eq!(total, full.len(), "reported total should not drift at offset {offset}");
-        if page.is_empty() {
+        let page = db.query_index_paginated(DEFAULT_NAMESPACE_ID, PREDICATE, offset, page_size)?;
+        assert_eq!(page.total, full.keys.len(), "reported total should not drift at offset {offset}");
+        if page.keys.is_empty() {
             break;
         }
-        assert!(page.len() <= page_size, "page at offset {offset} exceeded the limit");
-        walked.extend(page);
+        assert!(page.keys.len() <= page_size, "page at offset {offset} exceeded the limit");
+        walked.extend(page.keys);
         offset += page_size;
-        assert!(offset <= full.len() + page_size, "paging failed to terminate");
+        assert!(offset <= full.keys.len() + page_size, "paging failed to terminate");
     }
 
-    assert_eq!(walked, full, "page-by-page walk (page_size {page_size}) must equal the full query");
+    assert_eq!(walked, full.keys, "page-by-page walk (page_size {page_size}) must equal the full query");
 
     // An offset at the end is empty rather than wrapping or erroring.
-    let (past_end, total) = db.query_index_paginated(DEFAULT_NAMESPACE_ID, PREDICATE, full.len(), page_size)?;
-    assert!(past_end.is_empty(), "offset at the result length should yield nothing");
-    assert_eq!(total, full.len());
+    let past_end = db.query_index_paginated(DEFAULT_NAMESPACE_ID, PREDICATE, full.keys.len(), page_size)?;
+    assert!(past_end.keys.is_empty(), "offset at the result length should yield nothing");
+    assert_eq!(past_end.total, full.keys.len());
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
-use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
+use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, FieldRepairOutcome, NamespaceRegistry, QueryOutcome};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
@@ -1680,10 +1680,59 @@ impl Database {
     /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Query`]
     /// carrying a [`crate::index::query::QueryError::InactiveField`].
-    pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
-
+    pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
+        let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
+        let degraded_fields = self.degraded_among(namespace_id, &touched);
+        let total = bitmap.len();
+
+        if bitmap.is_empty() {
+            return Ok(QueryOutcome {
+                keys: Vec::new(),
+                total: 0,
+                degraded_fields,
+            });
+        }
+
+        // Fast path: when a RowToKeyFn inverse is registered, reconstruct each
+        // matching key directly from its row ID — O(|hits|), zero memory overhead,
+        // crash-safe (no map to rebuild on restart).
+        let keys = if let Some(ref inv) = *store.row_to_key_fn.read() {
+            bitmap.iter().map(|row_id| inv(row_id)).collect()
+        } else if store.rowmap_active() {
+            // Fast path: the dense row map resolves each hit's key directly — O(|hits|).
+            bitmap.iter().filter_map(|row_id| store.rowmap_key_for(row_id)).collect()
+        } else {
+            // Fallback (no inverse function): scan all keys and check bitmap membership.
+            // Pre-existing O(n_keys) path retained for backward compatibility.
+            store
+                .keys()?
+                .into_iter()
+                .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
+                .collect()
+        };
+
+        Ok(QueryOutcome {
+            keys,
+            total,
+            degraded_fields,
+        })
+    }
+
+    /// Parse and evaluate a predicate, returning the matching row bitmap **and
+    /// the set of fields the predicate actually referenced**.
+    ///
+    /// The touched-field set comes from the evaluator itself: it calls the
+    /// index lookup closure exactly once per field it needs, so recording those
+    /// ids is both free and exact — no second parse, and no risk of the two
+    /// disagreeing about which fields a query touched.
+    fn evaluate_predicate(
+        &self,
+        namespace_id: u32,
+        store: &Arc<KVStore>,
+        query_str: &str,
+    ) -> Result<(crate::index::bitmap::RoaringBitmap, Vec<FieldId>)> {
+        use crate::index::query::{SchemaMap, parse_and_evaluate};
 
         // Build the schema map: field_name → field_id, restricted to fields
         // that have an active in-memory index. Dropped fields remain in the
@@ -1703,40 +1752,31 @@ impl Database {
                 .unwrap_or_default()
         };
 
-        // Closure: look up a live DynFieldIndex by field_id
+        let touched = parking_lot::Mutex::new(Vec::new());
         let get_index = |field_id: u32| {
+            touched.lock().push(field_id);
             let ns_index = store.namespace_index.read();
             ns_index.get(field_id).map(|e| Arc::clone(&e.index))
         };
 
-        // Evaluate the query → bitmap of matching row IDs
         let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index)?;
+        let mut touched = touched.into_inner();
+        touched.sort_unstable();
+        touched.dedup();
+        Ok((bitmap, touched))
+    }
 
-        if bitmap.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Fast path: when a RowToKeyFn inverse is registered, reconstruct each
-        // matching key directly from its row ID — O(|hits|), zero memory overhead,
-        // crash-safe (no map to rebuild on restart).
-        if let Some(ref inv) = *store.row_to_key_fn.read() {
-            return Ok(bitmap.iter().map(|row_id| inv(row_id)).collect());
-        }
-
-        // Fast path: the dense row map resolves each hit's key directly — O(|hits|).
-        if store.rowmap_active() {
-            return Ok(bitmap.iter().filter_map(|row_id| store.rowmap_key_for(row_id)).collect());
-        }
-
-        // Fallback (no inverse function): scan all keys and check bitmap membership.
-        // Pre-existing O(n_keys) path retained for backward compatibility.
-        let all_keys = store.keys()?;
-        let matching = all_keys
-            .into_iter()
-            .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-            .collect();
-
-        Ok(matching)
+    /// Of the fields a query touched, which have an outstanding gap record.
+    ///
+    /// One marker read per touched field — a predicate references a handful of
+    /// fields, not the whole schema, so this is bounded by the query rather than
+    /// by the namespace.
+    fn degraded_among(&self, namespace_id: u32, touched: &[FieldId]) -> Vec<FieldId> {
+        touched
+            .iter()
+            .copied()
+            .filter(|&field_id| self.index_manager.read_gap(namespace_id, field_id).is_some())
+            .collect()
     }
 
     /// Evaluate a query and return `(page_keys, total)` where `total` is the
@@ -1748,37 +1788,19 @@ impl Database {
     /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
     ///
     /// [`query_keys`]: Self::query_keys
-    pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
-
+    pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
-
-        let schema_map: SchemaMap = {
-            let registry = self.registry.read();
-            let ns_index = store.namespace_index.read();
-            registry
-                .schema(namespace_id)
-                .map(|s| {
-                    s.list_fields()
-                        .into_iter()
-                        .filter(|f| ns_index.get(f.field_id).is_some())
-                        .map(|f| (f.field_name, f.field_id))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        let get_index = |field_id: u32| {
-            let ns_index = store.namespace_index.read();
-            ns_index.get(field_id).map(|e| Arc::clone(&e.index))
-        };
-
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index)?;
+        let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
+        let degraded_fields = self.degraded_among(namespace_id, &touched);
 
         let total = bitmap.len();
 
         if total == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok(QueryOutcome {
+                keys: Vec::new(),
+                total: 0,
+                degraded_fields,
+            });
         }
 
         // Both fast paths window the bitmap with `iter_page`, not
@@ -1791,7 +1813,11 @@ impl Database {
         // Fast path: RowToKeyFn registered — resolve only the page window.
         if let Some(ref inv) = *store.row_to_key_fn.read() {
             let keys: Vec<Vec<u8>> = bitmap.iter_page(offset, limit).map(|row_id| inv(row_id)).collect();
-            return Ok((keys, total));
+            return Ok(QueryOutcome {
+                keys,
+                total,
+                degraded_fields,
+            });
         }
 
         // Fast path: dense row map — resolve only the page window.
@@ -1800,7 +1826,11 @@ impl Database {
                 .iter_page(offset, limit)
                 .filter_map(|row_id| store.rowmap_key_for(row_id))
                 .collect();
-            return Ok((keys, total));
+            return Ok(QueryOutcome {
+                keys,
+                total,
+                degraded_fields,
+            });
         }
 
         // Fallback: scan all keys, filter by bitmap membership, then window.
@@ -1816,7 +1846,11 @@ impl Database {
             .skip(offset)
             .take(limit)
             .collect();
-        Ok((keys, total))
+        Ok(QueryOutcome {
+            keys,
+            total,
+            degraded_fields,
+        })
     }
 
     // ── Store access ───────────────────────────────────────────────────
@@ -2262,6 +2296,142 @@ impl Database {
             watermark = Some(watermark.map_or(segment, |w: u64| w.min(segment)));
         }
         watermark
+    }
+
+    /// Repair a field index that has an outstanding gap, then clear the gap.
+    ///
+    /// Two modes, chosen by the gap record itself:
+    ///
+    /// - **Row-scoped** (the normal case): walk the recorded key worklist,
+    ///   re-derive each key's field value from its *current* stored bytes, and
+    ///   rewrite that one row. Work is proportional to the damage, not to the
+    ///   store. Reading current values rather than the lost ones is what makes
+    ///   this idempotent and convergent: a key overwritten since the loss is
+    ///   already correct, and a key written five times needs one repair.
+    /// - **Full rebuild**: re-extract every key in the namespace. Used when the
+    ///   worklist crossed its cap, or for a no-WAL gap whose keys were never
+    ///   knowable.
+    ///
+    /// The gap is cleared **only on success**, so a failed or interrupted repair
+    /// leaves the field visibly degraded and retryable rather than quietly
+    /// marked healthy.
+    ///
+    /// Does not re-put documents: no WAL traffic, no vector re-embedding, no
+    /// other field's extractor. Returns [`FieldRepairOutcome::NotDegraded`] when
+    /// there is nothing to repair.
+    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+        use crate::db::index_manager::RepairMode;
+        use crate::db::namespace::FieldReindexOutcome;
+
+        let Some(gap) = self.index_manager.read_gap(namespace_id, field_id) else {
+            return Ok(FieldRepairOutcome::NotDegraded);
+        };
+        let store = self.get_store(namespace_id)?;
+        if store.namespace_index.read().get(field_id).is_none() {
+            return Err(KVError::Serialization(format!(
+                "Field {} in namespace {} has no active index to repair; activate it first",
+                field_id, namespace_id
+            )));
+        }
+
+        let outcome = match &gap.repair {
+            RepairMode::RowScoped { keys } => {
+                // A key recorded as un-decodable hex would silently shrink the
+                // worklist, so fail loudly rather than report a repair that
+                // skipped rows.
+                let mut decoded = Vec::with_capacity(keys.len());
+                for hex in keys {
+                    let key = crate::support::hex::hex_to_bytes(hex).ok_or_else(|| {
+                        KVError::Serialization(format!("Gap record for ns={namespace_id} field={field_id} holds a malformed key: {hex}"))
+                    })?;
+                    decoded.push(key);
+                }
+
+                let mut reindexed = 0usize;
+                let mut absent = 0usize;
+                for key in &decoded {
+                    match store.reindex_field(field_id, key)? {
+                        FieldReindexOutcome::Reindexed => reindexed += 1,
+                        // The key has no current value. `reindex_field` has
+                        // already cleared its row, which is the repair when it
+                        // was the *delete* that went missing.
+                        FieldReindexOutcome::KeyNotFound => absent += 1,
+                        FieldReindexOutcome::FieldNotActive => {
+                            return Err(KVError::Serialization(format!(
+                                "Field {field_id} in namespace {namespace_id} was deactivated mid-repair"
+                            )));
+                        }
+                    }
+                }
+                FieldRepairOutcome::RowScoped {
+                    keys_total: decoded.len(),
+                    reindexed,
+                    absent,
+                }
+            }
+            RepairMode::FullRebuild => {
+                let keys = store.keys()?;
+                let scanned = keys.len();
+                for key in &keys {
+                    match store.reindex_field(field_id, key)? {
+                        FieldReindexOutcome::FieldNotActive => {
+                            return Err(KVError::Serialization(format!(
+                                "Field {field_id} in namespace {namespace_id} was deactivated mid-repair"
+                            )));
+                        }
+                        _ => continue,
+                    }
+                }
+                FieldRepairOutcome::FullRebuild { scanned }
+            }
+        };
+
+        // Make the repaired index durable before dropping the record of why it
+        // needed repairing. The reverse order could clear the gap and then lose
+        // the repair to a crash, leaving a silently incomplete index with
+        // nothing left to say so.
+        self.run_index_checkpoint()?;
+        self.index_manager.clear_gap(namespace_id, field_id)?;
+        info!("[REPAIR] ns={namespace_id} field={field_id}: repaired ({outcome:?}), gap cleared");
+        Ok(outcome)
+    }
+
+    /// Report the health of every registered field index in a namespace.
+    ///
+    /// The operator-facing counterpart of the per-query `degraded_fields`
+    /// signal: that tells a caller their *answer* may be short, this tells an
+    /// operator *which indices* need repair and why. Dropped fields are omitted —
+    /// they have no index to be healthy or otherwise.
+    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<crate::db::index_manager::FieldIndexHealth>> {
+        let store = self.get_store(namespace_id)?;
+        let wal_tail = self.wal_metadata.read().tail;
+
+        let fields: Vec<FieldMeta> = {
+            let registry = self.registry.read();
+            registry
+                .schema(namespace_id)
+                .map(|s| s.list_fields().into_iter().filter(|f| !f.dropped).collect())
+                .unwrap_or_default()
+        };
+
+        let ns_index = store.namespace_index.read();
+        Ok(fields
+            .into_iter()
+            .map(|f| {
+                let checkpoint_offset = match self.index_manager.read_checkpoint_state(namespace_id, f.field_id, wal_tail) {
+                    crate::db::index_manager::CheckpointState::At(offset) => Some(offset),
+                    _ => None,
+                };
+                crate::db::index_manager::FieldIndexHealth {
+                    namespace_id,
+                    field_id: f.field_id,
+                    field_name: f.field_name,
+                    checkpoint_offset,
+                    active: ns_index.get(f.field_id).is_some(),
+                    gap: self.index_manager.read_gap(namespace_id, f.field_id),
+                }
+            })
+            .collect())
     }
 
     /// Note that a namespace has taken a no-WAL write whose field-index update
@@ -3623,7 +3793,7 @@ impl AsyncDatabase {
     /// Evaluate a query string and return matching document keys.
     ///
     /// See [`Database::query_keys`] for full documentation.
-    pub async fn query_keys(&self, namespace_id: u32, query_str: String) -> Result<Vec<Vec<u8>>> {
+    pub async fn query_keys(&self, namespace_id: u32, query_str: String) -> Result<QueryOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.query_keys(namespace_id, &query_str))
             .await
@@ -4463,11 +4633,11 @@ mod tests {
                 .unwrap();
 
             // Queries must return correct results from the warmed index
-            let mut active_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"active\"").unwrap();
+            let mut active_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"active\"").unwrap().keys;
             active_keys.sort();
             assert_eq!(active_keys, vec![b"user:1".to_vec(), b"user:3".to_vec()]);
 
-            let inactive_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"inactive\"").unwrap();
+            let inactive_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"inactive\"").unwrap().keys;
             assert_eq!(inactive_keys, vec![b"user:2".to_vec()]);
 
             db.shutdown().unwrap();
@@ -4526,7 +4696,7 @@ mod tests {
             // activate_field_index must replay batch B from the WAL tail.
             db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
 
-            let mut active_keys = db.query_keys(ns, "status = \"active\"").unwrap();
+            let mut active_keys = db.query_keys(ns, "status = \"active\"").unwrap().keys;
             active_keys.sort();
             assert_eq!(
                 active_keys,
@@ -4534,7 +4704,7 @@ mod tests {
                 "WAL replay must include batch-B writes",
             );
 
-            let mut inactive_keys = db.query_keys(ns, "status = \"inactive\"").unwrap();
+            let mut inactive_keys = db.query_keys(ns, "status = \"inactive\"").unwrap().keys;
             inactive_keys.sort();
             assert_eq!(inactive_keys, vec![b"user:2".to_vec(), b"user:4".to_vec()],);
 
@@ -4607,12 +4777,12 @@ mod tests {
 
             // u:1 must match ONLY its latest value after replay, not the old one.
             assert_eq!(
-                db.query_keys(ns, "status = \"archived\"").unwrap(),
+                db.query_keys(ns, "status = \"archived\"").unwrap().keys,
                 vec![b"u:1".to_vec()],
                 "replayed update must land u:1 under its new value"
             );
             assert_eq!(
-                db.query_keys(ns, "status = \"active\"").unwrap(),
+                db.query_keys(ns, "status = \"active\"").unwrap().keys,
                 vec![b"u:2".to_vec()],
                 "replayed update must remove u:1 from its old value (no stale bucket)"
             );
@@ -4642,16 +4812,16 @@ mod tests {
 
         // Field absent → not indexed.
         db.put(b"d:1", br#"{"other":1}"#).unwrap();
-        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().keys.is_empty());
 
         // Field appears (None → Some): row joins the "active" bucket.
         db.put(b"d:1", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"d:1".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"d:1".to_vec()]);
 
         // Field disappears (Some → None): row must leave the bucket.
         db.put(b"d:1", br#"{"other":2}"#).unwrap();
         assert!(
-            db.query_keys(ns, "status = \"active\"").unwrap().is_empty(),
+            db.query_keys(ns, "status = \"active\"").unwrap().keys.is_empty(),
             "row must leave its bucket when the indexed field is removed"
         );
 
@@ -5520,7 +5690,7 @@ mod tests {
         db.put(b"doc:2", br#"{"status":"inactive"}"#).unwrap();
 
         // Sanity: query works before deactivation.
-        let keys = db.query_keys(ns, "status = \"active\"").unwrap();
+        let keys = db.query_keys(ns, "status = \"active\"").unwrap().keys;
         assert_eq!(keys, vec![b"doc:1".to_vec()]);
 
         db.deactivate_field_index(ns, field_id).unwrap();
@@ -5552,6 +5722,44 @@ mod tests {
         });
         db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
         field_id
+    }
+
+    /// Activate an index over the named JSON string field. Returns the field id.
+    #[cfg(test)]
+    fn activate_named_index(db: &Database, ns: u32, field: &'static str) -> FieldId {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let field_id = db.register_index_field(ns, field, IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(move |bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v[field].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+        field_id
+    }
+
+    /// Record a minimal gap so a field reads as degraded.
+    #[cfg(test)]
+    fn record_test_gap(db: &Database, ns: u32, field_id: FieldId) {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+        db.index_manager
+            .record_gap(
+                GapRecord {
+                    namespace_id: ns,
+                    field_id,
+                    cause: GapCause::BackstopReclaim,
+                    from: 0,
+                    to: 0,
+                    missing_segments: vec![],
+                    detected_at_ms: 1,
+                    repair: RepairMode::FullRebuild,
+                },
+                1000,
+            )
+            .unwrap();
     }
 
     /// FR-001 step 1: dropping a field index deletes its on-disk directory.
@@ -5732,22 +5940,22 @@ mod tests {
 
         db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
         db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().len(), 2);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 2);
 
         // Update doc:1's status active -> archived. The targeted update must move
         // the row, so it no longer matches "active" and now matches "archived".
         db.put(b"doc:1", br#"{"status":"archived"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
-        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:2".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap().keys, vec![b"doc:1".to_vec()]);
 
         // Updating to the same value is a no-op and keeps the row queryable.
         db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:2".to_vec()]);
 
         // Delete doc:2 → it must leave the "active" bucket.
         db.delete(b"doc:2").unwrap();
-        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
-        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().keys.is_empty());
+        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap().keys, vec![b"doc:1".to_vec()]);
 
         db.shutdown().unwrap();
     }
@@ -5775,11 +5983,11 @@ mod tests {
         db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
 
         db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:1".to_vec()]);
 
         // Reindexing an up-to-date entry is a no-op: still queryable, no duplicate.
         assert_eq!(db.reindex_field(ns, field_id, b"doc:1").unwrap(), FieldReindexOutcome::Reindexed);
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:1".to_vec()]);
 
         // A key with no value reports KeyNotFound and changes nothing.
         assert_eq!(db.reindex_field(ns, field_id, b"missing").unwrap(), FieldReindexOutcome::KeyNotFound);
@@ -6386,6 +6594,287 @@ mod tests {
         full.repair = RepairMode::FullRebuild;
         full.merge(mk(0, 10, vec![], &["bb"]), 100);
         assert_eq!(full.repair, RepairMode::FullRebuild);
+    }
+
+    /// FR-001 step 4: a query over a degraded index still returns results, but
+    /// says so — and only for the fields *this* predicate touched.
+    ///
+    /// Serving a complete-looking result set over an incomplete index is the
+    /// original bug, so this is the assertion the whole feature turns on.
+    #[test]
+    fn a_query_over_a_degraded_index_reports_it() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let status_field = activate_status_index(&db, ns);
+        let other_field = activate_named_index(&db, ns, "tier");
+        db.put(b"doc:1", br#"{"status":"active","tier":"gold"}"#)?;
+        db.put(b"doc:2", br#"{"status":"inactive","tier":"gold"}"#)?;
+
+        // Healthy to begin with.
+        let outcome = db.query_keys(ns, "status = \"active\"")?;
+        assert_eq!(outcome.keys, vec![b"doc:1".to_vec()]);
+        assert!(!outcome.is_degraded(), "a healthy index must not report degradation");
+        assert_eq!(outcome.total, 1);
+
+        record_test_gap(&db, ns, status_field);
+
+        // Same results, now flagged.
+        let outcome = db.query_keys(ns, "status = \"active\"")?;
+        assert_eq!(outcome.keys, vec![b"doc:1".to_vec()], "a degraded index stays queryable");
+        assert_eq!(outcome.degraded_fields, vec![status_field], "the touched degraded field must be named");
+
+        // A predicate that does not touch the degraded field is unaffected —
+        // one damaged field must not taint every query in the namespace.
+        let outcome = db.query_keys(ns, "tier = \"gold\"")?;
+        assert_eq!(outcome.keys.len(), 2);
+        assert!(!outcome.is_degraded(), "an untouched degraded field must not taint this query");
+
+        // A predicate touching both reports only the damaged one.
+        let outcome = db.query_keys(ns, "tier = \"gold\" AND status = \"active\"")?;
+        assert_eq!(outcome.degraded_fields, vec![status_field]);
+        assert!(!outcome.degraded_fields.contains(&other_field));
+
+        // The paginated form carries the same signal.
+        let outcome = db.query_keys_paginated(ns, "status = \"active\"", 0, 10)?;
+        assert_eq!(outcome.degraded_fields, vec![status_field]);
+
+        // An empty result over a degraded index is the dangerous case: without
+        // the flag it is indistinguishable from "nothing matches".
+        let outcome = db.query_keys(ns, "status = \"nonexistent\"")?;
+        assert!(outcome.keys.is_empty());
+        assert!(outcome.is_degraded(), "an EMPTY result over a degraded index must still report it");
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 4: index health names the degraded fields for an operator.
+    #[test]
+    fn index_health_reports_gaps_per_field() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let status_field = activate_status_index(&db, ns);
+        activate_named_index(&db, ns, "tier");
+        db.put(b"doc:1", br#"{"status":"active","tier":"gold"}"#)?;
+        db.run_index_checkpoint()?;
+
+        let health = db.index_health(ns)?;
+        assert_eq!(health.len(), 2, "both registered fields should be reported");
+        assert!(health.iter().all(|h| h.active), "both fields are activated");
+        assert!(health.iter().all(|h| !h.is_degraded()), "nothing is degraded yet");
+        assert!(
+            health.iter().all(|h| h.checkpoint_offset.is_some()),
+            "a checkpointed field should report its offset"
+        );
+
+        record_test_gap(&db, ns, status_field);
+        let health = db.index_health(ns)?;
+        let degraded: Vec<&str> = health.iter().filter(|h| h.is_degraded()).map(|h| h.field_name.as_str()).collect();
+        assert_eq!(degraded, vec!["status"], "only the damaged field is reported degraded");
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: row-scoped repair fixes exactly the recorded keys and
+    /// clears the gap, so queries stop reporting degradation.
+    #[test]
+    fn row_scoped_repair_restores_the_index_and_clears_the_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        db.put(b"doc:1", br#"{"status":"active"}"#)?;
+        db.put(b"doc:2", br#"{"status":"active"}"#)?;
+
+        // Simulate the damage: drop doc:2's row from the index behind the write
+        // path's back, exactly as a lost replay would.
+        {
+            let store = db.get_store(ns)?;
+            let row_id = store.resolve_row_id_get(b"doc:2").expect("doc:2 has a row id");
+            let ns_index = store.namespace_index.read();
+            ns_index.get(field_id).unwrap().index.write().remove_all_for_row(row_id);
+        }
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys,
+            vec![b"doc:1".to_vec()],
+            "precondition: the index is now short one document"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::BackstopReclaim,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::RowScoped {
+                    keys: vec![crate::support::hex::bytes_to_hex(b"doc:2")],
+                },
+            },
+            1000,
+        )?;
+
+        let outcome = db.repair_field_index(ns, field_id)?;
+        assert_eq!(
+            outcome,
+            FieldRepairOutcome::RowScoped {
+                keys_total: 1,
+                reindexed: 1,
+                absent: 0
+            }
+        );
+
+        let after = db.query_keys(ns, "status = \"active\"")?;
+        let mut keys = after.keys.clone();
+        keys.sort();
+        assert_eq!(keys, vec![b"doc:1".to_vec(), b"doc:2".to_vec()], "the missing row is back");
+        assert!(!after.is_degraded(), "a successful repair clears the gap");
+        assert!(db.index_manager.read_gap(ns, field_id).is_none());
+
+        // Repairing a healthy field is a no-op, not an error.
+        assert_eq!(db.repair_field_index(ns, field_id)?, FieldRepairOutcome::NotDegraded);
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: a key on the worklist whose value is **gone** must have its
+    /// row cleared, not skipped.
+    ///
+    /// The lost update can be the *delete*. `reindex_field` used to return
+    /// `KeyNotFound` and do nothing, leaving a stale row that queries as a hit —
+    /// a repair that leaves the index wrong in the opposite direction.
+    #[test]
+    fn repair_clears_the_row_of_a_key_whose_delete_was_lost() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        db.put(b"doc:1", br#"{"status":"active"}"#)?;
+        db.put(b"doc:2", br#"{"status":"active"}"#)?;
+
+        // Delete doc:2 from storage only, leaving its index row behind — what a
+        // lost delete looks like after a crash.
+        {
+            let store = db.get_store(ns)?;
+            store.delete_from_storage(b"doc:2")?;
+            let row_id = store.resolve_row_id_get(b"doc:2").expect("row id still known");
+            let ns_index = store.namespace_index.read();
+            ns_index
+                .get(field_id)
+                .unwrap()
+                .index
+                .write()
+                .set(&crate::index::IndexValue::Str("active".into()), row_id)
+                .unwrap();
+        }
+        assert!(
+            db.query_keys(ns, "status = \"active\"")?.keys.contains(&b"doc:2".to_vec()),
+            "precondition: the index still returns the deleted document"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::BackstopReclaim,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::RowScoped {
+                    keys: vec![crate::support::hex::bytes_to_hex(b"doc:2")],
+                },
+            },
+            1000,
+        )?;
+
+        let outcome = db.repair_field_index(ns, field_id)?;
+        assert_eq!(
+            outcome,
+            FieldRepairOutcome::RowScoped {
+                keys_total: 1,
+                reindexed: 0,
+                absent: 1
+            },
+            "the key is absent, and that still counts as repaired"
+        );
+        assert!(
+            !db.query_keys(ns, "status = \"active\"")?.keys.contains(&b"doc:2".to_vec()),
+            "the stale row must be gone — a lost delete is as wrong as a lost write"
+        );
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: a `FullRebuild` gap re-extracts the whole field.
+    #[test]
+    fn full_rebuild_repair_reindexes_every_key() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        for i in 0..5u32 {
+            db.put(format!("doc:{i}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+
+        // Wipe several rows — a no-WAL gap cannot name which, hence full rebuild.
+        {
+            let store = db.get_store(ns)?;
+            let ns_index = store.namespace_index.read();
+            let entry = ns_index.get(field_id).unwrap();
+            for i in 0..3u32 {
+                let row_id = store.resolve_row_id_get(format!("doc:{i}").as_bytes()).unwrap();
+                entry.index.write().remove_all_for_row(row_id);
+            }
+        }
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys.len(),
+            2,
+            "precondition: three rows are missing"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::NoWalWrites,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::FullRebuild,
+            },
+            1000,
+        )?;
+
+        assert_eq!(db.repair_field_index(ns, field_id)?, FieldRepairOutcome::FullRebuild { scanned: 5 });
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys.len(),
+            5,
+            "a full rebuild restores every row"
+        );
+        assert!(db.index_manager.read_gap(ns, field_id).is_none());
+
+        db.shutdown()?;
+        Ok(())
     }
 
     /// FR-001 step 2: the backstop bounds pinned WAL.

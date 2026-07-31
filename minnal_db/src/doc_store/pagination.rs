@@ -34,6 +34,15 @@ pub struct Page<T> {
     pub page_size: usize,
     /// Total number of matching records across all pages.
     pub total: usize,
+    /// Names of indexed fields this query touched that are known to be
+    /// **incomplete**, so these results may be missing documents. Empty for a
+    /// healthy index, and always empty for scans (which read documents directly
+    /// rather than through an index).
+    ///
+    /// See `FEATURE-REQUEST.md` (FR-001): a degraded index stays queryable, but
+    /// the answer has to say so, or a complete-looking result set over an
+    /// incomplete index reproduces the original silent-wrong-answer bug.
+    pub degraded_fields: Vec<String>,
 }
 
 impl<T> Page<T> {
@@ -46,6 +55,7 @@ impl<T> Page<T> {
             page_no: pagination.page_no,
             page_size: pagination.page_size,
             total,
+            degraded_fields: Vec::new(),
         }
     }
 
@@ -56,7 +66,15 @@ impl<T> Page<T> {
             page_no: pagination.page_no,
             page_size: pagination.page_size,
             total,
+            degraded_fields: Vec::new(),
         }
+    }
+
+    /// Record that the query behind this page read one or more incomplete
+    /// field indices.
+    pub fn with_degraded_fields(mut self, fields: Vec<String>) -> Self {
+        self.degraded_fields = fields;
+        self
     }
 }
 

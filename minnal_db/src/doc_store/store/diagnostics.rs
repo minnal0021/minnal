@@ -167,6 +167,41 @@ impl DocStore {
         Ok(self.db.reindex_field(ns_id, fm.field_id, id.to_bytes()).await?)
     }
 
+    /// Report the health of every field index in a namespace: where its
+    /// persisted state reaches, whether it is active, and any outstanding gap.
+    pub async fn index_health(&self, namespace: &str) -> Result<Vec<crate::db::index_manager::FieldIndexHealth>, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        Ok(self.db.index_health(ns_id).await?)
+    }
+
+    /// Repair a degraded field index: replay its recorded key worklist (or
+    /// rebuild the whole field when the keys were not capturable), then clear
+    /// the gap so queries stop reporting the field as degraded.
+    ///
+    /// Does not re-put documents, so it generates no WAL traffic and triggers no
+    /// vector re-embedding.
+    ///
+    /// Errors with [`DocStoreError::IndexNotFound`] when `field` is not an
+    /// indexed field of the namespace.
+    pub async fn repair_index(&self, namespace: &str, field: &str) -> Result<crate::db::namespace::FieldRepairOutcome, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let fields = self.db.list_index_fields(ns_id);
+        let fm = fields
+            .iter()
+            .find(|f| f.field_name == field)
+            .ok_or_else(|| DocStoreError::IndexNotFound {
+                namespace: namespace.to_owned(),
+                field: field.to_owned(),
+            })?;
+        Ok(self.db.repair_field_index(ns_id, fm.field_id).await?)
+    }
+
     /// Re-enqueue a single document for vector (re-)embedding — the same enqueue
     /// the write path and [`index_all`](DocStore::index_all) use, scoped to one
     /// document. The async worker picks it up on its next pass.

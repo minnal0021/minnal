@@ -18,7 +18,7 @@ use axum::{
 };
 use minnal_db::{DocStoreError, Pagination, SchemaError, StoreType};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     AppState,
@@ -261,6 +261,10 @@ pub async fn index_query(
     let page_size = qp.page_size.or(qp.limit).unwrap_or(req.page_size).get();
     let pagination = Pagination::new(page_no, page_size);
     let page = state.store.query_resolved(&ns, &req.predicate, pagination, ns_id, key_type).await?;
+    let degraded_fields = page.degraded_fields.clone();
+    if !degraded_fields.is_empty() {
+        warn!(namespace = %ns, fields = ?degraded_fields, "index query served from an incomplete index");
+    }
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -271,5 +275,9 @@ pub async fn index_query(
         "page_no": page.page_no,
         "page_size": page.page_size,
         "total": page.total,
+        // Non-empty means these results may be MISSING documents: one or more
+        // indices the predicate read is known to be incomplete and awaiting
+        // repair. See FR-001.
+        "degraded_fields": degraded_fields,
     })))
 }

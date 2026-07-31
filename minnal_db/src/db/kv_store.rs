@@ -608,17 +608,31 @@ impl KVStore {
     /// Returns [`FieldReindexOutcome`]: `Reindexed` on success, `KeyNotFound`
     /// when the key has no value, `FieldNotActive` when `field_id` has no live
     /// index in this namespace.
+    ///
+    /// **An absent key still clears the row.** A key can be missing because its
+    /// *delete* is what was lost — the index then holds a stale row in the old
+    /// value's bucket, and a query returns a key that no longer exists. That is
+    /// as wrong as a missing row, so the row is removed before reporting
+    /// `KeyNotFound`; the outcome describes what was found, not whether work was
+    /// done. (Removing a row that is already absent is a no-op, so this is safe
+    /// for a key that simply never existed.)
     pub fn reindex_field(&self, field_id: crate::db::namespace::FieldId, key: &[u8]) -> Result<crate::db::namespace::FieldReindexOutcome> {
         use crate::db::namespace::FieldReindexOutcome;
 
-        let value = match self.get(key)? {
-            Some(v) => v,
-            None => return Ok(FieldReindexOutcome::KeyNotFound),
-        };
+        let value = self.get(key)?;
 
         let ns_index = self.namespace_index.read();
         let Some(entry) = ns_index.get(field_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
+        };
+
+        let Some(value) = value else {
+            // `resolve_row_id_get` never allocates: a key with no row id was
+            // never indexed, so there is nothing to clear.
+            if let Some(row_id) = self.resolve_row_id_get(key) {
+                entry.index.write().remove_all_for_row(row_id);
+            }
+            return Ok(FieldReindexOutcome::KeyNotFound);
         };
 
         // Same row-ID resolution and per-field ops as `update_indices_on_put`'s

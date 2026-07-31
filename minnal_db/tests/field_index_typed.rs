@@ -85,7 +85,7 @@ fn field_index_over_typed_struct_value() -> Result<(), KVError> {
     )?;
 
     // 4. Query the index with the predicate DSL. Returns the raw (rkyv) key bytes.
-    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
+    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?.keys;
 
     // 5. Resolve each matched key: decode the archived u64, then `get_typed`.
     let mut ids: Vec<u64> = keys
@@ -170,7 +170,7 @@ fn checkpoint_compacts_bloated_field_index() -> Result<(), KVError> {
     );
 
     // The live index must be correct after compaction.
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
+    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
     assert_eq!(active.len() as u64, n / 2, "every even-keyed doc must still match after compaction");
 
     // A second checkpoint is now a cheap no-op (waste reads back ≈0).
