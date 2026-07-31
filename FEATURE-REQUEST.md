@@ -24,6 +24,10 @@ re-check them before starting work.
 **Updated:** 2026-07-31 — prevention promoted from *Could have* to the first
 **Must have**, and full remediation scheduled alongside it. Scope is now
 *prevent **and** repair*, not repair alone.
+**Updated:** 2026-08-01 — two further divergence sources folded in (no-WAL
+writes, rejected index updates), without which the degraded-query signal would
+report false completeness; dropped-index cleanup corrected against the code and
+re-scoped around a persisted `dropped` flag.
 **Area:** `minnal_db` (WAL GC, index checkpoint), `minnal_db_api` (admin surface)
 **Severity:** High — silent incomplete query results
 **Related:** detection-only logging landed in `51ee29f` (see *What already
@@ -104,6 +108,17 @@ still required; see *Implementation order*.
   i.e. `update_indices_on_put` minus the storage write). Must clear the field
   index first — a crash can leave partially written post-checkpoint data that a
   merge-only pass would not remove.
+- **Capture the no-WAL divergence class.** *(added 2026-08-01)* WAL GC is not the
+  only way the index can silently diverge; see *Other divergence sources* below.
+  No-WAL writes have no WAL entry to replay, so neither the watermark nor
+  `detect_replay_gap` can see them. They must produce a gap record too, or the
+  degraded-query signal is a **false negative** — an assurance of completeness
+  that is not true, which is worse than no signal at all.
+- **A rejected index update is a gap.** *(added 2026-08-01)* `update_indices_on_put`
+  currently `warn!`s and continues when a field's `insert`/`update`/`set` returns
+  `Err` (`kv_store.rs`), leaving the row silently absent with nothing recorded.
+  Once the gap-record machinery exists this is the cheapest case in the whole FR
+  to capture — it is a one-key row-scoped gap and the key is already in hand.
 
 #### Should have
 
@@ -162,26 +177,66 @@ Active means present in `store.namespace_index` — the same test
 Filtering the watermark to active fields is a read-side guard. The write-side
 root cause is that dropping an index leaves everything behind:
 
-`deactivate_field_index` (`database.rs`) is a two-line in-memory deregister. It
-does not touch disk, and `IndexManager` has `remove_namespace_path` (whole
-namespace) but **no per-field removal**. So `index/{ns_id}/{field_id}/` — bitmap
-blob store, keymap store, `checkpoint` marker — survives a drop indefinitely,
-reclaimed only when the entire namespace is dropped.
+**Corrected 2026-08-01 after reading the code.** The original framing ("dropping
+an index leaves its files behind") is true of the engine but not of the whole
+system, and the real defect is sharper than a disk leak:
 
-Required: dropping a field index deletes its directory, so there is no stale
-marker to pin WAL GC and no orphaned blob to leak. Add
-`IndexManager::remove_field_path(ns_id, field_id)` alongside the existing
-namespace-level call.
+- `Database::deactivate_field_index` (`database.rs`) is a two-line in-memory
+  deregister that never touches disk, and `IndexManager` has
+  `remove_namespace_path` (whole namespace) but **no per-field removal**. So an
+  embedder driving the engine directly does leak the whole
+  `index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
+- But `doc_store::drop_index` (`doc_store/store/index_build.rs`) **already
+  deletes the directory** — by hand-building the path
+  (`db_path/index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
+  reaching straight past `IndexManager` into a layer it does not own.
+- **The live defect is the ordering, and it is exactly the one predicted below.**
+  `drop_index` deactivates, deletes the files, and *then* calls `schema.save()`.
+  A crash in that window leaves the doc-store schema still listing the index, so
+  the field is re-activated at the next open and finds no checkpoint and no data
+  — `Absent` + empty, the state `detect_replay_gap` **suppresses** as a normal
+  first build. The index comes up silently incomplete. This is not hypothetical;
+  it is the current code path.
 
-**Ordering is load-bearing — deregister first, delete files second.** This
+**Ordering is load-bearing — persist the drop first, delete files second.** This
 mirrors `remove_namespace`, which persists the registry deletion before touching
-any file. Taken the other way round, a crash between "files deleted" and
-"registry updated" leaves a field that is still registered, still activated at
-the next open, and now finds no checkpoint and no data — which reads as
-`Absent` + empty index, exactly the state `detect_replay_gap` **suppresses** as a
-normal first build. The index would come up silently incomplete: precisely the
-failure this FR exists to remove. Registry-first instead leaves orphaned files
-after a crash, which is a bounded disk leak and nothing worse.
+any file. Registry-first leaves orphaned files after a crash, which is a bounded
+disk leak and nothing worse.
+
+**A durable drop record is what makes the ordering completable.** Persisting
+"dropped" first only helps if something durable *records* it. Today the KV schema
+deliberately retains a dropped field's `FieldMeta` so a later re-add reuses the
+same `FieldId` (`doc_store::drop_index` documents this), and there is no flag
+distinguishing "registered and live" from "registered but dropped". Two
+consequences: an interrupted drop cannot be completed at the next open, and an
+orphan sweep keyed on registered field ids cannot tell a dropped field's
+leftovers from a live field's data.
+
+So step 1 is:
+
+1. `FieldMeta` / `FieldDef` gain a persisted `dropped` flag (serde-defaulted;
+   greenfield, so no migration). `register_field` clears it when the same field
+   is re-added, preserving the documented id-reuse behaviour.
+2. `IndexManager::remove_field_path(ns_id, field_id)` alongside the existing
+   namespace-level call — idempotent, `NotFound` is success.
+3. `Database::drop_field_index(ns_id, field_id)` owns the whole operation in the
+   layer that owns the paths: **persist `dropped` → deregister in memory →
+   delete the directory**. `doc_store::drop_index` saves its schema and then
+   calls this, instead of hand-building the path.
+4. **Complete interrupted drops at open.** After the registry loads, delete the
+   directory of every field marked `dropped`. Idempotent, and it is what makes
+   the crash window a bounded leak that actually gets reclaimed rather than one
+   that persists until the namespace is dropped.
+5. **Reject activation of a dropped field.** `activate_field_index` on a field
+   marked `dropped` is an error — it must be re-registered (and rebuilt) first.
+   This is the guard that closes the silent-incomplete window directly, rather
+   than relying on ordering alone.
+6. `all_indexed_fields` excludes dropped fields, so the checkpoint worker and the
+   future watermark never see them.
+
+`deactivate_field_index` stays as it is — deregister-only is a legitimate state
+(a field can be inactive without being dropped, e.g. while rebuilding), and it is
+precisely why the watermark keeps its active-fields filter regardless.
 
 Keep the active-fields filter on the watermark even once cleanup lands. A field
 can be inactive without being dropped, and cleanup can itself be interrupted;
@@ -216,6 +271,63 @@ No separate row-map watermark is needed.
 Related cleanup: the row-map marker *writes* a `wal_offset` (`rowmap.rs`, bytes
 32..40) that `read_marker` never reads back — it is write-only today. Either wire
 it up as part of this work or drop the field.
+
+#### Other divergence sources (added 2026-08-01)
+
+WAL GC is the divergence source this FR was filed for, but it is not the only
+one, and the ones below share its two defining properties: the index ends up
+disagreeing with the store, and **nothing says so**. They are listed here
+because step 4's degraded-query signal is only trustworthy if it covers them —
+a signal that reports "complete" over an index missing rows for one of these
+reasons is a worse outcome than the silence it replaced.
+
+The correct framing for the whole feature: the invariant is `index ≡ current
+store contents`. The WAL is one of several mechanisms that maintain it, not the
+thing the index is synchronised against.
+
+##### No-WAL writes
+
+`put_no_wal` / `delete_no_wal` (facade), used by the bulk loader and by REST
+`?skip_wal=true`, route through `put_to_storage_inner` / `delete_from_storage_inner`
+and **do** update the field index in memory. But there is no WAL entry, so:
+
+- WAL replay cannot heal a lost in-memory index update — there is nothing to
+  replay.
+- The watermark cannot help; there is no WAL entry to pin.
+- `detect_replay_gap` sees a perfectly healthy checkpoint offset against intact
+  segments, and reports nothing.
+
+Under bulk load the memtable flushes to L0 far more often than the 15-minute
+index checkpoint, so a crash readily leaves the **value durable and the index
+update gone, with no replay path**. `Database::shutdown` runs
+`run_index_checkpoint()` before anything else specifically to cover this, which
+makes it safe on *clean shutdown only*.
+
+Proposed handling (cheapest correct option): track per namespace whether any
+no-WAL write has landed since the last index checkpoint, and persist that with
+the checkpoint. On open, if the shutdown was unclean and the marker says no-WAL
+writes were outstanding, record a **full-rebuild** gap for that namespace's
+active fields. Coarse — it cannot name the affected keys, since there were never
+any WAL entries holding them — but it converts silence into a visible, repairable
+state, and step 5's full-rebuild fallback already exists to serve it.
+
+##### Rejected index updates
+
+`update_indices_on_put` logs `warn!("[KVStore '{}'] Index update rejected for
+field {}: {}")` and continues when a field's `DynFieldIndex` op returns `Err`;
+`update_indices_on_delete` does the same. The write succeeds, the row is absent
+from that field forever, no gap is recorded and no query reports degradation.
+
+This is the cheapest capture in the FR: the key, the field and the namespace are
+all in hand at the point of failure, so it is a one-key row-scoped gap written
+directly to the worklist. Do it as part of step 3.
+
+##### Not a divergence (recorded so it is not re-investigated)
+
+The best-effort LSM apply path — WAL fsync, then `apply_with_retry`, then an
+`ERROR` log while `put` still returns `Ok` — does **not** diverge. Store and
+index are both missing the row, so they agree with each other, and recovery
+replay restores both.
 
 #### Downstream: the row map
 
@@ -355,15 +467,19 @@ full rebuild instead. Repair then has two modes — row-scoped (normal) and full
 
 Total remediation — prevention **and** repair, not prevention alone.
 
-1. **Dropped-index cleanup.** `remove_field_path` + deregister-then-delete
-   ordering. Independent of everything else and removes the frozen markers the
-   watermark would otherwise trip over.
+1. **Dropped-index cleanup.** Persisted `dropped` flag, `remove_field_path`,
+   `drop_field_index` owning persist-then-delete, completion of interrupted drops
+   at open, and activation rejected for a dropped field. Independent of
+   everything else, removes the frozen markers the watermark would otherwise trip
+   over, and fixes the live wrong-order path in `doc_store::drop_index`.
 2. **Prevention.** Index-replay watermark gating WAL GC, active-fields scoped,
    `IndexCheckpointTrigger::request()` for liveness, backstop cap.
 3. **Detection at the moment of loss + persisted gap record.** Scan a pinned
    segment before the backstop reclaims it, record range, segment ids **and the
    affected-key worklist** (capped). Must survive restart. This has to precede
-   repair — it is what makes row-scoped repair possible at all.
+   repair — it is what makes row-scoped repair possible at all. Also lands the
+   two other divergence sources: the no-WAL full-rebuild gap and rejected index
+   updates as one-key gaps (see *Other divergence sources*).
 4. **Admin surface + degraded-query signal.** Index health per namespace/field,
    and the query response indicator so a caller reading a degraded index knows
    its results are incomplete.
@@ -385,7 +501,12 @@ the row map*.
   `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`.
 - A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
   does not pin WAL GC; a crash mid-drop never yields a registered field whose
-  data is gone.
+  data is gone, and the leftover directory is reclaimed at the next open.
+- Activating a field marked `dropped` fails loudly rather than coming up empty.
+- A namespace with outstanding no-WAL writes at an unclean shutdown comes up with
+  a recorded, visible, repairable gap rather than a silently incomplete index.
+- An index update rejected by a field's `DynFieldIndex` produces a gap record for
+  that key, not just a log line.
 - Pinned WAL is bounded: with the checkpoint worker stopped, retention stops at
   the backstop cap rather than growing without limit.
 - A replay gap detected at open is recorded durably and still visible after a
