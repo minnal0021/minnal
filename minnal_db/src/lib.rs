@@ -99,7 +99,9 @@ pub use db::config::DbConfig;
 pub use db::config::ThresholdConfig;
 
 /// Default field-index bitmap compaction threshold (percentage of dead space).
-pub use db::config::{DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_SEGMENT_GC_THRESHOLD};
+pub use db::config::{
+    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
+};
 pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
 
 /// Intervals at which the background workers run.

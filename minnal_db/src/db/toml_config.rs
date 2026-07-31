@@ -122,6 +122,10 @@ pub struct ThresholdSection {
     pub index_blob_waste_threshold: f64,
     #[serde(default = "default_index_blob_backpressure_bytes")]
     pub index_blob_backpressure_bytes: u64,
+    /// Cap on WAL segments the index-replay watermark may hold back from WAL GC
+    /// before the backstop reclaims the oldest anyway. `0` disables the backstop.
+    #[serde(default = "default_max_pinned_wal_segments")]
+    pub max_pinned_wal_segments: u32,
 }
 
 impl Default for ThresholdSection {
@@ -132,6 +136,7 @@ impl Default for ThresholdSection {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
+            max_pinned_wal_segments: default_max_pinned_wal_segments(),
         }
     }
 }
@@ -150,6 +155,10 @@ fn default_index_blob_waste_threshold() -> f64 {
 
 fn default_index_blob_backpressure_bytes() -> u64 {
     crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
+}
+
+fn default_max_pinned_wal_segments() -> u32 {
+    crate::db::config::DEFAULT_MAX_PINNED_WAL_SEGMENTS
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,7 +271,8 @@ impl MinnalTomlConfig {
                 .with_segment_gc_threshold(self.thresholds.segment_gc_threshold)
                 .with_tail_gc_min_garbage_pct(self.thresholds.tail_gc_min_garbage_pct)
                 .with_index_blob_waste_threshold(self.thresholds.index_blob_waste_threshold)
-                .with_index_blob_backpressure_bytes(self.thresholds.index_blob_backpressure_bytes),
+                .with_index_blob_backpressure_bytes(self.thresholds.index_blob_backpressure_bytes)
+                .with_max_pinned_wal_segments(self.thresholds.max_pinned_wal_segments),
             sync_config: SyncConfig::new(self.sync.records_per_sync),
             scheduled_task_config: ScheduledTaskConfig {
                 value_log_gc_interval: Duration::from_secs(self.scheduled_tasks.value_log_gc_interval_secs),

@@ -151,6 +151,15 @@ Each worker is a **single global task** that fans out over namespaces — there 
 
 All WAL logic (append, GC, recovery, sequence tracking) lives exclusively in `database.rs` (`Database`, the internal coordinator). Do not add WAL code anywhere else.
 
+**WAL GC is gated on the index-replay watermark — do not reclaim a segment on `persisted >= total` alone.** The field index is made durable by an inline in-memory update per write plus a periodic checkpoint recording the WAL offset it reflects; a crash is healed by replaying from that offset. Reclaiming on LSM persistence alone deleted the WAL that heals it, and the affected documents were then absent from the index **for the life of the database**, with queries silently returning incomplete results (measured: 10 segments reclaimed, 15 of ~360 writes still replayable). `garbage_collect_wal` now consults `index_replay_watermark_segment` = `min(checkpoint offset)` over **currently active** fields, via the shared `plan_wal_gc` that `has_deletable_wal_segments` also uses — keep those two agreeing or the worker either spins on segments GC refuses or skips the pass meant to fire the backstop.
+
+Three properties are load-bearing:
+- **Active fields only.** A dropped field's marker is frozen and a first-time build has none (reading as "replay from 0"); either would pin the WAL without bound. The empty + `CheckpointState::Absent` case is suppressed exactly as `detect_replay_gap` suppresses it — a new index is populated by a *build*, not by replay.
+- **Liveness via the checkpoint trigger.** When segments are pinned, GC fires `IndexCheckpointTrigger::request()` (uncapped — `request_if_over_cap` returns early when the backpressure valve is disabled) so retention tracks checkpoint latency, not the 15-minute timer.
+- **The backstop produces gaps by design.** Past `thresholds.max_pinned_wal_segments` GC reclaims the oldest pinned segments anyway and logs an ERROR. This is why detection and repair (FR-001 steps 3–5) are still required: prevention makes the condition rare, not impossible.
+
+Dropping a field index goes through `Database::drop_field_index`, which **persists the `dropped` flag first**, then deregisters, then deletes `index/{ns_id}/{field_id}/`. A crash leaves the drop recorded so `complete_interrupted_field_drops` finishes it at open. The reverse order leaves a registered field with no data, which reads as `Absent` + empty and is *suppressed* as a normal first build — a silently incomplete index. `deactivate_field_index` remains deregister-only and does not touch disk.
+
 ## Public API surface
 
 `Db` / `AsyncDb` (facade) with namespaces are the only entry points. `Namespace` is the scoped per-namespace handle returned by `Db::namespace()`.

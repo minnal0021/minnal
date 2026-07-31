@@ -141,6 +141,24 @@ index_blob_waste_threshold = 50.0
 # Default: 67108864 (64 MiB).
 index_blob_backpressure_bytes = 67_108_864
 
+# Cap on how many fully-persisted WAL segments the INDEX-REPLAY WATERMARK may
+# hold back from WAL GC.
+#
+# WAL GC will not reclaim a segment an active field index still needs to replay
+# after a crash — without that gate the index silently loses those documents for
+# the life of the database. The pin normally drains in seconds: GC asks the index
+# checkpoint worker for an early checkpoint and defers a tick, so WAL retention
+# tracks checkpoint latency rather than the ~15 min timer.
+#
+# If the checkpoint worker is disabled or wedged, nothing advances the watermark
+# and the WAL would grow without bound, so past this many pinned segments GC
+# reclaims the oldest of them anyway. That KNOWINGLY leaves the affected field
+# indices incomplete — an ERROR is logged when it happens. Raise this if you would
+# rather spend disk than lose index coverage; set 0 to disable the backstop
+# entirely (unbounded pinned WAL — only for callers certain their checkpoint
+# worker is healthy). Default: 32.
+max_pinned_wal_segments = 32
+
 # ---------------------------------------------------------------------------
 # [scheduled_tasks] — background worker intervals
 # ---------------------------------------------------------------------------

@@ -68,8 +68,25 @@ impl IndexCheckpointTrigger {
         if self.cap_bytes == 0 || dead_bytes < self.cap_bytes {
             return;
         }
-        // Debounce: only the transition false→true sends, so repeated writes over
-        // the cap before the checkpoint runs don't flood the channel.
+        self.request();
+    }
+
+    /// Request an early checkpoint **unconditionally**, ignoring `cap_bytes`.
+    ///
+    /// Used by WAL GC when the index-replay watermark is holding segments back:
+    /// the pin can only drain when a checkpoint advances the fields' recorded
+    /// offsets, so retention tracks checkpoint latency instead of the ~15 min
+    /// timer. It must not be routed through
+    /// [`request_if_over_cap`](Self::request_if_over_cap), which returns early
+    /// when the backpressure valve is disabled (`cap_bytes == 0`) — that would
+    /// leave the WAL pinned until the periodic tick on any database that has not
+    /// configured the valve.
+    ///
+    /// Shares the same debounce flag, so a repeatedly-blocked GC enqueues at most
+    /// one checkpoint at a time.
+    pub fn request(&self) {
+        // Debounce: only the transition false→true sends, so repeated requests
+        // before the checkpoint runs don't flood the channel.
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.tx.send(IndexCheckpointCommand::TriggerNow);
         }

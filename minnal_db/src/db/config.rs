@@ -49,6 +49,11 @@ pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 /// [`ThresholdConfig::index_blob_backpressure_bytes`].
 pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default cap on how many fully-persisted WAL segments the index-replay
+/// watermark may hold back. See
+/// [`ThresholdConfig::max_pinned_wal_segments`].
+pub const DEFAULT_MAX_PINNED_WAL_SEGMENTS: u32 = 32;
+
 /// Default percentage of a *value-log segment* that may be garbage before GC
 /// rewrites it. Deliberately **lower** than the bucket-level
 /// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
@@ -111,6 +116,24 @@ pub struct ThresholdConfig {
     /// The dead-byte count is O(1) to read, so the check is cheap on the hot
     /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
     pub index_blob_backpressure_bytes: u64,
+    /// Cap on how many fully-persisted WAL segments the **index-replay
+    /// watermark** may hold back from WAL GC.
+    ///
+    /// WAL GC will not reclaim a segment an active field index still needs to
+    /// replay after a crash. Normally that pin drains quickly: GC asks the
+    /// checkpoint worker for an early checkpoint and defers a tick, so retention
+    /// tracks checkpoint latency rather than the ~15 min timer. If the checkpoint
+    /// worker is disabled or wedged, nothing would ever advance the watermark and
+    /// the WAL would grow without bound — so past this many pinned segments GC
+    /// reclaims the oldest of them anyway.
+    ///
+    /// Doing so **knowingly strands part of a field index**, which is why
+    /// FR-001 keeps its detection and repair arms: the backstop produces gaps by
+    /// design, just rarely. Counted in segments rather than bytes because it is
+    /// GC's own unit of work. `0` disables the backstop, allowing unbounded
+    /// pinned WAL — availability over disk, only for callers who know their
+    /// checkpoint worker is healthy.
+    pub max_pinned_wal_segments: u32,
 }
 
 impl ThresholdConfig {
@@ -121,6 +144,7 @@ impl ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
 
@@ -155,6 +179,13 @@ impl ThresholdConfig {
         self.index_blob_backpressure_bytes = bytes;
         self
     }
+
+    /// Override the cap on WAL segments pinned by the index-replay watermark.
+    /// See [`max_pinned_wal_segments`](Self::max_pinned_wal_segments).
+    pub fn with_max_pinned_wal_segments(mut self, segments: u32) -> Self {
+        self.max_pinned_wal_segments = segments;
+        self
+    }
 }
 
 impl Default for ThresholdConfig {
@@ -165,6 +196,7 @@ impl Default for ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
 }
