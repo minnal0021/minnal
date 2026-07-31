@@ -439,9 +439,10 @@ struct WalGcPlan {
     reclaim: Vec<u64>,
     /// Segments held back by the watermark and left in place.
     deferred: usize,
-    /// Segments the watermark wanted to hold but the backstop reclaimed anyway.
-    /// Non-zero means a field index has been knowingly stranded.
-    forced: usize,
+    /// Segments the watermark wanted to hold but the backstop reclaimed anyway,
+    /// ascending. Non-empty means a field index has been knowingly stranded —
+    /// these are the segments whose keys must be harvested before the unlink.
+    forced: Vec<u64>,
 }
 
 // ── Database coordinator ───────────────────────────────────────────────
@@ -503,6 +504,12 @@ pub struct Database {
     // Shared index-checkpoint backpressure valve — stored so newly-opened
     // namespaces inherit it. `None` until the checkpoint worker is enabled.
     pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+    /// Rejected field-index updates awaiting the next checkpoint, which turns
+    /// them into durable gap records. Shared with every `KVStore`.
+    rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
+    /// Namespaces whose durable "no-WAL writes outstanding" marker is set.
+    /// Debounces the marker write to once per checkpoint interval.
+    no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
 
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
@@ -733,6 +740,8 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -751,12 +760,19 @@ impl Database {
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_index_gap_sink(Some(
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                ));
             }
         }
 
         // Finish any field-index drop a crash interrupted, before recovery can
         // replay into a directory that is meant to be gone.
         db.complete_interrupted_field_drops();
+
+        // Report field indices left incomplete by no-WAL writes that an unclean
+        // shutdown caught before any checkpoint covered them.
+        db.record_no_wal_gaps_after_unclean_shutdown();
 
         // Recover from WAL
         db.recover_from_wal()?;
@@ -843,6 +859,17 @@ impl Database {
     /// and *will* take effect (via the in-memory apply now, or via WAL replay on
     /// the next open), so this only bounds the retry of transient apply errors.
     const APPLY_RETRY_ATTEMPTS: usize = 3;
+
+    /// Cap on how many keys a field's gap record will carry as a row-scoped
+    /// repair worklist before it is downgraded to a full rebuild.
+    ///
+    /// Row-scoped repair is bounded by the damage, but the damage itself is not
+    /// bounded: a wedged checkpoint worker can strand many segments, and a
+    /// worklist large enough to rival the store would be both a disk cost and a
+    /// slower repair than simply rebuilding the field. At that point a full
+    /// rebuild is the cheaper, simpler answer, so the keys are dropped rather
+    /// than accumulated.
+    const GAP_KEY_WORKLIST_CAP: usize = 100_000;
 
     /// Apply a WAL-durable mutation to the in-memory store, retrying transient
     /// failures up to [`APPLY_RETRY_ATTEMPTS`] times.
@@ -973,6 +1000,7 @@ impl Database {
         // it lives only in memory — the background flusher uses this to bound
         // how much a crash can destroy.
         kv_store.note_no_wal_write();
+        self.note_no_wal_index_exposure(namespace_id);
         kv_store.put_to_storage(key, value)
     }
 
@@ -994,6 +1022,7 @@ impl Database {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
         }
         kv_store.note_no_wal_write();
+        self.note_no_wal_index_exposure(namespace_id);
         kv_store.delete_from_storage(key)
     }
 
@@ -1084,6 +1113,9 @@ impl Database {
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_index_gap_sink(Some(
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+        ));
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
@@ -1135,6 +1167,9 @@ impl Database {
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_index_gap_sink(Some(
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+        ));
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
@@ -2229,6 +2264,237 @@ impl Database {
         watermark
     }
 
+    /// Note that a namespace has taken a no-WAL write whose field-index update
+    /// no checkpoint has made durable yet.
+    ///
+    /// The durable marker is written **once** per checkpoint interval, not per
+    /// write: the in-memory set is the debounce, so the fsync cost is amortised
+    /// to roughly one per checkpoint rather than one per bulk-loaded document.
+    /// Cleared by `run_index_checkpoint` once that namespace's index state is on
+    /// disk.
+    ///
+    /// Only namespaces with at least one field index matter — an unindexed
+    /// namespace has no index to diverge — so this is free for the raw-KV case.
+    ///
+    /// Best-effort: a marker that cannot be written is logged. Failing the write
+    /// itself would be a worse trade (the caller asked for the fast path), but it
+    /// does mean a crash could then go unreported.
+    fn note_no_wal_index_exposure(&self, namespace_id: u32) {
+        {
+            let stores = self.stores.read();
+            match stores.get(&namespace_id) {
+                Some(store) if !store.namespace_index.read().is_empty() => {}
+                _ => return,
+            }
+        }
+        if !self.no_wal_pending.lock().insert(namespace_id) {
+            return; // already marked since the last checkpoint
+        }
+        if let Err(e) = self.index_manager.set_no_wal_pending(namespace_id) {
+            warn!("[NO-WAL] failed to mark ns={namespace_id} as having uncheckpointed no-WAL index updates: {e:?}");
+        }
+    }
+
+    /// Record a full-rebuild gap for every field of a namespace that had no-WAL
+    /// writes outstanding when the process died.
+    ///
+    /// Runs at open. The affected keys are **not** recoverable here and never
+    /// were: no-WAL writes leave no WAL entries, so unlike the backstop path
+    /// there is nothing to harvest. A coarse full rebuild is the honest answer,
+    /// and it is still infinitely better than the silence it replaces.
+    ///
+    /// Fields with no checkpoint marker are skipped: they hold no persisted index
+    /// state, so they are a first-time build rather than a damaged index — the
+    /// same judgement `detect_replay_gap` and the watermark make.
+    fn record_no_wal_gaps_after_unclean_shutdown(&self) {
+        let namespaces: Vec<(u32, Vec<FieldId>)> = {
+            let registry = self.registry.read();
+            registry
+                .list()
+                .into_iter()
+                .filter(|&(_, ns_id)| self.index_manager.no_wal_pending(ns_id))
+                .filter_map(|(_, ns_id)| registry.schema(ns_id).map(|s| (ns_id, s.live_field_ids())))
+                .collect()
+        };
+        if namespaces.is_empty() {
+            return;
+        }
+
+        let wal_tail = self.wal_metadata.read().tail;
+        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
+        for (ns_id, fields) in namespaces {
+            for field_id in fields {
+                if self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail) == crate::db::index_manager::CheckpointState::Absent {
+                    continue;
+                }
+                error!(
+                    "[NO-WAL] ns={ns_id} field={field_id}: the previous run ended uncleanly with no-WAL writes outstanding. \
+                     Those writes have no WAL entries, so their index updates cannot be replayed — the field index is INCOMPLETE \
+                     and needs a full rebuild."
+                );
+                let gap = crate::db::index_manager::GapRecord {
+                    namespace_id: ns_id,
+                    field_id,
+                    cause: crate::db::index_manager::GapCause::NoWalWrites,
+                    from: 0,
+                    to: 0,
+                    missing_segments: Vec::new(),
+                    detected_at_ms,
+                    repair: crate::db::index_manager::RepairMode::FullRebuild,
+                };
+                if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
+                    warn!("[NO-WAL] failed to record gap for ns={ns_id} field={field_id}: {e:?}");
+                }
+            }
+            // The condition is now recorded, so the marker has done its job.
+            if let Err(e) = self.index_manager.clear_no_wal_pending(ns_id) {
+                warn!("[NO-WAL] failed to clear the no-WAL marker for ns={ns_id}: {e:?}");
+            }
+        }
+    }
+
+    /// Turn field-index updates rejected since the last checkpoint into durable
+    /// gap records.
+    ///
+    /// Deliberately deferred to here rather than done on the write path: a gap
+    /// record is an fsync, and a field that rejects every write would otherwise
+    /// pay one per write. Deferring is sound because the buffer and the index
+    /// share a durability point — a crash that loses a buffered key also lost
+    /// the index update it describes, and WAL replay re-runs the write,
+    /// re-rejects it, and re-buffers the key.
+    ///
+    /// Best-effort: a failure to record is logged, never propagated, so a
+    /// reporting problem cannot fail a checkpoint that is otherwise persisting
+    /// real index state.
+    fn persist_rejected_update_gaps(&self) {
+        if self.rejected_index_updates.is_empty() {
+            return;
+        }
+        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
+        for ((ns_id, field_id), rejected) in self.rejected_index_updates.drain() {
+            let repair = if rejected.overflowed {
+                crate::db::index_manager::RepairMode::FullRebuild
+            } else {
+                crate::db::index_manager::RepairMode::RowScoped {
+                    keys: rejected.keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
+                }
+            };
+            warn!(
+                "[IndexCheckpoint] ns={ns_id} field={field_id}: recording a gap for {} rejected index update(s){}",
+                rejected.keys.len(),
+                if rejected.overflowed {
+                    " (overflowed — full rebuild required)"
+                } else {
+                    ""
+                }
+            );
+            let gap = crate::db::index_manager::GapRecord {
+                namespace_id: ns_id,
+                field_id,
+                cause: crate::db::index_manager::GapCause::RejectedUpdate,
+                // A rejected update is not a WAL replay window — the key is known
+                // exactly, so there is no range to record.
+                from: 0,
+                to: 0,
+                missing_segments: Vec::new(),
+                detected_at_ms,
+                repair,
+            };
+            if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
+                warn!("[IndexCheckpoint] failed to record rejected-update gap for ns={ns_id} field={field_id}: {e:?}");
+            }
+        }
+    }
+
+    /// Harvest the keys held by segments the backstop is about to reclaim, and
+    /// record a durable gap for every active field index that needed them.
+    ///
+    /// **Must be called before the segment files are unlinked.** The affected
+    /// keys live only in those files: a gap record holding a WAL range and
+    /// segment ids cannot name them, and detection at the next open — where the
+    /// original `detect_replay_gap` runs — is permanently too late, because by
+    /// then the evidence is gone. This is the single moment row-scoped repair is
+    /// possible at all.
+    ///
+    /// The WAL is shared across namespaces, so a segment's keys are attributed by
+    /// [`WalEntry::namespace_id`](crate::db::wal::WalEntry) to each `(ns, field)`
+    /// whose checkpoint sits at or below the reclaimed segment. A field already
+    /// checkpointed past a segment did not need it and gets no gap.
+    ///
+    /// Best-effort: a failure here is logged, not propagated. Losing the record
+    /// is bad, but aborting GC would leave the WAL growing without bound — the
+    /// very outage the backstop exists to prevent.
+    fn record_backstop_gaps(&self, forced: &[u64], wal_tail: u64) {
+        // Which active fields needed each reclaimed segment, by checkpoint offset.
+        let mut affected: Vec<(u32, FieldId, u64)> = Vec::new();
+        {
+            let fields = self.registry.read().all_indexed_fields();
+            let stores = self.stores.read();
+            for (ns_id, field_id) in fields {
+                let Some(store) = stores.get(&ns_id) else { continue };
+                let ns_index = store.namespace_index.read();
+                let Some(entry) = ns_index.get(field_id) else { continue };
+                let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
+                // Same suppression as the watermark: a never-checkpointed empty
+                // index is populated by a build, not by replay, so it loses
+                // nothing when a segment goes.
+                if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
+                    continue;
+                }
+                affected.push((ns_id, field_id, self.wal.segment_id_for_offset(state.replay_offset())));
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+
+        // Harvest once per segment; the same keys usually serve several fields.
+        let mut keys_by_ns: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+        for &segment_id in forced {
+            match self.wal.scan_segment_keys(segment_id) {
+                Ok(pairs) => {
+                    for (ns_id, key) in pairs {
+                        keys_by_ns.entry(ns_id).or_default().push(key);
+                    }
+                }
+                Err(e) => warn!("[WAL GC] could not harvest keys from segment {segment_id} before reclaiming it: {e:?}"),
+            }
+        }
+
+        let cap = Self::GAP_KEY_WORKLIST_CAP;
+        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
+        for (ns_id, field_id, field_segment) in affected {
+            // A field checkpointed past every reclaimed segment lost nothing.
+            if !forced.iter().any(|&s| s >= field_segment) {
+                continue;
+            }
+            let keys = keys_by_ns.get(&ns_id).cloned().unwrap_or_default();
+            // Past the cap the worklist is dropped and the field is marked for a
+            // full rebuild — a wedged checkpoint worker could otherwise strand a
+            // key set large enough to be its own problem.
+            let repair = if keys.is_empty() || keys.len() > cap {
+                crate::db::index_manager::RepairMode::FullRebuild
+            } else {
+                crate::db::index_manager::RepairMode::RowScoped {
+                    keys: keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
+                }
+            };
+            let gap = crate::db::index_manager::GapRecord {
+                namespace_id: ns_id,
+                field_id,
+                cause: crate::db::index_manager::GapCause::BackstopReclaim,
+                from: self.index_manager.read_checkpoint(ns_id, field_id, wal_tail),
+                to: wal_tail,
+                missing_segments: forced.to_vec(),
+                detected_at_ms,
+                repair,
+            };
+            if let Err(e) = self.index_manager.record_gap(gap, cap) {
+                warn!("[WAL GC] failed to record index gap for ns={ns_id} field={field_id}: {e:?}");
+            }
+        }
+    }
+
     /// Decide which fully-persisted, non-current WAL segments this GC pass may
     /// reclaim, given the index-replay watermark.
     ///
@@ -2254,7 +2520,7 @@ impl Database {
             return WalGcPlan {
                 reclaim: ready,
                 deferred: 0,
-                forced: 0,
+                forced: Vec::new(),
             };
         };
 
@@ -2266,15 +2532,16 @@ impl Database {
         // and `take` picks the oldest. This knowingly strands part of a field
         // index — see `ThresholdConfig::max_pinned_wal_segments`.
         let cap = self.config.threshold_config.max_pinned_wal_segments as usize;
-        let forced = if cap == 0 { 0 } else { pinned.len().saturating_sub(cap) };
+        let force_count = if cap == 0 { 0 } else { pinned.len().saturating_sub(cap) };
+        let forced: Vec<u64> = pinned.iter().take(force_count).copied().collect();
 
         let mut reclaim = free;
-        reclaim.extend(pinned.iter().take(forced).copied());
+        reclaim.extend(forced.iter().copied());
         reclaim.sort_unstable();
 
         WalGcPlan {
             reclaim,
-            deferred: pinned.len() - forced,
+            deferred: pinned.len() - force_count,
             forced,
         }
     }
@@ -2321,19 +2588,20 @@ impl Database {
         let mut bytes_reclaimed = 0u64;
         let mut segments_deleted = 0u64;
         let plan = self.plan_wal_gc(&wal_metadata, current_segment_id, watermark);
-        if plan.forced > 0 {
-            // The backstop fired: these segments were still needed to replay at
-            // least one active field index, and their entries are now gone. The
-            // affected documents are missing from that index until it is
-            // repaired. Capturing the affected keys before this point, and
-            // repairing them, is FR-001 steps 3-5.
+        if !plan.forced.is_empty() {
+            // The backstop is about to reclaim segments at least one active field
+            // index still needed. Harvest the affected keys FIRST: they exist only
+            // in these files, and once unlinked no gap record could ever name
+            // them. This is the only moment row-scoped repair is possible.
             error!(
                 "[WAL GC] index-replay watermark held {} segment(s), over the cap of {} — reclaiming the {} oldest ANYWAY. \
                  Field indices covering those segments are now INCOMPLETE. Is the index checkpoint worker running?",
-                plan.deferred + plan.forced,
+                plan.deferred + plan.forced.len(),
                 self.config.threshold_config.max_pinned_wal_segments,
-                plan.forced,
+                plan.forced.len(),
             );
+            let wal_tail = wal_metadata.tail;
+            self.record_backstop_gaps(&plan.forced, wal_tail);
         }
         for segment_id in plan.reclaim {
             let total = wal_metadata.segment_total(segment_id);
@@ -2734,6 +3002,8 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2750,10 +3020,17 @@ impl Database {
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_index_gap_sink(Some(
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                ));
             }
         }
 
         db.complete_interrupted_field_drops();
+
+        // Report field indices left incomplete by no-WAL writes that an unclean
+        // shutdown caught before any checkpoint covered them.
+        db.record_no_wal_gaps_after_unclean_shutdown();
         db.recover_from_wal()?;
         let last_persisted = db.rebuild_wal_persisted_state()?;
         *db.last_persisted_wal_offset.write() = last_persisted;
@@ -2888,6 +3165,17 @@ impl IndexCheckpointTarget for Database {
         }
 
         self.index_manager.checkpoint_fields(wal_tail, &active_fields)?;
+        drop(stores);
+
+        // The index is now durable up to `wal_tail`, so any no-WAL writes before
+        // this point are covered and their markers can go.
+        for ns_id in self.no_wal_pending.lock().drain() {
+            if let Err(e) = self.index_manager.clear_no_wal_pending(ns_id) {
+                warn!("[IndexCheckpoint] failed to clear the no-WAL marker for ns={ns_id}: {e:?}");
+            }
+        }
+
+        self.persist_rejected_update_gaps();
         Ok(active_fields.len())
     }
 }
@@ -5890,6 +6178,214 @@ mod tests {
 
         db.shutdown()?;
         Ok(())
+    }
+
+    /// FR-001 step 3: the backstop records a durable, key-level gap.
+    ///
+    /// This is the whole point of harvesting inside GC: the affected keys live in
+    /// the segments being unlinked, so a record written any later could never
+    /// name them.
+    #[test]
+    fn backstop_records_a_gap_naming_the_affected_keys() -> Result<()> {
+        use crate::db::index_manager::{GapCause, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let mut config = create_db_config();
+        config.threshold_config = config.threshold_config.with_max_pinned_wal_segments(2);
+        let db = Database::open_with_wal_segment_size(temp_dir.path(), config, 4096)?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        db.put(b"seed", br#"{"status":"active"}"#)?;
+        db.run_index_checkpoint()?;
+
+        for i in 0..400u32 {
+            db.put(format!("gap_{:04}", i).as_bytes(), br#"{"status":"active"}"#)?;
+        }
+        db.flush_all_namespaces()?;
+        db.garbage_collect_wal()?;
+
+        let gap = db.index_manager.read_gap(ns, field_id).expect("the backstop must record a gap");
+        assert_eq!(gap.cause, GapCause::BackstopReclaim);
+        assert_eq!(gap.namespace_id, ns);
+        assert_eq!(gap.field_id, field_id);
+        assert!(!gap.missing_segments.is_empty(), "the gap should name the reclaimed segments");
+
+        // The keys are the payload that makes row-scoped repair possible at all.
+        let RepairMode::RowScoped { keys } = &gap.repair else {
+            panic!("expected a row-scoped worklist, got {:?}", gap.repair);
+        };
+        assert!(!keys.is_empty(), "the worklist must name the affected keys");
+        let decoded: Vec<Vec<u8>> = keys.iter().filter_map(|k| crate::support::hex::hex_to_bytes(k)).collect();
+        assert_eq!(decoded.len(), keys.len(), "every recorded key must be valid hex");
+        assert!(
+            decoded.iter().any(|k| k.starts_with(b"gap_")),
+            "the worklist should contain keys written into the reclaimed segments"
+        );
+
+        // And it survives the restart — a log line would not have.
+        db.shutdown()?;
+        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
+        let after = db.index_manager.read_gap(ns, field_id).expect("the gap must survive a restart");
+        assert_eq!(after.repair, gap.repair);
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: a rejected index update becomes a durable one-key gap
+    /// rather than only a `warn!`.
+    #[test]
+    fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, RepairMode};
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        // A Str-typed field whose extractor yields an Int for one document: the
+        // index refuses the update, which used to be a log line and nothing else.
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str)?;
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            if bytes.starts_with(b"bad") {
+                Some(IndexValue::Int(1))
+            } else {
+                Some(IndexValue::Str(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor)?;
+
+        db.put(b"ok:1", b"fine")?;
+        db.put(b"doc:bad", b"bad-value")?;
+        db.run_index_checkpoint()?;
+
+        let gap = db.index_manager.read_gap(ns, field_id).expect("a rejected update must be recorded");
+        assert_eq!(gap.cause, GapCause::RejectedUpdate);
+        let RepairMode::RowScoped { keys } = &gap.repair else {
+            panic!("a rejected update names its key exactly, so repair is row-scoped: {:?}", gap.repair);
+        };
+        assert_eq!(keys.len(), 1, "only the rejected key should be listed, got {keys:?}");
+        assert_eq!(crate::support::hex::hex_to_bytes(&keys[0]).unwrap(), b"doc:bad".to_vec());
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: no-WAL writes have no WAL entries, so an unclean shutdown
+    /// leaves the field index incomplete with nothing to replay. The marker turns
+    /// that silence into a recorded, repairable full rebuild.
+    #[test]
+    fn unclean_shutdown_with_no_wal_writes_records_a_full_rebuild_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#)?;
+            // Checkpoint so the field has persisted state — otherwise it is a
+            // first-time build and legitimately has nothing to lose.
+            db.run_index_checkpoint()?;
+            assert!(!db.index_manager.no_wal_pending(ns), "a checkpoint clears the marker");
+
+            db.put_ns_no_wal(ns, b"doc:2", br#"{"status":"active"}"#)?;
+            assert!(db.index_manager.no_wal_pending(ns), "a no-WAL write must set the marker before writing");
+
+            // Drop without shutdown() — the unclean case. A clean shutdown runs a
+            // checkpoint first, which is exactly what clears the marker.
+            std::mem::forget(db);
+            field_id
+        };
+
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let gap = db
+            .index_manager
+            .read_gap(ns, field_id)
+            .expect("an unclean shutdown with no-WAL writes outstanding must record a gap");
+        assert_eq!(gap.cause, GapCause::NoWalWrites);
+        assert_eq!(
+            gap.repair,
+            RepairMode::FullRebuild,
+            "the affected keys were never in the WAL, so they cannot be named"
+        );
+        assert!(!db.index_manager.no_wal_pending(ns), "the marker is cleared once the gap is recorded");
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: a clean shutdown must NOT report a no-WAL gap — it
+    /// checkpoints first, which is what makes those index updates durable.
+    #[test]
+    fn clean_shutdown_after_no_wal_writes_records_no_gap() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#)?;
+            db.run_index_checkpoint()?;
+            db.put_ns_no_wal(ns, b"doc:2", br#"{"status":"active"}"#)?;
+            db.shutdown()?;
+            field_id
+        };
+
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        assert_eq!(
+            db.index_manager.read_gap(ns, field_id),
+            None,
+            "a clean shutdown checkpoints before exiting, so there is no gap to report"
+        );
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: gaps accumulate rather than overwrite. A second detection
+    /// before anyone repairs the first must not discard the first worklist.
+    #[test]
+    fn gap_records_merge_instead_of_overwriting() {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
+            namespace_id: 0,
+            field_id: 1,
+            cause: GapCause::BackstopReclaim,
+            from,
+            to,
+            missing_segments: segs,
+            detected_at_ms: from,
+            repair: RepairMode::RowScoped {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+            },
+        };
+
+        let mut first = mk(100, 200, vec![1, 2], &["aa", "bb"]);
+        first.merge(mk(50, 300, vec![2, 3], &["bb", "cc"]), 10);
+
+        assert_eq!(first.from, 50, "the earliest start wins");
+        assert_eq!(first.to, 300, "the latest end wins");
+        assert_eq!(first.missing_segments, vec![1, 2, 3], "segment ids union and dedupe");
+        assert_eq!(first.detected_at_ms, 100, "the original detection time is kept");
+        let RepairMode::RowScoped { keys } = &first.repair else {
+            panic!("expected the worklists to union, got {:?}", first.repair);
+        };
+        assert_eq!(keys, &["aa", "bb", "cc"], "worklists union and dedupe");
+
+        // Crossing the cap downgrades to a full rebuild...
+        let mut capped = mk(0, 10, vec![], &["aa", "bb"]);
+        capped.merge(mk(0, 10, vec![], &["cc", "dd"]), 3);
+        assert_eq!(capped.repair, RepairMode::FullRebuild, "past the cap the worklist is dropped");
+
+        // ...and a full rebuild is absorbing: it can never be downgraded back to
+        // a row-scoped repair that would miss the un-nameable rows.
+        let mut full = mk(0, 10, vec![], &["aa"]);
+        full.repair = RepairMode::FullRebuild;
+        full.merge(mk(0, 10, vec![], &["bb"]), 100);
+        assert_eq!(full.repair, RepairMode::FullRebuild);
     }
 
     /// FR-001 step 2: the backstop bounds pinned WAL.

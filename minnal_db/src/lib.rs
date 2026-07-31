@@ -102,7 +102,16 @@ pub use db::config::ThresholdConfig;
 pub use db::config::{
     DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
 };
+
 pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
+
+/// Hex encoding/decoding for raw key bytes.
+///
+/// Exposed because keys are arbitrary bytes and several surfaces carry them as
+/// hex: scan cursors at the REST boundary, and the field-index gap record's
+/// row-scoped repair worklist ([`db::index_manager::RepairMode`]). A caller
+/// reading either needs the matching decoder.
+pub use support::hex::{bytes_to_hex, hex_to_bytes};
 
 /// Intervals at which the background workers run.
 pub use db::config::ScheduledTaskConfig;

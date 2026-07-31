@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "doc-store")]
 pub(crate) mod file_lock;
+pub mod hex;
 pub(crate) mod simd_support;
 
 /// fsync a directory so that a create/rename/unlink of one of its entries is

@@ -56,7 +56,7 @@ pub(crate) type PrefixIdKey = (u32, Vec<u8>);
 /// Returned by [`KVStore::scan_prefixes_batch`].
 pub(crate) type PrefixBatchResult = std::collections::HashMap<u32, Vec<KeyValue>>;
 
-fn current_epoch_millis() -> u64 {
+pub(crate) fn current_epoch_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
@@ -107,6 +107,9 @@ pub struct KVStore {
     // field index accumulates too much reclaimable dead blob space. `None` until
     // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
     pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+    // Where rejected field-index updates are reported so they become durable gap
+    // records instead of a log line (set via `set_index_gap_sink`).
+    pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn crate::db::index_manager::IndexGapSink>>>>,
 
     // Optional TTL for automatic record expiry
     pub(crate) ttl: Option<Duration>,
@@ -232,6 +235,7 @@ impl KVStore {
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
+            index_gap_sink: Arc::new(RwLock::new(None)),
             ttl,
             namespace_index: Arc::new(RwLock::new(NamespaceIndexSet::new())),
             row_id_fn: Arc::new(RwLock::new(None)),
@@ -439,6 +443,12 @@ impl KVStore {
         *self.index_checkpoint_trigger.write() = trigger;
     }
 
+    /// Wire where rejected field-index updates are reported. See
+    /// [`IndexGapSink`](crate::db::index_manager::IndexGapSink).
+    pub(crate) fn set_index_gap_sink(&self, sink: Option<Arc<dyn crate::db::index_manager::IndexGapSink>>) {
+        *self.index_gap_sink.write() = sink;
+    }
+
     // ── Core data operations ───────────────────────────────────────────
 
     /// Put a key-value pair into storage (LSM + value log).
@@ -563,7 +573,13 @@ impl KVStore {
             let dead_bytes = idx.reclaimable_dead_bytes();
             drop(idx);
             if let Err(e) = result {
+                // A rejected update leaves this row absent from the field for
+                // good. Report it so it becomes a durable, repairable gap rather
+                // than only a log line — FR-001, *Rejected index updates*.
                 warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
+                if let Some(sink) = self.index_gap_sink.read().as_ref() {
+                    sink.note_rejected_update(self.namespace_id, entry.field_id, key);
+                }
             }
             // Backpressure: if this field's append-only blob has piled up enough
             // dead space, ask the checkpoint worker to compact early instead of

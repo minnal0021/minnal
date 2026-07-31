@@ -153,6 +153,18 @@ impl WalEntry {
         })
     }
 
+    /// Read only the namespace id and key, copying the key but never the value.
+    ///
+    /// Used when harvesting the keys a WAL segment holds before it is reclaimed
+    /// (see [`Wal::scan_segment_keys`]): a segment can hold tens of thousands of
+    /// documents, and full deserialisation would copy every one of their values
+    /// into memory just to throw them away.
+    pub fn peek_namespace_and_key(bytes: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
+            .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
+        Ok((archived.namespace_id.into(), archived.key.to_vec()))
+    }
+
     /// Deserialize entry from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
@@ -783,6 +795,68 @@ impl Wal {
         }
 
         Ok(entries)
+    }
+
+    /// Collect the distinct `(namespace_id, key)` pairs one WAL segment holds,
+    /// **without materialising any values**.
+    ///
+    /// This is the harvest that makes row-scoped index repair possible. When the
+    /// backstop forces WAL GC to reclaim a segment an active field index still
+    /// needs (see `ThresholdConfig::max_pinned_wal_segments`), the keys of the
+    /// affected documents exist *only* in that segment — a gap record holding a
+    /// WAL range and segment ids cannot name them, and once the file is unlinked
+    /// they are unrecoverable. So they are harvested here, immediately before the
+    /// unlink, and recorded as a repair worklist.
+    ///
+    /// Deliberately **not** built on [`scan_entries`](Self::scan_entries), which
+    /// returns whole `WalEntry` values: a segment can hold tens of thousands of
+    /// documents and their values would all be copied into memory only to be
+    /// discarded. This walks the frames itself and copies keys alone.
+    ///
+    /// Results are deduplicated (a key written five times in the segment needs
+    /// repairing once) and returned in first-seen order. Both upserts and deletes
+    /// are included — a lost *delete* leaves a stale row in the index, which is
+    /// just as wrong as a missing one.
+    ///
+    /// A missing segment file yields an empty result rather than an error: GC may
+    /// have already reclaimed it, and failing here would abort the whole pass.
+    pub fn scan_segment_keys(&self, segment_id: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+        let file = match self.open_segment_file(segment_id, false) {
+            Ok(f) => f,
+            Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut seen: std::collections::HashSet<(u32, Vec<u8>)> = std::collections::HashSet::new();
+        let mut keys = Vec::new();
+        let mut entry_bytes = Vec::new();
+        let mut segment_offset = 0u64;
+
+        while segment_offset < self.segment_size {
+            let mut size_buf = [0u8; 4];
+            if self.read_exact_at(&file, &mut size_buf, segment_offset).is_err() {
+                break;
+            }
+            let size = u32::from_le_bytes(size_buf);
+            // A zero length is the unwritten tail of the segment.
+            if size == 0 {
+                break;
+            }
+            entry_bytes.resize(size as usize, 0);
+            if self.read_exact_at(&file, &mut entry_bytes[..size as usize], segment_offset + 4).is_err() {
+                break;
+            }
+            // A torn tail ends the scan, exactly as `scan_entries` treats it.
+            let Ok((ns_id, key)) = WalEntry::peek_namespace_and_key(&entry_bytes[..size as usize]) else {
+                break;
+            };
+            if seen.insert((ns_id, key.clone())) {
+                keys.push((ns_id, key));
+            }
+            segment_offset += 4 + size as u64;
+        }
+
+        Ok(keys)
     }
 
     /// Scan only INSERTED entries from head onwards (for GC)

@@ -158,6 +158,18 @@ Three properties are load-bearing:
 - **Liveness via the checkpoint trigger.** When segments are pinned, GC fires `IndexCheckpointTrigger::request()` (uncapped — `request_if_over_cap` returns early when the backpressure valve is disabled) so retention tracks checkpoint latency, not the 15-minute timer.
 - **The backstop produces gaps by design.** Past `thresholds.max_pinned_wal_segments` GC reclaims the oldest pinned segments anyway and logs an ERROR. This is why detection and repair (FR-001 steps 3–5) are still required: prevention makes the condition rare, not impossible.
 
+**Gap records: the index reports its own incompleteness.** A field index that is missing updates writes a durable `gap.json` beside its `checkpoint` marker (`IndexManager::read_gap`/`record_gap`/`clear_gap`), carrying a `GapCause`, the WAL range, and a `RepairMode` — either a row-scoped worklist of hex-encoded keys or `FullRebuild`. Records **merge** rather than overwrite (a second detection must not discard the first worklist), and `FullRebuild` is absorbing. Three causes feed it, and the second and third are *not* WAL-GC problems — they are separate ways the index diverges from the store, each invisible to `detect_replay_gap`:
+
+| Cause | Detected | Repair | Why it can't be caught later |
+|---|---|---|---|
+| `BackstopReclaim` | inside `garbage_collect_wal`, **before** the unlink | row-scoped | the affected keys live only in the segments being deleted |
+| `NoWalWrites` | at open, from a durable per-namespace marker | full rebuild | no WAL entries ever existed, so the keys were never knowable |
+| `RejectedUpdate` | write path → buffered → persisted at checkpoint | row-scoped | — (key is known exactly; buffering just avoids an fsync per write) |
+
+**`Wal::scan_segment_keys` must stay key-only.** It is the harvest that makes row-scoped repair possible, and it deliberately does not build on `scan_entries`, which returns whole `WalEntry` values — a segment holds tens of thousands of documents and their values would be copied into memory only to be discarded.
+
+**The no-WAL marker is written before the write it describes.** Marker-then-write can only produce a spurious gap (a full rebuild is idempotent); write-then-marker can lose both and leave the index silently incomplete. It is debounced by an in-memory set to one fsync per checkpoint interval, and `Database::shutdown` checkpoints first — which is what makes a surviving marker mean "unclean shutdown".
+
 Dropping a field index goes through `Database::drop_field_index`, which **persists the `dropped` flag first**, then deregisters, then deletes `index/{ns_id}/{field_id}/`. A crash leaves the drop recorded so `complete_interrupted_field_drops` finishes it at open. The reverse order leaves a registered field with no data, which reads as `Absent` + empty and is *suppressed* as a normal first build — a silently incomplete index. `deactivate_field_index` remains deregister-only and does not touch disk.
 
 ## Public API surface
