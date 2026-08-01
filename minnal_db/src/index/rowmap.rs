@@ -12,8 +12,9 @@
 //! - **`key → id`** — an open-addressing hash table over the **full key bytes**
 //!   (not a hash of them, so there are no ID collisions). Consulted on every put,
 //!   delete, and replay. `O(1)` expected lookup / `O(1)` amortised insert. The
-//!   slot table is in-memory (anonymous mmap) and **rebuilt from the id array on
-//!   open**, so it is never a persisted source of truth.
+//!   slot table is file-backed (`rows.slots`) but **rebuilt from the id array on
+//!   every open**, so it is never a persisted source of truth — see
+//!   *The slot table is write-only* below.
 //! - **`id → key`** — an append-only array indexed directly by the dense ID
 //!   (`rows.idarray`), pointing into an append-only key-bytes region
 //!   (`rows.keybytes`). `O(1)` direct lookup, used to resolve query hits back to
@@ -32,6 +33,40 @@
 //! Entries are **never removed** (a deleted-then-recreated key reuses its ID), so
 //! the table has no tombstones and `count == next_id` always.
 //!
+//! ### The slot table is write-only (do not "optimise" the rebuild away)
+//!
+//! `rows.slots` is mapped from a file purely to keep it off the heap: a slot is
+//! 40 bytes held under a 0.7 load factor, so ~57–114 bytes are resident per
+//! distinct key ever written — 671 MB at 10M keys. Anonymous pages can be
+//! swapped but never *dropped*, so that was unreclaimable while the store was
+//! open; file-backed pages the kernel can evict and re-read.
+//!
+//! Nothing ever reads those bytes back across a restart. [`open`] recreates the
+//! file with `.truncate(true)` and rebuilds from `idarray[0..next_id]`, and that
+//! is **required, not laziness**. A `MAP_SHARED` mapping is written back by the
+//! kernel whenever it likes, with no inter-page ordering, so after a crash the
+//! file can hold entries for ids at or past the marker's `next_id`, or a
+//! half-finished [`rehash`](RowMap::rehash). Unlike `keybytes`/`idarray` — which
+//! are append-only, so the marker's length is a clean cut and anything past it
+//! is an ignorable torn tail — scattered hash positions give no such cut, and a
+//! stale entry is indistinguishable from a good one.
+//!
+//! Adopting one would be silent, permanent corruption rather than a slow path:
+//! a surviving `"user:alice" → 7` when the committed id array reaches only 5
+//! makes `get_or_alloc` hand back 7 without allocating, so the field index sets
+//! bit 7 while `key_for(7)` resolves to nothing — and the next genuine
+//! allocation reuses that id for a different key. **WAL replay cannot heal this:
+//! replay adds entries, it never removes them.** Note this is *not* fixed by
+//! guaranteeing the WAL tail survives (FR-001): that solves a missing tail, and
+//! this is unproven content.
+//!
+//! Trusting the file at open is possible, but it needs a real commit protocol —
+//! an in-file `CLEAN`/`DIRTY` header msynced *before* the first slot mutation,
+//! plus `header.next_id == marker.next_id`. It is deliberately not built,
+//! because after a crash the table is `DIRTY` by construction and rebuilds
+//! anyway: it would only ever speed up a clean restart, which is the one nobody
+//! is waiting on.
+//!
 //! [`flush`]: RowMap::flush
 //! [`open`]: RowMap::open
 
@@ -44,6 +79,10 @@ use crate::index::blob_store::GrowableMmap;
 
 const KEYBYTES_FILE: &str = "rows.keybytes";
 const IDARRAY_FILE: &str = "rows.idarray";
+const SLOTS_FILE: &str = "rows.slots";
+/// Scratch file `rehash` builds the doubled table in before renaming it over
+/// [`SLOTS_FILE`]. A leftover copy is harmless — the next open truncates it.
+const SLOTS_TMP_FILE: &str = "rows.slots.tmp";
 const MARKER_FILE: &str = "rowmap.ckpt";
 
 const MARKER_MAGIC: u64 = 0x4D494E4E414C524D; // "MINNALRM"
@@ -61,7 +100,7 @@ const INITIAL_SLOT_CAP: usize = 16;
 const INITIAL_KEYBYTES: usize = 4096;
 const INITIAL_IDARRAY: usize = INITIAL_SLOT_CAP * ID_ENTRY_SIZE;
 
-// ── Slot (in-memory hash table) ────────────────────────────────────────────────
+// ── Slot (file-backed hash table; see the module docs) ─────────────────────────
 //
 // Byte layout (40 bytes):
 //   0       state: u8
@@ -122,7 +161,9 @@ pub struct RowMap {
     keybytes: GrowableMmap,
     /// Append-only `id → (key_off, key_len)` array, indexed by ID.
     idarray: GrowableMmap,
-    /// In-memory open-addressing `key → id` table (anonymous; rebuilt on open).
+    /// Open-addressing `key → id` table, file-backed by `rows.slots` and
+    /// **rebuilt from `idarray` on every open** — see the durability note in the
+    /// type docs for why it is never adopted from disk.
     slots: GrowableMmap,
     cap: usize,
     next_id: u64,
@@ -135,7 +176,7 @@ impl RowMap {
         std::fs::create_dir_all(dir)?;
         let keybytes = GrowableMmap::create_file(&dir.join(KEYBYTES_FILE), INITIAL_KEYBYTES)?;
         let idarray = GrowableMmap::create_file(&dir.join(IDARRAY_FILE), INITIAL_IDARRAY)?;
-        let slots = GrowableMmap::new_anon(INITIAL_SLOT_CAP * SLOT_SIZE)?;
+        let slots = GrowableMmap::create_file(&dir.join(SLOTS_FILE), INITIAL_SLOT_CAP * SLOT_SIZE)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             keybytes,
@@ -184,7 +225,12 @@ impl RowMap {
         while (next_id as usize) * 10 >= cap * 7 {
             cap *= 2;
         }
-        let slots = GrowableMmap::new_anon(cap * SLOT_SIZE)?;
+        // `create_file` opens with `.truncate(true)`, so this is a zeroed table of
+        // exactly the right size and the rebuild below runs unchanged. The
+        // truncate is load-bearing, not inherited habit: it is what keeps the
+        // file write-only with respect to correctness, so no stale entry from a
+        // previous run can survive to be read back. See the type docs.
+        let slots = GrowableMmap::create_file(&dir.join(SLOTS_FILE), cap * SLOT_SIZE)?;
 
         let mut me = Self {
             dir: dir.to_path_buf(),
@@ -291,7 +337,20 @@ impl RowMap {
 
     // ── internals ──────────────────────────────────────────────────────────────
 
+    /// Claim `slot_idx` for `key`, appending its bytes and id-array entry.
+    ///
+    /// `slot_idx` must be an **empty** slot. `probe` returns `Empty(start)` when
+    /// it wraps a completely full table, and `start` is occupied in that case —
+    /// writing there would drop a live `key → id` binding on the floor and hand
+    /// the same id to two keys. The load factor makes a full table unreachable
+    /// (`get_or_alloc` rehashes first), so this is a cheap assertion against a
+    /// silent-corruption path, not an expected condition.
     fn insert_at(&mut self, slot_idx: usize, key: &[u8], hash: u64) -> u128 {
+        debug_assert_eq!(
+            read_slot(self.slots.as_slice(), slot_idx).state,
+            SLOT_EMPTY,
+            "insert would overwrite an occupied slot ({slot_idx})"
+        );
         let id = self.next_id;
         let key_off = self.keybytes_pos as u64;
         let key_len = crate::index::blob_store::u32_len(key.len(), "row key");
@@ -357,25 +416,51 @@ impl RowMap {
 
     /// Find the slot a new `key` would occupy (no duplicate-key check — callers
     /// only use this during a from-scratch rebuild where keys are unique).
+    /// Find the slot an insert should land in.
+    ///
+    /// Bounded by `cap`: the 0.7 load factor means a correct table always has
+    /// empty slots, so exhausting the probe is impossible in normal operation —
+    /// but an unbounded loop turns any violation of that invariant into a
+    /// **silent hang** with no diagnostics, which is the worst way for a storage
+    /// engine to fail. Panicking says what went wrong. (Reachable, for example,
+    /// if the slot file were ever adopted from disk instead of rebuilt, leaving
+    /// stale entries on top of the rebuilt ones — see the module docs.)
     fn find_empty(&self, _key: &[u8], hash: u64) -> usize {
         let start = (hash as usize) % self.cap;
         let data = self.slots.as_slice();
         let mut i = start;
-        loop {
+        for _ in 0..self.cap {
             if read_slot(data, i).state == SLOT_EMPTY {
                 return i;
             }
             i = (i + 1) % self.cap;
         }
+        panic!(
+            "row map slot table is full (cap {}, next_id {}) — the load-factor invariant was violated",
+            self.cap, self.next_id
+        );
     }
 
     fn needs_rehash(&self) -> bool {
         (self.next_id as usize) * 10 >= self.cap * 7
     }
 
+    /// Double the table and re-insert every occupied slot.
+    ///
+    /// Builds into a **scratch file** and renames it over `rows.slots`, rather
+    /// than into anonymous memory. Both tables are live at once here, so this is
+    /// the moment of peak footprint (~1.5× the final size); allocating the new
+    /// one anonymously would reintroduce exactly the unreclaimable RSS this file
+    /// backing exists to remove, at the worst possible time.
+    ///
+    /// The rename replaces the directory entry while our mapping keeps the old
+    /// inode alive, so no remap is needed — assigning `self.slots` drops the old
+    /// map and frees it. Nothing is fsynced: the table is rebuilt from `idarray`
+    /// at every open, so a torn or leftover file costs nothing.
     fn rehash(&mut self) {
         let new_cap = self.cap * 2;
-        let mut new_slots = GrowableMmap::new_anon(new_cap * SLOT_SIZE).expect("rehash slot alloc failed");
+        let tmp_path = self.dir.join(SLOTS_TMP_FILE);
+        let mut new_slots = GrowableMmap::create_file(&tmp_path, new_cap * SLOT_SIZE).expect("rehash slot file alloc failed");
         let old = self.slots.as_slice();
         for i in 0..self.cap {
             let s = read_slot(old, i);
@@ -389,6 +474,9 @@ impl RowMap {
             }
             write_slot(new_slots.as_mut_slice(), j, &s);
         }
+        // Publish the new table, then drop the old mapping (which frees the
+        // now-unlinked inode). Order matters only for disk-space transients.
+        std::fs::rename(&tmp_path, self.dir.join(SLOTS_FILE)).expect("rehash slot file rename failed");
         self.slots = new_slots;
         self.cap = new_cap;
     }
@@ -478,9 +566,169 @@ mod tests {
         assert_eq!(rm.next_id(), 3);
     }
 
+    /// Measurement, not a correctness check — run explicitly:
+    /// `cargo test -p minnal_db --lib slot_table_footprint -- --ignored --nocapture`
+    ///
+    /// Reports anonymous RSS against the slot file's size, which is the whole
+    /// point of phase 1: the same bytes, moved somewhere the kernel can reclaim.
+    #[test]
+    #[ignore = "measurement; run explicitly with --ignored --nocapture"]
+    fn slot_table_footprint() {
+        fn rss_anon_kb() -> u64 {
+            // RssAnon is the unreclaimable part — file-backed pages are RssFile.
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("RssAnon:")
+                        .map(|v| v.trim().trim_end_matches(" kB").trim().parse::<u64>().unwrap_or(0))
+                })
+                .unwrap_or(0)
+        }
+
+        const N: u32 = 1_000_000;
+        let dir = TempDir::new().unwrap();
+        let before = rss_anon_kb();
+        let mut rm = RowMap::create(dir.path()).unwrap();
+        for i in 0..N {
+            rm.get_or_alloc(format!("key-{i:08}").as_bytes());
+        }
+        let after = rss_anon_kb();
+        let slot_bytes = std::fs::metadata(dir.path().join(SLOTS_FILE)).unwrap().len();
+
+        println!(
+            "keys={N} cap={} slot_file={} MiB anon_rss_delta={} MiB",
+            rm.cap,
+            slot_bytes / (1024 * 1024),
+            (after - before) / 1024
+        );
+        assert_eq!(slot_bytes, (rm.cap * SLOT_SIZE) as u64);
+    }
+
+    /// Phase 1: the slot table is backed by a real file, not anonymous memory.
+    /// That is the whole point — anonymous pages can be swapped but never
+    /// dropped, so they are unreclaimable RSS for the life of the store.
+    #[test]
+    fn slot_table_is_file_backed_and_sized_to_capacity() {
+        let dir = TempDir::new().unwrap();
+        let slots = dir.path().join(SLOTS_FILE);
+
+        let mut rm = RowMap::create(dir.path()).unwrap();
+        assert!(slots.exists(), "the slot table must be backed by a file");
+        assert_eq!(
+            std::fs::metadata(&slots).unwrap().len(),
+            (INITIAL_SLOT_CAP * SLOT_SIZE) as u64,
+            "a fresh table is sized to the initial capacity"
+        );
+
+        // Past the 0.7 load factor the table rehashes; the file must grow with
+        // it rather than the doubled copy landing back in anonymous memory.
+        for i in 0u32..500 {
+            rm.get_or_alloc(format!("key-{i}").as_bytes());
+        }
+        assert_eq!(
+            std::fs::metadata(&slots).unwrap().len(),
+            (rm.cap * SLOT_SIZE) as u64,
+            "after rehashing, the file still backs the whole table"
+        );
+        assert!(
+            !dir.path().join(SLOTS_TMP_FILE).exists(),
+            "the rehash scratch file must be renamed into place, not left behind"
+        );
+    }
+
+    /// Phase 1's load-bearing property: `open` **never adopts** slot-file
+    /// contents. The file is truncated and rebuilt from the durable id array, so
+    /// entries the marker never committed cannot survive to be read back.
+    ///
+    /// Without this, a stale `key → id` for an uncommitted id would make
+    /// `get_or_alloc` hand back an id the id array does not have — silent,
+    /// permanent bitmap/key divergence that WAL replay cannot heal, because
+    /// replay adds entries and never removes them.
+    #[test]
+    fn open_rebuilds_the_slot_table_and_never_adopts_stale_entries() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut rm = RowMap::create(dir.path()).unwrap();
+            for i in 0u32..100 {
+                rm.get_or_alloc(format!("doc:{i}").as_bytes());
+            }
+            rm.flush(1).unwrap();
+            // Allocate past the committed marker, exactly as a run does between
+            // checkpoints, then "crash" without flushing.
+            for i in 100u32..150 {
+                rm.get_or_alloc(format!("doc:{i}").as_bytes());
+            }
+        }
+
+        // Find a slot the rebuild provably does not write, so the poison below
+        // is a deterministic negative control rather than a coin flip: if `open`
+        // ever stopped truncating, this entry would certainly survive.
+        let victim = {
+            let _ = RowMap::open(dir.path()).unwrap();
+            let data = std::fs::read(dir.path().join(SLOTS_FILE)).unwrap();
+            (0..data.len() / SLOT_SIZE)
+                .find(|&i| read_slot(&data, i).state == SLOT_EMPTY)
+                .expect("a table under 0.7 load must have empty slots")
+        };
+
+        // Simulate the kernel having written back a slot for an uncommitted id —
+        // which it may do at any time, in any order, for a MAP_SHARED mapping.
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.path().join(SLOTS_FILE))
+                .unwrap();
+            let mut poisoned = [0u8; SLOT_SIZE];
+            write_slot(
+                &mut poisoned,
+                0,
+                &Slot {
+                    state: SLOT_OCCUPIED,
+                    hash: hash_bytes(b"doc:142"),
+                    key_off: 0,
+                    key_len: 7,
+                    id: 142,
+                },
+            );
+            f.write_all_at(&poisoned, (victim * SLOT_SIZE) as u64).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let rm = RowMap::open(dir.path()).unwrap();
+        assert_eq!(rm.next_id(), 100, "only the committed ids survive");
+        assert_eq!(
+            rm.get(b"doc:142"),
+            None,
+            "an uncommitted entry must NOT be adopted — it would hand back an id the id array lacks"
+        );
+        for i in 0u32..100 {
+            assert_eq!(
+                rm.get(format!("doc:{i}").as_bytes()),
+                Some(i as u128),
+                "every committed key is rebuilt from the id array"
+            );
+        }
+
+        // The strongest form of the property: the only occupied slots on disk are
+        // the ones the rebuild just wrote. Anything else is residue that a future
+        // lookup could reach.
+        let data = std::fs::read(dir.path().join(SLOTS_FILE)).unwrap();
+        let occupied = (0..data.len() / SLOT_SIZE)
+            .filter(|&i| read_slot(&data, i).state == SLOT_OCCUPIED)
+            .count();
+        assert_eq!(occupied, 100, "the slot file must hold exactly the rebuilt entries, no residue");
+    }
+
     #[test]
     fn get_only_does_not_allocate() {
-        let mut rm = RowMap::create(TempDir::new().unwrap().path()).unwrap();
+        // Bind the TempDir: passing `TempDir::new()?.path()` directly drops the
+        // directory at the end of the statement, leaving the map pointed at a
+        // path that no longer exists.
+        let dir = TempDir::new().unwrap();
+        let mut rm = RowMap::create(dir.path()).unwrap();
         rm.get_or_alloc(b"x");
         assert_eq!(rm.get(b"x"), Some(0));
         assert_eq!(rm.get(b"missing"), None);
@@ -489,7 +737,11 @@ mod tests {
 
     #[test]
     fn key_for_round_trips() {
-        let mut rm = RowMap::create(TempDir::new().unwrap().path()).unwrap();
+        // Bind the TempDir: passing `TempDir::new()?.path()` directly drops the
+        // directory at the end of the statement, leaving the map pointed at a
+        // path that no longer exists.
+        let dir = TempDir::new().unwrap();
+        let mut rm = RowMap::create(dir.path()).unwrap();
         let id = rm.get_or_alloc(b"hello world");
         assert_eq!(rm.key_for(id).unwrap(), b"hello world");
         assert_eq!(rm.key_for(999), None);
@@ -497,7 +749,11 @@ mod tests {
 
     #[test]
     fn survives_rehash() {
-        let mut rm = RowMap::create(TempDir::new().unwrap().path()).unwrap();
+        // Bind the TempDir: passing `TempDir::new()?.path()` directly drops the
+        // directory at the end of the statement, leaving the map pointed at a
+        // path that no longer exists.
+        let dir = TempDir::new().unwrap();
+        let mut rm = RowMap::create(dir.path()).unwrap();
         for i in 0u32..500 {
             assert_eq!(rm.get_or_alloc(format!("key-{i}").as_bytes()), i as u128);
         }
