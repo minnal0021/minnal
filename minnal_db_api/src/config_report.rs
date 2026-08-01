@@ -163,6 +163,7 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("scheduled_tasks", "wal_gc_interval_secs", s.wal_gc_interval_secs);
     r.add("scheduled_tasks", "lsm_compaction_interval_secs", s.lsm_compaction_interval_secs);
     r.add("scheduled_tasks", "ttl_cleanup_interval_secs", s.ttl_cleanup_interval_secs);
+    r.add("scheduled_tasks", "index_checkpoint_interval_ms", s.index_checkpoint_interval_ms);
 
     r.add("wal", "segment_size_bytes", bytes(cfg.wal.segment_size_bytes));
     r.add("value_log", "segment_size_bytes", bytes(cfg.value_log.segment_size_bytes));

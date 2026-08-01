@@ -1005,7 +1005,9 @@ impl AsyncDb {
         // Wire the write-path backpressure valve to this worker before publishing it.
         self.inner.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
-        info!("[AsyncDb] Index checkpoint worker enabled with {}s interval", interval.as_secs());
+        // Milliseconds, not seconds: the default is 1750 ms, which `as_secs()`
+        // truncated to a misleading "1s".
+        info!("[AsyncDb] Index checkpoint worker enabled with {}ms interval", interval.as_millis());
         Ok(())
     }
 
