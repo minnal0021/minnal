@@ -3,6 +3,7 @@ pub mod hex;
 pub mod index_manager;
 pub mod index_observer;
 pub mod index_progress;
+pub mod kv_schema;
 pub mod pagination;
 pub mod schema;
 pub mod store;
