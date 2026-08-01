@@ -670,6 +670,117 @@ fn test_schema_survives_restart_and_index_activates_without_re_register() {
     }
 }
 
+/// Measurement — the decisive one for "just shrink the checkpoint interval".
+///
+/// Holds the replay WINDOW fixed and varies the TOTAL document count. If the
+/// per-key replay cost is flat, shrinking the interval is a lasting fix. If it
+/// grows with total data, shrinking the interval buys a one-off factor and the
+/// problem returns as the store grows.
+///
+/// `cargo test -p minnal_db --release --lib replay_cost_vs_total -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
+fn replay_cost_vs_total() {
+    const WINDOW: u32 = 750;
+    println!("fixed replay window={WINDOW} keys, 2 distinct values");
+    for total in [3_000u32, 6_000, 12_000] {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let config = create_db_config();
+        let field_id = {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            for i in 0..total {
+                let v = if i % 2 == 0 { "active" } else { "inactive" };
+                db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                    .unwrap();
+            }
+            db.run_index_checkpoint().unwrap();
+            for i in 0..WINDOW {
+                let v = if i % 2 == 0 { "active" } else { "inactive" };
+                db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                    .unwrap();
+            }
+            std::mem::forget(db);
+            field_id
+        };
+        let db = Database::open(dir.path(), config).unwrap();
+        let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        let t = std::time::Instant::now();
+        db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+            .unwrap();
+        let dt = t.elapsed();
+        println!(
+            "  total={total:6} docs -> replay {:>8.1?} ({:.3} ms/key)",
+            dt,
+            dt.as_secs_f64() * 1000.0 / WINDOW as f64
+        );
+        db.shutdown().unwrap();
+    }
+}
+
+/// Measurement, not a correctness check — run explicitly:
+/// `cargo test -p minnal_db --release --lib replay_cost_vs_window -- --ignored --nocapture`
+///
+/// Answers: does shrinking the checkpoint interval (i.e. the replay window)
+/// reduce restart time proportionally? Holds the total document count fixed and
+/// varies only how many of those keys fall inside the replay window.
+#[test]
+#[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
+fn replay_cost_vs_window() {
+    const TOTAL: u32 = 6_000;
+    println!("total docs={TOTAL}, 2 distinct values");
+    for window in [750u32, 1_500, 3_000, 6_000] {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let config = create_db_config();
+        let field_id = {
+            let db = Database::open(dir.path(), config.clone()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            for i in 0..TOTAL {
+                let v = if i % 2 == 0 { "active" } else { "inactive" };
+                db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                    .unwrap();
+            }
+            db.run_index_checkpoint().unwrap();
+            // Re-write `window` keys AFTER the checkpoint: those are exactly the
+            // keys the next replay will have to process.
+            for i in 0..window {
+                let v = if i % 2 == 0 { "active" } else { "inactive" };
+                db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                    .unwrap();
+            }
+            // Simulate a CRASH. `shutdown()` runs a final checkpoint, which
+            // would advance the marker past everything just written and leave
+            // the replay window empty — measuring nothing. (It did, on the
+            // first attempt at this measurement.)
+            std::mem::forget(db);
+            field_id
+        };
+
+        let db = Database::open(dir.path(), config).unwrap();
+        let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        let t = std::time::Instant::now();
+        db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+            .unwrap();
+        let dt = t.elapsed();
+        println!(
+            "  window={window:5} keys -> replay {:>8.1?} ({:.2} ms/key)",
+            dt,
+            dt.as_secs_f64() * 1000.0 / window as f64
+        );
+        db.shutdown().unwrap();
+    }
+}
+
 /// Replaying a **low-cardinality** field must not balloon its blob store.
 ///
 /// The bitmap store is append-only and rewrites a whole bitmap per key, so a
