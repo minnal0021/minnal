@@ -4,7 +4,7 @@
 //! It monitors the WAL and triggers GC when needed based on persisted entries.
 
 use crate::db::error::Result;
-use log::{debug, error, info};
+use log::{error, info};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -28,8 +28,6 @@ pub trait WalGcTarget: Send + Sync + 'static {
 
 /// Commands that can be sent to the WAL GC worker
 pub enum WalGcCommand {
-    /// Trigger an immediate WAL GC check
-    Trigger,
     /// Shutdown the worker gracefully
     Shutdown,
 }
@@ -55,11 +53,6 @@ impl WalGcWorker {
         tokio::spawn(Self::worker_loop(Arc::downgrade(&target), rx, shutdown_notify.clone(), check_interval));
 
         Self { tx, shutdown_notify }
-    }
-
-    /// Send a command to trigger immediate WAL GC
-    pub fn trigger_gc(&self) -> std::result::Result<(), mpsc::error::SendError<WalGcCommand>> {
-        self.tx.send(WalGcCommand::Trigger)
     }
 
     /// Shutdown the worker gracefully
@@ -90,20 +83,9 @@ impl WalGcWorker {
                 }
 
                 // Handle commands
-                Some(cmd) = rx.recv() => {
-                    match cmd {
-                        WalGcCommand::Trigger => {
-                            debug!("[WalGcWorker] Triggered immediate WAL GC check");
-                            match target.upgrade() {
-                                Some(t) => Self::perform_wal_gc_check(&t),
-                                None => break,
-                            }
-                        }
-                        WalGcCommand::Shutdown => {
-                            info!("[WalGcWorker] Shutting down");
-                            break;
-                        }
-                    }
+                Some(WalGcCommand::Shutdown) = rx.recv() => {
+                    info!("[WalGcWorker] Shutting down");
+                    break;
                 }
 
                 // Channel closed, shutdown
@@ -197,17 +179,25 @@ mod tests {
         worker.shutdown().await;
     }
 
+    /// The worker performs GC checks on its interval.
+    ///
+    /// Previously drove this through an explicit `trigger_gc()` whose only other
+    /// caller was a since-deleted async wrapper. On-demand WAL GC ships as the
+    /// synchronous `Db::garbage_collect_wal`, which returns its result to the
+    /// caller — so the interval is the worker behaviour worth pinning here.
     #[tokio::test]
-    async fn test_wal_gc_worker_trigger() {
+    async fn test_wal_gc_worker_runs_on_its_interval() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let db = Arc::new(Database::open(temp_dir.path(), create_db_config()).expect("failed to open database"));
+        for i in 0..50u32 {
+            db.put(format!("k{i}").as_bytes(), b"v").expect("put");
+        }
 
-        let worker = WalGcWorker::new(db.clone(), Duration::from_secs(10));
-
-        worker.trigger_gc().expect("failed to trigger wal gc");
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
+        let worker = WalGcWorker::new(db.clone(), Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(120)).await;
         worker.shutdown().await;
+
+        // The database is still usable and consistent after repeated GC passes.
+        assert_eq!(db.get(b"k0").expect("get"), Some(b"v".to_vec()));
     }
 }

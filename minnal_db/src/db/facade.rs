@@ -955,9 +955,21 @@ impl AsyncDb {
             }
         }
 
+        // Shutdown the index checkpoint worker. Stopped *before* the final
+        // checkpoint below so the two cannot run concurrently, and so a tick
+        // cannot land on an already-closed database.
+        if self.inner.inner.index_checkpoint_worker.read().await.is_some() {
+            info!("[AsyncDb] Shutting down index checkpoint worker...");
+            if let Some(w) = self.inner.inner.index_checkpoint_worker.write().await.take() {
+                w.shutdown().await;
+            }
+        }
+
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            // Flush index state on clean shutdown before stopping the checkpoint worker.
+            // Flush index state on clean shutdown, now that no worker can race
+            // with it. This is also what clears the no-WAL markers, so a clean
+            // shutdown reports no gap on the next open (FR-001).
             if let Err(e) = db.inner.run_index_checkpoint() {
                 log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
             }
@@ -965,6 +977,16 @@ impl AsyncDb {
         })
         .await
         .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Test-only: whether the index checkpoint worker is currently installed.
+    ///
+    /// Exists so a test can assert that [`shutdown`](Self::shutdown) actually
+    /// stops it — a gap that went unnoticed for as long as a second, unused
+    /// async wrapper was the only thing stopping the worker.
+    #[cfg(test)]
+    pub(crate) async fn index_checkpoint_worker_active(&self) -> bool {
+        self.inner.inner.index_checkpoint_worker.read().await.is_some()
     }
 
     // ── Background worker management ──────────────────────────────────

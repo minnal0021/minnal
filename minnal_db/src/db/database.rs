@@ -5001,6 +5001,34 @@ mod tests {
         db.shutdown().await.unwrap();
     }
 
+    /// `AsyncDb::shutdown` must stop the index checkpoint worker.
+    ///
+    /// It did not: the shutdown sequence stopped the TTL, WAL GC, LSM compaction
+    /// and value-log GC workers but silently skipped this one. The gap was
+    /// invisible because a since-deleted second async wrapper *did* stop it, so
+    /// nothing flagged the worker's shutdown path as unused. A checkpoint tick
+    /// could therefore land after the database was closed.
+    #[tokio::test]
+    async fn async_db_shutdown_stops_the_index_checkpoint_worker() {
+        let dir = TempDir::new().unwrap();
+        let db = crate::db::facade::AsyncDb::open_with_config(dir.path().to_path_buf(), create_db_config())
+            .await
+            .unwrap();
+        // A short interval so a surviving worker would keep firing.
+        db.enable_index_checkpoint_worker(Duration::from_millis(20)).await.unwrap();
+        db.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+
+        db.shutdown().await.unwrap();
+        assert!(
+            !db.index_checkpoint_worker_active().await,
+            "shutdown must stop the checkpoint worker, not leave it running"
+        );
+
+        // Ticks after shutdown must not blow up: give the interval several
+        // periods to fire if the task were still alive.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     #[tokio::test]
     async fn async_db_enable_all_workers_then_shut_down() {
         let dir = TempDir::new().unwrap();

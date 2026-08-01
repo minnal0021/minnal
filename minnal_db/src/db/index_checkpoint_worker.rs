@@ -140,11 +140,6 @@ impl IndexCheckpointWorker {
         })
     }
 
-    /// Trigger an immediate checkpoint outside of the normal schedule.
-    pub fn trigger(&self) -> std::result::Result<(), mpsc::error::SendError<IndexCheckpointCommand>> {
-        self.tx.send(IndexCheckpointCommand::TriggerNow)
-    }
-
     /// Shut down the worker and wait for it to exit.
     pub async fn shutdown(&self) {
         let _ = self.tx.send(IndexCheckpointCommand::Shutdown);
@@ -259,12 +254,16 @@ mod tests {
         worker.shutdown().await;
     }
 
+    /// Uses the write-path trigger handle, which is how an immediate checkpoint
+    /// is actually requested in production. (This previously called a
+    /// `Worker::trigger` method whose only other caller was a since-deleted
+    /// async wrapper — so it tested a path nothing shipped.)
     #[tokio::test]
     async fn test_trigger_calls_checkpoint() {
         let target = FakeTarget::new();
         let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
 
-        worker.trigger().unwrap();
+        worker.backpressure_trigger(1000).request();
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.shutdown().await;
 
@@ -277,7 +276,7 @@ mod tests {
         target.closed.store(true, Ordering::SeqCst);
         let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
 
-        worker.trigger().unwrap();
+        worker.backpressure_trigger(1000).request();
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.shutdown().await;
 
