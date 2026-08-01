@@ -670,6 +670,82 @@ fn test_schema_survives_restart_and_index_activates_without_re_register() {
     }
 }
 
+/// Replaying a **low-cardinality** field must not balloon its blob store.
+///
+/// The bitmap store is append-only and rewrites a whole bitmap per key, so a
+/// value shared by N keys leaves N-1 stale copies. On the write path the
+/// backpressure valve bounds that; during `activate_field_index`'s replay the
+/// valve is a no-op, because it signals the checkpoint *worker* and the workers
+/// are not started until every field has been activated.
+///
+/// Measured before the inline compaction existed: one 5-value field over 16k
+/// documents reached 2.6 GB and never finished replaying. This asserts the blob
+/// stays within a small multiple of the configured cap.
+#[test]
+fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    // 256 KiB cap so the test is quick; the property is "bounded by the cap",
+    // not any particular byte count.
+    let cap: u64 = 256 * 1024;
+    let mut config = create_db_config();
+    config.threshold_config = config.threshold_config.with_index_blob_backpressure_bytes(cap);
+
+    let field_id = {
+        let db = Database::open(dir.path(), config.clone()).unwrap();
+        let field_id = activate_status_index(&db, ns);
+        // Two distinct values across many rows: the pathological shape.
+        for i in 0..4_000u32 {
+            let v = if i % 2 == 0 { "active" } else { "inactive" };
+            db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                .unwrap();
+        }
+        db.run_index_checkpoint().unwrap();
+        db.shutdown().unwrap();
+        field_id
+    };
+
+    // Force a full replay: drop the checkpoint marker so the whole WAL is in
+    // the replay window, exactly as it is after a crash with no checkpoint.
+    let marker = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns)
+        .join(field_id.to_string())
+        .join("checkpoint");
+    std::fs::remove_file(&marker).unwrap();
+
+    let db = Database::open(dir.path(), config).unwrap();
+    let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+        let s = std::str::from_utf8(bytes).ok()?;
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+    });
+    db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+        .unwrap();
+
+    let field_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
+    let on_disk: u64 = std::fs::read_dir(&field_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+
+    // Generous bound: compaction fires at `cap` of dead bytes, so the blob can
+    // reach roughly cap + one live copy between compactions. 16x cap leaves
+    // ample headroom while still failing loudly on unbounded growth (which
+    // measured ~180x this cap for the same shape).
+    assert!(
+        on_disk < cap * 16,
+        "field blob grew to {on_disk} bytes with a {cap}-byte cap — replay is not compacting"
+    );
+
+    // ...and the replay must still be CORRECT, not just small.
+    let outcome = db.query_keys(ns, "status = \"active\"").unwrap();
+    assert_eq!(outcome.keys.len(), 2_000, "replay must rebuild every row it bounded");
+
+    db.shutdown().unwrap();
+}
+
 /// Verify that `activate_field_index` replays the WAL tail into the index
 /// on reopen, covering any writes that happened after the last checkpoint.
 ///

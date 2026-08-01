@@ -1525,7 +1525,47 @@ impl Database {
                         }
                     }
 
+                    // Bound the blob growth this replay produces.
+                    //
+                    // The bitmap store is append-only and `insert` rewrites a
+                    // whole bitmap per key, so replaying a **low-cardinality**
+                    // field is quadratic: a value shared by N keys leaves N-1
+                    // stale copies. The write path bounds exactly this with the
+                    // backpressure valve — but the valve signals the checkpoint
+                    // *worker*, and the workers are not started until after every
+                    // field has been activated. During replay the trigger is
+                    // `None` and the valve is a no-op.
+                    //
+                    // Measured before this compaction existed: replaying one
+                    // 5-distinct-value field over 16k documents reached 2.6 GB on
+                    // disk and had not finished after ~1.5 hours. It also
+                    // compounded — an interrupted replay leaves a bigger blob and
+                    // does not advance the checkpoint, so the next start was
+                    // worse. The database became unopenable.
+                    //
+                    // So compact inline, on the same `dead_bytes` cap the write
+                    // path uses. We hold `dyn_index` exclusively here (it is not
+                    // yet published behind the `RwLock`), so this needs no locks
+                    // and cannot race a writer.
+                    let waste_threshold = (self.config.threshold_config.index_blob_waste_threshold / 100.0).clamp(0.0, 1.0);
+                    // A cap of 0 disables the *write-path* valve, which is a
+                    // throughput choice. It must not disable this: replay is not
+                    // the write path, and an unbounded replay leaves the database
+                    // unopenable rather than merely slow.
+                    let cap = match self.config.threshold_config.index_blob_backpressure_bytes {
+                        0 => crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+                        n => n,
+                    };
+                    let mut compactions = 0usize;
+
                     for key in affected_keys {
+                        if dyn_index.reclaimable_dead_bytes() >= cap {
+                            dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                            if dyn_index.maybe_compact(waste_threshold).map_err(KVError::Io)? {
+                                dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                                compactions += 1;
+                            }
+                        }
                         let current_value = store.get(&key)?;
                         match current_value {
                             // Live key: allocate/resolve its dense ID, then
@@ -1553,6 +1593,12 @@ impl Database {
                         }
                     }
                     dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                    if compactions > 0 {
+                        debug!(
+                            "[activate_field_index] ns={namespace_id} field={field_id}: \
+                             compacted the index blob {compactions} time(s) during replay to keep it bounded"
+                        );
+                    }
                 }
             }
         }
