@@ -152,7 +152,9 @@ impl LsmCompactionWorker {
         }
 
         if !target.has_lsm_compaction_work() {
-            info!("[LsmCompactionWorker] tick — memtable below flush threshold, no level-0 files; nothing to compact");
+            // Routine "nothing to do" tick: DEBUG, not INFO. INFO is reserved
+            // for ticks that actually compact or flush something.
+            debug!("[LsmCompactionWorker] tick — memtable below flush threshold, no level-0 files; nothing to compact");
             return;
         }
 

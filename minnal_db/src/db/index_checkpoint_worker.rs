@@ -14,7 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use log::{error, info};
+use log::{debug, error, info};
+
+/// A checkpoint slower than this is logged at INFO rather than DEBUG.
+///
+/// Routine checkpoints are ~10-20 ms and happen every `index_checkpoint_interval`,
+/// so logging each one drowns the log. A slow one is the useful signal: it means
+/// a field's blob store is compacting, or fsyncs are contending.
+const SLOW_CHECKPOINT: Duration = Duration::from_millis(250);
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
@@ -153,7 +160,7 @@ impl IndexCheckpointWorker {
         interval: Duration,
         pending: Arc<AtomicBool>,
     ) {
-        info!("[IndexCheckpointWorker] started (interval={}s)", interval.as_secs());
+        info!("[IndexCheckpointWorker] started (interval={}ms)", interval.as_millis());
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -169,7 +176,7 @@ impl IndexCheckpointWorker {
                 Some(cmd) = rx.recv() => {
                     match cmd {
                         IndexCheckpointCommand::TriggerNow => {
-                            info!("[IndexCheckpointWorker] immediate checkpoint triggered");
+                            debug!("[IndexCheckpointWorker] immediate checkpoint triggered");
                             match target.upgrade() {
                                 Some(t) => Self::perform_checkpoint(&t, &pending),
                                 None => break,
@@ -201,14 +208,32 @@ impl IndexCheckpointWorker {
         if target.is_closed() {
             return;
         }
-        info!("[IndexCheckpointWorker] tick — starting index checkpoint");
+        // Routine ticks log at DEBUG, not INFO. This worker runs every
+        // `index_checkpoint_interval` — 1750 ms by default — so a per-tick INFO
+        // pair is ~98,000 lines a day of "nothing happened". These lines were
+        // written when the interval was 15 minutes and were reasonable then.
+        //
+        // What stays at INFO is a checkpoint that took long enough to be worth
+        // an operator's attention: it is the one signal in here that says the
+        // index is struggling (a large blob compaction, or fsync contention).
+        debug!("[IndexCheckpointWorker] tick — starting index checkpoint");
         let start = std::time::Instant::now();
         match target.run_index_checkpoint() {
-            Ok(count) => info!(
-                "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
-                start.elapsed(),
-                count
-            ),
+            Ok(count) => {
+                let elapsed = start.elapsed();
+                if elapsed >= SLOW_CHECKPOINT {
+                    info!(
+                        "[IndexCheckpointWorker] checkpoint took {:?} — {} field(s) flushed \
+                         (over the {:?} notice threshold; a field's blob may be compacting)",
+                        elapsed, count, SLOW_CHECKPOINT
+                    );
+                } else {
+                    debug!(
+                        "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
+                        elapsed, count
+                    );
+                }
+            }
             Err(e) => error!("[IndexCheckpointWorker] checkpoint failed: {:?}", e),
         }
     }

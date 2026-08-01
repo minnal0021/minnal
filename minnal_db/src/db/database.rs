@@ -2673,7 +2673,9 @@ impl ValueLogGcTarget for Database {
         let stores = self.stores.read();
         let segment_threshold = self.config.threshold_config.segment_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
-        info!(
+        // Fires on every tick whether or not there is anything to collect, so
+        // DEBUG. The per-namespace results below stay at INFO.
+        debug!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
              (segments rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),

@@ -4,7 +4,7 @@
 //! It monitors the WAL and triggers GC when needed based on persisted entries.
 
 use crate::db::error::Result;
-use log::{error, info};
+use log::{debug, error, info};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -128,7 +128,8 @@ impl WalGcWorker {
                     pending
                 );
             } else {
-                info!("[WalGcWorker] tick — WAL clean, nothing to reclaim");
+                // Routine "nothing to do" tick — see the LSM worker for the rule.
+                debug!("[WalGcWorker] tick — WAL clean, nothing to reclaim");
             }
             return;
         }
