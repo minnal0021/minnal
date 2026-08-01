@@ -19,6 +19,10 @@ pub mod wal;
 pub(crate) mod wal_gc;
 pub(crate) mod wal_worker;
 
+/// Shared fixtures for this module's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// Integration tests for the `Db` / `AsyncDb` facade.
 ///
 /// Test-only, and named for what it holds. It was `db::db` — which read as a

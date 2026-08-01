@@ -207,3 +207,144 @@ impl Database {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
+    use crate::db::test_support::*;
+    use tempfile::TempDir;
+
+    /// Item 13: a put that adds/removes the indexed field (absent↔present) must
+    /// update the index correctly via the targeted path — the row joins the new
+    /// value's bucket and leaves whatever it was in (including "nothing").
+    #[test]
+    fn test_field_index_update_field_appears_and_disappears() {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        // Field absent → not indexed.
+        db.put(b"d:1", br#"{"other":1}"#).unwrap();
+        assert!(db.query_keys(ns, "status = \"active\"").unwrap().keys.is_empty());
+
+        // Field appears (None → Some): row joins the "active" bucket.
+        db.put(b"d:1", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"d:1".to_vec()]);
+
+        // Field disappears (Some → None): row must leave the bucket.
+        db.put(b"d:1", br#"{"other":2}"#).unwrap();
+        assert!(
+            db.query_keys(ns, "status = \"active\"").unwrap().keys.is_empty(),
+            "row must leave its bucket when the indexed field is removed"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    /// Deactivating a field index removes the in-memory bitmap so that any
+    /// subsequent predicate query on that field returns an UnknownField error
+    /// (the field is filtered out of the queryable schema map).
+    #[test]
+    fn test_deactivate_field_index_makes_field_unqueryable() {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.put(b"doc:2", br#"{"status":"inactive"}"#).unwrap();
+
+        // Sanity: query works before deactivation.
+        let keys = db.query_keys(ns, "status = \"active\"").unwrap().keys;
+        assert_eq!(keys, vec![b"doc:1".to_vec()]);
+
+        db.deactivate_field_index(ns, field_id).unwrap();
+
+        // Dropped fields are excluded from the queryable schema map, so the
+        // query fails with "unknown field" rather than "no active index".
+        let err = db.query_keys(ns, "status = \"active\"").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected UnknownField error after deactivation, got: {err}"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 4: a query over a degraded index still returns results, but
+    /// says so — and only for the fields *this* predicate touched.
+    ///
+    /// Serving a complete-looking result set over an incomplete index is the
+    /// original bug, so this is the assertion the whole feature turns on.
+    #[test]
+    fn a_query_over_a_degraded_index_reports_it() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let status_field = activate_status_index(&db, ns);
+        let other_field = activate_named_index(&db, ns, "tier");
+        db.put(b"doc:1", br#"{"status":"active","tier":"gold"}"#)?;
+        db.put(b"doc:2", br#"{"status":"inactive","tier":"gold"}"#)?;
+
+        // Healthy to begin with.
+        let outcome = db.query_keys(ns, "status = \"active\"")?;
+        assert_eq!(outcome.keys, vec![b"doc:1".to_vec()]);
+        assert!(!outcome.is_degraded(), "a healthy index must not report degradation");
+        assert_eq!(outcome.total, 1);
+
+        record_test_gap(&db, ns, status_field);
+
+        // Same results, now flagged.
+        let outcome = db.query_keys(ns, "status = \"active\"")?;
+        assert_eq!(outcome.keys, vec![b"doc:1".to_vec()], "a degraded index stays queryable");
+        assert_eq!(outcome.degraded_fields, vec![status_field], "the touched degraded field must be named");
+
+        // A predicate that does not touch the degraded field is unaffected —
+        // one damaged field must not taint every query in the namespace.
+        let outcome = db.query_keys(ns, "tier = \"gold\"")?;
+        assert_eq!(outcome.keys.len(), 2);
+        assert!(!outcome.is_degraded(), "an untouched degraded field must not taint this query");
+
+        // A predicate touching both reports only the damaged one.
+        let outcome = db.query_keys(ns, "tier = \"gold\" AND status = \"active\"")?;
+        assert_eq!(outcome.degraded_fields, vec![status_field]);
+        assert!(!outcome.degraded_fields.contains(&other_field));
+
+        // The paginated form carries the same signal.
+        let outcome = db.query_keys_paginated(ns, "status = \"active\"", 0, 10)?;
+        assert_eq!(outcome.degraded_fields, vec![status_field]);
+
+        // An empty result over a degraded index is the dangerous case: without
+        // the flag it is indistinguishable from "nothing matches".
+        let outcome = db.query_keys(ns, "status = \"nonexistent\"")?;
+        assert!(outcome.keys.is_empty());
+        assert!(outcome.is_degraded(), "an EMPTY result over a degraded index must still report it");
+
+        db.shutdown()?;
+        Ok(())
+    }
+}

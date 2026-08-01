@@ -15,6 +15,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/db/query.rs` | Predicate evaluation against the field indices (`Database` methods) |
 | `src/db/wal_gc.rs` | WAL GC + the index-replay watermark + the backstop key harvest |
 | `src/db/index_health.rs` | Gap records, index health, repair, no-WAL tracking (FR-001 remediation) |
+| `src/db/test_support.rs` | `#[cfg(test)]` fixtures shared by every test module in `db/` |
 | `src/db/namespace.rs` | Namespace metadata, `FieldMeta`, `FieldId` |
 | `src/db/namespace_index.rs` | Per-namespace index registry, `ExtractorFn`, `RowIdFn`, `RowToKeyFn` |
 | `src/db/config.rs` | `DbConfig`, `SyncConfig`, `ThresholdConfig`, `ScheduledTaskConfig` |

@@ -296,3 +296,618 @@ impl Database {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
+    use crate::db::test_support::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// FR-001 step 1: dropping a field index deletes its on-disk directory.
+    ///
+    /// Before this, `deactivate_field_index` was an in-memory deregister only, so
+    /// the bitmap blob, keymap and — the load-bearing part — the frozen
+    /// `checkpoint` marker survived until the whole namespace was dropped.
+    #[test]
+    fn test_drop_field_index_deletes_its_directory() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.run_index_checkpoint().unwrap();
+
+        let field_path = db.index_manager.field_path(ns, field_id);
+        assert!(field_path.join("checkpoint").exists(), "checkpoint marker should exist before the drop");
+
+        db.drop_field_index(ns, field_id).unwrap();
+        assert!(!field_path.exists(), "the field directory must be gone after a drop");
+
+        // The namespace's row map is a sibling of the field directories and must
+        // survive — other fields resolve their row IDs through it.
+        assert!(db.index_manager.rowmap_path(ns).exists(), "dropping a field must not touch the row map");
+
+        // Idempotent: dropping again is not an error.
+        db.drop_field_index(ns, field_id).unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: a dropped field is excluded from the checkpoint worker's
+    /// field set, so its frozen marker can never hold up WAL GC (and the
+    /// checkpoint does not try to write into a directory that is gone).
+    #[test]
+    fn test_dropped_field_is_excluded_from_checkpoint_fields() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+
+        assert!(db.registry.read().all_indexed_fields().contains(&(ns, field_id)));
+
+        db.drop_field_index(ns, field_id).unwrap();
+
+        assert!(
+            !db.registry.read().all_indexed_fields().contains(&(ns, field_id)),
+            "a dropped field must not appear in all_indexed_fields"
+        );
+        // Checkpointing after the drop must still succeed — the field directory
+        // no longer exists, so including it would fail the whole pass.
+        db.run_index_checkpoint().unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: the drop is persisted, so a drop interrupted after the
+    /// schema write but before the files were deleted is completed at the next
+    /// open rather than leaking until the namespace is dropped.
+    #[test]
+    fn test_interrupted_field_drop_is_completed_at_open() {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_path;
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+            db.run_index_checkpoint().unwrap();
+            field_path = db.index_manager.field_path(ns, field_id);
+
+            // Simulate a crash between step (1) persist and step (3) delete:
+            // mark the field dropped durably, then leave every file in place.
+            db.registry.write().mark_schema_field_dropped(ns, field_id).unwrap();
+            assert!(field_path.exists(), "precondition: files still present at the crash point");
+            db.shutdown().unwrap();
+        }
+
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert!(!field_path.exists(), "open must finish the interrupted drop and reclaim the directory");
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: activating a dropped field must fail loudly.
+    ///
+    /// This is the guard that closes the silent-incomplete window directly: a
+    /// dropped field's directory is gone, so activation would open an empty index
+    /// whose `Absent` + empty shape `detect_replay_gap` deliberately suppresses as
+    /// a normal first build — an index that queries as complete while holding
+    /// nothing.
+    #[test]
+    fn test_activating_a_dropped_field_is_rejected() {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.drop_field_index(ns, field_id).unwrap();
+
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        let err = db.activate_field_index(ns, field_id, IndexValueType::Str, extractor.clone()).unwrap_err();
+        assert!(err.to_string().contains("was dropped"), "expected a dropped-field rejection, got: {err}");
+
+        // Re-registering clears the flag and reuses the same field id, so the
+        // documented add-after-drop path still works.
+        let reused = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        assert_eq!(reused, field_id, "re-registering a dropped field must reuse its id");
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 1: the `dropped` flag survives a restart. Without persistence
+    /// the drop could not be completed at open, and a dropped field would silently
+    /// become activatable again over an empty directory.
+    #[test]
+    fn test_dropped_flag_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+            db.drop_field_index(ns, field_id).unwrap();
+            db.shutdown().unwrap();
+            field_id
+        };
+
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let registry = db.registry.read();
+        let meta = registry
+            .schema(ns)
+            .unwrap()
+            .get_field(field_id)
+            .expect("field definition is retained for id reuse");
+        assert!(meta.dropped, "the dropped flag must survive a restart");
+        drop(registry);
+        db.shutdown().unwrap();
+    }
+
+    /// Targeted single-field reindex: re-deriving a key's value for one field
+    /// must repair a stale index entry, be idempotent, and report the right
+    /// outcome for a missing key or an inactive field.
+    #[test]
+    fn test_reindex_field_repairs_and_reports_outcome() {
+        use crate::db::namespace::FieldReindexOutcome;
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:1".to_vec()]);
+
+        // Reindexing an up-to-date entry is a no-op: still queryable, no duplicate.
+        assert_eq!(db.reindex_field(ns, field_id, b"doc:1").unwrap(), FieldReindexOutcome::Reindexed);
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![b"doc:1".to_vec()]);
+
+        // A key with no value reports KeyNotFound and changes nothing.
+        assert_eq!(db.reindex_field(ns, field_id, b"missing").unwrap(), FieldReindexOutcome::KeyNotFound);
+
+        // An unregistered field id reports FieldNotActive rather than erroring.
+        assert_eq!(db.reindex_field(ns, 9999, b"doc:1").unwrap(), FieldReindexOutcome::FieldNotActive);
+
+        db.shutdown().unwrap();
+    }
+
+    /// Deactivating a field index and deleting its on-disk directory must not
+    /// cause shutdown to fail with ENOENT when run_index_checkpoint is called.
+    #[test]
+    fn test_shutdown_after_drop_index_does_not_error() {
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+
+        // Simulate drop_index: deactivate in-memory then delete on-disk directory.
+        db.deactivate_field_index(ns, field_id).unwrap();
+        let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
+        if index_dir.exists() {
+            std::fs::remove_dir_all(&index_dir).unwrap();
+        }
+
+        // Shutdown must succeed even though the field's directory is gone.
+        db.shutdown().unwrap();
+    }
+
+    /// FR-001 step 3: a rejected index update becomes a durable one-key gap
+    /// rather than only a `warn!`.
+    #[test]
+    fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, RepairMode};
+        use crate::db::namespace_index::ExtractorFn;
+        use crate::index::{IndexValue, IndexValueType};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        // A Str-typed field whose extractor yields an Int for one document: the
+        // index refuses the update, which used to be a log line and nothing else.
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str)?;
+        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+            if bytes.starts_with(b"bad") {
+                Some(IndexValue::Int(1))
+            } else {
+                Some(IndexValue::Str(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        });
+        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor)?;
+
+        db.put(b"ok:1", b"fine")?;
+        db.put(b"doc:bad", b"bad-value")?;
+        db.run_index_checkpoint()?;
+
+        let gap = db.index_manager.read_gap(ns, field_id).expect("a rejected update must be recorded");
+        assert_eq!(gap.cause, GapCause::RejectedUpdate);
+        let RepairMode::RowScoped { keys } = &gap.repair else {
+            panic!("a rejected update names its key exactly, so repair is row-scoped: {:?}", gap.repair);
+        };
+        assert_eq!(keys.len(), 1, "only the rejected key should be listed, got {keys:?}");
+        assert_eq!(crate::support::hex::hex_to_bytes(&keys[0]).unwrap(), b"doc:bad".to_vec());
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: no-WAL writes have no WAL entries, so an unclean shutdown
+    /// leaves the field index incomplete with nothing to replay. The marker turns
+    /// that silence into a recorded, repairable full rebuild.
+    #[test]
+    fn unclean_shutdown_with_no_wal_writes_records_a_full_rebuild_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#)?;
+            // Checkpoint so the field has persisted state — otherwise it is a
+            // first-time build and legitimately has nothing to lose.
+            db.run_index_checkpoint()?;
+            assert!(!db.index_manager.no_wal_pending(ns), "a checkpoint clears the marker");
+
+            db.put_ns_no_wal(ns, b"doc:2", br#"{"status":"active"}"#)?;
+            assert!(db.index_manager.no_wal_pending(ns), "a no-WAL write must set the marker before writing");
+
+            // Drop without shutdown() — the unclean case. A clean shutdown runs a
+            // checkpoint first, which is exactly what clears the marker.
+            std::mem::forget(db);
+            field_id
+        };
+
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let gap = db
+            .index_manager
+            .read_gap(ns, field_id)
+            .expect("an unclean shutdown with no-WAL writes outstanding must record a gap");
+        assert_eq!(gap.cause, GapCause::NoWalWrites);
+        assert_eq!(
+            gap.repair,
+            RepairMode::FullRebuild,
+            "the affected keys were never in the WAL, so they cannot be named"
+        );
+        assert!(!db.index_manager.no_wal_pending(ns), "the marker is cleared once the gap is recorded");
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: a clean shutdown must NOT report a no-WAL gap — it
+    /// checkpoints first, which is what makes those index updates durable.
+    #[test]
+    fn clean_shutdown_after_no_wal_writes_records_no_gap() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let field_id = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field_id = activate_status_index(&db, ns);
+            db.put(b"doc:1", br#"{"status":"active"}"#)?;
+            db.run_index_checkpoint()?;
+            db.put_ns_no_wal(ns, b"doc:2", br#"{"status":"active"}"#)?;
+            db.shutdown()?;
+            field_id
+        };
+
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        assert_eq!(
+            db.index_manager.read_gap(ns, field_id),
+            None,
+            "a clean shutdown checkpoints before exiting, so there is no gap to report"
+        );
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 3: gaps accumulate rather than overwrite. A second detection
+    /// before anyone repairs the first must not discard the first worklist.
+    #[test]
+    fn gap_records_merge_instead_of_overwriting() {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
+            namespace_id: 0,
+            field_id: 1,
+            cause: GapCause::BackstopReclaim,
+            from,
+            to,
+            missing_segments: segs,
+            detected_at_ms: from,
+            repair: RepairMode::RowScoped {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+            },
+        };
+
+        let mut first = mk(100, 200, vec![1, 2], &["aa", "bb"]);
+        first.merge(mk(50, 300, vec![2, 3], &["bb", "cc"]), 10);
+
+        assert_eq!(first.from, 50, "the earliest start wins");
+        assert_eq!(first.to, 300, "the latest end wins");
+        assert_eq!(first.missing_segments, vec![1, 2, 3], "segment ids union and dedupe");
+        assert_eq!(first.detected_at_ms, 100, "the original detection time is kept");
+        let RepairMode::RowScoped { keys } = &first.repair else {
+            panic!("expected the worklists to union, got {:?}", first.repair);
+        };
+        assert_eq!(keys, &["aa", "bb", "cc"], "worklists union and dedupe");
+
+        // Crossing the cap downgrades to a full rebuild...
+        let mut capped = mk(0, 10, vec![], &["aa", "bb"]);
+        capped.merge(mk(0, 10, vec![], &["cc", "dd"]), 3);
+        assert_eq!(capped.repair, RepairMode::FullRebuild, "past the cap the worklist is dropped");
+
+        // ...and a full rebuild is absorbing: it can never be downgraded back to
+        // a row-scoped repair that would miss the un-nameable rows.
+        let mut full = mk(0, 10, vec![], &["aa"]);
+        full.repair = RepairMode::FullRebuild;
+        full.merge(mk(0, 10, vec![], &["bb"]), 100);
+        assert_eq!(full.repair, RepairMode::FullRebuild);
+    }
+
+    /// FR-001 step 4: index health names the degraded fields for an operator.
+    #[test]
+    fn index_health_reports_gaps_per_field() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+
+        let status_field = activate_status_index(&db, ns);
+        activate_named_index(&db, ns, "tier");
+        db.put(b"doc:1", br#"{"status":"active","tier":"gold"}"#)?;
+        db.run_index_checkpoint()?;
+
+        let health = db.index_health(ns)?;
+        assert_eq!(health.len(), 2, "both registered fields should be reported");
+        assert!(health.iter().all(|h| h.active), "both fields are activated");
+        assert!(health.iter().all(|h| !h.is_degraded()), "nothing is degraded yet");
+        assert!(
+            health.iter().all(|h| h.checkpoint_offset.is_some()),
+            "a checkpointed field should report its offset"
+        );
+
+        record_test_gap(&db, ns, status_field);
+        let health = db.index_health(ns)?;
+        let degraded: Vec<&str> = health.iter().filter(|h| h.is_degraded()).map(|h| h.field_name.as_str()).collect();
+        assert_eq!(degraded, vec!["status"], "only the damaged field is reported degraded");
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: row-scoped repair fixes exactly the recorded keys and
+    /// clears the gap, so queries stop reporting degradation.
+    #[test]
+    fn row_scoped_repair_restores_the_index_and_clears_the_gap() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        db.put(b"doc:1", br#"{"status":"active"}"#)?;
+        db.put(b"doc:2", br#"{"status":"active"}"#)?;
+
+        // Simulate the damage: drop doc:2's row from the index behind the write
+        // path's back, exactly as a lost replay would.
+        {
+            let store = db.get_store(ns)?;
+            let row_id = store.resolve_row_id_get(b"doc:2").expect("doc:2 has a row id");
+            let ns_index = store.namespace_index.read();
+            ns_index.get(field_id).unwrap().index.write().remove_all_for_row(row_id);
+        }
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys,
+            vec![b"doc:1".to_vec()],
+            "precondition: the index is now short one document"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::BackstopReclaim,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::RowScoped {
+                    keys: vec![crate::support::hex::bytes_to_hex(b"doc:2")],
+                },
+            },
+            1000,
+        )?;
+
+        let outcome = db.repair_field_index(ns, field_id)?;
+        assert_eq!(
+            outcome,
+            FieldRepairOutcome::RowScoped {
+                keys_total: 1,
+                reindexed: 1,
+                absent: 0
+            }
+        );
+
+        let after = db.query_keys(ns, "status = \"active\"")?;
+        let mut keys = after.keys.clone();
+        keys.sort();
+        assert_eq!(keys, vec![b"doc:1".to_vec(), b"doc:2".to_vec()], "the missing row is back");
+        assert!(!after.is_degraded(), "a successful repair clears the gap");
+        assert!(db.index_manager.read_gap(ns, field_id).is_none());
+
+        // Repairing a healthy field is a no-op, not an error.
+        assert_eq!(db.repair_field_index(ns, field_id)?, FieldRepairOutcome::NotDegraded);
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: a key on the worklist whose value is **gone** must have its
+    /// row cleared, not skipped.
+    ///
+    /// The lost update can be the *delete*. `reindex_field` used to return
+    /// `KeyNotFound` and do nothing, leaving a stale row that queries as a hit —
+    /// a repair that leaves the index wrong in the opposite direction.
+    #[test]
+    fn repair_clears_the_row_of_a_key_whose_delete_was_lost() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        db.put(b"doc:1", br#"{"status":"active"}"#)?;
+        db.put(b"doc:2", br#"{"status":"active"}"#)?;
+
+        // Delete doc:2 from storage only, leaving its index row behind — what a
+        // lost delete looks like after a crash.
+        {
+            let store = db.get_store(ns)?;
+            store.delete_from_storage(b"doc:2")?;
+            let row_id = store.resolve_row_id_get(b"doc:2").expect("row id still known");
+            let ns_index = store.namespace_index.read();
+            ns_index
+                .get(field_id)
+                .unwrap()
+                .index
+                .write()
+                .set(&crate::index::IndexValue::Str("active".into()), row_id)
+                .unwrap();
+        }
+        assert!(
+            db.query_keys(ns, "status = \"active\"")?.keys.contains(&b"doc:2".to_vec()),
+            "precondition: the index still returns the deleted document"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::BackstopReclaim,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::RowScoped {
+                    keys: vec![crate::support::hex::bytes_to_hex(b"doc:2")],
+                },
+            },
+            1000,
+        )?;
+
+        let outcome = db.repair_field_index(ns, field_id)?;
+        assert_eq!(
+            outcome,
+            FieldRepairOutcome::RowScoped {
+                keys_total: 1,
+                reindexed: 0,
+                absent: 1
+            },
+            "the key is absent, and that still counts as repaired"
+        );
+        assert!(
+            !db.query_keys(ns, "status = \"active\"")?.keys.contains(&b"doc:2".to_vec()),
+            "the stale row must be gone — a lost delete is as wrong as a lost write"
+        );
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// FR-001 step 5: a `FullRebuild` gap re-extracts the whole field.
+    #[test]
+    fn full_rebuild_repair_reindexes_every_key() -> Result<()> {
+        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+
+        for i in 0..5u32 {
+            db.put(format!("doc:{i}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+
+        // Wipe several rows — a no-WAL gap cannot name which, hence full rebuild.
+        {
+            let store = db.get_store(ns)?;
+            let ns_index = store.namespace_index.read();
+            let entry = ns_index.get(field_id).unwrap();
+            for i in 0..3u32 {
+                let row_id = store.resolve_row_id_get(format!("doc:{i}").as_bytes()).unwrap();
+                entry.index.write().remove_all_for_row(row_id);
+            }
+        }
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys.len(),
+            2,
+            "precondition: three rows are missing"
+        );
+
+        db.index_manager.record_gap(
+            GapRecord {
+                namespace_id: ns,
+                field_id,
+                cause: GapCause::NoWalWrites,
+                from: 0,
+                to: 0,
+                missing_segments: vec![],
+                detected_at_ms: 1,
+                repair: RepairMode::FullRebuild,
+            },
+            1000,
+        )?;
+
+        assert_eq!(db.repair_field_index(ns, field_id)?, FieldRepairOutcome::FullRebuild { scanned: 5 });
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"")?.keys.len(),
+            5,
+            "a full rebuild restores every row"
+        );
+        assert!(db.index_manager.read_gap(ns, field_id).is_none());
+
+        db.shutdown()?;
+        Ok(())
+    }
+}
