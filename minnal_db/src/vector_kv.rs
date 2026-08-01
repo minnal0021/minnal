@@ -63,6 +63,22 @@ pub fn dense_vectors_ns(namespace: &str) -> String {
     format!("{}_dense_vector", namespace)
 }
 
+/// The suffixes that mark a namespace as a vector companion of another.
+///
+/// Listed longest-first so [`companion_base`] cannot mistake
+/// `x_sparse_vector_meta` for `x_sparse_vector`.
+pub const COMPANION_SUFFIXES: [&str; 3] = ["_sparse_vector_meta", "_sparse_vector", "_dense_vector"];
+
+/// If `name` is a vector companion namespace, the base namespace it belongs to.
+///
+/// The inverse of [`sparse_vectors_ns`] and friends. It lives here so the naming
+/// rule has exactly one owner: the admin API used to strip its own hard-coded
+/// copy of these suffixes, so renaming one would have silently stopped companion
+/// namespaces being recognised as such.
+pub fn companion_base(name: &str) -> Option<&str> {
+    COMPANION_SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix))
+}
+
 /// System-wide namespace for caching query embeddings.
 ///
 /// A single shared TTL-enabled store under the `system` namespace; all doc-store
