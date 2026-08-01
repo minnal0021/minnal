@@ -583,7 +583,7 @@ impl KVStore {
             }
             // Backpressure: if this field's append-only blob has piled up enough
             // dead space, ask the checkpoint worker to compact early instead of
-            // waiting ~15 min (debounced inside the trigger).
+            // waiting for the next tick (debounced inside the trigger).
             self.request_checkpoint_if_over_cap(dead_bytes);
         }
     }

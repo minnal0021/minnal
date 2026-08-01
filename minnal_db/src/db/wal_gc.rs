@@ -345,7 +345,7 @@ impl Database {
 
         // Liveness: the pin can only drain when a checkpoint advances the
         // fields' recorded offsets, so ask for one now and let the next GC tick
-        // reclaim. Without this, retention would track the ~15 min checkpoint
+        // reclaim. Without this, retention would track the periodic checkpoint
         // timer instead of checkpoint latency. Debounced inside the trigger, and
         // deliberately uncapped — `request_if_over_cap` returns early when the
         // backpressure valve is disabled.

@@ -1558,7 +1558,54 @@ impl Database {
                     };
                     let mut compactions = 0usize;
 
-                    for key in affected_keys {
+                    // Group the replay by VALUE before writing anything.
+                    //
+                    // `insert` re-serialises the whole bitmap for a value, and
+                    // the blob store is append-only, so inserting key-by-key
+                    // leaves one dead copy of the entire bitmap per key. For a
+                    // low-cardinality field (few values, many rows) that is the
+                    // dominant cost of replay — measured at ~0.1 ms per key and
+                    // rising with the store's size, because the cost tracks the
+                    // bitmap, not the window.
+                    //
+                    // Replay is the one caller that can avoid it: it knows its
+                    // complete key set up front, so it can resolve every row
+                    // first and then write each value's bitmap exactly once.
+                    let mut rows_by_value: HashMap<crate::index::IndexValue, Vec<u128>> = HashMap::new();
+                    let mut rows_to_clear: Vec<u128> = Vec::new();
+
+                    for key in &affected_keys {
+                        match store.get(key)? {
+                            // Live key: resolve its dense ID and bucket it under
+                            // the value its current bytes extract to.
+                            Some(ref bytes) => {
+                                let row_id = store.resolve_row_id_alloc(key);
+                                rows_to_clear.push(row_id);
+                                if let Some(v) = extractor(bytes) {
+                                    rows_by_value.entry(v).or_default().push(row_id);
+                                }
+                            }
+                            // Deleted key: clear any existing entry without
+                            // allocating a (dead) ID for a key that no longer exists.
+                            None => {
+                                if let Some(row_id) = store.resolve_row_id_get(key) {
+                                    rows_to_clear.push(row_id);
+                                }
+                            }
+                        }
+                    }
+
+                    // Clear every affected row first, so the scalar
+                    // one-value-per-row invariant holds no matter which bucket
+                    // each row used to live in. This must precede the inserts:
+                    // clearing afterwards would undo them.
+                    //
+                    // Batched for the same reason the inserts are: the per-row
+                    // form loads every bucket and rewrites the changed one *per
+                    // row*, so clearing N rows appends N copies of the bitmap.
+                    dyn_index.remove_all_for_rows(&rows_to_clear);
+
+                    for (value, row_ids) in rows_by_value {
                         if dyn_index.reclaimable_dead_bytes() >= cap {
                             dyn_index.flush(&field_path).map_err(KVError::Io)?;
                             if dyn_index.maybe_compact(waste_threshold).map_err(KVError::Io)? {
@@ -1566,30 +1613,12 @@ impl Database {
                                 compactions += 1;
                             }
                         }
-                        let current_value = store.get(&key)?;
-                        match current_value {
-                            // Live key: allocate/resolve its dense ID, then
-                            // rebuild its index entry from the current value.
-                            Some(ref bytes) => {
-                                let row_id = store.resolve_row_id_alloc(&key);
-                                dyn_index.remove_all_for_row(row_id);
-                                if let Some(v) = extractor(bytes)
-                                    && let Err(e) = dyn_index.insert(&v, row_id)
-                                {
-                                    warn!(
-                                        "[activate_field_index] index update rejected \
-                                         ns={} field={}: {}",
-                                        namespace_id, field_id, e
-                                    );
-                                }
-                            }
-                            // Deleted key: clear any existing entry without
-                            // allocating a (dead) ID for a key that no longer exists.
-                            None => {
-                                if let Some(row_id) = store.resolve_row_id_get(&key) {
-                                    dyn_index.remove_all_for_row(row_id);
-                                }
-                            }
+                        if let Err(e) = dyn_index.insert_many(&value, &row_ids) {
+                            warn!(
+                                "[activate_field_index] index update rejected \
+                                 ns={} field={}: {}",
+                                namespace_id, field_id, e
+                            );
                         }
                     }
                     dyn_index.flush(&field_path).map_err(KVError::Io)?;

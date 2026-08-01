@@ -7,7 +7,8 @@
 //! nothing about [`IndexManager`] or [`NamespaceRegistry`] directly — it
 //! calls through [`IndexCheckpointTarget`], which [`Database`] implements.
 //!
-//! Default interval: 15 minutes.
+//! Default interval: [`DEFAULT_INDEX_CHECKPOINT_INTERVAL`](crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL)
+//! (1750 ms) — the interval is the crash-replay window, so it is deliberately short.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,9 +19,6 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
 use crate::db::error::Result;
-
-/// Default snapshot interval: 15 minutes.
-pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Trait implemented by the database coordinator to perform an index checkpoint.
 ///
@@ -75,7 +73,7 @@ impl IndexCheckpointTrigger {
     ///
     /// Used by WAL GC when the index-replay watermark is holding segments back:
     /// the pin can only drain when a checkpoint advances the fields' recorded
-    /// offsets, so retention tracks checkpoint latency instead of the ~15 min
+    /// offsets, so retention tracks checkpoint latency instead of the periodic
     /// timer. It must not be routed through
     /// [`request_if_over_cap`](Self::request_if_over_cap), which returns early
     /// when the backpressure valve is disabled (`cap_bytes == 0`) — that would

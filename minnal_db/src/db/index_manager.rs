@@ -518,7 +518,7 @@ impl IndexManager {
     /// No-WAL writes update the field index in memory but write **no WAL entry**,
     /// so replay cannot heal a lost update, the index-replay watermark has nothing
     /// to pin, and `detect_replay_gap` sees an entirely intact checkpoint. Under
-    /// bulk load the memtable flushes to L0 far more often than the ~15 min index
+    /// bulk load the memtable flushes to L0 far more often than the index
     /// checkpoint, so a crash readily leaves the value durable and the index
     /// update gone, with no replay path and nothing to notice it.
     ///

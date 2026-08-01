@@ -131,7 +131,7 @@ index_blob_waste_threshold = 50.0
 
 # Backpressure: when a single field index accumulates this many reclaimable dead
 # blob bytes, the write path requests an index checkpoint immediately instead of
-# waiting for the periodic (~15 min) tick. This bounds the transient on-disk
+# waiting for the next periodic tick. This bounds the transient on-disk
 # amplification of low-cardinality, high-churn fields (a boolean over many docs
 # rewrites its whole bitmap per document and can bloat to gigabytes between
 # ticks) to roughly this cap per field. It is an absolute BYTE cap, not a ratio:
@@ -148,7 +148,7 @@ index_blob_backpressure_bytes = 67_108_864
 # after a crash — without that gate the index silently loses those documents for
 # the life of the database. The pin normally drains in seconds: GC asks the index
 # checkpoint worker for an early checkpoint and defers a tick, so WAL retention
-# tracks checkpoint latency rather than the ~15 min timer.
+# tracks checkpoint latency rather than the timer.
 #
 # If the checkpoint worker is disabled or wedged, nothing advances the watermark
 # and the WAL would grow without bound, so past this many pinned segments GC
@@ -175,6 +175,20 @@ lsm_compaction_interval_secs = 60
 
 # How often (seconds) the TTL expiry worker scans for expired keys.
 ttl_cleanup_interval_secs = 3_600
+
+# How often the index checkpoint worker runs, in MILLISECONDS.
+#
+# This is the crash-replay window. After a crash every field index replays the
+# WAL from its last checkpoint, so a long interval means a crash faces that much
+# work before the database serves again. It also caps WAL retention: the
+# index-replay watermark refuses to let WAL GC reclaim a segment a field still
+# needs, so retention tracks this interval (see thresholds.max_pinned_wal_segments).
+#
+# The per-tick cost is a flush of each field index plus one marker write
+# (tmp + rename + two fsyncs) per field — small beside the WAL's fsync on every
+# write. Milliseconds, not seconds, because the useful range is sub-second to a
+# few seconds. Default: 1750.
+index_checkpoint_interval_ms = 1750
 
 # ---------------------------------------------------------------------------
 # [wal] — Write-Ahead Log

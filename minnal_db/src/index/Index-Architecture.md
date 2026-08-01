@@ -351,7 +351,7 @@ set in TOML as `thresholds.index_blob_waste_threshold`).
 Where that trigger fires is deliberately narrow. `compact()` is invoked from
 exactly one place — `Database::run_index_checkpoint` — and only for a field over
 the waste threshold. That checkpoint pass is reached three ways, all running the
-same code: the periodic `IndexCheckpointWorker` (~15 min), a clean shutdown, and
+same code: the periodic `IndexCheckpointWorker` (1750 ms by default), a clean shutdown, and
 the on-demand `Db::checkpoint_index()` exposed over REST as `POST
 /admin/storage/index-checkpoint`. There is no write-path compaction and no
 standalone one. (Do not confuse this with `Db::compact()` / `POST

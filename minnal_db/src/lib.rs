@@ -105,6 +105,9 @@ pub use db::config::{
 
 pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
 
+/// Default index checkpoint interval in milliseconds (the crash-replay window).
+pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
+
 /// Hex encoding/decoding for raw key bytes.
 ///
 /// Exposed because keys are arbitrary bytes and several surfaces carry them as

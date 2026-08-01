@@ -265,7 +265,8 @@ impl DocStoreApiConfig {
             Duration::from_secs(self.scheduled_tasks.wal_gc_interval_secs),
             Duration::from_secs(self.scheduled_tasks.lsm_compaction_interval_secs),
         )
-        .with_ttl_cleanup_interval(Duration::from_secs(self.scheduled_tasks.ttl_cleanup_interval_secs));
+        .with_ttl_cleanup_interval(Duration::from_secs(self.scheduled_tasks.ttl_cleanup_interval_secs))
+        .with_index_checkpoint_interval(Duration::from_millis(self.scheduled_tasks.index_checkpoint_interval_ms));
 
         DbConfig {
             threshold_config: ThresholdConfig {
@@ -503,6 +504,10 @@ pub struct ScheduledTaskSection {
     pub lsm_compaction_interval_secs: u64,
     #[serde(default = "default_ttl_cleanup_secs")]
     pub ttl_cleanup_interval_secs: u64,
+    /// Index checkpoint interval in **milliseconds** — this is the crash-replay
+    /// window, so the useful range is sub-second to a few seconds.
+    #[serde(default = "default_index_checkpoint_interval_ms")]
+    pub index_checkpoint_interval_ms: u64,
 }
 
 impl Default for ScheduledTaskSection {
@@ -512,6 +517,7 @@ impl Default for ScheduledTaskSection {
             wal_gc_interval_secs: default_gc_interval_secs(),
             lsm_compaction_interval_secs: default_gc_interval_secs(),
             ttl_cleanup_interval_secs: default_ttl_cleanup_secs(),
+            index_checkpoint_interval_ms: default_index_checkpoint_interval_ms(),
         }
     }
 }
@@ -519,6 +525,10 @@ impl Default for ScheduledTaskSection {
 fn default_gc_interval_secs() -> u64 {
     60
 }
+fn default_index_checkpoint_interval_ms() -> u64 {
+    minnal_db::DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS
+}
+
 fn default_ttl_cleanup_secs() -> u64 {
     3_600
 }

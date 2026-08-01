@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::db::config::DbConfig;
 use crate::db::database::Database;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::index_manager::FieldIndexHealth;
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
 use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
@@ -1068,7 +1068,8 @@ impl AsyncDb {
         self.enable_wal_gc_worker(st.wal_gc_interval).await?;
         self.enable_lsm_compaction_worker(st.lsm_compaction_interval).await?;
         self.enable_value_log_gc_worker(st.value_log_gc_interval, threshold).await?;
-        self.enable_index_checkpoint_worker(DEFAULT_CHECKPOINT_INTERVAL).await?;
+        self.enable_index_checkpoint_worker(config.scheduled_task_config.index_checkpoint_interval())
+            .await?;
         // Restore TTL: if any namespace has a persisted TTL config, start the
         // single global TTL worker so expiry resumes across restarts.
         if !self.inner.inner.registry.read().ttl_configs().is_empty() {
