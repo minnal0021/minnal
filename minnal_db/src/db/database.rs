@@ -8,7 +8,7 @@ use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
-use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, FieldRepairOutcome, NamespaceRegistry, QueryOutcome};
+use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
@@ -431,20 +431,6 @@ fn display_key(key: &[u8]) -> String {
     }
 }
 
-/// What one WAL GC pass may reclaim, after the index-replay watermark has had
-/// its say. Produced by `Database::plan_wal_gc`.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct WalGcPlan {
-    /// Segments to delete this pass, ascending. Includes any the backstop forced.
-    reclaim: Vec<u64>,
-    /// Segments held back by the watermark and left in place.
-    deferred: usize,
-    /// Segments the watermark wanted to hold but the backstop reclaimed anyway,
-    /// ascending. Non-empty means a field index has been knowingly stranded —
-    /// these are the segments whose keys must be harvested before the unlink.
-    forced: Vec<u64>,
-}
-
 // ── Database coordinator ───────────────────────────────────────────────
 
 /// The main database coordinator that manages:
@@ -456,16 +442,16 @@ pub struct Database {
     pub(crate) config: DbConfig,
 
     // Shared WAL
-    wal: Arc<Wal>,
+    pub(crate) wal: Arc<Wal>,
     #[allow(dead_code)]
     wal_path: PathBuf,
     wal_metadata_path: PathBuf,
-    wal_metadata: Arc<RwLock<WalMetadata>>,
+    pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
     pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
     last_persisted_wal_offset: Arc<RwLock<u64>>,
-    wal_gc_in_progress: Arc<AtomicBool>,
+    pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     // Namespace registry
     pub(crate) registry: RwLock<NamespaceRegistry>,
@@ -506,10 +492,10 @@ pub struct Database {
     pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
     /// Rejected field-index updates awaiting the next checkpoint, which turns
     /// them into durable gap records. Shared with every `KVStore`.
-    rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
+    pub(crate) rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
     /// Namespaces whose durable "no-WAL writes outstanding" marker is set.
     /// Debounces the marker write to once per checkpoint interval.
-    no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
+    pub(crate) no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
 
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
@@ -524,7 +510,7 @@ pub struct Database {
     pub(crate) index_checkpoint_worker: Arc<tokio::sync::RwLock<Option<Arc<IndexCheckpointWorker>>>>,
 
     // Global monotonic sequence counter. Seeded from the WAL on open.
-    next_seq: Arc<AtomicU64>,
+    pub(crate) next_seq: Arc<AtomicU64>,
 
     // Directory for recovery fail-log files.
     fail_log_dir: PathBuf,
@@ -533,7 +519,7 @@ pub struct Database {
     // WAL-GC counters plus a fold of every dropped namespace's final totals.
     // Per-namespace counters live on each KVStore's own Metrics instance; the
     // engine-wide view (`metrics_snapshot`) sums those with this global one.
-    metrics: Arc<crate::db::metrics::Metrics>,
+    pub(crate) metrics: Arc<crate::db::metrics::Metrics>,
 }
 
 impl Database {
@@ -869,7 +855,7 @@ impl Database {
     /// slower repair than simply rebuilding the field. At that point a full
     /// rebuild is the cheaper, simpler answer, so the keys are dropped rather
     /// than accumulated.
-    const GAP_KEY_WORKLIST_CAP: usize = 100_000;
+    pub(crate) const GAP_KEY_WORKLIST_CAP: usize = 100_000;
 
     /// Apply a WAL-durable mutation to the in-memory store, retrying transient
     /// failures up to [`APPLY_RETRY_ATTEMPTS`] times.
@@ -1661,198 +1647,6 @@ impl Database {
         }
     }
 
-    // ── Query execution ────────────────────────────────────────────────
-
-    /// Evaluate a query string against the active field indices of a namespace
-    /// and return the raw keys of all matching documents.
-    ///
-    /// # Arguments
-    /// * `namespace_id` — the namespace to query
-    /// * `query_str`    — query string, e.g. `"age > 30 AND status = 'active'"`
-    ///
-    /// # How it works
-    /// 1. Parses and evaluates `query_str` against the in-memory field indices,
-    ///    producing a bitmap of matching row IDs.
-    /// 2. Scans all keys in the namespace's KVStore and returns those whose
-    ///    row ID (from the dense row map) appears in the bitmap.
-    ///
-    /// # Limitations
-    /// Only fields activated via `activate_field_index` are queryable.
-    /// Unindexed fields in the predicate produce a [`KVError::Query`]
-    /// carrying a [`crate::index::query::QueryError::InactiveField`].
-    pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
-        let store = self.get_store(namespace_id)?;
-        let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
-        let degraded_fields = self.degraded_among(namespace_id, &touched);
-        let total = bitmap.len();
-
-        if bitmap.is_empty() {
-            return Ok(QueryOutcome {
-                keys: Vec::new(),
-                total: 0,
-                degraded_fields,
-            });
-        }
-
-        // Fast path: when a RowToKeyFn inverse is registered, reconstruct each
-        // matching key directly from its row ID — O(|hits|), zero memory overhead,
-        // crash-safe (no map to rebuild on restart).
-        let keys = if let Some(ref inv) = *store.row_to_key_fn.read() {
-            bitmap.iter().map(|row_id| inv(row_id)).collect()
-        } else if store.rowmap_active() {
-            // Fast path: the dense row map resolves each hit's key directly — O(|hits|).
-            bitmap.iter().filter_map(|row_id| store.rowmap_key_for(row_id)).collect()
-        } else {
-            // Fallback (no inverse function): scan all keys and check bitmap membership.
-            // Pre-existing O(n_keys) path retained for backward compatibility.
-            store
-                .keys()?
-                .into_iter()
-                .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-                .collect()
-        };
-
-        Ok(QueryOutcome {
-            keys,
-            total,
-            degraded_fields,
-        })
-    }
-
-    /// Parse and evaluate a predicate, returning the matching row bitmap **and
-    /// the set of fields the predicate actually referenced**.
-    ///
-    /// The touched-field set comes from the evaluator itself: it calls the
-    /// index lookup closure exactly once per field it needs, so recording those
-    /// ids is both free and exact — no second parse, and no risk of the two
-    /// disagreeing about which fields a query touched.
-    fn evaluate_predicate(
-        &self,
-        namespace_id: u32,
-        store: &Arc<KVStore>,
-        query_str: &str,
-    ) -> Result<(crate::index::bitmap::RoaringBitmap, Vec<FieldId>)> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
-
-        // Build the schema map: field_name → field_id, restricted to fields
-        // that have an active in-memory index. Dropped fields remain in the
-        // registry for field_id reuse but must not appear as queryable fields.
-        let schema_map: SchemaMap = {
-            let registry = self.registry.read();
-            let ns_index = store.namespace_index.read();
-            registry
-                .schema(namespace_id)
-                .map(|s| {
-                    s.list_fields()
-                        .into_iter()
-                        .filter(|f| ns_index.get(f.field_id).is_some())
-                        .map(|f| (f.field_name, f.field_id))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        let touched = parking_lot::Mutex::new(Vec::new());
-        let get_index = |field_id: u32| {
-            touched.lock().push(field_id);
-            let ns_index = store.namespace_index.read();
-            ns_index.get(field_id).map(|e| Arc::clone(&e.index))
-        };
-
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index)?;
-        let mut touched = touched.into_inner();
-        touched.sort_unstable();
-        touched.dedup();
-        Ok((bitmap, touched))
-    }
-
-    /// Of the fields a query touched, which have an outstanding gap record.
-    ///
-    /// One marker read per touched field — a predicate references a handful of
-    /// fields, not the whole schema, so this is bounded by the query rather than
-    /// by the namespace.
-    fn degraded_among(&self, namespace_id: u32, touched: &[FieldId]) -> Vec<FieldId> {
-        touched
-            .iter()
-            .copied()
-            .filter(|&field_id| self.index_manager.read_gap(namespace_id, field_id).is_some())
-            .collect()
-    }
-
-    /// Evaluate a query and return `(page_keys, total)` where `total` is the
-    /// full match count (bitmap cardinality) and `page_keys` contains at most
-    /// `limit` keys starting from `offset` in iteration order.
-    ///
-    /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// - With a registered `RowToKeyFn`: O(offset + limit) key resolutions.
-    /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
-    ///
-    /// [`query_keys`]: Self::query_keys
-    pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
-        let store = self.get_store(namespace_id)?;
-        let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
-        let degraded_fields = self.degraded_among(namespace_id, &touched);
-
-        let total = bitmap.len();
-
-        if total == 0 {
-            return Ok(QueryOutcome {
-                keys: Vec::new(),
-                total: 0,
-                degraded_fields,
-            });
-        }
-
-        // Both fast paths window the bitmap with `iter_page`, not
-        // `iter().skip(offset).take(limit)`. `iter` deserialises and
-        // materialises every container it passes over, so walking a full result
-        // set page by page costs O(n²). `iter_page` is bounded at both ends: it
-        // reaches the offset by skipping whole containers on their cardinality,
-        // and materialises at most `limit` values from each container it opens.
-
-        // Fast path: RowToKeyFn registered — resolve only the page window.
-        if let Some(ref inv) = *store.row_to_key_fn.read() {
-            let keys: Vec<Vec<u8>> = bitmap.iter_page(offset, limit).map(|row_id| inv(row_id)).collect();
-            return Ok(QueryOutcome {
-                keys,
-                total,
-                degraded_fields,
-            });
-        }
-
-        // Fast path: dense row map — resolve only the page window.
-        if store.rowmap_active() {
-            let keys: Vec<Vec<u8>> = bitmap
-                .iter_page(offset, limit)
-                .filter_map(|row_id| store.rowmap_key_for(row_id))
-                .collect();
-            return Ok(QueryOutcome {
-                keys,
-                total,
-                degraded_fields,
-            });
-        }
-
-        // Fallback: scan all keys, filter by bitmap membership, then window.
-        // The `.skip(offset)` here walks *keys*, not the bitmap, so it gets no
-        // benefit from `iter_page` — and it is not the bottleneck on this
-        // path anyway: `store.keys()` already materialises the whole namespace
-        // regardless of the page requested. Reached only when a namespace has
-        // neither a RowToKeyFn nor a loaded row map.
-        let all_keys = store.keys()?;
-        let keys: Vec<Vec<u8>> = all_keys
-            .into_iter()
-            .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-            .skip(offset)
-            .take(limit)
-            .collect();
-        Ok(QueryOutcome {
-            keys,
-            total,
-            degraded_fields,
-        })
-    }
-
     // ── Store access ───────────────────────────────────────────────────
 
     /// Get a KVStore by namespace ID.
@@ -1863,7 +1657,7 @@ impl Database {
     /// does — can arrive while the store is still being opened. If the registry
     /// knows the id, a creation is or was in flight: wait on the creation lock
     /// and look once more. Ids the registry does not know fail straight away.
-    fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
+    pub(crate) fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
         if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
             return Ok(store);
         }
@@ -1998,7 +1792,7 @@ impl Database {
         flushed
     }
 
-    fn flush_wal_metadata_internal(&self) -> Result<()> {
+    pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
         crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
@@ -2221,613 +2015,6 @@ impl Database {
         }
         self.flush_wal_metadata_internal()?;
         Ok(last_persisted_offset)
-    }
-
-    // ── WAL GC ─────────────────────────────────────────────────────────
-
-    pub fn get_wal_gc_stats(&self) -> (u64, u64) {
-        let wal_metadata = self.wal_metadata.read();
-        (wal_metadata.total_entries, wal_metadata.persisted_entries)
-    }
-
-    /// Returns `true` when at least one non-current WAL segment is fully persisted
-    /// and ready to be deleted.  Entries in the active segment are not yet eligible
-    /// — they will be marked persisted after the next memtable flush or clean shutdown.
-    ///
-    /// Accounts for the index-replay watermark, so the worker does not call GC
-    /// every tick for segments GC would only refuse. It deliberately still
-    /// reports `true` when the backstop is due to fire (`forced > 0`) — otherwise
-    /// a wedged checkpoint worker would pin the WAL *and* suppress the very GC
-    /// pass meant to bound it.
-    pub fn has_deletable_wal_segments(&self) -> bool {
-        let watermark = self.index_replay_watermark_segment();
-        let wal_metadata = self.wal_metadata.read();
-        if wal_metadata.tail == 0 {
-            return false;
-        }
-        let current = self.wal.segment_id_for_offset(wal_metadata.tail - 1);
-        let plan = self.plan_wal_gc(&wal_metadata, current, watermark);
-        !plan.reclaim.is_empty()
-    }
-
-    /// The oldest WAL segment any **currently active** field index still needs in
-    /// order to replay after a crash, or `None` when nothing is pinned.
-    ///
-    /// `min(checkpoint offset)` over active fields, mapped to its segment. Each
-    /// field already records its replay offset in its `checkpoint` marker, so
-    /// this needs no new per-entry or per-segment state — just one marker read
-    /// per active field, on a path that runs every 60 s.
-    ///
-    /// **Scoped to active fields on purpose.** Two kinds of inactive field would
-    /// otherwise pin the WAL without bound:
-    ///
-    /// - a **dropped** field, whose marker is frozen wherever it was last
-    ///   checkpointed. Step 1 of FR-001 deletes those markers, but a field can be
-    ///   inactive without being dropped (e.g. while rebuilding) and cleanup can
-    ///   itself be interrupted, so the filter stays;
-    /// - a field **being built for the first time**, which has no marker at all
-    ///   and so reads as "replay from 0". A new index is populated by a build,
-    ///   not by replay, so it is suppressed here exactly as `detect_replay_gap`
-    ///   suppresses it — otherwise every `add_index` on an established database
-    ///   would pin the entire WAL.
-    fn index_replay_watermark_segment(&self) -> Option<u64> {
-        let wal_tail = self.wal_metadata.read().tail;
-        if wal_tail == 0 {
-            return None;
-        }
-        let fields = self.registry.read().all_indexed_fields();
-        if fields.is_empty() {
-            return None;
-        }
-
-        let stores = self.stores.read();
-        let mut watermark: Option<u64> = None;
-        for (ns_id, field_id) in fields {
-            let Some(store) = stores.get(&ns_id) else { continue };
-            let ns_index = store.namespace_index.read();
-            // Not activated → not replayed into → nothing to pin for.
-            let Some(entry) = ns_index.get(field_id) else { continue };
-
-            let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-            if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                continue;
-            }
-            let segment = self.wal.segment_id_for_offset(state.replay_offset());
-            watermark = Some(watermark.map_or(segment, |w: u64| w.min(segment)));
-        }
-        watermark
-    }
-
-    /// Repair a field index that has an outstanding gap, then clear the gap.
-    ///
-    /// Two modes, chosen by the gap record itself:
-    ///
-    /// - **Row-scoped** (the normal case): walk the recorded key worklist,
-    ///   re-derive each key's field value from its *current* stored bytes, and
-    ///   rewrite that one row. Work is proportional to the damage, not to the
-    ///   store. Reading current values rather than the lost ones is what makes
-    ///   this idempotent and convergent: a key overwritten since the loss is
-    ///   already correct, and a key written five times needs one repair.
-    /// - **Full rebuild**: re-extract every key in the namespace. Used when the
-    ///   worklist crossed its cap, or for a no-WAL gap whose keys were never
-    ///   knowable.
-    ///
-    /// The gap is cleared **only on success**, so a failed or interrupted repair
-    /// leaves the field visibly degraded and retryable rather than quietly
-    /// marked healthy.
-    ///
-    /// Does not re-put documents: no WAL traffic, no vector re-embedding, no
-    /// other field's extractor. Returns [`FieldRepairOutcome::NotDegraded`] when
-    /// there is nothing to repair.
-    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
-        use crate::db::index_manager::RepairMode;
-        use crate::db::namespace::FieldReindexOutcome;
-
-        let Some(gap) = self.index_manager.read_gap(namespace_id, field_id) else {
-            return Ok(FieldRepairOutcome::NotDegraded);
-        };
-        let store = self.get_store(namespace_id)?;
-        if store.namespace_index.read().get(field_id).is_none() {
-            return Err(KVError::Serialization(format!(
-                "Field {} in namespace {} has no active index to repair; activate it first",
-                field_id, namespace_id
-            )));
-        }
-
-        let outcome = match &gap.repair {
-            RepairMode::RowScoped { keys } => {
-                // A key recorded as un-decodable hex would silently shrink the
-                // worklist, so fail loudly rather than report a repair that
-                // skipped rows.
-                let mut decoded = Vec::with_capacity(keys.len());
-                for hex in keys {
-                    let key = crate::support::hex::hex_to_bytes(hex).ok_or_else(|| {
-                        KVError::Serialization(format!("Gap record for ns={namespace_id} field={field_id} holds a malformed key: {hex}"))
-                    })?;
-                    decoded.push(key);
-                }
-
-                let mut reindexed = 0usize;
-                let mut absent = 0usize;
-                for key in &decoded {
-                    match store.reindex_field(field_id, key)? {
-                        FieldReindexOutcome::Reindexed => reindexed += 1,
-                        // The key has no current value. `reindex_field` has
-                        // already cleared its row, which is the repair when it
-                        // was the *delete* that went missing.
-                        FieldReindexOutcome::KeyNotFound => absent += 1,
-                        FieldReindexOutcome::FieldNotActive => {
-                            return Err(KVError::Serialization(format!(
-                                "Field {field_id} in namespace {namespace_id} was deactivated mid-repair"
-                            )));
-                        }
-                    }
-                }
-                FieldRepairOutcome::RowScoped {
-                    keys_total: decoded.len(),
-                    reindexed,
-                    absent,
-                }
-            }
-            RepairMode::FullRebuild => {
-                let keys = store.keys()?;
-                let scanned = keys.len();
-                for key in &keys {
-                    match store.reindex_field(field_id, key)? {
-                        FieldReindexOutcome::FieldNotActive => {
-                            return Err(KVError::Serialization(format!(
-                                "Field {field_id} in namespace {namespace_id} was deactivated mid-repair"
-                            )));
-                        }
-                        _ => continue,
-                    }
-                }
-                FieldRepairOutcome::FullRebuild { scanned }
-            }
-        };
-
-        // Make the repaired index durable before dropping the record of why it
-        // needed repairing. The reverse order could clear the gap and then lose
-        // the repair to a crash, leaving a silently incomplete index with
-        // nothing left to say so.
-        self.run_index_checkpoint()?;
-        self.index_manager.clear_gap(namespace_id, field_id)?;
-        info!("[REPAIR] ns={namespace_id} field={field_id}: repaired ({outcome:?}), gap cleared");
-        Ok(outcome)
-    }
-
-    /// Report the health of every registered field index in a namespace.
-    ///
-    /// The operator-facing counterpart of the per-query `degraded_fields`
-    /// signal: that tells a caller their *answer* may be short, this tells an
-    /// operator *which indices* need repair and why. Dropped fields are omitted —
-    /// they have no index to be healthy or otherwise.
-    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<crate::db::index_manager::FieldIndexHealth>> {
-        let store = self.get_store(namespace_id)?;
-        let wal_tail = self.wal_metadata.read().tail;
-
-        let fields: Vec<FieldMeta> = {
-            let registry = self.registry.read();
-            registry
-                .schema(namespace_id)
-                .map(|s| s.list_fields().into_iter().filter(|f| !f.dropped).collect())
-                .unwrap_or_default()
-        };
-
-        let ns_index = store.namespace_index.read();
-        Ok(fields
-            .into_iter()
-            .map(|f| {
-                let checkpoint_offset = match self.index_manager.read_checkpoint_state(namespace_id, f.field_id, wal_tail) {
-                    crate::db::index_manager::CheckpointState::At(offset) => Some(offset),
-                    _ => None,
-                };
-                crate::db::index_manager::FieldIndexHealth {
-                    namespace_id,
-                    field_id: f.field_id,
-                    field_name: f.field_name,
-                    checkpoint_offset,
-                    active: ns_index.get(f.field_id).is_some(),
-                    gap: self.index_manager.read_gap(namespace_id, f.field_id),
-                }
-            })
-            .collect())
-    }
-
-    /// Note that a namespace has taken a no-WAL write whose field-index update
-    /// no checkpoint has made durable yet.
-    ///
-    /// The durable marker is written **once** per checkpoint interval, not per
-    /// write: the in-memory set is the debounce, so the fsync cost is amortised
-    /// to roughly one per checkpoint rather than one per bulk-loaded document.
-    /// Cleared by `run_index_checkpoint` once that namespace's index state is on
-    /// disk.
-    ///
-    /// Only namespaces with at least one field index matter — an unindexed
-    /// namespace has no index to diverge — so this is free for the raw-KV case.
-    ///
-    /// Best-effort: a marker that cannot be written is logged. Failing the write
-    /// itself would be a worse trade (the caller asked for the fast path), but it
-    /// does mean a crash could then go unreported.
-    fn note_no_wal_index_exposure(&self, namespace_id: u32) {
-        {
-            let stores = self.stores.read();
-            match stores.get(&namespace_id) {
-                Some(store) if !store.namespace_index.read().is_empty() => {}
-                _ => return,
-            }
-        }
-        if !self.no_wal_pending.lock().insert(namespace_id) {
-            return; // already marked since the last checkpoint
-        }
-        if let Err(e) = self.index_manager.set_no_wal_pending(namespace_id) {
-            warn!("[NO-WAL] failed to mark ns={namespace_id} as having uncheckpointed no-WAL index updates: {e:?}");
-        }
-    }
-
-    /// Record a full-rebuild gap for every field of a namespace that had no-WAL
-    /// writes outstanding when the process died.
-    ///
-    /// Runs at open. The affected keys are **not** recoverable here and never
-    /// were: no-WAL writes leave no WAL entries, so unlike the backstop path
-    /// there is nothing to harvest. A coarse full rebuild is the honest answer,
-    /// and it is still infinitely better than the silence it replaces.
-    ///
-    /// Fields with no checkpoint marker are skipped: they hold no persisted index
-    /// state, so they are a first-time build rather than a damaged index — the
-    /// same judgement `detect_replay_gap` and the watermark make.
-    fn record_no_wal_gaps_after_unclean_shutdown(&self) {
-        let namespaces: Vec<(u32, Vec<FieldId>)> = {
-            let registry = self.registry.read();
-            registry
-                .list()
-                .into_iter()
-                .filter(|&(_, ns_id)| self.index_manager.no_wal_pending(ns_id))
-                .filter_map(|(_, ns_id)| registry.schema(ns_id).map(|s| (ns_id, s.live_field_ids())))
-                .collect()
-        };
-        if namespaces.is_empty() {
-            return;
-        }
-
-        let wal_tail = self.wal_metadata.read().tail;
-        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
-        for (ns_id, fields) in namespaces {
-            for field_id in fields {
-                if self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail) == crate::db::index_manager::CheckpointState::Absent {
-                    continue;
-                }
-                error!(
-                    "[NO-WAL] ns={ns_id} field={field_id}: the previous run ended uncleanly with no-WAL writes outstanding. \
-                     Those writes have no WAL entries, so their index updates cannot be replayed — the field index is INCOMPLETE \
-                     and needs a full rebuild."
-                );
-                let gap = crate::db::index_manager::GapRecord {
-                    namespace_id: ns_id,
-                    field_id,
-                    cause: crate::db::index_manager::GapCause::NoWalWrites,
-                    from: 0,
-                    to: 0,
-                    missing_segments: Vec::new(),
-                    detected_at_ms,
-                    repair: crate::db::index_manager::RepairMode::FullRebuild,
-                };
-                if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
-                    warn!("[NO-WAL] failed to record gap for ns={ns_id} field={field_id}: {e:?}");
-                }
-            }
-            // The condition is now recorded, so the marker has done its job.
-            if let Err(e) = self.index_manager.clear_no_wal_pending(ns_id) {
-                warn!("[NO-WAL] failed to clear the no-WAL marker for ns={ns_id}: {e:?}");
-            }
-        }
-    }
-
-    /// Turn field-index updates rejected since the last checkpoint into durable
-    /// gap records.
-    ///
-    /// Deliberately deferred to here rather than done on the write path: a gap
-    /// record is an fsync, and a field that rejects every write would otherwise
-    /// pay one per write. Deferring is sound because the buffer and the index
-    /// share a durability point — a crash that loses a buffered key also lost
-    /// the index update it describes, and WAL replay re-runs the write,
-    /// re-rejects it, and re-buffers the key.
-    ///
-    /// Best-effort: a failure to record is logged, never propagated, so a
-    /// reporting problem cannot fail a checkpoint that is otherwise persisting
-    /// real index state.
-    fn persist_rejected_update_gaps(&self) {
-        if self.rejected_index_updates.is_empty() {
-            return;
-        }
-        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
-        for ((ns_id, field_id), rejected) in self.rejected_index_updates.drain() {
-            let repair = if rejected.overflowed {
-                crate::db::index_manager::RepairMode::FullRebuild
-            } else {
-                crate::db::index_manager::RepairMode::RowScoped {
-                    keys: rejected.keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
-                }
-            };
-            warn!(
-                "[IndexCheckpoint] ns={ns_id} field={field_id}: recording a gap for {} rejected index update(s){}",
-                rejected.keys.len(),
-                if rejected.overflowed {
-                    " (overflowed — full rebuild required)"
-                } else {
-                    ""
-                }
-            );
-            let gap = crate::db::index_manager::GapRecord {
-                namespace_id: ns_id,
-                field_id,
-                cause: crate::db::index_manager::GapCause::RejectedUpdate,
-                // A rejected update is not a WAL replay window — the key is known
-                // exactly, so there is no range to record.
-                from: 0,
-                to: 0,
-                missing_segments: Vec::new(),
-                detected_at_ms,
-                repair,
-            };
-            if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
-                warn!("[IndexCheckpoint] failed to record rejected-update gap for ns={ns_id} field={field_id}: {e:?}");
-            }
-        }
-    }
-
-    /// Harvest the keys held by segments the backstop is about to reclaim, and
-    /// record a durable gap for every active field index that needed them.
-    ///
-    /// **Must be called before the segment files are unlinked.** The affected
-    /// keys live only in those files: a gap record holding a WAL range and
-    /// segment ids cannot name them, and detection at the next open — where the
-    /// original `detect_replay_gap` runs — is permanently too late, because by
-    /// then the evidence is gone. This is the single moment row-scoped repair is
-    /// possible at all.
-    ///
-    /// The WAL is shared across namespaces, so a segment's keys are attributed by
-    /// [`WalEntry::namespace_id`](crate::db::wal::WalEntry) to each `(ns, field)`
-    /// whose checkpoint sits at or below the reclaimed segment. A field already
-    /// checkpointed past a segment did not need it and gets no gap.
-    ///
-    /// Best-effort: a failure here is logged, not propagated. Losing the record
-    /// is bad, but aborting GC would leave the WAL growing without bound — the
-    /// very outage the backstop exists to prevent.
-    fn record_backstop_gaps(&self, forced: &[u64], wal_tail: u64) {
-        // Which active fields needed each reclaimed segment, by checkpoint offset.
-        let mut affected: Vec<(u32, FieldId, u64)> = Vec::new();
-        {
-            let fields = self.registry.read().all_indexed_fields();
-            let stores = self.stores.read();
-            for (ns_id, field_id) in fields {
-                let Some(store) = stores.get(&ns_id) else { continue };
-                let ns_index = store.namespace_index.read();
-                let Some(entry) = ns_index.get(field_id) else { continue };
-                let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-                // Same suppression as the watermark: a never-checkpointed empty
-                // index is populated by a build, not by replay, so it loses
-                // nothing when a segment goes.
-                if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                    continue;
-                }
-                affected.push((ns_id, field_id, self.wal.segment_id_for_offset(state.replay_offset())));
-            }
-        }
-        if affected.is_empty() {
-            return;
-        }
-
-        // Harvest once per segment; the same keys usually serve several fields.
-        let mut keys_by_ns: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
-        for &segment_id in forced {
-            match self.wal.scan_segment_keys(segment_id) {
-                Ok(pairs) => {
-                    for (ns_id, key) in pairs {
-                        keys_by_ns.entry(ns_id).or_default().push(key);
-                    }
-                }
-                Err(e) => warn!("[WAL GC] could not harvest keys from segment {segment_id} before reclaiming it: {e:?}"),
-            }
-        }
-
-        let cap = Self::GAP_KEY_WORKLIST_CAP;
-        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
-        for (ns_id, field_id, field_segment) in affected {
-            // A field checkpointed past every reclaimed segment lost nothing.
-            if !forced.iter().any(|&s| s >= field_segment) {
-                continue;
-            }
-            let keys = keys_by_ns.get(&ns_id).cloned().unwrap_or_default();
-            // Past the cap the worklist is dropped and the field is marked for a
-            // full rebuild — a wedged checkpoint worker could otherwise strand a
-            // key set large enough to be its own problem.
-            let repair = if keys.is_empty() || keys.len() > cap {
-                crate::db::index_manager::RepairMode::FullRebuild
-            } else {
-                crate::db::index_manager::RepairMode::RowScoped {
-                    keys: keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
-                }
-            };
-            let gap = crate::db::index_manager::GapRecord {
-                namespace_id: ns_id,
-                field_id,
-                cause: crate::db::index_manager::GapCause::BackstopReclaim,
-                from: self.index_manager.read_checkpoint(ns_id, field_id, wal_tail),
-                to: wal_tail,
-                missing_segments: forced.to_vec(),
-                detected_at_ms,
-                repair,
-            };
-            if let Err(e) = self.index_manager.record_gap(gap, cap) {
-                warn!("[WAL GC] failed to record index gap for ns={ns_id} field={field_id}: {e:?}");
-            }
-        }
-    }
-
-    /// Decide which fully-persisted, non-current WAL segments this GC pass may
-    /// reclaim, given the index-replay watermark.
-    ///
-    /// Pure and side-effect free so `has_deletable_wal_segments` and
-    /// `garbage_collect_wal` cannot disagree about what is reclaimable — if they
-    /// did, the worker would either spin on segments GC refuses or skip the pass
-    /// that is meant to fire the backstop.
-    fn plan_wal_gc(&self, wal_metadata: &WalMetadata, current_segment_id: u64, watermark: Option<u64>) -> WalGcPlan {
-        let ready: Vec<u64> = wal_metadata
-            .tracked_segments()
-            .take_while(|&s| s < current_segment_id)
-            .filter(|&s| {
-                let total = wal_metadata.segment_total(s);
-                // `>=` rather than `==`: a fully-persisted segment has
-                // persisted == total; accepting `>` too keeps GC unwedged if a
-                // persisted counter is ever over-reported, instead of stranding
-                // the segment forever.
-                total > 0 && wal_metadata.segment_persisted(s) >= total
-            })
-            .collect();
-
-        let Some(watermark) = watermark else {
-            return WalGcPlan {
-                reclaim: ready,
-                deferred: 0,
-                forced: Vec::new(),
-            };
-        };
-
-        let (pinned, free): (Vec<u64>, Vec<u64>) = ready.into_iter().partition(|&s| s >= watermark);
-
-        // Backstop: past the cap, reclaim the oldest pinned segments anyway
-        // rather than let a wedged checkpoint worker grow the WAL without bound.
-        // `tracked_segments` is ascending, so `partition` keeps `pinned` ascending
-        // and `take` picks the oldest. This knowingly strands part of a field
-        // index — see `ThresholdConfig::max_pinned_wal_segments`.
-        let cap = self.config.threshold_config.max_pinned_wal_segments as usize;
-        let force_count = if cap == 0 { 0 } else { pinned.len().saturating_sub(cap) };
-        let forced: Vec<u64> = pinned.iter().take(force_count).copied().collect();
-
-        let mut reclaim = free;
-        reclaim.extend(forced.iter().copied());
-        reclaim.sort_unstable();
-
-        WalGcPlan {
-            reclaim,
-            deferred: pinned.len() - force_count,
-            forced,
-        }
-    }
-
-    pub fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
-        if self
-            .wal_gc_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            let (total, persisted) = self.get_wal_gc_stats();
-            return Ok((0, total.saturating_sub(persisted)));
-        }
-
-        struct WalGcGuard<'a>(&'a AtomicBool);
-        impl<'a> Drop for WalGcGuard<'a> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _guard = WalGcGuard(&self.wal_gc_in_progress);
-
-        // Compute the watermark BEFORE taking the metadata write lock: it reads
-        // the registry, the stores and each active field's checkpoint marker, and
-        // holding the WAL metadata lock across all of that would widen the
-        // window against every writer for no benefit. A tail that advances in
-        // between only makes the watermark more conservative (a stale, smaller
-        // tail can make a marker read as `Unusable`, which pins from 0), never
-        // less.
-        let watermark = self.index_replay_watermark_segment();
-
-        let mut wal_metadata = self.wal_metadata.write();
-        let current_segment_id = if wal_metadata.tail == 0 {
-            0
-        } else {
-            self.wal.segment_id_for_offset(wal_metadata.tail - 1)
-        };
-
-        // Persist the current sequence high-water mark BEFORE deleting any segment.
-        // This ensures recover_sequence always finds a hint >= the max sequence
-        // in any segment that survives, even if those segments are later deleted.
-        wal_metadata.last_sequence = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
-
-        let mut bytes_reclaimed = 0u64;
-        let mut segments_deleted = 0u64;
-        let plan = self.plan_wal_gc(&wal_metadata, current_segment_id, watermark);
-        if !plan.forced.is_empty() {
-            // The backstop is about to reclaim segments at least one active field
-            // index still needed. Harvest the affected keys FIRST: they exist only
-            // in these files, and once unlinked no gap record could ever name
-            // them. This is the only moment row-scoped repair is possible.
-            error!(
-                "[WAL GC] index-replay watermark held {} segment(s), over the cap of {} — reclaiming the {} oldest ANYWAY. \
-                 Field indices covering those segments are now INCOMPLETE. Is the index checkpoint worker running?",
-                plan.deferred + plan.forced.len(),
-                self.config.threshold_config.max_pinned_wal_segments,
-                plan.forced.len(),
-            );
-            let wal_tail = wal_metadata.tail;
-            self.record_backstop_gaps(&plan.forced, wal_tail);
-        }
-        for segment_id in plan.reclaim {
-            let total = wal_metadata.segment_total(segment_id);
-            let persisted = wal_metadata.segment_persisted(segment_id);
-            if self.wal.delete_segment_file(segment_id).is_ok() {
-                bytes_reclaimed = bytes_reclaimed.saturating_add(self.wal.segment_size());
-                segments_deleted += 1;
-                wal_metadata.total_entries = wal_metadata.total_entries.saturating_sub(total);
-                wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_sub(persisted);
-                wal_metadata.clear_segment(segment_id);
-            }
-        }
-
-        // Advance head past all consecutively deleted/empty segments so that a
-        // subsequent scan_entries(head, tail) never tries to open a deleted file.
-        // Segments with segment_total == 0 were either deleted in this run or in
-        // a previous one; either way their files are gone.
-        let head_segment = wal_metadata.head / self.wal.segment_size();
-        let first_live = (head_segment..=current_segment_id)
-            .find(|&sid| sid == current_segment_id || wal_metadata.segment_total(sid) > 0)
-            .unwrap_or(current_segment_id);
-        let new_head = first_live * self.wal.segment_size();
-        if new_head > wal_metadata.head {
-            wal_metadata.head = new_head;
-        }
-        // Trim per-segment counters below the new head so the dense vecs track
-        // only the live segment window instead of growing with every segment
-        // ever created (keeps `base_segment_id == head`'s segment).
-        wal_metadata.trim_segments_before(first_live);
-
-        wal_metadata.total_gc_runs = wal_metadata.total_gc_runs.saturating_add(1);
-        wal_metadata.total_bytes_reclaimed = wal_metadata.total_bytes_reclaimed.saturating_add(bytes_reclaimed);
-        let remaining = wal_metadata.total_entries.saturating_sub(wal_metadata.persisted_entries);
-        drop(wal_metadata);
-        self.flush_wal_metadata_internal()?;
-
-        crate::db::metrics::Metrics::bump(&self.metrics.wal_gc_runs);
-        crate::db::metrics::Metrics::add(&self.metrics.wal_segments_deleted, segments_deleted);
-
-        // Liveness: the pin can only drain when a checkpoint advances the
-        // fields' recorded offsets, so ask for one now and let the next GC tick
-        // reclaim. Without this, retention would track the ~15 min checkpoint
-        // timer instead of checkpoint latency. Debounced inside the trigger, and
-        // deliberately uncapped — `request_if_over_cap` returns early when the
-        // backpressure valve is disabled.
-        if plan.deferred > 0 {
-            debug!(
-                "[WAL GC] {} segment(s) pinned by the index-replay watermark; requesting an index checkpoint",
-                plan.deferred
-            );
-            if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
-                trigger.request();
-            }
-        }
-
-        Ok((bytes_reclaimed, remaining))
     }
 
     // ── Value log GC (per namespace) ───────────────────────────────────
@@ -3500,7 +2687,10 @@ impl TtlTarget for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Query, WAL GC and index-health now live in sibling modules; their tests
+    // still run from here because they share the fixtures below.
     use crate::db::config::{ScheduledTaskConfig, SyncConfig, ThresholdConfig};
+    use crate::db::namespace::FieldRepairOutcome;
     use crate::store::lsm::lsm_tree::LSMConfig;
     use tempfile::TempDir;
 
