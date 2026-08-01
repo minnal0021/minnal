@@ -262,7 +262,7 @@ impl Db {
     /// Get or create a namespace with a TTL and return a scoped handle.
     ///
     /// Records in this namespace will be automatically expired after `ttl`.
-    /// Note: the TTL worker is only active when using `AsyncDatabase`.
+    /// Note: the TTL worker is only active when using [`AsyncDb`].
     /// In sync mode, the KVStore stores the TTL but no background worker runs.
     ///
     /// ```rust,no_run
