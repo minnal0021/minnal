@@ -11,6 +11,10 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
 | `src/db/facade.rs` | `Db` and `AsyncDb` — the only entry points callers use |
 | `src/db/database.rs` | Internal coordinator: owns all subsystems, routes ops |
+| `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("index")` or `format!("ns_{}", ..)` |
+| `src/db/query.rs` | Predicate evaluation against the field indices (`Database` methods) |
+| `src/db/wal_gc.rs` | WAL GC + the index-replay watermark + the backstop key harvest |
+| `src/db/index_health.rs` | Gap records, index health, repair, no-WAL tracking (FR-001 remediation) |
 | `src/db/namespace.rs` | Namespace metadata, `FieldMeta`, `FieldId` |
 | `src/db/namespace_index.rs` | Per-namespace index registry, `ExtractorFn`, `RowIdFn`, `RowToKeyFn` |
 | `src/db/config.rs` | `DbConfig`, `SyncConfig`, `ThresholdConfig`, `ScheduledTaskConfig` |
@@ -183,6 +187,10 @@ Dropping a field index goes through `Database::drop_field_index`, which **persis
 ## Public API surface
 
 `Db` / `AsyncDb` (facade) with namespaces are the only entry points. `Namespace` is the scoped per-namespace handle returned by `Db::namespace()`.
+
+**Where does a new operation go?** Four entry types with overlapping surfaces (`Db`, `Namespace`, `AsyncDb`, `AsyncNamespace`) means every operation exists at least twice, and the sync/async split is inherent to offering both. The rule, so the split stops drifting: an operation goes on **`Namespace`** if it acts on one namespace's keys or its indices, and on **`Db`** if it spans namespaces, touches the shared WAL, or is engine-wide (stats, GC, compaction, worker control). Async mirrors sync exactly — never add to one side only. A 2026-08-01 review found this choice looked arbitrary from outside because it had never been written down; that was the whole problem.
+
+There is **one** async wrapper. A second (`AsyncDatabase`) existed for a long time with no callers but its own tests, and its independent worker-management copy silently diverged — `AsyncDb::shutdown` never stopped the index checkpoint worker, and nothing noticed because the dead wrapper did. Deleted in `cef37d9`; don't reintroduce a parallel surface.
 
 `Database`, `AsyncDatabase`, and `KVStore` are **internal** types: `Database`/`AsyncDatabase` is the coordinator behind `Db`/`AsyncDb`; `KVStore` is the per-namespace store behind `Namespace`. They are no longer re-exported from the crate root (the deprecated `pub use` aliases were removed). Refer to them only via internal paths (`crate::db::database::Database`, `crate::db::kv_store::KVStore`).
 

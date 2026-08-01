@@ -771,6 +771,15 @@ documented.
 **Severity:** Low — layering; no defect, no user-visible symptom
 **Source:** engine correctness review 2026-07-25, item 5 (the half the
 decomposition could not reach)
+**Reaffirmed:** 2026-08-01 tech-debt review — the priority is right, but record
+*why*. The cost is not confusion today; it is that the document layer cannot be
+changed or replaced without dragging along a pile of forwarders that have
+nothing to do with documents, and that anyone wanting the engine *without*
+documents finds these diagnostics unavailable. Measured at that review: at least
+9 engine-level calls in `admin_storage.rs` alone route through `state.store`.
+**Interim rule (no migration needed):** stop adding to it. When the server needs
+something new from the engine, give it an engine handle rather than another
+forwarder — the existing ones then decay instead of needing a coordinated move.
 
 ### Summary
 
