@@ -36,8 +36,8 @@
 //! ### The slot table is write-only (do not "optimise" the rebuild away)
 //!
 //! `rows.slots` is mapped from a file purely to keep it off the heap: a slot is
-//! 40 bytes held under a 0.7 load factor, so ~57–114 bytes are resident per
-//! distinct key ever written — 671 MB at 10M keys. Anonymous pages can be
+//! 24 bytes held under a 0.7 load factor, so ~34–69 bytes are resident per
+//! distinct key ever written — 384 MiB at 10M keys. Anonymous pages can be
 //! swapped but never *dropped*, so that was unreclaimable while the store was
 //! open; file-backed pages the kernel can evict and re-read.
 //!
@@ -92,9 +92,7 @@ const MARKER_SIZE: usize = 40;
 /// `[key_off: u64 LE | key_len: u32 LE]` per ID in `rows.idarray`.
 const ID_ENTRY_SIZE: usize = 12;
 
-const SLOT_SIZE: usize = 40;
-const SLOT_EMPTY: u8 = 0;
-const SLOT_OCCUPIED: u8 = 1;
+const SLOT_SIZE: usize = 24;
 
 const INITIAL_SLOT_CAP: usize = 16;
 const INITIAL_KEYBYTES: usize = 4096;
@@ -102,54 +100,72 @@ const INITIAL_IDARRAY: usize = INITIAL_SLOT_CAP * ID_ENTRY_SIZE;
 
 // ── Slot (file-backed hash table; see the module docs) ─────────────────────────
 //
-// Byte layout (40 bytes):
-//   0       state: u8
-//   1..8    pad
-//   8..16   hash:    u64 LE  (full-byte hash, for fast reject before key compare)
-//   16..24  key_off: u64 LE  (offset into the key-bytes region)
-//   24..28  key_len: u32 LE
-//   28..32  pad
-//   32..40  id:      u64 LE
+// Byte layout (24 bytes), packed — every field is read with `from_le_bytes` on a
+// byte slice, so nothing here needs alignment padding:
+//
+//   0..8    id_plus_one: u64 LE  (0 ⇒ EMPTY; an occupied slot stores id + 1)
+//   8..16   key_off:     u64 LE  (offset into the key-bytes region)
+//   16..20  key_len:     u32 LE
+//   20..24  hash:        u32 LE  (low 32 bits of the key's FNV-1a hash)
+//
+// **A zero-filled slot must read as EMPTY**, which is what lets `create_file`'s
+// truncate produce a valid empty table for free. Row IDs are dense from 0, so a
+// raw `id` cannot be the sentinel — hence the `+ 1` encoding.
+//
+// The previous layout was 40 bytes, 11 of them padding that bought nothing.
 
 #[derive(Clone, Copy)]
 struct Slot {
-    state: u8,
-    hash: u64,
+    hash: u32,
     key_off: u64,
     key_len: u32,
     id: u64,
 }
 
-fn read_slot(data: &[u8], i: usize) -> Slot {
+/// Read slot `i`, or `None` when it is empty.
+fn read_slot(data: &[u8], i: usize) -> Option<Slot> {
     let b = i * SLOT_SIZE;
-    Slot {
-        state: data[b],
-        hash: u64::from_le_bytes(data[b + 8..b + 16].try_into().unwrap()),
-        key_off: u64::from_le_bytes(data[b + 16..b + 24].try_into().unwrap()),
-        key_len: u32::from_le_bytes(data[b + 24..b + 28].try_into().unwrap()),
-        id: u64::from_le_bytes(data[b + 32..b + 40].try_into().unwrap()),
+    let id_plus_one = u64::from_le_bytes(data[b..b + 8].try_into().unwrap());
+    if id_plus_one == 0 {
+        return None;
     }
+    Some(Slot {
+        id: id_plus_one - 1,
+        key_off: u64::from_le_bytes(data[b + 8..b + 16].try_into().unwrap()),
+        key_len: u32::from_le_bytes(data[b + 16..b + 20].try_into().unwrap()),
+        hash: u32::from_le_bytes(data[b + 20..b + 24].try_into().unwrap()),
+    })
 }
 
+/// Write an **occupied** slot. There is no way to write an empty one because
+/// entries are never removed; emptiness comes only from zeroed bytes.
 fn write_slot(data: &mut [u8], i: usize, s: &Slot) {
     let b = i * SLOT_SIZE;
-    data[b] = s.state;
-    data[b + 1..b + 8].fill(0);
-    data[b + 8..b + 16].copy_from_slice(&s.hash.to_le_bytes());
-    data[b + 16..b + 24].copy_from_slice(&s.key_off.to_le_bytes());
-    data[b + 24..b + 28].copy_from_slice(&s.key_len.to_le_bytes());
-    data[b + 28..b + 32].fill(0);
-    data[b + 32..b + 40].copy_from_slice(&s.id.to_le_bytes());
+    data[b..b + 8].copy_from_slice(&(s.id + 1).to_le_bytes());
+    data[b + 8..b + 16].copy_from_slice(&s.key_off.to_le_bytes());
+    data[b + 16..b + 20].copy_from_slice(&s.key_len.to_le_bytes());
+    data[b + 20..b + 24].copy_from_slice(&s.hash.to_le_bytes());
 }
 
-/// FNV-1a over the raw key bytes.
-fn hash_bytes(key: &[u8]) -> u64 {
+/// FNV-1a over the raw key bytes, truncated to 32 bits.
+///
+/// Two independent uses, and the truncation is safe for both:
+///
+/// - **Position** (`hash % cap`). `cap` is a power of two, so this only ever
+///   consumed the low `log2(cap)` bits — the high half was never read. Keeping
+///   32 bits is therefore identical placement, not an approximation, as long as
+///   `cap <= 2^32` (asserted in `rehash`; 2^32 slots would be a 96 GiB table).
+/// - **Fast reject** before comparing key bytes. A 32-bit tag collides one time
+///   in ~4 billion *within a probe chain*, and a collision costs one key compare
+///   that then rejects — the key comparison is what decides, so this cannot
+///   return a wrong id.
+fn hash_bytes(key: &[u8]) -> u32 {
     let mut h = 0xcbf29ce484222325u64;
     for &b in key {
         h ^= b as u64;
         h = h.wrapping_mul(0x00000100000001b3);
     }
-    h
+    h as u32
 }
 
 // ── RowMap ──────────────────────────────────────────────────────────────────────
@@ -261,7 +277,6 @@ impl RowMap {
                 me.slots.as_mut_slice(),
                 idx,
                 &Slot {
-                    state: SLOT_OCCUPIED,
                     hash,
                     key_off: off,
                     key_len: len,
@@ -345,10 +360,9 @@ impl RowMap {
     /// the same id to two keys. The load factor makes a full table unreachable
     /// (`get_or_alloc` rehashes first), so this is a cheap assertion against a
     /// silent-corruption path, not an expected condition.
-    fn insert_at(&mut self, slot_idx: usize, key: &[u8], hash: u64) -> u128 {
-        debug_assert_eq!(
-            read_slot(self.slots.as_slice(), slot_idx).state,
-            SLOT_EMPTY,
+    fn insert_at(&mut self, slot_idx: usize, key: &[u8], hash: u32) -> u128 {
+        debug_assert!(
+            read_slot(self.slots.as_slice(), slot_idx).is_none(),
             "insert would overwrite an occupied slot ({slot_idx})"
         );
         let id = self.next_id;
@@ -369,17 +383,7 @@ impl RowMap {
         ida[base..base + 8].copy_from_slice(&key_off.to_le_bytes());
         ida[base + 8..base + 12].copy_from_slice(&key_len.to_le_bytes());
 
-        write_slot(
-            self.slots.as_mut_slice(),
-            slot_idx,
-            &Slot {
-                state: SLOT_OCCUPIED,
-                hash,
-                key_off,
-                key_len,
-                id,
-            },
-        );
+        write_slot(self.slots.as_mut_slice(), slot_idx, &Slot { hash, key_off, key_len, id });
         self.next_id += 1;
         id as u128
     }
@@ -396,16 +400,15 @@ impl RowMap {
         slot.key_len as usize == key.len() && &self.keybytes.as_slice()[slot.key_off as usize..slot.key_off as usize + slot.key_len as usize] == key
     }
 
-    fn probe(&self, key: &[u8], hash: u64) -> Probe {
+    fn probe(&self, key: &[u8], hash: u32) -> Probe {
         let start = (hash as usize) % self.cap;
         let data = self.slots.as_slice();
         let mut i = start;
         loop {
-            let s = read_slot(data, i);
-            match s.state {
-                SLOT_EMPTY => return Probe::Empty(i),
-                SLOT_OCCUPIED if s.hash == hash && self.key_eq(&s, key) => return Probe::Found(s.id),
-                _ => {}
+            match read_slot(data, i) {
+                None => return Probe::Empty(i),
+                Some(s) if s.hash == hash && self.key_eq(&s, key) => return Probe::Found(s.id),
+                Some(_) => {}
             }
             i = (i + 1) % self.cap;
             if i == start {
@@ -425,12 +428,12 @@ impl RowMap {
     /// engine to fail. Panicking says what went wrong. (Reachable, for example,
     /// if the slot file were ever adopted from disk instead of rebuilt, leaving
     /// stale entries on top of the rebuilt ones — see the module docs.)
-    fn find_empty(&self, _key: &[u8], hash: u64) -> usize {
+    fn find_empty(&self, _key: &[u8], hash: u32) -> usize {
         let start = (hash as usize) % self.cap;
         let data = self.slots.as_slice();
         let mut i = start;
         for _ in 0..self.cap {
-            if read_slot(data, i).state == SLOT_EMPTY {
+            if read_slot(data, i).is_none() {
                 return i;
             }
             i = (i + 1) % self.cap;
@@ -461,15 +464,15 @@ impl RowMap {
         let new_cap = self.cap * 2;
         let tmp_path = self.dir.join(SLOTS_TMP_FILE);
         let mut new_slots = GrowableMmap::create_file(&tmp_path, new_cap * SLOT_SIZE).expect("rehash slot file alloc failed");
+        // The stored 32-bit hash must place a key exactly where a freshly
+        // computed one would; that holds only while `cap` fits in 32 bits.
+        debug_assert!(new_cap <= u32::MAX as usize, "slot capacity outgrew the 32-bit stored hash");
         let old = self.slots.as_slice();
         for i in 0..self.cap {
-            let s = read_slot(old, i);
-            if s.state != SLOT_OCCUPIED {
-                continue;
-            }
+            let Some(s) = read_slot(old, i) else { continue };
             let mut j = (s.hash as usize) % new_cap;
             let nd = new_slots.as_mut_slice();
-            while read_slot(nd, j).state != SLOT_EMPTY {
+            while read_slot(nd, j).is_some() {
                 j = (j + 1) % new_cap;
             }
             write_slot(new_slots.as_mut_slice(), j, &s);
@@ -605,6 +608,50 @@ mod tests {
         assert_eq!(slot_bytes, (rm.cap * SLOT_SIZE) as u64);
     }
 
+    /// Measurement, not a correctness check — run explicitly (use `--release`,
+    /// a debug build is not representative):
+    /// `cargo test -p minnal_db --release --lib rebuild_cost -- --ignored --nocapture`
+    ///
+    /// Times the `open` rebuild, which is the price phase 1 keeps paying to
+    /// avoid ever adopting slot-file contents. `MINNAL_ROWMAP_KEYS` overrides
+    /// the key count.
+    #[test]
+    #[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
+    fn rebuild_cost() {
+        let n: u32 = std::env::var("MINNAL_ROWMAP_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+        let dir = TempDir::new().unwrap();
+
+        let t0 = std::time::Instant::now();
+        {
+            let mut rm = RowMap::create(dir.path()).unwrap();
+            for i in 0..n {
+                rm.get_or_alloc(format!("key-{i:010}").as_bytes());
+            }
+            rm.flush(1).unwrap();
+        }
+        let populate = t0.elapsed();
+
+        // Re-open several times so page-cache-warm cost is visible separately
+        // from the first (cold-ish) open.
+        let mut opens = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let rm = RowMap::open(dir.path()).unwrap();
+            opens.push(t.elapsed());
+            assert_eq!(rm.next_id(), n as u64);
+        }
+
+        let slot_mib = std::fs::metadata(dir.path().join(SLOTS_FILE)).unwrap().len() / (1024 * 1024);
+        println!(
+            "keys={n} slot_file={slot_mib} MiB  populate={:?}  open_rebuild={:?} {:?} {:?}  (~{:.0} ns/key)",
+            populate,
+            opens[0],
+            opens[1],
+            opens[2],
+            opens[2].as_nanos() as f64 / n as f64
+        );
+    }
+
     /// Phase 1: the slot table is backed by a real file, not anonymous memory.
     /// That is the whole point — anonymous pages can be swapped but never
     /// dropped, so they are unreclaimable RSS for the life of the store.
@@ -668,7 +715,7 @@ mod tests {
             let _ = RowMap::open(dir.path()).unwrap();
             let data = std::fs::read(dir.path().join(SLOTS_FILE)).unwrap();
             (0..data.len() / SLOT_SIZE)
-                .find(|&i| read_slot(&data, i).state == SLOT_EMPTY)
+                .find(|&i| read_slot(&data, i).is_none())
                 .expect("a table under 0.7 load must have empty slots")
         };
 
@@ -686,7 +733,6 @@ mod tests {
                 &mut poisoned,
                 0,
                 &Slot {
-                    state: SLOT_OCCUPIED,
                     hash: hash_bytes(b"doc:142"),
                     key_off: 0,
                     key_len: 7,
@@ -716,9 +762,7 @@ mod tests {
         // the ones the rebuild just wrote. Anything else is residue that a future
         // lookup could reach.
         let data = std::fs::read(dir.path().join(SLOTS_FILE)).unwrap();
-        let occupied = (0..data.len() / SLOT_SIZE)
-            .filter(|&i| read_slot(&data, i).state == SLOT_OCCUPIED)
-            .count();
+        let occupied = (0..data.len() / SLOT_SIZE).filter(|&i| read_slot(&data, i).is_some()).count();
         assert_eq!(occupied, 100, "the slot file must hold exactly the rebuilt entries, no residue");
     }
 
