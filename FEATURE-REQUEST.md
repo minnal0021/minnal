@@ -11,7 +11,7 @@ re-check them before starting work.
 
 | # | Title | Area | Severity | Status |
 |---|---|---|---|---|
-| [FR-001](#fr-001--prevent-capture-surface-and-remediate-field-index-replay-gaps) | Prevent, capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | **Planned — 2026-08-01** |
+| [FR-001](#fr-001--prevent-capture-surface-and-remediate-field-index-replay-gaps) | Prevent, capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | ✅ **Done — 2026-08-01** |
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
@@ -28,6 +28,7 @@ re-check them before starting work.
 writes, rejected index updates), without which the degraded-query signal would
 report false completeness; dropped-index cleanup corrected against the code and
 re-scoped around a persisted `dropped` flag.
+**✅ Implemented:** 2026-08-01, all five steps — see *Implementation* below.
 **Area:** `minnal_db` (WAL GC, index checkpoint), `minnal_db_api` (admin surface)
 **Severity:** High — silent incomplete query results
 **Related:** detection-only logging landed in `51ee29f` (see *What already
@@ -50,6 +51,12 @@ lifetime of the database** — queries return incomplete results with no error.
 
 Today the only remedy is to drop and re-add the index, which the operator has no
 reason to do because nothing tells them the index is incomplete.
+
+> **Resolved 2026-08-01.** Everything from here to *Acceptance criteria* is the
+> original analysis, kept because it is the reasoning behind the design rather
+> than a description of the current code. For what shipped, see *Implementation*
+> at the end; the present-tense "today" claims below describe the state before
+> that work.
 
 Measured severity (`wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`,
 reproduced through ordinary writes → flush → GC with nothing hand-corrupted):
@@ -82,6 +89,8 @@ still required; see *Implementation order*.
 ### Scope
 
 #### Must have
+
+*(All shipped 2026-08-01 — see* Acceptance criteria *for the test pinning each.)*
 
 - **Prevention: gate WAL GC on the index-replay watermark.** WAL GC must not
   reclaim a segment the index checkpoint still needs. Full design in *Prevention*
@@ -496,32 +505,104 @@ the row map*.
 
 ### Acceptance criteria
 
-- WAL GC does not reclaim a segment that any active field index still needs for
-  replay, proven by the inverse of
-  `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`.
-- A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
+All met as of 2026-08-01. The test pinning each one is named beside it; all live
+in `minnal_db/src/db/database.rs` unless stated.
+
+- [x] WAL GC does not reclaim a segment that any active field index still needs
+  for replay, proven by the inverse of
+  `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`. —
+  `wal_gc_does_not_reclaim_segments_an_active_field_index_still_needs`
+- [x] A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
   does not pin WAL GC; a crash mid-drop never yields a registered field whose
-  data is gone, and the leftover directory is reclaimed at the next open.
-- Activating a field marked `dropped` fails loudly rather than coming up empty.
-- A namespace with outstanding no-WAL writes at an unclean shutdown comes up with
-  a recorded, visible, repairable gap rather than a silently incomplete index.
-- An index update rejected by a field's `DynFieldIndex` produces a gap record for
-  that key, not just a log line.
-- Pinned WAL is bounded: with the checkpoint worker stopped, retention stops at
-  the backstop cap rather than growing without limit.
-- A replay gap detected at open is recorded durably and still visible after a
-  restart.
-- The admin API reports outstanding gaps per namespace/field.
-- A gap recorded by the backstop names the affected keys, and a restart preserves
-  that worklist.
-- An operator can trigger a row-scoped re-index that repairs only those keys and
-  clears the gap record on success; the full-rebuild fallback is reachable when
-  the worklist cap was exceeded.
-- Re-indexing does not re-put documents through the WAL.
-- A query against a field with an outstanding gap returns results **and** an
-  indication that the index is degraded — never a complete-looking result set.
-- A namespace with no field indices is unaffected on every path, and WAL
-  retention is unchanged for it.
+  data is gone, and the leftover directory is reclaimed at the next open. —
+  `test_drop_field_index_deletes_its_directory`,
+  `test_dropped_field_is_excluded_from_checkpoint_fields`,
+  `test_interrupted_field_drop_is_completed_at_open`
+- [x] Activating a field marked `dropped` fails loudly rather than coming up
+  empty. — `test_activating_a_dropped_field_is_rejected`
+- [x] A namespace with outstanding no-WAL writes at an unclean shutdown comes up
+  with a recorded, visible, repairable gap rather than a silently incomplete
+  index. — `unclean_shutdown_with_no_wal_writes_records_a_full_rebuild_gap`, plus
+  `clean_shutdown_after_no_wal_writes_records_no_gap` for the negative case
+- [x] An index update rejected by a field's `DynFieldIndex` produces a gap record
+  for that key, not just a log line. —
+  `a_rejected_index_update_is_recorded_as_a_gap`
+- [x] Pinned WAL is bounded: with the checkpoint worker stopped, retention stops
+  at the backstop cap rather than growing without limit. —
+  `backstop_bounds_wal_pinned_by_the_index_watermark`
+- [x] A replay gap detected at open is recorded durably and still visible after a
+  restart. — `backstop_records_a_gap_naming_the_affected_keys` (reopens and
+  re-reads the record)
+- [x] The admin API reports outstanding gaps per namespace/field. —
+  `index_health_reports_gaps_per_field`; `GET /admin/indices/{ns}/health`
+- [x] A gap recorded by the backstop names the affected keys, and a restart
+  preserves that worklist. — `backstop_records_a_gap_naming_the_affected_keys`
+- [x] An operator can trigger a row-scoped re-index that repairs only those keys
+  and clears the gap record on success; the full-rebuild fallback is reachable
+  when the worklist cap was exceeded. —
+  `row_scoped_repair_restores_the_index_and_clears_the_gap`,
+  `full_rebuild_repair_reindexes_every_key`;
+  `POST /admin/indices/{ns}/attribute/{field}/repair`
+- [x] Re-indexing does not re-put documents through the WAL. — `repair_field_index`
+  drives `KVStore::reindex_field`, which touches only the named field's bitmap
+- [x] A query against a field with an outstanding gap returns results **and** an
+  indication that the index is degraded — never a complete-looking result set. —
+  `a_query_over_a_degraded_index_reports_it`, which also covers the sharpest
+  case: an *empty* result over a degraded index still reports it
+- [x] A namespace with no field indices is unaffected on every path, and WAL
+  retention is unchanged for it. — `wal_retention_is_unchanged_without_field_indices`
+
+One criterion gained a clause during implementation. "A gap recorded by the
+backstop names the affected keys" is only achievable because detection moved
+*inside* WAL GC; a record written at the next open could never satisfy it, since
+the keys die with the segments. That is why step 3 had to precede step 5.
+
+### Implementation (2026-08-01)
+
+Six commits on `hardening_code`, `e132cee`..`a947609`. Full suite green (1162),
+`clippy -D warnings` clean on all four feature combinations, `fmt` clean.
+
+| Commit | Step | What landed |
+|---|---|---|
+| `e132cee` | — | This document: the two extra divergence sources, and step 1 corrected against the code |
+| `7e36180` | 1 | Persisted `dropped` flag, `IndexManager::remove_field_path`, `Database::drop_field_index` (persist → deregister → delete), `complete_interrupted_field_drops` at open, activation refused for a dropped field |
+| `bca5efc` | 2 | `index_replay_watermark_segment` + shared `plan_wal_gc`, uncapped `IndexCheckpointTrigger::request()`, `thresholds.max_pinned_wal_segments` backstop |
+| `ce99200` | 3 | Durable `gap.json`, harvest inside WAL GC before the unlink, all three `GapCause`s |
+| `b046cbf` | — | `Wal::walk_frames`: every WAL scan on one frame-parsing loop |
+| `a947609` | 4, 5 | `QueryOutcome`, `Page::degraded_fields`, `GET …/health`, `POST …/repair`, `repair_field_index` |
+
+#### What the code taught us that the design did not
+
+- **The predicted crash window was already live.** `doc_store::drop_index`
+  deleted the field directory and *then* saved its schema — exactly the ordering
+  this FR warned against. It also hand-built the index path past `IndexManager`.
+  Both fixed in step 1.
+- **`reindex_field` was wrong for the case repair needs most.** It returned
+  `KeyNotFound` and did nothing for an absent key. But the lost update can be the
+  **delete**, in which case the index keeps a stale row that queries as a hit —
+  wrong in the opposite direction from the bug being repaired. It now clears the
+  row; the outcome describes what it *found*, not whether it did work.
+- **The touched-field set was free.** The predicate evaluator already calls the
+  index-lookup closure once per field it needs, so `evaluate_predicate` records
+  those ids as it goes — exact, no second parse, and no way for the two to
+  disagree about what a query touched.
+- **Harvesting keys needed a new scan, and then needed consolidating.** The first
+  cut duplicated `scan_entries`' frame loop to avoid copying values, which
+  silently re-decided three recovery judgements (a missing segment is a hole to
+  skip, a short frame is a torn tail, a bad decode ends the scan). `walk_frames`
+  now backs all three scans; `key_only_scan_agrees_with_the_full_scan` pins them
+  together *including over a hole*.
+
+#### Follow-ups deliberately not done here
+
+- `Wal::scan_keys_in_entries` is public and currently used only by
+  `scan_segment_keys`. It is the natural building block for any future
+  range-scoped repair, but nothing needs it yet.
+- The row-map marker still writes a `wal_offset` at bytes 32..40 that
+  `read_marker` never reads back (noted under *The row map comes along for free*).
+  Untouched — it is write-only today and harmless.
+- Repair is operator-triggered. Automatic repair at open was not in scope; the
+  gap records make it a small addition if it is ever wanted.
 
 ---
 
