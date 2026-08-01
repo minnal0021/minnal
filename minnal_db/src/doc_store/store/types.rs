@@ -89,10 +89,11 @@ pub struct DiskBuildProgress {
 }
 
 /// Path to the build-progress file for `(ns_id, field_id)`.
+///
+/// The directory comes from [`crate::db::layout`] — the engine owns where index
+/// files live; the doc store only owns the filename it puts there.
 pub(super) fn build_progress_path(db_path: &Path, ns_id: u32, field_id: FieldId) -> PathBuf {
-    db_path
-        .join("index")
-        .join(ns_id.to_string())
+    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id)
         .join(field_id.to_string())
         .join("build_progress.json")
 }
@@ -130,7 +131,7 @@ pub struct VecReindexProgress {
 }
 
 pub(super) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
-    db_path.join("index").join(ns_id.to_string()).join("vector_reindex.json")
+    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join("vector_reindex.json")
 }
 
 pub(super) fn read_vec_reindex(path: &Path) -> Option<VecReindexProgress> {

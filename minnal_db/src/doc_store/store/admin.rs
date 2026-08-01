@@ -353,13 +353,13 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
     }
 
     for ns_name in &ns_names {
-        let ns_dir = db_path.join(format!("ns_{}", ns_name));
+        let ns_dir = crate::db::layout::namespace_data_dir(db_path, ns_name);
         if ns_dir.exists() {
             std::fs::remove_dir_all(&ns_dir)?;
         }
     }
 
-    let index_dir = db_path.join("index").join(ns_id.to_string());
+    let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id);
     if index_dir.exists() {
         std::fs::remove_dir_all(&index_dir)?;
     }
@@ -739,7 +739,7 @@ mod tests {
     /// `Drop`/`shutdown` checkpoint never ran), forcing `activate_field_index`
     /// to replay the WAL tail on the next open.
     fn rewind_index_checkpoints(db_dir: &Path) {
-        let index_dir = db_dir.join("index");
+        let index_dir = crate::db::layout::index_root(db_dir);
         let Ok(namespaces) = std::fs::read_dir(&index_dir) else { return };
         for ns in namespaces.flatten() {
             let Ok(fields) = std::fs::read_dir(ns.path()) else { continue };

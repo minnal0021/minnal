@@ -330,7 +330,7 @@ pub struct IndexManager {
 impl IndexManager {
     /// Open (or create) the index manager rooted at `{db_path}/index/`.
     pub fn open(db_path: &Path) -> Result<Arc<Self>> {
-        let index_base_path = db_path.join("index");
+        let index_base_path = crate::db::layout::index_root(db_path);
         std::fs::create_dir_all(&index_base_path)?;
         Ok(Arc::new(Self { index_base_path }))
     }
@@ -350,7 +350,13 @@ impl IndexManager {
     ///
     /// Does not create the directory or verify the field is registered.
     pub fn field_path(&self, namespace_id: u32, field_id: FieldId) -> PathBuf {
-        self.index_base_path.join(namespace_id.to_string()).join(field_id.to_string())
+        self.namespace_path(namespace_id).join(field_id.to_string())
+    }
+
+    /// Compute the on-disk path for a namespace's whole index subtree:
+    /// `{index_base}/{namespace_id}/`.
+    pub fn namespace_path(&self, namespace_id: u32) -> PathBuf {
+        crate::db::layout::namespace_index_dir(&self.index_base_path, namespace_id)
     }
 
     /// Compute the on-disk path for a namespace's dense row-ID map.
@@ -359,7 +365,7 @@ impl IndexManager {
     /// directories. (`rowmap` can never collide with a `FieldId`, which is
     /// numeric.) The `RowMap` creates the directory on first use.
     pub fn rowmap_path(&self, namespace_id: u32) -> PathBuf {
-        self.index_base_path.join(namespace_id.to_string()).join("rowmap")
+        self.namespace_path(namespace_id).join("rowmap")
     }
 
     /// Remove the entire on-disk index subtree for a namespace.
@@ -369,7 +375,7 @@ impl IndexManager {
     /// namespace is dropped. A missing directory is treated as success, so this
     /// is safe to call when the namespace had no indexed fields.
     pub fn remove_namespace_path(&self, namespace_id: u32) -> Result<()> {
-        let path = self.index_base_path.join(namespace_id.to_string());
+        let path = self.namespace_path(namespace_id);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -503,7 +509,7 @@ impl IndexManager {
 
     /// Path of a namespace's "no-WAL writes are outstanding" marker.
     fn no_wal_marker_path(&self, namespace_id: u32) -> PathBuf {
-        self.index_base_path.join(namespace_id.to_string()).join("no_wal_pending")
+        self.namespace_path(namespace_id).join("no_wal_pending")
     }
 
     /// Durably record that this namespace has taken no-WAL writes which no index
@@ -526,7 +532,7 @@ impl IndexManager {
     /// idempotent); write-then-marker can lose both and leave the index silently
     /// incomplete, which is the failure being closed.
     pub fn set_no_wal_pending(&self, namespace_id: u32) -> Result<()> {
-        let dir = self.index_base_path.join(namespace_id.to_string());
+        let dir = self.namespace_path(namespace_id);
         std::fs::create_dir_all(&dir)?;
         crate::support::write_atomic_durable(&self.no_wal_marker_path(namespace_id), b"1").map_err(KVError::Io)
     }

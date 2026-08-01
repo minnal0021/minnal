@@ -8,6 +8,7 @@ pub(crate) mod fail_log;
 pub(crate) mod index_checkpoint_worker;
 pub mod index_manager;
 pub mod kv_store;
+pub(crate) mod layout;
 pub mod metrics;
 pub mod namespace;
 pub mod namespace_index;

@@ -690,7 +690,7 @@ impl Database {
         // persisted TTL (if any) so `store.ttl` reflects the durable config.
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = db_path.join(format!("ns_{}", name));
+            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
             let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
             let kv_store = KVStore::open_with_ttl(
                 ns_id,
@@ -1099,7 +1099,7 @@ impl Database {
 
         let ns_id = self.registry.write().create(name)?;
 
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         let kv_store = KVStore::open(
             ns_id,
             name,
@@ -1152,7 +1152,7 @@ impl Database {
 
         let ns_id = self.registry.write().create(name)?;
 
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         let kv_store = KVStore::open_with_ttl(
             ns_id,
             name,
@@ -1278,7 +1278,7 @@ impl Database {
     /// This deliberately never touches the shared WAL or its metadata, so WAL
     /// replay for other namespaces is unaffected.
     fn remove_namespace_storage(&self, ns_id: u32, name: &str) {
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         match std::fs::remove_dir_all(&ns_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3131,7 +3131,7 @@ impl Database {
 
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = db_path.join(format!("ns_{}", name));
+            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
             let kv_store = KVStore::open(
                 ns_id,
                 name,
@@ -5711,7 +5711,7 @@ mod tests {
 
         // Simulate drop_index: deactivate in-memory then delete on-disk directory.
         db.deactivate_field_index(ns, field_id).unwrap();
-        let index_dir = dir.path().join("index").join(ns.to_string()).join(field_id.to_string());
+        let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir).unwrap();
         }
