@@ -285,6 +285,221 @@ fn test_concurrent_activation_of_one_field_index_does_not_kill_the_process() {
     );
 }
 
+// ── The in-flight write barrier ────────────────────────────────────────────
+//
+// Three tests for one invariant: **a WAL entry may be marked `Persisted` only
+// once its key is in an SSTable**, because recovery skips `Persisted` entries.
+//
+// Everything that drives the persisted cut is derived from a `wal_metadata.tail`
+// snapshot, and a tail snapshot over-states durability: `put_ns` appends under
+// the WAL lock and applies to the memtable *after* releasing it, so in between,
+// an entry is visible in the tail while its key is nowhere. The three tests
+// cover the two places that read the tail, plus the path that put the bug in
+// front of a user.
+//
+// Found by the 2026-08-02 stress run: 1 acknowledged write lost in 34,538, then
+// 4 lost in one round of `work/stress/repro/drop_loses_a_write.py`.
+
+/// The cut must not pass a write that is in the WAL but not yet in a memtable.
+///
+/// `try_advance_persisted` cut at the **live tail** whenever no namespace
+/// reported un-flushed writes — which is exactly the state this test sets up.
+#[test]
+fn an_in_flight_write_holds_the_persisted_watermark_back() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+
+    // Flush everything written so far, so the namespace reports nothing
+    // outstanding. Without that this test would be vacuous: a namespace with
+    // un-flushed writes pins the cut on its own.
+    for i in 0..20u32 {
+        db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+
+    // The offset a write would occupy between its WAL append and its apply.
+    let in_flight_offset = db.wal_metadata.read().tail;
+    let guard = db.wal_flush_observer.begin_write(in_flight_offset);
+
+    // Move the tail well past it, then flush again so that — but for the
+    // in-flight registration — nothing at all constrains the cut.
+    for i in 20..40u32 {
+        db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+
+    let watermark = *db.last_persisted_wal_offset.read();
+    let tail = db.wal_metadata.read().tail;
+    assert!(
+        watermark <= in_flight_offset,
+        "watermark {watermark} passed an in-flight write at {in_flight_offset} \
+         (tail {tail}) — recovery would skip a write that is in no SSTable"
+    );
+    drop(guard);
+}
+
+/// A memtable seal must not claim a write whose apply has not landed.
+///
+/// `on_memtable_sealed_ns` records "every WAL entry below this tail is in the
+/// memtable I am sealing". That is false for an in-flight write: its apply goes
+/// into the **next** memtable, while its offset sits below the recorded tail —
+/// so `advance_namespace` would push `safe_offset` past an entry no SSTable
+/// holds. This needs no namespace drop, which is why guarding only the cut
+/// would have left the bug live.
+#[test]
+fn a_memtable_seal_does_not_claim_an_unapplied_write() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+
+    for i in 0..10u32 {
+        db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+
+    let in_flight_offset = db.wal_metadata.read().tail;
+    let guard = db.wal_flush_observer.begin_write(in_flight_offset);
+
+    // These land after the in-flight write, so a seal now must not report that
+    // it captured everything up to the current tail.
+    for i in 10..30u32 {
+        db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+
+    let safe = db.wal_flush_observer.ns_progress.read().get(&ns).map(|p| p.safe_offset).unwrap_or(0);
+    assert!(
+        safe <= in_flight_offset,
+        "seal recorded safe_offset {safe}, past the in-flight write at {in_flight_offset}"
+    );
+    drop(guard);
+}
+
+/// The path a user actually hit: dropping a store while another namespace writes.
+///
+/// `forget_namespace` calls `try_advance_persisted()` the instant it removes the
+/// dropped namespace from `ns_progress` — deliberately, to unpin the cut — and
+/// that is precisely when the set of namespaces reporting un-flushed writes can
+/// go empty while a survivor is mid-write. Measured before the fix: 4
+/// acknowledged writes lost in one round of the repro script, and the surviving
+/// namespace's key was gone after a SIGKILL with **no recovery pass at all**
+/// (`persisted == total` short-circuits it).
+#[test]
+fn dropping_a_store_does_not_persist_a_survivors_in_flight_write() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let survivor = db.create_namespace("survivor").unwrap();
+    let victim = db.create_namespace("victim").unwrap();
+
+    for i in 0..20u32 {
+        db.put_ns(survivor, format!("s{i}").as_bytes(), b"v").unwrap();
+        db.put_ns(victim, format!("v{i}").as_bytes(), b"v").unwrap();
+    }
+    // Both flushed: neither pins the cut, so only the in-flight guard can.
+    db.get_store(survivor).unwrap().flush_memtable_to_level0().unwrap();
+    db.get_store(victim).unwrap().flush_memtable_to_level0().unwrap();
+
+    let in_flight_offset = db.wal_metadata.read().tail;
+    let guard = db.wal_flush_observer.begin_write(in_flight_offset);
+    for i in 20..30u32 {
+        db.put_ns(survivor, format!("s{i}").as_bytes(), b"v").unwrap();
+    }
+    db.get_store(survivor).unwrap().flush_memtable_to_level0().unwrap();
+
+    db.remove_namespace("victim").unwrap();
+
+    let watermark = *db.last_persisted_wal_offset.read();
+    assert!(
+        watermark <= in_flight_offset,
+        "dropping a store advanced the watermark to {watermark}, past the survivor's \
+         in-flight write at {in_flight_offset}"
+    );
+    drop(guard);
+}
+
+/// `try_advance_persisted`'s cut must respect the ceiling on its own.
+///
+/// The other three tests all pass with the cut's cap reverted, because the seal
+/// cap alone keeps `safe_offset` behind the barrier — and that is not an
+/// accident. Registration happens under the WAL metadata write lock, so no seal
+/// can observe a tail containing a write without also observing its
+/// registration, which means `safe_offset` can never overtake an in-flight
+/// write and the cut's cap is **redundant by argument**.
+///
+/// It is kept, and tested here, because that argument is non-local: it lives in
+/// `put_ns`, three hundred lines from the `None` branch it protects. Moving the
+/// registration out of the WAL lock would silently re-open the hole, and the cut
+/// should not depend on remembering why it is safe.
+///
+/// The final trigger here is a **namespace drop**, which reaches
+/// `try_advance_persisted` through `forget_namespace` with no seal after it — so
+/// the cut's own cap is the only thing left holding the barrier.
+#[test]
+fn the_cut_respects_the_barrier_even_when_no_seal_enforces_it() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns_a = db.create_namespace("a").unwrap();
+    let ns_b = db.create_namespace("b").unwrap();
+
+    for i in 0..20u32 {
+        db.put_ns(ns_a, format!("a{i}").as_bytes(), b"v").unwrap();
+    }
+
+    // The barrier goes down BEFORE any flush. A barrier cannot retract progress
+    // the watermark has already made, so registering it after a flush that
+    // advanced past it asserts nothing (that mistake made an earlier version of
+    // this test fail against correct behaviour).
+    let barrier = db.wal_metadata.read().tail;
+    let guard = db.wal_flush_observer.begin_write(barrier);
+
+    for i in 0..20u32 {
+        db.put_ns(ns_b, format!("b{i}").as_bytes(), b"v").unwrap();
+    }
+    db.get_store(ns_a).unwrap().flush_memtable_to_level0().unwrap();
+    db.get_store(ns_b).unwrap().flush_memtable_to_level0().unwrap();
+
+    // Dropping `b` removes the last namespace that reports un-flushed writes,
+    // so the cut falls through to the `None` branch — the one that used to take
+    // the live tail.
+    db.remove_namespace("b").unwrap();
+
+    let watermark = *db.last_persisted_wal_offset.read();
+    let tail = db.wal_metadata.read().tail;
+    assert!(
+        watermark <= barrier,
+        "cut reached {watermark}, past the barrier at {barrier} (tail {tail}), \
+         with no seal left to stop it"
+    );
+    drop(guard);
+}
+
+/// The barrier must not leak: a registration outliving its write pins the
+/// watermark forever, so WAL GC's `persisted >= total` gate never fires again
+/// and the WAL grows without bound — the failure mode `17a8a0c` fixed for
+/// dropped namespaces, reached a different way.
+#[test]
+fn the_in_flight_barrier_is_released_when_the_write_finishes() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+
+    for i in 0..50u32 {
+        db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        db.wal_flush_observer.in_flight.lock().is_empty(),
+        "writes that have returned are still registered as in flight: {:?}",
+        db.wal_flush_observer.in_flight.lock()
+    );
+
+    // And the watermark can still reach the tail once everything has flushed —
+    // i.e. the barrier bounds progress without stopping it.
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+    let tail = db.wal_metadata.read().tail;
+    let watermark = *db.last_persisted_wal_offset.read();
+    assert_eq!(watermark, tail, "watermark stalled at {watermark} with tail {tail}");
+}
+
 /// Regression: syncing the value log must NOT advance the WAL persisted
 /// watermark.
 ///

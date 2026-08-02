@@ -79,6 +79,62 @@ pub(crate) struct WalPersistObserver {
     /// `persisted >= total`). Holding this across the whole operation makes the
     /// on-disk `status == Persisted` check a reliable per-entry dedup.
     persist_lock: Mutex<()>,
+    /// Start offsets of writes appended to the WAL but not yet applied to a
+    /// memtable — the writes for which "it is in the WAL" and "it is in the LSM"
+    /// disagree *right now*.
+    ///
+    /// **Why this exists.** Every quantity that drives the persisted cut is
+    /// derived from a `wal_metadata.tail` snapshot, and a tail snapshot
+    /// over-states durability: `put_ns` appends under the WAL lock (advancing
+    /// the tail) and applies to the memtable *after* releasing it, so between
+    /// those two points an entry is visible in the tail while its key is
+    /// nowhere. Marking such an entry `Persisted` tells recovery to skip a write
+    /// that only ever existed in a memtable — and a crash before that memtable
+    /// flushes loses an acknowledged write. Measured: 4 acknowledged writes lost
+    /// in one round of `work/stress/repro/drop_loses_a_write.py`, and 1 in
+    /// 34,538 in the 2026-08-02 stress run.
+    ///
+    /// Registration happens **while the WAL metadata write lock is still held**,
+    /// so anyone who can observe the new tail can also observe the registration.
+    /// That ordering is the whole guarantee; see [`Self::wal_cut_ceiling`].
+    ///
+    /// **Lock ordering: `ns_progress` → `wal_metadata` → `in_flight`.** Never
+    /// take `wal_metadata` while holding this.
+    ///
+    /// Refcounted rather than a set. Two registrations can legitimately name the
+    /// same offset — an entry starts exactly where the previous tail ended, so
+    /// anything that registers a *synthetic* offset (a test simulating a write
+    /// in flight) collides with the next real append, and a plain set would let
+    /// one `Drop` cancel the other's protection. Counting makes registration
+    /// composable and the barrier impossible to un-register by accident.
+    in_flight: Mutex<BTreeMap<u64, u32>>,
+}
+
+/// Registers a WAL entry as appended-but-not-yet-applied for its lifetime.
+///
+/// RAII is load-bearing, not stylistic: `put_ns` has fallible steps between the
+/// WAL append and the memtable apply (`get_store`), and a leaked registration
+/// pins [`WalPersistObserver::wal_cut_ceiling`] forever — which freezes the
+/// persisted watermark, so WAL GC's `persisted >= total` gate never fires again
+/// and the WAL grows without bound. That is the same failure mode as the dropped
+/// namespace in `17a8a0c`, reached a different way.
+pub(crate) struct InFlightWrite<'a> {
+    observer: &'a WalPersistObserver,
+    offset: u64,
+}
+
+impl Drop for InFlightWrite<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.observer.in_flight.lock();
+        if let std::collections::btree_map::Entry::Occupied(mut e) = in_flight.entry(self.offset) {
+            match e.get_mut() {
+                1 => {
+                    e.remove();
+                }
+                n => *n -= 1,
+            }
+        }
+    }
 }
 
 impl WalPersistObserver {
@@ -97,6 +153,45 @@ impl WalPersistObserver {
             ns_progress: RwLock::new(std::collections::HashMap::new()),
             last_persisted_offset,
             persist_lock: Mutex::new(()),
+            in_flight: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Register `offset` as appended-to-the-WAL-but-not-yet-applied.
+    ///
+    /// **Call this while still holding the WAL metadata write lock.** The
+    /// guarantee [`Self::wal_cut_ceiling`] rests on is that no observer can see a
+    /// tail containing this entry without also seeing this registration;
+    /// registering after releasing the lock reopens exactly the window this
+    /// closes.
+    pub(crate) fn begin_write(&self, offset: u64) -> InFlightWrite<'_> {
+        *self.in_flight.lock().entry(offset).or_insert(0) += 1;
+        InFlightWrite { observer: self, offset }
+    }
+
+    /// The highest WAL offset that may be treated as durable right now.
+    ///
+    /// This is the current tail, lowered to exclude every write that has been
+    /// appended but not yet applied to a memtable. Both consumers of "how far
+    /// has the WAL got" must go through it:
+    ///
+    /// * [`Self::try_advance_persisted`], whose cut would otherwise be the live
+    ///   tail whenever no namespace reports un-flushed writes;
+    /// * [`Self::on_memtable_sealed_ns`], which records "everything up to here is
+    ///   in the memtable I am sealing" — false for a write whose apply has not
+    ///   landed yet, because that apply goes into the *next* memtable while its
+    ///   offset sits below the recorded tail.
+    ///
+    /// The second one is why this is a shared helper rather than a check bolted
+    /// onto the first: it needs no namespace drop to trigger, and a fix that
+    /// only guarded the cut would have left it live.
+    ///
+    /// Lock order is `wal_metadata` then `in_flight`, matching the write path.
+    fn wal_cut_ceiling(&self) -> u64 {
+        let tail = self.wal_metadata.read().tail;
+        match self.in_flight.lock().first_key_value() {
+            Some((&oldest, _)) => tail.min(oldest),
+            None => tail,
         }
     }
 
@@ -343,9 +438,21 @@ impl WalPersistObserver {
         let cut = {
             let progress = self.ns_progress.read();
             let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
+            // The ceiling excludes writes that are in the WAL but not yet in any
+            // memtable. It is applied to BOTH branches, not just the `None` one:
+            // capping the `Some` branch too costs nothing (a namespace's
+            // `safe_offset` is already below any later write) and removes the
+            // need to re-derive that argument every time this is read.
+            //
+            // Without it, the `None` branch cut at the live tail, which is how a
+            // store drop lost acknowledged writes: `forget_namespace` calls this
+            // the instant it removes a namespace from `ns_progress`, and that is
+            // precisely when the set of namespaces reporting un-flushed writes
+            // can go empty while other namespaces are mid-write.
+            let ceiling = self.wal_cut_ceiling();
             match slowest {
-                Some(offset) => offset,
-                None => self.wal_metadata.read().tail,
+                Some(offset) => offset.min(ceiling),
+                None => ceiling,
             }
         };
 
@@ -358,19 +465,33 @@ impl WalPersistObserver {
 
 impl WalPersistObserver {
     fn on_memtable_sealed_ns(&self, namespace_id: u32, version: u64) {
-        let tail = self.wal_metadata.read().tail;
+        // The ceiling, not the raw tail. This record means "every WAL entry below
+        // `tail` is in the memtable being sealed", and that is false for a write
+        // whose apply has not landed yet: its apply will go into the *next*
+        // memtable, while its offset is below this tail. Recording the raw tail
+        // therefore let `advance_namespace` push `safe_offset` past an entry that
+        // no SSTable holds — the same lost-write bug as the cut, reached without
+        // any namespace drop.
+        //
+        // Computed before taking `pending`: the lock order is
+        // `pending` → `ns_progress` → `wal_metadata` → `in_flight`, so the tail
+        // must never be read while `pending` is held.
+        let tail = self.wal_cut_ceiling();
         let mut pending = self.pending.write();
         pending.entry((namespace_id, version)).or_insert(WalFlushState { tail, flushed: false });
     }
 
     fn on_ro_memtable_flushed_to_level0_ns(&self, namespace_id: u32, version: u64) {
+        // Same reasoning as the seal path, for the case where the flush is
+        // observed without a preceding seal record.
+        let ceiling = self.wal_cut_ceiling();
         {
             let mut pending = self.pending.write();
             let entry = pending
                 .entry((namespace_id, version))
                 .or_insert(WalFlushState { tail: 0, flushed: false });
             if entry.tail == 0 {
-                entry.tail = self.wal_metadata.read().tail;
+                entry.tail = ceiling;
             }
             entry.flushed = true;
         }
@@ -946,6 +1067,11 @@ impl Database {
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
         let wal_tail = wal_metadata.tail;
+        // Registered BEFORE the WAL lock is released, so no observer can see a
+        // tail containing this entry without also seeing that it is not yet in
+        // any memtable. Held until this function returns, by which point step 2
+        // has applied it (or failed loudly). See `WalPersistObserver::in_flight`.
+        let _in_flight = self.wal_flush_observer.begin_write(wal_pointer.offset);
         drop(wal_metadata);
 
         // This namespace now has a WAL-backed write that is not yet in an
@@ -1057,6 +1183,10 @@ impl Database {
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
         let wal_tail = wal_metadata.tail;
+        // As in `put_ns`: registered under the WAL lock, released on return.
+        // A lost delete is as damaging as a lost put — recovery skipping it
+        // resurrects the key.
+        let _in_flight = self.wal_flush_observer.begin_write(wal_pointer.offset);
         drop(wal_metadata);
 
         // As in `put_ns`: this namespace now holds an un-flushed WAL-backed write.

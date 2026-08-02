@@ -164,6 +164,23 @@ Each worker is a **single global task** that fans out over namespaces — there 
 
 All WAL logic (append, GC, recovery, sequence tracking) lives exclusively in `database.rs` (`Database`, the internal coordinator). Do not add WAL code anywhere else.
 
+**A tail snapshot over-states durability — never derive a persisted cut from `wal_metadata.tail` alone.** A WAL entry may be marked `Persisted` only once its key is in an SSTable, because recovery *skips* `Persisted` entries. But `put_ns`/`delete_ns` append under the WAL lock and apply to the memtable **after** releasing it, so in between an entry is visible in the tail while its key is nowhere. Two readers used the raw tail and both lost acknowledged writes:
+
+| Reader | What it did | Why it was wrong |
+|---|---|---|
+| `try_advance_persisted` | cut at the live tail whenever no namespace reported un-flushed writes | includes the in-flight entry |
+| `on_memtable_sealed_ns` | recorded the live tail as "everything below this is in the memtable I am sealing" | an in-flight write's apply lands in the **next** memtable, while its offset sits below the recorded tail — so `advance_namespace` pushed `safe_offset` past an entry no SSTable held |
+
+Both now go through **`WalPersistObserver::wal_cut_ceiling()`** = `min(tail, lowest in-flight offset)`. `put_ns`/`delete_ns` register the entry's start offset with `begin_write()` **while still holding the WAL metadata write lock** — that ordering is the entire guarantee: no observer can see a tail containing an entry without also seeing that it is not yet applied. The returned `InFlightWrite` is RAII because a leaked registration pins the ceiling forever, freezing the watermark so WAL GC's `persisted >= total` gate never fires again (the `17a8a0c` failure mode, reached another way), and `put_ns` has fallible steps between the append and the apply.
+
+The registry is **refcounted** (`BTreeMap<u64, u32>`), not a set: an entry starts exactly where the previous tail ended, so a synthetic registration at a tail offset collides with the next real append and a plain set lets one `Drop` cancel the other's protection.
+
+Note the cut's cap is *redundant by argument* — because registration happens under the WAL lock, no seal can overtake an in-flight write, so `safe_offset` already stays behind the barrier. It is kept because that argument is non-local (it lives in `put_ns`, far from the `None` branch it protects) and pinned by its own test, so moving the registration out of the WAL lock cannot silently re-open the hole.
+
+Measured before the fix (2026-08-02 stress run): **1 acknowledged write lost in 34,538**, and 4 lost in one round of `work/stress/repro/drop_loses_a_write.py`. A namespace drop is the trigger, because `forget_namespace` calls `try_advance_persisted()` the instant it removes a namespace — precisely when the set of namespaces reporting un-flushed writes can go empty while a survivor is mid-write. The tell-tale is that **recovery does not run at all** after the crash (`persisted == total` short-circuits it). Regression tests: `an_in_flight_write_holds_the_persisted_watermark_back`, `a_memtable_seal_does_not_claim_an_unapplied_write`, `the_cut_respects_the_barrier_even_when_no_seal_enforces_it`, `dropping_a_store_does_not_persist_a_survivors_in_flight_write`, `the_in_flight_barrier_is_released_when_the_write_finishes`.
+
+**Known remaining hole (pre-existing, not this bug):** if `apply_with_retry` exhausts its retries, `put_ns` still returns `Ok` and the barrier is released, so that entry can be marked persisted and skipped by recovery. It is ERROR-logged and written to the fail log, which is the operator's recovery path.
+
 **WAL GC is gated on the index-replay watermark — do not reclaim a segment on `persisted >= total` alone.** The field index is made durable by an inline in-memory update per write plus a periodic checkpoint recording the WAL offset it reflects; a crash is healed by replaying from that offset. Reclaiming on LSM persistence alone deleted the WAL that heals it, and the affected documents were then absent from the index **for the life of the database**, with queries silently returning incomplete results (measured: 10 segments reclaimed, 15 of ~360 writes still replayable). `garbage_collect_wal` now consults `index_replay_watermark_segment` = `min(checkpoint offset)` over **currently active** fields, via the shared `plan_wal_gc` that `has_deletable_wal_segments` also uses — keep those two agreeing or the worker either spins on segments GC refuses or skips the pass meant to fire the backstop.
 
 Three properties are load-bearing:
