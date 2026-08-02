@@ -473,6 +473,28 @@ pub struct Database {
     /// `registry.read()` while taking `stores.read()`.
     namespace_create_lock: Mutex<()>,
 
+    /// Serialises field-index activation.
+    ///
+    /// Activation *creates* memory-mapped files — the field's `BlobStore` pair,
+    /// its `keymap/` pair, and the namespace's `RowMap` — through a check-then-act
+    /// (`if exists { open } else { create }`), and `GrowableMmap::create_file`
+    /// opens with `truncate(true)`. Two threads activating the same field
+    /// therefore truncate a file the other has already mapped, and the next
+    /// access to that mapping faults: **SIGBUS, which kills the process** — no
+    /// unwinding, no `Result`, the whole database goes down. A different
+    /// interleaving surfaces it as a panic writing a 64-byte header into a
+    /// zero-length map.
+    ///
+    /// Not hypothetical, and not confined to tests: any client that retries a
+    /// `POST /stores` after a timeout can produce two concurrent creates of the
+    /// same namespace, and each activates the same field. Measured before this
+    /// lock: 8 racing creates killed the server on every attempt.
+    ///
+    /// **Lock ordering: taken only AFTER `get_store` returns**, never around it —
+    /// `get_store` may wait on `namespace_create_lock`, which is strictly
+    /// outermost (see above).
+    index_activate_lock: Mutex<()>,
+
     // Per-namespace stores: namespace_id -> KVStore
     pub(crate) stores: RwLock<HashMap<u32, Arc<KVStore>>>,
 
@@ -719,6 +741,7 @@ impl Database {
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
+            index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1425,6 +1448,13 @@ impl Database {
         }
 
         let store = self.get_store(namespace_id)?;
+
+        // Everything below this point creates or maps files under
+        // `index/{ns_id}/`. Two threads doing that for the same field truncate
+        // each other's live mappings and the process dies with SIGBUS — see
+        // `index_activate_lock`. Taken after `get_store`, which may itself wait
+        // on the strictly-outermost `namespace_create_lock`.
+        let _activate = self.index_activate_lock.lock();
 
         // Ensure the namespace's dense row-ID map is loaded before any
         // resolution happens — the write and replay paths resolve through it.
@@ -2427,6 +2457,7 @@ impl Database {
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
+            index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),

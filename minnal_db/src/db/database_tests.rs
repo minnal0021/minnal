@@ -8,6 +8,7 @@
 use super::*;
 use crate::db::config::SyncConfig;
 use crate::db::test_support::*;
+use crate::index::IndexValue;
 use tempfile::TempDir;
 
 // ── Process-level crash durability ─────────────────────────────────
@@ -195,6 +196,91 @@ fn test_concurrent_first_use_of_a_namespace_does_not_race() {
         "{} of 100 concurrent first-use attempts failed: {:?}",
         failures.len(),
         // Distinct messages only — the same two repeat.
+        failures.iter().collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+/// Regression: activating the same field index from several threads must not
+/// kill the process.
+///
+/// `activate_field_index` creates memory-mapped files — the field's `BlobStore`
+/// pair, its `keymap/` pair, and the namespace's `RowMap` — through a
+/// check-then-act (`if exists { open } else { create }`), and the create path
+/// opens with `truncate(true)`. Two threads racing it truncate a file the other
+/// has already mapped, so the next access to that mapping faults with
+/// **SIGBUS**: the process dies outright, with no unwinding and no `Result` for
+/// anyone to handle.
+///
+/// Reachable from an ordinary client: two concurrent `POST /stores` for one
+/// namespace (a timeout plus a retry is enough) each activate the same fields.
+/// Measured before the fix, against the stress server: 8 racing creates killed
+/// it on **every** attempt — `Bus error (core dumped)`, exit 135 — and a
+/// different interleaving surfaced instead as
+/// `range end index 8 out of range for slice of length 0` writing the 64-byte
+/// header into a zero-length map.
+///
+/// **Reverting the fix does not make this test fail — it makes the test binary
+/// die.** That is the honest reproduction; there is nothing to assert against a
+/// signal. What the assertions below add is that serialising activation did not
+/// break it: every thread returns `Ok`, and the index answers correctly
+/// afterwards.
+#[test]
+fn test_concurrent_activation_of_one_field_index_does_not_kill_the_process() {
+    use std::sync::Barrier;
+
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+
+    const THREADS: usize = 8;
+    let mut failures: Vec<String> = Vec::new();
+
+    for round in 0..10 {
+        let name = format!("act_ns_{round}");
+        let ns = db.create_namespace(&name).unwrap();
+        // Registered once, up front: the race under test is the *activation*,
+        // not the registration.
+        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
+                        let s = std::str::from_utf8(bytes).ok()?;
+                        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+                        Some(IndexValue::Str(v["status"].as_str()?.to_string()))
+                    });
+                    barrier.wait();
+                    db.activate_field_index(ns, field_id, IndexValueType::Str, extractor)
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Err(e) = handle.join().unwrap() {
+                failures.push(e.to_string());
+            }
+        }
+
+        // The surviving index must be usable, not merely present: a store that
+        // came through the race with a truncated key file would open with a
+        // zeroed header and silently answer nothing.
+        db.put_ns(ns, b"d1", br#"{"status":"active"}"#).unwrap();
+        db.put_ns(ns, b"d2", br#"{"status":"retired"}"#).unwrap();
+        let hits = db.query_keys(ns, r#"status = "active""#).unwrap();
+        assert_eq!(
+            hits.keys,
+            vec![b"d1".to_vec()],
+            "round {round}: the field index survived activation but does not answer correctly"
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} concurrent activations failed: {:?}",
+        failures.len(),
+        THREADS * 10,
         failures.iter().collect::<std::collections::BTreeSet<_>>()
     );
 }
