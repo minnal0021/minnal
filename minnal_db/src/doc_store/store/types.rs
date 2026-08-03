@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use crate::FieldId;
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::index_observer::InMemoryProgress;
+use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::ClusterIndex;
@@ -20,8 +21,12 @@ use crate::semantic_search::service::SemanticSearchConfig;
 
 /// A document identifier, typed to match the [`KeyType`] of the store.
 ///
-/// Keys are stored in big-endian byte order so that lexicographic range
-/// scans correspond to numeric ordering.
+/// Integer keys are stored in big-endian byte order and string keys verbatim,
+/// so in both cases lexicographic byte order corresponds to the natural order
+/// of the ID — which is what makes range scans over IDs work.
+///
+/// `DocId` is `Copy`: [`StrKey`] stores its bytes inline rather than in a
+/// `String`, so passing an ID by value never allocates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DocId {
     /// 128-bit UUID represented as a `u128`.
@@ -30,20 +35,26 @@ pub enum DocId {
     U64(u64),
     /// Unsigned 128-bit integer.
     U128(u128),
+    /// UTF-8 string key, validated to at most
+    /// [`MAX_STR_KEY_LEN`](crate::doc_store::key::MAX_STR_KEY_LEN) bytes.
+    Str(StrKey),
 }
 
 impl DocId {
-    /// Serialize this ID to big-endian bytes (the raw database key).
+    /// Serialize this ID to its raw database key bytes — big-endian for the
+    /// integer types, the UTF-8 bytes themselves for [`DocId::Str`].
     pub fn to_bytes(self) -> Vec<u8> {
         match self {
             DocId::Uuid(v) | DocId::U128(v) => v.to_be_bytes().to_vec(),
             DocId::U64(v) => v.to_be_bytes().to_vec(),
+            DocId::Str(k) => k.as_bytes().to_vec(),
         }
     }
 
     /// Deserialize bytes back to a `DocId` given the store's [`KeyType`].
     pub fn from_bytes(bytes: &[u8], key_type: KeyType) -> Result<Self, DocStoreError> {
         match key_type {
+            KeyType::Str => Ok(DocId::Str(StrKey::from_bytes(bytes)?)),
             KeyType::Uuid => {
                 let arr: [u8; 16] = bytes
                     .try_into()
@@ -288,5 +299,48 @@ mod tests {
     fn test_invalid_key_size_rejected() {
         assert!(DocId::from_bytes(&[0u8; 3], KeyType::U64).is_err());
         assert!(DocId::from_bytes(&[0u8; 5], KeyType::U128).is_err());
+    }
+
+    #[test]
+    fn test_doc_id_str_roundtrip() {
+        let id = DocId::Str(StrKey::new("acme-corp-2026").unwrap());
+        let bytes = id.to_bytes();
+        assert_eq!(bytes, b"acme-corp-2026", "a str key is stored verbatim, not encoded");
+        let restored = DocId::from_bytes(&bytes, KeyType::Str).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    /// The same property the integer types get from big-endian encoding: the
+    /// order of the stored key bytes is the order of the IDs, which is what
+    /// makes `scan_range` over document IDs meaningful.
+    #[test]
+    fn test_doc_id_str_ordering_matches_byte_ordering() {
+        let ids: Vec<DocId> = ["aa", "acme", "acme-corp", "b", "z"]
+            .into_iter()
+            .map(|s| DocId::Str(StrKey::new(s).unwrap()))
+            .collect();
+
+        let encoded: Vec<Vec<u8>> = ids.iter().map(|id| id.to_bytes()).collect();
+        let sorted = {
+            let mut c = encoded.clone();
+            c.sort();
+            c
+        };
+        assert_eq!(encoded, sorted, "str ids must sort lexicographically by their key bytes");
+
+        // And the `DocId` ordering itself agrees — a derived `Ord` on the
+        // inline buffer would compare length first and put "z" before "aa".
+        let mut by_doc_id = ids.clone();
+        by_doc_id.sort();
+        assert_eq!(by_doc_id, ids);
+    }
+
+    #[test]
+    fn test_invalid_str_key_rejected() {
+        // Over the cap, empty, and non-UTF-8 all fail to decode rather than
+        // producing a truncated or lossy id.
+        assert!(DocId::from_bytes(&[b'x'; crate::doc_store::key::MAX_STR_KEY_LEN + 1], KeyType::Str).is_err());
+        assert!(DocId::from_bytes(&[], KeyType::Str).is_err());
+        assert!(DocId::from_bytes(&[0xff, 0xfe], KeyType::Str).is_err());
     }
 }

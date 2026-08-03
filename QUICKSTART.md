@@ -13,7 +13,7 @@ chosen by a `store_type` field at creation:
 
 | Store type | Holds | Highlights |
 |---|---|---|
-| **Document store** (`store_type: "doc"`) | JSON documents under a typed key (`uuid` / `u64` / `u128`) | RoaringBitmap field-index predicate queries; optional semantic search |
+| **Document store** (`store_type: "doc"`) | JSON documents under a typed key (`uuid` / `u64` / `u128` / `str`) | RoaringBitmap field-index predicate queries; optional semantic search |
 | **KV store** (`store_type: "kv"`) | raw typed key-value data (`str`/`int` keys; `str`/`int`/`f32`/`vec_f32` values) | range & prefix scans; optional semantic search on string values |
 
 Both store types share the same engine and durability guarantees. This guide
@@ -313,7 +313,7 @@ into a one-step "fresh server → populated store" load:
 
 When `--schema` is given, the tool validates that the schema's `key_type` matches
 the selected store kind — e.g. passing `--kv` with a document schema (`u64` /
-`u128` / `uuid`) fails fast with a clear message, and vice versa.
+`u128` / `uuid` / `str`) fails fast with a clear message, and vice versa.
 
 **Document stores** (default) — each line becomes one document; `id_field` names
 the field holding the document ID:
@@ -333,7 +333,9 @@ cargo run -p minnal_tools -- bulk_load http://localhost:8080 profiles id profile
 ```
 
 The `id_field` value is parsed according to the namespace's `key_type` (`u64`,
-`u128`, or `uuid`).
+`u128`, `uuid`, or `str`). For `str` stores the field must be a JSON string of
+1–50 UTF-8 bytes; it is percent-encoded into the request URL, so keys may
+contain spaces and other reserved characters.
 
 **KV stores** (`--kv`) — each line supplies a key and a value via separate
 fields; `key_field` and `value_field` name them. The value is sent verbatim and
@@ -352,11 +354,14 @@ validated against the namespace's `value_type`:
 ```
 
 The `key_field` value is parsed according to the namespace's `key_type` (`str` or
-`int`).
+`int`). As with document IDs, a `str` key must be 1–50 UTF-8 bytes and is
+percent-encoded into the URL.
 
 For both store kinds each line must be a valid JSON object, and rows with missing
-or unparseable keys/IDs are skipped, counted in `skipped`, and written to a
-sibling `<data>.errors` file. Pass `--no-wal` (before the positional arguments)
+or unparseable keys/IDs — including string keys that are empty or over the
+50-byte cap — are skipped, counted in `skipped`, and written to a sibling
+`<data>.errors` file. Rows the *server* rejects (any non-2xx response) land in
+the same file with the status and response body. Pass `--no-wal` (before the positional arguments)
 for maximum throughput when re-running the load is acceptable — data written that
 way is unrecoverable on a crash. `--no-wal` works for both document and KV stores.
 

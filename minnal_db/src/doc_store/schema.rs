@@ -66,6 +66,15 @@ pub enum KeyType {
     U64,
     /// Unsigned 128-bit integer.
     U128,
+    /// UTF-8 string of at most [`MAX_STR_KEY_LEN`] bytes, stored verbatim so
+    /// that byte order matches string order.
+    ///
+    /// Unlike the fixed-width integer types, string keys are variable length,
+    /// so their row IDs come from the dense row map rather than from the key
+    /// bytes themselves — see `activate_indices`.
+    ///
+    /// [`MAX_STR_KEY_LEN`]: crate::doc_store::key::MAX_STR_KEY_LEN
+    Str,
 }
 
 /// The value type for an indexed field, matching the underlying index engine.

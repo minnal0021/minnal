@@ -52,9 +52,10 @@ pub(super) fn build_embedding_text(doc: &serde_json::Value, fields: &[String]) -
 
 /// Activate all field indices defined in `schema` for namespace `ns_id`.
 ///
-/// Also registers a [`RowIdFn`] + [`RowToKeyFn`] pair for numeric key types
-/// (`U64`, `U128`, `Uuid`) so that index queries resolve matching keys in
-/// O(|hits|) rather than the O(n_keys) fallback scan.
+/// Also registers a [`RowIdFn`] + [`RowToKeyFn`] pair for the **fixed-width**
+/// key types (`U64`, `U128`, `Uuid`) so that index queries resolve matching
+/// keys in O(|hits|) rather than the O(n_keys) fallback scan. `Str` keys
+/// deliberately register nothing — see below.
 ///
 /// Called once on open and once after creating a new store.
 pub(super) async fn activate_indices(db: &AsyncDb, ns_id: u32, schema: &DocStoreSchema) -> Result<(), DocStoreError> {
@@ -72,23 +73,35 @@ pub(super) async fn activate_indices(db: &AsyncDb, ns_id: u32, schema: &DocStore
     //
     // The functions exist for key types whose raw bytes are injective into u128,
     // which also gives O(|hits|) key resolution in index queries.
-    let (row_id_fn, row_to_key_fn): (RowIdFn, RowToKeyFn) = match schema.key_type {
-        KeyType::U64 => (
+    //
+    // `Str` keys are variable length and can be up to MAX_STR_KEY_LEN bytes, so
+    // they are NOT injective into a u128 and get no function pair: they fall
+    // through to the dense `RowMap`, which compares full key bytes (so distinct
+    // keys never share a row ID) and answers the reverse `row_id -> key` lookup
+    // in O(1) from its id array. Deriving an ID from the key bytes here instead
+    // would be actively unsafe — the fixed-width closures below slice `k[..8]` /
+    // `k[..16]`, which panics on a shorter key and silently truncates a longer
+    // one into a colliding row ID.
+    let fns: Option<(RowIdFn, RowToKeyFn)> = match schema.key_type {
+        KeyType::U64 => Some((
             std::sync::Arc::new(|k: &[u8]| {
                 let arr: [u8; 8] = k[..8].try_into().unwrap_or_default();
                 u64::from_be_bytes(arr) as u128
             }),
             std::sync::Arc::new(|id: u128| (id as u64).to_be_bytes().to_vec()),
-        ),
-        KeyType::U128 | KeyType::Uuid => (
+        )),
+        KeyType::U128 | KeyType::Uuid => Some((
             std::sync::Arc::new(|k: &[u8]| {
                 let arr: [u8; 16] = k[..16].try_into().unwrap_or_default();
                 u128::from_be_bytes(arr)
             }),
             std::sync::Arc::new(|id: u128| id.to_be_bytes().to_vec()),
-        ),
+        )),
+        KeyType::Str => None,
     };
-    db.set_row_id_fn(ns_id, row_id_fn, Some(row_to_key_fn)).await.map_err(DocStoreError::Db)?;
+    if let Some((row_id_fn, row_to_key_fn)) = fns {
+        db.set_row_id_fn(ns_id, row_id_fn, Some(row_to_key_fn)).await.map_err(DocStoreError::Db)?;
+    }
 
     for spec in &schema.indices {
         let ivt = to_ivt(spec.index_type);

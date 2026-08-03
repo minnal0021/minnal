@@ -10,7 +10,9 @@
 //! ```
 //!
 //! Keys are URL path segments:
-//! - `key_type = str`  → the segment is the string as-is
+//! - `key_type = str`  → the segment is the string as-is, at most
+//!   [`MAX_STR_KEY_LEN`](minnal_db::MAX_STR_KEY_LEN) bytes and not one of the
+//!   reserved segments (`prefix`, `semantic-search`)
 //! - `key_type = int`  → the segment is the decimal integer
 //!
 //! Values are raw JSON bodies matching the namespace `value_type`:
@@ -36,6 +38,7 @@ use tracing::debug;
 use crate::{
     AppState,
     error::AppError,
+    id::{RESERVED_KV_KEYS, check_reserved_key},
     routes::{decode_cursor, encode_cursor},
 };
 
@@ -249,10 +252,19 @@ async fn kv_key_type_for(state: &AppState, ns: &str) -> Result<KvKeyType, AppErr
 /// Convert the URL key string to a typed JSON value using the schema cache.
 ///
 /// Used by `put_kv` so that `kv_put` receives a properly typed JSON key.
+///
+/// This is also where reserved route segments are rejected. It only needs to
+/// happen on the write path: `GET`/`DELETE /stores/{ns}/kv/prefix` never reach
+/// a handler (the static prefix-scan route wins), so the fix is to refuse to
+/// *create* a record that could never be read back. Length validation happens
+/// one layer down, in `KvKeyType::serialize_key`.
 async fn key_to_json(state: &AppState, ns: &str, raw: &str) -> Result<serde_json::Value, AppError> {
     let key_type = kv_key_type_for(state, ns).await?;
     match key_type {
-        KvKeyType::Str => Ok(serde_json::Value::String(raw.to_owned())),
+        KvKeyType::Str => {
+            check_reserved_key(raw, RESERVED_KV_KEYS)?;
+            Ok(serde_json::Value::String(raw.to_owned()))
+        }
         KvKeyType::Int => raw
             .parse::<i64>()
             .map(serde_json::Value::from)

@@ -7,6 +7,10 @@ use minnal_db::{DocStoreError, SchemaError};
 use tracing::error;
 
 /// Wraps [`DocStoreError`] so it can be returned from axum handlers.
+///
+/// `Debug` is for tests and tracing only — what a client sees is decided by
+/// [`IntoResponse`], which withholds the message for 5xx.
+#[derive(Debug)]
 pub struct AppError {
     pub inner: DocStoreError,
     pub namespace: Option<String>,
@@ -64,7 +68,10 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::EmbeddingFieldNotString { .. })
             | DocStoreError::Schema(SchemaError::KvKeyTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::KvValueTypeMismatch { .. })
-            | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr) => StatusCode::BAD_REQUEST,
+            | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr)
+            | DocStoreError::Schema(SchemaError::StrKeyTooLong { .. })
+            | DocStoreError::Schema(SchemaError::EmptyStrKey)
+            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8) => StatusCode::BAD_REQUEST,
 
             // A key/value too large for the storage format's u32 length fields is
             // user-actionable: report 413 rather than a generic 500.
@@ -147,6 +154,28 @@ mod tests {
                 !message.contains("database error"),
                 "a client error must not be framed as a database failure: {message:?}"
             );
+        }
+    }
+
+    /// Key-validation failures are the caller's fault and must carry their
+    /// message. A `SchemaError` variant missing from the 400 arm falls through
+    /// to the catch-all and becomes a 500 with the text suppressed — which
+    /// would tell a client that a 51-byte key had broken the database.
+    #[tokio::test]
+    async fn string_key_validation_errors_are_400_and_explain_themselves() {
+        // `SchemaError` is not `Clone`, so each case is a constructor.
+        let cases: [fn() -> SchemaError; 3] = [
+            || SchemaError::StrKeyTooLong { max: 50, len: 51 },
+            || SchemaError::EmptyStrKey,
+            || SchemaError::StrKeyNotUtf8,
+        ];
+
+        for make in cases {
+            let expected = DocStoreError::Schema(make()).to_string();
+            let (status, message) = render(DocStoreError::Schema(make())).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "key validation must not be 5xx: {expected}");
+            assert_eq!(message, expected, "the client needs to be told what was wrong with the key");
         }
     }
 

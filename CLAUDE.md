@@ -2,6 +2,8 @@
 
 **minnal** (மின்னல்) means *lightning* in Tamil. It is a layered, embedded document database: an LSM + value-log KV engine at the bottom, RoaringBitmap field indexing and quantised ANN semantic search in the middle, and a JSON document store with a REST API on top.
 
+**Keys.** Doc stores are keyed by `uuid` / `u64` / `u128` / `str`, KV stores by `str` / `int`. String keys of either kind are validated by `StrKey` (`minnal_db/src/doc_store/key.rs`) — non-empty and at most `MAX_STR_KEY_LEN` = **50 UTF-8 bytes**, enforced on write in the library so the REST API and bulk loader inherit it. String-keyed namespaces take their field-index row IDs from the dense `RowMap` rather than deriving them from the key bytes (the fixed-width `RowIdFn` slicing is not injective for variable-length keys). Note the storage bucket is hashed from the **first 8 key bytes only**, so string keys should vary early — see `minnal_db/CLAUDE.md` → *Sharding*.
+
 **Platform:** Linux and macOS only. The storage engine uses `pread`/`pwrite` and the server requires POSIX signals — Windows is not supported.
 
 ## Architecture (single crate, feature-gated layers)

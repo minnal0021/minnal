@@ -62,6 +62,15 @@ pub enum SchemaError {
     #[error("KV key type mismatch: expected {expected}")]
     KvKeyTypeMismatch { expected: &'static str },
 
+    #[error("string key is too long: {len} bytes, maximum is {max}")]
+    StrKeyTooLong { max: usize, len: usize },
+
+    #[error("string key must not be empty")]
+    EmptyStrKey,
+
+    #[error("string key is not valid UTF-8")]
+    StrKeyNotUtf8,
+
     #[error("KV value type mismatch: expected {expected}")]
     KvValueTypeMismatch { expected: &'static str },
 

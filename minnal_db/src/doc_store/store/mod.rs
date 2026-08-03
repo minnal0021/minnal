@@ -48,6 +48,8 @@ mod index_build;
 mod kv;
 mod query;
 #[cfg(test)]
+mod str_keys_tests;
+#[cfg(test)]
 mod test_support;
 mod types;
 mod vector;

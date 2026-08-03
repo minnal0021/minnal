@@ -3,6 +3,7 @@ pub mod hex;
 pub mod index_manager;
 pub mod index_observer;
 pub mod index_progress;
+pub mod key;
 pub mod kv_schema;
 pub mod pagination;
 pub mod schema;
@@ -12,6 +13,9 @@ pub(crate) mod vec_index_worker;
 
 // ── Error types ────────────────────────────────────────────────────────────
 pub use self::error::{DocStoreError, SchemaError};
+
+// ── Key types ──────────────────────────────────────────────────────────────
+pub use self::key::{MAX_STR_KEY_LEN, StrKey};
 
 // ── Schema types ───────────────────────────────────────────────────────────
 pub use self::schema::{

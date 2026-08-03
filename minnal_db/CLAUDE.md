@@ -144,6 +144,15 @@ The `key → id` slot table is **file-backed (`rows.slots`) but never adopted fr
 
 `num_buckets` (default 16) shards both the value log and LSM SSTables. Keys are hash-distributed. **Cannot change `num_buckets` on an existing database** — the value is locked at creation time.
 
+**The bucket is chosen from the FIRST 8 BYTES of the key only.** `get_bucket_for_key` (`support/mod.rs`) hashes `key_prefix_of(key)`, which zero-pads or truncates to 8 bytes; the same 8-byte prefix is what `SStableEntry.key_prefix` carries for fast comparison, so this is a deliberate performance choice, not an oversight. The consequence is a **key-design rule that callers must be told about**: keys whose first 8 bytes are constant all land in the *same* bucket, however many buckets are configured — one hot LSM shard, one value log absorbing every write, and unbalanced compaction. Fixed-width integer and UUID keys spread well by construction. String keys (`KeyType::Str`, `KvKeyType::Str`) do not, if they are built the way people naturally build them:
+
+| Key shape | Effect |
+|---|---|
+| `user:profile:a3f9…`, `job_content_…` | ✗ constant leading 8 bytes → one bucket |
+| `a3f9-user-profile`, `2026-08-03-job` | ✓ varying leading bytes → spread |
+
+Guidance: put the varying part of the key first, or keep any constant prefix under 8 bytes.
+
 The value log's **segment size** (`DbConfig::segment_size_bytes`, default 256 MiB) is by contrast **not** locked at creation: it is not encoded in any pointer (only a segment id and a byte offset are), so existing segments keep the size they were written at and new ones use whatever is configured now. It bounds GC's unit of work and the file/fd count.
 
 ## Value-log GC thresholds (two knobs, not one)

@@ -13,6 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::doc_store::error::SchemaError;
+use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::{StoreType, peek_store_type};
 
 /// Key type for a KV store namespace.
@@ -126,12 +127,14 @@ impl KvKeyType {
     /// Serialize a JSON value as raw key bytes for storage in minnal_db.
     ///
     /// Int keys use big-endian encoding so that lexicographic byte order
-    /// matches numeric order, enabling range scans.
+    /// matches numeric order, enabling range scans. Str keys are stored
+    /// verbatim after validation through [`StrKey`], which bounds them to
+    /// [`MAX_STR_KEY_LEN`](crate::doc_store::key::MAX_STR_KEY_LEN) bytes.
     pub fn serialize_key(&self, key: &serde_json::Value) -> Result<Vec<u8>, SchemaError> {
         match self {
             KvKeyType::Str => {
                 let s = key.as_str().ok_or(SchemaError::KvKeyTypeMismatch { expected: "string" })?;
-                Ok(s.as_bytes().to_vec())
+                Ok(StrKey::new(s)?.as_bytes().to_vec())
             }
             KvKeyType::Int => {
                 let n = key.as_i64().ok_or(SchemaError::KvKeyTypeMismatch { expected: "integer" })?;
@@ -141,9 +144,14 @@ impl KvKeyType {
     }
 
     /// Parse a raw URL path segment and serialize it as key bytes.
+    ///
+    /// Str keys go through the same [`StrKey`] validation as
+    /// [`serialize_key`](Self::serialize_key) — this is the choke point for the
+    /// operations that address a key by string (get, delete, scan bounds), so
+    /// no over-long or empty key reaches storage through any of them.
     pub fn serialize_key_from_str(&self, raw: &str) -> Result<Vec<u8>, SchemaError> {
         match self {
-            KvKeyType::Str => Ok(raw.as_bytes().to_vec()),
+            KvKeyType::Str => Ok(StrKey::new(raw)?.as_bytes().to_vec()),
             KvKeyType::Int => {
                 let n: i64 = raw.parse().map_err(|_| SchemaError::KvKeyTypeMismatch { expected: "integer" })?;
                 Ok(n.to_be_bytes().to_vec())
@@ -394,6 +402,48 @@ mod tests {
         assert!(matches!(
             KvKeyType::Int.serialize_key_from_str("not-a-number"),
             Err(SchemaError::KvKeyTypeMismatch { .. })
+        ));
+    }
+
+    /// Both encoders must enforce the cap: `serialize_key` covers `kv_put`,
+    /// `serialize_key_from_str` covers get/delete/scan-bounds. An unbounded key
+    /// used to reach the row map, where the length check *panics*.
+    #[test]
+    fn kv_str_keys_are_length_capped_by_both_encoders() {
+        let over = "x".repeat(crate::doc_store::key::MAX_STR_KEY_LEN + 1);
+
+        assert!(matches!(
+            KvKeyType::Str.serialize_key(&serde_json::Value::String(over.clone())),
+            Err(SchemaError::StrKeyTooLong { .. })
+        ));
+        assert!(matches!(
+            KvKeyType::Str.serialize_key_from_str(&over),
+            Err(SchemaError::StrKeyTooLong { .. })
+        ));
+
+        let at_limit = "x".repeat(crate::doc_store::key::MAX_STR_KEY_LEN);
+        assert!(KvKeyType::Str.serialize_key(&serde_json::Value::String(at_limit.clone())).is_ok());
+        assert!(KvKeyType::Str.serialize_key_from_str(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn kv_str_keys_reject_empty() {
+        assert!(matches!(
+            KvKeyType::Str.serialize_key(&serde_json::Value::String(String::new())),
+            Err(SchemaError::EmptyStrKey)
+        ));
+        assert!(matches!(KvKeyType::Str.serialize_key_from_str(""), Err(SchemaError::EmptyStrKey)));
+    }
+
+    /// The cap counts UTF-8 bytes, so a key well under 50 characters can still
+    /// be rejected — and the byte count is what the row map and every SSTable
+    /// entry actually pay for.
+    #[test]
+    fn kv_str_key_cap_counts_bytes_not_chars() {
+        let twenty_chars = "日".repeat(20); // 60 bytes
+        assert!(matches!(
+            KvKeyType::Str.serialize_key_from_str(&twenty_chars),
+            Err(SchemaError::StrKeyTooLong { len: 60, .. })
         ));
     }
 

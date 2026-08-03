@@ -143,6 +143,7 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 | `GET` | `/stores/{ns}/docs/{id}` | `200` | Retrieve a document by primary key |
 | `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
 | `GET` | `/stores/{ns}/docs?start=&end=` | `200` | Range scan in primary-key order |
+| `GET` | `/stores/{ns}/docs/prefix?prefix=` | `200` | Prefix scan over document keys |
 | `POST` | `/stores/{ns}/query` | `200` | Index predicate query |
 | `POST` | `/stores/{ns}/semantic-search` | `200` | ANN similarity search (`semantic_search_enabled` only) |
 | `POST` | `/stores/{ns}/semantic-search/filtered` | `200` | ANN search restricted by an index predicate |
@@ -244,8 +245,20 @@ The primary key type is chosen at store creation and cannot be changed.
 | `uuid`    | 128-bit UUID | `550e8400-e29b-41d4-a716-446655440000` |
 | `u64`     | Unsigned 64-bit integer | `42` |
 | `u128`    | Unsigned 128-bit integer | `340282366920938463463374607431768211455` |
+| `str`     | UTF-8 string, 1–50 bytes | `acme-corp-2026` (percent-encode reserved characters) |
 
-Keys are stored in big-endian byte order so that numeric range scans return results in ascending order.
+Integer keys are stored in big-endian byte order and string keys verbatim, so in both cases range and prefix scans return results in ascending key order.
+
+**String keys** are capped at **50 UTF-8 bytes** and may not be empty; violations return `400`. The cap counts bytes, not characters, so a 20-character key of 3-byte code points (60 bytes) is rejected. Keys are ordinary URL path segments, so percent-encode anything reserved (`acme%20corp` for `acme corp`).
+
+A small set of keys is **reserved**, because a static route already claims that path segment and a record stored under it could never be read back. Writing or deleting one returns `400` with an explanatory message:
+
+| Store kind | Reserved keys | Claimed by |
+|---|---|---|
+| document | `prefix` | `GET /stores/{ns}/docs/prefix` |
+| KV | `prefix`, `semantic-search` | `GET /stores/{ns}/kv/prefix`, `POST /stores/{ns}/kv/semantic-search` |
+
+> **Key design:** the storage bucket is selected by hashing only the **first 8 bytes** of the key. String keys sharing a constant leading prefix (`user:profile:…`) all land in one bucket — a hot shard with unbalanced compaction. Put the varying part of the key first (`a3f9-user-profile`), or keep the constant prefix under 8 bytes.
 
 ### Indices
 
@@ -303,8 +316,10 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 
 | `key_type` | URL path segment | Storage |
 |-----------|-----------------|---------|
-| `str` | any UTF-8 string | raw UTF-8 bytes |
+| `str` | UTF-8 string, 1–50 bytes | raw UTF-8 bytes |
 | `int` | decimal integer | big-endian `i64` (ordered scans work correctly) |
+
+`str` keys are subject to the same rules as string document keys: at most 50 UTF-8 bytes, non-empty, and not equal to a reserved route segment (`prefix`, `semantic-search`). See [Key types](#key-types).
 
 **Value types:**
 
@@ -372,7 +387,7 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 |-------------|-----------------|----------|--------------------------------------|
 | `store_type` | `"doc"`          | yes      | Selects a document store             |
 | `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
-| `key_type`   | `uuid`/`u64`/`u128` | yes  | Primary key type                     |
+| `key_type`   | `uuid`/`u64`/`u128`/`str` | yes | Primary key type                |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
 | `attributes` | array            | no       | Non-indexed field declarations       |
 
@@ -596,6 +611,7 @@ All document endpoints accept the `{id}` path segment formatted according to the
 | `uuid`    | `550e8400-e29b-41d4-a716-446655440000` |
 | `u64`     | `42` |
 | `u128`    | `99999999999999999999` |
+| `str`     | `acme-corp-2026`, `acme%20corp` (URL-encode spaces) |
 
 ---
 
@@ -675,6 +691,39 @@ Response — a page of `{id, doc}` pairs ordered by key, plus `next_cursor`
   ],
   "next_cursor": "000000000000000c"
 }
+```
+
+---
+
+#### `GET /stores/{ns}/docs/prefix?prefix=`
+
+Scan every document whose key starts with `prefix`. **Cursor-paginated**, same
+response shape as the range scan.
+
+The `prefix` format depends on the store's `key_type`, because it is a partial
+key rather than a whole one:
+
+| `key_type` | `prefix` format | Example |
+|-----------|-----------------|---------|
+| `str`     | plain UTF-8 string, at most 50 bytes | `prefix=acme-` |
+| `uuid` / `u64` / `u128` | hex-encoded bytes, hyphens ignored, even length | `prefix=550e8400-e29b` |
+
+A partial big-endian integer has no readable text form, which is why the
+fixed-width types take hex; string keys are stored verbatim, so their prefix is
+just the string. An empty `prefix` matches every document.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prefix`  | yes      | Key prefix, formatted as above |
+| `limit`   | no       | Max documents per page (default: 20) |
+| `cursor`  | no       | Opaque token from a prior page's `next_cursor`; omit for the first page |
+
+```bash
+# str store — every document whose key starts with "acme-"
+curl "http://localhost:8080/stores/slugs/docs/prefix?prefix=acme-"
+
+# uuid store — every document whose UUID starts with those 6 bytes
+curl "http://localhost:8080/stores/users/docs/prefix?prefix=550e8400-e29b"
 ```
 
 ---
@@ -1824,7 +1873,7 @@ minnal_tools bulk_load [--no-wal] [--schema <schema.json>] <url> <namespace> <id
 | `--schema <file>`   | Import the schema (`POST /admin/stores/import`) before loading. An existing store is reused, so re-runs are safe. The schema's `namespace` must match the `namespace` argument. Without this flag the namespace must already exist. |
 | `--no-wal`          | Append `?skip_wal=true` to each write for maximum throughput. Data written this way is **unrecoverable on a crash** — only use when re-running the load is acceptable (e.g. an initial import from a source of truth). |
 
-The tool first calls `GET /stores` to confirm the namespace exists and resolve its `key_type` (after importing the schema if `--schema` was given), then `PUT`s each document. The `id_field` value is parsed according to the store's `key_type` — UUID string for `uuid`, integer (number or numeric string) for `u64`/`u128`. The id field is **not** removed from the stored document.
+The tool first calls `GET /stores` to confirm the namespace exists and resolve its `key_type` (after importing the schema if `--schema` was given), then `PUT`s each document. The `id_field` value is parsed according to the store's `key_type` — UUID string for `uuid`, integer (number or numeric string) for `u64`/`u128`, JSON string of 1–50 UTF-8 bytes for `str`. String keys are percent-encoded into the request URL, so they may contain spaces and other reserved characters. The id field is **not** removed from the stored document.
 
 ### Example
 
