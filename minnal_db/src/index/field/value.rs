@@ -56,7 +56,12 @@ use crate::index::field::field_index::FieldIndex;
 // ── Value types ────────────────────────────────────────────────────────────
 
 /// A single typed field value extracted from a document.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Eq`/`Hash` are derived so callers can group rows by value before writing —
+/// WAL replay does this to write each value's bitmap once instead of once per
+/// row. Every variant is a plain hashable scalar, so there is no float-equality
+/// hazard in deriving them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IndexValue {
     Bool(bool),
     Int(i64),
@@ -352,11 +357,29 @@ impl DynFieldIndex {
     /// reach the limit; `Bool`/`Int` are 1/8 bytes.) The caller can log and skip
     /// the field; the document itself is unaffected.
     pub fn insert(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
+        self.insert_many(value, std::slice::from_ref(&row_id))
+    }
+
+    /// Record that every row in `row_ids` has `value` for this field.
+    ///
+    /// One bitmap load and **one re-serialisation for the whole batch**, rather
+    /// than one per row. The blob store is append-only, so the per-row form
+    /// leaves a dead copy of the entire bitmap behind for every row — the
+    /// dominant cost when many rows share a value, i.e. exactly a
+    /// low-cardinality field. WAL replay uses this because it knows its whole
+    /// key set before it writes anything.
+    ///
+    /// Same type-mismatch and size errors as [`insert`](Self::insert). An empty
+    /// `row_ids` is a no-op.
+    pub fn insert_many(&mut self, value: &IndexValue, row_ids: &[u128]) -> Result<(), String> {
         check_value_size(value, u32::MAX as usize)?;
+        if row_ids.is_empty() {
+            return Ok(());
+        }
         match (&mut self.inner, value) {
             (DynFieldIndexInner::Bool(idx), IndexValue::Bool(v)) => {
                 let prev = idx.next_slot();
-                idx.insert(*v, row_id);
+                idx.insert_many(*v, row_ids);
                 if idx.next_slot() != prev
                     && let Some(ks) = &mut self.keymap_store
                 {
@@ -366,7 +389,7 @@ impl DynFieldIndex {
             }
             (DynFieldIndexInner::Int(idx), IndexValue::Int(v)) => {
                 let prev = idx.next_slot();
-                idx.insert(*v, row_id);
+                idx.insert_many(*v, row_ids);
                 if idx.next_slot() != prev
                     && let Some(ks) = &mut self.keymap_store
                 {
@@ -376,7 +399,7 @@ impl DynFieldIndex {
             }
             (DynFieldIndexInner::Str(idx), IndexValue::Str(v)) => {
                 let prev = idx.next_slot();
-                idx.insert(v.clone(), row_id);
+                idx.insert_many(v.clone(), row_ids);
                 if idx.next_slot() != prev
                     && let Some(ks) = &mut self.keymap_store
                 {
@@ -496,10 +519,20 @@ impl DynFieldIndex {
     /// Any value entries whose bitmaps become empty are also purged from the
     /// keymap mmap store.
     pub fn remove_all_for_row(&mut self, row_id: u128) {
+        self.remove_all_for_rows(std::slice::from_ref(&row_id));
+    }
+
+    /// Clear every row in `row_ids` from every bucket it occupies.
+    ///
+    /// One load and at most one write-back per bucket for the whole batch. The
+    /// single-row form pays that per row, which is the same append-only
+    /// quadratic that makes a per-key `insert` loop expensive. Used by WAL
+    /// replay, which clears its whole affected row set in one go.
+    pub fn remove_all_for_rows(&mut self, row_ids: &[u128]) {
         let removed_slots = match &mut self.inner {
-            DynFieldIndexInner::Bool(idx) => idx.remove_all_for_row(row_id),
-            DynFieldIndexInner::Int(idx) => idx.remove_all_for_row(row_id),
-            DynFieldIndexInner::Str(idx) => idx.remove_all_for_row(row_id),
+            DynFieldIndexInner::Bool(idx) => idx.remove_all_for_rows(row_ids),
+            DynFieldIndexInner::Int(idx) => idx.remove_all_for_rows(row_ids),
+            DynFieldIndexInner::Str(idx) => idx.remove_all_for_rows(row_ids),
         };
         if let Some(ks) = &mut self.keymap_store {
             for slot_id in removed_slots {

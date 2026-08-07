@@ -5,10 +5,12 @@
 //! PUT    /stores/{ns}/docs/{id}                → put (upsert) document
 //! DELETE /stores/{ns}/docs/{id}                → delete document
 //! GET    /stores/{ns}/docs?start=&end=         → range scan (end is optional)
-//! GET    /stores/{ns}/docs/prefix?prefix=<hex> → prefix scan by document-id bytes
+//! GET    /stores/{ns}/docs/prefix?prefix=      → prefix scan by document-id bytes
+//!                                                (raw string for `str` stores, hex otherwise)
 //! POST   /stores/{ns}/query                    → index predicate query
 //! ```
 
+use crate::limits::Limit;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -17,7 +19,7 @@ use axum::{
 };
 use minnal_db::{DocStoreError, Pagination, SchemaError, StoreType};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     AppState,
@@ -136,14 +138,8 @@ pub async fn delete_doc(State(state): State<AppState>, Path((ns, id_str)): Path<
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn default_page_size() -> usize {
-    20
-}
 fn default_page_no() -> usize {
     1
-}
-fn default_limit() -> usize {
-    20
 }
 
 /// Query parameters for the range scan endpoint.
@@ -151,8 +147,8 @@ fn default_limit() -> usize {
 pub struct RangeParams {
     start: String,
     end: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
 }
@@ -162,12 +158,12 @@ pub async fn range_query(
     Path(ns): Path<String>,
     Query(params): Query<RangeParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    debug!(namespace = %ns, start = %params.start, end = ?params.end, limit = params.limit, "range query");
+    debug!(namespace = %ns, start = %params.start, end = ?params.end, limit = %params.limit, "range query");
     let key_type = key_type_for(&state, &ns).await?;
     let start = parse_doc_id(&params.start, key_type)?;
     let end = params.end.as_deref().map(|s| parse_doc_id(s, key_type)).transpose()?;
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-    let page = state.store.scan_range(&ns, start, end, cursor, params.limit).await?;
+    let page = state.store.scan_range(&ns, start, end, cursor, params.limit.get()).await?;
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -200,16 +196,41 @@ fn parse_hex_prefix(s: &str) -> Result<Vec<u8>, AppError> {
 /// Query parameters for `GET /stores/{ns}/docs/prefix`.
 #[derive(Deserialize)]
 pub struct PrefixScanParams {
-    /// Hex-encoded byte prefix of the document key (hyphens ignored).
+    /// Byte prefix of the document key, in the store's own key format.
     ///
-    /// For UUID stores, `550e8400-e29b-41d4` matches every document whose UUID
-    /// starts with those 8 bytes.  For U64/U128 stores, supply the big-endian
-    /// hex representation of the desired prefix.
+    /// For `str` stores this is a plain UTF-8 string prefix (`acme-` matches
+    /// every key starting with it).  For the fixed-width types it is
+    /// hex-encoded (hyphens ignored): for UUID stores, `550e8400-e29b-41d4`
+    /// matches every document whose UUID starts with those 8 bytes; for
+    /// U64/U128 stores, supply the big-endian hex of the desired prefix.
     prefix: String,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    #[serde(default)]
+    limit: Limit,
     /// Opaque cursor from a prior page's `next_cursor`; absent for the first page.
     cursor: Option<String>,
+}
+
+/// Convert the `prefix` query parameter into raw key bytes.
+///
+/// String keys are stored verbatim, so their prefix is the raw UTF-8 — hex
+/// would be unusable for the case the endpoint is most useful for. The
+/// fixed-width types keep the hex form, since a partial big-endian integer has
+/// no readable text form. A string prefix is capped at the same length as a key
+/// (a longer prefix could not match anything).
+fn prefix_to_bytes(raw: &str, key_type: minnal_db::KeyType) -> Result<Vec<u8>, AppError> {
+    match key_type {
+        minnal_db::KeyType::Str => {
+            if raw.len() > minnal_db::MAX_STR_KEY_LEN {
+                return Err(DocStoreError::Schema(SchemaError::StrKeyTooLong {
+                    max: minnal_db::MAX_STR_KEY_LEN,
+                    len: raw.len(),
+                })
+                .into());
+            }
+            Ok(raw.as_bytes().to_vec())
+        }
+        _ => parse_hex_prefix(raw),
+    }
 }
 
 pub async fn prefix_scan(
@@ -217,10 +238,11 @@ pub async fn prefix_scan(
     Path(ns): Path<String>,
     Query(params): Query<PrefixScanParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    debug!(namespace = %ns, prefix = %params.prefix, limit = params.limit, "prefix scan");
-    let prefix_bytes = parse_hex_prefix(&params.prefix)?;
+    debug!(namespace = %ns, prefix = %params.prefix, limit = %params.limit, "prefix scan");
+    let key_type = key_type_for(&state, &ns).await?;
+    let prefix_bytes = prefix_to_bytes(&params.prefix, key_type)?;
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-    let page = state.store.scan_prefix(&ns, prefix_bytes, cursor, params.limit).await?;
+    let page = state.store.scan_prefix(&ns, prefix_bytes, cursor, params.limit.get()).await?;
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -238,18 +260,18 @@ pub async fn prefix_scan(
 #[derive(Deserialize)]
 pub struct QueryPaginationParams {
     page_no: Option<usize>,
-    page_size: Option<usize>,
+    page_size: Option<Limit>,
     /// Alias for `page_size` so `limit` works uniformly with the cursor-paginated
     /// scan endpoints. `page_size` wins if both are given.
-    limit: Option<usize>,
+    limit: Option<Limit>,
 }
 
 /// Request body for `POST /stores/{ns}/query`.
 #[derive(Deserialize)]
 pub struct QueryRequest {
     predicate: String,
-    #[serde(default = "default_page_size")]
-    page_size: usize,
+    #[serde(default)]
+    page_size: Limit,
     #[serde(default = "default_page_no")]
     page_no: usize,
 }
@@ -263,9 +285,13 @@ pub async fn index_query(
     debug!(namespace = %ns, predicate = %req.predicate, "index query");
     let (ns_id, key_type) = ns_schema_for(&state, &ns).await?;
     let page_no = qp.page_no.unwrap_or(req.page_no);
-    let page_size = qp.page_size.or(qp.limit).unwrap_or(req.page_size);
+    let page_size = qp.page_size.or(qp.limit).unwrap_or(req.page_size).get();
     let pagination = Pagination::new(page_no, page_size);
     let page = state.store.query_resolved(&ns, &req.predicate, pagination, ns_id, key_type).await?;
+    let degraded_fields = page.degraded_fields.clone();
+    if !degraded_fields.is_empty() {
+        warn!(namespace = %ns, fields = ?degraded_fields, "index query served from an incomplete index");
+    }
     let results: Vec<serde_json::Value> = page
         .results
         .into_iter()
@@ -276,5 +302,54 @@ pub async fn index_query(
         "page_no": page.page_no,
         "page_size": page.page_size,
         "total": page.total,
+        // Non-empty means these results may be MISSING documents: one or more
+        // indices the predicate read is known to be incomplete and awaiting
+        // repair. See FR-001.
+        "degraded_fields": degraded_fields,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minnal_db::{KeyType, MAX_STR_KEY_LEN};
+
+    fn prefix(raw: &str, key_type: KeyType) -> Option<Vec<u8>> {
+        prefix_to_bytes(raw, key_type).ok()
+    }
+
+    /// String keys are stored verbatim, so their prefix is the raw string —
+    /// requiring hex here would make the endpoint unusable for exactly the case
+    /// it exists for (`acme-` to find every acme record).
+    #[test]
+    fn str_stores_take_a_raw_string_prefix() {
+        assert_eq!(prefix("acme-", KeyType::Str), Some(b"acme-".to_vec()));
+        assert_eq!(prefix("", KeyType::Str), Some(Vec::new()), "an empty prefix matches everything");
+        assert_eq!(prefix("日", KeyType::Str), Some("日".as_bytes().to_vec()));
+    }
+
+    /// A prefix longer than any key could never match, so reject it rather than
+    /// scanning for something unreachable.
+    #[test]
+    fn str_prefixes_are_capped_at_the_key_length() {
+        assert_eq!(prefix(&"x".repeat(MAX_STR_KEY_LEN + 1), KeyType::Str), None);
+        assert!(prefix(&"x".repeat(MAX_STR_KEY_LEN), KeyType::Str).is_some());
+    }
+
+    /// The fixed-width types keep the hex form: a partial big-endian integer
+    /// has no readable text representation.
+    #[test]
+    fn fixed_width_stores_still_take_hex() {
+        assert_eq!(prefix("550e8400", KeyType::Uuid), Some(vec![0x55, 0x0e, 0x84, 0x00]));
+        assert_eq!(
+            prefix("550e8400-e29b", KeyType::Uuid),
+            Some(vec![0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b]),
+            "hyphens are ignored"
+        );
+        assert_eq!(prefix("zz", KeyType::U64), None);
+        assert_eq!(prefix("abc", KeyType::U64), None, "odd-length hex is rejected");
+
+        // What would be a perfectly good string prefix is not valid hex.
+        assert_eq!(prefix("acme-", KeyType::U64), None);
+    }
 }

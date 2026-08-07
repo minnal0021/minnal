@@ -57,7 +57,8 @@ impl<'a> Report<'a> {
         if from_file {
             self.overridden.push(format!("{section}.{key}"));
         }
-        self.rows.push([section.to_string(), key.to_string(), value.to_string(), source.to_string()]);
+        self.rows
+            .push([section.to_string(), key.to_string(), value.to_string(), source.to_string()]);
     }
 
     /// Render the collected rows as a fixed-width table.
@@ -82,7 +83,13 @@ impl<'a> Report<'a> {
                 ow = width[3],
             )
         };
-        let sep = format!("+-{}-+-{}-+-{}-+-{}-+", "-".repeat(width[0]), "-".repeat(width[1]), "-".repeat(width[2]), "-".repeat(width[3]));
+        let sep = format!(
+            "+-{}-+-{}-+-{}-+-{}-+",
+            "-".repeat(width[0]),
+            "-".repeat(width[1]),
+            "-".repeat(width[2]),
+            "-".repeat(width[3])
+        );
 
         let mut out = String::new();
         out.push_str("effective configuration (SOURCE: 'config' = set in file, 'default' = built-in)\n");
@@ -114,7 +121,11 @@ pub fn log_config_table(cfg: &DocStoreApiConfig, raw: Option<&toml::Table>) {
     } else if r.overridden.is_empty() {
         info!("configuration source: a file was loaded but sets no recognised keys — all values are defaults");
     } else {
-        info!("configuration: {} value(s) set from the config file: {}", r.overridden.len(), r.overridden.join(", "));
+        info!(
+            "configuration: {} value(s) set from the config file: {}",
+            r.overridden.len(),
+            r.overridden.join(", ")
+        );
     }
 }
 
@@ -152,13 +163,18 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("scheduled_tasks", "wal_gc_interval_secs", s.wal_gc_interval_secs);
     r.add("scheduled_tasks", "lsm_compaction_interval_secs", s.lsm_compaction_interval_secs);
     r.add("scheduled_tasks", "ttl_cleanup_interval_secs", s.ttl_cleanup_interval_secs);
+    r.add("scheduled_tasks", "index_checkpoint_interval_ms", s.index_checkpoint_interval_ms);
 
     r.add("wal", "segment_size_bytes", bytes(cfg.wal.segment_size_bytes));
     r.add("value_log", "segment_size_bytes", bytes(cfg.value_log.segment_size_bytes));
     r.add("value_log", "verify_checksums_on_read", cfg.value_log.verify_checksums_on_read);
 
     let ss = &cfg.semantic_search;
-    r.add("semantic_search", "number_of_bits_for_dense_quantisation", ss.number_of_bits_for_dense_quantisation);
+    r.add(
+        "semantic_search",
+        "number_of_bits_for_dense_quantisation",
+        ss.number_of_bits_for_dense_quantisation,
+    );
     r.add("semantic_search", "n_probes", ss.n_probes);
     r.add("semantic_search", "embedding_dim", ss.embedding_dim);
     r.add("semantic_search", "first_pass_sparse_search_top_k", ss.first_pass_sparse_search_top_k);
@@ -167,7 +183,11 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("semantic_search", "top_k_results", ss.top_k_results);
     r.add("semantic_search", "embedding_service_url", &ss.embedding_service_url);
     r.add("semantic_search", "model", &ss.model);
-    let cluster = ss.cluster_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (bundled default)".to_string());
+    let cluster = ss
+        .cluster_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none (bundled default)".to_string());
     r.add("semantic_search", "cluster_path", cluster);
     r.add("semantic_search", "supported_models", format!("{} entry(ies)", ss.supported_models.len()));
     r.add("semantic_search", "query_embedding_cache_ttl_secs", ss.query_embedding_cache_ttl_secs);

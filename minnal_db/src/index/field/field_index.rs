@@ -96,13 +96,34 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// it may already be under — see the type-level docs. For a scalar field,
     /// prefer [`set`](Self::set), which replaces rather than accumulates.
     pub fn insert(&mut self, value: V, row_id: u128) {
+        self.insert_many(value, std::slice::from_ref(&row_id));
+    }
+
+    /// Record that every row in `row_ids` has `value` for this field.
+    ///
+    /// The point of this over a loop of [`insert`](Self::insert) is that the
+    /// bitmap is loaded and **re-serialised once for the whole batch** rather
+    /// than once per row. The blob store is append-only, so a per-row loop
+    /// leaves one dead copy of the entire bitmap behind per row — the dominant
+    /// cost when many rows share one value, which is exactly the shape of a
+    /// low-cardinality field.
+    ///
+    /// Used by WAL replay, which knows its full key set up front and can group
+    /// by value before writing. An empty `row_ids` is a no-op and does not
+    /// allocate a slot.
+    pub fn insert_many(&mut self, value: V, row_ids: &[u128]) {
+        if row_ids.is_empty() {
+            return;
+        }
         let slot_id = *self.ordering.entry(value).or_insert_with(|| {
             let id = self.next_slot;
             self.next_slot += 1;
             id
         });
         let mut bm = self.load_bitmap(slot_id);
-        bm.insert(row_id);
+        for &row_id in row_ids {
+            bm.insert(row_id);
+        }
         self.store_bitmap(slot_id, &bm);
     }
 
@@ -217,18 +238,36 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// structure already rebuilt from the WAL on recovery); supplying the old
     /// value gives the same `O(1)` without that cost.
     pub fn remove_all_for_row(&mut self, row_id: u128) -> Vec<u128> {
-        // Collect slot IDs and which values to drop before any mutation to
-        // satisfy the borrow checker (can't borrow ordering immutably and
-        // mutably at the same time).
+        self.remove_all_for_rows(std::slice::from_ref(&row_id))
+    }
+
+    /// Clear every row in `row_ids` from every bucket it occupies.
+    ///
+    /// One load and at most one write-back **per bucket for the whole batch**,
+    /// rather than per row. The single-row form loads every bucket's bitmap and
+    /// rewrites the one that changed, so clearing N rows costs N loads of every
+    /// bucket and N appended copies — the same append-only quadratic that makes
+    /// a per-key `insert` loop expensive.
+    ///
+    /// Used by WAL replay, which clears its whole affected row set before
+    /// re-inserting. An empty `row_ids` is a no-op.
+    pub fn remove_all_for_rows(&mut self, row_ids: &[u128]) -> Vec<u128> {
+        if row_ids.is_empty() {
+            return Vec::new();
+        }
         let slots: Vec<(V, u128)> = self.ordering.iter().map(|(v, &id)| (v.clone(), id)).collect();
 
         let mut empty_values: Vec<V> = Vec::new();
         let mut removed_slots: Vec<u128> = Vec::new();
         for (value, slot_id) in slots {
             let mut bm = self.load_bitmap(slot_id);
-            // Only the bucket that held the row changes — skip the write-back for
-            // every other bucket (avoids appending an unchanged bitmap copy).
-            if !bm.remove(row_id) {
+            let mut changed = false;
+            for &row_id in row_ids {
+                changed |= bm.remove(row_id);
+            }
+            // Skip the write-back for buckets none of these rows touched, so an
+            // unchanged bitmap is never appended.
+            if !changed {
                 continue;
             }
             if bm.is_empty() {

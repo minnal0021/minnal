@@ -11,9 +11,10 @@ use std::time::Duration;
 use crate::db::config::DbConfig;
 use crate::db::database::Database;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::index_manager::FieldIndexHealth;
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
-use crate::db::namespace::{FieldId, FieldReindexOutcome};
+use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::db::namespace_index::ExtractorFn;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
@@ -73,8 +74,53 @@ where
 /// assert_eq!(db.get(b"hello").unwrap(), Some(b"world".to_vec()));
 /// db.shutdown().unwrap();
 /// ```
+///
+/// # Write durability
+///
+/// This contract applies to every write entry point on `Db`, [`Namespace`],
+/// [`AsyncDb`] and [`AsyncNamespace`] — `put`, `delete` and their `_typed`
+/// variants.
+///
+/// A write returns `Ok(())` once it is **durable**: its write-ahead-log entry
+/// has been fsynced to stable storage, so it survives power loss from that
+/// moment on.
+///
+/// `Ok(())` does **not** guarantee the write is immediately readable. After the
+/// WAL fsync the engine applies the operation to its in-memory structures, and
+/// that step is best-effort: it retries a bounded number of times, and if it
+/// still fails — a full disk, for instance — it logs at `ERROR`, increments the
+/// `apply_failures` metric, and returns `Ok(())` regardless. The data is
+/// already committed, so reporting an error would wrongly suggest it was lost.
+///
+/// In that rare window [`Db::get`] returns `None` for a key you successfully
+/// wrote. It is self-healing but not immediately so: the entry is replayed from
+/// the WAL on the next open, so state is correct again after a restart, and
+/// nothing repairs it while the process keeps running. `apply_failures` on
+/// [`Db::ops_metrics`] is how to detect it.
+///
+/// Every write is its own transaction and its own fsync. There is no batch or
+/// multi-key transaction primitive and no group commit, so write throughput is
+/// bounded by the storage's fsync rate. The `_no_wal` variants
+/// (e.g. [`AsyncNamespace::put_no_wal`]) skip the WAL entirely and give up this
+/// durability guarantee in exchange for speed.
 pub struct Db {
     inner: Database,
+}
+
+// Gated on `semantic-search` as well as `test` because that is the only feature
+// combination with a test that needs it; an unconditional `cfg(test)` is dead
+// code under the other combinations, which clippy rejects at `-D warnings`.
+#[cfg(all(test, feature = "semantic-search"))]
+impl Db {
+    /// Test-only access to the internal coordinator.
+    ///
+    /// Some durability behaviour is only observable as per-namespace engine
+    /// state — the no-WAL flush flag, for one — which the facade deliberately
+    /// does not expose. Tests in other modules of this crate need a way in
+    /// without that becoming public API.
+    pub(crate) fn coordinator_for_test(&self) -> &Database {
+        &self.inner
+    }
 }
 
 impl Db {
@@ -130,6 +176,9 @@ impl Db {
     // ── CRUD (default namespace) ──────────────────────────────────────
 
     /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put(key, value)
     }
@@ -140,6 +189,9 @@ impl Db {
     }
 
     /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
     }
@@ -210,7 +262,7 @@ impl Db {
     /// Get or create a namespace with a TTL and return a scoped handle.
     ///
     /// Records in this namespace will be automatically expired after `ttl`.
-    /// Note: the TTL worker is only active when using `AsyncDatabase`.
+    /// Note: the TTL worker is only active when using [`AsyncDb`].
     /// In sync mode, the KVStore stores the TTL but no background worker runs.
     ///
     /// ```rust,no_run
@@ -335,6 +387,9 @@ impl Db {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -360,6 +415,9 @@ impl Db {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -450,6 +508,18 @@ impl Db {
         self.inner.deactivate_field_index(namespace_id, field_id)
     }
 
+    /// Permanently drop a field index: persist the drop, deregister it, and
+    /// delete its on-disk directory.
+    ///
+    /// Use this rather than [`deactivate_field_index`](Self::deactivate_field_index)
+    /// when the index is going away for good — the latter is an in-memory
+    /// deregister that leaves every file in place. The field keeps its
+    /// [`FieldId`] for reuse, but must be re-registered before it can be
+    /// activated again.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        self.inner.drop_field_index(namespace_id, field_id)
+    }
+
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
@@ -490,20 +560,43 @@ impl Db {
         self.inner.index_blob_waste_threshold()
     }
 
+    /// Report the health of every registered field index in a namespace,
+    /// including any outstanding gap and what it would take to repair.
+    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+        self.inner.index_health(namespace_id)
+    }
+
+    /// Repair a degraded field index and clear its gap record.
+    ///
+    /// Row-scoped when the gap named the affected keys, a full rebuild
+    /// otherwise. Does not re-put documents. See
+    /// [`FieldRepairOutcome`](crate::FieldRepairOutcome).
+    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+        self.inner.repair_field_index(namespace_id, field_id)
+    }
+
     /// Evaluate a query string against the active field indices of a namespace
-    /// and return the raw keys of all matching documents.
-    pub fn query_index(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
+    /// and return the matching keys.
+    ///
+    /// Returns a [`QueryOutcome`], not a bare `Vec`: a field index can be
+    /// *degraded* (missing updates it can no longer recover) while still being
+    /// queryable, and serving results that look complete over one is the very
+    /// failure FR-001 exists to remove. Check
+    /// [`is_degraded`](QueryOutcome::is_degraded) — or `degraded_fields` for
+    /// which ones — before treating the result as exhaustive.
+    pub fn query_index(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
         self.inner.query_keys(namespace_id, query_str)
     }
 
-    /// Like [`query_index`] but returns only the `[offset, offset+limit)` window of
-    /// matching keys together with the full match count.
+    /// Like [`query_index`] but resolves only the `[offset, offset+limit)` window
+    /// of matching keys; [`QueryOutcome::total`] still carries the full match
+    /// count.
     ///
     /// Prefer this over `query_index` when serving a paginated API — with a
     /// registered `RowToKeyFn` only `offset + limit` keys need to be resolved.
     ///
     /// [`query_index`]: Db::query_index
-    pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
+    pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         self.inner.query_keys_paginated(namespace_id, query_str, offset, limit)
     }
 }
@@ -519,6 +612,9 @@ impl WalGcTarget for Db {
     fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+    fn flush_namespaces_pinning_wal(&self) -> usize {
+        self.inner.flush_namespaces_pinning_wal()
+    }
     fn get_wal_gc_stats(&self) -> (u64, u64) {
         self.inner.get_wal_gc_stats()
     }
@@ -533,6 +629,9 @@ impl WalGcTarget for Db {
 impl LsmCompactionTarget for Db {
     fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+    fn flush_no_wal_memtables(&self) -> usize {
+        self.inner.flush_no_wal_memtables()
     }
     fn has_lsm_compaction_work(&self) -> bool {
         self.inner.has_lsm_compaction_work()
@@ -595,6 +694,9 @@ impl<'db> Namespace<'db> {
     // ── CRUD ──────────────────────────────────────────────────────────
 
     /// Insert or update a key-value pair in this namespace.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.db.put_ns(self.ns_id, key, value)
     }
@@ -605,6 +707,9 @@ impl<'db> Namespace<'db> {
     }
 
     /// Delete a key from this namespace.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.db.delete_ns(self.ns_id, key)
     }
@@ -655,6 +760,9 @@ impl<'db> Namespace<'db> {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -680,6 +788,9 @@ impl<'db> Namespace<'db> {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -774,6 +885,15 @@ pub struct AsyncDb {
     inner: Arc<Db>,
 }
 
+#[cfg(all(test, feature = "semantic-search"))]
+impl AsyncDb {
+    /// Test-only access to the internal coordinator. See
+    /// [`Db::coordinator_for_test`].
+    pub(crate) fn coordinator_for_test(&self) -> &Database {
+        self.inner.coordinator_for_test()
+    }
+}
+
 impl AsyncDb {
     // ── Open / Close ──────────────────────────────────────────────────
 
@@ -835,9 +955,21 @@ impl AsyncDb {
             }
         }
 
+        // Shutdown the index checkpoint worker. Stopped *before* the final
+        // checkpoint below so the two cannot run concurrently, and so a tick
+        // cannot land on an already-closed database.
+        if self.inner.inner.index_checkpoint_worker.read().await.is_some() {
+            info!("[AsyncDb] Shutting down index checkpoint worker...");
+            if let Some(w) = self.inner.inner.index_checkpoint_worker.write().await.take() {
+                w.shutdown().await;
+            }
+        }
+
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            // Flush index state on clean shutdown before stopping the checkpoint worker.
+            // Flush index state on clean shutdown, now that no worker can race
+            // with it. This is also what clears the no-WAL markers, so a clean
+            // shutdown reports no gap on the next open (FR-001).
             if let Err(e) = db.inner.run_index_checkpoint() {
                 log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
             }
@@ -845,6 +977,16 @@ impl AsyncDb {
         })
         .await
         .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Test-only: whether the index checkpoint worker is currently installed.
+    ///
+    /// Exists so a test can assert that [`shutdown`](Self::shutdown) actually
+    /// stops it — a gap that went unnoticed for as long as a second, unused
+    /// async wrapper was the only thing stopping the worker.
+    #[cfg(test)]
+    pub(crate) async fn index_checkpoint_worker_active(&self) -> bool {
+        self.inner.inner.index_checkpoint_worker.read().await.is_some()
     }
 
     // ── Background worker management ──────────────────────────────────
@@ -863,7 +1005,9 @@ impl AsyncDb {
         // Wire the write-path backpressure valve to this worker before publishing it.
         self.inner.inner.wire_index_checkpoint_trigger(&worker);
         *self.inner.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
-        info!("[AsyncDb] Index checkpoint worker enabled with {}s interval", interval.as_secs());
+        // Milliseconds, not seconds: the default is 1750 ms, which `as_secs()`
+        // truncated to a misleading "1s".
+        info!("[AsyncDb] Index checkpoint worker enabled with {}ms interval", interval.as_millis());
         Ok(())
     }
 
@@ -926,7 +1070,8 @@ impl AsyncDb {
         self.enable_wal_gc_worker(st.wal_gc_interval).await?;
         self.enable_lsm_compaction_worker(st.lsm_compaction_interval).await?;
         self.enable_value_log_gc_worker(st.value_log_gc_interval, threshold).await?;
-        self.enable_index_checkpoint_worker(DEFAULT_CHECKPOINT_INTERVAL).await?;
+        self.enable_index_checkpoint_worker(config.scheduled_task_config.index_checkpoint_interval())
+            .await?;
         // Restore TTL: if any namespace has a persisted TTL config, start the
         // single global TTL worker so expiry resumes across restarts.
         if !self.inner.inner.registry.read().ttl_configs().is_empty() {
@@ -942,6 +1087,10 @@ impl AsyncDb {
 
     // ── CRUD ──────────────────────────────────────────────────────────
 
+    /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.put(&key, &value))
@@ -956,6 +1105,10 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.delete(&key))
@@ -1195,6 +1348,9 @@ impl AsyncDb {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1220,6 +1376,9 @@ impl AsyncDb {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1302,6 +1461,16 @@ impl AsyncDb {
         self.inner.inner.deactivate_field_index(namespace_id, field_id)
     }
 
+    /// Permanently drop a field index: persist the drop, deregister it, and
+    /// delete its on-disk directory.
+    ///
+    /// See [`Db::drop_field_index`] for the semantics and the ordering
+    /// guarantee. Synchronous — the work is a schema write plus a directory
+    /// removal, not a scan.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        self.inner.inner.drop_field_index(namespace_id, field_id)
+    }
+
     /// Register a custom row-ID function (and optionally its inverse) for a namespace.
     ///
     /// Call this before `activate_field_index` so WAL replay uses consistent row IDs.
@@ -1352,6 +1521,25 @@ impl AsyncDb {
     /// Reindex a single field for a single key, re-deriving its value from the
     /// key's current stored bytes using the same logic as the put path. Touches
     /// only the named field. See [`crate::FieldReindexOutcome`].
+    /// Report the health of every registered field index in a namespace.
+    pub async fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.index_health(namespace_id))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Repair a degraded field index and clear its gap record.
+    ///
+    /// Offloaded to a blocking task: a full rebuild scans the namespace, so this
+    /// must not run on the async runtime's worker threads.
+    pub async fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.repair_field_index(namespace_id, field_id))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: Vec<u8>) -> Result<FieldReindexOutcome> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.reindex_field(namespace_id, field_id, &key))
@@ -1366,7 +1554,7 @@ impl AsyncDb {
 
     /// Evaluate a query string against the active field indices of a namespace
     /// and return the raw keys of all matching documents.
-    pub async fn query_index(&self, namespace_id: u32, query: impl Into<String> + Send + 'static) -> Result<Vec<Vec<u8>>> {
+    pub async fn query_index(&self, namespace_id: u32, query: impl Into<String> + Send + 'static) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
         tokio::task::spawn_blocking(move || db.inner.query_keys(namespace_id, &q))
@@ -1384,7 +1572,7 @@ impl AsyncDb {
         query: impl Into<String> + Send + 'static,
         offset: usize,
         limit: usize,
-    ) -> Result<(Vec<Vec<u8>>, usize)> {
+    ) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
         tokio::task::spawn_blocking(move || db.inner.query_keys_paginated(namespace_id, &q, offset, limit))
@@ -1413,6 +1601,10 @@ impl AsyncNamespace {
         self.store.ttl
     }
 
+    /// Insert or update a key-value pair.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
         let ns_id = self.ns_id;
@@ -1467,6 +1659,10 @@ impl AsyncNamespace {
             .unwrap_or_else(|_| vec![None; n])
     }
 
+    /// Delete a key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
         let ns_id = self.ns_id;
@@ -1537,6 +1733,9 @@ impl AsyncNamespace {
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
 
     /// Insert a typed key-value pair, serialized via rkyv.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
@@ -1562,6 +1761,9 @@ impl AsyncNamespace {
     }
 
     /// Delete by typed key.
+    ///
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
         K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,

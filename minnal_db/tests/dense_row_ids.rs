@@ -98,7 +98,7 @@ fn dense_bitmap_stays_compact() -> Result<(), KVError> {
     );
 
     // Sanity: the query still returns every doc.
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
+    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
     assert_eq!(active.len(), n as usize);
 
     db.shutdown()?;
@@ -126,7 +126,7 @@ fn ids_survive_clean_restart() -> Result<(), KVError> {
     let db = open_test_db(dir.path())?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
+    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
     let mut ids: Vec<u64> = active
         .iter()
         .map(|kb| access::<Archived<u64>, rancor::Error>(kb).unwrap().to_native())
@@ -136,7 +136,7 @@ fn ids_survive_clean_restart() -> Result<(), KVError> {
 
     // An update after restart must reuse the doc's existing ID, not duplicate it.
     put_user(&db, 0, "inactive")?;
-    let active_after = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
+    let active_after = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
     assert_eq!(active_after.len(), 99, "doc 0 must move out of 'active', not linger under a stale id");
 
     db.shutdown()?;
@@ -176,7 +176,7 @@ fn ids_rebuilt_by_wal_replay_after_crash() -> Result<(), KVError> {
     let db = open_test_db(dir.path())?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())?;
 
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?;
+    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
     let mut ids: Vec<u64> = active
         .iter()
         .map(|kb| access::<Archived<u64>, rancor::Error>(kb).unwrap().to_native())

@@ -27,6 +27,14 @@ pub struct FieldDef {
     pub field_id: FieldId,
     pub field_name: String,
     pub field_type: IndexValueType,
+    /// Whether this field's index has been dropped.
+    ///
+    /// The definition is retained so a later re-add reuses the same
+    /// [`FieldId`]; the flag is what makes the drop *durable*, so an
+    /// interrupted drop can be completed at the next open. Defaults to `false`
+    /// for definitions written before the flag existed.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// The schema section of a namespace config: all registered field definitions.
@@ -65,6 +73,77 @@ pub struct FieldMeta {
     /// `activate_field_index` validates that the caller-supplied type matches
     /// this so mismatches are caught at activation time rather than at query time.
     pub field_type: IndexValueType,
+    /// Whether this field's index has been dropped.
+    ///
+    /// A dropped field keeps its entry so a later re-add reuses the same
+    /// [`FieldId`], but it is excluded from
+    /// [`NamespaceRegistry::all_indexed_fields`] and cannot be activated until
+    /// it is re-registered. See `FEATURE-REQUEST.md` (FR-001) —
+    /// *Dropped-index cleanup*.
+    pub dropped: bool,
+}
+
+/// The result of a field-index query: the matching keys **and** whether the
+/// indices that produced them are known to be incomplete.
+///
+/// Returning a bare `Vec` of keys was the original defect in a different
+/// costume: a degraded index served results that *looked* complete, so a caller
+/// could not tell a genuinely empty result from a missing one. The status is
+/// carried here rather than only at the REST boundary because
+/// [`Db::query_index`](crate::Db::query_index) is a first-class documented path
+/// — flagging only in `doc_store` would fix HTTP callers and leave embedders
+/// exactly where they started.
+///
+/// See `FEATURE-REQUEST.md` (FR-001) — *Queryable + degraded ⇒ the answer must
+/// say so*.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryOutcome {
+    /// The matching keys. For a paginated query, only the requested window.
+    pub keys: Vec<Vec<u8>>,
+    /// Total matching rows, i.e. the cardinality of the evaluated bitmap.
+    ///
+    /// May exceed `keys.len()`: a paginated query returns one window, and any
+    /// query can hold a row whose key cannot be resolved back (a row map that
+    /// has lost the entry).
+    pub total: usize,
+    /// Fields referenced by *this* predicate that have an outstanding gap
+    /// record, so the results may be incomplete. Empty ⇒ complete.
+    ///
+    /// Only fields the predicate actually touched are listed — an unrelated
+    /// degraded field elsewhere in the namespace does not taint this query.
+    pub degraded_fields: Vec<FieldId>,
+}
+
+impl QueryOutcome {
+    /// Whether any field this query touched has an outstanding gap, i.e. the
+    /// results may be missing rows.
+    pub fn is_degraded(&self) -> bool {
+        !self.degraded_fields.is_empty()
+    }
+}
+
+/// What a field-index repair did ([`crate::Db::repair_field_index`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum FieldRepairOutcome {
+    /// The field had no outstanding gap; nothing to do.
+    NotDegraded,
+    /// The recorded worklist was replayed key by key.
+    RowScoped {
+        /// Keys in the worklist.
+        keys_total: usize,
+        /// Keys whose current value was re-extracted and re-indexed.
+        reindexed: usize,
+        /// Keys with no current value. Their rows were cleared — the key may
+        /// have been deleted by the very write that went missing.
+        absent: usize,
+    },
+    /// The whole field was rebuilt from current data, because the worklist was
+    /// unavailable (over the cap, or never knowable for a no-WAL gap).
+    FullRebuild {
+        /// Keys scanned and re-extracted.
+        scanned: usize,
+    },
 }
 
 /// Outcome of a targeted single-field reindex ([`crate::Db::reindex_field`]).
@@ -110,6 +189,7 @@ impl NamespaceSchema {
                     field_id: f.field_id,
                     field_name: f.field_name,
                     field_type: f.field_type,
+                    dropped: f.dropped,
                 },
             );
         }
@@ -124,14 +204,20 @@ impl NamespaceSchema {
     /// **Idempotent**: if a field with the same name and type already exists
     /// the existing [`FieldId`] is returned without error.  A name collision
     /// with a *different* type is an error.
+    ///
+    /// Re-registering a previously **dropped** field clears its `dropped` flag
+    /// and reuses its [`FieldId`] — the documented id-reuse behaviour. The
+    /// caller is responsible for rebuilding the index; the flag only records
+    /// that the field is live again.
     pub fn register_field(&mut self, field_name: &str, field_type: IndexValueType) -> Result<FieldId> {
-        if let Some(existing) = self.fields.get(field_name) {
+        if let Some(existing) = self.fields.get_mut(field_name) {
             if existing.field_type != field_type {
                 return Err(KVError::Serialization(format!(
                     "Field '{}' is already registered as {:?}, cannot re-register as {:?}",
                     field_name, existing.field_type, field_type
                 )));
             }
+            existing.dropped = false;
             return Ok(existing.field_id);
         }
         let field_id = self.next_field_id;
@@ -142,9 +228,38 @@ impl NamespaceSchema {
                 field_id,
                 field_name: field_name.to_string(),
                 field_type,
+                dropped: false,
             },
         );
         Ok(field_id)
+    }
+
+    /// Mark a field's index as dropped, returning `false` if the field is not
+    /// registered.
+    ///
+    /// The [`FieldMeta`] is deliberately retained so a later
+    /// [`register_field`](Self::register_field) reuses the same [`FieldId`].
+    /// Persisting this flag is what makes a drop completable after a crash —
+    /// see `FEATURE-REQUEST.md` (FR-001).
+    pub fn mark_field_dropped(&mut self, field_id: FieldId) -> bool {
+        match self.fields.values_mut().find(|f| f.field_id == field_id) {
+            Some(f) => {
+                f.dropped = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Return the `FieldId`s of every field whose index has been dropped but
+    /// whose definition is retained, sorted ascending.
+    ///
+    /// Used at open to finish deleting the on-disk directories of drops that
+    /// were interrupted by a crash.
+    pub fn dropped_field_ids(&self) -> Vec<FieldId> {
+        let mut ids: Vec<FieldId> = self.fields.values().filter(|f| f.dropped).map(|f| f.field_id).collect();
+        ids.sort();
+        ids
     }
 
     /// Look up a field by name — the primary query-time access pattern, O(1).
@@ -164,9 +279,18 @@ impl NamespaceSchema {
         fields
     }
 
-    /// Return all registered `FieldId`s sorted ascending.
+    /// Return all registered `FieldId`s sorted ascending, **including dropped
+    /// fields** (whose definitions are retained for id reuse).
     pub fn field_ids(&self) -> Vec<FieldId> {
         let mut ids: Vec<FieldId> = self.fields.values().map(|f| f.field_id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Return the `FieldId`s of every field whose index has *not* been dropped,
+    /// sorted ascending.
+    pub fn live_field_ids(&self) -> Vec<FieldId> {
+        let mut ids: Vec<FieldId> = self.fields.values().filter(|f| !f.dropped).map(|f| f.field_id).collect();
         ids.sort();
         ids
     }
@@ -303,7 +427,7 @@ impl NamespaceRegistry {
 
     /// Return the directory path used for namespace `name`: `{db_path}/ns_{name}`.
     pub fn ns_dir(&self, name: &str) -> PathBuf {
-        self.db_path.join(format!("ns_{}", name))
+        crate::db::layout::namespace_data_dir(&self.db_path, name)
     }
 
     /// Create a new namespace and return its ID.
@@ -423,12 +547,35 @@ impl NamespaceRegistry {
         Ok(field_id)
     }
 
+    /// Mark a field's index as dropped in the namespace schema and persist the
+    /// change to `config.json` **before** any file is deleted.
+    ///
+    /// Returns `false` if the field is not registered (nothing to mark).
+    /// Persisting first is what makes an interrupted drop completable at the
+    /// next open; see `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+    pub fn mark_schema_field_dropped(&mut self, ns_id: u32, field_id: FieldId) -> Result<bool> {
+        let marked = self
+            .schemas
+            .get_mut(&ns_id)
+            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?
+            .mark_field_dropped(field_id);
+        if marked {
+            self.persist_schema(ns_id)?;
+        }
+        Ok(marked)
+    }
+
     /// Return all `(namespace_id, field_id)` pairs across every namespace,
     /// suitable for use by the index checkpoint worker.
+    ///
+    /// **Excludes dropped fields.** Their definitions are retained for id reuse
+    /// but their on-disk directories are gone, so checkpointing them would fail;
+    /// and a dropped field's frozen checkpoint marker must never hold up WAL GC
+    /// (FR-001, *The trap: active fields only*).
     pub fn all_indexed_fields(&self) -> Vec<(u32, FieldId)> {
         self.schemas
             .iter()
-            .flat_map(|(ns_id, schema)| schema.field_ids().into_iter().map(|fid| (*ns_id, fid)))
+            .flat_map(|(ns_id, schema)| schema.live_field_ids().into_iter().map(|fid| (*ns_id, fid)))
             .collect()
     }
 
@@ -436,7 +583,7 @@ impl NamespaceRegistry {
 
     /// Read `{db_path}/ns_{name}/config.json`, returning `None` if absent.
     fn load_config(db_path: &Path, name: &str) -> Result<Option<NamespaceConfig>> {
-        let config_path = db_path.join(format!("ns_{}", name)).join(CONFIG_FILENAME);
+        let config_path = crate::db::layout::namespace_data_dir(db_path, name).join(CONFIG_FILENAME);
         if !config_path.exists() {
             return Ok(None);
         }
@@ -474,13 +621,14 @@ impl NamespaceRegistry {
                         field_id: f.field_id,
                         field_name: f.field_name,
                         field_type: f.field_type,
+                        dropped: f.dropped,
                     })
                     .collect(),
                 next_field_id: schema.next_field_id,
             }),
         };
 
-        let config_dir = self.db_path.join(format!("ns_{}", name));
+        let config_dir = crate::db::layout::namespace_data_dir(&self.db_path, name);
         fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join(CONFIG_FILENAME);
 

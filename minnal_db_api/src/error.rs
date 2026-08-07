@@ -7,6 +7,10 @@ use minnal_db::{DocStoreError, SchemaError};
 use tracing::error;
 
 /// Wraps [`DocStoreError`] so it can be returned from axum handlers.
+///
+/// `Debug` is for tests and tracing only — what a client sees is decided by
+/// [`IntoResponse`], which withholds the message for 5xx.
+#[derive(Debug)]
 pub struct AppError {
     pub inner: DocStoreError,
     pub namespace: Option<String>,
@@ -64,11 +68,21 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::EmbeddingFieldNotString { .. })
             | DocStoreError::Schema(SchemaError::KvKeyTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::KvValueTypeMismatch { .. })
-            | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr) => StatusCode::BAD_REQUEST,
+            | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr)
+            | DocStoreError::Schema(SchemaError::StrKeyTooLong { .. })
+            | DocStoreError::Schema(SchemaError::EmptyStrKey)
+            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8) => StatusCode::BAD_REQUEST,
 
             // A key/value too large for the storage format's u32 length fields is
             // user-actionable: report 413 rather than a generic 500.
             DocStoreError::Db(minnal_db::KVError::WriteTooLarge(_)) => StatusCode::PAYLOAD_TOO_LARGE,
+
+            // A malformed predicate, an unknown or un-indexed field, a type
+            // mismatch, or a query past the parser's complexity limits are all
+            // faults in the *request*. Reporting them as 500 told the caller the
+            // database had failed and withheld the one thing that would let them
+            // fix it — the parser's message.
+            DocStoreError::Db(minnal_db::KVError::Query(_)) => StatusCode::BAD_REQUEST,
 
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -85,10 +99,93 @@ impl IntoResponse for AppError {
                 "internal server error"
             );
             "internal server error".to_owned()
+        } else if let DocStoreError::Db(minnal_db::KVError::Query(query_error)) = &self.inner {
+            // Report the parser's own message without the "database error:"
+            // framing `DocStoreError::Db` adds — the fault is in the caller's
+            // query, and saying "database error" for a 400 misdirects them.
+            query_error.to_string()
         } else {
             self.inner.to_string()
         };
         let body = Json(serde_json::json!({ "error": message }));
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minnal_db::KVError;
+    use minnal_db::index::query::QueryError;
+
+    async fn render(inner: DocStoreError) -> (StatusCode, String) {
+        let response = AppError::from(inner).into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json["error"].as_str().unwrap().to_owned())
+    }
+
+    /// A bad predicate is the caller's fault. Reporting it as 500 with the text
+    /// withheld — which is what every query error did before `KVError::Query`
+    /// existed — leaves the client unable to tell an invalid query from a broken
+    /// database, and with nothing to act on.
+    #[tokio::test]
+    async fn query_errors_are_400_and_carry_the_parsers_message() {
+        let cases = [
+            QueryError::UnknownField { name: "title".into() },
+            QueryError::Syntax {
+                pos: 12,
+                msg: "expected a value".into(),
+            },
+            QueryError::TooComplex {
+                msg: "nesting depth exceeded".into(),
+            },
+            QueryError::InactiveField { field: "status".into() },
+        ];
+
+        for case in cases {
+            let expected = case.to_string();
+            let (status, message) = render(DocStoreError::Db(KVError::Query(case))).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "query errors must not be 5xx");
+            assert_eq!(message, expected, "the parser's own message must reach the client, unframed");
+            assert!(
+                !message.contains("database error"),
+                "a client error must not be framed as a database failure: {message:?}"
+            );
+        }
+    }
+
+    /// Key-validation failures are the caller's fault and must carry their
+    /// message. A `SchemaError` variant missing from the 400 arm falls through
+    /// to the catch-all and becomes a 500 with the text suppressed — which
+    /// would tell a client that a 51-byte key had broken the database.
+    #[tokio::test]
+    async fn string_key_validation_errors_are_400_and_explain_themselves() {
+        // `SchemaError` is not `Clone`, so each case is a constructor.
+        let cases: [fn() -> SchemaError; 3] = [
+            || SchemaError::StrKeyTooLong { max: 50, len: 51 },
+            || SchemaError::EmptyStrKey,
+            || SchemaError::StrKeyNotUtf8,
+        ];
+
+        for make in cases {
+            let expected = DocStoreError::Schema(make()).to_string();
+            let (status, message) = render(DocStoreError::Schema(make())).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "key validation must not be 5xx: {expected}");
+            assert_eq!(message, expected, "the client needs to be told what was wrong with the key");
+        }
+    }
+
+    /// The other side of the split: a genuine engine failure still withholds its
+    /// details, which may name internal paths or state.
+    #[tokio::test]
+    async fn non_query_engine_errors_stay_500_and_opaque() {
+        let (status, message) = render(DocStoreError::Db(KVError::DatabaseClosed)).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "internal server error");
     }
 }

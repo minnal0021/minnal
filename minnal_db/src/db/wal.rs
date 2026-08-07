@@ -153,6 +153,18 @@ impl WalEntry {
         })
     }
 
+    /// Read only the namespace id and key, copying the key but never the value.
+    ///
+    /// Used when harvesting the keys a WAL segment holds before it is reclaimed
+    /// (see [`Wal::scan_segment_keys`]): a segment can hold tens of thousands of
+    /// documents, and full deserialisation would copy every one of their values
+    /// into memory just to throw them away.
+    pub fn peek_namespace_and_key(bytes: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
+            .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
+        Ok((archived.namespace_id.into(), archived.key.to_vec()))
+    }
+
     /// Deserialize entry from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
@@ -680,9 +692,53 @@ impl Wal {
         Ok(())
     }
 
-    /// Scan all entries from head to tail, filtering by status
-    pub fn scan_entries(&self, head: u64, tail: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
-        let mut entries = Vec::new();
+    /// Segment ids covering `[head, tail)` whose files are **absent**.
+    ///
+    /// A caller that scans this range gets no error for a missing segment —
+    /// [`scan_entries`](Self::scan_entries) deliberately treats one as a hole and
+    /// skips it, because aborting there would stall `mark_persisted_range` and
+    /// wedge WAL GC. That is correct for the LSM recovery path (those entries are
+    /// persisted by definition, which is why GC reclaimed them) but it means any
+    /// *other* consumer replaying this range is silently handed an incomplete
+    /// result. This reports the holes so such a consumer can say so.
+    ///
+    /// Presence is checked against the filesystem rather than inferred from
+    /// `WalMetadata`'s per-segment counters, which are trimmed and zeroed on
+    /// reclamation and so cannot distinguish "deleted" from "untracked".
+    ///
+    /// Note WAL GC reclaims fully-persisted segments **out of order** (see
+    /// `Database::garbage_collect_wal`), so a hole can sit in the middle of the
+    /// range while `WalMetadata::head` is still below it — comparing an offset
+    /// against `head` alone under-reports.
+    pub fn missing_segments(&self, head: u64, tail: u64) -> Vec<u64> {
+        if tail <= head {
+            return Vec::new();
+        }
+        let first = self.segment_id_for(head);
+        let last = self.segment_id_for(tail - 1);
+        (first..=last).filter(|&id| !self.segment_path_for(id).exists()).collect()
+    }
+
+    /// Walk the WAL frames in `[head, tail)`, handing each frame's **global
+    /// offset** and body bytes to `extract`, and collecting what it returns.
+    ///
+    /// The single frame-parsing loop every WAL scan goes through. Keeping it in
+    /// one place matters because the loop encodes three distinct recovery
+    /// judgements that must not drift apart between callers:
+    ///
+    /// - a **missing segment** is a hole to skip, not an error. WAL GC reclaims
+    ///   fully-persisted segments out of order, so a hole can sit mid-range;
+    ///   aborting would crash recovery and stall `mark_persisted_range`, and WAL
+    ///   GC could then never reclaim past it (unbounded WAL growth);
+    /// - a **short or zero-length frame** is a torn/unwritten segment tail:
+    ///   advance to the next segment and keep going;
+    /// - a frame that **will not decode** ends the scan — `extract` returns
+    ///   `None` to say so.
+    ///
+    /// The body buffer is reused across frames, so a scan allocates once rather
+    /// than per entry.
+    fn walk_frames<T>(&self, head: u64, tail: u64, mut extract: impl FnMut(u64, &[u8]) -> Option<T>) -> Result<Vec<T>> {
+        let mut collected = Vec::new();
         let mut offset = head;
         let mut entry_bytes = Vec::new();
 
@@ -744,18 +800,76 @@ impl Wal {
                 break;
             }
 
-            match WalEntry::from_bytes(&entry_bytes[..size as usize]) {
-                Ok(entry) => {
-                    let pointer = WalPointer::new(offset, size, entry.status);
-                    entries.push((pointer, entry));
-                }
-                Err(_) => break,
+            match extract(offset, &entry_bytes[..size as usize]) {
+                Some(value) => collected.push(value),
+                None => break,
             }
 
             offset += 4 + size as u64;
         }
 
-        Ok(entries)
+        Ok(collected)
+    }
+
+    /// Scan all entries from head to tail, filtering by status
+    pub fn scan_entries(&self, head: u64, tail: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
+        self.walk_frames(head, tail, |offset, body| {
+            let entry = WalEntry::from_bytes(body).ok()?;
+            Some((WalPointer::new(offset, body.len() as u32, entry.status), entry))
+        })
+    }
+
+    /// Scan `[head, tail)` for `(namespace_id, key)` pairs, **without
+    /// materialising any values**.
+    ///
+    /// The key-only counterpart of [`scan_entries`](Self::scan_entries), for
+    /// callers that need to know *which documents* a WAL range covers rather
+    /// than what was written to them. `scan_entries` returns whole `WalEntry`
+    /// values, so using it for that copies every document body in the range into
+    /// memory only to discard it — a range spanning a few segments can hold tens
+    /// of thousands of documents.
+    ///
+    /// Pairs are returned in WAL order, **with duplicates**: a key written five
+    /// times appears five times. Callers wanting a work list want
+    /// [`scan_segment_keys`](Self::scan_segment_keys), which deduplicates.
+    pub fn scan_keys_in_entries(&self, head: u64, tail: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+        self.walk_frames(head, tail, |_, body| WalEntry::peek_namespace_and_key(body).ok())
+    }
+
+    /// Collect the distinct `(namespace_id, key)` pairs one WAL segment holds,
+    /// **without materialising any values**.
+    ///
+    /// This is the harvest that makes row-scoped index repair possible. When the
+    /// backstop forces WAL GC to reclaim a segment an active field index still
+    /// needs (see `ThresholdConfig::max_pinned_wal_segments`), the keys of the
+    /// affected documents exist *only* in that segment — a gap record holding a
+    /// WAL range and segment ids cannot name them, and once the file is unlinked
+    /// they are unrecoverable. So they are harvested here, immediately before the
+    /// unlink, and recorded as a repair worklist.
+    ///
+    /// Built on [`scan_keys_in_entries`](Self::scan_keys_in_entries), so it
+    /// shares the one frame-parsing loop and never materialises a value.
+    ///
+    /// Results are deduplicated (a key written five times in the segment needs
+    /// repairing once) and returned in first-seen order. Both upserts and deletes
+    /// are included — a lost *delete* leaves a stale row in the index, which is
+    /// just as wrong as a missing one.
+    ///
+    /// A missing segment file yields an empty result rather than an error: GC may
+    /// have already reclaimed it, and failing here would abort the whole pass.
+    pub fn scan_segment_keys(&self, segment_id: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+        let start = segment_id * self.segment_size;
+        let pairs = self.scan_keys_in_entries(start, start + self.segment_size)?;
+
+        let mut seen: std::collections::HashSet<(u32, Vec<u8>)> = std::collections::HashSet::with_capacity(pairs.len());
+        let mut keys = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            if seen.insert(pair.clone()) {
+                keys.push(pair);
+            }
+        }
+        keys.shrink_to_fit();
+        Ok(keys)
     }
 
     /// Scan only INSERTED entries from head onwards (for GC)
@@ -1273,6 +1387,86 @@ mod tests {
         Ok(())
     }
 
+    /// `scan_keys_in_entries` and `scan_entries` share one frame-parsing loop, so
+    /// they must always agree on which entries a range contains — including over
+    /// a hole, where the recovery judgement "a missing segment is skipped, not an
+    /// error" lives. This is what stops the two drifting apart.
+    #[test]
+    fn key_only_scan_agrees_with_the_full_scan() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("keys.wal"), false, 256)?;
+
+        let mut tail = 0u64;
+        for i in 0..60u32 {
+            wal.append_entry(
+                &WalEntry::new_upsert_ns(i % 3, format!("k{i}").into_bytes(), vec![b'x'; 40]),
+                &mut tail,
+                false,
+            )?;
+        }
+
+        let expect = |wal: &Wal, tail: u64| -> Result<Vec<(u32, Vec<u8>)>> {
+            Ok(wal.scan_entries(0, tail)?.into_iter().map(|(_, e)| (e.namespace_id, e.key)).collect())
+        };
+
+        assert_eq!(
+            wal.scan_keys_in_entries(0, tail)?,
+            expect(&wal, tail)?,
+            "baseline: same entries, same order"
+        );
+
+        // ...and over a hole, so both paths make the same skip-don't-abort call.
+        wal.delete_segment_file(1)?;
+        let keys = wal.scan_keys_in_entries(0, tail)?;
+        assert_eq!(keys, expect(&wal, tail)?, "both scans must skip the hole identically");
+        assert!(keys.len() < 60, "the deleted segment's entries are gone");
+        Ok(())
+    }
+
+    /// `scan_segment_keys` covers exactly one segment and deduplicates, since a
+    /// key written repeatedly needs repairing once. `scan_keys_in_entries` does
+    /// not deduplicate — the raw WAL order is what a caller reading a range wants.
+    #[test]
+    fn segment_key_scan_is_scoped_and_deduplicated() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("dedupe.wal"), false, 256)?;
+
+        let mut tail = 0u64;
+        // The same key rewritten many times, plus a distinct one.
+        for _ in 0..8u32 {
+            wal.append_entry(&WalEntry::new_upsert(b"hot".to_vec(), vec![b'x'; 40]), &mut tail, false)?;
+        }
+        wal.append_entry(&WalEntry::new_upsert(b"cold".to_vec(), vec![b'x'; 40]), &mut tail, false)?;
+
+        let raw = wal.scan_keys_in_entries(0, tail)?;
+        assert_eq!(raw.len(), 9, "the range scan keeps every occurrence");
+
+        // Segment 0 only, deduplicated.
+        let seg0 = wal.scan_segment_keys(0)?;
+        let distinct: Vec<Vec<u8>> = seg0.iter().map(|(_, k)| k.clone()).collect();
+        assert!(distinct.len() < 9, "repeated keys collapse to one entry each, got {distinct:?}");
+        assert_eq!(
+            distinct.iter().filter(|k| k.as_slice() == b"hot").count(),
+            1,
+            "a key written eight times must appear once"
+        );
+        // Every key came from segment 0 alone.
+        let seg0_end = 256u64;
+        let in_segment_0: Vec<(u32, Vec<u8>)> = wal.scan_keys_in_entries(0, seg0_end)?;
+        for pair in &seg0 {
+            assert!(
+                in_segment_0.contains(pair),
+                "scan_segment_keys returned {pair:?} from outside its segment"
+            );
+        }
+
+        // A reclaimed segment yields nothing rather than an error — GC may have
+        // already unlinked it, and failing would abort the whole pass.
+        wal.delete_segment_file(0)?;
+        assert!(wal.scan_segment_keys(0)?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn test_wal_delete_segment_file() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -1289,6 +1483,44 @@ mod tests {
         assert!(segment_path.exists());
         wal.delete_segment_file(1)?;
         assert!(!segment_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_segments_reports_a_hole_in_the_middle_of_the_range() -> Result<()> {
+        // WAL GC reclaims fully-persisted segments out of *segment* order, so a
+        // hole can sit in the middle of a replay window while `head` is still
+        // below it. `scan_entries` skips such a hole silently, which is why a
+        // consumer replaying the range needs this to know its result is partial.
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("holes.wal");
+        let wal = Wal::open_with_options_and_segment_size(&path, false, 256)?;
+
+        let mut tail = 0u64;
+        for i in 0..50u32 {
+            let key = format!("k{}", i).into_bytes();
+            wal.append_entry(&WalEntry::new_upsert(key, vec![b'x'; 40]), &mut tail, false)?;
+        }
+        assert!(wal.segment_id_for_offset(tail - 1) >= 3, "test needs several segments, got {tail} bytes");
+
+        assert_eq!(wal.missing_segments(0, tail), Vec::<u64>::new(), "nothing deleted yet");
+
+        // Reclaim an interior segment, leaving 0 and everything above it in place.
+        wal.delete_segment_file(1)?;
+        assert_eq!(wal.missing_segments(0, tail), vec![1]);
+
+        // A window that does not cover the hole is unaffected.
+        let seg2_start = 2 * wal.segment_size();
+        assert_eq!(wal.missing_segments(seg2_start, tail), Vec::<u64>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_segments_is_empty_for_an_empty_range() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("empty.wal"), false, 256)?;
+        assert_eq!(wal.missing_segments(0, 0), Vec::<u64>::new());
+        assert_eq!(wal.missing_segments(500, 100), Vec::<u64>::new(), "tail <= head");
         Ok(())
     }
 

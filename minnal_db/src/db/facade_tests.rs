@@ -1,3 +1,8 @@
+//! Integration tests for the `Db` / `AsyncDb` facade.
+//!
+//! Lives beside `facade.rs` rather than in `tests/` because it reaches internal
+//! configuration types. Was `db/db.rs`.
+
 #[cfg(test)]
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 #[cfg(test)]

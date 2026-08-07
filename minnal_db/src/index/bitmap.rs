@@ -440,6 +440,78 @@ impl RoaringBitmap {
         })
     }
 
+    /// Yield at most `limit` values starting at rank `offset`, in ascending order.
+    ///
+    /// Equivalent to `iter().skip(offset).take(limit)` but bounded at **both**
+    /// ends, which is what makes it cheap:
+    ///
+    /// - it reaches `offset` by skipping whole containers on their cached
+    ///   cardinality rather than walking elements, and
+    /// - it materialises at most `limit` values from each container it does
+    ///   touch.
+    ///
+    /// Both bounds are load-bearing. [`iter`](Self::iter) deserialises and
+    /// collects every container it passes over, so `.skip(offset)` allocates its
+    /// way to the offset and a full paginated walk is quadratic. But taking
+    /// `limit` *outside* the iterator is not enough either: without the inner
+    /// bound, landing at rank 0 of a full 65 536-value container would
+    /// materialise all of it to return a page of 50 — measured **slower** than
+    /// the `iter().skip()` it replaced. Keep both.
+    ///
+    /// Only `ContainerStore::sorted_key_cards` is consulted up front (slot table
+    /// only, no container deserialisation); containers before the start point
+    /// are never touched.
+    ///
+    /// **The skip *within* the landing container is still linear**, bounded by
+    /// that container's cardinality (≤ 65 536) rather than by `offset`. So a
+    /// result set spanning many containers pages in near-constant time, while
+    /// one that fits in a single container keeps an `O(offset)` shape with a
+    /// much smaller constant. Measured against `iter().skip()` on 200k dense
+    /// ids: 171× faster at offset 0, 677× at offset 199 000, but only 4.4× at
+    /// offset 50 000 — which lands mid-container and pays that inner walk. A
+    /// full paged walk is 5.2× faster. Making the inner skip `O(1)` would need
+    /// rank-based positioning per container type; see `bench_bitmap_paging`.
+    ///
+    /// An `offset` at or beyond the cardinality yields nothing. Pass
+    /// `usize::MAX` as `limit` for "to the end".
+    pub fn iter_page(&self, offset: usize, limit: usize) -> impl Iterator<Item = u128> + '_ {
+        let key_cards = self.store.sorted_key_cards();
+
+        // Walk the per-container counts to find the container holding `offset`
+        // and how far into it the offset falls.
+        let mut containers_skipped = 0usize;
+        let mut within = offset;
+        for (_, card) in &key_cards {
+            let card = *card as usize;
+            if within < card {
+                break;
+            }
+            within -= card;
+            containers_skipped += 1;
+        }
+
+        let mut remaining = limit;
+        key_cards
+            .into_iter()
+            .skip(containers_skipped)
+            .enumerate()
+            .map_while(move |(i, (high, _))| {
+                if remaining == 0 {
+                    return None;
+                }
+                // Only the first container yielded is entered part-way.
+                let skip_within = if i == 0 { within } else { 0 };
+                let lows: Vec<u16> = self
+                    .store
+                    .get(high)
+                    .map(|c| c.iter().skip(skip_within).take(remaining).collect())
+                    .unwrap_or_default();
+                remaining -= lows.len();
+                Some(lows.into_iter().map(move |low| compose(high, low)))
+            })
+            .flatten()
+    }
+
     // ── Optimization ────────────────────────────────────────────────
 
     /// Re-evaluate container types across the entire bitmap.
@@ -564,6 +636,213 @@ impl FromIterator<u128> for RoaringBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── iter_page (offset paging without walking elements) ─────────────
+
+    /// A bitmap spanning three containers with a **different encoding in each**,
+    /// so the rank window exercises Array, Bitset and Run dispatch rather than
+    /// one path three times.
+    fn multi_container_bitmap() -> RoaringBitmap {
+        let mut bm = RoaringBitmap::new();
+        // high key 0 — sparse, stays an ArrayContainer.
+        for v in [1u128, 7, 90, 5_000, 60_000] {
+            bm.insert(v);
+        }
+        // high key 1 — dense enough to promote to a BitsetContainer (>= 4096
+        // values), and deliberately gappy so `optimize` does not prefer a Run:
+        // a consecutive stretch here would run-encode and never exercise Bitset.
+        for low in (0..10_000u32).step_by(2) {
+            bm.insert(compose(1, low as u16));
+        }
+        // high key 2 — one consecutive stretch, optimises to a RunContainer.
+        for low in 100..900u32 {
+            bm.insert(compose(2, low as u16));
+        }
+        bm.optimize();
+
+        // Assert the fixture actually is what it claims. Without this the test
+        // could silently degrade to covering ArrayContainer only.
+        let kinds: Vec<&str> = [0u128, 1, 2]
+            .iter()
+            .map(|&h| match bm.store.get(h).expect("container present") {
+                Container::Array(_) => "array",
+                Container::Bitset(_) => "bitset",
+                Container::Run(_) => "run",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["array", "bitset", "run"], "fixture must span all three encodings");
+        bm
+    }
+
+    #[test]
+    fn iter_page_matches_iter_skip_at_every_rank() {
+        // Exhaustive over a small bitmap that still straddles container
+        // boundaries (65535 / 65536 sit either side of one).
+        let mut bm = RoaringBitmap::new();
+        for v in [0u128, 1, 5, 65_535, 65_536, 65_537, 200_000] {
+            bm.insert(v);
+        }
+        let n = bm.len();
+        for k in 0..n + 3 {
+            let got: Vec<u128> = bm.iter_page(k, usize::MAX).collect();
+            let want: Vec<u128> = bm.iter().skip(k).collect();
+            assert_eq!(got, want, "rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_page_matches_iter_skip_across_container_encodings() {
+        let bm = multi_container_bitmap();
+        let all: Vec<u128> = bm.iter().collect();
+        let n = all.len();
+
+        // Container boundaries are where the cardinality-skipping arithmetic is
+        // most likely to be off by one, so probe around each of them explicitly
+        // rather than relying on a uniform sample.
+        let c0 = 5; // values in high key 0
+        let c1 = 5_000; // values in high key 1
+        let mut ranks: Vec<usize> = vec![0, 1, 2, n - 1, n, n + 1, n + 1_000];
+        for boundary in [c0, c0 + c1] {
+            ranks.extend([boundary - 1, boundary, boundary + 1]);
+        }
+        ranks.extend([c0 + 1, c0 + c1 / 2, c0 + c1 + 400]);
+
+        for k in ranks {
+            let got: Vec<u128> = bm.iter_page(k, usize::MAX).collect();
+            let want: Vec<u128> = all.iter().copied().skip(k).collect();
+            assert_eq!(got, want, "rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_page_on_an_empty_bitmap_yields_nothing() {
+        let bm = RoaringBitmap::new();
+        assert_eq!(bm.iter_page(0, usize::MAX).count(), 0);
+        assert_eq!(bm.iter_page(100, usize::MAX).count(), 0);
+    }
+
+    #[test]
+    fn iter_page_past_the_end_yields_nothing() {
+        let bm = multi_container_bitmap();
+        let n = bm.len();
+        assert_eq!(bm.iter_page(n, usize::MAX).count(), 0);
+        assert_eq!(bm.iter_page(n + 1, usize::MAX).count(), 0);
+        assert_eq!(bm.iter_page(usize::MAX, usize::MAX).count(), 0);
+    }
+
+    #[test]
+    fn iter_page_respects_the_limit() {
+        // The other tests all pass usize::MAX, so the inner bound — the one that
+        // stops a page of 50 from materialising a whole 65k container — needs
+        // its own coverage. Includes limits that span a container boundary.
+        let bm = multi_container_bitmap();
+        let all: Vec<u128> = bm.iter().collect();
+        let n = all.len();
+        let boundary = 5; // values in the first container
+
+        for (offset, limit) in [
+            (0, 0),
+            (0, 1),
+            (0, 50),
+            (3, 10),
+            (boundary - 2, 10), // crosses into the second container
+            (boundary, 1),
+            (n - 2, 10), // limit exceeds what remains
+            (n, 5),
+            (7, usize::MAX),
+        ] {
+            let got: Vec<u128> = bm.iter_page(offset, limit).collect();
+            let want: Vec<u128> = all.iter().copied().skip(offset).take(limit).collect();
+            assert_eq!(got, want, "offset {offset} limit {limit}");
+            assert!(got.len() <= limit, "offset {offset} limit {limit}: yielded {}", got.len());
+        }
+    }
+
+    #[test]
+    fn iter_page_zero_is_a_full_iteration() {
+        let bm = multi_container_bitmap();
+        let full: Vec<u128> = bm.iter().collect();
+        let from_zero: Vec<u128> = bm.iter_page(0, usize::MAX).collect();
+        assert_eq!(from_zero, full);
+    }
+
+    /// Assert the two iteration paths agree at *every* rank.
+    ///
+    /// This is the load-bearing check for `iter_page`: `iter` derives from
+    /// container **contents**, while `iter_page` trusts each slot's cached
+    /// **cardinality** to decide what to skip. Any drift between the two — a
+    /// `card` not refreshed on some mutation path — makes the fast path silently
+    /// return the wrong window while the slow path stays correct.
+    fn assert_ranks_agree(bm: &RoaringBitmap, label: &str) {
+        let all: Vec<u128> = bm.iter().collect();
+        assert_eq!(all.len(), bm.len(), "{label}: cached cardinality disagrees with iteration");
+        for k in 0..all.len() + 2 {
+            let got: Vec<u128> = bm.iter_page(k, usize::MAX).collect();
+            assert_eq!(got, all[all.len().min(k)..], "{label}: rank {k}");
+        }
+    }
+
+    #[test]
+    fn iter_page_survives_removal_and_reinsertion_churn() {
+        // Cached cardinalities are rewritten on every upsert and decremented on
+        // removal. Insert-only coverage would never catch a stale one.
+        let mut bm = RoaringBitmap::new();
+        for v in 0..300u128 {
+            bm.insert(v * 7);
+        }
+        assert_ranks_agree(&bm, "after inserts");
+
+        for v in (0..300u128).step_by(3) {
+            bm.remove(v * 7);
+        }
+        assert_ranks_agree(&bm, "after removals");
+
+        // Re-insert into containers that were partially emptied, and add a new
+        // one, so slots are rewritten rather than only created.
+        for v in (0..300u128).step_by(6) {
+            bm.insert(v * 7);
+        }
+        for low in 0..200u32 {
+            bm.insert(compose(9, low as u16));
+        }
+        assert_ranks_agree(&bm, "after reinsertion");
+
+        // Emptying a container entirely removes its slot.
+        for low in 0..200u32 {
+            bm.remove(compose(9, low as u16));
+        }
+        assert_ranks_agree(&bm, "after emptying a container");
+    }
+
+    #[test]
+    fn iter_page_agrees_on_set_operation_results() {
+        // This is the shape that actually reaches `iter_page` in
+        // production: `query_keys_paginated` pages over the bitmap returned by
+        // query evaluation, which is always built by and/or/and_not — never a
+        // directly-inserted bitmap like the other tests here use.
+        let a = multi_container_bitmap();
+        let mut b = RoaringBitmap::new();
+        for low in (0..10_000u32).step_by(3) {
+            b.insert(compose(1, low as u16));
+        }
+        for v in [1u128, 90, 60_000] {
+            b.insert(v);
+        }
+        for low in 500..1_500u32 {
+            b.insert(compose(2, low as u16));
+        }
+
+        assert_ranks_agree(&a.and(&b), "and");
+        assert_ranks_agree(&a.or(&b), "or");
+        assert_ranks_agree(&a.and_not(&b), "and_not");
+        assert_ranks_agree(&b.and_not(&a), "and_not reversed");
+
+        // Optimised results too — set ops can leave containers whose encoding
+        // `optimize` will change, which rewrites the slot.
+        let mut unioned = a.or(&b);
+        unioned.optimize();
+        assert_ranks_agree(&unioned, "or + optimize");
+    }
 
     #[test]
     fn insert_contains_remove() {

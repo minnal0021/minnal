@@ -7,20 +7,25 @@
 //! nothing about [`IndexManager`] or [`NamespaceRegistry`] directly — it
 //! calls through [`IndexCheckpointTarget`], which [`Database`] implements.
 //!
-//! Default interval: 15 minutes.
+//! Default interval: [`DEFAULT_INDEX_CHECKPOINT_INTERVAL`](crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL)
+//! (1750 ms) — the interval is the crash-replay window, so it is deliberately short.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use log::{error, info};
+use log::{debug, error, info};
+
+/// A checkpoint slower than this is logged at INFO rather than DEBUG.
+///
+/// Routine checkpoints are ~10-20 ms and happen every `index_checkpoint_interval`,
+/// so logging each one drowns the log. A slow one is the useful signal: it means
+/// a field's blob store is compacting, or fsyncs are contending.
+const SLOW_CHECKPOINT: Duration = Duration::from_millis(250);
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
 use crate::db::error::Result;
-
-/// Default snapshot interval: 15 minutes.
-pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Trait implemented by the database coordinator to perform an index checkpoint.
 ///
@@ -68,8 +73,25 @@ impl IndexCheckpointTrigger {
         if self.cap_bytes == 0 || dead_bytes < self.cap_bytes {
             return;
         }
-        // Debounce: only the transition false→true sends, so repeated writes over
-        // the cap before the checkpoint runs don't flood the channel.
+        self.request();
+    }
+
+    /// Request an early checkpoint **unconditionally**, ignoring `cap_bytes`.
+    ///
+    /// Used by WAL GC when the index-replay watermark is holding segments back:
+    /// the pin can only drain when a checkpoint advances the fields' recorded
+    /// offsets, so retention tracks checkpoint latency instead of the periodic
+    /// timer. It must not be routed through
+    /// [`request_if_over_cap`](Self::request_if_over_cap), which returns early
+    /// when the backpressure valve is disabled (`cap_bytes == 0`) — that would
+    /// leave the WAL pinned until the periodic tick on any database that has not
+    /// configured the valve.
+    ///
+    /// Shares the same debounce flag, so a repeatedly-blocked GC enqueues at most
+    /// one checkpoint at a time.
+    pub fn request(&self) {
+        // Debounce: only the transition false→true sends, so repeated requests
+        // before the checkpoint runs don't flood the channel.
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.tx.send(IndexCheckpointCommand::TriggerNow);
         }
@@ -123,11 +145,6 @@ impl IndexCheckpointWorker {
         })
     }
 
-    /// Trigger an immediate checkpoint outside of the normal schedule.
-    pub fn trigger(&self) -> std::result::Result<(), mpsc::error::SendError<IndexCheckpointCommand>> {
-        self.tx.send(IndexCheckpointCommand::TriggerNow)
-    }
-
     /// Shut down the worker and wait for it to exit.
     pub async fn shutdown(&self) {
         let _ = self.tx.send(IndexCheckpointCommand::Shutdown);
@@ -143,7 +160,7 @@ impl IndexCheckpointWorker {
         interval: Duration,
         pending: Arc<AtomicBool>,
     ) {
-        info!("[IndexCheckpointWorker] started (interval={}s)", interval.as_secs());
+        info!("[IndexCheckpointWorker] started (interval={}ms)", interval.as_millis());
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -159,7 +176,7 @@ impl IndexCheckpointWorker {
                 Some(cmd) = rx.recv() => {
                     match cmd {
                         IndexCheckpointCommand::TriggerNow => {
-                            info!("[IndexCheckpointWorker] immediate checkpoint triggered");
+                            debug!("[IndexCheckpointWorker] immediate checkpoint triggered");
                             match target.upgrade() {
                                 Some(t) => Self::perform_checkpoint(&t, &pending),
                                 None => break,
@@ -191,14 +208,32 @@ impl IndexCheckpointWorker {
         if target.is_closed() {
             return;
         }
-        info!("[IndexCheckpointWorker] tick — starting index checkpoint");
+        // Routine ticks log at DEBUG, not INFO. This worker runs every
+        // `index_checkpoint_interval` — 1750 ms by default — so a per-tick INFO
+        // pair is ~98,000 lines a day of "nothing happened". These lines were
+        // written when the interval was 15 minutes and were reasonable then.
+        //
+        // What stays at INFO is a checkpoint that took long enough to be worth
+        // an operator's attention: it is the one signal in here that says the
+        // index is struggling (a large blob compaction, or fsync contention).
+        debug!("[IndexCheckpointWorker] tick — starting index checkpoint");
         let start = std::time::Instant::now();
         match target.run_index_checkpoint() {
-            Ok(count) => info!(
-                "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
-                start.elapsed(),
-                count
-            ),
+            Ok(count) => {
+                let elapsed = start.elapsed();
+                if elapsed >= SLOW_CHECKPOINT {
+                    info!(
+                        "[IndexCheckpointWorker] checkpoint took {:?} — {} field(s) flushed \
+                         (over the {:?} notice threshold; a field's blob may be compacting)",
+                        elapsed, count, SLOW_CHECKPOINT
+                    );
+                } else {
+                    debug!(
+                        "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
+                        elapsed, count
+                    );
+                }
+            }
             Err(e) => error!("[IndexCheckpointWorker] checkpoint failed: {:?}", e),
         }
     }
@@ -242,12 +277,16 @@ mod tests {
         worker.shutdown().await;
     }
 
+    /// Uses the write-path trigger handle, which is how an immediate checkpoint
+    /// is actually requested in production. (This previously called a
+    /// `Worker::trigger` method whose only other caller was a since-deleted
+    /// async wrapper — so it tested a path nothing shipped.)
     #[tokio::test]
     async fn test_trigger_calls_checkpoint() {
         let target = FakeTarget::new();
         let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
 
-        worker.trigger().unwrap();
+        worker.backpressure_trigger(1000).request();
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.shutdown().await;
 
@@ -260,7 +299,7 @@ mod tests {
         target.closed.store(true, Ordering::SeqCst);
         let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
 
-        worker.trigger().unwrap();
+        worker.backpressure_trigger(1000).request();
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.shutdown().await;
 

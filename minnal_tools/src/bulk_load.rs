@@ -62,14 +62,23 @@
 //! | `u64`      | JSON number or numeric string           |
 //! | `u128`     | JSON number or numeric string           |
 //! | `uuid`     | UUID string (`xxxxxxxx-xxxx-…`)         |
+//! | `str`      | JSON string, 1–50 UTF-8 bytes           |
 //!
 //! For KV stores the `key_field` value is parsed according to the namespace's
-//! `key_type` (`str` → JSON string, `int` → JSON integer or numeric string) and
-//! the `value_field` value is sent verbatim, validated server-side against the
-//! namespace's `value_type` (`str`, `int`, `f32`, `vec_f32`).
+//! `key_type` (`str` → JSON string of 1–50 UTF-8 bytes, `int` → JSON integer or
+//! numeric string) and the `value_field` value is sent verbatim, validated
+//! server-side against the namespace's `value_type` (`str`, `int`, `f32`,
+//! `vec_f32`).
+//!
+//! String keys are percent-encoded into the request URL, so a key may contain
+//! spaces or other reserved characters. Note that a key equal to a static route
+//! segment (`prefix` for both store kinds, plus `semantic-search` for KV) is
+//! rejected by the server, since such a record could never be read back.
 //!
 //! Lines with a missing or unparseable ID/key are skipped with a warning and
-//! logged to a sibling `.errors` file.
+//! logged to a sibling `.errors` file. Server-side rejections (including keys
+//! the server judges invalid) are written to the same file, with the response
+//! status and body.
 //!
 //! # Examples
 //!
@@ -142,6 +151,8 @@ pub(crate) enum DocKeyType {
     U128,
     #[serde(rename = "uuid")]
     Uuid,
+    #[serde(rename = "str")]
+    Str,
 }
 
 /// Minimal projection of a doc-store schema entry in the `GET /stores` list.
@@ -446,10 +457,11 @@ async fn load_doc_jsonl(
             }
         };
 
+        let id_seg = percent_encode_segment(&id_str);
         let put_url = if skip_wal {
-            format!("{base_url}/stores/{namespace}/docs/{id_str}?skip_wal=true")
+            format!("{base_url}/stores/{namespace}/docs/{id_seg}?skip_wal=true")
         } else {
-            format!("{base_url}/stores/{namespace}/docs/{id_str}")
+            format!("{base_url}/stores/{namespace}/docs/{id_seg}")
         };
 
         match client.put(put_url).json(&doc).send().await {
@@ -508,6 +520,10 @@ fn extract_doc_id(doc: &Value, id_field: &str, key_type: DocKeyType, line_no: us
             Value::String(s) if is_valid_uuid(s) => Some(s.clone()),
             _ => None,
         },
+        DocKeyType::Str => match raw {
+            Value::String(s) if is_valid_str_key(s) => Some(s.clone()),
+            _ => None,
+        },
     };
 
     if result.is_none() {
@@ -523,6 +539,39 @@ fn extract_doc_id(doc: &Value, id_field: &str, key_type: DocKeyType, line_no: us
 fn is_valid_uuid(s: &str) -> bool {
     let hex_count = s.chars().filter(|c| c.is_ascii_hexdigit()).count();
     hex_count == 32
+}
+
+/// Maximum length of a string key, in UTF-8 bytes.
+///
+/// Mirrors `minnal_db::MAX_STR_KEY_LEN`. The tool talks to the server over HTTP
+/// and does not link the library, so the constant is duplicated here; the server
+/// remains the authority and rejects an over-long key with a 400 regardless.
+/// Checking locally just keeps the bad row out of the request stream and puts a
+/// clearer message in the `.errors` file.
+pub(crate) const MAX_STR_KEY_LEN: usize = 50;
+
+/// Returns `true` if `s` is a usable string key: non-empty and within the
+/// server's byte-length cap.
+fn is_valid_str_key(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_STR_KEY_LEN
+}
+
+/// Percent-encode a string for use as a single URL path segment.
+///
+/// String keys are user data and can contain spaces, `/`, `?`, `#`, or `%` —
+/// all of which change the meaning of the request when interpolated raw, either
+/// addressing the wrong key or producing a malformed URL. Everything outside
+/// the RFC 3986 *unreserved* set is escaped, which is stricter than necessary
+/// but never wrong.
+pub(crate) fn percent_encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ── KV store ────────────────────────────────────────────────────────────────
@@ -608,10 +657,11 @@ async fn load_kv_jsonl(
             }
         };
 
+        let key_seg = percent_encode_segment(&key_str);
         let put_url = if skip_wal {
-            format!("{base_url}/stores/{namespace}/kv/{key_str}?skip_wal=true")
+            format!("{base_url}/stores/{namespace}/kv/{key_seg}?skip_wal=true")
         } else {
-            format!("{base_url}/stores/{namespace}/kv/{key_str}")
+            format!("{base_url}/stores/{namespace}/kv/{key_seg}")
         };
 
         match client.put(put_url).json(value).send().await {
@@ -657,7 +707,7 @@ fn extract_kv_key(row: &Value, key_field: &str, key_type: KvKeyType, line_no: us
 
     let result = match key_type {
         KvKeyType::Str => match raw {
-            Value::String(s) => Some(s.clone()),
+            Value::String(s) if is_valid_str_key(s) => Some(s.clone()),
             _ => None,
         },
         KvKeyType::Int => match raw {
@@ -810,6 +860,76 @@ mod tests {
         assert!(extract_doc_id(&doc, "id", DocKeyType::Uuid, 1, "", &mut errs).is_none());
     }
 
+    #[test]
+    fn doc_str_from_string() {
+        let doc = json!({ "id": "acme-corp-2026" });
+        let mut errs = Vec::new();
+        assert_eq!(extract_doc_id(&doc, "id", DocKeyType::Str, 1, "", &mut errs).unwrap(), "acme-corp-2026");
+    }
+
+    /// A numeric id in a `str` store is a schema mismatch, not a key to coerce
+    /// — silently stringifying it would store a key the caller never wrote.
+    #[test]
+    fn doc_str_rejects_non_string_values() {
+        let doc = json!({ "id": 42 });
+        let mut errs = Vec::new();
+        assert!(extract_doc_id(&doc, "id", DocKeyType::Str, 1, "", &mut errs).is_none());
+        assert_eq!(errs.len(), 1);
+    }
+
+    /// Caught client-side so the row lands in the `.errors` file without
+    /// spending a round trip; the server rejects it as well.
+    #[test]
+    fn doc_str_rejects_an_over_long_or_empty_key() {
+        let mut errs = Vec::new();
+
+        let over = json!({ "id": "x".repeat(MAX_STR_KEY_LEN + 1) });
+        assert!(extract_doc_id(&over, "id", DocKeyType::Str, 1, "", &mut errs).is_none());
+
+        let empty = json!({ "id": "" });
+        assert!(extract_doc_id(&empty, "id", DocKeyType::Str, 2, "", &mut errs).is_none());
+
+        let at_limit = json!({ "id": "x".repeat(MAX_STR_KEY_LEN) });
+        assert!(extract_doc_id(&at_limit, "id", DocKeyType::Str, 3, "", &mut errs).is_some());
+
+        assert_eq!(errs.len(), 2, "both bad rows must be recorded for the .errors file");
+    }
+
+    /// The cap is on bytes, matching the server, so a short multi-byte key can
+    /// still be too long.
+    #[test]
+    fn doc_str_counts_bytes_not_chars() {
+        let doc = json!({ "id": "日".repeat(20) }); // 20 chars, 60 bytes
+        let mut errs = Vec::new();
+        assert!(extract_doc_id(&doc, "id", DocKeyType::Str, 1, "", &mut errs).is_none());
+    }
+
+    // ── percent_encode_segment ────────────────────────────────────────────
+
+    /// Interpolating a raw key into the URL is how a key with a space or a `/`
+    /// silently became a different request (or a malformed one).
+    #[test]
+    fn percent_encoding_escapes_everything_outside_the_unreserved_set() {
+        assert_eq!(percent_encode_segment("acme corp"), "acme%20corp");
+        assert_eq!(percent_encode_segment("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_segment("q?x=1"), "q%3Fx%3D1");
+        assert_eq!(percent_encode_segment("100%"), "100%25");
+        assert_eq!(percent_encode_segment("a#b"), "a%23b");
+    }
+
+    #[test]
+    fn percent_encoding_leaves_unreserved_characters_alone() {
+        assert_eq!(percent_encode_segment("acme-corp_2026.v1~x"), "acme-corp_2026.v1~x");
+        assert_eq!(percent_encode_segment("550e8400-e29b-41d4"), "550e8400-e29b-41d4");
+    }
+
+    /// Multi-byte characters are encoded per UTF-8 byte, which is what the
+    /// server decodes back.
+    #[test]
+    fn percent_encoding_handles_multibyte_characters() {
+        assert_eq!(percent_encode_segment("日"), "%E6%97%A5");
+    }
+
     // ── extract_kv_key ────────────────────────────────────────────────────
 
     #[test]
@@ -848,5 +968,23 @@ mod tests {
         let mut errs = Vec::new();
         assert!(extract_kv_key(&row, "key", KvKeyType::Str, 1, "", &mut errs).is_none());
         assert_eq!(errs.len(), 1);
+    }
+
+    /// The KV path gained the same cap as the doc path — previously any length
+    /// was accepted here and reached the server.
+    #[test]
+    fn kv_str_key_is_length_capped_and_non_empty() {
+        let mut errs = Vec::new();
+
+        let over = json!({ "key": "x".repeat(MAX_STR_KEY_LEN + 1) });
+        assert!(extract_kv_key(&over, "key", KvKeyType::Str, 1, "", &mut errs).is_none());
+
+        let empty = json!({ "key": "" });
+        assert!(extract_kv_key(&empty, "key", KvKeyType::Str, 2, "", &mut errs).is_none());
+
+        let at_limit = json!({ "key": "x".repeat(MAX_STR_KEY_LEN) });
+        assert!(extract_kv_key(&at_limit, "key", KvKeyType::Str, 3, "", &mut errs).is_some());
+
+        assert_eq!(errs.len(), 2);
     }
 }

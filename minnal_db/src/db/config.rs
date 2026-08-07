@@ -38,6 +38,23 @@ pub struct ScheduledTaskConfig {
     pub(crate) wal_gc_interval: Duration,
     pub(crate) lsm_compaction_interval: Duration,
     pub(crate) ttl_cleanup_interval: Duration,
+    /// How often the index checkpoint worker runs.
+    ///
+    /// This sets the **crash-replay window**: after a crash, every field index
+    /// replays the WAL from its last checkpoint, and that replay costs roughly
+    /// 0.1 ms per distinct key in the window (rising with the store's size,
+    /// because the cost tracks the bitmap being rewritten rather than the
+    /// window). A 15-minute interval therefore meant a crash could face fifteen
+    /// minutes of writes to replay — measured at 7-27 minutes to restart on a
+    /// 16k-document store.
+    ///
+    /// It also bounds **WAL retention**: the index-replay watermark refuses to
+    /// let WAL GC reclaim a segment a field still needs, so retention tracks
+    /// this interval (see `ThresholdConfig::max_pinned_wal_segments`).
+    ///
+    /// The cost of a short interval is a flush of every field index plus a
+    /// marker write (tmp + rename + two fsyncs) per field, per tick.
+    pub(crate) index_checkpoint_interval: Duration,
 }
 
 /// Default percentage of a field-index bitmap value region that may be dead
@@ -48,6 +65,23 @@ pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 /// bytes before the write path requests an early index checkpoint. 64 MiB. See
 /// [`ThresholdConfig::index_blob_backpressure_bytes`].
 pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default cap on how many fully-persisted WAL segments the index-replay
+/// watermark may hold back. See
+/// [`ThresholdConfig::max_pinned_wal_segments`].
+pub const DEFAULT_MAX_PINNED_WAL_SEGMENTS: u32 = 32;
+
+/// Default interval between index checkpoints: **1750 ms**.
+///
+/// Deliberately short. The interval is the crash-replay window, and replay costs
+/// roughly 0.1 ms per distinct key in that window, so a long interval turns a
+/// crash into minutes of restart. It also caps WAL retention, since the
+/// index-replay watermark holds segments until a checkpoint advances.
+///
+/// The per-tick cost is a flush of each field index plus one marker write
+/// (tmp + rename + two fsyncs) per field — small beside the WAL's fsync on every
+/// write.
+pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(1750);
 
 /// Default percentage of a *value-log segment* that may be garbage before GC
 /// rewrites it. Deliberately **lower** than the bucket-level
@@ -98,7 +132,7 @@ pub struct ThresholdConfig {
     pub index_blob_waste_threshold: f64,
     /// Absolute cap (bytes) on a single field index's reclaimable dead blob
     /// bytes before the write path proactively requests an index checkpoint,
-    /// instead of waiting for the periodic (~15 min) tick.
+    /// instead of waiting for the next periodic tick.
     ///
     /// This is **backpressure**, and it is an absolute byte cap on purpose — a
     /// *ratio* trigger is useless here because a low-cardinality, high-churn
@@ -111,6 +145,24 @@ pub struct ThresholdConfig {
     /// The dead-byte count is O(1) to read, so the check is cheap on the hot
     /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
     pub index_blob_backpressure_bytes: u64,
+    /// Cap on how many fully-persisted WAL segments the **index-replay
+    /// watermark** may hold back from WAL GC.
+    ///
+    /// WAL GC will not reclaim a segment an active field index still needs to
+    /// replay after a crash. Normally that pin drains quickly: GC asks the
+    /// checkpoint worker for an early checkpoint and defers a tick, so retention
+    /// tracks checkpoint latency rather than the timer. If the checkpoint
+    /// worker is disabled or wedged, nothing would ever advance the watermark and
+    /// the WAL would grow without bound — so past this many pinned segments GC
+    /// reclaims the oldest of them anyway.
+    ///
+    /// Doing so **knowingly strands part of a field index**, which is why
+    /// FR-001 keeps its detection and repair arms: the backstop produces gaps by
+    /// design, just rarely. Counted in segments rather than bytes because it is
+    /// GC's own unit of work. `0` disables the backstop, allowing unbounded
+    /// pinned WAL — availability over disk, only for callers who know their
+    /// checkpoint worker is healthy.
+    pub max_pinned_wal_segments: u32,
 }
 
 impl ThresholdConfig {
@@ -121,6 +173,7 @@ impl ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
 
@@ -155,6 +208,13 @@ impl ThresholdConfig {
         self.index_blob_backpressure_bytes = bytes;
         self
     }
+
+    /// Override the cap on WAL segments pinned by the index-replay watermark.
+    /// See [`max_pinned_wal_segments`](Self::max_pinned_wal_segments).
+    pub fn with_max_pinned_wal_segments(mut self, segments: u32) -> Self {
+        self.max_pinned_wal_segments = segments;
+        self
+    }
 }
 
 impl Default for ThresholdConfig {
@@ -165,6 +225,7 @@ impl Default for ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
 }
@@ -176,6 +237,7 @@ impl Default for ScheduledTaskConfig {
             wal_gc_interval: Duration::from_secs(60),
             lsm_compaction_interval: Duration::from_secs(60),
             ttl_cleanup_interval: Duration::from_secs(3600),
+            index_checkpoint_interval: DEFAULT_INDEX_CHECKPOINT_INTERVAL,
         }
     }
 }
@@ -187,6 +249,7 @@ impl ScheduledTaskConfig {
             wal_gc_interval,
             lsm_compaction_interval,
             ttl_cleanup_interval: Duration::from_secs(3600),
+            index_checkpoint_interval: DEFAULT_INDEX_CHECKPOINT_INTERVAL,
         }
     }
 
@@ -194,6 +257,18 @@ impl ScheduledTaskConfig {
     pub fn with_ttl_cleanup_interval(mut self, interval: Duration) -> Self {
         self.ttl_cleanup_interval = interval;
         self
+    }
+
+    /// Set the index checkpoint interval. See
+    /// [`index_checkpoint_interval`](Self::index_checkpoint_interval).
+    pub fn with_index_checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.index_checkpoint_interval = interval;
+        self
+    }
+
+    /// The configured index checkpoint interval.
+    pub fn index_checkpoint_interval(&self) -> Duration {
+        self.index_checkpoint_interval
     }
 }
 

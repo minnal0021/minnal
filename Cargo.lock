@@ -956,6 +956,7 @@ dependencies = [
  "criterion",
  "crossbeam-epoch",
  "json_dotpath",
+ "libc",
  "log",
  "memmap2",
  "mm3h",
@@ -979,6 +980,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "minnal_db",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",

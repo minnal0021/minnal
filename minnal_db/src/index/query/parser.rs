@@ -68,11 +68,47 @@ pub enum RawExpr {
     Predicate { field: String, op: Op, value: RawValue },
 }
 
+// ── Complexity limits ──────────────────────────────────────────────────────
+
+/// Maximum nesting depth the parser will accept, counted in `(` and `NOT`
+/// levels entered.
+///
+/// `parse_term` recurses on both, so nesting depth *is* parser stack depth.
+/// Unbounded, ~5,000 `(` characters (a ~5 KB request body, well under axum's
+/// 2 MB default) overflowed the stack and aborted the process — taking every
+/// namespace with it — via the unauthenticated `POST /stores/{ns}/query` route.
+pub(super) const MAX_PARSE_DEPTH: u32 = 64;
+
+/// Maximum number of [`RawExpr`] nodes in one parsed query.
+///
+/// This is the limit that actually bounds the **tree**, and it is not
+/// redundant with [`MAX_PARSE_DEPTH`]: a flat `a = 1 AND a = 1 AND …` chain
+/// needs no parser recursion at all (`parse_and` loops), yet builds a
+/// left-nested tree one level deep per operand. The recursive consumers —
+/// `eval::validate`, `eval::eval_expr`, `collect_field_ids`, and `RawExpr`'s
+/// compiler-generated drop glue — then walk that depth. Verified: 50,000
+/// `AND` terms parsed *successfully* and then overflowed the stack in the
+/// **drop** alone, before evaluation. Since node count bounds tree depth, this
+/// cap bounds every one of those walks.
+///
+/// **The value is empirically bounded, not arbitrary.** Measured against a
+/// 2 MiB stack (Rust's default thread stack, and tokio's default worker stack)
+/// on a *debug* build, which has the fattest frames: 1024 nodes passes, 2048
+/// overflows. 512 keeps ~4× headroom there and far more in release —
+/// `eval::tests::a_maximally_complex_accepted_query_evaluates_within_a_small_stack`
+/// pins it from the other side, so raising this fails that test rather than
+/// silently reopening the hole. Note an `IN` list is a **single** node
+/// regardless of length, so the natural "many values" query shape is unaffected.
+pub(super) const MAX_PARSE_NODES: u32 = 512;
+
 // ── Parser ─────────────────────────────────────────────────────────────────
 
 /// Parse a query string into a [`RawExpr`].
 ///
-/// Returns a `QueryError::Syntax` if the input does not conform to the grammar.
+/// Returns a `QueryError::Syntax` if the input does not conform to the grammar,
+/// or [`QueryError::TooComplex`] if it exceeds `MAX_PARSE_DEPTH` nesting levels
+/// or `MAX_PARSE_NODES` terms. Both limits are internal (see their definitions
+/// in this module for the rationale and the measurements behind the values).
 pub fn parse(input: &str) -> Result<RawExpr, QueryError> {
     let mut p = Parser::new(input)?;
     let expr = p.parse_expr()?;
@@ -92,6 +128,10 @@ struct Parser<'a> {
     current: Token,
     /// Byte offset of `current` in the source string (for error messages).
     tok_pos: usize,
+    /// Grammar-recursion levels currently open (see [`MAX_PARSE_DEPTH`]).
+    depth: u32,
+    /// [`RawExpr`] nodes built so far (see [`MAX_PARSE_NODES`]).
+    nodes: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -99,7 +139,13 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(input);
         let tok_pos = lexer.pos();
         let current = lexer.next_token()?;
-        Ok(Self { lexer, current, tok_pos })
+        Ok(Self {
+            lexer,
+            current,
+            tok_pos,
+            depth: 0,
+            nodes: 0,
+        })
     }
 
     /// Consume the current token and return it, advancing to the next.
@@ -107,6 +153,37 @@ impl<'a> Parser<'a> {
         self.tok_pos = self.lexer.pos();
         let next = self.lexer.next_token()?;
         Ok(std::mem::replace(&mut self.current, next))
+    }
+
+    // ── Complexity guards ──────────────────────────────────────────────
+
+    /// Open one level of grammar recursion, rejecting input nested deeper than
+    /// [`MAX_PARSE_DEPTH`]. Every `Ok` must be paired with a [`Self::leave`].
+    fn enter(&mut self) -> Result<(), QueryError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(QueryError::TooComplex {
+                msg: format!("nesting is deeper than the limit of {MAX_PARSE_DEPTH} levels"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Close a level opened by [`Self::enter`].
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Account for one [`RawExpr`] node about to be built, rejecting the query
+    /// once it exceeds [`MAX_PARSE_NODES`].
+    fn add_node(&mut self) -> Result<(), QueryError> {
+        self.nodes += 1;
+        if self.nodes > MAX_PARSE_NODES {
+            return Err(QueryError::TooComplex {
+                msg: format!("expression has more than the limit of {MAX_PARSE_NODES} terms"),
+            });
+        }
+        Ok(())
     }
 
     // ── Grammar rules ──────────────────────────────────────────────────
@@ -126,6 +203,7 @@ impl<'a> Parser<'a> {
         while self.current == Token::Or {
             self.advance()?;
             let right = self.parse_and()?;
+            self.add_node()?;
             left = RawExpr::Or(Box::new(left), Box::new(right));
         }
         Ok(left)
@@ -140,22 +218,33 @@ impl<'a> Parser<'a> {
         while self.current == Token::And {
             self.advance()?;
             let right = self.parse_term()?;
+            self.add_node()?;
             left = RawExpr::And(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     /// term = "NOT" term | "(" expr ")" | predicate
+    ///
+    /// The two recursive branches are the parser's only stack growth, so each
+    /// is bracketed by [`Self::enter`] / [`Self::leave`].
     fn parse_term(&mut self) -> Result<RawExpr, QueryError> {
         match &self.current.clone() {
             Token::Not => {
                 self.advance()?;
-                let inner = self.parse_term()?;
+                self.enter()?;
+                let inner = self.parse_term();
+                self.leave();
+                let inner = inner?;
+                self.add_node()?;
                 Ok(RawExpr::Not(Box::new(inner)))
             }
             Token::LParen => {
                 self.advance()?;
-                let expr = self.parse_expr()?;
+                self.enter()?;
+                let expr = self.parse_expr();
+                self.leave();
+                let expr = expr?;
                 if self.current != Token::RParen {
                     return Err(QueryError::syntax(self.tok_pos, "expected ')'"));
                 }
@@ -195,6 +284,7 @@ impl<'a> Parser<'a> {
 
         let value = if op == Op::In { self.parse_in_list()? } else { self.parse_scalar()? };
 
+        self.add_node()?;
         Ok(RawExpr::Predicate { field, op, value })
     }
 
@@ -492,6 +582,60 @@ mod tests {
         let expr = parse("NOT a = 1 OR b = 2").unwrap();
         let expected = RawExpr::Or(Box::new(RawExpr::Not(Box::new(pred("a", 1)))), Box::new(pred("b", 2)));
         assert_eq!(expr, expected);
+    }
+
+    // ── Complexity limits (stack-overflow DoS regression) ───────────────────
+
+    #[test]
+    fn deeply_nested_parens_are_rejected_not_stack_overflowed() {
+        // `(` recursed parse_term → parse_expr → parse_or → parse_and → parse_term
+        // with no bound, one stack frame per paren. 5,000 of them (a ~5 KB request
+        // body, far under axum's 2 MB limit) aborted the whole process with a
+        // stack overflow, taking every namespace down with it.
+        let input = format!("{}a = 1{}", "(".repeat(5_000), ")".repeat(5_000));
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(err, QueryError::TooComplex { .. }), "expected TooComplex, got {err:?}");
+    }
+
+    #[test]
+    fn deeply_nested_not_is_rejected_not_stack_overflowed() {
+        // The other recursive branch of parse_term: NOT NOT NOT … .
+        let input = format!("{}a = 1", "NOT ".repeat(5_000));
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(err, QueryError::TooComplex { .. }), "expected TooComplex, got {err:?}");
+    }
+
+    #[test]
+    fn long_flat_and_chain_is_rejected_by_the_node_budget() {
+        // A flat chain needs NO parser recursion (parse_and loops), but it builds a
+        // left-nested tree one level deep per operand — which the *evaluator* and
+        // RawExpr's recursive drop glue then walk recursively. So the depth counter
+        // alone does not close the hole; the node budget is what bounds tree depth.
+        let input = "a = 1 AND ".repeat(50_000) + "a = 1";
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(err, QueryError::TooComplex { .. }), "expected TooComplex, got {err:?}");
+    }
+
+    #[test]
+    fn long_flat_or_chain_is_rejected_by_the_node_budget() {
+        let input = "a = 1 OR ".repeat(50_000) + "a = 1";
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(err, QueryError::TooComplex { .. }), "expected TooComplex, got {err:?}");
+    }
+
+    #[test]
+    fn nesting_and_size_just_inside_the_limits_still_parse() {
+        // The guards must not reject queries a real caller could plausibly send.
+        // MAX_PARSE_DEPTH counts the nesting levels entered by `(` / NOT; a
+        // predicate wrapped in that many parens is exactly at the limit.
+        let depth = MAX_PARSE_DEPTH as usize;
+        let nested = format!("{}a = 1{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(parse(&nested).is_ok(), "depth {depth} should be accepted");
+
+        // A chain of N predicates is N leaves + N-1 AND nodes = 2N-1 nodes.
+        let terms = (MAX_PARSE_NODES as usize).div_ceil(2);
+        let chain = vec!["a = 1"; terms].join(" AND ");
+        assert!(parse(&chain).is_ok(), "{terms}-term chain should be accepted");
     }
 
     #[test]

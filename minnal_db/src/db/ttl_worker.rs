@@ -11,7 +11,7 @@
 //! process (and each one's TTL and per-run delete cap) is owned by the target
 //! via [`TtlTarget::run_ttl_pass`].
 
-use log::{debug, error, info};
+use log::{error, info};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -28,8 +28,6 @@ pub trait TtlTarget: Send + Sync + 'static {
 
 /// Commands that can be sent to the TTL worker.
 pub enum TtlCommand {
-    /// Trigger an immediate TTL cleanup pass.
-    Trigger,
     /// Shutdown the worker gracefully.
     Shutdown,
 }
@@ -54,11 +52,6 @@ impl TtlWorker {
         tokio::spawn(Self::worker_loop(Arc::downgrade(&target), rx, shutdown_notify.clone(), check_interval));
 
         Self { tx, shutdown_notify }
-    }
-
-    /// Send a command to trigger an immediate TTL cleanup pass.
-    pub fn trigger(&self) -> Result<(), mpsc::error::SendError<TtlCommand>> {
-        self.tx.send(TtlCommand::Trigger)
     }
 
     /// Shutdown the worker gracefully.
@@ -90,20 +83,9 @@ impl TtlWorker {
                     }
                 }
 
-                Some(cmd) = rx.recv() => {
-                    match cmd {
-                        TtlCommand::Trigger => {
-                            debug!("[TtlWorker] Triggered immediate TTL cleanup");
-                            match target.upgrade() {
-                                Some(t) => Self::run_pass(t).await,
-                                None => break,
-                            }
-                        }
-                        TtlCommand::Shutdown => {
-                            info!("[TtlWorker] Shutting down");
-                            break;
-                        }
-                    }
+                Some(TtlCommand::Shutdown) = rx.recv() => {
+                    info!("[TtlWorker] Shutting down");
+                    break;
                 }
 
                 else => {
@@ -167,21 +149,28 @@ mod tests {
         worker.shutdown().await;
     }
 
+    /// The worker runs expiry passes on its interval.
+    ///
+    /// Previously drove this through an explicit `trigger()` whose only other
+    /// caller was a since-deleted async wrapper; nothing shipping ever asked the
+    /// TTL worker for an immediate pass, so the interval is the real behaviour
+    /// to pin.
     #[tokio::test]
-    async fn test_ttl_worker_trigger_runs_a_pass() {
+    async fn test_ttl_worker_runs_passes_on_its_interval() {
         let target = Arc::new(CountingTarget {
             passes: AtomicUsize::new(0),
             closed: false,
         });
-        // Long interval so only the explicit trigger fires a pass.
-        let worker = TtlWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        let worker = TtlWorker::new(Arc::clone(&target), Duration::from_millis(20));
 
-        worker.trigger().unwrap();
-        // FIFO mpsc: the awaited pass completes before Shutdown is processed, so
-        // shutdown().await is a sufficient synchronization point.
+        tokio::time::sleep(Duration::from_millis(120)).await;
         worker.shutdown().await;
 
-        assert_eq!(target.passes.load(Ordering::SeqCst), 1);
+        assert!(
+            target.passes.load(Ordering::SeqCst) >= 2,
+            "expected repeated passes on a 20ms interval, got {}",
+            target.passes.load(Ordering::SeqCst)
+        );
     }
 
     fn create_test_store(dir: &TempDir) -> Arc<KVStore> {

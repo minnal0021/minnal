@@ -23,6 +23,7 @@
 //! POST   /admin/indices/{ns}/vector/queue/{doc_id}/retry  → retry one exhausted entry
 //! ```
 
+use crate::limits::Limit;
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
@@ -35,7 +36,7 @@ use minnal_db::doc_store::hex::hex_to_bytes;
 use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
 use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{AppState, id::parse_doc_id, routes::stores::reload_schema};
 
@@ -152,7 +153,7 @@ pub async fn attribute_reindex_all(
     Path(ns): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     {
-        let ops = state.attr_index_ops.lock().unwrap();
+        let ops = state.attr_index_ops.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -182,7 +183,7 @@ pub async fn attribute_reindex_all(
         ));
     }
 
-    state.attr_index_ops.lock().unwrap().insert(ns.clone());
+    state.attr_index_ops.lock().insert(ns.clone());
     info!(namespace = %ns, "attribute reindex-all accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -203,7 +204,7 @@ pub async fn attribute_reindex_all(
             Ok(()) => info!(namespace = %ns, "attribute reindex-all complete"),
             Err(e) => error!(namespace = %ns, error = %e, "attribute reindex-all failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -216,7 +217,7 @@ pub async fn attribute_reindex_all(
 /// Returns `409` when an operation is already active.
 pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     {
-        let ops = state.attr_index_ops.lock().unwrap();
+        let ops = state.attr_index_ops.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -246,7 +247,7 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
         ));
     }
 
-    state.attr_index_ops.lock().unwrap().insert(ns.clone());
+    state.attr_index_ops.lock().insert(ns.clone());
     info!(namespace = %ns, "attribute drop-all accepted — running in background");
 
     let state_c = state.clone();
@@ -264,7 +265,7 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
             }
             Err(e) => error!(namespace = %ns, error = %e, "attribute drop-all failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -388,7 +389,7 @@ pub async fn attribute_reindex_doc(
 pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Block if cleanup already running.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -423,7 +424,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
     })?;
 
     reload_schema(&state, &ns).await;
-    state.vec_index_cleanup.lock().unwrap().insert(ns.clone());
+    state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector drop-all accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -434,7 +435,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
             Ok(()) => info!(namespace = %ns, "vector drop-all cleanup complete"),
             Err(e) => error!(namespace = %ns, error = %e, "vector drop-all cleanup failed"),
         }
-        ops_ref.lock().unwrap().remove(&ns);
+        ops_ref.lock().remove(&ns);
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -450,7 +451,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
 pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Block if vector cleanup is in progress.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -586,7 +587,7 @@ pub async fn vector_reindex_failed(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Block if vector cleanup is in progress.
     {
-        let ops = state.vec_index_cleanup.lock().unwrap();
+        let ops = state.vec_index_cleanup.lock();
         if ops.contains(&ns) {
             return Err((
                 StatusCode::CONFLICT,
@@ -752,15 +753,12 @@ pub struct QueueListResponse {
 pub struct QueuePaginationParams {
     #[serde(default = "default_page_no")]
     page_no: usize,
-    #[serde(default = "default_page_size")]
-    page_size: usize,
+    #[serde(default)]
+    page_size: Limit,
 }
 
 fn default_page_no() -> usize {
     1
-}
-fn default_page_size() -> usize {
-    20
 }
 
 fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> QueueListResponse {
@@ -776,7 +774,7 @@ fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> Que
 /// `GET /admin/indices/vector/queue/retried` — entries retried at least once (all namespaces).
 pub async fn vector_queue_retried(State(state): State<AppState>, Query(params): Query<QueuePaginationParams>) -> impl IntoResponse {
     let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.retry_count > 0).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/vector/queue/summary` — global queue depth and lag.
@@ -847,7 +845,7 @@ pub async fn vector_queue_by_namespace(
     Query(params): Query<QueuePaginationParams>,
 ) -> impl IntoResponse {
     let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.namespace == ns).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/retried` — retried entries for one namespace.
@@ -863,7 +861,7 @@ pub async fn vector_queue_retried_by_namespace(
         .into_iter()
         .filter(|e| e.namespace == ns && e.retry_count > 0)
         .collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size)))
+    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/{doc_id}` — look up one queue entry.
@@ -966,4 +964,79 @@ pub async fn vector_queue_retry_entry(
 
     info!(namespace = %ns, doc_id_hex = %doc_id_hex, "reset retry count for exhausted queue entry");
     Ok(Json(QueueEntryInfo::from(entry)))
+}
+
+/// `GET /admin/indices/{ns}/health`
+///
+/// Report every field index in the namespace: where its persisted state reaches,
+/// whether it is active, and any outstanding gap (what is missing and what
+/// repair it needs).
+///
+/// This is the operator-facing half of FR-001. The per-query `degraded_fields`
+/// field tells a *caller* their answer may be short; this tells an operator
+/// which indices to repair, and is what makes the condition alertable rather
+/// than something buried in a log line.
+pub async fn index_health(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    let health = state.store.index_health(&ns).await.map_err(|e| match e {
+        DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+
+    let degraded: Vec<&str> = health.iter().filter(|h| h.is_degraded()).map(|h| h.field_name.as_str()).collect();
+    if !degraded.is_empty() {
+        warn!(namespace = %ns, fields = ?degraded, "namespace has incomplete field indices");
+    }
+    Ok(Json(serde_json::json!({
+        "namespace": ns,
+        "degraded": !degraded.is_empty(),
+        "degraded_fields": degraded,
+        "fields": health,
+    })))
+}
+
+/// `POST /admin/indices/{ns}/attribute/{field}/repair`
+///
+/// Repair a degraded field index and clear its gap record.
+///
+/// Row-scoped when the gap named the affected keys (work proportional to the
+/// damage), a full rebuild when they could not be captured. Either way the
+/// documents themselves are not re-put, so this generates no WAL traffic and
+/// triggers no vector re-embedding.
+///
+/// Synchronous: row-scoped repair is bounded by the recorded worklist. A full
+/// rebuild scans the namespace, so it can take a while on a large store.
+pub async fn attribute_repair(
+    State(state): State<AppState>,
+    Path((ns, field)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+
+    match state.store.repair_index(&ns, &field).await {
+        Ok(minnal_db::FieldRepairOutcome::NotDegraded) => Ok(Json(serde_json::json!({
+            "status": "not_degraded",
+            "namespace": ns,
+            "field": field,
+            "message": "the index has no outstanding gap; nothing to repair",
+        }))),
+        Ok(outcome) => {
+            info!(namespace = %ns, field = %field, outcome = ?outcome, "field index repaired");
+            Ok(Json(serde_json::json!({
+                "status": "repaired",
+                "namespace": ns,
+                "field": field,
+                "result": outcome,
+            })))
+        }
+        Err(DocStoreError::IndexNotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("'{field}' is not an indexed field of '{ns}'"))),
+        Err(DocStoreError::NotFound { .. }) => Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
+        Err(e) => {
+            error!(namespace = %ns, field = %field, error = %e, "field index repair failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
 }

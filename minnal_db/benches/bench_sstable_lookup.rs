@@ -234,7 +234,11 @@ fn bench_mixed_tier_lookup(c: &mut Criterion) {
             b.iter(|| {
                 idx = idx.wrapping_add(104_729) % n;
                 tier_toggle = !tier_toggle;
-                let key = if tier_toggle { make_key("old:", idx * 2) } else { make_key("new:", idx * 2) };
+                let key = if tier_toggle {
+                    make_key("old:", idx * 2)
+                } else {
+                    make_key("new:", idx * 2)
+                };
                 black_box(store.get(&key)).unwrap()
             });
         });

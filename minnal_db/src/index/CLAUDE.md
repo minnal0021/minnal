@@ -90,6 +90,21 @@ The string DSL is used by `minnal_doc_store` to accept structured query strings 
 
 **`NOT` uses document-store semantics, not SQL.** `NOT` is complemented against a universe scoped to the fields the inner expression references, so `NOT status = "active"` returns rows that **have a `status` value** other than `"active"` — a row with **no `status` field is excluded** (a missing field is "no value", not "a differing value"). There is no `EXISTS`/`MISSING` operator yet; add one if you need to match rows by field presence. See the `parse_and_evaluate` rustdoc in `query/eval.rs`.
 
+### Query complexity is capped — the whole pipeline is recursive
+
+The parser (`parse_term`), the evaluator (`validate` / `eval_expr` / `collect_field_ids`) and `RawExpr`'s compiler-generated **drop glue** all recurse over the expression tree, and a stack overflow *aborts the process* (it does not unwind, so `panic = "abort"` and handlers returning `Result` are both irrelevant to it). Since `POST /stores/{ns}/query` passes the caller's predicate string straight through, an unbounded tree is a remote kill switch for every namespace at once. Two caps in `query/parser.rs` bound it, and **both are needed**:
+
+| Const | Value | Bounds |
+|---|---|---|
+| `MAX_PARSE_DEPTH` | 64 | nesting levels entered via `(` and `NOT` — i.e. *parser* stack depth |
+| `MAX_PARSE_NODES` | 512 | total `RawExpr` nodes — i.e. *tree* depth, hence every other walk |
+
+Exceeding either yields `QueryError::TooComplex`.
+
+**The node budget is not redundant with the depth limit.** A flat `a = 1 AND a = 1 AND …` chain needs no parser recursion at all (`parse_and` loops) but builds a left-nested tree one level deep per operand. Verified before the fix: 5,000 `(` aborted inside the parser, while 50,000 `AND` terms parsed **successfully** and then overflowed the stack in the **drop alone**, before evaluation ever ran. A depth counter by itself would have closed only the first.
+
+`MAX_PARSE_NODES` is pinned from both sides — `parser::tests::long_flat_and_chain_is_rejected_by_the_node_budget` rejects oversize input, and `eval::tests::a_maximally_complex_accepted_query_evaluates_within_a_small_stack` evaluates a max-size chain on a deliberately small 2 MiB stack (Rust's default thread stack, and tokio's default worker stack). Measured on a debug build: 1024 nodes fits, 2048 overflows, so 512 keeps ~4× headroom. **Raise the cap and that eval test fails** — which is the point. Note an `IN` list is a single node regardless of length, so the natural "match many values" query shape is unaffected by the budget.
+
 ## Persistence
 
 Index snapshots are written to the database directory alongside the LSM/value-log data. `IndexCheckpointWorker` in `minnal_db` drives periodic snapshots; on open, `minnal_db` replays any un-checkpointed WAL entries to bring the index back in sync.

@@ -14,6 +14,22 @@ use axum::{
 
 use crate::{AppState, error::AppError};
 
+/// Answer a CRUD request aimed at a key that a static route already claims.
+///
+/// `/stores/{ns}/docs/prefix` and `/stores/{ns}/kv/prefix` are scan endpoints,
+/// so a record keyed `prefix` could be written but never read back. The router
+/// matches the static path first, which means `parse_doc_id`'s reserved-key
+/// check is never reached over HTTP and axum answers a bare `405` with no body.
+/// Registering the other methods on those paths turns that into the 400 that
+/// says what is actually wrong.
+async fn reserved_key(axum::extract::Path(ns): axum::extract::Path<String>, uri: axum::http::Uri) -> AppError {
+    let segment = uri.path().rsplit('/').next().unwrap_or_default().to_owned();
+    let err = minnal_db::DocStoreError::InvalidId(format!(
+        "'{segment}' is a reserved key: it collides with the /{segment} endpoint, so a record stored under it could not be read back"
+    ));
+    AppError::from(err).with_ns(&ns).with_id(&segment)
+}
+
 /// Encode an opaque scan cursor (raw key bytes) as a hex string for round-trip
 /// through a request query parameter.
 pub(crate) fn encode_cursor(key: &[u8]) -> String {
@@ -89,6 +105,9 @@ pub fn router() -> Router<AppState> {
             post(admin_indices::attribute_reindex_doc),
         )
         .route("/admin/indices/{ns}/{field}/blob-stats", get(admin_indices::field_blob_stats))
+        // Admin / indices — field-index health and repair (FR-001)
+        .route("/admin/indices/{ns}/health", get(admin_indices::index_health))
+        .route("/admin/indices/{ns}/attribute/{field}/repair", post(admin_indices::attribute_repair))
         .route("/admin/indices/{ns}/vector/reindex-all", post(admin_indices::vector_reindex_all))
         .route("/admin/indices/{ns}/vector/reindex/{doc_id}", post(admin_indices::vector_reindex_doc))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))
@@ -122,7 +141,8 @@ pub fn router() -> Router<AppState> {
         // ── Document CRUD (doc stores) ────────────────────────────────────────
         .route("/stores/{ns}/docs/{id}", get(docs::get_doc).put(docs::put_doc).delete(docs::delete_doc))
         .route("/stores/{ns}/docs", get(docs::range_query))
-        .route("/stores/{ns}/docs/prefix", get(docs::prefix_scan))
+        // `prefix` is a reserved key for str stores — see `reserved_key`.
+        .route("/stores/{ns}/docs/prefix", get(docs::prefix_scan).put(reserved_key).delete(reserved_key))
         .route("/stores/{ns}/query", post(docs::index_query))
         // ── Semantic search (doc stores) ──────────────────────────────────────
         .route("/stores/{ns}/semantic-search", post(semantic_search::query))
@@ -130,7 +150,11 @@ pub fn router() -> Router<AppState> {
         // ── KV CRUD (KV stores) ───────────────────────────────────────────────
         .route("/stores/{ns}/kv/{key}", get(kv::get_kv).put(kv::put_kv).delete(kv::delete_kv))
         .route("/stores/{ns}/kv", get(kv::range_kv))
-        .route("/stores/{ns}/kv/prefix", get(kv::prefix_scan_kv))
+        // `prefix` and `semantic-search` are reserved keys — see `reserved_key`.
+        .route("/stores/{ns}/kv/prefix", get(kv::prefix_scan_kv).put(reserved_key).delete(reserved_key))
         // ── KV semantic search (KV stores) ────────────────────────────────────
-        .route("/stores/{ns}/kv/semantic-search", post(kv::search_kv_semantic))
+        .route(
+            "/stores/{ns}/kv/semantic-search",
+            post(kv::search_kv_semantic).get(reserved_key).put(reserved_key).delete(reserved_key),
+        )
 }

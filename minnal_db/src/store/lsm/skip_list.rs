@@ -15,7 +15,7 @@ pub mod skip_list {
         pub key: Vec<u8>,
         pub value: u128,
         pub tombstone: bool,
-        pub seq: u32,
+        pub seq: u64,
     }
 
     #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -50,7 +50,7 @@ pub mod skip_list {
         key_prefix: u64,
         value: u128,
         tombstone: bool,
-        sequence: u32,
+        sequence: u64,
         height: u8,
         links_index_offset: u32,
     }
@@ -63,7 +63,7 @@ pub mod skip_list {
             key_prefix: u64,
             value: u128,
             tombstone: bool,
-            sequence: u32,
+            sequence: u64,
             height: u8,
             links_index_offset: u32,
         ) -> Self {
@@ -133,19 +133,25 @@ pub mod skip_list {
             }
         }
 
-        /// Serial-number ("RFC 1982") comparison: returns true when `new` is the
-        /// same as, or newer than, `existing` in a wrapping `u32` sequence space.
+        /// Returns true when `new` is the same as, or newer than, `existing`.
         ///
-        /// Callers feed a global monotonically-increasing write sequence
-        /// (truncated to `u32`) so that conflicting writes to one key resolve to
-        /// the higher sequence. Wrapping comparison keeps that correct even when
-        /// the truncated counter rolls over, as long as the two values being
-        /// compared are within 2^31 of each other — always true here, because a
-        /// node only carries a *recent* sequence (the memtable flushes long
-        /// before 2 billion writes accumulate).
+        /// Callers feed the global monotonically-increasing write sequence
+        /// (`Database::next_seq`) so that conflicting writes to one key resolve
+        /// to the higher sequence.
+        ///
+        /// The sequence is carried at its full `u64` width, so this is a plain
+        /// comparison. It previously stored a `u32` truncation and compared with
+        /// wrapping serial-number ("RFC 1982") arithmetic, which is only valid
+        /// while the two values are within 2^31 of each other. That held for the
+        /// memtable (it flushes long before 2 billion writes accumulate) but the
+        /// same comparison also governed the SSTable levels, where it does *not*
+        /// hold: an L1 entry keeps its original sequence for the lifetime of the
+        /// database, so the gap to a later write of the same key is unbounded.
+        /// **Do not narrow the sequence again** — see
+        /// `lsm_tree::test_write_after_huge_seq_gap_beats_cold_l1_entry`.
         #[inline]
-        fn seq_is_newer_or_equal(new: u32, existing: u32) -> bool {
-            new.wrapping_sub(existing) < 0x8000_0000
+        fn seq_is_newer_or_equal(new: u64, existing: u64) -> bool {
+            new >= existing
         }
 
         /// Get the maximum capacity (total nodes that can be stored)
@@ -181,7 +187,7 @@ pub mod skip_list {
         /// distinguishes a **tombstone** (present but deleted) from **absent**,
         /// which a caller searching layered storage needs so that a tombstone in
         /// a newer layer shadows a live value in an older one.
-        pub fn entry(&self, key: &[u8]) -> Option<(u128, u32, bool)> {
+        pub fn entry(&self, key: &[u8]) -> Option<(u128, u64, bool)> {
             let (found, _) = self.find_path(key);
             let idx = found?;
             let n = &self.nodes[idx as usize];
@@ -203,7 +209,7 @@ pub mod skip_list {
         /// for two racing writes to one key identical to the winner recovery
         /// would pick (it replays in sequence order), closing the live-vs-recovery
         /// divergence for concurrent same-key writes.
-        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u32) -> Result<Option<u128>, InsertError> {
+        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u64) -> Result<Option<u128>, InsertError> {
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
@@ -242,7 +248,7 @@ pub mod skip_list {
         ///   in place; its stored value is left untouched.
         /// - Key present with a newer sequence → this delete is stale (a newer
         ///   write superseded it) and is dropped.
-        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u32) -> Result<(), InsertError> {
+        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u64) -> Result<(), InsertError> {
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
@@ -268,7 +274,7 @@ pub mod skip_list {
         /// Allocate a node with a freshly drawn height and splice it in at every
         /// level it owns. `update` is the predecessor array from `find_path` for
         /// the same key; the caller is responsible for the live/tombstone counters.
-        fn splice_new_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u32, mut update: [u32; MAX_LEVEL]) -> Result<(), InsertError> {
+        fn splice_new_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u64, mut update: [u32; MAX_LEVEL]) -> Result<(), InsertError> {
             let node_level = self.random_level();
             if node_level > self.level {
                 #[allow(clippy::needless_range_loop)]
@@ -387,7 +393,7 @@ pub mod skip_list {
             &self.keys[start..end]
         }
 
-        fn allocate_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u32, height: u8) -> Option<u32> {
+        fn allocate_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u64, height: u8) -> Option<u32> {
             let idx = self.nodes.len();
 
             let links_base = self.links.len();
@@ -637,7 +643,7 @@ pub mod skip_list {
     }
 
     impl<'a> Iterator for IterRaw<'a> {
-        type Item = (&'a [u8], u128, u32, bool);
+        type Item = (&'a [u8], u128, u64, bool);
 
         fn next(&mut self) -> Option<Self::Item> {
             if self.current == NONE_VALUE {
@@ -736,9 +742,9 @@ pub mod skip_list {
     /// last-write-wins for repeated writes to one key.
     #[cfg(test)]
     impl SkipList {
-        fn next_test_seq() -> u32 {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEQ: AtomicU32 = AtomicU32::new(1);
+        fn next_test_seq() -> u64 {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(1);
             SEQ.fetch_add(1, Ordering::Relaxed)
         }
 
@@ -863,16 +869,22 @@ pub mod skip_list {
         }
 
         #[test]
-        fn insert_tombstone_seq_comparison_handles_u32_wraparound() {
+        fn insert_tombstone_seq_comparison_spans_the_whole_sequence_space() {
+            // Sequences are compared at full u64 width, so an arbitrarily large
+            // gap between a tombstone and a later write still resolves correctly.
+            // (This replaced a u32-wraparound test: the truncation it tolerated is
+            // exactly what let a newer write lose to an older entry.)
             let mut sl = SkipList::new();
-            let big = u32::MAX - 2;
-            sl.insert_tombstone_with_seq(b"k", big).unwrap();
-            // A write whose seq wraps past 0 is still newer: it must resurrect.
-            sl.try_insert_with_seq(b"k", 1, big.wrapping_add(3)).unwrap();
-            assert_eq!(sl.get_value(b"k"), Some(1), "newer write across a wrap boundary must beat the tombstone");
-            // And a delete that wraps further is newer still.
-            sl.insert_tombstone_with_seq(b"k", big.wrapping_add(6)).unwrap();
+            let old = 1_000u64;
+            sl.insert_tombstone_with_seq(b"k", old).unwrap();
+            // Far beyond the old 2^31 serial-comparison window.
+            sl.try_insert_with_seq(b"k", 1, old + 3_000_000_000).unwrap();
+            assert_eq!(sl.get_value(b"k"), Some(1), "a much-later write must beat the tombstone");
+            sl.insert_tombstone_with_seq(b"k", old + 6_000_000_000).unwrap();
             assert_eq!(sl.get_value(b"k"), None);
+            // And a stale write from before the gap must still lose.
+            sl.try_insert_with_seq(b"k", 9, old + 1).unwrap();
+            assert_eq!(sl.get_value(b"k"), None, "a stale low-seq write must not resurrect the key");
         }
 
         #[test]
@@ -913,7 +925,7 @@ pub mod skip_list {
                 s
             };
 
-            for seq in 1..=4000u32 {
+            for seq in 1..=4000u64 {
                 let r = next();
                 let key = format!("key{:03}", r % 500).into_bytes(); // heavy collisions
                 if r % 3 == 0 {
@@ -940,15 +952,16 @@ pub mod skip_list {
         }
 
         #[test]
-        fn seq_comparison_handles_u32_wraparound() {
-            // Serial-number comparison must stay correct when the truncated u32
-            // sequence wraps, as long as the two values are within 2^31.
+        fn seq_comparison_spans_the_whole_sequence_space() {
+            // The comparison must hold across a gap far wider than the 2^31 window
+            // the old truncated-u32 serial arithmetic could represent.
             let mut sl = SkipList::new();
-            let big = u32::MAX - 2;
-            sl.try_insert_with_seq(b"k", 1, big).unwrap();
-            // `big + 3` wraps past 0 but is still the newer write.
-            sl.try_insert_with_seq(b"k", 2, big.wrapping_add(3)).unwrap();
-            assert_eq!(sl.get_value(b"k"), Some(2), "newer write across a wrap boundary must win");
+            sl.try_insert_with_seq(b"k", 1, 1_000).unwrap();
+            sl.try_insert_with_seq(b"k", 2, 1_000 + 3_000_000_000).unwrap();
+            assert_eq!(sl.get_value(b"k"), Some(2), "a much-later write must win");
+            // Past u32::MAX entirely — a truncating store would alias these.
+            sl.try_insert_with_seq(b"k", 3, u64::from(u32::MAX) + 1_001).unwrap();
+            assert_eq!(sl.get_value(b"k"), Some(3), "sequences beyond u32::MAX must not alias");
         }
 
         #[test]

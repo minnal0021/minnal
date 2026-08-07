@@ -265,7 +265,8 @@ impl DocStoreApiConfig {
             Duration::from_secs(self.scheduled_tasks.wal_gc_interval_secs),
             Duration::from_secs(self.scheduled_tasks.lsm_compaction_interval_secs),
         )
-        .with_ttl_cleanup_interval(Duration::from_secs(self.scheduled_tasks.ttl_cleanup_interval_secs));
+        .with_ttl_cleanup_interval(Duration::from_secs(self.scheduled_tasks.ttl_cleanup_interval_secs))
+        .with_index_checkpoint_interval(Duration::from_millis(self.scheduled_tasks.index_checkpoint_interval_ms));
 
         DbConfig {
             threshold_config: ThresholdConfig {
@@ -274,6 +275,7 @@ impl DocStoreApiConfig {
                 tail_gc_min_garbage_pct: self.thresholds.tail_gc_min_garbage_pct,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
                 index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
+                max_pinned_wal_segments: self.thresholds.max_pinned_wal_segments,
             },
             sync_config: SyncConfig {
                 records_per_sync: self.sync.records_per_sync,
@@ -453,6 +455,10 @@ pub struct ThresholdSection {
     pub index_blob_waste_threshold: f64,
     #[serde(default = "default_index_blob_backpressure_bytes")]
     pub index_blob_backpressure_bytes: u64,
+    /// Cap on WAL segments the index-replay watermark may hold back from WAL GC
+    /// before the backstop reclaims the oldest anyway. `0` disables the backstop.
+    #[serde(default = "default_max_pinned_wal_segments")]
+    pub max_pinned_wal_segments: u32,
 }
 
 impl Default for ThresholdSection {
@@ -463,6 +469,7 @@ impl Default for ThresholdSection {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
+            max_pinned_wal_segments: default_max_pinned_wal_segments(),
         }
     }
 }
@@ -483,6 +490,10 @@ fn default_index_blob_backpressure_bytes() -> u64 {
     minnal_db::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
+fn default_max_pinned_wal_segments() -> u32 {
+    minnal_db::DEFAULT_MAX_PINNED_WAL_SEGMENTS
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ScheduledTaskSection {
     #[serde(default = "default_gc_interval_secs")]
@@ -493,6 +504,10 @@ pub struct ScheduledTaskSection {
     pub lsm_compaction_interval_secs: u64,
     #[serde(default = "default_ttl_cleanup_secs")]
     pub ttl_cleanup_interval_secs: u64,
+    /// Index checkpoint interval in **milliseconds** — this is the crash-replay
+    /// window, so the useful range is sub-second to a few seconds.
+    #[serde(default = "default_index_checkpoint_interval_ms")]
+    pub index_checkpoint_interval_ms: u64,
 }
 
 impl Default for ScheduledTaskSection {
@@ -502,6 +517,7 @@ impl Default for ScheduledTaskSection {
             wal_gc_interval_secs: default_gc_interval_secs(),
             lsm_compaction_interval_secs: default_gc_interval_secs(),
             ttl_cleanup_interval_secs: default_ttl_cleanup_secs(),
+            index_checkpoint_interval_ms: default_index_checkpoint_interval_ms(),
         }
     }
 }
@@ -509,6 +525,10 @@ impl Default for ScheduledTaskSection {
 fn default_gc_interval_secs() -> u64 {
     60
 }
+fn default_index_checkpoint_interval_ms() -> u64 {
+    minnal_db::DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS
+}
+
 fn default_ttl_cleanup_secs() -> u64 {
     3_600
 }

@@ -5,7 +5,7 @@
 
 use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{DEFAULT_CHECKPOINT_INTERVAL, IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
+use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
@@ -35,13 +35,41 @@ struct WalFlushState {
     flushed: bool,
 }
 
+/// How far one namespace's writes have made it onto disk.
+///
+/// The WAL is global but memtables are per-namespace, so "this entry is durable
+/// in an SSTable" is a *per-namespace* question and the global watermark can only
+/// be the slowest namespace's answer.
+#[derive(Default, Clone, Copy)]
+struct NsFlushProgress {
+    /// WAL offset up to which every write by this namespace is in an SSTable.
+    safe_offset: u64,
+    /// WAL tail just after this namespace's most recent WAL append.
+    last_write_offset: u64,
+}
+
+impl NsFlushProgress {
+    /// Whether this namespace still holds WAL-backed writes that are not yet in
+    /// an SSTable, and so must hold the global watermark back.
+    fn has_unflushed(&self) -> bool {
+        self.last_write_offset > self.safe_offset
+    }
+}
+
 /// Observes LSM flush events and marks WAL entries as persisted.
 /// Shared across all namespaces since the WAL is global.
 pub(crate) struct WalPersistObserver {
     wal: Arc<Wal>,
     wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_metadata_path: PathBuf,
-    pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+    /// Keyed by `(namespace_id, memtable version)`. Memtable versions are
+    /// allocated **per KVStore**, so keying by version alone made namespace A's
+    /// version 7 and namespace B's version 7 the same entry — A's flush would
+    /// then satisfy B's pending record and advance the watermark past B's
+    /// un-flushed writes.
+    pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    /// Per-namespace flush progress — the input to the global watermark.
+    ns_progress: RwLock<std::collections::HashMap<u32, NsFlushProgress>>,
     last_persisted_offset: Arc<RwLock<u64>>,
     /// Serializes every persisted-marking operation (`mark_persisted_range`,
     /// `mark_namespace_persisted`). These do a non-atomic scan → check status →
@@ -51,6 +79,62 @@ pub(crate) struct WalPersistObserver {
     /// `persisted >= total`). Holding this across the whole operation makes the
     /// on-disk `status == Persisted` check a reliable per-entry dedup.
     persist_lock: Mutex<()>,
+    /// Start offsets of writes appended to the WAL but not yet applied to a
+    /// memtable — the writes for which "it is in the WAL" and "it is in the LSM"
+    /// disagree *right now*.
+    ///
+    /// **Why this exists.** Every quantity that drives the persisted cut is
+    /// derived from a `wal_metadata.tail` snapshot, and a tail snapshot
+    /// over-states durability: `put_ns` appends under the WAL lock (advancing
+    /// the tail) and applies to the memtable *after* releasing it, so between
+    /// those two points an entry is visible in the tail while its key is
+    /// nowhere. Marking such an entry `Persisted` tells recovery to skip a write
+    /// that only ever existed in a memtable — and a crash before that memtable
+    /// flushes loses an acknowledged write. Measured: 4 acknowledged writes lost
+    /// in one round of `work/stress/repro/drop_loses_a_write.py`, and 1 in
+    /// 34,538 in the 2026-08-02 stress run.
+    ///
+    /// Registration happens **while the WAL metadata write lock is still held**,
+    /// so anyone who can observe the new tail can also observe the registration.
+    /// That ordering is the whole guarantee; see [`Self::wal_cut_ceiling`].
+    ///
+    /// **Lock ordering: `ns_progress` → `wal_metadata` → `in_flight`.** Never
+    /// take `wal_metadata` while holding this.
+    ///
+    /// Refcounted rather than a set. Two registrations can legitimately name the
+    /// same offset — an entry starts exactly where the previous tail ended, so
+    /// anything that registers a *synthetic* offset (a test simulating a write
+    /// in flight) collides with the next real append, and a plain set would let
+    /// one `Drop` cancel the other's protection. Counting makes registration
+    /// composable and the barrier impossible to un-register by accident.
+    in_flight: Mutex<BTreeMap<u64, u32>>,
+}
+
+/// Registers a WAL entry as appended-but-not-yet-applied for its lifetime.
+///
+/// RAII is load-bearing, not stylistic: `put_ns` has fallible steps between the
+/// WAL append and the memtable apply (`get_store`), and a leaked registration
+/// pins [`WalPersistObserver::wal_cut_ceiling`] forever — which freezes the
+/// persisted watermark, so WAL GC's `persisted >= total` gate never fires again
+/// and the WAL grows without bound. That is the same failure mode as the dropped
+/// namespace in `17a8a0c`, reached a different way.
+pub(crate) struct InFlightWrite<'a> {
+    observer: &'a WalPersistObserver,
+    offset: u64,
+}
+
+impl Drop for InFlightWrite<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.observer.in_flight.lock();
+        if let std::collections::btree_map::Entry::Occupied(mut e) = in_flight.entry(self.offset) {
+            match e.get_mut() {
+                1 => {
+                    e.remove();
+                }
+                n => *n -= 1,
+            }
+        }
+    }
 }
 
 impl WalPersistObserver {
@@ -58,7 +142,7 @@ impl WalPersistObserver {
         wal: Arc<Wal>,
         wal_metadata: Arc<RwLock<WalMetadata>>,
         wal_metadata_path: PathBuf,
-        pending: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+        pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
         last_persisted_offset: Arc<RwLock<u64>>,
     ) -> Self {
         Self {
@@ -66,9 +150,107 @@ impl WalPersistObserver {
             wal_metadata,
             wal_metadata_path,
             pending,
+            ns_progress: RwLock::new(std::collections::HashMap::new()),
             last_persisted_offset,
             persist_lock: Mutex::new(()),
+            in_flight: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Register `offset` as appended-to-the-WAL-but-not-yet-applied.
+    ///
+    /// **Call this while still holding the WAL metadata write lock.** The
+    /// guarantee [`Self::wal_cut_ceiling`] rests on is that no observer can see a
+    /// tail containing this entry without also seeing this registration;
+    /// registering after releasing the lock reopens exactly the window this
+    /// closes.
+    pub(crate) fn begin_write(&self, offset: u64) -> InFlightWrite<'_> {
+        *self.in_flight.lock().entry(offset).or_insert(0) += 1;
+        InFlightWrite { observer: self, offset }
+    }
+
+    /// The highest WAL offset that may be treated as durable right now.
+    ///
+    /// This is the current tail, lowered to exclude every write that has been
+    /// appended but not yet applied to a memtable. Both consumers of "how far
+    /// has the WAL got" must go through it:
+    ///
+    /// * [`Self::try_advance_persisted`], whose cut would otherwise be the live
+    ///   tail whenever no namespace reports un-flushed writes;
+    /// * [`Self::on_memtable_sealed_ns`], which records "everything up to here is
+    ///   in the memtable I am sealing" — false for a write whose apply has not
+    ///   landed yet, because that apply goes into the *next* memtable while its
+    ///   offset sits below the recorded tail.
+    ///
+    /// The second one is why this is a shared helper rather than a check bolted
+    /// onto the first: it needs no namespace drop to trigger, and a fix that
+    /// only guarded the cut would have left it live.
+    ///
+    /// Lock order is `wal_metadata` then `in_flight`, matching the write path.
+    fn wal_cut_ceiling(&self) -> u64 {
+        let tail = self.wal_metadata.read().tail;
+        match self.in_flight.lock().first_key_value() {
+            Some((&oldest, _)) => tail.min(oldest),
+            None => tail,
+        }
+    }
+
+    /// Namespaces holding WAL-backed writes that are not yet in an SSTable.
+    ///
+    /// These are what hold the global watermark — and therefore WAL GC — back.
+    /// A namespace that writes a little and then goes idle would pin the WAL
+    /// indefinitely, so the WAL GC worker flushes them on its tick.
+    pub(crate) fn namespaces_with_unflushed(&self) -> Vec<u32> {
+        self.ns_progress
+            .read()
+            .iter()
+            .filter(|(_, p)| p.has_unflushed())
+            .map(|(ns, _)| *ns)
+            .collect()
+    }
+
+    /// Record that `namespace_id` appended a WAL entry ending at `tail`.
+    ///
+    /// This is what lets the watermark tell "namespace has nothing outstanding"
+    /// apart from "namespace has not flushed yet": a namespace that never writes
+    /// must not hold the watermark — and therefore WAL GC — back forever.
+    pub(crate) fn note_write(&self, namespace_id: u32, tail: u64) {
+        let mut progress = self.ns_progress.write();
+        let entry = progress.entry(namespace_id).or_default();
+        entry.last_write_offset = entry.last_write_offset.max(tail);
+    }
+
+    /// Stop tracking a namespace that has been dropped.
+    ///
+    /// A dropped namespace's store is gone from the registry, so it can never
+    /// flush again and its `safe_offset` can never advance. Left in
+    /// `ns_progress` it reports [`has_unflushed`](NsFlushProgress::has_unflushed)
+    /// forever, which pins the global cut in [`try_advance_persisted`] at its
+    /// stale offset — and [`Database::flush_namespaces_pinning_wal`] cannot clear
+    /// it, because the store it would flush no longer exists. The watermark then
+    /// never advances, `persisted_entries` stops tracking `total_entries`, and
+    /// WAL GC's `persisted >= total` gate never fires again: unbounded WAL growth
+    /// after any namespace drop.
+    ///
+    /// Forgetting it is sound because `remove_namespace` has already flushed and
+    /// shut the store down and marked its WAL entries persisted
+    /// ([`mark_namespace_persisted`]) before calling this — those entries need no
+    /// further protection, and recovery skips entries for namespaces missing from
+    /// the registry anyway.
+    ///
+    /// [`try_advance_persisted`]: Self::try_advance_persisted
+    /// [`mark_namespace_persisted`]: Self::mark_namespace_persisted
+    pub(crate) fn forget_namespace(&self, namespace_id: u32) {
+        {
+            self.ns_progress.write().remove(&namespace_id);
+            // Seal records for memtables that will now never be flushed; left
+            // behind they would be folded into a future namespace's scan.
+            self.pending.write().retain(|(ns, _), _| *ns != namespace_id);
+        }
+        // Locks released: the dropped namespace was potentially the one holding
+        // the cut back, so re-evaluate it now rather than waiting for some other
+        // namespace to happen to flush.
+        self.try_advance_persisted();
     }
 
     pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
@@ -203,17 +385,23 @@ impl WalPersistObserver {
         }
     }
 
-    fn try_advance_persisted(&self) {
+    /// Fold `namespace_id`'s completed flushes into its `safe_offset`.
+    ///
+    /// Versions are consumed in order and only while flushed, so an out-of-order
+    /// flush cannot advance the namespace past a still-pending older memtable.
+    fn advance_namespace(&self, namespace_id: u32) {
+        let mut new_safe = 0u64;
         loop {
             let next = {
                 let pending = self.pending.read();
-                let Some((&version, state)) = pending.iter().next() else {
-                    return;
+                // BTreeMap ordering makes this the namespace's lowest version.
+                let Some((&key, state)) = pending.range((namespace_id, 0)..=(namespace_id, u64::MAX)).next() else {
+                    break;
                 };
                 if !state.flushed {
-                    return;
+                    break;
                 }
-                (version, state.tail)
+                (key, state.tail)
             };
 
             {
@@ -222,49 +410,115 @@ impl WalPersistObserver {
                     continue;
                 };
                 if !state.flushed {
-                    return;
+                    break;
                 }
                 pending.remove(&next.0);
             }
+            new_safe = new_safe.max(next.1);
+        }
 
-            let start = *self.last_persisted_offset.read();
-            self.mark_persisted_range(start, next.1);
+        if new_safe > 0 {
+            let mut progress = self.ns_progress.write();
+            let entry = progress.entry(namespace_id).or_default();
+            entry.safe_offset = entry.safe_offset.max(new_safe);
+        }
+    }
+
+    /// Advance the global watermark to the point every namespace has reached.
+    ///
+    /// A WAL entry may only be marked `Persisted` once the namespace that owns it
+    /// has flushed it to an SSTable, because recovery skips `Persisted` entries.
+    /// The WAL is shared, so the safe cut is the **minimum** `safe_offset` over
+    /// the namespaces that still hold un-flushed writes. Marking up to one
+    /// namespace's own tail — as this did before — declared every *other*
+    /// namespace's un-flushed entries persisted too, and a crash then lost them.
+    /// Namespaces with nothing outstanding do not constrain the cut; if none do,
+    /// everything written so far is durable and the cut is the current tail.
+    fn try_advance_persisted(&self) {
+        let cut = {
+            let progress = self.ns_progress.read();
+            let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
+            // The ceiling excludes writes that are in the WAL but not yet in any
+            // memtable. It is applied to BOTH branches, not just the `None` one:
+            // capping the `Some` branch too costs nothing (a namespace's
+            // `safe_offset` is already below any later write) and removes the
+            // need to re-derive that argument every time this is read.
+            //
+            // Without it, the `None` branch cut at the live tail, which is how a
+            // store drop lost acknowledged writes: `forget_namespace` calls this
+            // the instant it removes a namespace from `ns_progress`, and that is
+            // precisely when the set of namespaces reporting un-flushed writes
+            // can go empty while other namespaces are mid-write.
+            let ceiling = self.wal_cut_ceiling();
+            match slowest {
+                Some(offset) => offset.min(ceiling),
+                None => ceiling,
+            }
+        };
+
+        let start = *self.last_persisted_offset.read();
+        if cut > start {
+            self.mark_persisted_range(start, cut);
         }
     }
 }
 
-impl LsmFlushObserver for WalPersistObserver {
-    fn on_memtable_sealed(&self, version: u64) {
-        let tail = self.wal_metadata.read().tail;
+impl WalPersistObserver {
+    fn on_memtable_sealed_ns(&self, namespace_id: u32, version: u64) {
+        // The ceiling, not the raw tail. This record means "every WAL entry below
+        // `tail` is in the memtable being sealed", and that is false for a write
+        // whose apply has not landed yet: its apply will go into the *next*
+        // memtable, while its offset is below this tail. Recording the raw tail
+        // therefore let `advance_namespace` push `safe_offset` past an entry that
+        // no SSTable holds — the same lost-write bug as the cut, reached without
+        // any namespace drop.
+        //
+        // Computed before taking `pending`: the lock order is
+        // `pending` → `ns_progress` → `wal_metadata` → `in_flight`, so the tail
+        // must never be read while `pending` is held.
+        let tail = self.wal_cut_ceiling();
         let mut pending = self.pending.write();
-        pending.entry(version).or_insert(WalFlushState { tail, flushed: false });
+        pending.entry((namespace_id, version)).or_insert(WalFlushState { tail, flushed: false });
     }
 
-    fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
+    fn on_ro_memtable_flushed_to_level0_ns(&self, namespace_id: u32, version: u64) {
+        // Same reasoning as the seal path, for the case where the flush is
+        // observed without a preceding seal record.
+        let ceiling = self.wal_cut_ceiling();
         {
             let mut pending = self.pending.write();
-            let entry = pending.entry(version).or_insert(WalFlushState { tail: 0, flushed: false });
+            let entry = pending
+                .entry((namespace_id, version))
+                .or_insert(WalFlushState { tail: 0, flushed: false });
             if entry.tail == 0 {
-                entry.tail = self.wal_metadata.read().tail;
+                entry.tail = ceiling;
             }
             entry.flushed = true;
         }
+        self.advance_namespace(namespace_id);
         self.try_advance_persisted();
     }
 }
 
 /// Hub that fans out LSM flush events to the WAL observer and compaction trigger.
+///
+/// One hub per KVStore, which is what supplies the namespace id the shared
+/// [`WalPersistObserver`] needs: the LSM itself only knows memtable versions, and
+/// those are allocated per store.
 struct LsmFlushObserverHub {
+    namespace_id: u32,
     wal_observer: Arc<WalPersistObserver>,
     compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 }
 
 impl LsmFlushObserverHub {
     fn new(
+        namespace_id: u32,
         wal_observer: Arc<WalPersistObserver>,
         compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
     ) -> Self {
         Self {
+            namespace_id,
             wal_observer,
             compaction_trigger,
         }
@@ -279,12 +533,12 @@ impl LsmFlushObserverHub {
 
 impl LsmFlushObserver for LsmFlushObserverHub {
     fn on_memtable_sealed(&self, version: u64) {
-        self.wal_observer.on_memtable_sealed(version);
+        self.wal_observer.on_memtable_sealed_ns(self.namespace_id, version);
         self.trigger_compaction();
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
-        self.wal_observer.on_ro_memtable_flushed_to_level0(version);
+        self.wal_observer.on_ro_memtable_flushed_to_level0_ns(self.namespace_id, version);
     }
 }
 
@@ -309,19 +563,58 @@ pub struct Database {
     pub(crate) config: DbConfig,
 
     // Shared WAL
-    wal: Arc<Wal>,
+    pub(crate) wal: Arc<Wal>,
     #[allow(dead_code)]
     wal_path: PathBuf,
     wal_metadata_path: PathBuf,
-    wal_metadata: Arc<RwLock<WalMetadata>>,
-    wal_flush_observer: Arc<WalPersistObserver>,
+    pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
+    pub(crate) wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
-    pending_wal_flushes: Arc<RwLock<BTreeMap<u64, WalFlushState>>>,
+    pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
     last_persisted_wal_offset: Arc<RwLock<u64>>,
-    wal_gc_in_progress: Arc<AtomicBool>,
+    pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     // Namespace registry
     pub(crate) registry: RwLock<NamespaceRegistry>,
+
+    /// Serialises namespace creation, and lets a reader that lands mid-creation
+    /// wait it out.
+    ///
+    /// Creation is not atomic across the two maps below: the registry entry is
+    /// published (and persisted) before the `KVStore` is opened and inserted into
+    /// `stores`, so in between, a name resolves to an id that `get_store` does
+    /// not know. This lock is what makes creation appear atomic — held across the
+    /// whole of `create_namespace`, and taken by [`Database::get_store`] on a miss
+    /// so it blocks until any in-flight creation has finished.
+    ///
+    /// **Lock ordering: this is the outermost lock.** Never acquire it while
+    /// holding `registry` or `stores`. Making the two maps update atomically the
+    /// obvious way instead — holding `stores.write()` across the registry publish
+    /// — would deadlock against `metrics_snapshot_by_namespace`, which holds
+    /// `registry.read()` while taking `stores.read()`.
+    namespace_create_lock: Mutex<()>,
+
+    /// Serialises field-index activation.
+    ///
+    /// Activation *creates* memory-mapped files — the field's `BlobStore` pair,
+    /// its `keymap/` pair, and the namespace's `RowMap` — through a check-then-act
+    /// (`if exists { open } else { create }`), and `GrowableMmap::create_file`
+    /// opens with `truncate(true)`. Two threads activating the same field
+    /// therefore truncate a file the other has already mapped, and the next
+    /// access to that mapping faults: **SIGBUS, which kills the process** — no
+    /// unwinding, no `Result`, the whole database goes down. A different
+    /// interleaving surfaces it as a panic writing a 64-byte header into a
+    /// zero-length map.
+    ///
+    /// Not hypothetical, and not confined to tests: any client that retries a
+    /// `POST /stores` after a timeout can produce two concurrent creates of the
+    /// same namespace, and each activates the same field. Measured before this
+    /// lock: 8 racing creates killed the server on every attempt.
+    ///
+    /// **Lock ordering: taken only AFTER `get_store` returns**, never around it —
+    /// `get_store` may wait on `namespace_create_lock`, which is strictly
+    /// outermost (see above).
+    index_activate_lock: Mutex<()>,
 
     // Per-namespace stores: namespace_id -> KVStore
     pub(crate) stores: RwLock<HashMap<u32, Arc<KVStore>>>,
@@ -340,6 +633,12 @@ pub struct Database {
     // Shared index-checkpoint backpressure valve — stored so newly-opened
     // namespaces inherit it. `None` until the checkpoint worker is enabled.
     pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+    /// Rejected field-index updates awaiting the next checkpoint, which turns
+    /// them into durable gap records. Shared with every `KVStore`.
+    pub(crate) rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
+    /// Namespaces whose durable "no-WAL writes outstanding" marker is set.
+    /// Debounces the marker write to once per checkpoint interval.
+    pub(crate) no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
 
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
@@ -354,7 +653,7 @@ pub struct Database {
     pub(crate) index_checkpoint_worker: Arc<tokio::sync::RwLock<Option<Arc<IndexCheckpointWorker>>>>,
 
     // Global monotonic sequence counter. Seeded from the WAL on open.
-    next_seq: Arc<AtomicU64>,
+    pub(crate) next_seq: Arc<AtomicU64>,
 
     // Directory for recovery fail-log files.
     fail_log_dir: PathBuf,
@@ -363,7 +662,7 @@ pub struct Database {
     // WAL-GC counters plus a fold of every dropped namespace's final totals.
     // Per-namespace counters live on each KVStore's own Metrics instance; the
     // engine-wide view (`metrics_snapshot`) sums those with this global one.
-    metrics: Arc<crate::db::metrics::Metrics>,
+    pub(crate) metrics: Arc<crate::db::metrics::Metrics>,
 }
 
 impl Database {
@@ -520,7 +819,7 @@ impl Database {
         // persisted TTL (if any) so `store.ttl` reflects the durable config.
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = db_path.join(format!("ns_{}", name));
+            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
             let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
             let kv_store = KVStore::open_with_ttl(
                 ns_id,
@@ -562,6 +861,8 @@ impl Database {
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
+            namespace_create_lock: Mutex::new(()),
+            index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -569,6 +870,8 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -587,8 +890,19 @@ impl Database {
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_index_gap_sink(Some(
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                ));
             }
         }
+
+        // Finish any field-index drop a crash interrupted, before recovery can
+        // replay into a directory that is meant to be gone.
+        db.complete_interrupted_field_drops();
+
+        // Report field indices left incomplete by no-WAL writes that an unclean
+        // shutdown caught before any checkpoint covered them.
+        db.record_no_wal_gaps_after_unclean_shutdown();
 
         // Recover from WAL
         db.recover_from_wal()?;
@@ -628,8 +942,9 @@ impl Database {
     /// Wire up LSM flush observers for all KVStores
     fn wire_up_flush_observers(&self) {
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for (ns_id, kv_store) in stores.iter() {
             let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+                *ns_id,
                 Arc::clone(&self.wal_flush_observer),
                 Arc::clone(&kv_store.lsm_compaction_trigger),
             ));
@@ -674,6 +989,17 @@ impl Database {
     /// and *will* take effect (via the in-memory apply now, or via WAL replay on
     /// the next open), so this only bounds the retry of transient apply errors.
     const APPLY_RETRY_ATTEMPTS: usize = 3;
+
+    /// Cap on how many keys a field's gap record will carry as a row-scoped
+    /// repair worklist before it is downgraded to a full rebuild.
+    ///
+    /// Row-scoped repair is bounded by the damage, but the damage itself is not
+    /// bounded: a wedged checkpoint worker can strand many segments, and a
+    /// worklist large enough to rival the store would be both a disk cost and a
+    /// slower repair than simply rebuilding the field. At that point a full
+    /// rebuild is the cheaper, simpler answer, so the keys are dropped rather
+    /// than accumulated.
+    pub(crate) const GAP_KEY_WORKLIST_CAP: usize = 100_000;
 
     /// Apply a WAL-durable mutation to the in-memory store, retrying transient
     /// failures up to [`APPLY_RETRY_ATTEMPTS`] times.
@@ -740,7 +1066,18 @@ impl Database {
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
+        let wal_tail = wal_metadata.tail;
+        // Registered BEFORE the WAL lock is released, so no observer can see a
+        // tail containing this entry without also seeing that it is not yet in
+        // any memtable. Held until this function returns, by which point step 2
+        // has applied it (or failed loudly). See `WalPersistObserver::in_flight`.
+        let _in_flight = self.wal_flush_observer.begin_write(wal_pointer.offset);
         drop(wal_metadata);
+
+        // This namespace now has a WAL-backed write that is not yet in an
+        // SSTable, so it holds the global persisted watermark back until it
+        // flushes (see `WalPersistObserver::try_advance_persisted`).
+        self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
         // Step 2: Apply to the namespace's in-memory store. The write is already
         // durable in the WAL, so this is best-effort with bounded retry: on
@@ -763,11 +1100,18 @@ impl Database {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
-        // Step 3: Maybe sync
-        if kv_store.should_sync() && kv_store.sync_value_log().is_ok() {
-            let start = *self.last_persisted_wal_offset.read();
-            let tail = self.wal_metadata.read().tail;
-            self.wal_flush_observer.mark_persisted_range(start, tail);
+        // Step 3: Maybe sync the value log.
+        //
+        // Syncing the value log does NOT make these WAL entries replaceable by
+        // what is on disk: the value is durable, but the key → pointer mapping
+        // still lives only in the LSM memtable until that memtable is flushed to
+        // an SSTable. Marking the WAL persisted here would tell recovery to skip
+        // entries whose keys exist nowhere on disk, silently losing acknowledged
+        // writes and stranding their values in the value log. The persisted
+        // watermark is advanced solely by `WalPersistObserver`, which waits for
+        // the memtable flush (`on_memtable_sealed` → `try_advance_persisted`).
+        if kv_store.should_sync() {
+            let _ = kv_store.sync_value_log();
         }
 
         Ok(())
@@ -787,6 +1131,11 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
         }
+        // No WAL entry exists for this write, so until the memtable is flushed
+        // it lives only in memory — the background flusher uses this to bound
+        // how much a crash can destroy.
+        kv_store.note_no_wal_write();
+        self.note_no_wal_index_exposure(namespace_id);
         kv_store.put_to_storage(key, value)
     }
 
@@ -807,6 +1156,8 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
         }
+        kv_store.note_no_wal_write();
+        self.note_no_wal_index_exposure(namespace_id);
         kv_store.delete_from_storage(key)
     }
 
@@ -831,7 +1182,15 @@ impl Database {
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
         wal_metadata.total_entries += 1;
+        let wal_tail = wal_metadata.tail;
+        // As in `put_ns`: registered under the WAL lock, released on return.
+        // A lost delete is as damaging as a lost put — recovery skipping it
+        // resurrects the key.
+        let _in_flight = self.wal_flush_observer.begin_write(wal_pointer.offset);
         drop(wal_metadata);
+
+        // As in `put_ns`: this namespace now holds an un-flushed WAL-backed write.
+        self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
         // Step 2: Apply the delete to the in-memory store (best-effort with
         // bounded retry; durable in the WAL — see `put_ns`).
@@ -849,11 +1208,11 @@ impl Database {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
-        // Step 3: Maybe sync
-        if kv_store.should_sync() && kv_store.sync_value_log().is_ok() {
-            let start = *self.last_persisted_wal_offset.read();
-            let tail = self.wal_metadata.read().tail;
-            self.wal_flush_observer.mark_persisted_range(start, tail);
+        // Step 3: Maybe sync the value log. As in `put_ns`, syncing the value
+        // log must NOT advance the WAL persisted watermark — the tombstone still
+        // lives only in the memtable until it is flushed.
+        if kv_store.should_sync() {
+            let _ = kv_store.sync_value_log();
         }
 
         Ok(())
@@ -865,9 +1224,21 @@ impl Database {
     pub fn create_namespace(&self, name: &str) -> Result<u32> {
         self.check_closed()?;
 
+        // Held until this function returns, so no one can observe the window
+        // between the registry publish below and the `stores` insert at the end.
+        let _create = self.namespace_create_lock.lock();
+
+        // Idempotent under the lock. Callers reach this through get-or-create
+        // (`Db::namespace`), which checks for the name and creates it if absent —
+        // two of them racing a brand-new name both see it absent, and without
+        // this the loser would get a spurious "already exists" from the registry.
+        if let Some(existing) = self.registry.read().get_id(name) {
+            return Ok(existing);
+        }
+
         let ns_id = self.registry.write().create(name)?;
 
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         let kv_store = KVStore::open(
             ns_id,
             name,
@@ -881,9 +1252,13 @@ impl Database {
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_index_gap_sink(Some(
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+        ));
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+            ns_id,
             Arc::clone(&self.wal_flush_observer),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
@@ -908,9 +1283,15 @@ impl Database {
     pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<u32> {
         self.check_closed()?;
 
+        // Same contract as `create_namespace` — see its comments.
+        let _create = self.namespace_create_lock.lock();
+        if let Some(existing) = self.registry.read().get_id(name) {
+            return Ok(existing);
+        }
+
         let ns_id = self.registry.write().create(name)?;
 
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         let kv_store = KVStore::open_with_ttl(
             ns_id,
             name,
@@ -925,9 +1306,13 @@ impl Database {
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_index_gap_sink(Some(
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+        ));
 
         // Wire up flush observer
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
+            ns_id,
             Arc::clone(&self.wal_flush_observer),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
@@ -1010,6 +1395,12 @@ impl Database {
         let tail = self.wal_metadata.read().tail;
         self.wal_flush_observer.mark_namespace_persisted(ns_id, start, tail);
 
+        // (3b) Stop tracking its flush progress. The store is gone, so it can
+        // never flush again — left in place it would report un-flushed writes
+        // forever, pinning the global persisted watermark (and therefore WAL GC)
+        // at a stale offset that nothing can ever advance.
+        self.wal_flush_observer.forget_namespace(ns_id);
+
         // (4) Reclaim disk. Best-effort and independent of the WAL.
         self.remove_namespace_storage(ns_id, name);
 
@@ -1026,7 +1417,7 @@ impl Database {
     /// This deliberately never touches the shared WAL or its metadata, so WAL
     /// replay for other namespaces is unaffected.
     fn remove_namespace_storage(&self, ns_id: u32, name: &str) {
-        let ns_path = self.db_path.join(format!("ns_{}", name));
+        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
         match std::fs::remove_dir_all(&ns_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1172,9 +1563,28 @@ impl Database {
                     meta.field_name, field_id, meta.field_type, value_type
                 )));
             }
+            // A dropped field's directory is gone (or is about to be), so
+            // activating it would open an empty index and silently serve
+            // incomplete results — `detect_replay_gap` suppresses exactly this
+            // shape (`Absent` + empty) as a normal first build. Fail loudly and
+            // make the caller re-register, which clears the flag and forces a
+            // rebuild. See `FEATURE-REQUEST.md` (FR-001).
+            if meta.dropped {
+                return Err(KVError::Serialization(format!(
+                    "Field '{}' (id {}) in namespace {} was dropped; re-register it before activating so the index is rebuilt",
+                    meta.field_name, field_id, namespace_id
+                )));
+            }
         }
 
         let store = self.get_store(namespace_id)?;
+
+        // Everything below this point creates or maps files under
+        // `index/{ns_id}/`. Two threads doing that for the same field truncate
+        // each other's live mappings and the process dies with SIGBUS — see
+        // `index_activate_lock`. Taken after `get_store`, which may itself wait
+        // on the strictly-outermost `namespace_create_lock`.
+        let _activate = self.index_activate_lock.lock();
 
         // Ensure the namespace's dense row-ID map is loaded before any
         // resolution happens — the write and replay paths resolve through it.
@@ -1191,9 +1601,47 @@ impl Database {
         {
             let wal_tail = self.wal_metadata.read().tail;
             if wal_tail > 0 {
-                let checkpoint_offset = self.index_manager.read_checkpoint(namespace_id, field_id, wal_tail);
+                let checkpoint_state = self.index_manager.read_checkpoint_state(namespace_id, field_id, wal_tail);
+                let checkpoint_offset = checkpoint_state.replay_offset();
                 if checkpoint_offset < wal_tail {
                     let wal_head = self.wal_metadata.read().head;
+
+                    // Report — but do not act on — a replay window the WAL can no
+                    // longer satisfy. WAL GC reclaims a segment once its entries are
+                    // persisted to the *LSM*; it never consults these checkpoint
+                    // markers, so the segments that would heal this field's index may
+                    // already be gone. `scan_entries` skips a missing segment as a
+                    // hole and returns what it can, silently, which is exactly how
+                    // this stayed invisible. Checking segment *presence* rather than
+                    // `checkpoint_offset < wal_head` matters: GC reclaims
+                    // fully-persisted segments out of order, so a hole can sit in the
+                    // middle of the window while `head` is still below the checkpoint.
+                    //
+                    // Detection only — the replay below is unchanged, and the missing
+                    // updates are unrecoverable from here. Recording, surfacing and
+                    // repairing this is tracked in `FEATURE-REQUEST.md` (FR-001).
+                    if let Some(gap) = crate::db::index_manager::detect_replay_gap(
+                        checkpoint_state,
+                        dyn_index.distinct_count() == 0,
+                        wal_tail,
+                        self.wal.missing_segments(checkpoint_offset, wal_tail),
+                    ) {
+                        error!(
+                            "[activate_field_index] ns={} field={}: field index is INCOMPLETE and cannot be repaired \
+                             by WAL replay — {} WAL segment(s) covering the replay window [{}, {}) have been reclaimed \
+                             (missing segment ids: {:?}, checkpoint marker: {:?}). Every write recorded in those \
+                             segments is absent from this field index, so queries on it will return incomplete \
+                             results until the index is rebuilt. Re-index this field to restore full coverage.",
+                            namespace_id,
+                            field_id,
+                            gap.missing_segments.len(),
+                            gap.from,
+                            gap.to,
+                            gap.missing_segments,
+                            checkpoint_state,
+                        );
+                    }
+
                     let entries = self.wal.scan_entries(wal_head.max(checkpoint_offset), wal_tail)?;
                     let mut affected_keys = std::collections::BTreeSet::<Vec<u8>>::new();
                     for (_, wal_entry) in &entries {
@@ -1237,34 +1685,109 @@ impl Database {
                         }
                     }
 
-                    for key in affected_keys {
-                        let current_value = store.get(&key)?;
-                        match current_value {
-                            // Live key: allocate/resolve its dense ID, then
-                            // rebuild its index entry from the current value.
+                    // Bound the blob growth this replay produces.
+                    //
+                    // The bitmap store is append-only and `insert` rewrites a
+                    // whole bitmap per key, so replaying a **low-cardinality**
+                    // field is quadratic: a value shared by N keys leaves N-1
+                    // stale copies. The write path bounds exactly this with the
+                    // backpressure valve — but the valve signals the checkpoint
+                    // *worker*, and the workers are not started until after every
+                    // field has been activated. During replay the trigger is
+                    // `None` and the valve is a no-op.
+                    //
+                    // Measured before this compaction existed: replaying one
+                    // 5-distinct-value field over 16k documents reached 2.6 GB on
+                    // disk and had not finished after ~1.5 hours. It also
+                    // compounded — an interrupted replay leaves a bigger blob and
+                    // does not advance the checkpoint, so the next start was
+                    // worse. The database became unopenable.
+                    //
+                    // So compact inline, on the same `dead_bytes` cap the write
+                    // path uses. We hold `dyn_index` exclusively here (it is not
+                    // yet published behind the `RwLock`), so this needs no locks
+                    // and cannot race a writer.
+                    let waste_threshold = (self.config.threshold_config.index_blob_waste_threshold / 100.0).clamp(0.0, 1.0);
+                    // A cap of 0 disables the *write-path* valve, which is a
+                    // throughput choice. It must not disable this: replay is not
+                    // the write path, and an unbounded replay leaves the database
+                    // unopenable rather than merely slow.
+                    let cap = match self.config.threshold_config.index_blob_backpressure_bytes {
+                        0 => crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+                        n => n,
+                    };
+                    let mut compactions = 0usize;
+
+                    // Group the replay by VALUE before writing anything.
+                    //
+                    // `insert` re-serialises the whole bitmap for a value, and
+                    // the blob store is append-only, so inserting key-by-key
+                    // leaves one dead copy of the entire bitmap per key. For a
+                    // low-cardinality field (few values, many rows) that is the
+                    // dominant cost of replay — measured at ~0.1 ms per key and
+                    // rising with the store's size, because the cost tracks the
+                    // bitmap, not the window.
+                    //
+                    // Replay is the one caller that can avoid it: it knows its
+                    // complete key set up front, so it can resolve every row
+                    // first and then write each value's bitmap exactly once.
+                    let mut rows_by_value: HashMap<crate::index::IndexValue, Vec<u128>> = HashMap::new();
+                    let mut rows_to_clear: Vec<u128> = Vec::new();
+
+                    for key in &affected_keys {
+                        match store.get(key)? {
+                            // Live key: resolve its dense ID and bucket it under
+                            // the value its current bytes extract to.
                             Some(ref bytes) => {
-                                let row_id = store.resolve_row_id_alloc(&key);
-                                dyn_index.remove_all_for_row(row_id);
-                                if let Some(v) = extractor(bytes)
-                                    && let Err(e) = dyn_index.insert(&v, row_id)
-                                {
-                                    warn!(
-                                        "[activate_field_index] index update rejected \
-                                         ns={} field={}: {}",
-                                        namespace_id, field_id, e
-                                    );
+                                let row_id = store.resolve_row_id_alloc(key);
+                                rows_to_clear.push(row_id);
+                                if let Some(v) = extractor(bytes) {
+                                    rows_by_value.entry(v).or_default().push(row_id);
                                 }
                             }
                             // Deleted key: clear any existing entry without
                             // allocating a (dead) ID for a key that no longer exists.
                             None => {
-                                if let Some(row_id) = store.resolve_row_id_get(&key) {
-                                    dyn_index.remove_all_for_row(row_id);
+                                if let Some(row_id) = store.resolve_row_id_get(key) {
+                                    rows_to_clear.push(row_id);
                                 }
                             }
                         }
                     }
+
+                    // Clear every affected row first, so the scalar
+                    // one-value-per-row invariant holds no matter which bucket
+                    // each row used to live in. This must precede the inserts:
+                    // clearing afterwards would undo them.
+                    //
+                    // Batched for the same reason the inserts are: the per-row
+                    // form loads every bucket and rewrites the changed one *per
+                    // row*, so clearing N rows appends N copies of the bitmap.
+                    dyn_index.remove_all_for_rows(&rows_to_clear);
+
+                    for (value, row_ids) in rows_by_value {
+                        if dyn_index.reclaimable_dead_bytes() >= cap {
+                            dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                            if dyn_index.maybe_compact(waste_threshold).map_err(KVError::Io)? {
+                                dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                                compactions += 1;
+                            }
+                        }
+                        if let Err(e) = dyn_index.insert_many(&value, &row_ids) {
+                            warn!(
+                                "[activate_field_index] index update rejected \
+                                 ns={} field={}: {}",
+                                namespace_id, field_id, e
+                            );
+                        }
+                    }
                     dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                    if compactions > 0 {
+                        debug!(
+                            "[activate_field_index] ns={namespace_id} field={field_id}: \
+                             compacted the index blob {compactions} time(s) during replay to keep it bounded"
+                        );
+                    }
                 }
             }
         }
@@ -1281,7 +1804,7 @@ impl Database {
     /// Remove a previously-activated field index from the in-memory registry.
     ///
     /// After this call the field's bitmap is dropped and any predicate query
-    /// that references it returns [`KVError::Serialization`] wrapping
+    /// that references it returns [`KVError::Query`] carrying
     /// [`crate::index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
@@ -1289,163 +1812,102 @@ impl Database {
         Ok(())
     }
 
-    // ── Query execution ────────────────────────────────────────────────
-
-    /// Evaluate a query string against the active field indices of a namespace
-    /// and return the raw keys of all matching documents.
+    /// Drop a field index: persist the drop, deregister it, and delete its
+    /// on-disk directory.
     ///
-    /// # Arguments
-    /// * `namespace_id` — the namespace to query
-    /// * `query_str`    — query string, e.g. `"age > 30 AND status = 'active'"`
+    /// Unlike [`deactivate_field_index`](Self::deactivate_field_index) — which
+    /// is an in-memory deregister a caller may legitimately use while a field is
+    /// rebuilt — this is the permanent operation. The field's [`FieldMeta`] is
+    /// retained in the schema so a later `register_field` reuses the same
+    /// [`FieldId`], but it is marked `dropped`: excluded from the checkpoint
+    /// worker and refused by `activate_field_index`.
     ///
-    /// # How it works
-    /// 1. Parses and evaluates `query_str` against the in-memory field indices,
-    ///    producing a bitmap of matching row IDs.
-    /// 2. Scans all keys in the namespace's KVStore and returns those whose
-    ///    row ID (from the dense row map) appears in the bitmap.
+    /// **Step order is load-bearing** (mirrors `remove_namespace`):
     ///
-    /// # Limitations
-    /// Only fields activated via `activate_field_index` are queryable.
-    /// Unindexed fields in the predicate produce a [`KVError::Serialization`]
-    /// wrapping a [`crate::index::query::QueryError::InactiveField`].
-    pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<Vec<Vec<u8>>> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
+    /// 1. persist `dropped` to `config.json`,
+    /// 2. deregister the in-memory index,
+    /// 3. delete `index/{ns_id}/{field_id}/`.
+    ///
+    /// A crash anywhere in that sequence leaves the drop *recorded*, so
+    /// [`complete_interrupted_field_drops`](Self::complete_interrupted_field_drops)
+    /// finishes it at the next open. The reverse order — files first — would
+    /// leave a live-looking field with no data, which reads as `Absent` + empty
+    /// and is suppressed by `detect_replay_gap` as a normal first build: a
+    /// silently incomplete index. See `FEATURE-REQUEST.md` (FR-001).
+    ///
+    /// Idempotent: dropping an already-dropped or unregistered field still
+    /// deregisters and reclaims any leftover directory.
+    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+        // (1) Persist the drop before anything becomes unreachable.
+        self.registry.write().mark_schema_field_dropped(namespace_id, field_id)?;
 
-        let store = self.get_store(namespace_id)?;
-
-        // Build the schema map: field_name → field_id, restricted to fields
-        // that have an active in-memory index. Dropped fields remain in the
-        // registry for field_id reuse but must not appear as queryable fields.
-        let schema_map: SchemaMap = {
-            let registry = self.registry.read();
-            let ns_index = store.namespace_index.read();
-            registry
-                .schema(namespace_id)
-                .map(|s| {
-                    s.list_fields()
-                        .into_iter()
-                        .filter(|f| ns_index.get(f.field_id).is_some())
-                        .map(|f| (f.field_name, f.field_id))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        // Closure: look up a live DynFieldIndex by field_id
-        let get_index = |field_id: u32| {
-            let ns_index = store.namespace_index.read();
-            ns_index.get(field_id).map(|e| Arc::clone(&e.index))
-        };
-
-        // Evaluate the query → bitmap of matching row IDs
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index).map_err(|e| KVError::Serialization(e.to_string()))?;
-
-        if bitmap.is_empty() {
-            return Ok(Vec::new());
+        // (2) Deregister in memory. Best-effort on the store lookup: a namespace
+        // that is not open has no in-memory index to deregister, but its files
+        // still need reclaiming below.
+        if let Ok(store) = self.get_store(namespace_id) {
+            store.namespace_index.write().deregister(field_id);
         }
 
-        // Fast path: when a RowToKeyFn inverse is registered, reconstruct each
-        // matching key directly from its row ID — O(|hits|), zero memory overhead,
-        // crash-safe (no map to rebuild on restart).
-        if let Some(ref inv) = *store.row_to_key_fn.read() {
-            return Ok(bitmap.iter().map(|row_id| inv(row_id)).collect());
-        }
-
-        // Fast path: the dense row map resolves each hit's key directly — O(|hits|).
-        if store.rowmap_active() {
-            return Ok(bitmap.iter().filter_map(|row_id| store.rowmap_key_for(row_id)).collect());
-        }
-
-        // Fallback (no inverse function): scan all keys and check bitmap membership.
-        // Pre-existing O(n_keys) path retained for backward compatibility.
-        let all_keys = store.keys()?;
-        let matching = all_keys
-            .into_iter()
-            .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-            .collect();
-
-        Ok(matching)
+        // (3) Reclaim disk.
+        self.index_manager.remove_field_path(namespace_id, field_id)
     }
 
-    /// Evaluate a query and return `(page_keys, total)` where `total` is the
-    /// full match count (bitmap cardinality) and `page_keys` contains at most
-    /// `limit` keys starting from `offset` in iteration order.
+    /// Finish deleting the directories of field indices whose drop was
+    /// interrupted by a crash, and reclaim any that were dropped before this
+    /// cleanup existed.
     ///
-    /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// - With a registered `RowToKeyFn`: O(offset + limit) key resolutions.
-    /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
+    /// Runs at open, after the registry is loaded and before any field is
+    /// activated. Idempotent — `remove_field_path` treats a missing directory as
+    /// success — so the common case (nothing dropped, or every drop completed)
+    /// costs one `remove_dir_all` per dropped field and touches no disk.
     ///
-    /// [`query_keys`]: Self::query_keys
-    pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<(Vec<Vec<u8>>, usize)> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
-
-        let store = self.get_store(namespace_id)?;
-
-        let schema_map: SchemaMap = {
+    /// Failures are logged, not propagated: a leftover directory wastes disk but
+    /// cannot affect correctness, and refusing to open the database over it would
+    /// be a far worse outcome.
+    fn complete_interrupted_field_drops(&self) {
+        let dropped: Vec<(u32, FieldId)> = {
             let registry = self.registry.read();
-            let ns_index = store.namespace_index.read();
             registry
-                .schema(namespace_id)
-                .map(|s| {
-                    s.list_fields()
-                        .into_iter()
-                        .filter(|f| ns_index.get(f.field_id).is_some())
-                        .map(|f| (f.field_name, f.field_id))
-                        .collect()
-                })
-                .unwrap_or_default()
+                .list()
+                .into_iter()
+                .filter_map(|(_, ns_id)| registry.schema(ns_id).map(|s| (ns_id, s.dropped_field_ids())))
+                .flat_map(|(ns_id, fields)| fields.into_iter().map(move |fid| (ns_id, fid)))
+                .collect()
         };
-
-        let get_index = |field_id: u32| {
-            let ns_index = store.namespace_index.read();
-            ns_index.get(field_id).map(|e| Arc::clone(&e.index))
-        };
-
-        let bitmap = parse_and_evaluate(query_str, &schema_map, &get_index).map_err(|e| KVError::Serialization(e.to_string()))?;
-
-        let total = bitmap.len();
-
-        if total == 0 {
-            return Ok((Vec::new(), 0));
+        for (ns_id, field_id) in dropped {
+            match self.index_manager.remove_field_path(ns_id, field_id) {
+                Ok(()) => debug!("[INDEX] reclaimed dropped field index ns={ns_id} field={field_id}"),
+                Err(e) => warn!("[INDEX] failed to reclaim dropped field index ns={ns_id} field={field_id}: {e:?}"),
+            }
         }
-
-        // Fast path: RowToKeyFn registered — resolve only the page window.
-        if let Some(ref inv) = *store.row_to_key_fn.read() {
-            let keys: Vec<Vec<u8>> = bitmap.iter().skip(offset).take(limit).map(|row_id| inv(row_id)).collect();
-            return Ok((keys, total));
-        }
-
-        // Fast path: dense row map — resolve only the page window.
-        if store.rowmap_active() {
-            let keys: Vec<Vec<u8>> = bitmap
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .filter_map(|row_id| store.rowmap_key_for(row_id))
-                .collect();
-            return Ok((keys, total));
-        }
-
-        // Fallback: scan all keys, filter by bitmap membership, then window.
-        let all_keys = store.keys()?;
-        let keys: Vec<Vec<u8>> = all_keys
-            .into_iter()
-            .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-            .skip(offset)
-            .take(limit)
-            .collect();
-        Ok((keys, total))
     }
 
     // ── Store access ───────────────────────────────────────────────────
 
-    /// Get a KVStore by namespace ID
-    fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
-        self.stores
-            .read()
-            .get(&namespace_id)
-            .cloned()
-            .ok_or_else(|| KVError::Serialization(format!("Namespace with ID {} not found", namespace_id)))
+    /// Get a KVStore by namespace ID.
+    ///
+    /// A miss is not immediately an error. `create_namespace` publishes the
+    /// registry entry before it opens the store, so a caller that has just
+    /// resolved a *name* to this id — which is what every get-or-create path
+    /// does — can arrive while the store is still being opened. If the registry
+    /// knows the id, a creation is or was in flight: wait on the creation lock
+    /// and look once more. Ids the registry does not know fail straight away.
+    pub(crate) fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
+        if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
+            return Ok(store);
+        }
+
+        if self.registry.read().get_name(namespace_id).is_some() {
+            // Blocks until any in-flight `create_namespace` has inserted its
+            // store. Taken only after both reads above are released — this lock
+            // is the outermost one (see `namespace_create_lock`).
+            let _create = self.namespace_create_lock.lock();
+            if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
+                return Ok(store);
+            }
+        }
+
+        Err(KVError::Serialization(format!("Namespace with ID {} not found", namespace_id)))
     }
 
     /// Get a KVStore by namespace name
@@ -1503,7 +1965,69 @@ impl Database {
         Ok(())
     }
 
-    fn flush_wal_metadata_internal(&self) -> Result<()> {
+    /// Flush every namespace holding no-WAL writes that exist only in memory.
+    ///
+    /// WAL-backed writes survive a crash because recovery replays them; no-WAL
+    /// writes have no such copy, so whatever sits in the memtable when the
+    /// process dies is gone. That is the intended trade for the vector index and
+    /// the query-embedding cache — both are bulky and re-derivable — but a
+    /// memtable is only flushed at capacity, so in practice a crash discarded
+    /// *everything* those namespaces had accumulated. Observed: a `SIGKILL` left
+    /// `stress_docs_sparse_vector` with 4 entries on disk against 6020 in
+    /// memory, and reconciliation re-enqueued ~18000 documents whose embeddings
+    /// had already been computed — hours of work against the embedding service.
+    ///
+    /// Running this on the compaction worker's tick bounds that loss to one tick
+    /// of writes instead of a whole memtable. Only namespaces with no-WAL writes
+    /// are flushed: WAL-backed ones are recoverable, are already flushed by
+    /// [`flush_namespaces_pinning_wal`], and forcing extra flushes on them would
+    /// buy no durability while adding L0 files for compaction to merge.
+    ///
+    /// Returns how many namespaces were flushed.
+    ///
+    /// [`flush_namespaces_pinning_wal`]: Self::flush_namespaces_pinning_wal
+    pub(crate) fn flush_no_wal_memtables(&self) -> usize {
+        let stores = self.stores.read();
+        let mut flushed = 0;
+        for (ns_id, kv_store) in stores.iter() {
+            if !kv_store.has_unflushed_no_wal_writes() {
+                continue;
+            }
+            match kv_store.flush_memtable_to_level0() {
+                Ok(()) => flushed += 1,
+                Err(e) => warn!("[LSM] Failed to flush no-WAL memtable for ns={}: {:?}", ns_id, e),
+            }
+        }
+        flushed
+    }
+
+    /// Flush every namespace that is holding the WAL persisted watermark back.
+    ///
+    /// The watermark can only advance to the slowest namespace's flushed offset,
+    /// so a namespace that writes a few records and then goes idle would pin the
+    /// whole WAL forever. Flushing those memtables to level 0 is what lets the
+    /// watermark — and WAL GC behind it — move again. Returns how many
+    /// namespaces were flushed.
+    pub(crate) fn flush_namespaces_pinning_wal(&self) -> usize {
+        let pinning = self.wal_flush_observer.namespaces_with_unflushed();
+        if pinning.is_empty() {
+            return 0;
+        }
+        let stores = self.stores.read();
+        let mut flushed = 0;
+        for ns_id in pinning {
+            let Some(kv_store) = stores.get(&ns_id) else {
+                continue;
+            };
+            match kv_store.flush_memtable_to_level0() {
+                Ok(()) => flushed += 1,
+                Err(e) => warn!("[WAL] Failed to flush ns={} while unpinning the WAL watermark: {:?}", ns_id, e),
+            }
+        }
+        flushed
+    }
+
+    pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
         crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
@@ -1726,108 +2250,6 @@ impl Database {
         }
         self.flush_wal_metadata_internal()?;
         Ok(last_persisted_offset)
-    }
-
-    // ── WAL GC ─────────────────────────────────────────────────────────
-
-    pub fn get_wal_gc_stats(&self) -> (u64, u64) {
-        let wal_metadata = self.wal_metadata.read();
-        (wal_metadata.total_entries, wal_metadata.persisted_entries)
-    }
-
-    /// Returns `true` when at least one non-current WAL segment is fully persisted
-    /// and ready to be deleted.  Entries in the active segment are not yet eligible
-    /// — they will be marked persisted after the next memtable flush or clean shutdown.
-    pub fn has_deletable_wal_segments(&self) -> bool {
-        let wal_metadata = self.wal_metadata.read();
-        if wal_metadata.tail == 0 {
-            return false;
-        }
-        let current = self.wal.segment_id_for_offset(wal_metadata.tail - 1);
-        wal_metadata.tracked_segments().take_while(|&s| s < current).any(|s| {
-            let t = wal_metadata.segment_total(s);
-            // `>=` rather than `==`: a fully-persisted segment has persisted == total;
-            // accepting `>` too keeps GC unwedged if a persisted counter is ever
-            // over-reported, instead of stranding the segment forever.
-            t > 0 && wal_metadata.segment_persisted(s) >= t
-        })
-    }
-
-    pub fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
-        if self
-            .wal_gc_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            let (total, persisted) = self.get_wal_gc_stats();
-            return Ok((0, total.saturating_sub(persisted)));
-        }
-
-        struct WalGcGuard<'a>(&'a AtomicBool);
-        impl<'a> Drop for WalGcGuard<'a> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _guard = WalGcGuard(&self.wal_gc_in_progress);
-
-        let mut wal_metadata = self.wal_metadata.write();
-        let current_segment_id = if wal_metadata.tail == 0 {
-            0
-        } else {
-            self.wal.segment_id_for_offset(wal_metadata.tail - 1)
-        };
-
-        // Persist the current sequence high-water mark BEFORE deleting any segment.
-        // This ensures recover_sequence always finds a hint >= the max sequence
-        // in any segment that survives, even if those segments are later deleted.
-        wal_metadata.last_sequence = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
-
-        let mut bytes_reclaimed = 0u64;
-        let mut segments_deleted = 0u64;
-        let candidates: Vec<u64> = wal_metadata.tracked_segments().take_while(|&s| s < current_segment_id).collect();
-        for segment_id in candidates {
-            let total = wal_metadata.segment_total(segment_id);
-            let persisted = wal_metadata.segment_persisted(segment_id);
-            // `persisted >= total` (not `==`): a segment is reclaimable once every
-            // entry is persisted; `>=` also unwedges GC if a counter was ever
-            // over-reported (see `has_deletable_wal_segments`).
-            if total > 0 && persisted >= total && self.wal.delete_segment_file(segment_id).is_ok() {
-                bytes_reclaimed = bytes_reclaimed.saturating_add(self.wal.segment_size());
-                segments_deleted += 1;
-                wal_metadata.total_entries = wal_metadata.total_entries.saturating_sub(total);
-                wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_sub(persisted);
-                wal_metadata.clear_segment(segment_id);
-            }
-        }
-
-        // Advance head past all consecutively deleted/empty segments so that a
-        // subsequent scan_entries(head, tail) never tries to open a deleted file.
-        // Segments with segment_total == 0 were either deleted in this run or in
-        // a previous one; either way their files are gone.
-        let head_segment = wal_metadata.head / self.wal.segment_size();
-        let first_live = (head_segment..=current_segment_id)
-            .find(|&sid| sid == current_segment_id || wal_metadata.segment_total(sid) > 0)
-            .unwrap_or(current_segment_id);
-        let new_head = first_live * self.wal.segment_size();
-        if new_head > wal_metadata.head {
-            wal_metadata.head = new_head;
-        }
-        // Trim per-segment counters below the new head so the dense vecs track
-        // only the live segment window instead of growing with every segment
-        // ever created (keeps `base_segment_id == head`'s segment).
-        wal_metadata.trim_segments_before(first_live);
-
-        wal_metadata.total_gc_runs = wal_metadata.total_gc_runs.saturating_add(1);
-        wal_metadata.total_bytes_reclaimed = wal_metadata.total_bytes_reclaimed.saturating_add(bytes_reclaimed);
-        let remaining = wal_metadata.total_entries.saturating_sub(wal_metadata.persisted_entries);
-        drop(wal_metadata);
-        self.flush_wal_metadata_internal()?;
-
-        crate::db::metrics::Metrics::bump(&self.metrics.wal_gc_runs);
-        crate::db::metrics::Metrics::add(&self.metrics.wal_segments_deleted, segments_deleted);
-
-        Ok((bytes_reclaimed, remaining))
     }
 
     // ── Value log GC (per namespace) ───────────────────────────────────
@@ -2131,7 +2553,7 @@ impl Database {
 
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = db_path.join(format!("ns_{}", name));
+            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
             let kv_store = KVStore::open(
                 ns_id,
                 name,
@@ -2164,6 +2586,8 @@ impl Database {
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             registry: RwLock::new(registry),
+            namespace_create_lock: Mutex::new(()),
+            index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
             closed: Arc::new(AtomicBool::new(false)),
             wal_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2171,6 +2595,8 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2187,9 +2613,17 @@ impl Database {
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_index_gap_sink(Some(
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                ));
             }
         }
 
+        db.complete_interrupted_field_drops();
+
+        // Report field indices left incomplete by no-WAL writes that an unclean
+        // shutdown caught before any checkpoint covered them.
+        db.record_no_wal_gaps_after_unclean_shutdown();
         db.recover_from_wal()?;
         let last_persisted = db.rebuild_wal_persisted_state()?;
         *db.last_persisted_wal_offset.write() = last_persisted;
@@ -2324,6 +2758,17 @@ impl IndexCheckpointTarget for Database {
         }
 
         self.index_manager.checkpoint_fields(wal_tail, &active_fields)?;
+        drop(stores);
+
+        // The index is now durable up to `wal_tail`, so any no-WAL writes before
+        // this point are covered and their markers can go.
+        for ns_id in self.no_wal_pending.lock().drain() {
+            if let Err(e) = self.index_manager.clear_no_wal_pending(ns_id) {
+                warn!("[IndexCheckpoint] failed to clear the no-WAL marker for ns={ns_id}: {e:?}");
+            }
+        }
+
+        self.persist_rejected_update_gaps();
         Ok(active_fields.len())
     }
 }
@@ -2333,6 +2778,10 @@ impl IndexCheckpointTarget for Database {
 impl WalGcTarget for Database {
     fn is_closed(&self) -> bool {
         self.is_closed()
+    }
+
+    fn flush_namespaces_pinning_wal(&self) -> usize {
+        self.flush_namespaces_pinning_wal()
     }
 
     fn get_wal_gc_stats(&self) -> (u64, u64) {
@@ -2353,6 +2802,10 @@ impl WalGcTarget for Database {
 impl LsmCompactionTarget for Database {
     fn is_closed(&self) -> bool {
         self.is_closed()
+    }
+
+    fn flush_no_wal_memtables(&self) -> usize {
+        self.flush_no_wal_memtables()
     }
 
     fn has_lsm_compaction_work(&self) -> bool {
@@ -2381,7 +2834,9 @@ impl ValueLogGcTarget for Database {
         let stores = self.stores.read();
         let segment_threshold = self.config.threshold_config.segment_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();
-        info!(
+        // Fires on every tick whether or not there is anything to collect, so
+        // DEBUG. The per-namespace results below stay at INFO.
+        debug!(
             "[GCWorker] tick — checking {} namespace(s) against {:.2}% waste threshold \
              (segments rewritten at >= {:.2}% garbage, tail sealed at >= {:.2}%)",
             stores.len(),
@@ -2467,2098 +2922,11 @@ impl TtlTarget for Database {
     }
 }
 
-// ── AsyncDatabase ──────────────────────────────────────────────────────
-
-/// Async wrapper around Database for use with Tokio.
-/// Provides the same multi-namespace API with async/await support.
-#[derive(Clone)]
-pub struct AsyncDatabase {
-    inner: Arc<Database>,
-}
-
-impl AsyncDatabase {
-    pub fn new(db: Database) -> Self {
-        Self { inner: Arc::new(db) }
-    }
-
-    /// Open a database with background workers enabled
-    pub async fn open_with_workers(db_path: &Path, config: DbConfig) -> Result<Self> {
-        let db_path = db_path.to_path_buf();
-        let cfg = config.clone();
-        let db = tokio::task::spawn_blocking(move || Database::open(&db_path, cfg))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))??;
-        let async_db = AsyncDatabase::new(db);
-
-        // Enable background workers
-        let scheduled = config.scheduled_task_config;
-        async_db.enable_wal_gc_worker(scheduled.wal_gc_interval).await?;
-        async_db.enable_index_checkpoint_worker(DEFAULT_CHECKPOINT_INTERVAL).await?;
-
-        Ok(async_db)
-    }
-
-    // ── Core data operations (default namespace) ───────────────────────
-
-    pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.put(&key, &value))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.get(&key))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.delete(&key))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    // ── Namespace-aware data operations ────────────────────────────────
-
-    pub async fn put_ns(&self, namespace_id: u32, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.put_ns(namespace_id, &key, &value))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn get_ns(&self, namespace_id: u32, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.get_ns(namespace_id, &key))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn delete_ns(&self, namespace_id: u32, key: Vec<u8>) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.delete_ns(namespace_id, &key))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    // ── Namespace management ───────────────────────────────────────────
-
-    pub fn create_namespace(&self, name: &str) -> Result<u32> {
-        self.inner.create_namespace(name)
-    }
-
-    pub fn list_namespaces(&self) -> Vec<(String, u32)> {
-        self.inner.list_namespaces()
-    }
-
-    pub fn get_namespace_id(&self, name: &str) -> Option<u32> {
-        self.inner.get_namespace_id(name)
-    }
-
-    pub fn namespace_exists(&self, name: &str) -> bool {
-        self.inner.namespace_exists(name)
-    }
-
-    pub fn remove_namespace(&self, name: &str) -> Result<u32> {
-        self.inner.remove_namespace(name)
-    }
-
-    /// Ensure the single global TTL worker is running. Idempotent — a no-op if
-    /// it has already been started. The worker scans every TTL-registered
-    /// namespace on each tick (driven by `ttl_cleanup_interval`).
-    pub(crate) async fn ensure_ttl_worker(&self) {
-        let mut slot = self.inner.ttl_worker.write().await;
-        if slot.is_none() {
-            let interval = self.inner.config.scheduled_task_config.ttl_cleanup_interval;
-            let worker = TtlWorker::new(Arc::clone(&self.inner), interval);
-            *slot = Some(Arc::new(worker));
-            info!("[AsyncDatabase] Global TTL worker enabled (interval={}s)", interval.as_secs());
-        }
-    }
-
-    /// Create a namespace with a TTL. The namespace is registered with the
-    /// single global TTL worker, which expires its records older than `ttl`
-    /// (capped at `max_deletes_per_run` per pass).
-    pub async fn create_namespace_with_ttl(&self, name: &str, ttl: Duration, max_deletes_per_run: usize) -> Result<u32> {
-        let ns_id = self.inner.create_namespace_with_ttl(name, Some(ttl))?;
-        self.inner.registry.write().set_ttl_config(ns_id, ttl, max_deletes_per_run)?;
-        self.ensure_ttl_worker().await;
-        info!(
-            "[AsyncDatabase] TTL registered for namespace '{}' (ttl={}s, max_deletes={})",
-            name,
-            ttl.as_secs(),
-            max_deletes_per_run
-        );
-        Ok(ns_id)
-    }
-
-    /// Trigger an immediate TTL cleanup pass.
-    ///
-    /// `namespace_id` is accepted for API compatibility but the single global
-    /// worker runs a full pass over every TTL-registered namespace; if that
-    /// namespace is registered it will be expired as part of the pass.
-    pub async fn trigger_ttl_cleanup(&self, _namespace_id: u32) -> Result<()> {
-        if let Some(worker) = self.inner.ttl_worker.read().await.as_ref() {
-            worker.trigger().map_err(|e| KVError::Io(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
-    }
-
-    /// Stop expiring records for a namespace by removing its persisted TTL
-    /// config. The worker task itself keeps running for other namespaces; the
-    /// namespace's `store.ttl` metadata is left intact.
-    pub async fn shutdown_ttl_worker(&self, namespace_id: u32) {
-        if let Err(e) = self.inner.registry.write().remove_ttl_config(namespace_id) {
-            warn!("[AsyncDatabase] Failed to remove TTL config for ns_id={}: {:?}", namespace_id, e);
-        }
-    }
-
-    // ── WAL GC worker ──────────────────────────────────────────────────
-
-    pub async fn enable_wal_gc_worker(&self, check_interval: Duration) -> Result<()> {
-        let worker = WalGcWorker::new(self.inner.clone(), check_interval);
-        *self.inner.wal_gc_worker.write().await = Some(Arc::new(worker));
-        info!("[AsyncDatabase] WAL GC worker enabled with {}ms interval", check_interval.as_millis());
-        Ok(())
-    }
-
-    pub async fn trigger_wal_gc_worker(&self) -> Result<()> {
-        if let Some(worker) = self.inner.wal_gc_worker.read().await.as_ref() {
-            worker.trigger_gc().map_err(|e| KVError::Io(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
-    }
-
-    pub async fn shutdown_wal_gc_worker(&self) {
-        if let Some(worker) = self.inner.wal_gc_worker.write().await.take() {
-            worker.shutdown().await;
-        }
-    }
-
-    pub async fn is_wal_gc_worker_enabled(&self) -> bool {
-        self.inner.wal_gc_worker.read().await.is_some()
-    }
-
-    // ── Index checkpoint worker ────────────────────────────────────────
-
-    /// Start the index checkpoint worker with the given interval.
-    ///
-    /// The worker periodically serialises in-memory field indices to
-    /// `{db_path}/index/{namespace_id}/{field_id}/` so that crash recovery
-    /// only needs to replay a bounded WAL tail.
-    pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
-        let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
-        // Wire the write-path backpressure valve to this worker before publishing it.
-        self.inner.wire_index_checkpoint_trigger(&worker);
-        *self.inner.index_checkpoint_worker.write().await = Some(Arc::new(worker));
-        info!("[AsyncDatabase] Index checkpoint worker enabled with {}s interval", interval.as_secs());
-        Ok(())
-    }
-
-    /// Trigger an immediate index checkpoint outside of the normal schedule.
-    pub async fn trigger_index_checkpoint(&self) -> Result<()> {
-        if let Some(worker) = self.inner.index_checkpoint_worker.read().await.as_ref() {
-            worker.trigger().map_err(|e| KVError::Io(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
-    }
-
-    /// Shut down the index checkpoint worker gracefully.
-    pub async fn shutdown_index_checkpoint_worker(&self) {
-        if let Some(worker) = self.inner.index_checkpoint_worker.write().await.take() {
-            worker.shutdown().await;
-        }
-    }
-
-    // ── LSM compaction worker ──────────────────────────────────────────
-
-    /// Start the LSM compaction worker.
-    ///
-    /// Wires all existing KVStores' compaction triggers to the worker so that
-    /// memtable flushes immediately schedule a compaction check.  Namespaces
-    /// opened after this call are wired up at creation time.
-    pub async fn enable_lsm_compaction_worker(&self, interval: Duration) -> Result<()> {
-        let worker = LsmCompactionWorker::new(Arc::clone(&self.inner), interval);
-        let sender = worker.sender();
-        // Wire existing namespaces — drop the read-guard before the async write below.
-        {
-            let stores = self.inner.stores.read();
-            for kv_store in stores.values() {
-                kv_store.set_compaction_trigger(sender.clone());
-            }
-        }
-        *self.inner.lsm_compaction_sender.write() = Some(sender);
-        *self.inner.lsm_compaction_worker.write().await = Some(Arc::new(worker));
-        info!("[AsyncDatabase] LSM compaction worker enabled with {}ms interval", interval.as_millis());
-        Ok(())
-    }
-
-    pub async fn shutdown_lsm_compaction_worker(&self) {
-        if let Some(worker) = self.inner.lsm_compaction_worker.write().await.take() {
-            worker.shutdown().await;
-        }
-        *self.inner.lsm_compaction_sender.write() = None;
-    }
-
-    // ── Value-log GC worker ────────────────────────────────────────────
-
-    /// Start the value-log GC worker.  Runs GC on every namespace whose waste
-    /// ratio exceeds `waste_threshold` on each `interval` tick.
-    pub async fn enable_value_log_gc_worker(&self, interval: Duration, waste_threshold: f64) -> Result<()> {
-        let worker = GCWorker::new(Arc::clone(&self.inner), interval, waste_threshold);
-        *self.inner.value_log_gc_worker.write().await = Some(Arc::new(worker));
-        info!(
-            "[AsyncDatabase] Value-log GC worker enabled with {}s interval, threshold {:.1}%",
-            interval.as_secs(),
-            waste_threshold
-        );
-        Ok(())
-    }
-
-    pub async fn shutdown_value_log_gc_worker(&self) {
-        if let Some(worker) = self.inner.value_log_gc_worker.write().await.take() {
-            worker.shutdown().await;
-        }
-    }
-
-    /// Register an indexed field for a namespace.  Returns the assigned `FieldId`.
-    pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
-        self.inner.register_index_field(namespace_id, field_name, value_type)
-    }
-
-    /// Return all indexed fields registered for a namespace, sorted by `FieldId`.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<FieldMeta> {
-        self.inner.list_index_fields(namespace_id)
-    }
-
-    /// Return the number of distinct indexed values for a field.
-    ///
-    /// Returns `None` when the field is not active.
-    pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
-        self.inner.field_index_distinct_count(namespace_id, field_id)
-    }
-
-    /// Register a custom row-ID function (and optionally its inverse) for a namespace.
-    ///
-    /// See [`Database::set_row_id_fn`] for full documentation.
-    pub fn set_row_id_fn(
-        &self,
-        namespace_id: u32,
-        row_id_fn: crate::db::namespace_index::RowIdFn,
-        row_to_key_fn: Option<crate::db::namespace_index::RowToKeyFn>,
-    ) -> Result<()> {
-        self.inner.set_row_id_fn(namespace_id, row_id_fn, row_to_key_fn)
-    }
-
-    /// Wire up a live extractor for a registered field and load its snapshot.
-    ///
-    /// See [`Database::activate_field_index`] for full documentation.
-    pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
-        self.inner.activate_field_index(namespace_id, field_id, value_type, extractor)
-    }
-
-    /// Evaluate a query string and return matching document keys.
-    ///
-    /// See [`Database::query_keys`] for full documentation.
-    pub async fn query_keys(&self, namespace_id: u32, query_str: String) -> Result<Vec<Vec<u8>>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.query_keys(namespace_id, &query_str))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    // ── Shutdown ───────────────────────────────────────────────────────
-
-    #[allow(dead_code)]
-    pub(crate) async fn shutdown(&self) -> Result<()> {
-        // Shutdown the global TTL worker. The TTL config stays persisted in the
-        // registry so it is restored on the next open.
-        if let Some(worker) = self.inner.ttl_worker.write().await.take() {
-            info!("[AsyncDatabase] Shutting down TTL worker...");
-            worker.shutdown().await;
-        }
-
-        // Shutdown WAL GC worker
-        if self.is_wal_gc_worker_enabled().await {
-            info!("[AsyncDatabase] Shutting down WAL GC worker...");
-            self.shutdown_wal_gc_worker().await;
-        }
-
-        // Flush index state to disk before stopping the checkpoint worker so
-        // that snapshot.idx files are always consistent with the last write.
-        if self.inner.index_checkpoint_worker.read().await.is_some() {
-            info!("[AsyncDatabase] Running final index checkpoint before shutdown...");
-            let db = self.inner.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || db.run_index_checkpoint())
-                .await
-                .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-            {
-                log::warn!("[AsyncDatabase] Final index checkpoint failed: {:?}", e);
-            }
-            info!("[AsyncDatabase] Shutting down index checkpoint worker...");
-            self.shutdown_index_checkpoint_worker().await;
-        }
-
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.shutdown())
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    #[allow(dead_code)]
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
-}
-
+/// Unit tests for the coordinator.
+///
+/// Declared here with `#[path]` rather than as a sibling module so `use super::*`
+/// still resolves to this file's scope — the tests were written against it, and
+/// re-deriving 40 imports to move them would have been change for its own sake.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::config::{ScheduledTaskConfig, SyncConfig, ThresholdConfig};
-    use crate::store::lsm::lsm_tree::LSMConfig;
-    use tempfile::TempDir;
-
-    fn create_db_config() -> DbConfig {
-        let gc_interval = Duration::from_secs(5);
-        let wal_gc_interval = Duration::from_secs(5);
-        let lsm_compaction_interval = Duration::from_secs(5);
-
-        let sync_config = SyncConfig::default();
-        let threshold_config = ThresholdConfig::new(2.5);
-        let scheduled_task_config = ScheduledTaskConfig::new(gc_interval, wal_gc_interval, lsm_compaction_interval);
-        let lsm_config = LSMConfig::default();
-        let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
-        config.num_buckets = crate::support::TEST_NUM_BUCKETS;
-        config
-    }
-
-    #[test]
-    fn test_concurrent_mark_persisted_never_overcounts() {
-        // Regression: `mark_persisted_range` is a non-atomic scan → flip → count.
-        // Run concurrently by multiple writers reaching the sync point at once, two
-        // threads would flip and BOTH count the same entry, pushing
-        // `persisted_entries` past `total_entries`. Because the WAL GC deletion gate
-        // was exact equality (`total == persisted`), that impossible state wedged
-        // WAL GC forever (segments never became deletable → unbounded WAL growth).
-        // `persist_lock` must serialize the flip+count so no entry is counted twice.
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        // Append a batch of entries (default records_per_sync is high, so these do
-        // not auto-persist during the writes).
-        let n = 500u64;
-        for i in 0..n {
-            db.put(format!("key{i}").as_bytes(), b"value").unwrap();
-        }
-        let tail = db.wal_metadata.read().tail;
-        let total = db.wal_metadata.read().total_entries;
-        assert!(total >= n, "expected at least {n} entries, got {total}");
-
-        // Hammer the same range from many threads at once.
-        std::thread::scope(|s| {
-            for _ in 0..16 {
-                s.spawn(|| {
-                    for _ in 0..8 {
-                        db.wal_flush_observer.mark_persisted_range(0, tail);
-                    }
-                });
-            }
-        });
-
-        let meta = db.wal_metadata.read();
-        // The invariant the bug violated: persisted can never exceed total.
-        assert!(
-            meta.persisted_entries <= meta.total_entries,
-            "persisted_entries ({}) exceeded total_entries ({}) — over-count race",
-            meta.persisted_entries,
-            meta.total_entries,
-        );
-        // The whole range was covered, so every entry is persisted exactly once.
-        assert_eq!(meta.persisted_entries, meta.total_entries);
-        // Per-segment invariant holds too.
-        for seg in meta.tracked_segments() {
-            assert!(
-                meta.segment_persisted(seg) <= meta.segment_total(seg),
-                "segment {seg}: persisted {} > total {}",
-                meta.segment_persisted(seg),
-                meta.segment_total(seg),
-            );
-        }
-        drop(meta);
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_wal_segment_size_is_locked_at_creation() {
-        // The configured WAL segment size applies only to a brand-new WAL, and is
-        // then fixed: reopening with a different config value must NOT change it
-        // (a segment id is offset / segment_size, so a change would re-bucket
-        // stored offsets into the wrong files).
-        let dir = TempDir::new().unwrap();
-        let small = 64 * 1024; // 64 KiB
-        {
-            let mut cfg = create_db_config();
-            cfg.wal_segment_size = small;
-            let db = Database::open(dir.path(), cfg).unwrap();
-            assert_eq!(db.wal.segment_size(), small, "fresh WAL should honour config");
-            db.put(b"k", b"v").unwrap();
-            db.shutdown().unwrap();
-        }
-        // A marker must have been recorded.
-        assert!(dir.path().join("wal_segment_size").exists());
-        {
-            // Reopen with a DIFFERENT configured size — the created size must win.
-            let mut cfg = create_db_config();
-            cfg.wal_segment_size = 8 * 1024 * 1024;
-            let db = Database::open(dir.path(), cfg).unwrap();
-            assert_eq!(db.wal.segment_size(), small, "existing WAL size must be locked");
-            assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
-            db.shutdown().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_database_basic_operations() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        db.put(b"key1", b"value1").unwrap();
-        db.put(b"key2", b"value2").unwrap();
-
-        assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-
-        db.delete(b"key2").unwrap();
-        assert_eq!(db.get(b"key2").unwrap(), None);
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_database_multiple_namespaces() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        // Create additional namespace — ID 0 = default, 1 = system, so users gets 2.
-        let users_id = db.create_namespace("users").unwrap();
-        assert_eq!(users_id, 2);
-
-        // Write to default namespace
-        db.put(b"global_key", b"global_value").unwrap();
-
-        // Write to users namespace
-        db.put_ns(users_id, b"user:1", b"alice").unwrap();
-        db.put_ns(users_id, b"user:2", b"bob").unwrap();
-
-        // Read from default — should not see users data
-        assert_eq!(db.get(b"global_key").unwrap(), Some(b"global_value".to_vec()));
-        assert_eq!(db.get(b"user:1").unwrap(), None);
-
-        // Read from users namespace
-        assert_eq!(db.get_ns(users_id, b"user:1").unwrap(), Some(b"alice".to_vec()));
-        assert_eq!(db.get_ns(users_id, b"user:2").unwrap(), Some(b"bob".to_vec()));
-        assert_eq!(db.get_ns(users_id, b"global_key").unwrap(), None);
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_database_namespace_listing() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        db.create_namespace("users").unwrap();
-        db.create_namespace("orders").unwrap();
-
-        let mut namespaces = db.list_namespaces();
-        namespaces.sort_by_key(|(_, id)| *id);
-        // default(0), system(1), users(2), orders(3)
-        assert_eq!(namespaces.len(), 4);
-        assert_eq!(namespaces[0], ("default".to_string(), 0));
-        assert_eq!(namespaces[1], ("system".to_string(), 1));
-        assert_eq!(namespaces[2], ("users".to_string(), 2));
-        assert_eq!(namespaces[3], ("orders".to_string(), 3));
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_database_namespace_persistence() {
-        let dir = TempDir::new().unwrap();
-
-        // Create database with namespaces and data
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            let users_id = db.create_namespace("users").unwrap();
-            db.put(b"default_key", b"default_val").unwrap();
-            db.put_ns(users_id, b"user_key", b"user_val").unwrap();
-            db.shutdown().unwrap();
-        }
-
-        // Reopen and verify
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            assert!(db.namespace_exists("users"));
-            let users_id = db.get_namespace_id("users").unwrap();
-
-            assert_eq!(db.get(b"default_key").unwrap(), Some(b"default_val".to_vec()));
-            assert_eq!(db.get_ns(users_id, b"user_key").unwrap(), Some(b"user_val".to_vec()));
-
-            db.shutdown().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_database_remove_namespace() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let users_id = db.create_namespace("users").unwrap();
-        db.put_ns(users_id, b"key", b"val").unwrap();
-
-        db.remove_namespace("users").unwrap();
-        assert!(!db.namespace_exists("users"));
-        assert!(db.get_ns(users_id, b"key").is_err());
-
-        // Cannot remove default
-        assert!(db.remove_namespace("default").is_err());
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_wal_gc_eligible_after_namespace_drop() {
-        // Regression test: WAL entries for a dropped namespace must be marked
-        // persisted on drop so that WAL GC can reclaim the segments they occupy.
-        // Previously, removing a namespace left its WAL entries as Inserted forever,
-        // blocking GC for any segment that contained those entries.
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns_id = db.create_namespace("temp").unwrap();
-        db.put_ns(ns_id, b"k1", b"v1").unwrap();
-        db.put_ns(ns_id, b"k2", b"v2").unwrap();
-
-        let (total_before, persisted_before) = db.get_wal_gc_stats();
-        assert!(total_before >= 2, "expected at least 2 WAL entries");
-
-        db.remove_namespace("temp").unwrap();
-
-        let (total_after, persisted_after) = db.get_wal_gc_stats();
-        // After dropping the namespace, the persisted count must have increased
-        // to cover the entries we just wrote, so GC is not blocked on them.
-        assert!(
-            persisted_after > persisted_before,
-            "persisted count should increase after namespace drop (before={}, after={})",
-            persisted_before,
-            persisted_after,
-        );
-        assert_eq!(total_after, total_before, "total entry count should be unchanged");
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_activate_type_mismatch_rejected() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::IndexValueType;
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns = DEFAULT_NAMESPACE_ID;
-        // Register as Int
-        let field_id = db.register_index_field(ns, "age", IndexValueType::Int).unwrap();
-
-        // Activating with the correct type succeeds
-        let extractor: ExtractorFn = Arc::new(|_| None);
-        assert!(db.activate_field_index(ns, field_id, IndexValueType::Int, Arc::clone(&extractor)).is_ok());
-
-        // Activating with a different type must fail
-        let err = db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap_err();
-        assert!(err.to_string().contains("Type mismatch"), "unexpected error: {}", err);
-    }
-
-    #[test]
-    fn test_activate_unknown_field_id_rejected() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::IndexValueType;
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let extractor: ExtractorFn = Arc::new(|_| None);
-        // field_id 99 was never registered
-        let err = db
-            .activate_field_index(DEFAULT_NAMESPACE_ID, 99, IndexValueType::Int, extractor)
-            .unwrap_err();
-        assert!(err.to_string().contains("not registered"), "unexpected error: {}", err);
-    }
-
-    #[test]
-    fn test_duplicate_register_field_idempotent() {
-        use crate::index::IndexValueType;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let id1 = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str).unwrap();
-        // Same name + same type: idempotent, returns existing id
-        let id2 = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str).unwrap();
-        assert_eq!(id1, id2);
-        // Same name, different type: error
-        let err = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Int).unwrap_err();
-        assert!(err.to_string().contains("already registered"), "unexpected error: {}", err);
-    }
-
-    #[test]
-    fn test_schema_survives_restart_and_index_activates_without_re_register() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-
-        // ── First open: register fields and write some data ──────────────
-        let status_field_id;
-        let age_field_id;
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-            status_field_id = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str).unwrap();
-            age_field_id = db.register_index_field(DEFAULT_NAMESPACE_ID, "age", IndexValueType::Int).unwrap();
-
-            // Activate both indices with extractors
-            let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-            });
-            let age_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Int(v["age"].as_i64()?))
-            });
-            db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field_id, IndexValueType::Str, status_extractor)
-                .unwrap();
-            db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field_id, IndexValueType::Int, age_extractor)
-                .unwrap();
-
-            db.put(b"user:1", br#"{"status":"active","age":30}"#).unwrap();
-            db.put(b"user:2", br#"{"status":"inactive","age":25}"#).unwrap();
-            db.put(b"user:3", br#"{"status":"active","age":40}"#).unwrap();
-
-            db.shutdown().unwrap();
-        }
-
-        // ── Second open: do NOT call register_index_field ────────────────
-        // Schema must be loaded from config.json automatically.
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-            // Confirm schema is present without re-registering
-            let fields = db.list_index_fields(DEFAULT_NAMESPACE_ID);
-            assert_eq!(fields.len(), 2);
-            assert!(fields.iter().any(|f| f.field_name == "status" && f.field_type == IndexValueType::Str));
-            assert!(fields.iter().any(|f| f.field_name == "age" && f.field_type == IndexValueType::Int));
-
-            // Activate indices with extractors (closures can't be persisted — caller always supplies these)
-            let status_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-            });
-            let age_extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Int(v["age"].as_i64()?))
-            });
-            // These must succeed using the field IDs recovered from config.json
-            db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field_id, IndexValueType::Str, status_extractor)
-                .unwrap();
-            db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field_id, IndexValueType::Int, age_extractor)
-                .unwrap();
-
-            // Queries must return correct results from the warmed index
-            let mut active_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"active\"").unwrap();
-            active_keys.sort();
-            assert_eq!(active_keys, vec![b"user:1".to_vec(), b"user:3".to_vec()]);
-
-            let inactive_keys = db.query_keys(DEFAULT_NAMESPACE_ID, "status = \"inactive\"").unwrap();
-            assert_eq!(inactive_keys, vec![b"user:2".to_vec()]);
-
-            db.shutdown().unwrap();
-        }
-    }
-
-    /// Verify that `activate_field_index` replays the WAL tail into the index
-    /// on reopen, covering any writes that happened after the last checkpoint.
-    ///
-    /// Sequence:
-    ///   1. Open DB, activate index, write batch A.
-    ///   2. Checkpoint (flush BlobStore + keymap mmap store + checkpoint file).
-    ///   3. Write batch B (live index updated, checkpoint is now stale).
-    ///   4. Drop DB without shutdown — simulates a crash.
-    ///   5. Reopen DB, activate index (WAL replay runs for batch B).
-    ///   6. Query must return all of batch A and batch B.
-    #[test]
-    fn test_activate_field_index_replays_wal_after_crash() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-
-        let make_extractor = || -> ExtractorFn {
-            Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-            })
-        };
-
-        let field_id;
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
-
-            // Batch A — will be on disk after checkpoint.
-            db.put(b"user:1", br#"{"status":"active"}"#).unwrap();
-            db.put(b"user:2", br#"{"status":"inactive"}"#).unwrap();
-
-            // Checkpoint: flush BlobStore + keymap mmap store + checkpoint marker.
-            db.run_index_checkpoint().unwrap();
-
-            // Batch B — live index only; checkpoint is now stale.
-            db.put(b"user:3", br#"{"status":"active"}"#).unwrap();
-            db.put(b"user:4", br#"{"status":"inactive"}"#).unwrap();
-
-            // Drop without shutdown — WAL has batch B but checkpoint does not.
-        }
-
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            // activate_field_index must replay batch B from the WAL tail.
-            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
-
-            let mut active_keys = db.query_keys(ns, "status = \"active\"").unwrap();
-            active_keys.sort();
-            assert_eq!(
-                active_keys,
-                vec![b"user:1".to_vec(), b"user:3".to_vec()],
-                "WAL replay must include batch-B writes",
-            );
-
-            let mut inactive_keys = db.query_keys(ns, "status = \"inactive\"").unwrap();
-            inactive_keys.sort();
-            assert_eq!(inactive_keys, vec![b"user:2".to_vec(), b"user:4".to_vec()],);
-
-            db.shutdown().unwrap();
-        }
-    }
-
-    #[test]
-    fn check_total_len_rejects_over_limit() {
-        // Within / at the limit → Ok; over → WriteTooLarge. Tiny limit so the
-        // over-limit branch needs no multi-GiB allocation.
-        assert!(Database::check_total_len(5, 5, 12).is_ok());
-        assert!(Database::check_total_len(7, 5, 12).is_ok()); // exactly at limit
-        match Database::check_total_len(8, 5, 12) {
-            Err(KVError::WriteTooLarge(m)) => assert!(m.contains("exceeds the 12-byte"), "got: {m}"),
-            other => panic!("expected WriteTooLarge, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn put_and_delete_accept_normal_sized_keys_and_values() {
-        // Regression: the size guard must not reject ordinary writes.
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        db.put(b"k", &vec![0u8; 4096]).unwrap();
-        assert_eq!(db.get(b"k").unwrap(), Some(vec![0u8; 4096]));
-        db.delete(b"k").unwrap();
-        assert_eq!(db.get(b"k").unwrap(), None);
-        db.shutdown().unwrap();
-    }
-
-    /// Item 13 regression: replaying an **update** (same key, changed field
-    /// value) must reconcile via the targeted O(1) path — during replay
-    /// `lsm.get` returns the replay-so-far value, so the second put moves the
-    /// row off the old value. A bug here would leave the key matching BOTH the
-    /// old and new value after recovery.
-    #[test]
-    fn test_field_index_replays_updates_after_crash() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-        let make_extractor = || -> ExtractorFn {
-            Arc::new(|bytes: &[u8]| {
-                let s = std::str::from_utf8(bytes).ok()?;
-                let v: serde_json::Value = serde_json::from_str(s).ok()?;
-                Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-            })
-        };
-
-        let field_id;
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
-
-            // Insert, then UPDATE the same key to a different value — all in the
-            // WAL, no checkpoint, so recovery must replay both writes in order.
-            db.put(b"u:1", br#"{"status":"active"}"#).unwrap();
-            db.put(b"u:1", br#"{"status":"archived"}"#).unwrap(); // update
-            db.put(b"u:2", br#"{"status":"active"}"#).unwrap();
-            // Drop without shutdown — index lives only in the WAL.
-        }
-
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            db.activate_field_index(ns, field_id, IndexValueType::Str, make_extractor()).unwrap();
-
-            // u:1 must match ONLY its latest value after replay, not the old one.
-            assert_eq!(
-                db.query_keys(ns, "status = \"archived\"").unwrap(),
-                vec![b"u:1".to_vec()],
-                "replayed update must land u:1 under its new value"
-            );
-            assert_eq!(
-                db.query_keys(ns, "status = \"active\"").unwrap(),
-                vec![b"u:2".to_vec()],
-                "replayed update must remove u:1 from its old value (no stale bucket)"
-            );
-            db.shutdown().unwrap();
-        }
-    }
-
-    /// Item 13: a put that adds/removes the indexed field (absent↔present) must
-    /// update the index correctly via the targeted path — the row joins the new
-    /// value's bucket and leaves whatever it was in (including "nothing").
-    #[test]
-    fn test_field_index_update_field_appears_and_disappears() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-            let s = std::str::from_utf8(bytes).ok()?;
-            let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-        });
-        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
-
-        // Field absent → not indexed.
-        db.put(b"d:1", br#"{"other":1}"#).unwrap();
-        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
-
-        // Field appears (None → Some): row joins the "active" bucket.
-        db.put(b"d:1", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"d:1".to_vec()]);
-
-        // Field disappears (Some → None): row must leave the bucket.
-        db.put(b"d:1", br#"{"other":2}"#).unwrap();
-        assert!(
-            db.query_keys(ns, "status = \"active\"").unwrap().is_empty(),
-            "row must leave its bucket when the indexed field is removed"
-        );
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_ops_metrics_counters_move() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        db.put(b"k1", b"v1").unwrap();
-        db.put(b"k2", b"v2").unwrap();
-        assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec())); // hit
-        assert_eq!(db.get(b"missing").unwrap(), None); // miss
-        db.delete(b"k2").unwrap();
-
-        let m = db.metrics_snapshot();
-        assert_eq!(m.puts, 2, "two WAL-backed puts");
-        assert_eq!(m.deletes, 1, "one delete");
-        assert_eq!(m.reads, 2, "two user reads");
-        assert_eq!(m.read_hits, 1, "one hit");
-        assert_eq!(m.read_misses, 1, "one miss");
-        // Every WAL-backed write fsyncs once (2 puts + 1 delete).
-        assert_eq!(m.wal_fsyncs, 3);
-        assert!(m.wal_bytes_appended > 0);
-        // Reads go through the LSM point-lookup path.
-        assert!(m.lookups >= 2, "lookups should cover the user reads, got {}", m.lookups);
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_value_log_physical_and_segment_stats() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        for i in 0..50u32 {
-            db.put(format!("k{i}").as_bytes(), &vec![b'v'; 256]).unwrap();
-        }
-
-        // Physical stats: present for the default namespace, with real on-disk bytes.
-        let physical = db.value_log_physical_stats();
-        let (_, shards) = physical.iter().find(|(ns, _)| ns == "default").expect("default ns present");
-        assert!(!shards.is_empty(), "expected value-log shards");
-        let total_physical: u64 = shards.iter().map(|s| s.physical_bytes).sum();
-        assert!(total_physical > 0, "physical bytes should be non-zero after writes");
-
-        // Segment stats: per-bucket segment breakdown, with live bytes accounted.
-        let segments = db.value_log_segment_stats("default").unwrap();
-        assert_eq!(segments.len(), db.config.num_buckets, "one entry per bucket");
-        let live: u64 = segments.iter().flat_map(|(_, ss)| ss.iter()).map(|s| s.live_bytes).sum();
-        assert!(live > 0, "written records should be accounted as live bytes, got {live}");
-        // Every bucket has exactly one active tail (unsealed) segment.
-        for (bucket, ss) in &segments {
-            let unsealed = ss.iter().filter(|s| !s.sealed).count();
-            assert_eq!(unsealed, 1, "bucket {bucket} must have exactly one active tail segment");
-        }
-
-        // Unknown namespace errors rather than panicking.
-        assert!(db.value_log_segment_stats("nope").is_err());
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
-        // Under real concurrency, racing writers to the same keys must not drift the
-        // value-log accounting GC selection relies on: total live bytes must equal
-        // exactly one live record per distinct key. (The deterministic form of the
-        // underlying bug is `a_lower_seq_put_charges_its_own_record_not_the_live_one`
-        // in kv_store; this guards the invariant end-to-end under load.)
-        use std::sync::Arc;
-        use std::thread;
-
-        let dir = TempDir::new().unwrap();
-        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
-
-        let keys: Vec<Vec<u8>> = (0..4u32).map(|k| format!("hot-key-{k}").into_bytes()).collect();
-        let mut handles = Vec::new();
-        for t in 0..4usize {
-            let (db, keys) = (Arc::clone(&db), keys.clone());
-            handles.push(thread::spawn(move || {
-                for i in 0..100usize {
-                    // Vary the value size per write so a mis-charged displacement can't
-                    // cancel in the aggregate byte count.
-                    let len = 64 + (t * 37 + i * 101) % 1024;
-                    db.put(&keys[(t + i) % keys.len()], &vec![0xACu8; len]).unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // Expected live bytes: one record per distinct key, sized by that key's current
-        // (winning) value. Database::open starts no GC worker, so nothing reclaims
-        // concurrently and the live set is exactly the winning records.
-        let expected_live: u64 = keys
-            .iter()
-            .map(|k| {
-                let v = db.get(k).unwrap().expect("key present after the race");
-                crate::store::value_log::ValueRecordHeader::record_len(k.len(), v.len())
-            })
-            .sum();
-
-        let stats = db.value_log_segment_stats("default").unwrap();
-        let mut total_live = 0u64;
-        for (_bucket, segs) in &stats {
-            for s in segs {
-                assert_eq!(
-                    s.live_bytes + s.garbage_bytes,
-                    s.total_bytes,
-                    "segment {} broke live+garbage==total",
-                    s.id
-                );
-                total_live += s.live_bytes;
-            }
-        }
-        assert_eq!(
-            total_live, expected_live,
-            "accounted live bytes must equal exactly one record per live key, not leak intermediate records"
-        );
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn existing_bucket_count_is_detected_from_segmented_value_logs() {
-        // num_buckets is locked at creation: reopening with a different configured
-        // value must NOT re-shard. detect_bucket_count reads the count back from the
-        // value-log filenames — which are now `value_log_{bucket}.segNNNNNN`, not the
-        // old `value_log_{bucket}.log`. A stale matcher would see zero buckets and
-        // silently honour the new config, corrupting key→bucket sharding.
-        let dir = TempDir::new().unwrap();
-        let original_buckets = 3;
-
-        {
-            let mut config = create_db_config();
-            config.num_buckets = original_buckets;
-            let db = Database::open(dir.path(), config).unwrap();
-            for i in 0..30u32 {
-                db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
-            }
-            assert_eq!(db.config.num_buckets, original_buckets);
-            db.shutdown().unwrap();
-        }
-
-        // Reopen asking for a DIFFERENT bucket count.
-        let mut config = create_db_config();
-        config.num_buckets = original_buckets + 3;
-        let db = Database::open(dir.path(), config).unwrap();
-        assert_eq!(
-            db.config.num_buckets, original_buckets,
-            "the original bucket count must be detected from the segment files and preserved, not the newly configured one"
-        );
-
-        // Every value is still readable — keys resolved to the same buckets they were
-        // written to, which they only can if the original count was honoured.
-        for i in 0..30u32 {
-            assert_eq!(
-                db.get(format!("k{i}").as_bytes()).unwrap(),
-                Some(format!("v{i}").into_bytes()),
-                "value k{i} unreadable after reopen with a mismatched num_buckets"
-            );
-        }
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
-        use crate::store::gc_value_log_worker::ValueLogGcTarget;
-        // The GC trigger is per-bucket, not just the namespace average: a bucket over the
-        // trigger must be collected even when near-empty buckets drag the average below it.
-        let dir = TempDir::new().unwrap();
-        let mut config = create_db_config();
-        config.threshold_config.value_log_waste_threshold = 30.0; // tail bar tracks this
-        let db = Database::open(dir.path(), config).unwrap();
-
-        let value = vec![0x33u8; 300];
-        // Live data spread across buckets keeps the namespace average low...
-        for i in 0..800u32 {
-            db.put(format!("k{i:04}").as_bytes(), &value).unwrap();
-        }
-        // ...then hammer a single key so ITS bucket alone piles up garbage.
-        for _ in 0..250u32 {
-            db.put(b"k0000", &value).unwrap();
-        }
-
-        let store = db.get_store(DEFAULT_NAMESPACE_ID).unwrap();
-        let avg = store.get_waste_ratio();
-        assert!(avg < 30.0, "precondition: namespace average must be below the trigger, got {avg:.1}%");
-        assert!(store.has_bucket_over_waste(30.0), "precondition: some bucket must be over the trigger");
-
-        // The per-bucket-aware trigger runs GC where the old average-only gate would have
-        // skipped the whole namespace.
-        ValueLogGcTarget::run_gc_if_needed(&db, 30.0);
-
-        let after = store.get_waste_ratio();
-        assert!(
-            after < avg,
-            "the hot bucket's garbage must be reclaimed, dropping overall waste (was {avg:.1}%, now {after:.1}%)"
-        );
-        assert_eq!(db.get(b"k0000").unwrap(), Some(value.clone()), "the hammered key must survive collection");
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
-        // A crash can strike right after WAL replay re-appended values to the log but
-        // before the value-log metadata was flushed — leaving segment files longer than
-        // their recorded totals. The next open must reconcile that (rebuild stats from
-        // the LSM) and lose nothing, even across repeated crash/replay cycles. Crash is
-        // simulated with mem::forget, which skips Database::drop's clean flush.
-        let dir = TempDir::new().unwrap();
-        let mut config = create_db_config();
-        config.num_buckets = 1;
-        let keys: Vec<Vec<u8>> = (0..30u32).map(|i| format!("k{i:03}").into_bytes()).collect();
-
-        // Session 1: write, then crash before any clean flush.
-        {
-            let db = Database::open(dir.path(), config.clone()).unwrap();
-            for (i, k) in keys.iter().enumerate() {
-                db.put(k, format!("v{i}").as_bytes()).unwrap();
-            }
-            std::mem::forget(db);
-        }
-
-        // Session 2: reopen replays the WAL (re-appending to the log), then crash again
-        // before the post-replay metadata is flushed.
-        {
-            let db = Database::open(dir.path(), config.clone()).unwrap();
-            assert_eq!(db.get(b"k000").unwrap().as_deref(), Some(b"v0".as_slice()), "replay must restore the data");
-            std::mem::forget(db);
-        }
-
-        // Session 3: open cleanly. Everything is still readable, and the value-log
-        // accounting is self-consistent despite the stale metadata it started from.
-        let db = Database::open(dir.path(), config).unwrap();
-        for (i, k) in keys.iter().enumerate() {
-            assert_eq!(
-                db.get(k).unwrap().as_deref(),
-                Some(format!("v{i}").as_bytes()),
-                "key {i} lost across replay+crash cycles"
-            );
-        }
-        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
-            for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke live+garbage==total after recovery", s.id);
-            }
-        }
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn a_torn_tail_survives_reopen_append_and_gc() {
-        // The full torn-tail hazard end to end: a crash leaves a partial record at the
-        // active tail; reopen truncates it and replays; we append past it, churn to make
-        // the segment collectable, then GC seals and relocates it. Records from BEFORE
-        // the torn tail and those appended AFTER it must all survive GC relocation.
-        let dir = TempDir::new().unwrap();
-        let mut config = create_db_config();
-        config.num_buckets = 1; // one bucket → one active-tail segment to tear
-        let value = vec![0x5Au8; 300];
-
-        // Session 1: write, crash before clean flush.
-        {
-            let db = Database::open(dir.path(), config.clone()).unwrap();
-            for i in 0..40u32 {
-                db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
-            }
-            std::mem::forget(db);
-        }
-
-        // Inject a torn write at the tail of bucket 0's active segment.
-        let seg = dir.path().join("ns_default").join("value_logs").join("value_log_0.seg000001");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        bytes.extend_from_slice(&[0xAB; 20]); // partial, not a valid header
-        std::fs::write(&seg, &bytes).unwrap();
-
-        // Session 2: reopen (truncates the torn tail, replays), append MORE past it,
-        // overwrite the originals to pile up garbage, then GC.
-        let db = Database::open(dir.path(), config).unwrap();
-        for i in 40..60u32 {
-            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
-        }
-        for i in 0..40u32 {
-            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
-        }
-        db.garbage_collect().unwrap();
-
-        // All 60 keys survive — including those appended after the torn tail.
-        for i in 0..60u32 {
-            assert_eq!(
-                db.get(format!("k{i:03}").as_bytes()).unwrap(),
-                Some(value.clone()),
-                "k{i:03} lost across torn-tail reopen + GC"
-            );
-        }
-        for (_bucket, segs) in db.value_log_segment_stats("default").unwrap() {
-            for s in segs {
-                assert_eq!(s.live_bytes + s.garbage_bytes, s.total_bytes, "segment {} broke the invariant after GC", s.id);
-            }
-        }
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_database_wal_gc() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        db.put(b"key", b"value").unwrap();
-
-        let (total, _persisted) = db.get_wal_gc_stats();
-        assert!(total >= 1);
-
-        db.shutdown().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_async_database_basic() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let async_db = AsyncDatabase::new(db);
-
-        async_db.put(b"key1".to_vec(), b"value1".to_vec()).await.unwrap();
-        let val = async_db.get(b"key1".to_vec()).await.unwrap();
-        assert_eq!(val, Some(b"value1".to_vec()));
-
-        async_db.delete(b"key1".to_vec()).await.unwrap();
-        let val = async_db.get(b"key1".to_vec()).await.unwrap();
-        assert_eq!(val, None);
-
-        async_db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_async_database_wal_gc_worker() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let async_db = AsyncDatabase::new(db);
-
-        // Enable WAL GC worker
-        async_db.enable_wal_gc_worker(Duration::from_secs(1)).await.unwrap();
-        assert!(async_db.is_wal_gc_worker_enabled().await);
-
-        // Write some data so the WAL has entries
-        async_db.put(b"key1".to_vec(), b"value1".to_vec()).await.unwrap();
-        async_db.put(b"key2".to_vec(), b"value2".to_vec()).await.unwrap();
-
-        // Trigger WAL GC manually
-        async_db.trigger_wal_gc_worker().await.unwrap();
-
-        // Give it a moment to process
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Shutdown should cleanly stop the worker
-        async_db.shutdown().await.unwrap();
-        assert!(!async_db.is_wal_gc_worker_enabled().await);
-    }
-
-    #[tokio::test]
-    async fn test_async_database_open_with_workers() {
-        let dir = TempDir::new().unwrap();
-        let dir_path = dir.path().to_path_buf();
-
-        let async_db = AsyncDatabase::open_with_workers(&dir_path, create_db_config()).await.unwrap();
-        assert!(async_db.is_wal_gc_worker_enabled().await);
-
-        async_db.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
-        assert_eq!(async_db.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
-
-        async_db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_async_database_multi_namespace() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let async_db = AsyncDatabase::new(db);
-
-        let users_id = async_db.create_namespace("users").unwrap();
-
-        async_db.put(b"global".to_vec(), b"g_val".to_vec()).await.unwrap();
-        async_db.put_ns(users_id, b"user:1".to_vec(), b"alice".to_vec()).await.unwrap();
-
-        // Cross-namespace isolation
-        assert_eq!(async_db.get(b"user:1".to_vec()).await.unwrap(), None);
-        assert_eq!(async_db.get_ns(users_id, b"user:1".to_vec()).await.unwrap(), Some(b"alice".to_vec()));
-        assert_eq!(async_db.get_ns(users_id, b"global".to_vec()).await.unwrap(), None);
-
-        async_db.shutdown().await.unwrap();
-    }
-
-    // ── delete_ns tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_delete_ns_removes_key_from_namespace() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns = db.create_namespace("items").unwrap();
-
-        db.put_ns(ns, b"k1", b"v1").unwrap();
-        db.put_ns(ns, b"k2", b"v2").unwrap();
-        assert_eq!(db.get_ns(ns, b"k1").unwrap(), Some(b"v1".to_vec()));
-
-        db.delete_ns(ns, b"k1").unwrap();
-        assert_eq!(db.get_ns(ns, b"k1").unwrap(), None);
-        // Sibling key is untouched
-        assert_eq!(db.get_ns(ns, b"k2").unwrap(), Some(b"v2".to_vec()));
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_delete_ns_does_not_affect_other_namespaces() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns_a = db.create_namespace("ns_a").unwrap();
-        let ns_b = db.create_namespace("ns_b").unwrap();
-
-        // Same key in three namespaces
-        db.put(b"shared", b"default_val").unwrap();
-        db.put_ns(ns_a, b"shared", b"a_val").unwrap();
-        db.put_ns(ns_b, b"shared", b"b_val").unwrap();
-
-        // Delete only from ns_a
-        db.delete_ns(ns_a, b"shared").unwrap();
-
-        assert_eq!(db.get_ns(ns_a, b"shared").unwrap(), None);
-        assert_eq!(db.get(b"shared").unwrap(), Some(b"default_val".to_vec()));
-        assert_eq!(db.get_ns(ns_b, b"shared").unwrap(), Some(b"b_val".to_vec()),);
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_delete_ns_nonexistent_key_is_ok() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns = db.create_namespace("empty").unwrap();
-
-        // Deleting a key that was never written should succeed silently.
-        db.delete_ns(ns, b"ghost").unwrap();
-        assert_eq!(db.get_ns(ns, b"ghost").unwrap(), None);
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_delete_ns_advances_wal() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        let ns = db.create_namespace("wal_check").unwrap();
-        db.put_ns(ns, b"k", b"v").unwrap();
-
-        let tail_before = db.wal_metadata().tail;
-        db.delete_ns(ns, b"k").unwrap();
-        let tail_after = db.wal_metadata().tail;
-
-        assert!(
-            tail_after > tail_before,
-            "WAL tail must advance after delete_ns (before={}, after={})",
-            tail_before,
-            tail_after,
-        );
-
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_delete_ns_invalid_namespace_returns_error() {
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-
-        // Namespace 9999 was never created.
-        let result = db.delete_ns(9999, b"k");
-        assert!(result.is_err(), "delete_ns on unknown namespace should fail");
-
-        db.shutdown().unwrap();
-    }
-
-    /// Item 1 regression: several single-op writes to one key, laid down in the
-    /// WAL with sequences *out of physical order*, must resolve to the
-    /// highest-sequence value. This directly exercises the sequence sort in
-    /// recovery (a naive scan-order replay would pick the physically-last entry,
-    /// which here has a lower sequence).
-    #[test]
-    fn test_recovery_applies_same_key_writes_in_sequence_order() {
-        use crate::db::wal::{Wal, WalEntry, WalMetadata};
-
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal.log");
-        let wal_meta_path = dir.path().join("wal_metadata");
-        {
-            let wal = Wal::open(&wal_path).unwrap();
-            let mut tail = 0u64;
-
-            // Physical order: seq 5, seq 9, seq 7. Sequence order says seq 9 wins.
-            for (seq, val) in [(5u64, b"v5".to_vec()), (9, b"v9".to_vec()), (7, b"v7".to_vec())] {
-                wal.append_entry(&WalEntry::new_upsert(b"k".to_vec(), val).with_sequence(seq), &mut tail, false)
-                    .unwrap();
-            }
-            wal.sync().unwrap();
-
-            let mut meta = WalMetadata::new();
-            meta.tail = tail;
-            meta.total_entries = 3;
-            meta.segment_total_entries = vec![3];
-            meta.segment_persisted_entries = vec![0];
-            std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
-        }
-
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        assert_eq!(
-            db.get(b"k").unwrap(),
-            Some(b"v9".to_vec()),
-            "recovery must apply same-key writes in sequence order (seq 9 is newest)"
-        );
-        db.shutdown().unwrap();
-    }
-
-    /// Critical regression: WAL entries fsynced *after* the last `wal_metadata`
-    /// flush must not be lost. We craft the post-crash state — three durable WAL
-    /// entries but a metadata file whose `tail`/counts cover only the first —
-    /// and assert recovery reconstructs the true tail and replays all three
-    /// (without the fix, recovery scans only up to the stale tail and the last
-    /// two are silently dropped).
-    #[test]
-    fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
-        use crate::db::wal::{Wal, WalEntry, WalMetadata};
-
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal.log");
-        let wal_meta_path = dir.path().join("wal_metadata");
-
-        let stale_tail;
-        {
-            let wal = Wal::open(&wal_path).unwrap();
-            let mut tail = 0u64;
-
-            // Entry 1 — covered by the (earlier) metadata flush.
-            wal.append_entry(&WalEntry::new_upsert(b"k1".to_vec(), b"v1".to_vec()).with_sequence(1), &mut tail, false)
-                .unwrap();
-            stale_tail = tail;
-
-            // Entries 2 and 3 — fsynced after the flush; metadata never recorded them.
-            wal.append_entry(&WalEntry::new_upsert(b"k2".to_vec(), b"v2".to_vec()).with_sequence(2), &mut tail, false)
-                .unwrap();
-            wal.append_entry(&WalEntry::new_upsert(b"k3".to_vec(), b"v3".to_vec()).with_sequence(3), &mut tail, false)
-                .unwrap();
-            wal.sync().unwrap();
-
-            // Persist metadata as it stood at the earlier flush: it sees only entry 1.
-            let mut meta = WalMetadata::new();
-            meta.tail = stale_tail;
-            meta.total_entries = 1;
-            meta.segment_total_entries = vec![1];
-            meta.segment_persisted_entries = vec![0];
-            std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
-        }
-
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(
-            db.get(b"k2").unwrap(),
-            Some(b"v2".to_vec()),
-            "entry past the stale tail must be recovered"
-        );
-        assert_eq!(
-            db.get(b"k3").unwrap(),
-            Some(b"v3".to_vec()),
-            "entry past the stale tail must be recovered"
-        );
-        db.shutdown().unwrap();
-    }
-
-    /// Coordinator-level companion to
-    /// [`test_recovery_reconstructs_wal_tail_past_stale_metadata`]: rather than
-    /// hand-crafting the WAL, it drives the **real** `Database::put` write path so
-    /// it catches counter/short-circuit regressions in `Database::open` +
-    /// `recover_from_wal` + `Wal::recover_tail` — e.g. a stale `total_entries`
-    /// that wrongly trips the `persisted >= total` short-circuit, or a tail fold
-    /// that miscounts `total`/`segment_total` and so under- or over-replays.
-    ///
-    /// Scenario (the "crash just after a metadata flush" window):
-    ///   1. open Db, `put` key A,
-    ///   2. flush WAL metadata so the durable snapshot covers only A,
-    ///   3. `put` key B — fsynced into the WAL, but its in-memory metadata bump
-    ///      never reaches disk (no further flush, `records_per_sync = 1000` so the
-    ///      write path never auto-syncs/persists for two puts),
-    ///   4. abandon the Db **without** shutdown via `mem::forget`, faithfully
-    ///      simulating a crash: the in-memory metadata that knows about B and the
-    ///      unflushed memtable holding A and B are both lost, leaving both keys
-    ///      only in the WAL. (A plain `drop` would run `Database::drop`, which does
-    ///      a *clean* flush — memtable→SSTable plus metadata — making B durable and
-    ///      defeating the test.)
-    ///   5. restore the stale (A-only) metadata on disk,
-    ///   6. reopen and assert BOTH A and B are recovered.
-    #[test]
-    fn test_recovery_from_stale_metadata_via_real_write_path() {
-        let dir = TempDir::new().unwrap();
-        let wal_meta_path = dir.path().join("wal_metadata");
-
-        let stale_metadata: Vec<u8>;
-        {
-            let db = Database::open(dir.path(), create_db_config()).unwrap();
-            db.put(b"A", b"va").unwrap();
-
-            // The on-disk metadata as it stood at the last flush before the crash:
-            // its tail/total cover only A.
-            db.flush_wal_metadata_internal().unwrap();
-            stale_metadata = std::fs::read(&wal_meta_path).unwrap();
-
-            // B is durable in the WAL (every put fsyncs it) but its metadata bump
-            // lives only in memory — exactly the post-flush window.
-            db.put(b"B", b"vb").unwrap();
-
-            // Abandon without shutdown to simulate a crash: `mem::forget` skips
-            // `Database::drop`, which would otherwise cleanly flush the memtable
-            // and metadata (persisting B and defeating the test). The leaked
-            // handles are released at process exit; everything durable (the WAL)
-            // is already fsynced.
-            std::mem::forget(db);
-        }
-
-        // Force the on-disk metadata back to the A-only snapshot, simulating the
-        // crash landing after A's flush but before B's would have been recorded.
-        // (Belt-and-suspenders: nothing should have rewritten it, but this makes
-        // the staleness explicit regardless of write-path sync timing.)
-        std::fs::write(&wal_meta_path, &stale_metadata).unwrap();
-
-        // Reopen: recover_tail must notice the durable WAL extends past the stale
-        // tail, fold B into total/segment counters, and recover_from_wal must
-        // replay both A (lost from the memtable) and B (past the stale tail).
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        assert_eq!(
-            db.get(b"A").unwrap(),
-            Some(b"va".to_vec()),
-            "A lived only in the WAL and must be replayed"
-        );
-        assert_eq!(
-            db.get(b"B").unwrap(),
-            Some(b"vb".to_vec()),
-            "B was appended after the last metadata flush; recover_tail must fold it in and replay it"
-        );
-        db.shutdown().unwrap();
-    }
-
-    /// Item 3: `apply_with_retry` rides out transient apply failures and stops
-    /// as soon as one attempt succeeds.
-    #[test]
-    fn test_apply_with_retry_succeeds_after_transient_failure() {
-        use std::cell::Cell;
-
-        let attempts = Cell::new(0);
-        Database::apply_with_retry("put", 0, b"k", 1, || {
-            attempts.set(attempts.get() + 1);
-            // Fail on the first attempt, succeed on the second.
-            if attempts.get() < 2 { Err(KVError::KeyNotFound) } else { Ok(()) }
-        });
-        assert_eq!(attempts.get(), 2, "should stop retrying once an attempt succeeds");
-    }
-
-    /// Item 3: `apply_with_retry` gives up after a bounded number of attempts
-    /// (it never surfaces the error — the write is durable in the WAL).
-    #[test]
-    fn test_apply_with_retry_gives_up_after_max_attempts() {
-        use std::cell::Cell;
-
-        let attempts = Cell::new(0);
-        Database::apply_with_retry("put", 0, b"k", 1, || {
-            attempts.set(attempts.get() + 1);
-            Err(KVError::KeyNotFound)
-        });
-        assert_eq!(
-            attempts.get(),
-            Database::APPLY_RETRY_ATTEMPTS,
-            "should attempt exactly APPLY_RETRY_ATTEMPTS times before giving up"
-        );
-    }
-
-    /// Deactivating a field index removes the in-memory bitmap so that any
-    /// subsequent predicate query on that field returns an UnknownField error
-    /// (the field is filtered out of the queryable schema map).
-    #[test]
-    fn test_deactivate_field_index_makes_field_unqueryable() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-
-        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-            let s = std::str::from_utf8(bytes).ok()?;
-            let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-        });
-        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
-
-        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
-        db.put(b"doc:2", br#"{"status":"inactive"}"#).unwrap();
-
-        // Sanity: query works before deactivation.
-        let keys = db.query_keys(ns, "status = \"active\"").unwrap();
-        assert_eq!(keys, vec![b"doc:1".to_vec()]);
-
-        db.deactivate_field_index(ns, field_id).unwrap();
-
-        // Dropped fields are excluded from the queryable schema map, so the
-        // query fails with "unknown field" rather than "no active index".
-        let err = db.query_keys(ns, "status = \"active\"").unwrap_err();
-        assert!(
-            err.to_string().contains("unknown field"),
-            "expected UnknownField error after deactivation, got: {err}"
-        );
-
-        db.shutdown().unwrap();
-    }
-
-    /// Regression for the O(1) targeted field-index update/delete (item 13): a
-    /// document update must move its row from the old value's bucket to the new
-    /// one (the prior value must stop matching), and a delete must remove it —
-    /// driven by the prior document bytes read in the put/delete path, not a
-    /// full bucket scan.
-    #[test]
-    fn test_field_index_targeted_update_and_delete() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-
-        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-            let s = std::str::from_utf8(bytes).ok()?;
-            let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-        });
-        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
-
-        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
-        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().len(), 2);
-
-        // Update doc:1's status active -> archived. The targeted update must move
-        // the row, so it no longer matches "active" and now matches "archived".
-        db.put(b"doc:1", br#"{"status":"archived"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
-        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
-
-        // Updating to the same value is a no-op and keeps the row queryable.
-        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:2".to_vec()]);
-
-        // Delete doc:2 → it must leave the "active" bucket.
-        db.delete(b"doc:2").unwrap();
-        assert!(db.query_keys(ns, "status = \"active\"").unwrap().is_empty());
-        assert_eq!(db.query_keys(ns, "status = \"archived\"").unwrap(), vec![b"doc:1".to_vec()]);
-
-        db.shutdown().unwrap();
-    }
-
-    /// Targeted single-field reindex: re-deriving a key's value for one field
-    /// must repair a stale index entry, be idempotent, and report the right
-    /// outcome for a missing key or an inactive field.
-    #[test]
-    fn test_reindex_field_repairs_and_reports_outcome() {
-        use crate::db::namespace::FieldReindexOutcome;
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-
-        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-            let s = std::str::from_utf8(bytes).ok()?;
-            let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-        });
-        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
-
-        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
-
-        // Reindexing an up-to-date entry is a no-op: still queryable, no duplicate.
-        assert_eq!(db.reindex_field(ns, field_id, b"doc:1").unwrap(), FieldReindexOutcome::Reindexed);
-        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap(), vec![b"doc:1".to_vec()]);
-
-        // A key with no value reports KeyNotFound and changes nothing.
-        assert_eq!(db.reindex_field(ns, field_id, b"missing").unwrap(), FieldReindexOutcome::KeyNotFound);
-
-        // An unregistered field id reports FieldNotActive rather than erroring.
-        assert_eq!(db.reindex_field(ns, 9999, b"doc:1").unwrap(), FieldReindexOutcome::FieldNotActive);
-
-        db.shutdown().unwrap();
-    }
-
-    /// Deactivating a field index and deleting its on-disk directory must not
-    /// cause shutdown to fail with ENOENT when run_index_checkpoint is called.
-    #[test]
-    fn test_shutdown_after_drop_index_does_not_error() {
-        use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
-        use std::sync::Arc;
-
-        let dir = TempDir::new().unwrap();
-        let db = Database::open(dir.path(), create_db_config()).unwrap();
-        let ns = DEFAULT_NAMESPACE_ID;
-
-        let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
-        let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
-            let s = std::str::from_utf8(bytes).ok()?;
-            let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(IndexValue::Str(v["status"].as_str()?.to_string()))
-        });
-        db.activate_field_index(ns, field_id, IndexValueType::Str, extractor).unwrap();
-        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
-
-        // Simulate drop_index: deactivate in-memory then delete on-disk directory.
-        db.deactivate_field_index(ns, field_id).unwrap();
-        let index_dir = dir.path().join("index").join(ns.to_string()).join(field_id.to_string());
-        if index_dir.exists() {
-            std::fs::remove_dir_all(&index_dir).unwrap();
-        }
-
-        // Shutdown must succeed even though the field's directory is gone.
-        db.shutdown().unwrap();
-    }
-
-    // ── WAL GC segment deletion tests ────────────────────────────────────
-
-    #[test]
-    fn test_wal_gc_deletes_fully_persisted_segments() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-
-        for i in 0..120u32 {
-            let key = format!("wal_gc_key_{:03}", i).into_bytes();
-            let value = vec![b'v'; 64];
-            db.put(&key, &value)?;
-        }
-
-        db.flush_all_namespaces()?;
-
-        let segment_size = db.wal.segment_size();
-        let mut tail = db.wal_metadata.read().tail;
-        let mut remaining = segment_size.saturating_sub(tail % segment_size);
-        if remaining == segment_size {
-            db.put(b"wal_gc_pad", b"pad")?;
-            db.flush_all_namespaces()?;
-            tail = db.wal_metadata.read().tail;
-            remaining = segment_size.saturating_sub(tail % segment_size);
-        }
-
-        let mut pad_value_len = 1usize;
-        loop {
-            let pad_entry = WalEntry::new_upsert(b"wal_gc_pad_crash".to_vec(), vec![0u8; pad_value_len]);
-            let entry_len = 4u64 + pad_entry.to_bytes()?.len() as u64;
-            if entry_len > remaining && entry_len < segment_size {
-                db.simulate_crash_with_wal_entries(vec![pad_entry])?;
-                break;
-            }
-            pad_value_len = pad_value_len.saturating_add(8);
-        }
-
-        let segment1_path = temp_dir.path().join("wal.log.seg000001");
-        assert!(segment1_path.exists());
-
-        let crash_entries = (0..3u32)
-            .map(|i| WalEntry::new_upsert(format!("crash_{}", i).into_bytes(), vec![b'x'; 16]))
-            .collect();
-        db.simulate_crash_with_wal_entries(crash_entries)?;
-
-        let (bytes_reclaimed, _) = db.garbage_collect_wal()?;
-        assert!(bytes_reclaimed > 0);
-        assert!(!segment1_path.exists());
-
-        Ok(())
-    }
-
-    // Regression: WAL GC can delete a fully-persisted segment out of segment
-    // order (e.g. a dropped namespace persists a trailing segment while an
-    // earlier one stays live), leaving a "hole". Recovery scans head→tail, so it
-    // must survive the missing middle segment. Before the `scan_entries` hole-skip
-    // fix, the open-time scan aborted with NotFound and `Database::open` failed.
-    #[test]
-    fn test_recovery_survives_deleted_middle_wal_segment() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        {
-            let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-            // Inject un-persisted entries spanning several WAL segments so reopen
-            // actually runs recovery (persisted < total).
-            let entries: Vec<WalEntry> = (0..60u32)
-                .map(|i| WalEntry::new_upsert(format!("rk{:03}", i).into_bytes(), vec![b'v'; 32]))
-                .collect();
-            db.simulate_crash_with_wal_entries(entries)?;
-            assert!(
-                temp_dir.path().join("wal.log.seg000002").exists(),
-                "need >= 3 segments to have a middle one"
-            );
-
-            // Punch a hole: delete a middle segment while segment 0 stays live
-            // (so head is not advanced past it) — exactly what WAL GC would leave.
-            db.wal.delete_segment_file(1)?;
-            drop(db);
-        }
-
-        // Reopen: recovery must NOT crash on the hole, and the entries from the
-        // surviving segments must be recovered (the deleted segment's are lost).
-        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-        assert_eq!(db.get(b"rk000")?, Some(vec![b'v'; 32]), "segment 0 entry must survive the hole");
-        assert_eq!(db.get(b"rk059")?, Some(vec![b'v'; 32]), "last-segment entry must survive the hole");
-        db.shutdown()?;
-        Ok(())
-    }
-
-    // Regression: the per-segment counter vecs must be trimmed as segments are
-    // reclaimed, so the wal_metadata file stays proportional to the *live*
-    // segment window instead of growing ~16 bytes for every segment ever created.
-    #[test]
-    fn test_wal_gc_trims_segment_counters_so_metadata_stays_bounded() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-
-        let mut max_vec_len = 0usize;
-        // Many write→persist→GC rounds create and reclaim far more segments than
-        // are ever live at once.
-        for round in 0..50u32 {
-            for i in 0..10u32 {
-                db.put(format!("k{}_{}", round, i).as_bytes(), &[b'v'; 32])?;
-            }
-            db.flush_all_namespaces()?;
-            db.garbage_collect_wal()?;
-            max_vec_len = max_vec_len.max(db.wal_metadata.read().segment_total_entries.len());
-        }
-
-        let m = db.wal_metadata.read();
-        // The base advanced as old segments were reclaimed and trimmed...
-        assert!(
-            m.base_segment_id > 10,
-            "base_segment_id should advance as segments are reclaimed, got {}",
-            m.base_segment_id
-        );
-        // ...while the counter vecs stayed bounded by the live window rather than
-        // growing to ~= total segments ever created (base + len).
-        assert!(max_vec_len <= 8, "segment counter vec should stay bounded, peaked at {}", max_vec_len);
-        assert_eq!(m.segment_total_entries.len(), m.segment_persisted_entries.len());
-        drop(m);
-        db.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_gc_shrinks_wal_directory_once_persisted() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        // Small segments so a modest number of writes fills several of them.
-        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
-
-        for i in 0..400u32 {
-            db.put(format!("wal_{:04}", i).as_bytes(), &[b'v'; 64])?;
-        }
-        // Persist the entries (flush memtables → SSTables), marking their WAL
-        // segments fully persisted and therefore reclaimable.
-        db.flush_all_namespaces()?;
-
-        let wal_dir_bytes = |dir: &std::path::Path| -> u64 {
-            std::fs::read_dir(dir)
-                .unwrap()
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("wal.log.seg"))
-                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-                .sum()
-        };
-
-        let before = wal_dir_bytes(temp_dir.path());
-        assert!(before > 4096, "expected several WAL segments before GC, got {before} bytes");
-
-        let (reclaimed, _) = db.garbage_collect_wal()?;
-        assert!(reclaimed > 0, "WAL GC should reclaim fully-persisted segments");
-
-        let after = wal_dir_bytes(temp_dir.path());
-        assert!(after < before, "WAL directory should shrink: {before} -> {after} bytes");
-
-        // Persisted data is still readable after the segments were deleted.
-        assert_eq!(db.get(b"wal_0000")?, Some(vec![b'v'; 64]));
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_gc_global_counters_stay_consistent_after_restart() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-
-        {
-            let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-
-            for i in 0..120u32 {
-                db.put(&format!("k{:03}", i).into_bytes(), &[b'v'; 32])?;
-            }
-            db.flush_all_namespaces()?;
-
-            db.put(b"sentinel", b"v")?;
-            db.flush_all_namespaces()?;
-
-            let (bytes_reclaimed, _) = db.garbage_collect_wal()?;
-            assert!(bytes_reclaimed > 0, "expected segments to be GC'd");
-
-            let (total, persisted) = db.get_wal_gc_stats();
-            assert_eq!(
-                total.saturating_sub(persisted),
-                0,
-                "pending should be 0 immediately after GC (total={total}, persisted={persisted})"
-            );
-        }
-
-        {
-            let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-            let (total, persisted) = db.get_wal_gc_stats();
-            assert_eq!(
-                total.saturating_sub(persisted),
-                0,
-                "pending should still be 0 after reopen (total={total}, persisted={persisted})"
-            );
-        }
-
-        Ok(())
-    }
-
-    // ── WAL sequence number tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_sequence_increments_on_writes() -> Result<()> {
-        use std::sync::atomic::Ordering;
-        let temp_dir = TempDir::new()?;
-        let db = Database::open(temp_dir.path(), create_db_config())?;
-
-        let seq_before = db.next_seq.load(Ordering::Relaxed);
-        db.put(b"a", b"1")?;
-        db.put(b"b", b"2")?;
-        db.delete(b"a")?;
-        let seq_after = db.next_seq.load(Ordering::Relaxed);
-
-        assert_eq!(seq_after - seq_before, 3);
-        Ok(())
-    }
-
-    #[test]
-    fn test_sequence_stamps_wal_entries() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Database::open(temp_dir.path(), create_db_config())?;
-
-        db.put(b"x", b"v1")?;
-        db.put(b"y", b"v2")?;
-
-        let wal_metadata = db.wal_metadata.read();
-        let entries = db.wal.scan_entries(0, wal_metadata.tail)?;
-        drop(wal_metadata);
-
-        let seqs: Vec<u64> = entries.iter().map(|(_, e)| e.sequence).collect();
-        assert!(!seqs.is_empty());
-        for seq in &seqs {
-            assert!(*seq > 0, "sequence must be non-zero");
-        }
-        for w in seqs.windows(2) {
-            assert!(w[1] > w[0], "sequences must be strictly increasing");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_sequence_recovered_after_reopen() -> Result<()> {
-        use std::sync::atomic::Ordering;
-        let temp_dir = TempDir::new()?;
-
-        let seq_at_close = {
-            let db = Database::open(temp_dir.path(), create_db_config())?;
-            db.put(b"k1", b"v1")?;
-            db.put(b"k2", b"v2")?;
-            db.next_seq.load(Ordering::Relaxed)
-        };
-
-        let db2 = Database::open(temp_dir.path(), create_db_config())?;
-        let seq_after_reopen = db2.next_seq.load(Ordering::Relaxed);
-        assert!(
-            seq_after_reopen >= seq_at_close,
-            "recovered seq ({}) must be >= seq at close ({})",
-            seq_after_reopen,
-            seq_at_close
-        );
-
-        let seq_before_new_write = db2.next_seq.load(Ordering::Relaxed);
-        db2.put(b"k3", b"v3")?;
-        let wal_metadata = db2.wal_metadata.read();
-        let entries = db2.wal.scan_entries(0, wal_metadata.tail)?;
-        drop(wal_metadata);
-        let max_old_seq = seq_before_new_write - 1;
-        let new_entry_seq = entries.last().map(|(_, e)| e.sequence).unwrap_or(0);
-        assert!(
-            new_entry_seq > max_old_seq,
-            "new write seq ({}) must exceed previous max ({})",
-            new_entry_seq,
-            max_old_seq
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_gc_updates_last_sequence_before_deleting_segments() -> Result<()> {
-        use std::sync::atomic::Ordering;
-        let temp_dir = TempDir::new()?;
-        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-
-        for i in 0..60u32 {
-            let key = format!("gc_key_{}", i).into_bytes();
-            db.put(&key, b"some_value_padding_xxx")?;
-        }
-
-        let seq_before_gc = db.next_seq.load(Ordering::Relaxed).saturating_sub(1);
-
-        {
-            let wal_metadata = db.wal_metadata.read();
-            let tail = wal_metadata.tail;
-            let head = wal_metadata.head;
-            drop(wal_metadata);
-            db.wal_flush_observer.mark_persisted_range(head, tail);
-        }
-        {
-            let mut wal_metadata = db.wal_metadata.write();
-            for i in 0..wal_metadata.segment_total_entries.len() {
-                wal_metadata.segment_persisted_entries[i] = wal_metadata.segment_total_entries[i];
-            }
-        }
-
-        db.garbage_collect_wal()?;
-
-        let last_seq = db.wal_metadata.read().last_sequence;
-        assert!(
-            last_seq >= seq_before_gc,
-            "last_sequence ({}) must be >= highest written seq ({}) after GC",
-            last_seq,
-            seq_before_gc
-        );
-        Ok(())
-    }
-
-    // ── WAL metadata corruption recovery test ─────────────────────────────
-
-    #[test]
-    fn test_metadata_checksum_corruption_recovery() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().to_path_buf();
-
-        {
-            let db = Database::open(&path, create_db_config())?;
-            db.put(b"key1", b"value1")?;
-            db.shutdown()?;
-        }
-
-        {
-            let wal_metadata_path = path.join("wal_metadata");
-            let mut data = std::fs::read(&wal_metadata_path)?;
-            if let Some(byte) = data.get_mut(16) {
-                *byte ^= 0xFF;
-            }
-            std::fs::write(&wal_metadata_path, data)?;
-        }
-
-        let db = Database::open(&path, create_db_config())?;
-        assert!(path.join("wal_metadata.corrupt").exists());
-        assert_eq!(db.get(b"key1")?, Some(b"value1".to_vec()));
-
-        Ok(())
-    }
-}
+#[path = "database_tests.rs"]
+mod tests;

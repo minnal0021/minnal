@@ -122,6 +122,13 @@ is how you keep unrelated data apart inside one database.
 Whichever API you use, call `shutdown()` when you are done: it stops the
 background workers and flushes buffered writes.
 
+> **One rule about key bytes:** the storage bucket is chosen by hashing only the
+> **first 8 bytes** of the key, so keys that share a constant 8-byte prefix
+> (`user:profile:…`) all land in the same bucket — one hot shard instead of
+> `num_buckets`. Put the varying part of the key first. At the raw-engine level
+> there is no length limit; the typed doc/KV stores of §5–§6 cap string keys at
+> 50 bytes.
+
 ### The synchronous API
 
 ```rust
@@ -270,6 +277,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+#### Key types
+
+`key_type` fixes the shape of every document ID in the store:
+
+| `key_type` | `DocId` variant | Stored as |
+|---|---|---|
+| `KeyType::U64` | `DocId::U64(u64)` | 8 bytes, big-endian |
+| `KeyType::U128` | `DocId::U128(u128)` | 16 bytes, big-endian |
+| `KeyType::Uuid` | `DocId::Uuid(u128)` | 16 bytes, big-endian |
+| `KeyType::Str` | `DocId::Str(StrKey)` | the UTF-8 bytes, verbatim |
+
+Integer keys are big-endian and string keys verbatim so that in both cases the
+byte order matches the natural order of the ID — which is what makes
+`scan_range` and `scan_prefix` over IDs meaningful.
+
+**String keys are capped at `MAX_STR_KEY_LEN` (50) UTF-8 bytes and may not be
+empty.** The cap is counted in bytes, not characters, so a 20-character key of
+3-byte code points is 60 bytes and is rejected. `StrKey::new` is the only
+constructor and does the validation, so an invalid key cannot reach storage:
+
+```rust
+let schema = DocStoreSchema {
+    namespace: "slugs".into(),
+    store_type: StoreType::Doc,
+    ns_id: None,
+    key_type: KeyType::Str,
+    attributes: vec![],
+    indices: vec![IndexSpec { field: "status".into(), index_type: IndexType::Str }],
+    semantic_search_enabled: false,
+    embedding_fields: vec![],
+};
+store.create(schema).await?;
+
+let id = DocId::Str(StrKey::new("acme-corp-2026")?);
+store.put("slugs", id, serde_json::json!({ "status": "active" })).await?;
+
+// Prefix scans take the raw key bytes, which for a string store is the string.
+let page = store.scan_prefix("slugs", b"acme-".to_vec(), None, 100).await?;
+```
+
+The same cap applies to `KvKeyType::Str` keys in a KV store.
+
+> **Key design: vary the first 8 bytes.** The storage bucket is chosen by
+> hashing only the **first 8 bytes** of the key. Fixed-width integer and UUID
+> keys spread across buckets by construction, but string keys with a constant
+> leading prefix (`user:profile:…`, `job_content_…`) all hash to the *same*
+> bucket — one hot shard, one value log taking every write, and unbalanced
+> compaction. Put the varying part first (`a3f9-user-profile`, not
+> `user:profile:a3f9`), or keep the constant prefix under 8 bytes.
 
 Add `"semantic-search"` to the features to enable embed-on-write and vector
 search on document (or `value_type = "str"` KV) stores — see §6.

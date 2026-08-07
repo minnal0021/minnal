@@ -99,8 +99,22 @@ pub use db::config::DbConfig;
 pub use db::config::ThresholdConfig;
 
 /// Default field-index bitmap compaction threshold (percentage of dead space).
-pub use db::config::{DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_SEGMENT_GC_THRESHOLD};
+pub use db::config::{
+    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
+};
+
 pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
+
+/// Default index checkpoint interval in milliseconds (the crash-replay window).
+pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
+
+/// Hex encoding/decoding for raw key bytes.
+///
+/// Exposed because keys are arbitrary bytes and several surfaces carry them as
+/// hex: scan cursors at the REST boundary, and the field-index gap record's
+/// row-scoped repair worklist ([`db::index_manager::RepairMode`]). A caller
+/// reading either needs the matching decoder.
+pub use support::hex::{bytes_to_hex, hex_to_bytes};
 
 /// Intervals at which the background workers run.
 pub use db::config::ScheduledTaskConfig;
@@ -115,6 +129,21 @@ pub use db::toml_config::MinnalTomlConfig;
 
 /// The unified error type returned by all operations.
 pub use db::error::KVError;
+
+/// The subsystem errors carried by [`KVError`]'s variants.
+///
+/// These are re-exported so those variants are actually usable: `LSMError`,
+/// `ValueLogError` and `ShardedValueLogError` live inside the private `store`
+/// module, so without this a caller could match on `KVError::LsmError(_)` but
+/// never name or inspect the value inside it. `WalError` is reachable via
+/// `minnal_db::db::wal`, and is lifted here too so all four payloads are
+/// namable from one place.
+///
+/// Re-exporting the types does not open the `store` module itself.
+pub use db::wal::WalError;
+pub use store::lsm::lsm_tree::LSMError;
+pub use store::value_log::ValueLogError;
+pub use store::value_log::sharded::ShardedValueLogError;
 
 // ── Index types ───────────────────────────────────────────────────────────────
 
@@ -134,6 +163,17 @@ pub use db::namespace::FieldId;
 pub use db::namespace::FieldMeta;
 /// Outcome of a targeted single-field reindex ([`Db::reindex_field`]).
 pub use db::namespace::FieldReindexOutcome;
+/// What a field-index repair did ([`Db::repair_field_index`]).
+pub use db::namespace::FieldRepairOutcome;
+/// A field-index query result: matching keys plus whether the indices that
+/// produced them are known to be incomplete.
+pub use db::namespace::QueryOutcome;
+
+/// Health of one field index, including any outstanding gap
+/// ([`Db::index_health`]).
+pub use db::index_manager::FieldIndexHealth;
+/// Why a field index is incomplete, and what repair it needs.
+pub use db::index_manager::{GapCause, GapRecord, RepairMode};
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
 pub use db::namespace_index::ExtractorFn;
@@ -201,8 +241,8 @@ pub use store::value_log::SegmentStats;
 #[cfg(feature = "doc-store")]
 pub use doc_store::{
     AttributeDef, AttributeType, CursorPage, DiskBuildProgress, DocId, DocStore, DocStoreError, DocStoreSchema, IndexBuildHandle, IndexBuildManager,
-    IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, Page, Pagination,
-    SchemaAmendment, SchemaError, StoreType, prefix_upper_bound,
+    IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, MAX_STR_KEY_LEN, Page,
+    Pagination, SchemaAmendment, SchemaError, StoreType, StrKey, prefix_upper_bound,
 };
 
 // Document-store types that only exist alongside `semantic-search`.
