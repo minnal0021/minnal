@@ -114,7 +114,8 @@ minnal_db = { version = "0.2", features = ["semantic-search"] }
 ## 3. Using the key-value engine (default `kv-store`)
 
 `Db` (and its async twin, `AsyncDb`) is the entry point: you open a database
-directory, and from there put, get, delete, scan by prefix, or walk a key range.
+directory, and from there put, get, delete, merge, scan by prefix, or walk a key
+range.
 Keys and values are plain bytes — minnal does not interpret them. A database also
 carries any number of **namespaces**, each an isolated keyspace of its own, which
 is how you keep unrelated data apart inside one database.
@@ -150,10 +151,83 @@ ns.put(b"o1", b"shipped")?;
 db.shutdown()?;
 ```
 
+### Read-modify-write with `merge`
+
+`put` overwrites blindly, which is a problem whenever the new value depends on
+the old one — a counter, a running total, a set you keep adding to. Doing it by
+hand as `get` → compute → `put` silently loses updates: two callers read the same
+value, and whichever writes second wipes out the other's increment.
+
+`merge` is that sequence done atomically. It takes the same `(key, value)` as
+`put` plus a closure, and the closure decides what actually gets stored:
+
+```rust
+let db = Db::open("/tmp/mydb")?;
+
+// Increment a counter by the operand, creating it at zero.
+let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
+    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let step = u64::from_le_bytes(operand.try_into().unwrap());
+    Ok(Some((current + step).to_le_bytes().to_vec()))
+})?;
+// → Some(new count). Run it from ten threads and none of them is lost.
+```
+
+The closure receives `(existing, operand)` — `existing` is `None` when the key is
+absent — and its return value drives the write:
+
+| Returns | Effect |
+|---|---|
+| `Ok(Some(new))` | write `new` |
+| `Ok(None)` | delete the key (nothing is written if it was already absent) |
+| `Err(e)` | abort — nothing is written, and `e` comes back to you |
+
+`Err` is how you decline a write, and `KVError::MergeAborted` exists for exactly
+that so you needn't borrow an error variant that means something else:
+
+```rust
+// A counter that refuses to go past a cap.
+let result = db.merge(b"quota", &1u64.to_le_bytes(), |existing, operand| {
+    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    if current >= 100 {
+        return Err(minnal_db::KVError::MergeAborted("quota exhausted".into()));
+    }
+    let step = u64::from_le_bytes(operand.try_into().unwrap());
+    Ok(Some((current + step).to_le_bytes().to_vec()))
+});
+```
+
+`merge_typed` is the same thing over rkyv values, so the closure works with your
+own type instead of bytes:
+
+```rust
+let total: Option<u64> = db.merge_typed(&"visits".to_string(), &1u64, |current, step| {
+    Ok(Some(current.unwrap_or(0) + step))
+})?;
+```
+
+Both are available on `Db`, `Namespace`, `AsyncDb` and `AsyncNamespace`. Two
+things to know:
+
+- **The guarantee is per key, not a transaction.** A merge is indivisible for the
+  key it touches and says nothing about any other key. There is still no
+  multi-key transaction primitive.
+- **`merge` can fail after your closure ran.** `KVError::MergeNotApplied` means
+  the write reached the WAL — it is durable and will appear after the next open —
+  but did not reach memory, so its result is not readable and a follow-up merge
+  would compute from the old value. `put` deliberately returns `Ok` in the same
+  situation; `merge` does not, because for a read-modify-write the distinction
+  matters.
+- **The closure runs while a lock is held**, so keep it quick and never write
+  back into the database from inside it — a re-entrant write to the same key
+  deadlocks. (Reading is safe, just pointless: you get the same value the
+  closure was already handed.)
+
 ### The asynchronous API
 
 `AsyncDb` mirrors the same operations for a tokio runtime. The shape is
-identical; the calls take owned buffers and are awaited.
+identical; the calls take owned buffers and are awaited. `merge` additionally
+needs its closure to be `Send + 'static`, because it runs on a blocking worker.
 
 ```rust
 use minnal_db::AsyncDb;
@@ -161,6 +235,14 @@ use minnal_db::AsyncDb;
 let db = AsyncDb::open("/tmp/mydb").await?;
 db.put(b"hello".to_vec(), b"world".to_vec()).await?;
 let val = db.get(b"hello".to_vec()).await?;
+
+db.merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let step = u64::from_le_bytes(operand.try_into().unwrap());
+    Ok(Some((current + step).to_le_bytes().to_vec()))
+})
+.await?;
+
 db.shutdown().await?;
 ```
 

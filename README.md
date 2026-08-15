@@ -114,8 +114,42 @@ Key design choices:
 | Background workers | LSM compaction, value-log GC, WAL cleanup, TTL eviction — each on its own async task |
 | Hashing | Fast, SIMD-accelerated hashing for bucket assignment |
 | Prefix scan | SIMD-accelerated prefix scan across all layers — see below |
+| Atomic read-modify-write | `merge(key, operand, closure)` — reads a key, runs your closure over `(existing, operand)`, and writes the result back as one indivisible step — see below |
 
 The WAL is written before every mutation. On startup the engine replays any WAL segments that postdate the last LSM flush, ensuring no committed write is lost after a crash.
+
+#### Atomic read-modify-write with `merge`
+
+`put` overwrites blindly, so any value that depends on the value already stored —
+a counter, a running total, a set being accumulated — cannot be written safely
+with `get` → compute → `put`: two callers read the same value and the second
+write erases the first one's update.
+
+`merge` performs that sequence atomically. It takes the same `(key, value)` as
+`put`, plus a closure that receives `(existing, operand)` and returns
+`Ok(Some(new))` to write, `Ok(None)` to delete, or `Err` to abort without
+writing anything.
+
+```rust
+// Increment a counter by the operand, creating it at zero. Safe from any
+// number of threads.
+let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
+    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let step = u64::from_le_bytes(operand.try_into().unwrap());
+    Ok(Some((current + step).to_le_bytes().to_vec()))
+})?;
+```
+
+Atomicity comes from a striped per-key lock that sits above the WAL lock and is
+held across the read, the closure, the WAL append and the in-memory apply. Every
+write path takes it, so a blind `put` cannot land in the middle of a merge
+either. The WAL records only the *result*, as an ordinary upsert or delete — so
+crash recovery is completely unchanged, and nothing re-runs your closure at
+replay. `merge` and its rkyv twin `merge_typed` are on `Db`, `Namespace`,
+`AsyncDb` and `AsyncNamespace`.
+
+The guarantee is **per key** — it is not a transaction, and minnal still has no
+multi-key transaction primitive.
 
 #### Prefix scan with SIMD acceleration
 

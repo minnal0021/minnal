@@ -288,6 +288,178 @@ mod tests {
         }
         Ok(())
     }
+
+    // ── merge ─────────────────────────────────────────────────────────
+
+    /// The typed value used by the `merge_typed` tests.
+    #[derive(Debug, Clone, PartialEq, crate::rkyv_derives::Archive, crate::rkyv_derives::Serialize, crate::rkyv_derives::Deserialize)]
+    struct Tally {
+        count: u64,
+        label: String,
+    }
+
+    fn u64_of(bytes: Option<&[u8]>) -> u64 {
+        bytes.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    #[test]
+    fn merge_on_the_default_namespace_round_trips() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+
+        let first = db.merge(b"visits", &2u64.to_le_bytes(), |existing, operand| {
+            Ok(Some((u64_of(existing) + u64_of(Some(operand))).to_le_bytes().to_vec()))
+        })?;
+        assert_eq!(first, Some(2u64.to_le_bytes().to_vec()), "merge returns the value it wrote");
+
+        db.merge(b"visits", &3u64.to_le_bytes(), |existing, operand| {
+            Ok(Some((u64_of(existing) + u64_of(Some(operand))).to_le_bytes().to_vec()))
+        })?;
+        assert_eq!(u64_of(db.get(b"visits")?.as_deref()), 5);
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// A `Namespace` merge must stay inside its own keyspace.
+    #[test]
+    fn merge_is_scoped_to_its_namespace() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+
+        db.put(b"k", b"default-value")?;
+        let orders = db.namespace("orders")?;
+        let written = orders.merge(b"k", b"ns-value", |existing, operand| {
+            assert_eq!(existing, None, "the namespace saw the default namespace's value");
+            Ok(Some(operand.to_vec()))
+        })?;
+
+        assert_eq!(written, Some(b"ns-value".to_vec()));
+        assert_eq!(orders.get(b"k")?, Some(b"ns-value".to_vec()));
+        assert_eq!(db.get(b"k")?, Some(b"default-value".to_vec()));
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn merge_typed_accumulates_a_typed_value() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+
+        let step = Tally {
+            count: 4,
+            label: "clicks".to_string(),
+        };
+        let first: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
+            assert!(current.is_none());
+            Ok(Some(operand))
+        })?;
+        assert_eq!(first.unwrap().count, 4);
+
+        let second: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
+            let current = current.expect("the stored tally should be visible");
+            Ok(Some(Tally {
+                count: current.count + operand.count,
+                label: current.label,
+            }))
+        })?;
+        let second = second.expect("merge_typed returns the new value");
+        assert_eq!(second.count, 8);
+        assert_eq!(second.label, "clicks");
+
+        // And it is what actually landed in storage.
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        assert_eq!(stored.unwrap().count, 8);
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn merge_typed_aborts_without_touching_the_stored_value() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+
+        let tally = Tally {
+            count: 1,
+            label: "clicks".to_string(),
+        };
+        db.put_typed(&"stats".to_string(), &tally)?;
+
+        let err = db
+            .merge_typed(&"stats".to_string(), &tally, |_current, _operand| -> Result<Option<Tally>> {
+                Err(KVError::MergeAborted("declined".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(err, KVError::MergeAborted(_)), "unexpected error: {err:?}");
+
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        assert_eq!(stored.unwrap().count, 1);
+
+        db.shutdown()?;
+        Ok(())
+    }
+
+    /// The async twin of the coordinator's concurrency test — 100 tasks racing
+    /// on one key through `spawn_blocking`.
+    #[tokio::test]
+    async fn concurrent_async_merges_lose_no_updates() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
+
+        let mut handles = vec![];
+        for _ in 0..100 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                db.merge(b"hits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+                    Ok(Some((u64_of(existing) + u64_of(Some(operand))).to_le_bytes().to_vec()))
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(u64_of(db.get(b"hits".to_vec()).await?.as_deref()), 100);
+
+        db.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_namespace_merge_and_merge_typed_work() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
+        let ns = db.namespace("orders".to_string()).await?;
+
+        let written = ns
+            .merge(b"o1".to_vec(), b"shipped".to_vec(), |existing, operand| {
+                assert_eq!(existing, None);
+                Ok(Some(operand.to_vec()))
+            })
+            .await?;
+        assert_eq!(written, Some(b"shipped".to_vec()));
+
+        let tally: Option<Tally> = db
+            .merge_typed(&"stats".to_string(), &Tally { count: 3, label: "a".into() }, |current, operand| {
+                Ok(Some(Tally {
+                    count: current.map_or(0, |c| c.count) + operand.count,
+                    label: operand.label,
+                }))
+            })
+            .await?;
+        assert_eq!(tally.unwrap().count, 3);
+
+        // Deleting through the async surface.
+        assert_eq!(ns.merge(b"o1".to_vec(), Vec::new(), |_, _| Ok(None)).await?, None);
+        assert_eq!(ns.get(b"o1".to_vec()).await?, None);
+
+        db.shutdown().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

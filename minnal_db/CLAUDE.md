@@ -13,6 +13,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/db/database.rs` | Internal coordinator: owns all subsystems, routes ops |
 | `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("index")` or `format!("ns_{}", ..)` |
 | `src/db/query.rs` | Predicate evaluation against the field indices (`Database` methods) |
+| `src/db/key_locks.rs` | Striped per-key write locks — the outermost lock on every write path |
 | `src/db/wal_gc.rs` | WAL GC + the index-replay watermark + the backstop key harvest |
 | `src/db/index_health.rs` | Gap records, index health, repair, no-WAL tracking (FR-001 remediation) |
 | `src/db/test_support.rs` | `#[cfg(test)]` fixtures shared by every test module in `db/` |
@@ -38,6 +39,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 ```
 Db::put(key, value)
   → Database::put
+      → key stripe lock (outermost — see below)
       → WAL append (fsynced)
       → Value log write → pointer
       → Memtable insert with pointer (best-effort w/ bounded retry; ERROR-logged
@@ -46,12 +48,39 @@ Db::put(key, value)
       → Background: LSM compaction, value-log GC, WAL GC, TTL cleanup
 ```
 
+`Db::merge(key, operand, closure)` is the one read-modify-write: it reads the key,
+runs the caller's closure over `(existing, operand)`, and writes the result back
+under the same key stripe, so no other write to that key can land in between. The
+WAL sees only the *result* — an ordinary `Upsert` or `Delete` tagged
+`op_name: "merge"` — so recovery, WAL GC and index replay are untouched and
+nothing re-runs the closure at replay (a closure cannot be serialised, and
+recovery runs long before user code could re-register one).
+
 Every write is a single-op WAL transaction — there is no batch/transaction primitive. The in-memory apply is best-effort with bounded retry (`Database::apply_with_retry`): once the WAL fsync succeeds the op is durable and the call returns `Ok` regardless of the apply outcome. Recovery **replays all un-persisted entries in global sequence order** (so writes to the same key resolve to the last writer), retries each once, and writes persistent failures to `fail_logs/<timestamp>.json`.
 
 ## Concurrency & correctness invariants
 
 These are load-bearing; preserve them when touching the store/GC paths:
 
+- **The key stripe is the OUTERMOST write lock.** Every WAL-backed write and both
+  no-WAL writes take `Database::key_locks.guard(ns_id, key)` before anything else,
+  giving one uniform order: **`key stripe → wal_metadata → (released) → value-log
+  bucket`**. Nothing else in the crate takes a stripe, which is what makes a cycle
+  impossible rather than merely unlikely — so do not introduce a path that acquires
+  a stripe while holding either of the other two. It exists for `merge_ns`, which
+  must read a key and write it back indivisibly: `wal_metadata` is global (running
+  a user closure under it would stall every namespace) and the bucket lock is taken
+  only *after* the WAL lock is released, so serialising on it would invert the
+  established order. Cost on `put`/`delete` is nil — those already serialise
+  globally on `wal_metadata.write()` across the fsync. Two writers sit outside it,
+  deliberately: TTL expiry (`KVStore::expire_records` deletes straight through the
+  store, so a merge racing an expiry can resurrect a key the next pass re-expires)
+  and GC's re-point (sequence-preserving, so it creates no new version). Stripes are
+  hashed from the **whole** key, not `get_bucket_for_key`'s 8-byte prefix — reusing
+  that would collapse every key sharing a prefix onto one stripe. Regression tests:
+  `concurrent_merges_on_one_key_lose_no_updates`,
+  `a_blind_put_cannot_land_in_the_middle_of_a_merge` (both fail if the stripe is
+  removed), `writers_and_gc_make_progress_together`.
 - **Sequence == WAL order, and the memtable resolves conflicts by it.** Writers allocate the global sequence (`Database::next_seq`, shared into every `KVStore` via `set_seq_counter`) *inside* the WAL append lock, so on-disk WAL order == sequence order. The memtable resolves same-key conflicts **highest-sequence-wins** (`SkipList::try_insert_with_seq` / `insert_tombstone_with_seq`, plain `u64` comparison): a lower-sequence write applied later is dropped. Deletes go through `insert_tombstone_with_seq`, which creates the node *directly as a tombstone* when the key is absent from the memtable (so it still shadows lower layers) — there is no transient live placeholder. This makes the live winner for racing same-key writes identical to recovery's winner (recovery replays in sequence order), so a value observed live survives a crash. Non-WAL writes (TTL expiry, bulk, tests) allocate from the same counter (`KVStore::alloc_seq`) so there is one consistent sequence space.
 - **The value log is SEGMENTED and segment ids are NEVER REUSED.** Each bucket is a series of immutable sealed segment files plus one active tail. A pointer is `bucket(32) | segment_id(32) | rec_offset(32) | value_len(32)`, so an address means one record *forever*: a superseded pointer still reads that key's own bytes, and a pointer into a reclaimed segment fails loudly (`ValueLogError::SegmentMissing`) instead of landing on another key's record. **This is the property the whole design rests on** — it is why there is no seqlock, no read-time seq check, no GC journal, no commit marker and no `.new`/`.old` recovery. `next_segment_id` is an in-memory `AtomicU64` seeded at open from `max(persisted high-water mark, highest existing id + 1)`; **never** derive an id from `max(files)+1` at runtime, or unlinking the newest segment hands its id out again and resurrects the recycled-slot bug.
 - **Records store their KEY** (`[header 36B][value][key]`), which is what lets GC decide liveness per segment (one LSM point-get per record) instead of inverting the whole LSM. The value precedes the key so a read is **one pread of `36 + value_len`** — the pointer carries `value_len`.
@@ -105,7 +134,7 @@ Two more invariants to preserve when touching SSTable I/O:
 
 ## Typed value API
 
-`put_typed<T>` / `get_typed<T>` use `rkyv` for zero-copy serialisation. Types must derive `rkyv::Archive + rkyv::Serialize + rkyv::Deserialize`. These are re-exported via `minnal_db::rkyv_derives` so downstream crates don't need a direct `rkyv` dependency.
+`put_typed<T>` / `get_typed<T>` / `merge_typed<T>` use `rkyv` for zero-copy serialisation. Types must derive `rkyv::Archive + rkyv::Serialize + rkyv::Deserialize`. These are re-exported via `minnal_db::rkyv_derives` so downstream crates don't need a direct `rkyv` dependency.
 
 ## Scan / read API
 
@@ -232,6 +261,21 @@ Dropping a field index goes through `Database::drop_field_index`, which **persis
 ## Public API surface
 
 `Db` / `AsyncDb` (facade) with namespaces are the only entry points. `Namespace` is the scoped per-namespace handle returned by `Db::namespace()`.
+
+CRUD is `put` / `get` / `delete` / `merge`, each with a `_typed` (rkyv) twin, on all
+four surfaces. **`merge` is the one write that reports a failed in-memory apply**
+(`KVError::MergeNotApplied`) instead of returning `Ok` like `put`/`delete` do —
+its result never became readable, so the next merge on that key would accumulate
+onto a stale base. The write is still durable and replays on the next open; the
+error means "not readable yet", not "lost". The converse is undetectable: a merge
+reading a key whose last `put` is stuck in that window gets the stale value with
+no way to tell. `merge(key, value, closure)` is the atomic read-modify-write; the
+closure returns `Ok(Some(v))` to write, `Ok(None)` to delete (writing nothing when
+the key was already absent), or `Err` to abort — `KVError::MergeAborted` exists so
+declining does not have to borrow a variant that means something else. It runs
+while the key stripe is held, so it must not call back into the `Db`. Library only:
+there is no REST or doc-store merge, because a Rust closure does not cross an HTTP
+boundary.
 
 **Where does a new operation go?** Four entry types with overlapping surfaces (`Db`, `Namespace`, `AsyncDb`, `AsyncNamespace`) means every operation exists at least twice, and the sync/async split is inherent to offering both. The rule, so the split stops drifting: an operation goes on **`Namespace`** if it acts on one namespace's keys or its indices, and on **`Db`** if it spans namespaces, touches the shared WAL, or is engine-wide (stats, GC, compaction, worker control). Async mirrors sync exactly — never add to one side only. A 2026-08-01 review found this choice looked arbitrary from outside because it had never been written down; that was the whole problem.
 

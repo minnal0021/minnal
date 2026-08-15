@@ -25,6 +25,37 @@
 //! }
 //! ```
 //!
+//! ## Atomic read-modify-write
+//!
+//! [`Db::merge`] reads a key, hands the stored value and your operand to a
+//! closure, and writes the result back as one indivisible step — the thing
+//! `get` + `put` cannot do safely, because a concurrent writer can land between
+//! the two and have its update erased.
+//!
+//! ```rust,no_run
+//! use minnal_db::Db;
+//!
+//! fn main() -> Result<(), minnal_db::KVError> {
+//!     let db = Db::open("/tmp/my_db")?;
+//!
+//!     // A counter, safe from any number of threads.
+//!     let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
+//!         let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+//!         let step = u64::from_le_bytes(operand.try_into().unwrap());
+//!         Ok(Some((current + step).to_le_bytes().to_vec()))
+//!     })?;
+//!     println!("{:?}", total);
+//!
+//!     db.shutdown()?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The closure returns `Ok(Some(v))` to write, `Ok(None)` to delete the key, or
+//! `Err` to abort without writing anything. It runs while a per-key lock is
+//! held, so it must not call back into the database. The guarantee is per key:
+//! this is not a transaction.
+//!
 //! ## Async usage
 //!
 //! ```rust,no_run

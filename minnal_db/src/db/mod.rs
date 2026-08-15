@@ -6,6 +6,7 @@ pub(crate) mod fail_log;
 pub(crate) mod index_checkpoint_worker;
 pub(crate) mod index_health;
 pub mod index_manager;
+pub(crate) mod key_locks;
 pub mod kv_store;
 pub(crate) mod layout;
 pub mod metrics;

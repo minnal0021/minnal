@@ -508,9 +508,38 @@ in-process — no server, no daemon. Capabilities are selected by cargo feature
 (`kv-store` default, `doc-store`, `semantic-search`), so you compile only what
 you use and the lean default pulls no vector dependencies.
 
+```rust
+use minnal_db::Db;
+
+let db = Db::open("/tmp/mydb")?;
+
+db.put(b"hello", b"world")?;
+let val = db.get(b"hello")?;              // Some(b"world")
+
+// `merge` is the atomic read-modify-write `get` + `put` cannot give you:
+// it reads the key, runs your closure over (existing, operand), and writes
+// the result back as one step. Safe from any number of threads.
+let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
+    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let step = u64::from_le_bytes(operand.try_into().unwrap());
+    Ok(Some((current + step).to_le_bytes().to_vec()))
+})?;
+
+// Namespaces — each an isolated keyspace inside the same database
+let orders = db.namespace("orders")?;
+orders.put(b"o1", b"shipped")?;
+
+db.shutdown()?;
+```
+
+The closure returns `Ok(Some(v))` to write, `Ok(None)` to delete the key, or
+`Err` to abort without writing anything. `merge` is a **per-key** guarantee, not
+a transaction — minnal has no multi-key transaction primitive.
+
 See the dedicated **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — it covers
 feature selection as a table, the key-value and field-index APIs with runnable
-examples, and the document-store handle. Full engine internals are in
+examples, `merge` and its typed twin `merge_typed` in full, and the
+document-store handle. Full engine internals are in
 [`minnal_db/README.md`](minnal_db/README.md).
 
 ## Scripts and Config
