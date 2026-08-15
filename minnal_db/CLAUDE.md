@@ -173,6 +173,20 @@ Each worker is a **single global task** that fans out over namespaces — there 
 
 All WAL logic (append, GC, recovery, sequence tracking) lives exclusively in `database.rs` (`Database`, the internal coordinator). Do not add WAL code anywhere else.
 
+**Both write-size bounds must be checked before the WAL append.**
+`Database::check_write_size` enforces two limits, and for a long time only the
+first existed: the `u32` field widths (~4 GiB) *and* the value-log segment
+capacity (`DbConfig::segment_size_bytes`, default 256 MiB — far tighter). A value
+between the two passed validation, got a fsynced WAL entry so `put` returned
+`Ok`, and only then hit `ValueLogError::ValueTooLarge` inside `ValueLog::append`
+— past the durability barrier, where the write path treats failures as
+best-effort. All three apply attempts failed identically (size does not change
+between retries), reads kept returning the previous value, and WAL replay hit the
+same error at every open. `crate::store::value_log::max_record_payload` is the
+shared bound; keep it and `ValueLog::append` in agreement. Regression test:
+`a_value_too_big_for_a_segment_is_rejected_before_the_wal`, which asserts the WAL
+did not grow — that is what makes the rejection mean "nothing happened".
+
 **A tail snapshot over-states durability — never derive a persisted cut from `wal_metadata.tail` alone.** A WAL entry may be marked `Persisted` only once its key is in an SSTable, because recovery *skips* `Persisted` entries. But `put_ns`/`delete_ns` append under the WAL lock and apply to the memtable **after** releasing it, so in between an entry is visible in the tail while its key is nowhere. Two readers used the raw tail and both lost acknowledged writes:
 
 | Reader | What it did | Why it was wrong |

@@ -1230,12 +1230,65 @@ fn test_activate_field_index_replays_wal_after_crash() {
 fn check_total_len_rejects_over_limit() {
     // Within / at the limit → Ok; over → WriteTooLarge. Tiny limit so the
     // over-limit branch needs no multi-GiB allocation.
-    assert!(Database::check_total_len(5, 5, 12).is_ok());
-    assert!(Database::check_total_len(7, 5, 12).is_ok()); // exactly at limit
-    match Database::check_total_len(8, 5, 12) {
+    assert!(Database::check_total_len(5, 5, 12, "test limit").is_ok());
+    assert!(Database::check_total_len(7, 5, 12, "test limit").is_ok()); // exactly at limit
+    match Database::check_total_len(8, 5, 12, "test limit") {
         Err(KVError::WriteTooLarge(m)) => assert!(m.contains("exceeds the 12-byte"), "got: {m}"),
         other => panic!("expected WriteTooLarge, got {other:?}"),
     }
+}
+
+/// A value too big for a value-log segment must be rejected **at the write
+/// boundary**, not deep inside the apply.
+///
+/// This was the gap: `check_write_size` bounded only the `u32` field widths
+/// (~4 GiB), while `ValueLog::append` additionally requires a record to fit one
+/// segment (256 MiB by default). A value between the two passed the front door,
+/// got a fsynced WAL entry — so `put` returned `Ok` — and then failed every
+/// apply attempt, leaving an acknowledged write that `get` could not see and
+/// that WAL replay could only turn into a fail log.
+///
+/// Asserting the error is only half of it; the load-bearing half is that the WAL
+/// did not grow, because that is what makes the rejection mean "nothing
+/// happened".
+#[test]
+fn a_value_too_big_for_a_segment_is_rejected_before_the_wal() {
+    const SEG: u64 = 64 * 1024; // the minimum legal segment size
+
+    let dir = TempDir::new().unwrap();
+    let mut config = create_db_config();
+    config.segment_size_bytes = SEG;
+    let db = Database::open(dir.path(), config).unwrap();
+
+    db.put(b"k", b"small").unwrap();
+    let entries_before = db.wal_metadata.read().total_entries;
+
+    // Comfortably over the segment, but far under the u32 field-width limit that
+    // was the only bound before.
+    let oversized = vec![0u8; (SEG as usize) * 2];
+    match db.put(b"k", &oversized) {
+        Err(KVError::WriteTooLarge(m)) => {
+            assert!(
+                m.contains("value-log segment"),
+                "the message should name the bound that was hit; got: {m}"
+            );
+        }
+        other => panic!("expected WriteTooLarge, got {other:?}"),
+    }
+
+    assert_eq!(
+        db.wal_metadata.read().total_entries,
+        entries_before,
+        "the rejected write reached the WAL — it was not rejected at the boundary"
+    );
+    assert_eq!(db.get(b"k").unwrap(), Some(b"small".to_vec()), "the prior value must be untouched");
+
+    // A record that fits still writes.
+    let fits = vec![7u8; (SEG as usize) - 1024];
+    db.put(b"k", &fits).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(fits));
+
+    db.shutdown().unwrap();
 }
 
 #[test]

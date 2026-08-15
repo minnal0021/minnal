@@ -1049,7 +1049,7 @@ impl Database {
 
     pub fn put_ns(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, value)?;
+        self.check_write_size(key, value)?;
 
         // Step 1: Write to shared WAL.
         // Allocate the sequence number *inside* the WAL lock so the global
@@ -1126,7 +1126,7 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, value)?;
+        self.check_write_size(key, value)?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
@@ -1151,7 +1151,7 @@ impl Database {
     /// concurrent same-key writes highest-sequence-wins like any other write.
     pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, &[])?;
+        self.check_write_size(key, &[])?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
@@ -1169,7 +1169,7 @@ impl Database {
 
     pub fn delete_ns(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, &[])?; // delete carries only a key
+        self.check_write_size(key, &[])?; // delete carries only a key
 
         // Step 1: Write DELETE to shared WAL.
         // Allocate the sequence inside the WAL lock so sequence order == WAL
@@ -1938,28 +1938,53 @@ impl Database {
     /// formats, with a clean [`KVError::WriteTooLarge`] instead of silently
     /// truncating a length deep in the store.
     ///
-    /// Several persisted lengths are `u32`: the value record's `value_len`, the
-    /// row-ID map's `key_len`, and the whole write is framed as one `u32`-sized
-    /// WAL entry (key + value + op-name + rkyv overhead). A single combined check
-    /// — `key + value + headroom ≤ u32::MAX` — covers all three (key alone and
-    /// value alone are subsets of the entry). The headroom bounds the per-entry
-    /// framing. Enforced at the write boundary so nothing reaches the WAL,
-    /// value-log, LSM, row-ID map, or field indexes before validation.
-    fn check_write_size(key: &[u8], value: &[u8]) -> Result<()> {
+    /// **Two** bounds apply, and both must be checked here.
+    ///
+    /// 1. **Field widths.** Several persisted lengths are `u32`: the value
+    ///    record's `value_len`, the row-ID map's `key_len`, and the whole write
+    ///    is framed as one `u32`-sized WAL entry (key + value + op-name + rkyv
+    ///    overhead). A single combined check — `key + value + headroom ≤
+    ///    u32::MAX` — covers all three (key alone and value alone are subsets of
+    ///    the entry). The headroom bounds the per-entry framing.
+    /// 2. **Segment capacity.** A value record must fit inside one value-log
+    ///    segment, whose size is `DbConfig::segment_size_bytes` (default 256
+    ///    MiB, so *far* tighter than the ~4 GiB field-width bound).
+    ///
+    /// Checking only the first left a gap that produced an acknowledged write
+    /// nobody could read: a value between the segment size and ~4 GiB passed
+    /// here, got a fsynced WAL entry — so `put` returned `Ok` — and only then hit
+    /// `ValueLogError::ValueTooLarge` inside `ValueLog::append`, where the write
+    /// path is past its durability barrier and treats failures as best-effort.
+    /// All three apply attempts failed identically (the value's size does not
+    /// change between retries), `get` kept returning the previous value, and WAL
+    /// replay hit the same error on the next open and wrote a fail log. **Both
+    /// bounds must be enforced before the WAL append**, which is the only point
+    /// at which a rejection can still mean "nothing happened".
+    fn check_write_size(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Generous headroom for WAL-entry framing (short op-name + rkyv) and the
         // value-record header — far larger than any of those.
         const HEADROOM: u64 = 64 * 1024;
-        const LIMIT: u64 = u32::MAX as u64 - HEADROOM;
-        Self::check_total_len(key.len(), value.len(), LIMIT)
+        const FIELD_WIDTH_LIMIT: u64 = u32::MAX as u64 - HEADROOM;
+
+        Self::check_total_len(key.len(), value.len(), FIELD_WIDTH_LIMIT, "lengths are stored as u32")?;
+
+        let segment_size = self.config.segment_size_bytes;
+        Self::check_total_len(
+            key.len(),
+            value.len(),
+            crate::store::value_log::max_record_payload(segment_size),
+            &format!("a record must fit one value-log segment; value_log.segment_size_bytes = {segment_size}"),
+        )
     }
 
     /// Inner of [`check_write_size`] with the limit as a parameter so both
     /// branches are testable without allocating a multi-GiB key/value.
-    fn check_total_len(key_len: usize, value_len: usize, limit: u64) -> Result<()> {
+    /// `reason` names which bound was hit, since the two have different fixes.
+    fn check_total_len(key_len: usize, value_len: usize, limit: u64, reason: &str) -> Result<()> {
         let total = key_len as u64 + value_len as u64;
         if total > limit {
             return Err(KVError::WriteTooLarge(format!(
-                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit (lengths are stored as u32)"
+                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit ({reason})"
             )));
         }
         Ok(())
