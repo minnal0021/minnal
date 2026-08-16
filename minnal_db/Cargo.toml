@@ -69,6 +69,10 @@ approx = "0.5.1"
 tempfile = "3.27"
 
 [[bench]]
+name = "bench_merge"
+harness = false
+
+[[bench]]
 name = "bench_write"
 harness = false
 
