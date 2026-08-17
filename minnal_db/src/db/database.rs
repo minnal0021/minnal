@@ -285,7 +285,7 @@ impl WalPersistObserver {
             if entry.status == WalEntryStatus::Persisted {
                 continue;
             }
-            if let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted) {
+            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
                 warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
                 had_error = true;
                 continue;
@@ -296,6 +296,16 @@ impl WalPersistObserver {
         }
 
         if updated > 0 {
+            // One fsync per touched segment, not one per entry. See
+            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+            // happens BEFORE the metadata write below, so the on-disk statuses are
+            // never less durable than the counters that describe them.
+            for &segment_id in per_segment.keys() {
+                if let Err(e) = self.wal.sync_segment(segment_id) {
+                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a persist sweep: {e:?}");
+                    had_error = true;
+                }
+            }
             let mut wal_metadata = self.wal_metadata.write();
             for (segment_id, count) in per_segment {
                 wal_metadata.add_segment_persisted(segment_id, count);
@@ -359,7 +369,7 @@ impl WalPersistObserver {
             if entry.status == WalEntryStatus::Persisted {
                 continue;
             }
-            if let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted) {
+            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
                 warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
                 continue;
             }
@@ -369,6 +379,15 @@ impl WalPersistObserver {
         }
 
         if updated > 0 {
+            // One fsync per touched segment, not one per entry. See
+            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+            // happens BEFORE the metadata write below, so the on-disk statuses are
+            // never less durable than the counters that describe them.
+            for &segment_id in per_segment.keys() {
+                if let Err(e) = self.wal.sync_segment(segment_id) {
+                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a namespace persist sweep: {e:?}");
+                }
+            }
             let mut wal_metadata = self.wal_metadata.write();
             for (segment_id, count) in per_segment {
                 wal_metadata.add_segment_persisted(segment_id, count);
@@ -2375,12 +2394,21 @@ impl Database {
         let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
         for (pointer, entry) in entries {
             if entry.status != WalEntryStatus::Persisted
-                && let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted)
+                && let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted)
             {
                 warn!("[RECOVERY] Failed to update WAL entry status: {:?}", e);
             }
             let segment_id = self.wal.segment_id_for_offset(pointer.offset);
             *per_segment.entry(segment_id).or_insert(0) += 1;
+        }
+        // One fsync per touched segment, not one per entry. See
+        // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+        // happens BEFORE the metadata write below, so the on-disk statuses are
+        // never less durable than the counters that describe them.
+        for &segment_id in per_segment.keys() {
+            if let Err(e) = self.wal.sync_segment(segment_id) {
+                warn!("[RECOVERY] Failed to sync WAL segment {segment_id}: {e:?}");
+            }
         }
 
         {

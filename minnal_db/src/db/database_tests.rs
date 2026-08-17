@@ -2776,3 +2776,46 @@ mod merge_tests {
         db.shutdown().unwrap();
     }
 }
+
+/// Marking a range persisted must cost one fsync per WAL **segment**, not one
+/// per entry.
+///
+/// The per-entry fsync was measured at 218.9 s for 57,735 entries. That loop is
+/// reached from the LSM flush observer, so it runs inside
+/// `flush_ro_memtable_to_level0` with `read_only_memtables` held — which blocks
+/// any writer whose memtable needs sealing, while that writer holds a value-log
+/// bucket lock and a key stripe. Under a stress workload every namespace froze
+/// for minutes behind it.
+///
+/// Asserted on the fsync **count**, not on elapsed time: the property is
+/// algorithmic, so this cannot flake on a slow machine. The counter covers both
+/// the batched and the per-entry path, so reinstating the per-entry fsync fails
+/// here even if the batch fsync is left in place.
+#[test]
+fn marking_a_range_persisted_costs_one_fsync_per_segment_not_per_entry() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("bulk").unwrap();
+
+    let entries = 600u32;
+    for i in 0..entries {
+        db.put_ns(ns, format!("k{i:05}").as_bytes(), b"v").unwrap();
+    }
+
+    let before = db.wal.status_sync_count();
+    let tail = db.wal_metadata.read().tail;
+    db.wal_flush_observer.mark_persisted_range(0, tail);
+    let syncs = db.wal.status_sync_count() - before;
+
+    let persisted = db.wal_metadata.read().persisted_entries;
+    assert!(
+        persisted >= entries as u64,
+        "the sweep should have flipped every entry, marked {persisted} of {entries}"
+    );
+    // A default WAL segment is 64 MiB, so 600 tiny entries are all in segment 0.
+    assert!(
+        syncs <= 2,
+        "marking {persisted} entries persisted issued {syncs} fsyncs — it must be one per WAL segment, \
+         not one per entry (the per-entry loop took 218.9 s for 57,735 entries and froze every writer)"
+    );
+}
