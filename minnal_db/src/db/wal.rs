@@ -478,6 +478,10 @@ pub struct Wal {
 
     segment_size: u64,
     current_segment_id: AtomicU64,
+
+    /// Segment fsyncs issued by the deferred entry-status path. See
+    /// [`status_sync_count`](Wal::status_sync_count).
+    status_syncs: AtomicU64,
 }
 
 impl Wal {
@@ -569,6 +573,7 @@ impl Wal {
             path,
             segment_size: segment_size.max(MIN_SEGMENT_SIZE),
             current_segment_id: AtomicU64::new(0),
+            status_syncs: AtomicU64::new(0),
         })
     }
 
@@ -657,6 +662,63 @@ impl Wal {
     /// Update entry status in-place (for marking as persisted)
     /// This is efficient with memory mapping
     pub fn update_entry_status(&self, offset: u64, new_status: WalEntryStatus) -> Result<()> {
+        self.write_entry_status(offset, new_status, true)
+    }
+
+    /// As [`update_entry_status`](Self::update_entry_status), but **without** the
+    /// per-entry fsync. The caller must follow up with
+    /// [`sync_segment`](Self::sync_segment) for every segment it touched.
+    ///
+    /// This exists because marking a range persisted is a batch operation, and
+    /// fsyncing per entry made it cost one journal commit per WAL record: a
+    /// measured **57,735 entries in 218.9 s** (3.8 ms each) on the path that
+    /// value-log GC and LSM compaction both call, freezing every writer behind it.
+    ///
+    /// Deferring the fsync is safe, and strictly safer than the alternative it
+    /// replaces. The status byte is a *hint* that lets recovery skip an entry
+    /// whose data is already in an SSTable; losing the flip in a crash only means
+    /// recovery replays an entry it did not need to, which is idempotent
+    /// (highest-sequence-wins). The dangerous direction — the flip becoming
+    /// durable *before* the data it describes — is unaffected: the flip is only
+    /// issued after the L0 flush has fsynced, and deferring a write can never
+    /// make it land earlier.
+    pub fn update_entry_status_deferred(&self, offset: u64, new_status: WalEntryStatus) -> Result<()> {
+        self.write_entry_status(offset, new_status, false)
+    }
+
+    /// Every fsync issued to make entry-status flips durable, by either path.
+    ///
+    /// The guard on the batching: a persist sweep must cost one fsync per WAL
+    /// **segment**, not one per entry. Marking 57,735 entries persisted one
+    /// fsync at a time was measured at 218.9 s, during which every writer was
+    /// blocked behind the LSM locks the sweep runs under. Counting both paths is
+    /// deliberate — a regression that reinstated the per-entry fsync *and* kept
+    /// the batch one would be invisible to a counter that only saw the batch.
+    #[cfg(test)]
+    pub(crate) fn status_sync_count(&self) -> u64 {
+        self.status_syncs.load(Ordering::Relaxed)
+    }
+
+    /// fsync one segment file, making every deferred status flip in it durable.
+    pub fn sync_segment(&self, segment_id: u64) -> Result<()> {
+        self.status_syncs.fetch_add(1, Ordering::Relaxed);
+        let guard = epoch::pin();
+        let handle = self.load_handle(&guard)?;
+        if segment_id == self.current_segment_id.load(Ordering::Acquire) {
+            handle.file.sync_data()?;
+        } else {
+            match self.open_segment_file(segment_id, false) {
+                Ok(file) => file.sync_data()?,
+                // Reclaimed by WAL GC while we were writing: nothing to make
+                // durable, and its entries are gone either way.
+                Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_entry_status(&self, offset: u64, new_status: WalEntryStatus, sync: bool) -> Result<()> {
         // Read the entry
         let guard = epoch::pin();
         let handle = self.load_handle(&guard)?;
@@ -666,7 +728,7 @@ impl Wal {
             &*handle.file
         } else {
             let file = self.open_segment_file(segment_id, false)?;
-            return self.update_entry_status_in_file(&file, segment_offset, new_status);
+            return self.update_entry_status_in_file(&file, segment_offset, new_status, sync);
         };
 
         let mut size_buf = [0u8; 4];
@@ -687,7 +749,10 @@ impl Wal {
 
         // Write back
         self.write_all_at(file, &updated_bytes, segment_offset + 4)?; // Skip size header
-        file.sync_data()?;
+        if sync {
+            self.status_syncs.fetch_add(1, Ordering::Relaxed);
+            file.sync_data()?;
+        }
 
         Ok(())
     }
@@ -1027,7 +1092,7 @@ impl Wal {
         WalEntry::from_bytes(&entry_bytes)
     }
 
-    fn update_entry_status_in_file(&self, file: &File, segment_offset: u64, new_status: WalEntryStatus) -> Result<()> {
+    fn update_entry_status_in_file(&self, file: &File, segment_offset: u64, new_status: WalEntryStatus, sync: bool) -> Result<()> {
         let mut size_buf = [0u8; 4];
         self.read_exact_at(file, &mut size_buf, segment_offset)?;
         let size = u32::from_le_bytes(size_buf);
@@ -1040,7 +1105,10 @@ impl Wal {
             return Err(WalError::CorruptedLog);
         }
         self.write_all_at(file, &updated_bytes, segment_offset + 4)?;
-        file.sync_data()?;
+        if sync {
+            self.status_syncs.fetch_add(1, Ordering::Relaxed);
+            file.sync_data()?;
+        }
         Ok(())
     }
 

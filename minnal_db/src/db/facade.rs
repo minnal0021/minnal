@@ -78,8 +78,8 @@ where
 /// # Write durability
 ///
 /// This contract applies to every write entry point on `Db`, [`Namespace`],
-/// [`AsyncDb`] and [`AsyncNamespace`] — `put`, `delete` and their `_typed`
-/// variants.
+/// [`AsyncDb`] and [`AsyncNamespace`] — `put`, `delete`, [`merge`](Db::merge)
+/// and their `_typed` variants.
 ///
 /// A write returns `Ok(())` once it is **durable**: its write-ahead-log entry
 /// has been fsynced to stable storage, so it survives power loss from that
@@ -98,9 +98,18 @@ where
 /// nothing repairs it while the process keeps running. `apply_failures` on
 /// [`Db::ops_metrics`] is how to detect it.
 ///
+/// [`merge`](Db::merge) is the **one exception** to the paragraph above: it
+/// returns [`KVError::MergeNotApplied`] rather than `Ok` when its own write does
+/// not become readable, because a merge whose result is invisible poisons the
+/// next merge on that key. It cannot detect the converse — a merge reading a key
+/// whose *last write* is stuck in that window computes from the stale value and
+/// has no way to know.
+///
 /// Every write is its own transaction and its own fsync. There is no batch or
 /// multi-key transaction primitive and no group commit, so write throughput is
-/// bounded by the storage's fsync rate. The `_no_wal` variants
+/// bounded by the storage's fsync rate. [`merge`](Db::merge) is a *single-key*
+/// exception and not a transaction: it makes one key's read-modify-write
+/// indivisible, and says nothing about any other key. The `_no_wal` variants
 /// (e.g. [`AsyncNamespace::put_no_wal`]) skip the WAL entirely and give up this
 /// durability guarantee in exchange for speed.
 pub struct Db {
@@ -194,6 +203,74 @@ impl Db {
     /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.delete(key)
+    }
+
+    /// Read `key`, hand the stored value and `value` to `merge_fn`, and write
+    /// the result back — atomically with respect to every other write to that key.
+    ///
+    /// This is the read-modify-write that `get` + `put` cannot give you: two
+    /// callers that each `get`, compute, and `put` will silently lose one
+    /// update, because nothing stops the second read from happening before the
+    /// first write lands. `merge` closes that window.
+    ///
+    /// `merge_fn` receives `(existing, operand)` — `existing` is `None` when the
+    /// key is absent, `operand` is the `value` passed in — and returns:
+    ///
+    /// | Returns | Effect |
+    /// |---|---|
+    /// | `Ok(Some(new))` | write `new` |
+    /// | `Ok(None)` | delete the key (nothing is written if it was already absent) |
+    /// | `Err(e)` | abort — nothing is written, and `e` is returned to the caller |
+    ///
+    /// The call returns the value that was written, or `None` for the delete and
+    /// no-op cases. It can also fail *after* the closure ran — see *Durability*
+    /// below for [`KVError::MergeNotApplied`].
+    ///
+    /// ```rust,no_run
+    /// # use minnal_db::Db;
+    /// # fn main() -> Result<(), minnal_db::KVError> {
+    /// # let db = Db::open("/tmp/merge_doc")?;
+    /// // A counter that increments by the operand, starting from zero.
+    /// let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
+    ///     let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    ///     let step = u64::from_le_bytes(operand.try_into().unwrap());
+    ///     Ok(Some((current + step).to_le_bytes().to_vec()))
+    /// })?;
+    /// # let _ = total;
+    /// # db.shutdown()?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Durability
+    ///
+    /// A merge is one ordinary WAL-backed write of the *result*, so it carries
+    /// the guarantee described in [*Write durability*](Db#write-durability) — with
+    /// one deliberate difference. Where `put` returns `Ok` for a write that is
+    /// durable but whose in-memory apply failed, `merge` returns
+    /// [`KVError::MergeNotApplied`]: its result never became readable, so the
+    /// next merge on this key would accumulate onto a stale base. The write is
+    /// **not lost** — the WAL entry replays on the next open — so treat that
+    /// error as "not readable yet", not "nothing happened".
+    ///
+    /// The converse is not detectable: if some earlier `put` to this key is
+    /// itself stuck in that window, the closure is handed the stale value and
+    /// nothing here can tell. `apply_failures` on [`Db::ops_metrics`] is the
+    /// signal that it has happened at all.
+    ///
+    /// Nothing re-runs `merge_fn` during recovery: the WAL records the value the
+    /// closure produced, not the closure.
+    ///
+    /// # `merge_fn` runs while a lock is held
+    ///
+    /// It must be quick, must not block, and must **not write back** into the
+    /// database — a re-entrant write to this key, or to any key that happens to
+    /// share its lock stripe, self-deadlocks. Reads are safe but pointless: a
+    /// read of this key returns the same pre-merge value the closure was handed.
+    pub fn merge<F>(&self, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.inner.merge(key, value, merge_fn)
     }
 
     // ── Iteration (default namespace) ─────────────────────────────────
@@ -424,6 +501,58 @@ impl Db {
     {
         let kb = rkyv_serialize(key)?;
         self.delete(&kb)
+    }
+
+    /// Atomically merge a typed value, serialized via rkyv.
+    ///
+    /// The typed twin of [`Db::merge`]: `merge_fn` sees the stored value and the
+    /// operand already deserialized, and returns the new value (or `None` to
+    /// delete the key). Every caveat on [`Db::merge`] applies — in particular the
+    /// closure runs under a lock and must not call back into the database.
+    ///
+    /// ```rust,no_run
+    /// # use minnal_db::Db;
+    /// # fn main() -> Result<(), minnal_db::KVError> {
+    /// # let db = Db::open("/tmp/merge_typed_doc")?;
+    /// let total: Option<u64> = db.merge_typed(&"visits".to_string(), &1u64, |current, step| {
+    ///     Ok(Some(current.unwrap_or(0) + step))
+    /// })?;
+    /// # let _ = total;
+    /// # db.shutdown()?;
+    /// # Ok(()) }
+    /// ```
+    pub fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
+    where
+        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        F: FnOnce(Option<V>, V) -> Result<Option<V>>,
+    {
+        let kb = rkyv_serialize(key)?;
+        let vb = rkyv_serialize(value)?;
+        // The new `V` is carried out of the closure rather than deserialized back
+        // from the bytes `merge` returns — it already exists in there, and a
+        // second round-trip on every call would be pure waste.
+        let mut produced: Option<V> = None;
+        {
+            let slot = &mut produced;
+            self.merge(&kb, &vb, move |existing, operand| {
+                let current = match existing {
+                    Some(bytes) => Some(rkyv_deserialize::<V>(bytes)?),
+                    None => None,
+                };
+                let operand = rkyv_deserialize::<V>(operand)?;
+                match merge_fn(current, operand)? {
+                    Some(new) => {
+                        let bytes = rkyv_serialize(&new)?;
+                        *slot = Some(new);
+                        Ok(Some(bytes))
+                    }
+                    None => Ok(None),
+                }
+            })?;
+        }
+        Ok(produced)
     }
 
     // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
@@ -714,6 +843,18 @@ impl<'db> Namespace<'db> {
         self.db.delete_ns(self.ns_id, key)
     }
 
+    /// Atomically read-modify-write a key in this namespace.
+    ///
+    /// See [`Db::merge`] for the full contract — the closure's return values, the
+    /// durability guarantee, and the rule that `merge_fn` must not call back into
+    /// the database.
+    pub fn merge<F>(&self, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.db.merge_ns(self.ns_id, key, value, merge_fn)
+    }
+
     // ── Iteration ─────────────────────────────────────────────────────
 
     /// Iterate over all key-value pairs in key order.
@@ -797,6 +938,43 @@ impl<'db> Namespace<'db> {
     {
         let kb = rkyv_serialize(key)?;
         self.delete(&kb)
+    }
+
+    /// Atomically merge a typed value, serialized via rkyv.
+    ///
+    /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
+    pub fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
+    where
+        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        F: FnOnce(Option<V>, V) -> Result<Option<V>>,
+    {
+        let kb = rkyv_serialize(key)?;
+        let vb = rkyv_serialize(value)?;
+        // The new `V` is carried out of the closure rather than deserialized back
+        // from the bytes `merge` returns — it already exists in there, and a
+        // second round-trip on every call would be pure waste.
+        let mut produced: Option<V> = None;
+        {
+            let slot = &mut produced;
+            self.merge(&kb, &vb, move |existing, operand| {
+                let current = match existing {
+                    Some(bytes) => Some(rkyv_deserialize::<V>(bytes)?),
+                    None => None,
+                };
+                let operand = rkyv_deserialize::<V>(operand)?;
+                match merge_fn(current, operand)? {
+                    Some(new) => {
+                        let bytes = rkyv_serialize(&new)?;
+                        *slot = Some(new);
+                        Ok(Some(bytes))
+                    }
+                    None => Ok(None),
+                }
+            })?;
+        }
+        Ok(produced)
     }
 
     // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
@@ -1116,6 +1294,21 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Atomically read-modify-write a key.
+    ///
+    /// See [`Db::merge`] for the full contract. `merge_fn` must be `Send + 'static`
+    /// because it runs on a blocking worker thread, exactly as the rest of this
+    /// surface takes owned buffers for the same reason.
+    pub async fn merge<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
+    {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.merge(&key, &value, merge_fn))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     // ── Iteration ─────────────────────────────────────────────────────
 
     pub async fn iter(&self) -> Result<Vec<KeyValue>> {
@@ -1385,6 +1578,41 @@ impl AsyncDb {
     {
         let kb = rkyv_serialize(key)?;
         self.delete(kb).await
+    }
+
+    /// Atomically merge a typed value, serialized via rkyv.
+    ///
+    /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
+    pub async fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
+    where
+        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>> + Send + 'static,
+        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        F: FnOnce(Option<V>, V) -> Result<Option<V>> + Send + 'static,
+    {
+        let kb = rkyv_serialize(key)?;
+        let vb = rkyv_serialize(value)?;
+        // Unlike the sync twin, the new `V` cannot be carried out of the closure
+        // in a borrowed slot: the closure crosses a `spawn_blocking` boundary and
+        // so must be `'static`. Deserializing the returned bytes is the price of
+        // that, and it is paid only when the merge actually wrote.
+        let written = self
+            .merge(kb, vb, move |existing, operand| {
+                let current = match existing {
+                    Some(bytes) => Some(rkyv_deserialize::<V>(bytes)?),
+                    None => None,
+                };
+                let operand = rkyv_deserialize::<V>(operand)?;
+                match merge_fn(current, operand)? {
+                    Some(new) => Ok(Some(rkyv_serialize(&new)?)),
+                    None => Ok(None),
+                }
+            })
+            .await?;
+        match written {
+            Some(bytes) => Ok(Some(rkyv_deserialize::<V>(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
@@ -1682,6 +1910,20 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Atomically read-modify-write a key in this namespace.
+    ///
+    /// See [`Db::merge`] for the full contract.
+    pub async fn merge<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
+    {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.merge_ns(ns_id, &key, &value, merge_fn))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn iter(&self) -> Result<Vec<KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))
@@ -1770,6 +2012,41 @@ impl AsyncNamespace {
     {
         let kb = rkyv_serialize(key)?;
         self.delete(kb).await
+    }
+
+    /// Atomically merge a typed value, serialized via rkyv.
+    ///
+    /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
+    pub async fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
+    where
+        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>> + Send + 'static,
+        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        F: FnOnce(Option<V>, V) -> Result<Option<V>> + Send + 'static,
+    {
+        let kb = rkyv_serialize(key)?;
+        let vb = rkyv_serialize(value)?;
+        // Unlike the sync twin, the new `V` cannot be carried out of the closure
+        // in a borrowed slot: the closure crosses a `spawn_blocking` boundary and
+        // so must be `'static`. Deserializing the returned bytes is the price of
+        // that, and it is paid only when the merge actually wrote.
+        let written = self
+            .merge(kb, vb, move |existing, operand| {
+                let current = match existing {
+                    Some(bytes) => Some(rkyv_deserialize::<V>(bytes)?),
+                    None => None,
+                };
+                let operand = rkyv_deserialize::<V>(operand)?;
+                match merge_fn(current, operand)? {
+                    Some(new) => Ok(Some(rkyv_serialize(&new)?)),
+                    None => Ok(None),
+                }
+            })
+            .await?;
+        match written {
+            Some(bytes) => Ok(Some(rkyv_deserialize::<V>(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────

@@ -7,6 +7,7 @@ use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
+use crate::db::key_locks::KeyLocks;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
@@ -284,7 +285,7 @@ impl WalPersistObserver {
             if entry.status == WalEntryStatus::Persisted {
                 continue;
             }
-            if let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted) {
+            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
                 warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
                 had_error = true;
                 continue;
@@ -295,6 +296,16 @@ impl WalPersistObserver {
         }
 
         if updated > 0 {
+            // One fsync per touched segment, not one per entry. See
+            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+            // happens BEFORE the metadata write below, so the on-disk statuses are
+            // never less durable than the counters that describe them.
+            for &segment_id in per_segment.keys() {
+                if let Err(e) = self.wal.sync_segment(segment_id) {
+                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a persist sweep: {e:?}");
+                    had_error = true;
+                }
+            }
             let mut wal_metadata = self.wal_metadata.write();
             for (segment_id, count) in per_segment {
                 wal_metadata.add_segment_persisted(segment_id, count);
@@ -358,7 +369,7 @@ impl WalPersistObserver {
             if entry.status == WalEntryStatus::Persisted {
                 continue;
             }
-            if let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted) {
+            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
                 warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
                 continue;
             }
@@ -368,6 +379,15 @@ impl WalPersistObserver {
         }
 
         if updated > 0 {
+            // One fsync per touched segment, not one per entry. See
+            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+            // happens BEFORE the metadata write below, so the on-disk statuses are
+            // never less durable than the counters that describe them.
+            for &segment_id in per_segment.keys() {
+                if let Err(e) = self.wal.sync_segment(segment_id) {
+                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a namespace persist sweep: {e:?}");
+                }
+            }
             let mut wal_metadata = self.wal_metadata.write();
             for (segment_id, count) in per_segment {
                 wal_metadata.add_segment_persisted(segment_id, count);
@@ -552,6 +572,27 @@ fn display_key(key: &[u8]) -> String {
     }
 }
 
+/// What a WAL-backed write achieved.
+///
+/// The write path has two distinct successes, and collapsing them into `Ok(())`
+/// is what let a merge compute from a stale base. Once the WAL fsync returns the
+/// write is **durable** and will take effect — but the in-memory apply that makes
+/// it *readable* is best-effort (`Database::apply_with_retry`), so it can fail
+/// while the write remains committed.
+///
+/// `put`/`delete` discard this: for a blind write, durable-but-not-yet-readable
+/// is a success, and there is nothing useful the caller could do with the
+/// distinction. `merge_ns` does not, because a merge whose result never became
+/// readable poisons the next merge on that key.
+pub(crate) struct WriteOutcome {
+    /// The global sequence this write was assigned, for correlating with the
+    /// ERROR log line the failed apply emitted.
+    pub(crate) seq: u64,
+    /// `true` if the write reached the in-memory store, so a read sees it now.
+    /// `false` if it is durable in the WAL only, until the next open replays it.
+    pub(crate) applied: bool,
+}
+
 // ── Database coordinator ───────────────────────────────────────────────
 
 /// The main database coordinator that manages:
@@ -654,6 +695,16 @@ pub struct Database {
 
     // Global monotonic sequence counter. Seeded from the WAL on open.
     pub(crate) next_seq: Arc<AtomicU64>,
+
+    // Striped per-key write locks — the OUTERMOST lock on every WAL-backed
+    // write path. `merge_ns` needs read-modify-write to be indivisible, and the
+    // two locks the write path already takes cannot provide that: the WAL
+    // metadata lock is global (so a user closure under it stalls every
+    // namespace), and the value-log bucket lock is taken only *after* the WAL
+    // lock is released, so making the merge atomic with it would invert the
+    // established order. The stripe sits above both, giving one uniform order
+    // `stripe -> wal_metadata -> (released) -> bucket`. See `key_locks`.
+    key_locks: KeyLocks,
 
     // Directory for recovery fail-log files.
     fail_log_dir: PathBuf,
@@ -876,6 +927,7 @@ impl Database {
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
+            key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics: Arc::new(crate::db::metrics::Metrics::default()),
         };
@@ -982,6 +1034,13 @@ impl Database {
         self.delete_ns(DEFAULT_NAMESPACE_ID, key)
     }
 
+    pub fn merge<F>(&self, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.merge_ns(DEFAULT_NAMESPACE_ID, key, value, merge_fn)
+    }
+
     // ── Namespace-aware data operations ────────────────────────────────
 
     /// Number of attempts to apply a WAL-durable write to the in-memory store
@@ -989,6 +1048,18 @@ impl Database {
     /// and *will* take effect (via the in-memory apply now, or via WAL replay on
     /// the next open), so this only bounds the retry of transient apply errors.
     const APPLY_RETRY_ATTEMPTS: usize = 3;
+
+    /// Fail-log label carried by WAL entries a `merge` produced.
+    ///
+    /// (See also [`WriteOutcome`], returned by the `_locked` helpers below.)
+    ///
+    /// Only merges set `op_name`. An ordinary put or delete leaves it empty, as
+    /// it always has: the entry's own `WalOperationType` already says what it is,
+    /// so writing a label would add bytes to every record on the hot path to
+    /// record nothing new. A merge is worth the exception — its entry is
+    /// indistinguishable from a blind write otherwise, and "which op produced
+    /// this?" is exactly the question a fail log is read to answer.
+    const MERGE_OP_NAME: &'static str = "merge";
 
     /// Cap on how many keys a field's gap record will carry as a row-scoped
     /// repair worklist before it is downgraded to a full rebuild.
@@ -1049,7 +1120,34 @@ impl Database {
 
     pub fn put_ns(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, value)?;
+        // The key stripe is the outermost write lock (see `key_locks`). A blind
+        // put does not need it for itself, but taking it is what lets `merge_ns`
+        // read-modify-write without a concurrent put slipping in between its
+        // read and its write. It costs an uncontended mutex acquire on a path
+        // that already serialises globally on the WAL fsync.
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        // Discarded: `put`'s contract is that a WAL-durable write is a success,
+        // whether or not it is readable yet. See `WriteOutcome`.
+        self.put_ns_locked(namespace_id, key, value, "put").map(|_| ())
+    }
+
+    /// The body of [`Self::put_ns`], with the caller holding the key stripe.
+    ///
+    /// Split out so [`Self::merge_ns`] can reuse the WAL append verbatim rather
+    /// than growing a second copy of it. That matters more than it looks:
+    /// `WalPersistObserver::begin_write` must be called while the WAL metadata
+    /// write lock is still held, and a hand-rolled second copy that got the
+    /// ordering wrong lost one acknowledged write in 34,538 (see the *WAL
+    /// ownership* section of `minnal_db/CLAUDE.md`).
+    ///
+    /// `op_name` labels the operation in log and fail-log output; see
+    /// [`Self::MERGE_OP_NAME`] for which entries carry it into the WAL.
+    ///
+    /// Returns the [`WriteOutcome`] so `merge_ns` can tell a write that became
+    /// readable from one that is merely durable. `put_ns` discards it, keeping
+    /// its own `Ok(())` contract unchanged.
+    fn put_ns_locked(&self, namespace_id: u32, key: &[u8], value: &[u8], op_name: &str) -> Result<WriteOutcome> {
+        self.check_write_size(key, value)?;
 
         // Step 1: Write to shared WAL.
         // Allocate the sequence number *inside* the WAL lock so the global
@@ -1061,7 +1159,10 @@ impl Database {
         let mut wal_metadata = self.wal_metadata.write();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         assert!(seq != u64::MAX, "WAL global sequence number exhausted");
-        let wal_entry = WalEntry::new_upsert_ns(namespace_id, key.to_vec(), value.to_vec()).with_sequence(seq);
+        let mut wal_entry = WalEntry::new_upsert_ns(namespace_id, key.to_vec(), value.to_vec()).with_sequence(seq);
+        if op_name == Self::MERGE_OP_NAME {
+            wal_entry = wal_entry.with_op_name(op_name);
+        }
         let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
@@ -1094,9 +1195,8 @@ impl Database {
             crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + 4);
         }
 
-        if !Self::apply_with_retry("put", namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq))
-            && let Some(m) = kv_store.metrics()
-        {
+        let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq));
+        if !applied && let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
@@ -1114,7 +1214,7 @@ impl Database {
             let _ = kv_store.sync_value_log();
         }
 
-        Ok(())
+        Ok(WriteOutcome { seq, applied })
     }
 
     /// Write a key-value pair **without** appending to the WAL.
@@ -1126,7 +1226,10 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, value)?;
+        self.check_write_size(key, value)?;
+        // Outermost write lock — see `put_ns`. No-WAL writes take it too, so a
+        // merge is serialised against bulk loading as well as against `put`.
+        let _stripe = self.key_locks.guard(namespace_id, key);
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
@@ -1151,7 +1254,9 @@ impl Database {
     /// concurrent same-key writes highest-sequence-wins like any other write.
     pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, &[])?;
+        self.check_write_size(key, &[])?;
+        // Outermost write lock — see `put_ns`.
+        let _stripe = self.key_locks.guard(namespace_id, key);
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
@@ -1159,6 +1264,96 @@ impl Database {
         kv_store.note_no_wal_write();
         self.note_no_wal_index_exposure(namespace_id);
         kv_store.delete_from_storage(key)
+    }
+
+    /// Read a key, hand the stored value and `value` to `merge_fn`, and write
+    /// the result back — atomically with respect to every other write to that
+    /// key.
+    ///
+    /// `merge_fn` receives `(existing, operand)`, where `existing` is `None`
+    /// when the key is absent, and returns:
+    ///
+    /// - `Ok(Some(new))` — write `new` (an ordinary WAL-backed upsert),
+    /// - `Ok(None)` — delete the key; a no-op appending **nothing** to the WAL
+    ///   when the key was already absent,
+    /// - `Err(e)` — abort. Nothing is written, no WAL entry is appended and no
+    ///   sequence number is consumed.
+    ///
+    /// Returns the value that was written, or `None` for the delete and no-op
+    /// cases — or [`KVError::MergeNotApplied`] if the write was committed to the
+    /// WAL but did not reach the in-memory store, so its result is not readable
+    /// (see [`Self::require_applied`]).
+    ///
+    /// # Durability and the WAL
+    ///
+    /// The merge resolves to an ordinary `Upsert` or `Delete` WAL record
+    /// carrying the *result*, so recovery, WAL GC and index replay are unchanged
+    /// — there is no merge record type and nothing re-runs `merge_fn` at replay.
+    /// (A closure cannot be serialised, and recovery runs long before user code
+    /// could re-register one.) The usual durability contract applies: the call
+    /// returns once the WAL entry is fsynced.
+    ///
+    /// # The closure runs under a lock
+    ///
+    /// `merge_fn` is invoked while this key's stripe lock is held, so it must be
+    /// quick and must **not write back** into the database — a re-entrant write
+    /// to the same key, or to any key sharing its stripe, self-deadlocks. Reads
+    /// are safe but pointless: a read of this key returns the same pre-merge
+    /// value the closure was already handed.
+    ///
+    /// TTL expiry is the one writer outside the stripe: it deletes straight
+    /// through `KVStore`, so a merge racing an expiry can resurrect a key that
+    /// was about to expire. The next TTL pass expires it again.
+    pub fn merge_ns<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.check_closed()?;
+        // Held across the read, the closure, the WAL append AND the in-memory
+        // apply. This is the whole atomicity argument: no other WAL-backed write
+        // to this key can be durable-but-unapplied while we hold it, so the
+        // closure never sees a stale base.
+        let _stripe = self.key_locks.guard(namespace_id, key);
+
+        let kv_store = self.get_store(namespace_id)?;
+        if let Some(m) = kv_store.metrics() {
+            crate::db::metrics::Metrics::bump(&m.merges);
+        }
+
+        let existing = kv_store.get(key)?;
+        // `existing` outlives the call: the delete arm below needs to know
+        // whether there was anything there to delete.
+        let merged = merge_fn(existing.as_deref(), value)?;
+
+        match merged {
+            Some(new_value) => {
+                let outcome = self.put_ns_locked(namespace_id, key, &new_value, Self::MERGE_OP_NAME)?;
+                Self::require_applied(outcome)?;
+                Ok(Some(new_value))
+            }
+            // Deleting an absent key would cost an fsync and a tombstone to say
+            // nothing, so the absent -> absent case writes nothing at all.
+            None if existing.is_some() => {
+                let outcome = self.delete_ns_locked(namespace_id, key, Self::MERGE_OP_NAME)?;
+                Self::require_applied(outcome)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Turn a durable-but-unapplied merge write into an error.
+    ///
+    /// The write is committed either way — this does not undo it, and the WAL
+    /// entry replays on the next open. What it prevents is the caller carrying
+    /// on as though the merge took effect, because the *next* merge on this key
+    /// would then read the unchanged value and accumulate onto a stale base.
+    fn require_applied(outcome: WriteOutcome) -> Result<()> {
+        if outcome.applied {
+            Ok(())
+        } else {
+            Err(KVError::MergeNotApplied { seq: outcome.seq })
+        }
     }
 
     pub fn get_ns(&self, namespace_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1169,7 +1364,16 @@ impl Database {
 
     pub fn delete_ns(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        Self::check_write_size(key, &[])?; // delete carries only a key
+        // Outermost write lock — see `put_ns`.
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        // Discarded, as in `put_ns`.
+        self.delete_ns_locked(namespace_id, key, "delete").map(|_| ())
+    }
+
+    /// The body of [`Self::delete_ns`], with the caller holding the key stripe.
+    /// See [`Self::put_ns_locked`] for why this split exists.
+    fn delete_ns_locked(&self, namespace_id: u32, key: &[u8], op_name: &str) -> Result<WriteOutcome> {
+        self.check_write_size(key, &[])?; // delete carries only a key
 
         // Step 1: Write DELETE to shared WAL.
         // Allocate the sequence inside the WAL lock so sequence order == WAL
@@ -1177,7 +1381,10 @@ impl Database {
         let mut wal_metadata = self.wal_metadata.write();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         assert!(seq != u64::MAX, "WAL global sequence number exhausted");
-        let wal_entry = WalEntry::new_delete_ns(namespace_id, key.to_vec()).with_sequence(seq);
+        let mut wal_entry = WalEntry::new_delete_ns(namespace_id, key.to_vec()).with_sequence(seq);
+        if op_name == Self::MERGE_OP_NAME {
+            wal_entry = wal_entry.with_op_name(op_name);
+        }
         let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
         let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
         wal_metadata.add_segment_total(segment_id, 1);
@@ -1202,9 +1409,8 @@ impl Database {
             crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + 4);
         }
 
-        if !Self::apply_with_retry("delete", namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq))
-            && let Some(m) = kv_store.metrics()
-        {
+        let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq));
+        if !applied && let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.apply_failures);
         }
 
@@ -1215,7 +1421,7 @@ impl Database {
             let _ = kv_store.sync_value_log();
         }
 
-        Ok(())
+        Ok(WriteOutcome { seq, applied })
     }
 
     // ── Namespace management (admin API) ───────────────────────────────
@@ -1938,28 +2144,53 @@ impl Database {
     /// formats, with a clean [`KVError::WriteTooLarge`] instead of silently
     /// truncating a length deep in the store.
     ///
-    /// Several persisted lengths are `u32`: the value record's `value_len`, the
-    /// row-ID map's `key_len`, and the whole write is framed as one `u32`-sized
-    /// WAL entry (key + value + op-name + rkyv overhead). A single combined check
-    /// — `key + value + headroom ≤ u32::MAX` — covers all three (key alone and
-    /// value alone are subsets of the entry). The headroom bounds the per-entry
-    /// framing. Enforced at the write boundary so nothing reaches the WAL,
-    /// value-log, LSM, row-ID map, or field indexes before validation.
-    fn check_write_size(key: &[u8], value: &[u8]) -> Result<()> {
+    /// **Two** bounds apply, and both must be checked here.
+    ///
+    /// 1. **Field widths.** Several persisted lengths are `u32`: the value
+    ///    record's `value_len`, the row-ID map's `key_len`, and the whole write
+    ///    is framed as one `u32`-sized WAL entry (key + value + op-name + rkyv
+    ///    overhead). A single combined check — `key + value + headroom ≤
+    ///    u32::MAX` — covers all three (key alone and value alone are subsets of
+    ///    the entry). The headroom bounds the per-entry framing.
+    /// 2. **Segment capacity.** A value record must fit inside one value-log
+    ///    segment, whose size is `DbConfig::segment_size_bytes` (default 256
+    ///    MiB, so *far* tighter than the ~4 GiB field-width bound).
+    ///
+    /// Checking only the first left a gap that produced an acknowledged write
+    /// nobody could read: a value between the segment size and ~4 GiB passed
+    /// here, got a fsynced WAL entry — so `put` returned `Ok` — and only then hit
+    /// `ValueLogError::ValueTooLarge` inside `ValueLog::append`, where the write
+    /// path is past its durability barrier and treats failures as best-effort.
+    /// All three apply attempts failed identically (the value's size does not
+    /// change between retries), `get` kept returning the previous value, and WAL
+    /// replay hit the same error on the next open and wrote a fail log. **Both
+    /// bounds must be enforced before the WAL append**, which is the only point
+    /// at which a rejection can still mean "nothing happened".
+    fn check_write_size(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Generous headroom for WAL-entry framing (short op-name + rkyv) and the
         // value-record header — far larger than any of those.
         const HEADROOM: u64 = 64 * 1024;
-        const LIMIT: u64 = u32::MAX as u64 - HEADROOM;
-        Self::check_total_len(key.len(), value.len(), LIMIT)
+        const FIELD_WIDTH_LIMIT: u64 = u32::MAX as u64 - HEADROOM;
+
+        Self::check_total_len(key.len(), value.len(), FIELD_WIDTH_LIMIT, "lengths are stored as u32")?;
+
+        let segment_size = self.config.segment_size_bytes;
+        Self::check_total_len(
+            key.len(),
+            value.len(),
+            crate::store::value_log::max_record_payload(segment_size),
+            &format!("a record must fit one value-log segment; value_log.segment_size_bytes = {segment_size}"),
+        )
     }
 
     /// Inner of [`check_write_size`] with the limit as a parameter so both
     /// branches are testable without allocating a multi-GiB key/value.
-    fn check_total_len(key_len: usize, value_len: usize, limit: u64) -> Result<()> {
+    /// `reason` names which bound was hit, since the two have different fixes.
+    fn check_total_len(key_len: usize, value_len: usize, limit: u64, reason: &str) -> Result<()> {
         let total = key_len as u64 + value_len as u64;
         if total > limit {
             return Err(KVError::WriteTooLarge(format!(
-                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit (lengths are stored as u32)"
+                "key {key_len} + value {value_len} = {total} bytes exceeds the {limit}-byte limit ({reason})"
             )));
         }
         Ok(())
@@ -2163,12 +2394,21 @@ impl Database {
         let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
         for (pointer, entry) in entries {
             if entry.status != WalEntryStatus::Persisted
-                && let Err(e) = self.wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted)
+                && let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted)
             {
                 warn!("[RECOVERY] Failed to update WAL entry status: {:?}", e);
             }
             let segment_id = self.wal.segment_id_for_offset(pointer.offset);
             *per_segment.entry(segment_id).or_insert(0) += 1;
+        }
+        // One fsync per touched segment, not one per entry. See
+        // `Wal::update_entry_status_deferred` for why deferring is safe — and it
+        // happens BEFORE the metadata write below, so the on-disk statuses are
+        // never less durable than the counters that describe them.
+        for &segment_id in per_segment.keys() {
+            if let Err(e) = self.wal.sync_segment(segment_id) {
+                warn!("[RECOVERY] Failed to sync WAL segment {segment_id}: {e:?}");
+            }
         }
 
         {
@@ -2601,6 +2841,7 @@ impl Database {
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
+            key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics: Arc::new(crate::db::metrics::Metrics::default()),
         };

@@ -84,6 +84,19 @@ pub type Result<T> = std::result::Result<T, ValueLogError>;
 /// Default size at which a segment is sealed and a new one opened.
 pub const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The largest `key.len() + value.len()` a segment of `segment_size` bytes can
+/// hold, once the segment header and the per-record header are accounted for.
+///
+/// [`ValueLog::append`] rejects anything above this with
+/// [`ValueLogError::ValueTooLarge`] — but by then the write has already been
+/// appended to the WAL and fsynced, so the caller has been told it succeeded.
+/// The write boundary (`Database::check_write_size`) applies the same bound
+/// *before* the WAL append, which is the only place a rejection can still mean
+/// "nothing happened". Keep the two in agreement.
+pub(crate) fn max_record_payload(segment_size: u64) -> u64 {
+    segment_size.saturating_sub(SEGMENT_HEADER_SIZE + ValueRecordHeader::SIZE as u64)
+}
+
 const SEGMENT_SIZE_ALIGNMENT: u64 = 4096;
 const MIN_SEGMENT_SIZE_BYTES: u64 = 64 * 1024;
 /// `rec_offset` in the value pointer is a `u32`, so every record must be

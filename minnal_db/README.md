@@ -426,6 +426,31 @@ put(key, value)
 
 > **On `fsync` cadence.** Each `put`/`delete` `fsync`s the WAL *individually* — that is what makes the operation durable on return — so `records_per_sync` governs only how often the **value log** is `fsync`ed, never the WAL.
 
+#### The merge path
+
+`merge(key, operand, closure)` is the same write path with a read in front of it, made indivisible:
+
+```
+merge(key, operand, closure)
+        │
+        ├──► lock key stripe                 ← OUTERMOST lock; held to the end
+        │
+        ├──► get(key)                        ← the read path, below
+        │
+        ├──► closure(existing, operand)      ← your code decides the new value
+        │         ├─ Ok(Some(v)) ──► the put path above
+        │         ├─ Ok(None)    ──► the delete path (nothing if already absent)
+        │         └─ Err(e)      ──► abort: no WAL entry, no sequence consumed
+        │
+        └──► unlock key stripe
+```
+
+Three things fall out of that shape:
+
+- **The WAL never learns a merge happened.** It records the *result* as an ordinary `Upsert` or `Delete`, so recovery, WAL GC and index replay are byte-for-byte unchanged, and nothing re-runs the closure at replay — which is what makes an arbitrary Rust closure usable here at all.
+- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway.
+- **`put` and `delete` take the stripe too**, so a blind write cannot land between a merge's read and its write. The guarantee is per key: this is not a transaction.
+
 ### Read Path
 
 A read resolves the key's current version by **highest write sequence**, then follows that pointer into the value log:

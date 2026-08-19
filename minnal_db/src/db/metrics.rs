@@ -47,6 +47,11 @@ pub struct Metrics {
     // ── Writes ──────────────────────────────────────────────────────────
     pub puts: AtomicU64,
     pub deletes: AtomicU64,
+    /// `merge` calls. Counts every attempt, including those the closure aborted
+    /// or resolved to a no-op — so `merges` minus the merges that wrote is how
+    /// often a merge cost a read but no fsync. A merge that *does* write also
+    /// bumps `puts` or `deletes`, because it is one ordinary WAL-backed write.
+    pub merges: AtomicU64,
     pub no_wal_puts: AtomicU64,
     pub no_wal_deletes: AtomicU64,
     pub wal_bytes_appended: AtomicU64,
@@ -122,6 +127,7 @@ impl Metrics {
             bloom_rejects: g(&self.bloom_rejects),
             puts: g(&self.puts),
             deletes: g(&self.deletes),
+            merges: g(&self.merges),
             no_wal_puts: g(&self.no_wal_puts),
             no_wal_deletes: g(&self.no_wal_deletes),
             wal_bytes_appended: g(&self.wal_bytes_appended),
@@ -162,6 +168,7 @@ impl Metrics {
         a(&self.bloom_rejects, o.bloom_rejects);
         a(&self.puts, o.puts);
         a(&self.deletes, o.deletes);
+        a(&self.merges, o.merges);
         a(&self.no_wal_puts, o.no_wal_puts);
         a(&self.no_wal_deletes, o.no_wal_deletes);
         a(&self.wal_bytes_appended, o.wal_bytes_appended);
@@ -194,6 +201,7 @@ pub struct MetricsSnapshot {
     pub bloom_rejects: u64,
     pub puts: u64,
     pub deletes: u64,
+    pub merges: u64,
     pub no_wal_puts: u64,
     pub no_wal_deletes: u64,
     pub wal_bytes_appended: u64,
@@ -228,6 +236,7 @@ impl MetricsSnapshot {
         self.bloom_rejects += o.bloom_rejects;
         self.puts += o.puts;
         self.deletes += o.deletes;
+        self.merges += o.merges;
         self.no_wal_puts += o.no_wal_puts;
         self.no_wal_deletes += o.no_wal_deletes;
         self.wal_bytes_appended += o.wal_bytes_appended;
