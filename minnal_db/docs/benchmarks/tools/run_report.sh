@@ -5,7 +5,7 @@
 #
 #   minnal_db/docs/benchmarks/tools/run_report.sh
 #
-# Takes roughly 45 minutes on an idle machine. Run it on an otherwise quiet
+# Takes roughly 95 minutes on an idle machine. Run it on an otherwise quiet
 # host: several suites measure sub-microsecond operations where a busy machine
 # shows up as a 20-40% swing (see benchmark.md's closing section).
 #

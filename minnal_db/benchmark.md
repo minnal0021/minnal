@@ -52,6 +52,14 @@ here. It archives any previous `target/criterion` rather than deleting it, so
 Criterion never reports a cross-machine "regression" against a baseline measured
 somewhere else.
 
+**Reading the charts.** Bars are sorted **ascending by measured value**, never by
+benchmark name, so the shape of a chart is the finding rather than something to
+be decoded against the table. Where a group of benchmarks spans more than about
+two orders of magnitude it is split across several charts — one per magnitude
+band — because a log axis wide enough to fit nanoseconds and milliseconds in one
+frame renders every bar in the upper band the same height. Within a band the
+axis is linear, which is what makes a few-percent spread visible at all.
+
 Everything ran with Criterion's defaults — 100 samples per case, a 3-second
 warm-up, a 10-second measurement window, 95% confidence intervals. The one
 exception is the mixed read/write suite, which re-seeds thousands of durable keys
@@ -167,13 +175,20 @@ put measuring slower than a 2 KiB one, a merge measuring faster than a put.
 Any of them means the same thing: read the decomposition, not the difference
 between two write rows.
 
-![merge against the other CRUD operations](docs/benchmarks/merge.png)
+![The durable CRUD operations, every one an fsync](docs/benchmarks/merge_writes.png)
 
-*Bar labels: `crud/*` are the durable operations (every one an fsync);
-`closure/*` are the two merge closures run with no database underneath;
-`stripe/*` reproduces the per-key lock's hash-and-acquire against the same
-primitives the engine uses (`KeyLocks` is crate-private, so the bench cannot
-call it directly).*
+*The six durable operations on a linear axis, which is the only way a 2.8%
+spread is visible. Note `put_2KiB` sitting at the top and both merges below it —
+the impossible ordering described above.*
+
+![What merge adds over a blind put](docs/benchmarks/merge_components.png)
+
+*The same section's decomposition, on its own axis because it is three orders of
+magnitude below the writes: `crud/get_2KiB` is the read a merge does and a put
+does not, `closure/*` are the two merge closures run with no database
+underneath, and `stripe/*` reproduces the per-key lock's hash-and-acquire
+against the same primitives the engine uses (`KeyLocks` is crate-private, so the
+bench cannot call it directly).*
 
 ## Reads
 
@@ -242,11 +257,14 @@ itself. A workload that read a whole batch of in-memory keys and then a whole
 batch of on-disk keys — rather than alternating one by one — probably
 wouldn't pay this extra cost.
 
-![Lookup latency across tiers and key counts](docs/benchmarks/sstable_lookup.png)
+![Point lookup hits by tier and key count](docs/benchmarks/sstable_hits.png)
 
-*Bar labels: `memtable` = in memory, `l1` = on disk, `mixed` = the blended
-workload described above; `hit` = the key exists, `miss` = it doesn't; the
-trailing number is how many keys are in the store for that case.*
+![Point lookup misses by tier and key count](docs/benchmarks/sstable_misses.png)
+
+*Hits and misses are charted separately because they invert: sorted ascending,
+the hit chart runs `memtable` → `mixed` → `l1` and the miss chart runs the other
+way round. `memtable` = in memory, `l1` = on disk, `mixed` = the blended workload
+described above; the trailing number is how many keys are in the store.*
 
 ## Scans
 
@@ -271,12 +289,16 @@ pages the pagination bookkeeping itself dominates the cost regardless of which
 tier the data sits in, so the usual tier gap simply doesn't get a chance to
 show.
 
-![Scan latency across scan types and tiers](docs/benchmarks/scan.png)
+![Prefix and range scans by tier and result size](docs/benchmarks/scan_prefix_range.png)
 
-*Bar labels: `prefix`/`range`/`cursor`/`iter` are the four scan types above;
-`memtable`/`l1` = in memory vs. on disk. The trailing number means whatever
-that scan type varies — matching keys for `prefix`, results returned for
-`range`, page size for `cursor`, value size for `iter`.*
+![Cursor pagination and full iteration by tier](docs/benchmarks/scan_cursor_iter.png)
+
+*Split so the two comparisons in this section each get their own axis: the
+prefix/range chart shows the consistent ~2x tier ratio, the cursor/iter chart
+shows the small-page inversion. `memtable`/`l1` = in memory vs. on disk; the
+trailing number means whatever that scan type varies — matching keys for
+`prefix`, results returned for `range`, page size for `cursor`, value size for
+`iter`.*
 
 ## Mixed read/write workload
 
@@ -328,9 +350,15 @@ way, which is the one place in this report where it is visible rather than
 swamped: 1.60 µs at 128 bytes, 2.54 µs at 4 KiB, 10.55 µs at 64 KiB. That is the
 real shape of the write path underneath its durability guarantee.
 
-![Durable write cost: fsync'd append, full put, and namespace tagging](docs/benchmarks/wal_durability.png)
+![Durable write cost: fsync'd append, full put, and namespace tagging](docs/benchmarks/wal_durable_writes.png)
 
-*Bar labels: `append_fsync` = a raw, durable WAL append in isolation;
+![The same append with the fsync omitted](docs/benchmarks/wal_unsynced_appends.png)
+
+*Two charts rather than one, because at 1,421x apart the unsynced bars are
+invisible next to the durable ones — the contrast is the ratio in the text, and
+each chart's own axis is what makes its internal spread readable. The second
+chart is also the only place in this report where payload size drives the shape.
+Bar labels: `append_fsync` = a raw, durable WAL append in isolation;
 `append_no_fsync` = the same append with the sync omitted, which is what the
 rest of the write path costs; `full_put_throughput` = the entire write path
 (WAL + value log + in-memory index) end to end; `namespace_overhead` = the same
@@ -379,11 +407,17 @@ never touches the value log, so at small counts the tier difference is too small
 to clear the noise floor, and only becomes visible once there are enough keys
 for it to accumulate.
 
-![Typed API latencies](docs/benchmarks/typed.png)
+![Typed writes](docs/benchmarks/typed_writes.png)
 
-*Bar labels: `get`/`put`/`delete`/`iter`/`keys`/`range`/`scan_prefix` are the
-typed operations, mirroring the raw-bytes API's method names; `memtable`/`l1`
-= in memory vs. on disk.*
+![Typed point reads by tier and value size](docs/benchmarks/typed_point_reads.png)
+
+![Typed multi-key reads by tier](docs/benchmarks/typed_scans.png)
+
+*Three charts, one per magnitude band — the typed writes are fsync-bound
+milliseconds, the point reads are microseconds, and the multi-key reads are in
+between. Bar labels: `get`/`put`/`delete`/`iter`/`keys`/`range`/`scan_prefix`
+are the typed operations, mirroring the raw-bytes API's method names;
+`memtable`/`l1` = in memory vs. on disk.*
 
 ## Field-index predicates
 
@@ -445,11 +479,14 @@ quadratic-versus-linear difference: the old path re-walks the bitmap from the
 start on every page, so its cost grows with the square of the number of pages,
 while container-skipping stays linear.
 
-![Offset paging over a result bitmap](docs/benchmarks/bitmap_paging.png)
+![One page fetched at increasing offsets](docs/benchmarks/bitmap_page_at_offset.png)
 
-*Bar labels: `bitmap_page_at_offset/*` is one page fetched at the given offset;
-`bitmap_full_paged_walk/*` is every page of the result set in sequence.
-`iter_skip` is the old path, `iter_page` the current one.*
+![Walking every page of the result set](docs/benchmarks/bitmap_full_walk.png)
+
+*The single-page chart keeps a log axis — it spans 713x, which is the finding —
+while the full-walk chart is linear so the 5.2x is read directly off the axis.
+`iter_skip` is the old path, `iter_page` the current one; the trailing number on
+the first chart is the page offset.*
 
 ## Semantic search
 
@@ -476,24 +513,35 @@ doesn't get that cap: cost there scales roughly in step with the extra chunks
 (eight times the chunks per document costs 5.36x as much), because the first
 pass scans all of them rather than capping.
 
-![Semantic search latency by stage](docs/benchmarks/distance_estimation.png)
+![Candidate scoring and cluster selection](docs/benchmarks/semantic_scoring.png)
 
-*A guide to the bars. `single_bit` and `multi_bit` are the coarse first pass
-and the more precise second pass. Under `top_n_cluster_selection`, `select_nth`
-is the current cluster-picking algorithm and `full_sort` is the older
-sort-everything baseline it is measured against. `coarse_assignment` contrasts
-two ways of assigning a multi-chunk query to its nearest clusters: `serial_hashmap`
-walks the query's chunks one at a time, looking each one up individually in a
-scattered `HashMap` of clusters, while `batched_matrix` — the current approach —
-scores all of a query's chunks at once against a single contiguous matrix of
-cluster centroids. That contiguity is what produces the speedup, through better
-cache locality and more vectorizable math. `pass1_scoring` peels the first pass
-apart into cumulative layers, starting from the bare distance math
-(`dot_arithmetic`), then adding the cost of reading the on-disk format
-(`plus_archived`), and finally the real scoring data structure (`plus_hashmap`),
-which is the closest of the three to what production actually pays. Finally,
-`end_to_end_search` and `end_to_end_multichunk` are complete searches that vary
-the query length and the per-document chunk count respectively.*
+*Scoring a batch of candidates, plus picking which clusters to search.
+`single_bit` and `multi_bit` are the coarse first pass and the more precise
+second pass — sorted ascending they interleave, which is the finding: the extra
+precision costs nothing at this scale. Under `top_n_cluster_selection`,
+`select_nth` is the current cluster-picking algorithm and `full_sort` the older
+sort-everything baseline it is measured against.*
+
+![Query-to-cluster assignment and first-pass layers](docs/benchmarks/semantic_pipeline.png)
+
+*`coarse_assignment` contrasts two ways of assigning a multi-chunk query to its
+nearest clusters: `serial_hashmap` walks the query's chunks one at a time,
+looking each one up individually in a scattered `HashMap` of clusters, while
+`batched_matrix` — the current approach — scores all of a query's chunks at once
+against a single contiguous matrix of cluster centroids. That contiguity is what
+produces the speedup, through better cache locality and more vectorizable math.
+`pass1_scoring` peels the first pass apart into cumulative layers, starting from
+the bare distance math (`dot_arithmetic`), then adding the cost of reading the
+on-disk format (`plus_archived`), and finally the real scoring data structure
+(`plus_hashmap`), which is the closest of the three to what production actually
+pays.*
+
+![Complete searches](docs/benchmarks/semantic_end_to_end.png)
+
+*Complete searches on a linear millisecond axis: `end_to_end_search` varies the
+query length, `end_to_end_multichunk` the per-document chunk count. The
+sub-linear query scaling and the near-linear chunk scaling described above are
+both read straight off this chart.*
 
 ---
 

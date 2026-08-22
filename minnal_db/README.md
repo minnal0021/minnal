@@ -672,7 +672,7 @@ Benchmark reports are written to `target/criterion/`. The helpers in `benches/co
 To regenerate [`benchmark.md`](benchmark.md)'s dataset and charts in one step — every suite, then Criterion's means extracted and the charts re-rendered — run:
 
 ```bash
-minnal_db/docs/benchmarks/tools/run_report.sh    # ~45 min; archives any previous target/criterion
+minnal_db/docs/benchmarks/tools/run_report.sh    # ~95 min; archives any previous target/criterion
 ```
 
 Run it on an otherwise idle machine: several suites measure sub-microsecond operations, where a busy host shows up as a 20-40% swing.
