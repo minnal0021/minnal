@@ -73,6 +73,10 @@ rather than decoded against the table:
   a trend. The exception is the durable-CRUD chart, which is deliberately zoomed
   to a 2.26-2.34 ms window so the ordering is legible; its spread is noise, as
   that section explains.
+- **Labels sit horizontally under their bars wherever they fit**, with each part
+  of the name on its own line, so they are read at a glance rather than sideways
+  a character at a time. Only a chart whose bars are too narrow for that falls
+  back to rotated labels.
 
 Everything ran with Criterion's defaults — 100 samples per case, a 3-second
 warm-up, a 10-second measurement window, 95% confidence intervals. The one
@@ -310,15 +314,18 @@ pages the pagination bookkeeping itself dominates the cost regardless of which
 tier the data sits in, so the usual tier gap simply doesn't get a chance to
 show.
 
-![Prefix and range scans by tier and result size](docs/benchmarks/scan_prefix_range.png)
+![Prefix scan by tier, matching keys and value size](docs/benchmarks/scan_prefix.png)
+
+![Range scan by tier and result count](docs/benchmarks/scan_range.png)
 
 ![Cursor pagination by page size and tier](docs/benchmarks/scan_cursor.png)
 
 ![Full async iteration by value size and tier](docs/benchmarks/scan_iter.png)
 
-*Each comparison in this section gets its own axis. The prefix/range chart is
-grouped by tier so the consistent ~2x ratio shows up as two same-shaped blocks.
-The cursor chart is deliberately *not* grouped: sorted by value, `l1/100`
+*One chart per scan type, and the prefix and range charts share an axis so the
+two can be compared with each other. Sorted by value, each `memtable`/`l1` pair
+at a given size lands on adjacent bars, so the consistent ~2x ratio is the step
+between neighbours. The cursor chart is a deliberate exception: sorted by value, `l1/100`
 lands first and `memtable/100` second, which is the small-page inversion stated
 above, and tier blocks would have put those two bars at opposite ends. The
 trailing number is whatever that scan type varies — matching keys for `prefix`,
@@ -566,26 +573,32 @@ clusters were requested. `select_nth` occupies the three cheapest bars and
 `full_sort` the three dearest, and `full_sort` is flat because it sorts all 256
 clusters whatever you ask for.*
 
-![Query-to-cluster assignment and first-pass layers](docs/benchmarks/semantic_pipeline.png)
+![Assigning a query's chunks to clusters](docs/benchmarks/semantic_cluster_assignment.png)
 
-*`coarse_assignment` contrasts two ways of assigning a multi-chunk query to its
-nearest clusters: `serial_hashmap` walks the query's chunks one at a time,
-looking each one up individually in a scattered `HashMap` of clusters, while
+*Two ways of assigning a multi-chunk query to its nearest clusters, paired at
+each query size. `serial_hashmap` walks the query's chunks one at a time,
+looking each one up individually in a scattered `HashMap` of clusters;
 `batched_matrix` — the current approach — scores all of a query's chunks at once
 against a single contiguous matrix of cluster centroids. That contiguity is what
-produces the speedup, through better cache locality and more vectorizable math.
-`pass1_scoring` peels the first pass apart into cumulative layers, starting from
-the bare distance math (`dot_arithmetic`), then adding the cost of reading the
-on-disk format (`plus_archived`), and finally the real scoring data structure
-(`plus_hashmap`), which is the closest of the three to what production actually
-pays.*
+produces the speedup, through better cache locality and more vectorizable math,
+and the chart shows it as the gap within each adjacent pair.*
 
-![Complete searches](docs/benchmarks/semantic_end_to_end.png)
+![First pass, peeled apart into cumulative layers](docs/benchmarks/semantic_pass1_layers.png)
 
-*Complete searches on a linear millisecond axis: `end_to_end_search` varies the
-query length, `end_to_end_multichunk` the per-document chunk count. The
-sub-linear query scaling and the near-linear chunk scaling described above are
-both read straight off this chart.*
+*The first pass in cumulative layers, starting from the bare distance math
+(`dot_arithmetic`), then adding the cost of reading the on-disk format
+(`plus_archived`), and finally the real scoring data structure (`plus_hashmap`),
+which is the closest of the three to what production actually pays. Each layer
+is dearer than the one below it at both query sizes.*
+
+![Complete search as the query grows](docs/benchmarks/semantic_query_length.png)
+
+![Complete search as documents gain chunks](docs/benchmarks/semantic_chunks_per_doc.png)
+
+*The two end-to-end sweeps, on a shared millisecond axis so they can be read
+against each other: the query-length sweep is visibly sub-linear (ten times the
+query for 2.19x the cost) while the chunk sweep is not (eight times the chunks
+for 5.36x), which is the capped-re-ranking argument above in picture form.*
 
 ---
 

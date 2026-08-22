@@ -167,11 +167,32 @@ for chart in charts:
             yrange = f"[{max(0, lo - pad):.6g}:{hi + pad:.6g}]"
         ytics = "set ytics autofreq"
 
-    # Labels are rotated vertical, so the bottom margin has to clear the
-    # longest one; a fixed margin either clips long labels or leaves a band of
-    # dead space under short ones.
-    longest = max(len(lbl) for lbl in labels)
-    bmargin = max(4, min(24, round(longest * 0.72)))
+    # Rotated labels are read sideways, one character at a time. Where the
+    # labels are short enough to fit under their own bars, stack their
+    # slash-separated parts on separate lines and leave them horizontal — a
+    # two-line "batched_matrix / 4" under the bar reads instantly, the same
+    # string rotated 90 degrees does not. Rotate only when the bars are too
+    # narrow for that.
+    # 7.6 px/char is DejaVu Sans 10 measured against the widest glyphs, and the
+    # 0.9 factor leaves a gutter so neighbouring labels cannot touch. Both are
+    # deliberately pessimistic: a label that overflows collides with the one
+    # next to it and is worse than an honestly rotated one.
+    PX_PER_CHAR, PLOT_PX = 7.6, 880.0
+    per_bar_px = PLOT_PX / max(1, len(labels))
+    widest_part = max((max(len(part) for part in lbl.split("/")) for lbl in labels), default=0)
+    horizontal = widest_part * PX_PER_CHAR <= per_bar_px * 0.9
+
+    if horizontal:
+        deepest = max(lbl.count("/") for lbl in labels) + 1
+        bmargin = max(3, deepest + 2)
+        xtics_rotate = "set xtics scale 0 noenhanced"
+        with dat.open("w") as f:
+            for i, lbl in enumerate(labels):
+                f.write(f'{i}\t{rows[picked[i]] / div:.6g}\t"{lbl.replace("/", chr(92) + "n")}"\n')
+    else:
+        longest = max(len(lbl) for lbl in labels)
+        bmargin = max(4, min(24, round(longest * 0.72)))
+        xtics_rotate = "set xtics rotate by -90 scale 0 noenhanced"
 
     gp = work / (chart["file"].replace(".png", ".gp"))
     gp.write_text(f"""
@@ -185,7 +206,7 @@ set boxwidth 0.7
 {logscale}
 {ytics}
 set grid ytics lc rgb "#dddddd"
-set xtics rotate by -90 scale 0 noenhanced
+{xtics_rotate}
 set key off
 set bmargin {bmargin}
 set yrange {yrange}

@@ -76,6 +76,18 @@
       [
         "^crud/",
         ""
+      ],
+      [
+        "^(put|delete)_(\\d+\\w*)$",
+        "\\1/\\2"
+      ],
+      [
+        "^merge_(counter|sorted_set)_(\\w+)$",
+        "merge/\\1/\\2"
+      ],
+      [
+        "^get_then_put_sorted_set_(\\w+)$",
+        "get_then_put/sorted_set/\\1"
       ]
     ]
   },
@@ -148,29 +160,45 @@
     ]
   },
   {
-    "file": "scan_prefix_range.png",
-    "title": "bench_scan \u2014 prefix and range scans by tier and result size",
+    "file": "scan_prefix.png",
+    "title": "bench_scan \u2014 prefix scan by tier, matching keys and value size",
     "ylabel": "Mean latency, us (log scale)",
     "unit": "us",
     "scale": "log",
-    "cases": [
-      "scan_prefix/.*",
-      "scan_range/.*"
-    ],
-    "group_by": "/(memtable|l1|mixed)",
+    "ylink": "scan_multi",
     "relabel": [
       [
-        "^scan_",
+        "^scan_prefix/",
+        ""
+      ],
+      [
+        "_(\\d+)_keys_",
+        "/\\1keys/"
+      ]
+    ],
+    "cases": [
+      "scan_prefix/.*"
+    ]
+  },
+  {
+    "file": "scan_range.png",
+    "title": "bench_scan \u2014 range scan by tier and result count",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "scale": "log",
+    "ylink": "scan_multi",
+    "relabel": [
+      [
+        "^scan_range/",
         ""
       ],
       [
         "_result_count/",
         "/"
-      ],
-      [
-        "_(\\d+)_keys_",
-        "/\\1keys_"
       ]
+    ],
+    "cases": [
+      "scan_range/.*"
     ]
   },
   {
@@ -254,6 +282,18 @@
       [
         "^wal_",
         ""
+      ],
+      [
+        "^append_fsync/value_size/",
+        "append_fsync/"
+      ],
+      [
+        "^full_put_throughput/db_put_with_wal",
+        "full_put/end_to_end"
+      ],
+      [
+        "^namespace_overhead/",
+        "namespace/"
       ]
     ],
     "zero_based": true
@@ -535,47 +575,69 @@
     ]
   },
   {
-    "file": "semantic_pipeline.png",
-    "title": "bench_distance_estimation \u2014 query-to-cluster assignment and first-pass layers",
+    "file": "semantic_cluster_assignment.png",
+    "title": "bench_distance_estimation \u2014 assigning a query's chunks to clusters",
     "ylabel": "Mean latency, us (log scale)",
     "unit": "us",
     "scale": "log",
-    "cases": [
-      "coarse_assignment/.*",
-      "pass1_scoring/.*"
-    ],
     "relabel": [
       [
         "^coarse_assignment/",
-        "assign/"
-      ],
-      [
-        "^pass1_scoring/",
-        "pass1/"
+        ""
       ]
     ],
-    "group_by": "^(coarse_assignment|pass1_scoring)"
+    "cases": [
+      "coarse_assignment/.*"
+    ]
   },
   {
-    "file": "semantic_end_to_end.png",
-    "title": "bench_distance_estimation \u2014 complete searches",
+    "file": "semantic_pass1_layers.png",
+    "title": "bench_distance_estimation \u2014 first pass, peeled apart into cumulative layers",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "scale": "log",
+    "relabel": [
+      [
+        "^pass1_scoring/",
+        ""
+      ]
+    ],
+    "cases": [
+      "pass1_scoring/.*"
+    ]
+  },
+  {
+    "file": "semantic_query_length.png",
+    "title": "bench_distance_estimation \u2014 complete search as the query grows",
     "ylabel": "Mean latency, ms",
     "unit": "ms",
     "scale": "linear",
-    "cases": [
-      "end_to_end_search/.*",
-      "end_to_end_multichunk/.*"
-    ],
+    "ylink": "semantic_e2e",
     "relabel": [
       [
         "^end_to_end_search/",
-        "query_len/"
-      ],
-      [
-        "^end_to_end_multichunk/chunks_per_doc/",
-        "chunks/"
+        "query_chunks/"
       ]
     ],
-    "group_by": "^(end_to_end_search|end_to_end_multichunk)"
+    "cases": [
+      "end_to_end_search/.*"
+    ]
+  },
+  {
+    "file": "semantic_chunks_per_doc.png",
+    "title": "bench_distance_estimation \u2014 complete search as documents gain chunks",
+    "ylabel": "Mean latency, ms",
+    "unit": "ms",
+    "scale": "linear",
+    "ylink": "semantic_e2e",
+    "relabel": [
+      [
+        "^end_to_end_multichunk/chunks_per_doc/",
+        "chunks_per_doc/"
+      ]
+    ],
+    "cases": [
+      "end_to_end_multichunk/.*"
+    ]
   }
 ]
