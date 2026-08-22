@@ -350,21 +350,15 @@
     ]
   },
   {
-    "file": "typed_scans.png",
-    "title": "bench_typed \u2014 typed (rkyv) multi-key reads by tier",
+    "file": "typed_iter.png",
+    "title": "bench_typed \u2014 typed (rkyv) full async iteration by tier",
     "ylabel": "Mean latency, us (log scale)",
     "unit": "us",
     "scale": "log",
-    "cases": [
-      "typed_iter/.*",
-      "typed_keys/.*",
-      "typed_range/.*",
-      "typed_scan_prefix/.*"
-    ],
-    "group_by": "^(typed_iter|typed_keys|typed_range|typed_scan_prefix)",
+    "ylink": "typed_multikey",
     "relabel": [
       [
-        "^typed_",
+        "^typed_iter/",
         ""
       ],
       [
@@ -375,6 +369,84 @@
         "_result_count/",
         "/"
       ]
+    ],
+    "cases": [
+      "typed_iter/.*"
+    ]
+  },
+  {
+    "file": "typed_keys.png",
+    "title": "bench_typed \u2014 typed (rkyv) keys-only fetch by tier",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "scale": "log",
+    "ylink": "typed_multikey",
+    "relabel": [
+      [
+        "^typed_keys/",
+        ""
+      ],
+      [
+        "_keys/",
+        "/"
+      ],
+      [
+        "_result_count/",
+        "/"
+      ]
+    ],
+    "cases": [
+      "typed_keys/.*"
+    ]
+  },
+  {
+    "file": "typed_range.png",
+    "title": "bench_typed \u2014 typed (rkyv) range scan by tier",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "scale": "log",
+    "ylink": "typed_multikey",
+    "relabel": [
+      [
+        "^typed_range/",
+        ""
+      ],
+      [
+        "_keys/",
+        "/"
+      ],
+      [
+        "_result_count/",
+        "/"
+      ]
+    ],
+    "cases": [
+      "typed_range/.*"
+    ]
+  },
+  {
+    "file": "typed_scan_prefix.png",
+    "title": "bench_typed \u2014 typed (rkyv) prefix scan by tier",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "scale": "log",
+    "ylink": "typed_multikey",
+    "relabel": [
+      [
+        "^typed_scan_prefix/",
+        ""
+      ],
+      [
+        "_keys/",
+        "/"
+      ],
+      [
+        "_result_count/",
+        "/"
+      ]
+    ],
+    "cases": [
+      "typed_scan_prefix/.*"
     ]
   },
   {

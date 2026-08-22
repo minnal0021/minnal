@@ -435,13 +435,28 @@ for it to accumulate.
 
 ![Typed point reads by tier and value size](docs/benchmarks/typed_point_reads.png)
 
-![Typed multi-key reads by tier](docs/benchmarks/typed_scans.png)
+![Typed full async iteration by tier](docs/benchmarks/typed_iter.png)
 
-*Three charts, one per magnitude band — the typed writes are fsync-bound
-milliseconds, the point reads are microseconds, and the multi-key reads are in
-between. Bar labels: `get`/`put`/`delete`/`iter`/`keys`/`range`/`scan_prefix`
-are the typed operations, mirroring the raw-bytes API's method names;
-`memtable`/`l1` = in memory vs. on disk.*
+![Typed keys-only fetch by tier](docs/benchmarks/typed_keys.png)
+
+![Typed range scan by tier](docs/benchmarks/typed_range.png)
+
+![Typed prefix scan by tier](docs/benchmarks/typed_scan_prefix.png)
+
+*The writes are fsync-bound milliseconds and the point reads are microseconds,
+so they get their own charts; the four multi-key operations then get one chart
+each, all four drawn on a single shared axis so they remain comparable with one
+another. One operation per chart is what makes the tier ratio legible: sorted by
+value, each `memtable`/`l1` pair falls on adjacent bars, so the ~2x step is the
+gap between neighbours rather than something to hunt for across eighteen bars.
+
+The keys-only chart is the one to look at twice — it is the only one where the
+on-disk bar comes *first* (`l1/100` at 253 µs against `memtable/100` at 256 µs),
+which is the no-tier-gap-at-small-counts result described above, and by 1,000
+keys the usual order has returned. Bar labels:
+`get`/`put`/`delete`/`iter`/`keys`/`range`/`scan_prefix` are the typed
+operations, mirroring the raw-bytes API's method names; `memtable`/`l1` = in
+memory vs. on disk, and the trailing number is the key or result count.*
 
 ## Field-index predicates
 
