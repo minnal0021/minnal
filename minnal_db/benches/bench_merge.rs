@@ -36,6 +36,12 @@
 // 2 KiB put, which no amount of real work can produce. If you see that ordering,
 // stop reading the write rows.
 //
+// A quieter host shrinks the problem without removing it. On the bare-metal
+// Linux box of the 2026-08-22 report (`benchmark.md`), all six `crud/*` write
+// rows landed inside a 1.6% band — but the 8 B put was *still* the slowest of
+// them, 1.5% above the 2 KiB put. Same inversion, two orders of magnitude
+// smaller, and still larger than anything a merge adds.
+//
 // This is why the decomposition below exists. `crud/get`, `closure/*` and
 // `stripe/*` touch no fsync, reproduce to within ~2% run-to-run, and between
 // them account for **everything a merge does that a put does not**. Sum those
