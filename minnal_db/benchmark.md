@@ -52,13 +52,27 @@ here. It archives any previous `target/criterion` rather than deleting it, so
 Criterion never reports a cross-machine "regression" against a baseline measured
 somewhere else.
 
-**Reading the charts.** Bars are sorted **ascending by measured value**, never by
-benchmark name, so the shape of a chart is the finding rather than something to
-be decoded against the table. Where a group of benchmarks spans more than about
-two orders of magnitude it is split across several charts — one per magnitude
-band — because a log axis wide enough to fit nanoseconds and milliseconds in one
-frame renders every bar in the upper band the same height. Within a band the
-axis is linear, which is what makes a few-percent spread visible at all.
+**Reading the charts.** Four conventions, so a chart can be read on its own
+rather than decoded against the table:
+
+- **Bars ascend by measured value**, never by benchmark name, so the shape of a
+  chart is the finding.
+- **A group spanning more than about two orders of magnitude is split across
+  several charts**, one per magnitude band, because a log axis wide enough to
+  hold nanoseconds and milliseconds draws every bar in the upper band at the
+  same height. Within a band the axis is linear, which is what makes a
+  few-percent spread visible at all.
+- **Where the finding is a comparison, the compared category stays contiguous** —
+  the tier blocks in the lookup and scan charts, for instance. Pure value order
+  would drop an `l1` bar between two `memtable` ones and break the side-by-side
+  read. The exceptions are deliberate and called out in the caption: cursor
+  pagination and first-versus-second-pass scoring are both charted in plain value
+  order, because there the interleaving *is* the result.
+- **Where the finding is that several numbers are the same**, the axis starts at
+  zero. A truncated axis would turn sub-1% noise into a staircase that reads as
+  a trend. The exception is the durable-CRUD chart, which is deliberately zoomed
+  to a 2.26-2.34 ms window so the ordering is legible; its spread is noise, as
+  that section explains.
 
 Everything ran with Criterion's defaults — 100 samples per case, a 3-second
 warm-up, a 10-second measurement window, 95% confidence intervals. The one
@@ -211,10 +225,17 @@ which is a cheaper thing to do than the in-memory skip-list search that has to
 walk to the insertion point to be sure. The same inversion shows up, more
 clearly, in the point-lookup sweep below.
 
-![Read latency, memory versus disk](docs/benchmarks/read.png)
+![Get latency from the in-memory table](docs/benchmarks/read_memtable.png)
 
-*Bar labels: `memtable` = still in the in-memory table, `l1` = flushed and
-compacted onto disk.*
+![Get latency from the on-disk SSTable](docs/benchmarks/read_l1.png)
+
+*One chart per tier, drawn on a shared axis so bar heights are directly
+comparable between them — the whole l1 chart sits about 3.1 µs above its
+memtable twin, which is the fixed disk cost. Within each tier the 64 KiB bar is
+the value log making itself felt: values live in the value log whichever tier
+holds the key, so a large value pays for the bytes in both. `miss` is a lookup
+for a key that was never written, and it is the one bar that is cheaper on disk
+than in memory.*
 
 ## Point lookups as the key count grows
 
@@ -291,14 +312,17 @@ show.
 
 ![Prefix and range scans by tier and result size](docs/benchmarks/scan_prefix_range.png)
 
-![Cursor pagination and full iteration by tier](docs/benchmarks/scan_cursor_iter.png)
+![Cursor pagination by page size and tier](docs/benchmarks/scan_cursor.png)
 
-*Split so the two comparisons in this section each get their own axis: the
-prefix/range chart shows the consistent ~2x tier ratio, the cursor/iter chart
-shows the small-page inversion. `memtable`/`l1` = in memory vs. on disk; the
-trailing number means whatever that scan type varies — matching keys for
-`prefix`, results returned for `range`, page size for `cursor`, value size for
-`iter`.*
+![Full async iteration by value size and tier](docs/benchmarks/scan_iter.png)
+
+*Each comparison in this section gets its own axis. The prefix/range chart is
+grouped by tier so the consistent ~2x ratio shows up as two same-shaped blocks.
+The cursor chart is deliberately *not* grouped: sorted by value, `l1/100`
+lands first and `memtable/100` second, which is the small-page inversion stated
+above, and tier blocks would have put those two bars at opposite ends. The
+trailing number is whatever that scan type varies — matching keys for `prefix`,
+results returned for `range`, page size for `cursor`, value size for `iter`.*
 
 ## Mixed read/write workload
 
@@ -513,14 +537,19 @@ doesn't get that cap: cost there scales roughly in step with the extra chunks
 (eight times the chunks per document costs 5.36x as much), because the first
 pass scans all of them rather than capping.
 
-![Candidate scoring and cluster selection](docs/benchmarks/semantic_scoring.png)
+![Candidate scoring, first pass against second](docs/benchmarks/semantic_scoring.png)
 
-*Scoring a batch of candidates, plus picking which clusters to search.
-`single_bit` and `multi_bit` are the coarse first pass and the more precise
-second pass — sorted ascending they interleave, which is the finding: the extra
-precision costs nothing at this scale. Under `top_n_cluster_selection`,
-`select_nth` is the current cluster-picking algorithm and `full_sort` the older
-sort-everything baseline it is measured against.*
+*`first_pass` is the coarse pass and `second_pass` the more precise one. Sorted
+by value they interleave pairwise at every candidate count, and that
+interleaving is the finding: the extra precision costs nothing at this scale.*
+
+![Choosing which clusters to search](docs/benchmarks/semantic_cluster_selection.png)
+
+*`select_nth` is the current cluster-picking algorithm, `full_sort` the older
+sort-everything baseline it is measured against; the trailing number is how many
+clusters were requested. `select_nth` occupies the three cheapest bars and
+`full_sort` the three dearest, and `full_sort` is flat because it sorts all 256
+clusters whatever you ask for.*
 
 ![Query-to-cluster assignment and first-pass layers](docs/benchmarks/semantic_pipeline.png)
 
