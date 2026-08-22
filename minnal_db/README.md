@@ -628,12 +628,16 @@ These are single-threaded ballpark figures; treat them as orders of magnitude ra
 | Operation | Approximate throughput |
 |---|---|
 | `put` (small values, single writer) | ~400–500 ops/s on NVMe without power-loss protection, bound by the per-write WAL fsync; scales roughly with concurrent writers spread across `num_buckets` |
-| `get` (cache-warm) | 500k–1M ops/s |
+| `delete` (single writer) | ~400–500 ops/s — same fsync bound as `put` |
+| `merge` (small values, single writer) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
+| `get` (cache-warm) | 1M–2.5M ops/s |
 | `get` (cold, hits L1 SSTable) | 100k–300k ops/s |
 | Range / prefix scan | Bounded by result-set size |
 | Value-log GC throughput | 100–500 MB/s |
 
-Actual numbers depend heavily on value size, the underlying storage hardware's fsync latency, and (for `put`) how many buckets are being written concurrently. See [`benchmark.md`](benchmark.md) for a dated, full measurement run (hardware spec, per-suite tables, and charts) that this table is checked against — the previous `put` figure here (100k–500k ops/s) was an unverified aspirational number that undercounted the per-write fsync cost by roughly 1000x.
+Actual numbers depend heavily on value size, the underlying storage hardware's fsync latency, and (for `put`) how many buckets are being written concurrently. Every figure above is checked against [`benchmark.md`](benchmark.md), a dated full measurement run with hardware spec, per-suite tables and charts — most recently **2026-08-22** on bare-metal Linux, which measured 440 `put`/s, 438 `merge`/s, 2.53M warm `get`/s and 287k cold `get`/s. Treat any write figure not backed by that report with suspicion: the per-write fsync dominates by three orders of magnitude, and it is easy to publish a write throughput that quietly assumes it away.
+
+**Every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 1.6% of each other on the same hardware — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#merge-against-the-rest-of-crud) for the decomposition.
 
 ---
 
@@ -649,16 +653,29 @@ cargo test
 # Run benchmarks (individual)
 cargo bench --bench bench_write
 cargo bench --bench bench_read
+cargo bench --bench bench_merge           # merge vs. the other CRUD operations
 cargo bench --bench bench_scan
 cargo bench --bench bench_mixed
 cargo bench --bench bench_typed
 cargo bench --bench bench_wal
+cargo bench --bench bench_sstable_lookup
+cargo bench --bench bench_predicate       # field-index query evaluation
+cargo bench --bench bench_bitmap_paging   # paginating query results
+cargo bench --bench bench_distance_estimation --features semantic-search
 
 # All benchmarks
-cargo bench
+cargo bench -p minnal_db --all-features
 ```
 
 Benchmark reports are written to `target/criterion/`. The helpers in `benches/common.rs` disable background workers and use `target/bench_tmp/` (rather than `/tmp/`) to avoid skew from RAM-backed filesystems.
+
+To regenerate [`benchmark.md`](benchmark.md)'s dataset and charts in one step — every suite, then Criterion's means extracted and the charts re-rendered — run:
+
+```bash
+minnal_db/docs/benchmarks/tools/run_report.sh    # ~45 min; archives any previous target/criterion
+```
+
+Run it on an otherwise idle machine: several suites measure sub-microsecond operations, where a busy host shows up as a 20-40% swing.
 
 ---
 

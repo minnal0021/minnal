@@ -1,0 +1,154 @@
+[
+  {
+    "file": "write.png",
+    "title": "bench_write \u2014 put latency by value size",
+    "ylabel": "Mean latency, ms (log scale)",
+    "unit": "ms",
+    "strip": "^write_",
+    "cases": [
+      "write_put/.*"
+    ]
+  },
+  {
+    "file": "read.png",
+    "title": "bench_read \u2014 read/get latency by value size (+ miss path)",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^read_",
+    "cases": [
+      "read_get/.*",
+      "read_get_miss/.*"
+    ]
+  },
+  {
+    "file": "merge.png",
+    "title": "bench_merge \u2014 merge against the other CRUD operations",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "",
+    "cases": [
+      "crud/.*",
+      "closure/.*",
+      "stripe/.*"
+    ]
+  },
+  {
+    "file": "sstable_lookup.png",
+    "title": "bench_sstable_lookup \u2014 point lookup by tier and key count",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^sstable_lookup/",
+    "cases": [
+      "sstable_lookup/.*"
+    ]
+  },
+  {
+    "file": "scan.png",
+    "title": "bench_scan \u2014 scan latency by scan type and tier",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^scan_",
+    "cases": [
+      "scan_prefix/.*",
+      "scan_range/.*",
+      "scan_cursor/.*",
+      "scan_iter/.*"
+    ]
+  },
+  {
+    "file": "mixed.png",
+    "title": "bench_mixed \u2014 blended read/write workload, per-operation cost",
+    "ylabel": "Mean latency per op, ms (log scale)",
+    "unit": "ms",
+    "strip": "^mixed/",
+    "cases": [
+      "mixed/.*"
+    ]
+  },
+  {
+    "file": "wal_durability.png",
+    "title": "bench_wal \u2014 write cost: fsync'd vs unsynced append, full put, namespace tagging",
+    "ylabel": "Mean latency, ms (log scale)",
+    "unit": "ms",
+    "strip": "^wal_",
+    "cases": [
+      "wal_append_fsync/.*",
+      "wal_append_no_fsync/.*",
+      "wal_full_put_throughput/.*",
+      "wal_namespace_overhead/.*"
+    ]
+  },
+  {
+    "file": "wal_serialization.png",
+    "title": "bench_wal \u2014 WAL entry serialization round-trip",
+    "ylabel": "Mean latency, ns (log scale)",
+    "unit": "ns",
+    "strip": "^wal_serialization/",
+    "cases": [
+      "wal_serialization/.*"
+    ]
+  },
+  {
+    "file": "wal_scan.png",
+    "title": "bench_wal \u2014 recovery scan",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^wal_scan/",
+    "cases": [
+      "wal_scan/.*"
+    ]
+  },
+  {
+    "file": "typed.png",
+    "title": "bench_typed \u2014 typed (rkyv) API latencies",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^typed_",
+    "cases": [
+      "typed_get/.*",
+      "typed_put/.*",
+      "typed_delete/.*",
+      "typed_iter/.*",
+      "typed_keys/.*",
+      "typed_range/.*",
+      "typed_scan_prefix/.*"
+    ]
+  },
+  {
+    "file": "predicate.png",
+    "title": "bench_predicate \u2014 field-index predicate evaluation",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^predicate_",
+    "cases": [
+      "predicate_.*"
+    ]
+  },
+  {
+    "file": "bitmap_paging.png",
+    "title": "bench_bitmap_paging \u2014 offset paging over a result bitmap",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "^bitmap_",
+    "cases": [
+      "bitmap_page_at_offset/.*",
+      "bitmap_full_paged_walk/.*"
+    ]
+  },
+  {
+    "file": "distance_estimation.png",
+    "title": "bench_distance_estimation \u2014 semantic search stages",
+    "ylabel": "Mean latency, us (log scale)",
+    "unit": "us",
+    "strip": "",
+    "cases": [
+      "first_pass_single_bit/.*",
+      "second_pass_multi_bit/.*",
+      "top_n_cluster_selection/.*",
+      "coarse_assignment/.*",
+      "pass1_scoring/.*",
+      "end_to_end_search/.*",
+      "end_to_end_multichunk/.*"
+    ]
+  }
+]
