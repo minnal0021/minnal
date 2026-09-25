@@ -4,19 +4,19 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 
 ## Key files
 
-| File | Role |
+| File (under `minnal_db/src/semantic_search/`) | Role |
 |---|---|
-| `src/lib.rs` | Public re-exports |
-| `src/chunking/mod.rs` | Document chunking: `chunk_document` (sentence-split → `sliding_windows`). Queries are not chunked. |
-| `src/cluster/mod.rs` | `Cluster`, `ClusterIndex` — IVF cluster centroids, nearest-cluster lookup |
-| `src/index/vector_index.rs` | `VectorIndex` struct, `VectorKvStore` trait (`scan_sparse_cluster`, `get_dense_entry`) |
-| `src/index/composite_key.rs` | Composite key layout: `cluster_id (4B BE) ‖ doc_id` |
-| `src/index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
-| `src/quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode) |
-| `src/service/mod.rs` | HTTP client for the external embedding service; `embed_document` / `embed_query`; `search()` two-pass ANN |
-| `src/beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
+| `mod.rs` | Module root and re-exports |
+| `chunking/mod.rs` | Document chunking: `chunk_document` (sentence-split → `sliding_windows`). Queries are not chunked. |
+| `cluster/mod.rs` | `Cluster`, `ClusterIndex` — IVF cluster centroids, nearest-cluster lookup |
+| `index/vector_index.rs` | `VectorIndex` struct, `VectorKvStore` trait (`scan_sparse_clusters_batch` / `get_dense_entries_batch`, which `search()` uses, and their single-item forms) |
+| `index/composite_key.rs` | Composite key layout: `cluster_id (4B BE) ‖ doc_id` |
+| `index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
+| `quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode) |
+| `service/mod.rs` | HTTP client for the external embedding service; `embed_document` / `embed_query`; `search()` two-pass ANN and `SCORING_GATE` |
+| `beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
 | `query-embedding-report.md` | BEIR evaluation behind whole-query Pass-1 embedding (vs chunked queries) |
-| `src/vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
+| `vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
 
 ## How it works
 
@@ -46,20 +46,30 @@ The **query-embedding cache** (`system_qemb_cache`, below) follows the same spli
 **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
 1. Use the Pass-1 query vector (the whole-query embedding; fetched from the `system_qemb_cache` TTL namespace on a hit).
 2. Find its top-`n_probes` clusters by Euclidean distance (with several query vectors, the union across them). This is an **exact, exhaustive** scan — `ClusterIndex::find_top_n_cluster_ids_batch` computes the distance to *every* centroid (over a contiguous centroid matrix) and selects the `n_probes` nearest (`select_nth_unstable`, ~O(C)). There is **no neighbour graph / approximate traversal**: coarse-assignment cost is **T·C·D** (query vectors × centroids × dim), and production `T = 1`, so it is ~microseconds at C≈256. A graph is the wrong lever — approximate on the most recall-sensitive stage, marginal at a few hundred nodes. The contiguous-matrix scan was a measured ~12% win back when queries were chunked (T up to 100); **parallelising the per-vector scans was tried and reverted (~2.4× slower — the work is microseconds, so the thread pool costs more than it saves)**; a blocked GEMM is the only remaining lever and only pays at far larger C. See `Semantic-Search-Architecture.md`.
-3. `scan_sparse_cluster(cluster_id)` for each probed cluster in parallel.
-4. Apply the optional `doc_filter` (RoaringBitmap predicate) — skip non-matching docs.
-5. Score with `SingleBitQuanDotProductEstimator` using **ColBERT MaxSim**:
-   - For each query vector `q_i` and each document `d`, find `max_j ⟨q_i, d_j⟩` over all chunks `d_j` of `d` in the probed cluster.
-   - Accumulate the per-vector max across all probed clusters (same chunk may appear in several).
-   - Final score: `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩`. With production's single whole-query vector this is `max_j ⟨q, d_j⟩`, the document's best-matching chunk.
-6. Retain top `first_pass_sparse_search_top_k` candidates.
+3. `scan_sparse_clusters_batch(probe_clusters)` fetches every probed cluster in **one** call: `LSMTree::scan_prefixes` reads each LSM layer once for the whole prefix set (L1 seeks per prefix via the sparse index), then the value log resolves each pointer with its own `pread`. This scan is most of a warm query's cost and scales with the number of entries probed.
+4. Take a `SCORING_GATE` permit (see *Concurrency* below).
+5. Flatten every probed entry into one list and score it **in parallel over entries, not clusters** (IVF clusters are skewed; one can hold a third of a corpus), each entry into its own row of a flat `n_query`-wide matrix. Entries are read zero-copy from their rkyv archive. The optional `doc_filter` (RoaringBitmap predicate) skips non-matching docs here, as do corrupt or wrong-style entries.
+6. Group per document with **ColBERT MaxSim**: sort the kept entry indices by `doc_id`, and fold each run of one document's entries (a document's chunks can sit in several probed clusters) with an element-wise max. `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩`; with production's single whole-query vector this is `max_j ⟨q, d_j⟩`, the document's best-matching chunk. The sort replaced a per-document `HashMap` whose allocations and cross-thread merge were half of a FiQA query.
+7. Keep the top `first_pass_sparse_search_top_k` with `select_nth_unstable` — O(n), because Pass 2 re-ranks and does not care about their order.
+8. Release the permit and hand the scanned entries to `spawn_blocking` to be freed (~90k heap buffers on FiQA, ~6 ms single-threaded) off the request path.
 
 **Pass 2 — dense (MultiBit):**
-1. `get_dense_entry(doc_id)` for each sparse candidate in parallel.
-2. Score each candidate with `MultiBitQuanDotProductEstimator` against the single whole-query dense embedding (symmetric with the document's whole-text dense vector).
+1. `get_dense_entries_batch` fetches every candidate's dense entry in one batch read.
+2. Take a `SCORING_GATE` permit again, then score each candidate with `MultiBitQuanDotProductEstimator` against the single whole-query dense embedding (symmetric with the document's whole-text dense vector), in parallel.
 3. Build top-k min-heap and return sorted descending.
 
 The `doc_filter` is applied **only in Pass 1**. Pass 2 operates on the already-filtered candidate list.
+
+### Concurrency: the scoring gate (load-bearing)
+
+`search()` runs its rayon work from a tokio task, and every search shares rayon's global pool. A rayon worker waiting inside a `join` steals **any** queued job, including another search's root job. The stolen search then runs on top of the waiting one's stack, so the first cannot return until the second finishes, and under steady load new root jobs keep arriving. Measured on FiQA at 32 concurrent clients before the fix: 19 of 32 connections stalled in Pass 1 for the entire 20 s run while the rest completed normally (p99 4–10 s across runs, max = the run length). The code before the hot-path work had the same flaw (p99 3–4 s, max 5–9 s under the same load); the faster Pass 1 made it worse, not new.
+
+`SCORING_GATE` (`service/mod.rs`) is a process-wide tokio semaphore of `MAX_CONCURRENT_SCORING` = 2 permits around the two CPU sections. It bounds nesting to one level, and tokio admits waiters in FIFO order, so nothing starves. With it, FiQA at 32 clients went from p99 9.7 s / max 15.1 s to p99 308 ms / max 356 ms (p99 ≈ 1.2× p50, so what remains is queueing), and throughput rose from 110 to 125 qps. 2 permits beat 1, 4, 8 and no bound in a sweep. Concurrency is correct as well as fair: results at 32 clients are byte-identical to sequential ones.
+
+Three rules keep it working:
+- **Never hold a permit across an `.await`.** A search holding one permit while it waits for I/O and then for a second permit deadlocks at `MAX_CONCURRENT_SCORING` concurrent searches. `test_concurrent_searches_match_sequential_results` catches this.
+- **Keep off-request-path work off the rayon pool.** The scan-result drop was `rayon::spawn`, and a 6 ms job on the rayon queue is stolen by workers waiting in some search's `join` exactly as a search is. Moving it to `spawn_blocking` alone cut the c=32 max from 20 s to 2.5 s. It is not free: a single client pays ~0.1 ms on SciFact and ~0.8 ms on FiQA (≈4%) against `rayon::spawn` with the gate, which keeps single-client latency but has 20–30% worse p99/max under load. A single dedicated dropper thread was worse on both counts (it falls behind at 64 clients).
+- **The bound is process-wide because the pool is.** Other rayon users on a tokio thread (the RaBitQ quantisation in the embed path) are not gated, so a search can still nest one of those small jobs.
 
 ## External dependency
 

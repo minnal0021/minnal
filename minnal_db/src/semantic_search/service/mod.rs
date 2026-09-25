@@ -23,6 +23,24 @@ use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, Vect
 use crate::semantic_search::quantisation::rabitq;
 use std::collections::HashMap;
 
+/// How many searches may run their rayon-parallel scoring at once, process-wide.
+///
+/// Every search shares rayon's global pool, and a rayon worker blocked in a `join`
+/// steals *any* queued job — including another search's root job from the
+/// injector. The stolen search then runs on top of the waiting one's stack, so the
+/// first cannot return until the second finishes; under steady load new root jobs
+/// keep arriving and a request can be buried indefinitely. Measured on FiQA at 32
+/// concurrent clients with no bound: requests stalled in Pass 1 for the whole 20 s
+/// run (p99 4.2 s) while the rest completed normally. With at most `K` root jobs
+/// in the pool, nesting is at most `K - 1` deep, and the tokio semaphore admits
+/// waiters in FIFO order, so nothing starves.
+///
+/// Each gated section already spreads over every rayon thread, so a small bound
+/// costs little throughput: 2 measured best (119 qps vs 108–110 for 1, 4 and 8, p99
+/// 333 ms vs 1.1 s with no bound). The bound is process-wide because the pool is.
+const MAX_CONCURRENT_SCORING: usize = 2;
+static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCORING);
+
 /// One fetched Pass-1 entry, borrowed from the scan result:
 /// `(cluster_id, per-query-vector estimators for that cluster, doc_id, raw rkyv bytes)`.
 type SparseEntryRef<'a> = (u32, &'a [SingleBitQuanDotProductEstimator], &'a [u8], &'a [u8]);
@@ -354,8 +372,13 @@ where
 
     debug!("ANN search: probing {} cluster(s) (sparse pass)", probe_clusters.len());
 
-    // Fetch all probed clusters in a single batch operation (one blocking task, num_buckets threads).
+    // Fetch all probed clusters in a single batch operation: one blocking task, which
+    // spawns a scoped thread per overlapping L1 bucket and then one per value-log bucket.
     let sparse_by_cluster = kv_store.scan_sparse_clusters_batch(&probe_clusters).await;
+
+    // Everything from here to the dense fetch is CPU work, mostly on the rayon pool.
+    // No `.await` happens while a permit is held.
+    let pass1_permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
 
     // Score using ColBERT MaxSim across all probed clusters — in parallel.
     //
@@ -503,8 +526,11 @@ where
     // are two heap buffers per entry (doc_id + rkyv bytes), and dropping ~90k entries
     // on a 57k-doc corpus took ~6 ms single-threaded — the same order as all of
     // Pass 1's scoring. The total work is unchanged; it just no longer delays the reply.
+    // Not `rayon::spawn`: a 6 ms job queued on the rayon pool gets stolen by workers
+    // waiting inside another search's `join` and stalls that search (see SCORING_GATE).
     drop(entries);
-    rayon::spawn(move || drop(sparse_by_cluster));
+    drop(pass1_permit);
+    tokio::task::spawn_blocking(move || drop(sparse_by_cluster));
 
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await;
 
@@ -531,6 +557,7 @@ where
     // builds ~n_probes estimators instead of one per candidate. Both pieces of reused
     // state are per rayon worker via `map_init`; doc_ids are moved (not cloned) into the
     // heap entries.
+    let _pass2_permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
     let scored: Vec<HeapEntry> = dense_doc_ids
         .into_par_iter()
         .zip(dense_raw.into_par_iter())
@@ -2109,5 +2136,95 @@ mod tests {
         assert_eq!(results.len(), 2, "both docs should pass the sparse cap");
         // Sparse scores: doc_all_tokens = 1+1+1 = 3.0, doc_one_token = 1+1+1 = 3.0
         // (Same chunk, same centroid, same query token → both get 3.0; result order is by dense score.)
+    }
+
+    /// Runs one search over `store` and returns `(doc_id, score)` pairs.
+    async fn run_search(config: &SemanticSearchConfig, index: &ClusterIndex, store: &MockVectorKvStore) -> Vec<(Vec<u8>, f32)> {
+        search(
+            config,
+            "test_ns",
+            index,
+            &[vec![1.0f32, 0.0, 0.0, 0.0]],
+            &[1.0f32, 0.0, 0.0, 0.0],
+            store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await
+        .into_iter()
+        .map(|r| (r.document_id, r.dot_product))
+        .collect()
+    }
+
+    /// Every early return after SCORING_GATE is acquired must give its permit back.
+    /// A leak would leave fewer than MAX_CONCURRENT_SCORING permits, and after that
+    /// many leaking searches every later search would wait forever — so the timeout
+    /// is what fails.
+    #[tokio::test]
+    async fn test_search_early_return_releases_the_scoring_gate() {
+        let index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let config = SemanticSearchConfig {
+            n_probes: 1,
+            ..Default::default()
+        };
+        // Every sparse entry is corrupt, so Pass 1 keeps no candidate and `search`
+        // returns from inside the gated section.
+        let mut no_candidates = MockVectorKvStore::new();
+        no_candidates.add_corrupt_sparse_entry(1, b"doc_corrupt");
+        let mut one_doc = MockVectorKvStore::new();
+        one_doc.add_sparse_entry(1, b"doc_ok", 0.1);
+        one_doc.add_dense_entry(1, b"doc_ok", 0.1);
+
+        let bounded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for _ in 0..MAX_CONCURRENT_SCORING * 4 {
+                assert!(run_search(&config, &index, &no_candidates).await.is_empty());
+            }
+            run_search(&config, &index, &one_doc).await
+        })
+        .await;
+        assert_eq!(bounded.expect("search blocked on SCORING_GATE: a permit leaked").len(), 1);
+    }
+
+    /// Many searches in flight on a multi-threaded runtime (the production shape)
+    /// all finish, and each returns exactly what the same search returns alone.
+    /// Guards the gate against holding a permit across an `.await` (a deadlock under
+    /// concurrency) and against any cross-request state in the scoring path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_searches_match_sequential_results() {
+        let index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        for d in 0..2_000u32 {
+            let doc_id = format!("doc_{d:05}").into_bytes();
+            let cluster = 1 + d % 2;
+            store.add_sparse_entry(cluster, &doc_id, (d % 97) as f32 * 0.01);
+            store.add_dense_entry(cluster, &doc_id, (d % 89) as f32 * 0.01);
+        }
+        let config = SemanticSearchConfig {
+            n_probes: 2,
+            first_pass_sparse_search_top_k: 500,
+            ..Default::default()
+        };
+        let (index, store, config) = (std::sync::Arc::new(index), std::sync::Arc::new(store), std::sync::Arc::new(config));
+        let expected = run_search(&config, &index, &store).await;
+        assert!(!expected.is_empty());
+
+        let searches: Vec<_> = (0..64)
+            .map(|_| {
+                let (index, store, config) = (index.clone(), store.clone(), config.clone());
+                tokio::spawn(async move { run_search(&config, &index, &store).await })
+            })
+            .collect();
+        let all = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut all = Vec::with_capacity(searches.len());
+            for search in searches {
+                all.push(search.await.expect("search task panicked"));
+            }
+            all
+        })
+        .await
+        .expect("concurrent searches did not all finish");
+        for result in all {
+            assert_eq!(result, expected);
+        }
     }
 }
