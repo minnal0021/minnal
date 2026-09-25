@@ -488,11 +488,12 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
     );
 }
 
-// ── Pass-1 scoring isolation: dot arithmetic vs deserialize vs hashmap ─────────
+// ── Pass-1 scoring isolation: dot arithmetic vs deserialize vs per-doc grouping ─
 //
-// Decomposes the Pass-1 MaxSim inner fold (`service::search`, the loop over a probed
-// cluster's entries at `service/mod.rs`) into three CUMULATIVE layers over ONE fixed
-// candidate set, so the marginal cost of each stage is directly readable:
+// Decomposes Pass-1 MaxSim scoring (`service::search`) into CUMULATIVE layers over
+// ONE fixed candidate set, so the marginal cost of each stage is directly readable.
+// All layers are single-threaded: production spreads the same per-entry work over the
+// rayon pool, and this bench measures the work, not the parallelism.
 //
 //   dot_arithmetic  pure `estimate_from_parts` + running-max, over pre-widened native
 //                   u64 buffers — no rkyv, no map. This is the SIMD masked-sum the
@@ -500,13 +501,18 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
 //   plus_archived   + `VectorIndex::access_list` (validated zero-copy) and
 //                   `copy_packed_into` per chunk — the deserialize+widen the real
 //                   path actually pays (it does NOT own-deserialize).
-//   plus_hashmap    + accumulate into the `HashMap<doc_id, Vec<f32>>` MaxSim state,
-//                   exactly like the real fold. This layer == real Pass-1 scoring.
+//   plus_grouping   + the production MaxSim state: each entry scored into its own row
+//                   of a flat matrix, then entries grouped per doc by sorting their
+//                   indices on doc_id and folding each run. This layer == real Pass-1.
+//   plus_hashmap    the fold `search()` used before `e414cdb`: accumulate into a
+//                   `HashMap<doc_id, Vec<f32>>`. Kept as the baseline plus_grouping
+//                   replaced — not what production pays any more.
 //
 // Read the attribution as:
 //   dot_arithmetic                 → the dot products themselves
 //   plus_archived − dot_arithmetic → access_list + copy_packed_into (deserialize/widen)
-//   plus_hashmap  − plus_archived  → the MaxSim state map
+//   plus_grouping − plus_archived  → the per-doc grouping (current)
+//   plus_hashmap  − plus_archived  → the MaxSim state map (previous)
 //
 // Throughput is set to the number of dot products (docs × chunks × tokens), so criterion
 // reports per-dot-product time — compare it against the deserialize/map deltas to decide
@@ -639,7 +645,46 @@ fn bench_pass1_scoring_isolation(c: &mut Criterion) {
             });
         });
 
-        // L3 — + the HashMap<doc_id, Vec<f32>> MaxSim state map. == real Pass-1 scoring.
+        // L3 — + flat per-entry rows, grouped per doc by sort + chunk_by. == real Pass-1.
+        group.bench_with_input(BenchmarkId::new("plus_grouping", t), &t, |b, _| {
+            let mut words_buf: Vec<u64> = Vec::new();
+            let mut doc_maxes = vec![f32::NEG_INFINITY; t];
+            b.iter(|| {
+                let mut rows = vec![f32::NEG_INFINITY; inp.blobs.len() * t];
+                for ((_doc_id, blob), row) in inp.blobs.iter().zip(rows.chunks_mut(t)) {
+                    let list = VectorIndex::access_list(blob).expect("scoring bench: archive access");
+                    for vi in list.iter() {
+                        vi.copy_packed_into(&mut words_buf);
+                        let scaling = vi.scaling_factor();
+                        for ((q, est), row_max) in inp.query.iter().zip(&inp.estimators).zip(row.iter_mut()) {
+                            let sc = est.estimate_from_parts(q, &words_buf, scaling);
+                            if sc > *row_max {
+                                *row_max = sc;
+                            }
+                        }
+                    }
+                }
+                let mut order: Vec<usize> = (0..inp.blobs.len()).collect();
+                order.sort_unstable_by(|&a, &b| inp.blobs[a].0.cmp(&inp.blobs[b].0));
+                let acc: f32 = order
+                    .chunk_by(|&a, &b| inp.blobs[a].0 == inp.blobs[b].0)
+                    .map(|group| {
+                        doc_maxes.fill(f32::NEG_INFINITY);
+                        for &i in group {
+                            for (doc_max, &entry_max) in doc_maxes.iter_mut().zip(&rows[i * t..(i + 1) * t]) {
+                                if entry_max > *doc_max {
+                                    *doc_max = entry_max;
+                                }
+                            }
+                        }
+                        collapse(&doc_maxes)
+                    })
+                    .sum();
+                black_box(acc)
+            });
+        });
+
+        // Previous L3 — the HashMap<doc_id, Vec<f32>> fold search() used before e414cdb.
         group.bench_with_input(BenchmarkId::new("plus_hashmap", t), &t, |b, _| {
             b.iter(|| {
                 let mut map: HashMap<&[u8], Vec<f32>> = HashMap::new();

@@ -2485,17 +2485,29 @@ impl LSMTree {
         Ok(results)
     }
 
-    /// Scan multiple 4-byte BE u32 prefixes in a **single pass per bucket**.
+    /// Scan multiple 4-byte BE u32 prefixes in one call, returning live
+    /// `(key, pointer)` pairs in ascending key order.
     ///
-    /// Where `scan_prefix` × N prefixes would do N × num_buckets full linear
-    /// scans of the level1 SSTables (each entry read via two `pread` syscalls),
-    /// this method reads each bucket's level1 file **once** into an in-memory
-    /// buffer and checks every entry against the full `prefix_ids` set — cutting
-    /// `pread` syscall count from O(N_prefixes × entries_per_bucket) to O(1)
-    /// per bucket.
+    /// Each layer is read once for the whole prefix set rather than once per prefix:
     ///
-    /// Returns a flat `Vec<(key, pointer)>`; the caller maps entries back to
-    /// their originating prefix via the first 4 bytes of each key.
+    /// * **L1** — one scoped thread per bucket whose key span overlaps the requested
+    ///   ids. Each seeks to every requested prefix through the sparse index and
+    ///   reads just that range with a buffered frame reader
+    ///   ([`for_each_l1_entry_in_range`](Self::for_each_l1_entry_in_range)), so a
+    ///   probe of a few clusters out of a large L1 reads only those clusters.
+    /// * **L0** — one scoped thread per bucket holding L0 files; each file is read
+    ///   end to end (L0 has no sparse index) and filtered to the prefix set.
+    /// * **Memtables** — the active one is range-iterated per prefix; read-only ones
+    ///   are filtered.
+    ///
+    /// The layers are resolved by [`merge_scan_layers`]: L1 entries are sorted and
+    /// deduplicated in bulk, then a sorted merge lets the newer layers shadow them.
+    /// The newer layers go through a `BTreeMap` first, which is cheap because they are
+    /// usually small; L1 is not, since a per-entry map insert was most of the cost of
+    /// a large scan.
+    ///
+    /// The caller maps entries back to their originating prefix via the first 4
+    /// bytes of each key.
     ///
     /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
     /// returned pointers are LSM-complete but must be resolved against the value log
