@@ -183,21 +183,30 @@ impl DocStore {
 
     /// Run an ANN semantic search against a KV namespace with `value_type = str`.
     ///
+    /// `ranking` overrides the configured result ordering for this call (see
+    /// [`DocStore::effective_ranking`]).
+    ///
     /// Returns [`DocStoreError::EmbeddingFailed`] when no [`SemanticSearchContext`]
     /// is configured, when the namespace does not have `semantic_search_enabled`,
-    /// or when the embedding service call fails.
+    /// or when the embedding service call fails, and
+    /// [`DocStoreError::InvalidRanking`] if `ranking` yields invalid params.
     #[cfg(feature = "semantic-search")]
     pub async fn kv_search_semantic(
         &self,
         namespace: &str,
         query_text: &str,
         top_k: Option<usize>,
+        ranking: &crate::semantic_search::service::RankingOverride,
         pagination: crate::doc_store::pagination::Pagination,
     ) -> Result<crate::doc_store::pagination::Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
         let ctx = self
             .semantic_ctx
             .as_ref()
             .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+        let opts = crate::semantic_search::service::SearchOptions {
+            top_k,
+            ranking: Some(ctx.config.ranking.with_override(ranking)?),
+        };
 
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
@@ -219,7 +228,7 @@ impl DocStore {
             &query_dense,
             &db_store,
             None::<fn(&[u8]) -> bool>,
-            top_k,
+            opts,
         )
         .await;
 

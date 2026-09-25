@@ -114,15 +114,29 @@ pub fn score_rkyv_bytes<E: DistanceEstimator>(bytes: &[u8], query_embedding: &[f
 }
 
 /// A single ranked candidate returned by an ANN search.
+///
+/// Results are ordered by `fused_score` (see
+/// [`RankingParams`](crate::semantic_search::service::RankingParams)). Both ranks
+/// are 1-based and computed over the whole candidate set that reached fusion, not
+/// just the returned top-k.
 #[derive(Clone, Debug)]
 pub struct QueryResult {
     /// Raw bytes of the document identifier, taken from the KV store key
     /// suffix after the 4-byte cluster prefix.  Decode into the concrete
     /// type with e.g. `u64::from_be_bytes(...)` or `Uuid::from_slice(...)`.
     pub document_id: Vec<u8>,
-    /// Estimated dot-product similarity to the query embedding.
-    pub dot_product: f32,
-    /// Per-document error bound from the quantised vector index.
+    /// Pass-2 estimated dot-product similarity between the whole-query and
+    /// whole-document dense embeddings.
+    pub dense_score: f32,
+    /// Pass-1 ColBERT MaxSim score over the document's chunk embeddings.
+    pub sparse_score: f32,
+    /// Score the results are ordered by; equals `dense_score` in `Dense` mode.
+    pub fused_score: f32,
+    /// Rank of this document by `dense_score` alone (the `Dense`-mode order).
+    pub dense_rank: u32,
+    /// Rank of this document by `sparse_score` alone.
+    pub sparse_rank: u32,
+    /// Error bound of the quantised dense estimate.
     pub error_bound: f32,
 }
 

@@ -5,6 +5,7 @@
 //! probing, and result ranking.  Raw text is forwarded to the service as-is.
 
 mod embedding_service;
+mod fusion;
 
 pub use crate::semantic_search::index::vector_index::QuantisationStyle;
 
@@ -12,15 +13,15 @@ use crate::semantic_search::chunking;
 
 use log::{debug, info, warn};
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-
 use rayon::prelude::*;
 
 use crate::semantic_search::cluster::ClusterIndex;
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::semantic_search::quantisation::rabitq;
+pub(crate) use fusion::Candidate;
+#[cfg(test)]
+pub(crate) use fusion::fuse;
 use std::collections::HashMap;
 
 /// `(cluster_id, [(doc_id_bytes, raw_rkyv_bytes)])` pairs — the fetched sparse entries
@@ -28,6 +29,7 @@ use std::collections::HashMap;
 type ClusterEntryList = Vec<(u32, Vec<(Vec<u8>, Vec<u8>)>)>;
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
+pub use fusion::{DEFAULT_RRF_K, DEFAULT_SPARSE_WEIGHT, RankFusion, RankingError, RankingOverride, RankingParams};
 
 /// Configuration required to call the embedding service.
 #[derive(Debug, Clone)]
@@ -93,6 +95,11 @@ pub struct SemanticSearchConfig {
     /// the overall cap. Bound when the shared HTTP client is first built.
     /// Default: 10s.
     pub embedding_connect_timeout: std::time::Duration,
+
+    /// How the final order is derived from the Pass-1 (MaxSim) and Pass-2 (dense)
+    /// scores. Can be overridden per call via [`SearchOptions::ranking`].
+    /// Default: [`RankFusion::Dense`].
+    pub ranking: RankingParams,
 }
 
 impl Default for SemanticSearchConfig {
@@ -110,6 +117,7 @@ impl Default for SemanticSearchConfig {
             query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
             embedding_request_timeout: std::time::Duration::from_secs(30),
             embedding_connect_timeout: std::time::Duration::from_secs(10),
+            ranking: RankingParams::default(),
         }
     }
 }
@@ -212,67 +220,6 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
     })
 }
 
-/// Run a two-pass approximate nearest-neighbour search against the quantised embedding store.
-///
-/// # Algorithm
-///
-/// **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
-/// 1. For each query token, find the `n_probes` closest clusters by Euclidean distance.
-/// 2. Scan all SingleBit entries in the union of those clusters in parallel.
-/// 3. For each document `d` and each query token `q_i`, estimate `max_j ⟨q_i, d_j⟩`
-///    over all chunks `d_j` of `d` found in the probed clusters.
-/// 4. Aggregate via ColBERT MaxSim: `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩`.
-///    Document chunks whose clusters are not probed contribute 0 to their query token's term.
-/// 5. Retain the top `first_pass_sparse_search_top_k` candidates.
-///
-/// **Pass 2 — dense (MultiBit):**
-/// 1. Batch-fetch the dense entry for every sparse candidate by `doc_id` in a single
-///    operation ([`VectorKvStore::get_dense_entries_batch`]).
-/// 2. Score each candidate in parallel with [`MultiBitQuanDotProductEstimator`] against
-///    the single whole-query embedding `query_dense_embedding` (symmetric with the
-///    document's whole-text dense vector). Each [`VectorIndex`] carries its own
-///    `cluster_id`, so the centroid is looked up directly with no separate meta read.
-/// 3. Sort descending by score and return the top `top_k` entries.
-///
-/// # Query inputs
-///
-/// - `query_sparse_embeddings` — one embedding per query chunk, used in Pass 1.
-/// - `query_dense_embedding` — a single whole-query embedding, used in Pass 2.
-///
-/// Returns an empty result if either is empty.
-///
-/// # Predicate filtering
-///
-/// `doc_filter` is an optional closure `Fn(&[u8]) -> bool` applied in the sparse pass.
-/// Documents that fail the filter are excluded from both passes.
-///
-/// # Top-k override
-///
-/// `top_k` overrides `config.top_k_results` for this call only.
-// Heap entry for top-k tracking; min-heap ordered by dot_product ascending.
-struct HeapEntry {
-    dot_product: f32,
-    error_bound: f32,
-    document_id: Vec<u8>,
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.dot_product.total_cmp(&other.dot_product).is_eq()
-    }
-}
-impl Eq for HeapEntry {}
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.dot_product.total_cmp(&other.dot_product)
-    }
-}
-
 /// Aggregate a document's per-query-token MaxSim maxima into its sparse score:
 /// `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩` (true ColBERT MaxSim).
 ///
@@ -295,6 +242,57 @@ fn doc_id_hex(doc_id: &[u8]) -> String {
     s
 }
 
+/// Per-call overrides for [`search`]; `None` fields use the [`SemanticSearchConfig`] value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions {
+    /// Maximum number of results (overrides `top_k_results`).
+    pub top_k: Option<usize>,
+    /// Ranking / fusion parameters (overrides `ranking`).
+    pub ranking: Option<RankingParams>,
+}
+
+/// Run a two-pass approximate nearest-neighbour search against the quantised embedding store.
+///
+/// # Algorithm
+///
+/// **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
+/// 1. For each query token, find the `n_probes` closest clusters by Euclidean distance.
+/// 2. Scan all SingleBit entries in the union of those clusters in parallel.
+/// 3. For each document `d` and each query token `q_i`, estimate `max_j ⟨q_i, d_j⟩`
+///    over all chunks `d_j` of `d` found in the probed clusters.
+/// 4. Aggregate via ColBERT MaxSim: `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩`.
+///    Document chunks whose clusters are not probed contribute 0 to their query token's term.
+/// 5. Retain the top `first_pass_sparse_search_top_k` candidates.
+///
+/// **Pass 2 — dense (MultiBit):**
+/// 1. Batch-fetch the dense entry for every sparse candidate by `doc_id` in a single
+///    operation ([`VectorKvStore::get_dense_entries_batch`]).
+/// 2. Score each candidate in parallel with [`MultiBitQuanDotProductEstimator`] against
+///    the single whole-query embedding `query_dense_embedding` (symmetric with the
+///    document's whole-text dense vector). Each [`VectorIndex`] carries its own
+///    `cluster_id`, so the centroid is looked up directly with no separate meta read.
+/// 3. Fuse the Pass-1 and Pass-2 scores of every candidate according to the
+///    effective [`RankingParams`] (see [`RankFusion`]) and return the top `top_k`.
+///    Each result carries both raw scores, the fused score, and its rank under
+///    each signal alone.
+///
+/// # Query inputs
+///
+/// - `query_sparse_embeddings` — one embedding per query chunk, used in Pass 1.
+/// - `query_dense_embedding` — a single whole-query embedding, used in Pass 2.
+///
+/// Returns an empty result if either is empty.
+///
+/// # Predicate filtering
+///
+/// `doc_filter` is an optional closure `Fn(&[u8]) -> bool` applied in the sparse pass.
+/// Documents that fail the filter are excluded from both passes.
+///
+/// # Per-call overrides
+///
+/// `opts.top_k` overrides `config.top_k_results` and `opts.ranking` overrides
+/// `config.ranking` for this call only. Invalid ranking params (see
+/// [`RankingParams::validate`]) return no results with a warning.
 #[allow(clippy::too_many_arguments)]
 pub async fn search<K, F>(
     config: &SemanticSearchConfig,
@@ -304,7 +302,7 @@ pub async fn search<K, F>(
     query_dense_embedding: &[f32],
     kv_store: &K,
     doc_filter: Option<F>,
-    top_k: Option<usize>,
+    opts: SearchOptions,
 ) -> Vec<QueryResult>
 where
     K: VectorKvStore,
@@ -325,7 +323,12 @@ where
         return vec![];
     }
 
-    let top_k_limit = top_k.unwrap_or(config.top_k_results);
+    let top_k_limit = opts.top_k.unwrap_or(config.top_k_results);
+    let ranking = opts.ranking.unwrap_or(config.ranking);
+    if let Err(e) = ranking.validate() {
+        warn!("semantic search ranking params are invalid ({e}); returning no results");
+        return vec![];
+    }
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
@@ -477,8 +480,9 @@ where
     // Fetch all dense entries in one batch operation (single blocking task in production).
     let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.clone()).collect();
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await;
+    drop(dense_doc_ids);
 
-    debug!("ANN search: dense pass over {} candidates", dense_doc_ids.len());
+    debug!("ANN search: dense pass over {} candidates", sparse_ranked.len());
 
     // scaled_query_sum is constant for the whole-query dense embedding + bit-width
     // across all clusters, so compute it once.
@@ -499,14 +503,14 @@ where
     // constant for every candidate in the same cluster, so it is cached per cluster in
     // the per-worker `est_cache` — with ~1000 candidates over ~n_probes clusters this
     // builds ~n_probes estimators instead of one per candidate. Both pieces of reused
-    // state are per rayon worker via `map_init`; doc_ids are moved (not cloned) into the
-    // heap entries.
-    let scored: Vec<HeapEntry> = dense_doc_ids
+    // state are per rayon worker via `map_init`; each candidate's doc_id and Pass-1
+    // MaxSim score are moved (not cloned) into its fusion `Candidate`.
+    let candidates: Vec<Candidate> = sparse_ranked
         .into_par_iter()
         .zip(dense_raw.into_par_iter())
         .map_init(
             || (HashMap::<u32, MultiBitQuanDotProductEstimator>::new(), Vec::<u64>::new()),
-            |(est_cache, words_buf), (doc_id, opt_bytes)| {
+            |(est_cache, words_buf), ((doc_id, sparse_score), opt_bytes)| {
                 let raw_bytes = opt_bytes?;
                 let list = match VectorIndex::access_list(&raw_bytes) {
                     Ok(list) => list,
@@ -552,38 +556,22 @@ where
                     MultiBitQuanDotProductEstimator::with_scaled_query_sum(cluster_id, query_dense_embedding, &cluster.centroid, scaled_query_sum)
                 });
                 vi.copy_packed_into(words_buf);
-                let dot_product = estimator.estimate_from_parts(query_dense_embedding, words_buf, vi.addition_factor(), vi.scaling_factor());
-                Some(HeapEntry {
-                    dot_product,
-                    error_bound: vi.error_bound(),
+                let dense_score = estimator.estimate_from_parts(query_dense_embedding, words_buf, vi.addition_factor(), vi.scaling_factor());
+                Some(Candidate {
                     document_id: doc_id,
+                    sparse_score,
+                    dense_score,
+                    error_bound: vi.error_bound(),
                 })
             },
         )
         .flatten()
         .collect();
 
-    // Build top-k from dense scored results.
-    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::with_capacity(top_k_limit + 1);
-    for entry in scored {
-        if heap.len() < top_k_limit {
-            heap.push(Reverse(entry));
-        } else if heap.peek().is_some_and(|Reverse(min)| entry.dot_product > min.dot_product) {
-            heap.pop();
-            heap.push(Reverse(entry));
-        }
-    }
-
-    debug!("ANN search: returning top {} results", heap.len());
-
-    heap.into_sorted_vec()
-        .into_iter()
-        .map(|Reverse(e)| QueryResult {
-            document_id: e.document_id,
-            dot_product: e.dot_product,
-            error_bound: e.error_bound,
-        })
-        .collect()
+    // Fuse Pass-1 and Pass-2 over the whole candidate set, then take the top-k.
+    let results = fusion::fuse(candidates, &ranking, top_k_limit);
+    debug!("ANN search: returning top {} results ({:?} ranking)", results.len(), ranking.mode);
+    results
 }
 
 /// Fixed payload sent to both embedding endpoints at startup to validate the
@@ -1109,7 +1097,7 @@ mod tests {
             &[],
             &EmptyKvStore,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
         assert!(results.is_empty());
@@ -1138,7 +1126,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
         assert!(results.is_empty(), "mismatched query dimension must yield no results, not a panic");
@@ -1160,7 +1148,7 @@ mod tests {
             &dense,
             &EmptyKvStore,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
         assert!(results.is_empty());
@@ -1304,7 +1292,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             Some(|_: &[u8]| false),
-            None,
+            SearchOptions::default(),
         )
         .await;
         assert!(results.is_empty(), "filtered doc must not appear in results");
@@ -1342,7 +1330,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
         let after = crate::semantic_search::metrics::snapshot(ns);
@@ -1389,7 +1377,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1431,7 +1419,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1472,7 +1460,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1512,7 +1500,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1548,7 +1536,7 @@ mod tests {
             &[1.0f32, 1.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1580,7 +1568,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1617,17 +1605,111 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
         assert_eq!(results.len(), 2);
         assert!(
-            results[0].dot_product >= results[1].dot_product,
+            results[0].dense_score >= results[1].dense_score,
             "results must be sorted by score descending"
         );
         assert_eq!(results[0].document_id, b"doc_high_score", "highest-scoring doc must come first");
         assert_eq!(results[1].document_id, b"doc_low_score");
+    }
+
+    /// The ranking mode decides the final order: `Dense` keeps the dense-only order,
+    /// `Rrf` promotes a doc ranked well by both passes, and every result carries both
+    /// scores plus its rank under each pass — whatever the mode.
+    #[tokio::test]
+    async fn test_search_ranking_modes_fuse_sparse_and_dense() {
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        // Sparse (MaxSim): a > c > b.  Dense: b > a > c.
+        store.add_sparse_entry_scaled(1, b"a", 0.0);
+        store.add_sparse_entry_scaled(1, b"b", 0.5);
+        store.add_sparse_entry_scaled(1, b"c", 0.2);
+        store.add_dense_entry(1, b"a", 0.2);
+        store.add_dense_entry(1, b"b", 0.1);
+        store.add_dense_entry(1, b"c", 0.4);
+
+        let config = SemanticSearchConfig {
+            n_probes: 1,
+            ..Default::default()
+        };
+        let run = |mode: RankFusion| {
+            let (config, cluster_index, store) = (&config, &cluster_index, &store);
+            async move {
+                let opts = SearchOptions {
+                    top_k: None,
+                    ranking: Some(RankingParams {
+                        mode,
+                        rrf_k: 60.0,
+                        sparse_weight: 0.5,
+                    }),
+                };
+                search(
+                    config,
+                    "test_ns",
+                    cluster_index,
+                    &[vec![1.0f32, 0.0, 0.0, 0.0]],
+                    &[1.0f32, 0.0, 0.0, 0.0],
+                    store,
+                    None::<fn(&[u8]) -> bool>,
+                    opts,
+                )
+                .await
+            }
+        };
+        let order = |r: &[QueryResult]| r.iter().map(|q| q.document_id.clone()).collect::<Vec<_>>();
+
+        let dense = run(RankFusion::Dense).await;
+        assert_eq!(order(&dense), [b"b".to_vec(), b"a".to_vec(), b"c".to_vec()]);
+        assert!(dense.iter().all(|q| q.fused_score == q.dense_score));
+        assert_eq!(dense.iter().map(|q| q.sparse_rank).collect::<Vec<_>>(), [3, 1, 2]);
+
+        let sparse = run(RankFusion::Sparse).await;
+        assert_eq!(order(&sparse), [b"a".to_vec(), b"c".to_vec(), b"b".to_vec()]);
+
+        let rrf = run(RankFusion::Rrf).await;
+        assert_eq!(rrf[0].document_id, b"a", "1st sparse + 2nd dense beats 1st dense + 3rd sparse");
+        assert_eq!((rrf[0].dense_rank, rrf[0].sparse_rank), (2, 1));
+        // Scores are reported unchanged whatever the mode.
+        let a_dense = dense.iter().find(|q| q.document_id == b"a").unwrap();
+        assert_eq!(rrf[0].dense_score, a_dense.dense_score);
+        assert_eq!(rrf[0].sparse_score, a_dense.sparse_score);
+    }
+
+    /// Invalid ranking params yield no results rather than a panic or a silent default.
+    #[tokio::test]
+    async fn test_search_invalid_ranking_returns_empty() {
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        store.add_sparse_entry(1, b"a", 0.1);
+        store.add_dense_entry(1, b"a", 0.1);
+        let config = SemanticSearchConfig {
+            n_probes: 1,
+            ..Default::default()
+        };
+        let opts = SearchOptions {
+            top_k: None,
+            ranking: Some(RankingParams {
+                sparse_weight: -1.0,
+                ..Default::default()
+            }),
+        };
+        let r = search(
+            &config,
+            "test_ns",
+            &cluster_index,
+            &[vec![1.0f32, 0.0, 0.0, 0.0]],
+            &[1.0f32, 0.0, 0.0, 0.0],
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            opts,
+        )
+        .await;
+        assert!(r.is_empty());
     }
 
     /// search() must return at most top_k_results entries even when more candidates exist.
@@ -1656,7 +1738,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1689,7 +1771,10 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            Some(1), // override: return only 1
+            SearchOptions {
+                top_k: Some(1),
+                ..Default::default()
+            }, // override: return only 1
         )
         .await;
 
@@ -1767,7 +1852,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1828,7 +1913,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1869,7 +1954,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1939,7 +2024,7 @@ mod tests {
             &[1.0f32, 0.0, 0.0, 0.0],
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 
@@ -1993,7 +2078,7 @@ mod tests {
             &q,
             &store,
             None::<fn(&[u8]) -> bool>,
-            None,
+            SearchOptions::default(),
         )
         .await;
 

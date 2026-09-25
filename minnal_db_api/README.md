@@ -773,6 +773,7 @@ Embed `query` and return the top-k most similar documents.
 |-------|------|----------|-------------|
 | `query` | string | yes | Query text to embed and search |
 | `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
+| `ranking` | object | no | Per-request ranking override — see [Result ranking](#result-ranking) |
 | `page_size` | integer | no | Page size (default: 20). Also accepts `limit` as a query-param alias; `page_size` wins if both are given. |
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
@@ -782,18 +783,23 @@ curl -X POST http://localhost:8080/stores/profiles/semantic-search \
   -d '{"query": "senior engineer with distributed systems experience", "top_k": 5}'
 ```
 
-Response — ranked highest-similarity first, plus the pagination envelope:
+Response — ranked best first by `fused_score`, with the effective `ranking` and the pagination envelope:
 
 ```json
 {
   "results": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
-      "dot_product": 0.94,
+      "dense_score": 0.94,
+      "sparse_score": 3.71,
+      "fused_score": 0.94,
+      "dense_rank": 1,
+      "sparse_rank": 2,
       "error_bound": 0.02,
       "document": {"name": "Alice", "status": "active", "bio": "…"}
     }
   ],
+  "ranking": {"mode": "dense", "rrf_k": 1.0, "sparse_weight": 0.1},
   "page_no": 1,
   "page_size": 20,
   "total": 1
@@ -803,9 +809,38 @@ Response — ranked highest-similarity first, plus the pagination envelope:
 | Field | Meaning |
 |-------|---------|
 | `id` | Document key, serialised according to the namespace's `key_type` |
-| `dot_product` | Estimated cosine similarity to the query (higher = more similar) |
-| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
+| `dense_score` | Pass-2 estimated similarity of the whole query and whole document (higher = more similar) |
+| `sparse_score` | Pass-1 ColBERT MaxSim score over the document's chunks |
+| `fused_score` | The score results are ordered by — depends on `ranking.mode`; equals `dense_score` in `dense` mode |
+| `dense_rank` / `sparse_rank` | Rank by that score alone among all candidates (`dense_rank` is the `dense`-mode order) |
+| `error_bound` | Theoretical max deviation of `dense_score` from the true dot product |
 | `document` | The stored document (never `null` — orphaned index entries are filtered out) |
+
+#### Result ranking
+
+Search runs in two passes: Pass 1 picks up to `first_pass_sparse_search_top_k`
+candidates by ColBERT MaxSim over 1-bit chunk embeddings (`sparse_score`);
+Pass 2 scores each with the 8-bit whole-document embedding (`dense_score`).
+`ranking` decides how the two become the final order. The server default comes
+from `[semantic_search.ranking]`; any request can override any field:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `mode` | `dense` / `sparse` / `rrf` / `zscore` | `dense`: dense score only. `sparse`: MaxSim only. `rrf`: reciprocal rank fusion `w/(rrf_k + sparse_rank) + (1-w)/(rrf_k + dense_rank)`. `zscore`: `w·z(sparse) + (1-w)·z(dense)` |
+| `rrf_k` | number > 0 | RRF smoothing constant (default 1, BEIR-tuned) |
+| `sparse_weight` | number in [0, 1] | `w` above — weight of the MaxSim signal (default 0.1, BEIR-tuned) |
+
+Ranks and z-scores span every candidate, not just the returned top-k. Because
+each result reports `dense_rank`, an `rrf` response also shows where the
+dense-only order would have placed each hit — send the same query with
+`{"mode": "dense"}` and `{"mode": "rrf"}` to compare. An invalid override
+returns `400 Bad Request`.
+
+```bash
+curl -X POST http://localhost:8080/stores/profiles/semantic-search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "senior engineer with distributed systems experience", "ranking": {"mode": "rrf"}}'
+```
 
 ---
 
@@ -820,6 +855,7 @@ eligible. The predicate uses the same [syntax](#predicate-syntax) as
 | `query` | string | yes | Query text to embed and search |
 | `predicate` | string | yes | Index predicate candidates must satisfy |
 | `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
+| `ranking` | object | no | Per-request ranking override — see [Result ranking](#result-ranking) |
 | `page_size` | integer | no | Page size (default: 20). `limit` query param is an alias. |
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
@@ -1038,7 +1074,8 @@ Requires `semantic_search_enabled = true` and `value_type = str` on the KV store
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `query` | string | yes | Query text to embed and search |
-| `top_k` | integer | no | Maximum number of candidates to return (default: all in probed clusters) |
+| `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
+| `ranking` | object | no | Per-request ranking override — see [Result ranking](#result-ranking) |
 | `page_size` | integer | no | Page size (default: 20). Also accepts `limit` as an alias (query param); `page_size` wins if both are given. |
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
@@ -1055,13 +1092,16 @@ Response:
   "results": [
     {
       "key": "sku-1042",
-      "dot_product": 0.93,
+      "dense_score": 0.93,
+      "sparse_score": 2.87,
+      "fused_score": 0.93,
+      "dense_rank": 1,
+      "sparse_rank": 1,
       "error_bound": 0.02,
-      "cluster_id": 7,
-      "is_primary": true,
       "value": "Ultra-light trail runner with waterproof membrane"
     }
   ],
+  "ranking": {"mode": "dense", "rrf_k": 1.0, "sparse_weight": 0.1},
   "page_no": 1,
   "page_size": 20,
   "total": 1
@@ -1071,11 +1111,12 @@ Response:
 | Field | Meaning |
 |-------|---------|
 | `key` | The key, serialised as a JSON string or number according to `key_type` |
-| `dot_product` | Estimated cosine similarity (higher = more similar) |
-| `error_bound` | Theoretical max deviation of the estimate from the true dot product |
-| `cluster_id` | IVF cluster this entry was indexed under |
-| `is_primary` | `true` if the entry's cluster is the closest cluster to the query |
-| `value` | The stored value, or `null` if the key no longer exists |
+| `dense_score` | Pass-2 estimated similarity of the whole query and whole document (higher = more similar) |
+| `sparse_score` | Pass-1 ColBERT MaxSim score over the document's chunks |
+| `fused_score` | The score results are ordered by — depends on `ranking.mode`; equals `dense_score` in `dense` mode |
+| `dense_rank` / `sparse_rank` | Rank by that score alone among all candidates (`dense_rank` is the `dense`-mode order) |
+| `error_bound` | Theoretical max deviation of `dense_score` from the true dot product |
+| `value` | The stored value (never `null` — orphaned index entries are filtered out) |
 
 ---
 

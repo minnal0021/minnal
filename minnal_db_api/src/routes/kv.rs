@@ -30,6 +30,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use minnal_db::semantic_search::service::RankingOverride;
 use minnal_db::{DocStoreError, KvKeyType, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -184,6 +185,11 @@ pub struct SemanticSearchParams {
 pub struct KvSemanticSearchRequest {
     pub query: String,
     pub top_k: Option<Limit>,
+    /// Per-request override of the server's result ranking, e.g.
+    /// `{"mode": "rrf", "rrf_k": 1, "sparse_weight": 0.1}`. Absent fields keep
+    /// the configured value; the effective params are echoed as `ranking`.
+    #[serde(default)]
+    pub ranking: RankingOverride,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -194,7 +200,19 @@ pub struct KvSemanticSearchRequest {
 pub struct KvSemanticSearchResult {
     /// Key, rendered as a JSON string or number according to `key_type`.
     pub key: serde_json::Value,
-    pub dot_product: f32,
+    /// Pass-2 estimated dot product of the whole-query and whole-document
+    /// dense embeddings (higher = more similar).
+    pub dense_score: f32,
+    /// Pass-1 ColBERT MaxSim score over the document's chunk embeddings.
+    pub sparse_score: f32,
+    /// Score results are ordered by — depends on the ranking mode; equals
+    /// `dense_score` in `dense` mode.
+    pub fused_score: f32,
+    /// Rank by `dense_score` alone among all candidates (the `dense`-mode order).
+    pub dense_rank: u32,
+    /// Rank by `sparse_score` alone among all candidates.
+    pub sparse_rank: u32,
+    /// Error bound of the quantised dense estimate.
     pub error_bound: f32,
     /// The stored value. Always present: candidates whose entry no longer exists
     /// (orphaned vector-index entries) are filtered out of the results, so a
@@ -216,9 +234,10 @@ pub async fn search_kv_semantic(
         qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
     );
 
+    let ranking = state.store.effective_ranking(&req.ranking).map_err(|e| AppError::from(e).with_ns(&ns))?;
     let page = state
         .store
-        .kv_search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
+        .kv_search_semantic(&ns, &req.query, req.top_k.map(Limit::get), &req.ranking, pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
 
@@ -229,6 +248,7 @@ pub async fn search_kv_semantic(
         StatusCode::OK,
         Json(serde_json::json!({
             "results": results,
+            "ranking": ranking,
             "page_no": pagination.page_no,
             "page_size": pagination.page_size,
             "total": total,
@@ -319,7 +339,11 @@ async fn hydrate_kv_results(
         .filter_map(|((r, key), value)| {
             value.map(|v| KvSemanticSearchResult {
                 key,
-                dot_product: r.dot_product,
+                dense_score: r.dense_score,
+                sparse_score: r.sparse_score,
+                fused_score: r.fused_score,
+                dense_rank: r.dense_rank,
+                sparse_rank: r.sparse_rank,
                 error_bound: r.error_bound,
                 value: Some(v),
             })

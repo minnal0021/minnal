@@ -174,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             query_embedding_cache_ttl: semantic_cfg.query_embedding_cache_ttl,
             embedding_request_timeout: semantic_cfg.embedding_request_timeout,
             embedding_connect_timeout: semantic_cfg.embedding_connect_timeout,
+            ranking: semantic_cfg.ranking,
         };
 
         // Probe the embedding service so operators get an early warning if it

@@ -55,23 +55,33 @@ impl DocStore {
     ///
     /// Embeds `query_text` using the configured embedding service, then scores
     /// every quantised vector in the namespace's companion KV store and returns
-    /// the top results sorted by descending dot-product similarity.
+    /// the top results in the configured ranking order (dense score by default).
+    ///
+    /// `ranking` overrides the configured result ordering for this call (see
+    /// [`DocStore::effective_ranking`]); pass `&RankingOverride::default()` to use
+    /// the configured one.
     ///
     /// Returns [`DocStoreError::EmbeddingFailed`] if no [`SemanticSearchContext`]
     /// is attached, if the namespace does not have `semantic_search_enabled`, or
-    /// if the embedding service call fails.
+    /// if the embedding service call fails, and [`DocStoreError::InvalidRanking`]
+    /// if `ranking` yields invalid params.
     #[cfg(feature = "semantic-search")]
     pub async fn search_semantic(
         &self,
         namespace: &str,
         query_text: &str,
         top_k: Option<usize>,
+        ranking: &crate::semantic_search::service::RankingOverride,
         pagination: Pagination,
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
         let ctx = self
             .semantic_ctx
             .as_ref()
             .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+        let opts = crate::semantic_search::service::SearchOptions {
+            top_k,
+            ranking: Some(ctx.config.ranking.with_override(ranking)?),
+        };
 
         let schema = self.load_schema(namespace)?;
         if !schema.semantic_search_enabled {
@@ -95,12 +105,30 @@ impl DocStore {
             &query_dense,
             &db_store,
             None::<fn(&[u8]) -> bool>,
-            top_k,
+            opts,
         )
         .await;
 
         debug!("semantic search namespace='{}' returned {} results", namespace, all.len());
         Ok(Page::from_vec(all, pagination))
+    }
+
+    /// Resolve a per-request ranking override against the configured
+    /// [`RankingParams`](crate::semantic_search::service::RankingParams) — the
+    /// params a semantic search with this override will actually use.
+    ///
+    /// Returns [`DocStoreError::EmbeddingFailed`] if no [`SemanticSearchContext`]
+    /// is attached and [`DocStoreError::InvalidRanking`] if the result is invalid.
+    #[cfg(feature = "semantic-search")]
+    pub fn effective_ranking(
+        &self,
+        ranking: &crate::semantic_search::service::RankingOverride,
+    ) -> Result<crate::semantic_search::service::RankingParams, DocStoreError> {
+        let ctx = self
+            .semantic_ctx
+            .as_ref()
+            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+        Ok(ctx.config.ranking.with_override(ranking)?)
     }
 
     /// Run an approximate nearest-neighbour semantic search restricted to documents
@@ -125,6 +153,7 @@ impl DocStore {
         query_text: &str,
         predicate: &str,
         top_k: Option<usize>,
+        ranking: &crate::semantic_search::service::RankingOverride,
         pagination: Pagination,
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
@@ -140,6 +169,10 @@ impl DocStore {
             .semantic_ctx
             .as_ref()
             .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+        let opts = crate::semantic_search::service::SearchOptions {
+            top_k,
+            ranking: Some(ctx.config.ranking.with_override(ranking)?),
+        };
 
         let schema = self.load_schema(namespace)?;
         if !schema.semantic_search_enabled {
@@ -162,7 +195,7 @@ impl DocStore {
             &query_dense,
             &db_store,
             Some(move |id: &[u8]| allowed_ids.contains(id)),
-            top_k,
+            opts,
         )
         .await;
 

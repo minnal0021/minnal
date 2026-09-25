@@ -14,6 +14,9 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `src/index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
 | `src/quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode) |
 | `src/service/mod.rs` | HTTP client for the external embedding service; `search()` two-pass ANN |
+| `src/service/fusion.rs` | Final ranking: `RankFusion` / `RankingParams` / `RankingOverride`, `fuse()` over both pass scores |
+| `src/beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the ranking modes (nDCG@10 / MRR@10 / R@100) |
+| `report.md` | BEIR results: fusion doesn't beat `dense`; tuned `rrf_k=1`, `sparse_weight=0.1`; why, and next steps |
 | `src/vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
 
 ## How it works
@@ -54,8 +57,10 @@ The **query-embedding cache** (`system_qemb_cache`, below) is a *separate* no-WA
 
 **Pass 2 — dense (MultiBit):**
 1. `get_dense_entry(doc_id)` for each sparse candidate in parallel.
-2. Score each candidate with `MultiBitQuanDotProductEstimator` against the single whole-query dense embedding (symmetric with the document's whole-text dense vector).
-3. Build top-k min-heap and return sorted descending.
+2. Score each candidate with `MultiBitQuanDotProductEstimator` against the single whole-query dense embedding (symmetric with the document's whole-text dense vector), keeping its Pass-1 MaxSim score alongside.
+3. **Fuse** (`fusion::fuse`): rank all candidates by sparse and by dense score, compute the fused score per `RankingParams.mode` — `dense` (default, the old behaviour), `sparse`, `rrf` (`w/(k+r_s) + (1−w)/(k+r_d)`), or `zscore` — and return the top-k by it. Every `QueryResult` carries `dense_score`, `sparse_score`, `fused_score`, `dense_rank`, `sparse_rank`.
+
+Ranking is set by `[semantic_search.ranking]` and overridable per call (`SearchOptions::ranking`; REST: a `ranking` object in the request body, echoed back in the response). Ranks span the **whole** candidate set, not the dense top-k — re-ordering only the dense top-k cannot promote a doc ColBERT likes. **Judge a ranking change with `beir_eval.rs`, not `real_recall_vs_nprobes`** — the latter uses the pipeline's own ranking as ground truth, so every re-order reads as a recall loss. See `Semantic-Search-Architecture.md` → *Final ranking*.
 
 The `doc_filter` is applied **only in Pass 1**. Pass 2 operates on the already-filtered candidate list.
 

@@ -71,7 +71,8 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr)
             | DocStoreError::Schema(SchemaError::StrKeyTooLong { .. })
             | DocStoreError::Schema(SchemaError::EmptyStrKey)
-            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8) => StatusCode::BAD_REQUEST,
+            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8)
+            | DocStoreError::InvalidRanking(_) => StatusCode::BAD_REQUEST,
 
             // A key/value too large for the storage format's u32 length fields is
             // user-actionable: report 413 rather than a generic 500.

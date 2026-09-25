@@ -22,17 +22,29 @@
 //!
 //! # Response (both endpoints)
 //!
-//! An ordered array of results, highest similarity first:
+//! `{"results": [...], "ranking": {...}, "page_no", "page_size", "total"}` —
+//! `results` is ordered best first by `fused_score`, and `ranking` echoes the
+//! effective ranking params. Each result:
 //! ```json
 //! [
 //!   {
 //!     "id": "550e8400-e29b-41d4-a716-446655440000",
-//!     "dot_product": 0.94,
+//!     "dense_score": 0.94,
+//!     "sparse_score": 3.71,
+//!     "fused_score": 0.0325,
+//!     "dense_rank": 2,
+//!     "sparse_rank": 1,
 //!     "error_bound": 0.02,
 //!     "document": { "id": 1, "text": "Senior Rust engineer with distributed systems experience." }
 //!   }
 //! ]
 //! ```
+//!
+//! Both requests accept an optional `ranking` override
+//! (`{"mode": "dense" | "sparse" | "rrf" | "zscore", "rrf_k": f32, "sparse_weight": f32}`,
+//! every field optional) so the configured ordering can be compared against the
+//! others per request. `dense_rank` is where `dense` mode would place the result,
+//! so an `rrf` response also shows the dense-only order. An invalid override is 400.
 //!
 //! `document` is the full stored document object for the result.
 //! It is `null` when the document could not be found (e.g. deleted since indexing).
@@ -61,6 +73,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use minnal_db::semantic_search::service::RankingOverride;
 use minnal_db::{DocId, DocStoreError, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -92,6 +105,11 @@ pub struct SemanticSearchRequest {
     /// Override the number of results returned for this request only.
     /// When `None`, the value from the server-side TOML config is used.
     pub top_k: Option<Limit>,
+    /// Per-request override of the server's result ranking, e.g.
+    /// `{"mode": "rrf", "rrf_k": 1, "sparse_weight": 0.1}`. Absent fields keep
+    /// the configured value; the effective params are echoed as `ranking`.
+    #[serde(default)]
+    pub ranking: RankingOverride,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -110,6 +128,11 @@ pub struct SemanticSearchFilteredRequest {
     /// Override the number of results returned for this request only.
     /// When `None`, the value from the server-side TOML config is used.
     pub top_k: Option<Limit>,
+    /// Per-request override of the server's result ranking, e.g.
+    /// `{"mode": "rrf", "rrf_k": 1, "sparse_weight": 0.1}`. Absent fields keep
+    /// the configured value; the effective params are echoed as `ranking`.
+    #[serde(default)]
+    pub ranking: RankingOverride,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -121,9 +144,19 @@ pub struct SemanticSearchFilteredRequest {
 pub struct SemanticSearchResult {
     /// Document identifier serialised according to the namespace's `key_type`.
     pub id: serde_json::Value,
-    /// Estimated dot-product similarity to the query (higher = more similar).
-    pub dot_product: f32,
-    /// Per-document error bound from the quantised vector index.
+    /// Pass-2 estimated dot product of the whole-query and whole-document
+    /// dense embeddings (higher = more similar).
+    pub dense_score: f32,
+    /// Pass-1 ColBERT MaxSim score over the document's chunk embeddings.
+    pub sparse_score: f32,
+    /// Score results are ordered by — depends on the ranking mode; equals
+    /// `dense_score` in `dense` mode.
+    pub fused_score: f32,
+    /// Rank by `dense_score` alone among all candidates (the `dense`-mode order).
+    pub dense_rank: u32,
+    /// Rank by `sparse_score` alone among all candidates.
+    pub sparse_rank: u32,
+    /// Error bound of the quantised dense estimate.
     pub error_bound: f32,
     /// The stored document value. Always present: candidates whose document no
     /// longer exists in the store (orphaned vector-index entries) are filtered
@@ -148,9 +181,10 @@ pub async fn query(
         qp.page_no.unwrap_or(req.page_no),
         qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
     );
+    let ranking = state.store.effective_ranking(&req.ranking).map_err(|e| AppError::from(e).with_ns(&ns))?;
     let page = state
         .store
-        .search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
+        .search_semantic(&ns, &req.query, req.top_k.map(Limit::get), &req.ranking, pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
@@ -160,6 +194,7 @@ pub async fn query(
         StatusCode::OK,
         Json(serde_json::json!({
             "results": results,
+            "ranking": ranking,
             "page_no": pagination.page_no,
             "page_size": pagination.page_size,
             "total": total,
@@ -183,9 +218,10 @@ pub async fn query_filtered(
         qp.page_no.unwrap_or(req.page_no),
         qp.page_size.or(qp.limit).unwrap_or(req.page_size).get(),
     );
+    let ranking = state.store.effective_ranking(&req.ranking).map_err(|e| AppError::from(e).with_ns(&ns))?;
     let page = state
         .store
-        .search_semantic_filtered(&ns, &req.query, &req.predicate, req.top_k.map(Limit::get), pagination)
+        .search_semantic_filtered(&ns, &req.query, &req.predicate, req.top_k.map(Limit::get), &req.ranking, pagination)
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
@@ -199,6 +235,7 @@ pub async fn query_filtered(
         StatusCode::OK,
         Json(serde_json::json!({
             "results": results,
+            "ranking": ranking,
             "page_no": pagination.page_no,
             "page_size": pagination.page_size,
             "total": total,
@@ -267,7 +304,11 @@ async fn decode_results(
         .filter_map(|((r, doc_id), document)| {
             document.map(|doc| SemanticSearchResult {
                 id: doc_id_to_value(doc_id),
-                dot_product: r.dot_product,
+                dense_score: r.dense_score,
+                sparse_score: r.sparse_score,
+                fused_score: r.fused_score,
+                dense_rank: r.dense_rank,
+                sparse_rank: r.sparse_rank,
                 error_bound: r.error_bound,
                 document: Some(doc),
             })

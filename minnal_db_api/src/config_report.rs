@@ -181,6 +181,14 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("semantic_search", "window_size", ss.window_size);
     r.add("semantic_search", "sliding_size", ss.sliding_size);
     r.add("semantic_search", "top_k_results", ss.top_k_results);
+    r.add(
+        "semantic_search",
+        "ranking",
+        format!(
+            "{:?} (rrf_k {}, sparse_weight {})",
+            ss.ranking.mode, ss.ranking.rrf_k, ss.ranking.sparse_weight
+        ),
+    );
     r.add("semantic_search", "embedding_service_url", &ss.embedding_service_url);
     r.add("semantic_search", "model", &ss.model);
     let cluster = ss

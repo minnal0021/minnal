@@ -484,7 +484,7 @@ use minnal_db::{
     KvStoreSchema, KvValueType, Pagination, SemanticSearchContext, StoreType,
 };
 use minnal_db::semantic_search::ClusterIndex;
-use minnal_db::semantic_search::service::SemanticSearchConfig;
+use minnal_db::semantic_search::service::{RankingOverride, SemanticSearchConfig};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let embedding_dim = 768; // must match the model the embedding service serves
@@ -539,10 +539,15 @@ store.put("articles", DocId::U64(1), serde_json::json!({ "body": "thunder and li
 store.put("articles", DocId::U64(2), serde_json::json!({ "body": "a quiet afternoon in the library" })).await?;
 
 // Two-pass ANN search over the stored vectors (top 5). `document_id` is the doc's key bytes.
-let hits = store.search_semantic("articles", "a storm at night", Some(5), Pagination::default()).await?;
+// Pass `RankingOverride::default()` for the configured ranking, or e.g.
+// `RankingOverride { mode: Some(RankFusion::Rrf), ..Default::default() }` to fuse
+// the ColBERT (sparse) and dense rankings for this call.
+let hits = store
+    .search_semantic("articles", "a storm at night", Some(5), &RankingOverride::default(), Pagination::default())
+    .await?;
 for r in hits.results {
     let id = u64::from_be_bytes(r.document_id[..8].try_into().unwrap());
-    println!("doc {id}  score={:.4}", r.dot_product);
+    println!("doc {id}  score={:.4}  (dense {:.4}, sparse {:.4})", r.fused_score, r.dense_score, r.sparse_score);
 }
 ```
 
@@ -569,9 +574,11 @@ store.kv_put("notes", &serde_json::json!("n1"), &serde_json::json!("meeting abou
 store.kv_put("notes", &serde_json::json!("n2"), &serde_json::json!("weekend hiking trip planning")).await?;
 
 // `document_id` here is the raw string key.
-let hits = store.kv_search_semantic("notes", "financial planning", Some(5), Pagination::default()).await?;
+let hits = store
+    .kv_search_semantic("notes", "financial planning", Some(5), &RankingOverride::default(), Pagination::default())
+    .await?;
 for r in hits.results {
-    println!("key {}  score={:.4}", String::from_utf8_lossy(&r.document_id), r.dot_product);
+    println!("key {}  score={:.4}", String::from_utf8_lossy(&r.document_id), r.fused_score);
 }
 
 store.shutdown().await?; // stops the embed-worker cleanly

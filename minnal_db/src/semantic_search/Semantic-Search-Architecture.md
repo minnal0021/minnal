@@ -164,8 +164,12 @@ Pass 2 — Dense (MultiBit):
     look up its centroid via the stored VectorIndex's cluster_id
     score with MultiBitQuanDotProductEstimator against the single
       whole-query dense embedding
-  build top-k min-heap
-  return sorted descending
+    keep its Pass-1 MaxSim score alongside (Candidate { sparse, dense })
+
+Fusion (service/fusion.rs):
+  rank every candidate by sparse and by dense score (1-based, ties → doc_id)
+  fused score per RankingParams.mode (dense | sparse | rrf | zscore)
+  select top-k by fused score (ties → dense rank), return best first
 ```
 
 ### Why two passes?
@@ -188,6 +192,35 @@ Chunks whose cluster is not probed contribute **0** to their query token's term 
 ### Dense re-ranking (Pass 2)
 
 Pass 2 scores each candidate against a **single whole-query dense embedding** — symmetric with the document's whole-text dense vector. There is no aggregation across multiple query vectors: each `doc_id` is scored once by one `MultiBitQuanDotProductEstimator`, so each document appears exactly once in the final output.
+
+### Final ranking: fusing the two passes
+
+Before fusion existed, Pass 2's dense score alone decided the final order and the Pass-1 MaxSim score was discarded, so ColBERT only chose *which* ~1000 documents were considered. The two signals measure different things: MaxSim is passage-level (the best-matching chunk per query token), the dense score is document-level (one whole-text vector, which dilutes a strong passage inside a long document). `RankingParams` (`[semantic_search.ranking]`, overridable per request) chooses how they combine:
+
+| `mode` | Final score |
+|---|---|
+| `dense` | dense dot product (the pre-fusion behaviour) |
+| `sparse` | MaxSim (ablation) |
+| `rrf` | `w/(rrf_k + rank_sparse) + (1−w)/(rrf_k + rank_dense)` |
+| `zscore` | `w·z(sparse) + (1−w)·z(dense)` |
+
+with `w = sparse_weight` (default 0.1) and `rrf_k` (default 1) — both BEIR-tuned; see [`report.md`](report.md). Design points:
+
+- **Ranks and z-scores span the whole candidate set**, not the dense top-k — so a document ColBERT ranks highly can overtake one the dense pass alone preferred. Re-ordering only the dense top-k could never promote it (the eval measures this as `rrf-dense100`).
+- **`sparse_weight` exists because the signals are not equally reliable**: MaxSim comes from 1-bit estimates, and chunks in unprobed clusters contribute 0, so a document's MaxSim can be understated at low `n_probes`. The dense score is 8-bit.
+- **`zscore` exists because RRF discards score magnitude** — a decisive dense winner is flattened to "rank 1". z-scores keep the gaps while putting the two scales on a common footing; a zero-variance list contributes 0.
+- **Output carries everything**: `QueryResult` has `dense_score`, `sparse_score`, `fused_score`, `dense_rank`, `sparse_rank`, `error_bound`. `dense_rank` is where `dense` mode would place the result, so one `rrf` response also shows the dense-only order.
+- Fusion costs one sort of ≤ `first_pass_sparse_search_top_k` floats per signal — no extra I/O or embedding calls. A candidate with no valid dense entry is still dropped, as before.
+
+**Measured result (2026-09-25, [`report.md`](report.md)):** on BEIR SciFact and NFCorpus no fusion setting beat `dense` significantly on both corpora. MaxSim alone is −0.148 / −0.045 nDCG@10 vs dense, and the textbook `rrf k=60 w=0.5` is −0.044 / −0.020. The tuned `rrf k=1 w=0.1` ties dense, so `dense` stays the default. The cause is that query chunks are 4 *words* against 4-*sentence* document chunks: using the whole query as the single sparse chunk lifts MaxSim alone from 0.640 to 0.752 on SciFact test, though fusion still gains at most about +0.004 on these short-abstract corpora (report §6). On NFCorpus, `n_probes` 32 → 256 (+0.014) is a far bigger lever than fusion.
+
+**Choosing a mode needs relevance judgements.** `real_recall_vs_nprobes` treats the pipeline's own exhaustive ranking as ground truth, so it scores *any* re-ordering as a recall loss. Use the BEIR harness instead (`beir_eval.rs`, `#[ignore]`d): it indexes a BEIR corpus through the real embedding service and reports nDCG@10 / MRR@10 / Recall@100 and per-query wins/losses vs `dense` for every mode and a `rrf_k × sparse_weight` grid, at `n_probes = 32` and exhaustive.
+
+```sh
+service/scripts/fetch_beir.sh scifact nfcorpus
+MINNAL_EMBED_URL=http://<host>:8001 MINNAL_BEIR_DATASET=scifact MINNAL_BEIR_DB=../work/beir/db_scifact \
+  cargo test -p minnal_db --all-features --release --lib beir_rank_fusion_eval -- --ignored --nocapture
+```
 
 ### Predicate filtering
 
@@ -339,6 +372,9 @@ All parameters are under `[semantic_search]` in the TOML config:
 | `embedding_service_url` | `http://localhost:8001` | Base URL of the external embedding service. |
 | `top_k_results` | `100` | Maximum results returned per query (overridable per-request). |
 | `query_embedding_cache_ttl_secs` | `86400` | TTL (seconds) for cached query embeddings in `system_qemb_cache`. Default is 1 day. |
+| `ranking.mode` | `dense` | Final-order fusion: `dense`, `sparse`, `rrf`, `zscore` (overridable per-request) — see *Final ranking* above. |
+| `ranking.rrf_k` | `1` | RRF smoothing constant (> 0). BEIR-tuned. |
+| `ranking.sparse_weight` | `0.1` | Weight of the MaxSim signal in `rrf`/`zscore`, in `[0, 1]`. BEIR-tuned. |
 
 ### Tuning & profiling `n_probes`
 

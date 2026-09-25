@@ -1687,7 +1687,7 @@ mod real_kv_profile {
     use crate::AsyncDb;
     use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
     use crate::semantic_search::index::vector_index::VectorKvStore;
-    use crate::semantic_search::service::{SemanticSearchConfig, search};
+    use crate::semantic_search::service::{SearchOptions, SemanticSearchConfig, search};
     use crate::semantic_search::{ClusterIndex, QuantisationStyle, index_embedding_to_cluster};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -1806,7 +1806,17 @@ mod real_kv_profile {
                 for _ in 0..3 {
                     let _ = store.scan_sparse_clusters_batch(&probe_clusters).await;
                     let _ = store.get_dense_entries_batch(&dense_ids).await;
-                    let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                    let _ = search(
+                        &config,
+                        ns,
+                        &index,
+                        &sparse_query,
+                        &dense_query,
+                        &store,
+                        no_filter,
+                        SearchOptions::default(),
+                    )
+                    .await;
                 }
 
                 let mut coarse = Vec::with_capacity(ITERS);
@@ -1839,7 +1849,17 @@ mod real_kv_profile {
                     dense.push(t.elapsed().as_nanos() as f64 / 1e3);
 
                     let t = Instant::now();
-                    let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                    let results = search(
+                        &config,
+                        ns,
+                        &index,
+                        &sparse_query,
+                        &dense_query,
+                        &store,
+                        no_filter,
+                        SearchOptions::default(),
+                    )
+                    .await;
                     total.push(t.elapsed().as_nanos() as f64 / 1e3);
                     result_len = results.len();
                 }
@@ -1864,6 +1884,64 @@ mod real_kv_profile {
 
             db.shutdown().await.unwrap();
         }
+    }
+}
+
+// ── Shared corpus indexing for the real-embedding harnesses ───────────────────
+//
+// Used by `real_recall` below and `semantic_search::beir_eval`: embeds each text
+// through the real embedding service and upserts its vectors under a `u64` BE doc id.
+#[cfg(test)]
+pub(crate) mod eval_indexing {
+    use super::upsert_vectors;
+    use crate::AsyncDb;
+    use crate::semantic_search::ClusterIndex;
+    use crate::semantic_search::service::{SemanticSearchConfig, embed_document};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// Embed and index `docs` (`(doc_id, text)`) into `ns` with at most `concurrency`
+    /// embedding requests in flight. Returns `(indexed, failed, first_error)`.
+    pub(crate) async fn index_texts(
+        db: &Arc<AsyncDb>,
+        ns: &str,
+        config: &Arc<SemanticSearchConfig>,
+        index: &Arc<ClusterIndex>,
+        docs: Vec<(u64, String)>,
+        concurrency: usize,
+    ) -> (usize, usize, Option<String>) {
+        // `upsert_vectors` silently skips a namespace that is not registered (so a
+        // dropped store is never resurrected), so the parent must exist first —
+        // without this every upsert is an `Ok` no-op and the index stays empty.
+        if let Err(e) = db.namespace(ns.to_string()).await {
+            return (0, docs.len(), Some(format!("create namespace '{ns}': {e}")));
+        }
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut set = tokio::task::JoinSet::new();
+        for (id, text) in docs {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let (cfg, idx, db, ns) = (config.clone(), index.clone(), db.clone(), ns.to_string());
+            set.spawn(async move {
+                let _permit = permit;
+                let doc_id = id.to_be_bytes().to_vec();
+                match embed_document(&cfg, &idx, &text).await {
+                    Ok(vis) => upsert_vectors(&db, &ns, &doc_id, &vis).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+        }
+        let (mut ok, mut fail) = (0usize, 0usize);
+        let mut first_err: Option<String> = None;
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        (ok, fail, first_err)
     }
 }
 
@@ -1895,13 +1973,12 @@ mod real_recall {
     use super::*;
     use crate::semantic_search::ClusterIndex;
     use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
-    use crate::semantic_search::service::{SemanticSearchConfig, embed_document, embed_query, search};
+    use crate::semantic_search::service::{SearchOptions, SemanticSearchConfig, embed_query, search};
     use std::collections::{HashMap, HashSet};
     use std::io::BufRead;
     use std::sync::Arc;
     use std::time::Instant;
     use tempfile::TempDir;
-    use tokio::sync::Semaphore;
 
     const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
     const DEFAULT_CORPUS: &str = "../work/sample_data/sample_data_news.jsonl";
@@ -1993,32 +2070,9 @@ mod real_recall {
                 .await
                 .unwrap(),
         );
-        let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
         let t_index = Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for (i, text) in doc_texts.into_iter().enumerate() {
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let (cfg, idx, db) = (base_config.clone(), index.clone(), db.clone());
-            set.spawn(async move {
-                let _permit = permit;
-                let doc_id = (i as u64).to_be_bytes().to_vec();
-                match embed_document(&cfg, &idx, &text).await {
-                    Ok(vis) => upsert_vectors(&db, NS, &doc_id, &vis).await.map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
-            });
-        }
-        let (mut ok, mut fail) = (0usize, 0usize);
-        let mut first_err: Option<String> = None;
-        while let Some(res) = set.join_next().await {
-            match res.unwrap() {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    fail += 1;
-                    first_err.get_or_insert(e);
-                }
-            }
-        }
+        let docs = doc_texts.into_iter().enumerate().map(|(i, t)| (i as u64, t)).collect();
+        let (ok, fail, first_err) = super::eval_indexing::index_texts(&db, NS, &base_config, &index, docs, INDEX_CONCURRENCY).await;
         eprintln!("  indexed {ok} docs ({fail} failed) in {:.1}s", t_index.elapsed().as_secs_f64());
         if ok == 0 {
             eprintln!(
@@ -2055,7 +2109,20 @@ mod real_recall {
             let mut lat_us = Vec::with_capacity(q_embs.len());
             for qe in q_embs {
                 let t = Instant::now();
-                let r = search(config, NS, index, &qe.sparse, &qe.dense, store, no_filter, Some(SEARCH_TOPK)).await;
+                let r = search(
+                    config,
+                    NS,
+                    index,
+                    &qe.sparse,
+                    &qe.dense,
+                    store,
+                    no_filter,
+                    SearchOptions {
+                        top_k: Some(SEARCH_TOPK),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 lat_us.push(t.elapsed().as_nanos() as f64 / 1e3);
                 ranked.push(r.into_iter().map(|q| q.document_id).collect());
             }

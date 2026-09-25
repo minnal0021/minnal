@@ -326,6 +326,32 @@ sliding_size = 2
 # embedding_connect_timeout_secs = 10
 
 # ---------------------------------------------------------------------------
+# [semantic_search.ranking] — how the final result order is derived
+#
+# Pass 1 scores each candidate with ColBERT MaxSim over its 1-bit chunk
+# embeddings ("sparse"); Pass 2 scores it with the 8-bit whole-document
+# embedding ("dense"). `mode` picks how the two become the final order:
+#   dense  — dense score only; Pass 1 only selects candidates
+#   sparse — MaxSim only
+#   rrf    — reciprocal rank fusion: w/(rrf_k + sparse_rank) + (1-w)/(rrf_k + dense_rank)
+#   zscore — w*z(sparse) + (1-w)*z(dense), z over the candidate set
+# where w = sparse_weight. Ranks/z-scores span all Pass-1 candidates, not just
+# the top-k. Every search request can override any of these via a `ranking`
+# object in its body; results always carry dense_score, sparse_score,
+# fused_score, dense_rank and sparse_rank. Compare modes on labelled data with
+# the BEIR eval (minnal_db/src/semantic_search/beir_eval.rs).
+# ---------------------------------------------------------------------------
+#
+# BEIR results (minnal_db/src/semantic_search/report.md): no fusion setting beat
+# `dense` significantly, so it stays the default. The defaults below are the
+# tuned fusion params (they only matter when mode = rrf/zscore); the textbook
+# rrf_k = 60 / sparse_weight = 0.5 cost 2-4.5 nDCG@10 points.
+[semantic_search.ranking]
+mode = "dense"
+# rrf_k = 1           # > 0; larger flattens the gap between top and lower ranks
+# sparse_weight = 0.1 # in [0, 1]; the dense signal gets 1 - sparse_weight
+
+# ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — enabled embedding models
 #
 # Each entry declares one embedding model this instance may serve.  The model

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod beir_eval;
 pub mod chunking;
 pub mod cluster;
 pub mod index;

@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use minnal_db::VectorIndexConfig;
+use minnal_db::semantic_search::service::RankingParams;
 use minnal_db::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig, lsm::LSMConfig};
 use serde::Deserialize;
 
@@ -174,6 +175,10 @@ impl DocStoreApiConfig {
                  {MIN_MULTI_BIT_QUANTISATION_BITS}..={MAX_MULTI_BIT_QUANTISATION_BITS}, got {bits}"
             ));
         }
+        self.semantic_search
+            .ranking
+            .validate()
+            .map_err(|e| format!("semantic_search.ranking: {e}"))?;
         Ok(())
     }
 
@@ -701,6 +706,14 @@ pub struct SemanticSearchSection {
     /// `embedding_request_timeout_secs` (the overall cap). Default: 10.
     #[serde(default = "default_embedding_connect_timeout_secs")]
     pub embedding_connect_timeout_secs: u64,
+
+    /// `[semantic_search.ranking]` — how the final result order is derived from
+    /// the Pass-1 (ColBERT MaxSim) and Pass-2 (dense) scores: `mode` (`dense` |
+    /// `sparse` | `rrf` | `zscore`), `rrf_k`, `sparse_weight`. Requests can
+    /// override any field. Default: `mode = "dense"`, `rrf_k = 1`, `sparse_weight = 0.1` (BEIR-tuned;
+    /// see `minnal_db/src/semantic_search/report.md`).
+    #[serde(default)]
+    pub ranking: RankingParams,
 }
 
 impl Default for SemanticSearchSection {
@@ -720,6 +733,7 @@ impl Default for SemanticSearchSection {
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
             embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
             embedding_connect_timeout_secs: default_embedding_connect_timeout_secs(),
+            ranking: RankingParams::default(),
         }
     }
 }
@@ -808,6 +822,9 @@ pub struct ResolvedSemanticSearchConfig {
 
     /// Timeout for just the TCP connect phase to the embedding service.
     pub embedding_connect_timeout: std::time::Duration,
+
+    /// Default result ranking (per-request overridable).
+    pub ranking: RankingParams,
 }
 
 impl SemanticSearchSection {
@@ -832,6 +849,7 @@ impl SemanticSearchSection {
             query_embedding_cache_ttl: std::time::Duration::from_secs(self.query_embedding_cache_ttl_secs),
             embedding_request_timeout: std::time::Duration::from_secs(self.embedding_request_timeout_secs),
             embedding_connect_timeout: std::time::Duration::from_secs(self.embedding_connect_timeout_secs),
+            ranking: self.ranking,
         }
     }
 }
@@ -864,6 +882,22 @@ mod tests {
                 "bits={bits} should be rejected, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_semantic_search_checks_ranking() {
+        let mut cfg = config_with_bits(8);
+        cfg.semantic_search.ranking.sparse_weight = 2.0;
+        let err = cfg.validate_semantic_search().unwrap_err();
+        assert!(err.contains("semantic_search.ranking"), "got: {err}");
+    }
+
+    #[test]
+    fn ranking_section_parses_from_toml() {
+        let section: SemanticSearchSection = toml::from_str("[ranking]\nmode = \"rrf\"\nsparse_weight = 0.3\n").unwrap();
+        assert_eq!(section.ranking.mode, minnal_db::semantic_search::service::RankFusion::Rrf);
+        assert_eq!(section.ranking.sparse_weight, 0.3);
+        assert_eq!(section.ranking.rrf_k, minnal_db::semantic_search::service::DEFAULT_RRF_K);
     }
 
     #[test]

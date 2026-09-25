@@ -181,6 +181,11 @@ pub enum DocStoreError {
     #[error("vector index cleanup for namespace '{namespace}' is already in progress")]
     VecIndexCleanupInProgress { namespace: String },
 
+    /// A semantic-search ranking override produced invalid params.
+    #[cfg(feature = "semantic-search")]
+    #[error("invalid ranking: {0}")]
+    InvalidRanking(#[from] crate::semantic_search::service::RankingError),
+
     /// An exclusive attribute-index operation is already running for this namespace.
     #[error("an attribute index operation is already in progress for namespace '{namespace}'")]
     AttrIndexOpInProgress { namespace: String },

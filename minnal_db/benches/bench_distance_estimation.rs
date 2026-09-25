@@ -18,7 +18,7 @@ use minnal_db::semantic_search::{
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
     index::vector_index::{ClusterBatchResult, QuantisationStyle, VectorIndex, VectorKvStore},
     index_embedding_to_cluster,
-    service::{SemanticSearchConfig, search},
+    service::{SearchOptions, SemanticSearchConfig, search},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -415,7 +415,7 @@ fn bench_end_to_end_search(c: &mut Criterion) {
                     black_box(&dense_query),
                     black_box(&store),
                     no_filter,
-                    None,
+                    SearchOptions::default(),
                 ));
                 black_box(results)
             });
@@ -470,7 +470,7 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
                     black_box(&dense_query),
                     black_box(&store),
                     no_filter,
-                    None,
+                    SearchOptions::default(),
                 ));
                 black_box(results)
             });
