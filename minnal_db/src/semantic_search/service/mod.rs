@@ -498,6 +498,14 @@ where
 
     // Fetch all dense entries in one batch operation (single blocking task in production).
     let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.to_vec()).collect();
+
+    // Pass 1 is done with the scanned entries: free them off the request path. They
+    // are two heap buffers per entry (doc_id + rkyv bytes), and dropping ~90k entries
+    // on a 57k-doc corpus took ~6 ms single-threaded — the same order as all of
+    // Pass 1's scoring. The total work is unchanged; it just no longer delays the reply.
+    drop(entries);
+    rayon::spawn(move || drop(sparse_by_cluster));
+
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await;
 
     debug!("ANN search: dense pass over {} candidates", dense_doc_ids.len());
