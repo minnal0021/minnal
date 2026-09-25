@@ -299,19 +299,22 @@ n_probes = 32
 # before re-scoring with the dense multi-bit index.  Default: 1000.
 first_pass_sparse_search_top_k = 1000
 
-# Window size (sentences/tokens per chunk) for the sliding-window chunked embedding call.
+# Document chunking for the sparse first pass: sentences per sliding-window chunk.
 # Each chunk is independently assigned to its nearest IVF cluster and quantised as 1-bit.
-# Default: 4.
+# Queries are NOT chunked — a query is embedded once, whole, for both passes.
+# Changing window_size or sliding_size requires re-indexing the corpus
+# (POST /admin/indices/{ns}/vector/reindex-all).  Default: 4.
 window_size = 4
 
-# How far the window advances between consecutive chunks.
+# How far the document window advances between consecutive chunks, in sentences.
 # A sliding_size smaller than window_size produces overlapping chunks.  Default: 2.
 sliding_size = 2
 
 # Time-to-live (seconds) for cached query embeddings in the system-wide
 # `system_qemb_cache` namespace. After this duration a cached entry is evicted by
-# the TTL worker. Clear the cache explicitly (DELETE /admin/indices/vector/query-cache)
-# after changing window_size/sliding_size rather than waiting for this to expire.
+# the TTL worker. Entries hold the whole-query embedding, so chunking settings never
+# invalidate them; clear the cache (DELETE /admin/indices/vector/query-cache) after
+# changing the embedding model or service rather than waiting for this to expire.
 # Default: 86400 (1 day).
 # query_embedding_cache_ttl_secs = 86400
 

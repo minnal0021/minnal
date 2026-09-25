@@ -61,12 +61,11 @@ pub struct SemanticSearchConfig {
     /// In production this is always set from the TOML config file.
     pub number_of_bits_for_dense_quantisation: usize,
 
-    /// Tokens/sentences per sliding-window chunk for the single-bit chunked embedding call.
-    /// Default: 4.
+    /// Sentences per sliding-window chunk for **document** single-bit (Pass-1)
+    /// embeddings. Queries are not chunked (see [`embed_query`]). Default: 4.
     pub window_size: usize,
 
-    /// How far the window advances between chunks for single-bit embeddings.
-    /// Default: 2.
+    /// How far the document chunk window advances, in sentences. Default: 2.
     pub sliding_size: usize,
 
     /// Number of IVF clusters to probe in the first-pass sparse (single-bit) search.
@@ -114,11 +113,12 @@ impl Default for SemanticSearchConfig {
     }
 }
 
-/// Query embeddings for a two-pass search: chunked vectors for Pass 1 and a
-/// single whole-query vector for Pass 2.
+/// Query embeddings for a two-pass search.
 #[derive(Debug, Clone)]
 pub struct QueryEmbeddings {
-    /// One embedding per sliding-window query chunk — Pass 1 (ColBERT MaxSim).
+    /// Pass-1 (ColBERT MaxSim) query vectors: a single copy of `dense`, since
+    /// queries are not chunked (see [`embed_query`]). `search()` still accepts
+    /// several query vectors, so this stays a list.
     pub sparse: Vec<Vec<f32>>,
     /// A single embedding of the whole query — Pass 2 dense re-ranking.
     pub dense: Vec<f32>,
@@ -178,22 +178,21 @@ pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &Clust
 
 /// Fetch the query embeddings needed for a two-pass search.
 ///
-/// Chunking happens here. A **single** batch call embeds one ordered payload list:
+/// The query is **not chunked**: one embedding of the whole query text serves
+/// both passes. It is Pass 2's dense vector and also Pass 1's single MaxSim
+/// query vector, so `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
 ///
-/// - **payload\[0\]** — the whole query text → one embedding (Pass 2 dense re-rank).
-/// - **payload\[1..\]** — [`chunk_query`](crate::semantic_search::chunking::chunk_query)'s
-///   word-tokenised sliding-window chunks → one embedding per chunk (Pass 1).
-///
-/// **Ordering is load-bearing** — the service returns embeddings in payload order,
-/// so element 0 is always the whole-query (dense) vector. The sparse list may be
-/// empty for a whitespace-only query; the dense vector is always present.
+/// Queries used to be split into 4-word sliding windows, each embedded on its
+/// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
+/// `semantic_search/query-embedding-report.md`) found the whole-query vector
+/// never worse and often better. With a tight first-pass cut it kept more
+/// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
+/// It is also much cheaper: one embedding instead of 1 + N, and `n_probes`
+/// clusters probed instead of the union over every fragment (search up to 74%
+/// faster). Document-style sentence windows for long queries gained nothing
+/// either.
 pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<QueryEmbeddings, EmbeddingError> {
-    // payload[0] = whole query (dense); payload[1..] = sliding-window chunks (sparse).
-    let mut payloads = Vec::with_capacity(1);
-    payloads.push(text.to_string());
-    payloads.extend(chunking::chunk_query(text, config.window_size, config.sliding_size));
-    debug!("query embeddings: 1 dense payload + {} sparse chunk(s)", payloads.len() - 1);
-
+    let payloads = [text.to_string()];
     let mut embeddings = embedding_service::embed(
         &config.embedding_service_url,
         EmbeddingTarget::Query,
@@ -207,7 +206,7 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 
     let dense = embeddings.next().ok_or(EmbeddingError::EmptyResponse)?;
     Ok(QueryEmbeddings {
-        sparse: embeddings.collect(),
+        sparse: vec![dense.clone()],
         dense,
     })
 }
@@ -216,14 +215,20 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 ///
 /// # Algorithm
 ///
-/// **Pass 1 — sparse (SingleBit), ColBERT MaxSim:**
-/// 1. For each query token, find the `n_probes` closest clusters by Euclidean distance.
-/// 2. Scan all SingleBit entries in the union of those clusters in parallel.
-/// 3. For each document `d` and each query token `q_i`, estimate `max_j ⟨q_i, d_j⟩`
+/// **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
+/// 1. For each query vector `q_i` in `query_sparse_embeddings`, find the `n_probes`
+///    closest clusters by Euclidean distance.
+/// 2. Scan all SingleBit (document-chunk) entries in the union of those clusters in parallel.
+/// 3. For each document `d` and each query vector `q_i`, estimate `max_j ⟨q_i, d_j⟩`
 ///    over all chunks `d_j` of `d` found in the probed clusters.
 /// 4. Aggregate via ColBERT MaxSim: `S(q, d) = Σ_i max_j ⟨q_i, d_j⟩`.
-///    Document chunks whose clusters are not probed contribute 0 to their query token's term.
+///    Document chunks whose clusters are not probed contribute 0 to their query vector's term.
 /// 5. Retain the top `first_pass_sparse_search_top_k` candidates.
+///
+/// In production the query is **not chunked**: [`embed_query`] passes a single
+/// vector (the whole-query embedding), so Pass 1 probes exactly `n_probes`
+/// clusters and `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
+/// The multi-vector form is kept general.
 ///
 /// **Pass 2 — dense (MultiBit):**
 /// 1. Batch-fetch the dense entry for every sparse candidate by `doc_id` in a single
@@ -236,7 +241,8 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 ///
 /// # Query inputs
 ///
-/// - `query_sparse_embeddings` — one embedding per query chunk, used in Pass 1.
+/// - `query_sparse_embeddings` — the Pass-1 query vectors (in production, one:
+///   the whole-query embedding, see [`embed_query`]).
 /// - `query_dense_embedding` — a single whole-query embedding, used in Pass 2.
 ///
 /// Returns an empty result if either is empty.
@@ -329,9 +335,10 @@ where
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
-    // Union of top-n_probes clusters across all query chunk embeddings. The per-chunk
-    // top-n scans are batched (parallel over chunks, contiguous centroid matrix); the
-    // union/dedup below preserves first-seen order over the batched per-chunk results.
+    // Union of top-n_probes clusters across all Pass-1 query vectors (in production
+    // there is one, so this is just its n_probes nearest). The per-vector top-n scans
+    // are batched over a contiguous centroid matrix; the union/dedup below preserves
+    // first-seen order over the batched results.
     let probe_clusters: Vec<u32> = {
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
@@ -352,12 +359,13 @@ where
 
     // Score using ColBERT MaxSim across all probed clusters — in parallel.
     //
-    // For each document `d` we accumulate, per query token `q_i`, the best estimated
-    // similarity over all chunks of `d` found in any probed cluster.  The final sparse
-    // score is the sum of those per-token maxima:
+    // For each document `d` we accumulate, per query vector `q_i` (ColBERT's "query
+    // token"; one whole-query vector in production), the best estimated similarity
+    // over all chunks of `d` found in any probed cluster.  The final sparse score is
+    // the sum of those per-vector maxima:
     //   S(q, d) = Σ_i  max_j ⟨q_i, d_j⟩
-    // where `i` ranges over query tokens and `j` over document chunks seen so far.
-    // Query tokens for which no chunk of `d` falls in a probed cluster contribute 0.
+    // where `i` ranges over query vectors and `j` over document chunks seen so far.
+    // Query vectors for which no chunk of `d` falls in a probed cluster contribute 0.
     let n_query = query_sparse_embeddings.len();
 
     // Fold state: doc_id → Vec<f32> where Vec[i] = running max of ⟨q_i, d_j⟩ over all
@@ -1077,6 +1085,21 @@ mod tests {
         // With the same input embedding, both styles land in the same cluster.
         // The cluster_id field is set independently per call; this asserts the invariant.
         assert_eq!(mb_vi.cluster_id, sb_vi.cluster_id, "same embedding → same cluster for both styles");
+    }
+
+    // ── query embedding ───────────────────────────────────────────────────────
+
+    /// A long multi-sentence query is still embedded as ONE payload, and Pass 1
+    /// reuses that vector. The mock returns exactly one embedding per request and
+    /// the client rejects a count mismatch, so sending query chunks would fail.
+    #[tokio::test]
+    async fn embed_query_embeds_the_whole_query_once_for_both_passes() {
+        let url = spawn_probe_server(8, 1.0);
+        let long = "Vitamin D deficiency is common in winter. It weakens bones. Supplements may help older adults. \
+                    Sunlight exposure also matters. Diet plays a role too. Fatty fish and fortified milk are good sources.";
+        let q = embed_query(&probe_config(url, 8), long).await.expect("single-payload query embedding");
+        assert_eq!(q.dense.len(), 8);
+        assert_eq!(q.sparse, vec![q.dense.clone()], "Pass 1 must reuse the whole-query vector");
     }
 
     // ── search() edge cases ───────────────────────────────────────────────────

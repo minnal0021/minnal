@@ -108,34 +108,28 @@ pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_4
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
 
-/// Look up cached query embeddings from the system-wide TTL cache.
+/// Look up a cached query embedding in the system-wide TTL cache.
 ///
-/// Returns `(dense, sparse)` where `dense` is the single whole-query embedding
-/// (Pass 2) and `sparse` is the list of sliding-window chunk embeddings (Pass 1).
-/// The two are stored together as one encoded list with the dense vector first.
+/// Keyed by query text. Returns the whole-query embedding, which serves both
+/// search passes (queries are not chunked; see
+/// [`embed_query`](crate::semantic_search::service::embed_query)).
 ///
 /// Returns `None` on cache miss, dimension mismatch, or any I/O error so that
 /// the caller always falls back to the embedding service transparently.
-pub async fn get_cached_query_embedding(db: &AsyncDb, query_text: &str, expected_dim: usize, ttl: Duration) -> Option<(Vec<f32>, Vec<Vec<f32>>)> {
+pub async fn get_cached_query_embedding(db: &AsyncDb, query_text: &str, expected_dim: usize, ttl: Duration) -> Option<Vec<f32>> {
     let cache_ns = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await
         .ok()?;
 
     let bytes = cache_ns.get(query_text.as_bytes().to_vec()).await.ok()??;
-    let list = bytes_to_f32_vec_list(&bytes, expected_dim)?;
-    let mut it = list.into_iter();
-    let dense = it.next()?; // first element is the whole-query dense embedding
-    Some((dense, it.collect()))
+    bytes_to_f32_vec_list(&bytes, expected_dim)?.into_iter().next()
 }
 
-/// Store query embeddings in the system-wide TTL cache.
-///
-/// `dense` (the whole-query embedding) is stored as the first element of the
-/// encoded list, followed by the `sparse` chunk embeddings; [`get_cached_query_embedding`]
-/// splits them back out. Failures are silently ignored — the cache is
-/// best-effort and must never block or fail a query.
-pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &[f32], sparse: &[Vec<f32>], ttl: Duration) {
+/// Store a whole-query embedding in the system-wide TTL cache under `query_text` (see
+/// [`get_cached_query_embedding`]). Failures are silently ignored — the cache
+/// is best-effort and must never block or fail a query.
+pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &[f32], ttl: Duration) {
     let Ok(cache_ns) = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await
@@ -143,24 +137,22 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &
         return;
     };
 
-    let mut list = Vec::with_capacity(1 + sparse.len());
-    list.push(dense.to_vec());
-    list.extend_from_slice(sparse);
     // No-WAL: the cache is best-effort, TTL-bounded and fully regenerable by
     // re-calling the embedding service on a miss, so a WAL fsync per populate
     // would be pure query-path latency with no durability benefit. A crash that
     // drops the entry simply turns into a future cache miss.
-    let _ = cache_ns.put_no_wal(query_text.as_bytes().to_vec(), f32_vec_list_to_bytes(&list)).await;
+    let _ = cache_ns
+        .put_no_wal(query_text.as_bytes().to_vec(), f32_vec_list_to_bytes(&[dense.to_vec()]))
+        .await;
 }
 
 /// Delete every entry from the system-wide query-embedding cache.
 ///
 /// Returns the number of cached entries removed. This is an explicit
-/// administrative operation: the cache is keyed only by query text, so after a
-/// change to the chunking parameters (`window_size` / `sliding_size`) the cached
-/// sparse vectors no longer match freshly-indexed documents — the cache must be
-/// cleared (alongside a corpus re-index) or stale entries will silently degrade
-/// recall until the configured TTL expires.
+/// administrative operation. Chunking settings no longer affect cached entries
+/// (queries are not chunked), but the cache key does not capture the embedding
+/// *model*: clear it after switching models or embedding services, or stale
+/// vectors are served until the configured TTL expires.
 pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Result<usize, crate::KVError> {
     let cache_ns = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
@@ -1549,31 +1541,15 @@ mod query_embedding_cache_tests {
     }
 
     #[tokio::test]
-    async fn test_cache_roundtrip_dense_and_sparse() {
+    async fn test_cache_roundtrip() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let dense = vec![0.1f32, 0.2, 0.3, 0.4];
-        let sparse = vec![vec![0.5f32, 0.6, 0.7, 0.8], vec![0.9f32, 1.0, 1.1, 1.2]];
-        put_cached_query_embedding(&db, "hello", &dense, &sparse, TEST_TTL).await;
-        let (cached_dense, cached_sparse) = get_cached_query_embedding(&db, "hello", 4, TEST_TTL).await.unwrap();
-        for (a, b) in cached_dense.iter().zip(dense.iter()) {
-            assert!((a - b).abs() < 1e-6, "dense f32 mismatch after cache round-trip");
+        put_cached_query_embedding(&db, "hello", &dense, TEST_TTL).await;
+        let cached = get_cached_query_embedding(&db, "hello", 4, TEST_TTL).await.unwrap();
+        for (a, b) in cached.iter().zip(dense.iter()) {
+            assert!((a - b).abs() < 1e-6, "f32 mismatch after cache round-trip");
         }
-        assert_eq!(cached_sparse.len(), 2);
-        assert!((cached_sparse[0][0] - 0.5f32).abs() < 1e-6);
-        assert!((cached_sparse[1][3] - 1.2f32).abs() < 1e-6);
-    }
-
-    #[tokio::test]
-    async fn test_cache_roundtrip_empty_sparse() {
-        // A whitespace-only query yields no chunks; only the dense vector is cached.
-        let dir = TempDir::new().unwrap();
-        let db = open_db(&dir).await;
-        let dense = vec![1.0f32, 2.0];
-        put_cached_query_embedding(&db, "dense-only", &dense, &[], TEST_TTL).await;
-        let (cached_dense, cached_sparse) = get_cached_query_embedding(&db, "dense-only", 2, TEST_TTL).await.unwrap();
-        assert_eq!(cached_dense, dense);
-        assert!(cached_sparse.is_empty());
     }
 
     #[tokio::test]
@@ -1581,7 +1557,7 @@ mod query_embedding_cache_tests {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let dense = vec![1.0f32, 2.0, 3.0, 4.0];
-        put_cached_query_embedding(&db, "query", &dense, &[], TEST_TTL).await;
+        put_cached_query_embedding(&db, "query", &dense, TEST_TTL).await;
         // stored as dim=4; ask for dim=3 — should be a cache miss
         assert!(get_cached_query_embedding(&db, "query", 3, TEST_TTL).await.is_none());
     }
@@ -1592,10 +1568,10 @@ mod query_embedding_cache_tests {
         let db = open_db(&dir).await;
         let dense_a = vec![1.0f32, 0.0];
         let dense_b = vec![0.0f32, 1.0];
-        put_cached_query_embedding(&db, "query-a", &dense_a, &[], TEST_TTL).await;
-        put_cached_query_embedding(&db, "query-b", &dense_b, &[], TEST_TTL).await;
-        let (cached_a, _) = get_cached_query_embedding(&db, "query-a", 2, TEST_TTL).await.unwrap();
-        let (cached_b, _) = get_cached_query_embedding(&db, "query-b", 2, TEST_TTL).await.unwrap();
+        put_cached_query_embedding(&db, "query-a", &dense_a, TEST_TTL).await;
+        put_cached_query_embedding(&db, "query-b", &dense_b, TEST_TTL).await;
+        let cached_a = get_cached_query_embedding(&db, "query-a", 2, TEST_TTL).await.unwrap();
+        let cached_b = get_cached_query_embedding(&db, "query-b", 2, TEST_TTL).await.unwrap();
         assert!((cached_a[0] - 1.0f32).abs() < 1e-6);
         assert!((cached_b[1] - 1.0f32).abs() < 1e-6);
     }
@@ -1604,8 +1580,8 @@ mod query_embedding_cache_tests {
     async fn test_clear_removes_all_entries() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        put_cached_query_embedding(&db, "query-a", &[1.0f32, 0.0], &[], TEST_TTL).await;
-        put_cached_query_embedding(&db, "query-b", &[0.0f32, 1.0], &[], TEST_TTL).await;
+        put_cached_query_embedding(&db, "query-a", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, "query-b", &[0.0f32, 1.0], TEST_TTL).await;
 
         let cleared = clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap();
         assert_eq!(cleared, 2);
@@ -1627,8 +1603,8 @@ mod query_embedding_cache_tests {
         // Baseline after namespace setup, so we only measure the cache writes.
         let before = db.ops_metrics();
 
-        put_cached_query_embedding(&db, "q1", &[1.0f32, 0.0], &[], TEST_TTL).await;
-        put_cached_query_embedding(&db, "q2", &[0.0f32, 1.0], &[], TEST_TTL).await;
+        put_cached_query_embedding(&db, "q1", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, "q2", &[0.0f32, 1.0], TEST_TTL).await;
         let cleared = clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap();
         assert_eq!(cleared, 2);
 
@@ -1640,30 +1616,14 @@ mod query_embedding_cache_tests {
         assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 0, "cache writes add no WAL fsync");
     }
 
-    /// The cache is keyed by query text **only** — it carries no chunk-config
-    /// version, so a change to `window_size` / `sliding_size` does not invalidate
-    /// it automatically (the documented limitation; remediation is an explicit
-    /// `clear_cached_query_embeddings` + corpus re-index, or TTL expiry). This pins
-    /// the remediation half: once the same query is re-embedded under the new
-    /// chunking, the fresh entry overwrites the stale one (different chunk count).
+    /// Re-embedding the same query overwrites its entry.
     #[tokio::test]
-    async fn test_cache_reembed_overwrites_with_new_chunking() {
+    async fn test_cache_reembed_overwrites() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        let dense = vec![1.0f32, 0.0];
-
-        // Old chunking: 2 sparse chunks.
-        let old_sparse = vec![vec![0.1f32, 0.2], vec![0.3f32, 0.4]];
-        put_cached_query_embedding(&db, "q", &dense, &old_sparse, TEST_TTL).await;
-        let (_, cached) = get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap();
-        assert_eq!(cached.len(), 2, "stale chunking is served until re-embedded (keyed by text only)");
-
-        // New chunking for the SAME query text (e.g. after a window_size change +
-        // re-embed): 4 sparse chunks. The fresh put overwrites the stale entry.
-        let new_sparse = vec![vec![0.1f32, 0.2], vec![0.3f32, 0.4], vec![0.5f32, 0.6], vec![0.7f32, 0.8]];
-        put_cached_query_embedding(&db, "q", &dense, &new_sparse, TEST_TTL).await;
-        let (_, cached) = get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap();
-        assert_eq!(cached, new_sparse, "re-embedding the same query must overwrite with the new chunking");
+        put_cached_query_embedding(&db, "q", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, "q", &[0.0f32, 1.0], TEST_TTL).await;
+        assert_eq!(get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap(), vec![0.0f32, 1.0]);
     }
 }
 
@@ -1867,6 +1827,64 @@ mod real_kv_profile {
     }
 }
 
+// ── Shared corpus indexing for the real-embedding harnesses ───────────────────
+//
+// Used by `real_recall` below and `semantic_search::beir_eval`: embeds each text
+// through the real embedding service and upserts its vectors under a `u64` BE doc id.
+#[cfg(test)]
+pub(crate) mod eval_indexing {
+    use super::upsert_vectors;
+    use crate::AsyncDb;
+    use crate::semantic_search::ClusterIndex;
+    use crate::semantic_search::service::{SemanticSearchConfig, embed_document};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// Embed and index `docs` (`(doc_id, text)`) into `ns` with at most `concurrency`
+    /// embedding requests in flight. Returns `(indexed, failed, first_error)`.
+    pub(crate) async fn index_texts(
+        db: &Arc<AsyncDb>,
+        ns: &str,
+        config: &Arc<SemanticSearchConfig>,
+        index: &Arc<ClusterIndex>,
+        docs: Vec<(u64, String)>,
+        concurrency: usize,
+    ) -> (usize, usize, Option<String>) {
+        // `upsert_vectors` silently skips a namespace that is not registered (so a
+        // dropped store is never resurrected), so the parent must exist first —
+        // without this every upsert is an `Ok` no-op and the index stays empty.
+        if let Err(e) = db.namespace(ns.to_string()).await {
+            return (0, docs.len(), Some(format!("create namespace '{ns}': {e}")));
+        }
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut set = tokio::task::JoinSet::new();
+        for (id, text) in docs {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let (cfg, idx, db, ns) = (config.clone(), index.clone(), db.clone(), ns.to_string());
+            set.spawn(async move {
+                let _permit = permit;
+                let doc_id = id.to_be_bytes().to_vec();
+                match embed_document(&cfg, &idx, &text).await {
+                    Ok(vis) => upsert_vectors(&db, &ns, &doc_id, &vis).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+        }
+        let (mut ok, mut fail) = (0usize, 0usize);
+        let mut first_err: Option<String> = None;
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        (ok, fail, first_err)
+    }
+}
+
 // ── Real-embedding recall vs n_probes ──────────────────────────────────────────
 //
 // The `real_kv_search_profile` above measures *latency* per n_probes over synthetic
@@ -1895,13 +1913,12 @@ mod real_recall {
     use super::*;
     use crate::semantic_search::ClusterIndex;
     use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
-    use crate::semantic_search::service::{SemanticSearchConfig, embed_document, embed_query, search};
+    use crate::semantic_search::service::{SemanticSearchConfig, embed_query, search};
     use std::collections::{HashMap, HashSet};
     use std::io::BufRead;
     use std::sync::Arc;
     use std::time::Instant;
     use tempfile::TempDir;
-    use tokio::sync::Semaphore;
 
     const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
     const DEFAULT_CORPUS: &str = "../work/sample_data/sample_data_news.jsonl";
@@ -1993,32 +2010,9 @@ mod real_recall {
                 .await
                 .unwrap(),
         );
-        let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
         let t_index = Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for (i, text) in doc_texts.into_iter().enumerate() {
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let (cfg, idx, db) = (base_config.clone(), index.clone(), db.clone());
-            set.spawn(async move {
-                let _permit = permit;
-                let doc_id = (i as u64).to_be_bytes().to_vec();
-                match embed_document(&cfg, &idx, &text).await {
-                    Ok(vis) => upsert_vectors(&db, NS, &doc_id, &vis).await.map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
-            });
-        }
-        let (mut ok, mut fail) = (0usize, 0usize);
-        let mut first_err: Option<String> = None;
-        while let Some(res) = set.join_next().await {
-            match res.unwrap() {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    fail += 1;
-                    first_err.get_or_insert(e);
-                }
-            }
-        }
+        let docs = doc_texts.into_iter().enumerate().map(|(i, t)| (i as u64, t)).collect();
+        let (ok, fail, first_err) = super::eval_indexing::index_texts(&db, NS, &base_config, &index, docs, INDEX_CONCURRENCY).await;
         eprintln!("  indexed {ok} docs ({fail} failed) in {:.1}s", t_index.elapsed().as_secs_f64());
         if ok == 0 {
             eprintln!(

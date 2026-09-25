@@ -206,11 +206,11 @@ A third namespace, `{ns}_sparse_vector_meta`, records which clusters each docume
 #### Two-Pass Search
 
 **Pass 1 — Sparse (SingleBit):**
-1. The query text is embedded (or fetched from the `system_qemb_cache` TTL namespace; TTL configurable via `query_embedding_cache_ttl_secs`, default 1 day).
-2. The top-`n_probes` clusters by Euclidean distance are identified; the union of probe sets across all query chunks is scanned.
-3. All SingleBit entries for the probed clusters are scanned from `{ns}_sparse_vector`.
+1. The query text is embedded **once, whole** (or fetched from the `system_qemb_cache` TTL namespace; TTL configurable via `query_embedding_cache_ttl_secs`, default 1 day). Queries are not chunked — this one vector is used by both passes.
+2. The top-`n_probes` clusters nearest the query vector by Euclidean distance are identified.
+3. All SingleBit (document-chunk) entries for the probed clusters are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
-5. Candidates are scored and aggregated via **SimMax** (max score per `doc_id` across all clusters × all query chunks).
+5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed clusters.
 6. The top `first_pass_sparse_search_top_k` candidates are retained.
 
 **Pass 2 — Dense (MultiBit):**

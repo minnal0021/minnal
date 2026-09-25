@@ -674,8 +674,9 @@ pub struct SemanticSearchSection {
     #[serde(default)]
     pub supported_models: Vec<SupportedModelEntry>,
 
-    /// Tokens/sentences per sliding-window chunk for single-bit chunked embeddings.
-    /// Default: 4.
+    /// Sentences per sliding-window chunk for document single-bit (Pass-1)
+    /// embeddings. Queries are not chunked. Changing this requires a corpus
+    /// re-index. Default: 4.
     #[serde(default = "default_window_size")]
     pub window_size: usize,
 
@@ -791,7 +792,7 @@ pub struct ResolvedSemanticSearchConfig {
     /// Maximum number of results returned by a semantic search query.
     pub top_k_results: usize,
 
-    /// Tokens/sentences per chunk for the single-bit sliding-window embedding call.
+    /// Sentences per chunk for document single-bit (Pass-1) embeddings.
     pub window_size: usize,
 
     /// How far the window advances between chunks for single-bit embeddings.

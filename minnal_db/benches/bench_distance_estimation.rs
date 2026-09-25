@@ -206,7 +206,8 @@ fn full_sort_top_n(cluster_map: &HashMap<u32, Cluster>, embedding: &[f32], n: us
 
 /// Compares the current selection-based `find_top_n_cluster_ids` against the old
 /// full-sort baseline over the real cluster file, at a few `n_probes` values. This
-/// is the Pass-1 cluster-probing cost, paid once per query chunk.
+/// is the Pass-1 cluster-probing cost, paid once per query vector (production
+/// queries are not chunked, so once per query).
 fn bench_top_n_cluster_selection(c: &mut Criterion) {
     let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
@@ -228,7 +229,10 @@ fn bench_top_n_cluster_selection(c: &mut Criterion) {
 
 // ── Coarse assignment: serial-HashMap (before) vs batched-matrix (after) ───────
 
-/// Generate `t` synthetic query chunks of `DIM` via a seeded XorShift64 PRNG.
+/// Generate `t` synthetic Pass-1 query vectors of `DIM` via a seeded XorShift64 PRNG.
+///
+/// Production queries are a single whole-query vector (`t = 1`); `t > 1` exercises
+/// `search()`'s general multi-vector path (and mirrors the old chunked-query cost).
 fn synthetic_query_chunks(t: usize) -> Vec<Vec<f32>> {
     let mut s = 0x00c0_ffee_1234_5678_u64;
     let mut next_f32 = move || -> f32 {

@@ -18,7 +18,7 @@ The `model` name in the config (e.g. `qwen`) is therefore *not* used to select o
 
 ### Service interface
 
-Each request carries a **`payloads` array of strings and returns one embedding per string**, so a single HTTP call can embed many strings at once. Minnal decides how many strings to send: chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service, so the service never splits a string — it embeds exactly the strings it is given. To embed a whole text, minnal sends a `payloads` array with a single string; to embed a chunked (sliding-window) document, it sends one string per chunk — all in the same request.
+Each request carries a **`payloads` array of strings and returns one embedding per string**, so a single HTTP call can embed many strings at once. Minnal decides how many strings to send: chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service, so the service never splits a string — it embeds exactly the strings it is given. To embed a whole text, minnal sends a `payloads` array with a single string — every query is exactly that, since queries are not chunked; to embed a chunked (sliding-window) document, it sends one string per chunk — all in the same request.
 
 Two `POST` endpoints, identical in request/response shape, differing only in which side of the asymmetric model they target (documents are embedded differently from queries):
 
@@ -113,8 +113,8 @@ All quantised entries share the same `VectorIndex` struct:
 The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
 
 - A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
-- **Cluster probing is exact and exhaustive.** For each query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. The union of these sets across all query embeddings is scanned once.
-- **Coarse-assignment cost is cheap at this scale.** The cost is **T·C·D** (query chunks × centroids × dim) — the distance scan runs once per query chunk. At C≈256 that is ~50 µs at 4 chunks, ~1.1 ms at 100 chunks (`bench_distance_estimation` → `coarse_assignment`). It grows *linearly with query length*, so it is not entirely free for long, many-chunk queries on a warm query-embedding cache (where the embedding round-trip no longer hides it), but it is a small fraction of a query at realistic lengths.
+- **Cluster probing is exact and exhaustive.** For the Pass-1 query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. Production queries are not chunked, so there is **one** Pass-1 query vector and exactly `n_probes` clusters are scanned (`search()` still accepts several vectors, in which case the union of their sets is scanned once).
+- **Coarse-assignment cost is cheap at this scale.** The cost is **T·C·D** (query vectors × centroids × dim), and production `T = 1`: one distance scan per query, ~microseconds at C≈256 (`bench_distance_estimation` → `coarse_assignment` measures larger T, ~50 µs at 4 and ~1.1 ms at 100, from when queries were split into word-window chunks and the cost grew with query length).
 
 Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
 
@@ -140,22 +140,22 @@ Lines are parsed independently (`read_clusters_from_file` in `cluster/mod.rs`): 
 ```
 Raw query text
   → embedding cache lookup (system_qemb_cache TTL namespace)
-  → on miss: embed_query — ONE batch POST to {base_url}/embedding/query
-       · payload[0]:  whole query → 1 embedding         (Pass 2 dense)
-       · payload[1..]: chunk_query → N chunk embeddings  (Pass 1 sparse)
-  → cache both together (TTL configurable; default 1 day)
+  → on miss: embed_query — ONE POST to {base_url}/embedding/query
+       · payload[0]: whole query → 1 embedding q
+                     (Pass 2 dense vector AND Pass 1's single MaxSim vector;
+                      queries are not chunked)
+  → cache it (TTL configurable; default 1 day)
 
-Pass 1 — Sparse (SingleBit), ColBERT MaxSim:
-  for each query chunk q_i:
-    find top-n_probes cluster IDs by Euclidean distance
-  union cluster sets across all query tokens
+Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
+  find top-n_probes cluster IDs for q by Euclidean distance
+    (several query vectors → union of their cluster sets)
   scan_sparse_cluster(cluster_id) for each cluster in parallel
   for each (cluster, document d):
     apply doc_filter (RoaringBitmap predicate) — skip if fails
-    for each query token q_i:
-      score = max_j SingleBitEstimator(q_i, d_j)   ← best chunk for this token
-      per_token_max[doc_id][i] = max(per_token_max[doc_id][i], score)
-  final sparse score: S(q, d) = Σ_i per_token_max[d][i]  (ColBERT MaxSim)
+    for each query vector q_i (one in production):
+      score = max_j SingleBitEstimator(q_i, d_j)   ← best chunk of d
+      per_vector_max[doc_id][i] = max(per_vector_max[doc_id][i], score)
+  final sparse score: S(q, d) = Σ_i per_vector_max[d][i]  (= max_j ⟨q, d_j⟩ for one vector)
   sort descending by score, truncate to first_pass_sparse_search_top_k
 
 Pass 2 — Dense (MultiBit):
@@ -175,15 +175,17 @@ Pass 2 — Dense (MultiBit):
 
 ### ColBERT MaxSim aggregation (Pass 1)
 
-Pass 1 uses **ColBERT MaxSim** to aggregate scores across multiple query tokens and document chunks:
+Pass 1 uses **ColBERT MaxSim** to aggregate scores across query vectors and document chunks:
 
 ```
 S(q, d) = Σ_i  max_j ⟨q_i, d_j⟩
 ```
 
-where `i` iterates over query tokens and `j` over document chunks. For each query token, the best-matching chunk of the document wins (inner `max`); those per-token bests are then **summed** (outer `Σ`). This means a document that matches many query tokens scores proportionally higher than one that only matches one — even if that one match is equally strong.
+where `i` iterates over query vectors and `j` over document chunks. For each query vector, the best-matching chunk of the document wins (inner `max`); those per-vector bests are then **summed** (outer `Σ`).
 
-Chunks whose cluster is not probed contribute **0** to their query token's term (rather than −∞), so documents are never penalised for having chunks in far-away clusters.
+**In production there is one query vector** — the whole-query embedding — so this reduces to `S(q, d) = max_j ⟨q, d_j⟩`: a document scores by its single best-matching chunk. Queries used to be split into 4-word sliding windows (one `q_i` per window), which let a document score by matching many fragments. A BEIR evaluation (`query-embedding-report.md`) found that signal weaker, not stronger. 4-word fragments carry little meaning on their own, and with a tight first-pass cut they let relevant documents drop out (ArguAna candidate recall 0.870 vs 0.991). They were also far costlier: 96 query vectors and 171 probed clusters per ArguAna query vs 1 and 32. Sentence-window query chunks matched the whole query on quality at extra cost, so the query is not chunked at all. The general `Σ_i` form stays in `search()`.
+
+Chunks whose cluster is not probed contribute **0** to their query vector's term (rather than −∞), so documents are never penalised for having chunks in far-away clusters.
 
 ### Dense re-ranking (Pass 2)
 
@@ -333,8 +335,8 @@ All parameters are under `[semantic_search]` in the TOML config:
 | `number_of_bits_for_dense_quantisation` | `8` | Bits per dimension for MultiBit (dense) quantisation. 4 = compact, 8 = high recall. Only affects Pass 2 precision. |
 | `n_probes` | `32` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower — see *Tuning & profiling* below. |
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
-| `window_size` | `4` | Sentences/tokens per sliding-window chunk for SingleBit embeddings. |
-| `sliding_size` | `2` | Window advance step. Smaller than `window_size` → overlapping chunks. |
+| `window_size` | `4` | Sentences per sliding-window chunk for **document** SingleBit embeddings (queries are not chunked). Changing it requires a corpus re-index. |
+| `sliding_size` | `2` | Document window advance step, in sentences. Smaller than `window_size` → overlapping chunks. |
 | `cluster_path` | — | Path to the JSONL cluster centroids file. |
 | `embedding_service_url` | `http://localhost:8001` | Base URL of the external embedding service. |
 | `top_k_results` | `100` | Maximum results returned per query (overridable per-request). |

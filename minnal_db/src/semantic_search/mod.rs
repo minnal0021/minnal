@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod beir_eval;
 pub mod chunking;
 pub mod cluster;
 pub mod index;
@@ -7,7 +9,7 @@ pub mod service;
 pub(crate) mod simd;
 pub mod vector_math;
 
-pub use self::chunking::{ChunkBoundary, chunk_document, chunk_query};
+pub use self::chunking::chunk_document;
 pub use self::cluster::Cluster;
 pub use self::cluster::ClusterIndex;
 pub use self::index::composite_key;

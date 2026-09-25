@@ -258,17 +258,17 @@ number_of_bits_for_dense_quantisation = 8
 # n_probes = 32
 # Candidates kept after Pass 1 before dense re-ranking.
 # first_pass_sparse_search_top_k = 1000
-# Sliding-window chunk parameters for Pass 1 single-bit embeddings.
+# Sentence-window chunk parameters for documents' Pass 1 single-bit embeddings.
 # window_size = 4
 # sliding_size = 2
 ```
 
-> **Note:** `window_size` and `sliding_size` control how text is split into chunks
-> for the sparse (Pass 1) embeddings, and the *same* values are used to chunk both
-> documents at index time and queries at search time. Changing them after
-> documents have been indexed makes stored chunks and new query chunks
-> inconsistent, which silently degrades recall (no error is raised). Treat them as
-> a fixed indexing decision: if you change either value, re-embed the corpus with
+> **Note:** `window_size` and `sliding_size` control how **documents** are split
+> into sentence-window chunks for the sparse (Pass 1) embeddings. Queries are not
+> chunked: a query is embedded once, whole, for both passes. Changing either value
+> after documents have been indexed leaves already-indexed documents with the old
+> chunks (no error is raised). Treat them as a fixed indexing decision: if you
+> change either value, re-embed the corpus with
 > `POST /admin/indices/{ns}/vector/reindex-all`.
 
 Config file resolution order (CLI argument → `MINNAL_CONFIG_FILE` → built-in
