@@ -78,6 +78,8 @@ A whole-text ("single") embedding is just a one-element `payloads` array; chunke
 
 Pre-built centroids ship per model at `service/embedding_support/{model}/clusters.json` — currently **gemma** (what the companion embedding service serves) and **qwen**, each 256 centroids × 768 dims. Set `semantic_search.cluster_path` to the one matching the model the service actually serves; both are 768-dim, so a mismatch passes `load_with_dim` and degrades recall silently. Each file is ~4.4 MB of JSONL — do not read it; it is data, not code.
 
+**The gemma set was regenerated on 2026-09-25 for the PyTorch embedding service.** The earlier ONNX/FastEmbed service mean-pooled raw hidden states and skipped EmbeddingGemma's two Dense projections, so its vectors, and the old centroids fit on them, lived in a different space (cosine ≈ 0 vs the real embeddings). Any vector index built with the old service is incompatible with this file: re-index it (`POST /admin/indices/{ns}/vector/reindex-all`) and clear the query-embedding cache (`DELETE /admin/indices/vector/query-cache`). Provenance, reproducible with the embedding service's `generate_sample_embeddings.sh` + `generate_cluster_centroids.sh`: ELI5 QA pairs (first 25,024 records, `question + "\n" + answer`, document prompt), K-means k=256, seed 42. It is a **general-purpose example set**: well spread on general text (253/256 clusters used by held-out ELI5), but specialist text collapses (SciFact: 43% of docs in one cluster), so domain-specific deployments should fit centroids on their own data.
+
 ## Configuration (from TOML)
 
 ```toml
