@@ -11,6 +11,7 @@
 //! | Tool        | Description                                                          |
 //! |-------------|----------------------------------------------------------------------|
 //! | `bulk_load` | Load a JSONL file into a doc store (default) or KV store (`--kv`), optionally importing its schema first |
+//! | `search_load` | Closed-loop concurrent load against a semantic-search endpoint; reports throughput and latency percentiles |
 //!
 //! # Example
 //!
@@ -23,9 +24,13 @@
 //!
 //! # Load into a store that already exists
 //! minnal_tools bulk_load http://localhost:8080 profiles id profiles.jsonl
+//!
+//! # 32 concurrent clients against a KV store's semantic search for 20 seconds
+//! minnal_tools search_load --kv -c 32 --duration 20 --qids qrels/test.tsv http://localhost:8080 fiqa queries.jsonl
 //! ```
 
 mod bulk_load;
+mod search_load;
 
 fn usage() -> ! {
     eprintln!(concat!(
@@ -34,6 +39,7 @@ fn usage() -> ! {
         "tools:\n",
         "  bulk_load    load a JSONL file into a doc store (default) or KV store (--kv),\n",
         "               optionally importing its schema first\n",
+        "  search_load  concurrent load against a semantic-search endpoint\n",
         "\n",
         "run 'minnal_tools <tool>' with no further arguments for tool-specific help",
     ));
@@ -50,6 +56,7 @@ async fn main() {
 
     let result = match args[1].as_str() {
         "bulk_load" => bulk_load::run(&args[2..]).await,
+        "search_load" => search_load::run(&args[2..]).await,
         other => {
             eprintln!("unknown tool: {other}");
             usage();
