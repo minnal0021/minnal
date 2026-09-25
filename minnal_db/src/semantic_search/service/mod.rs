@@ -23,9 +23,9 @@ use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, Vect
 use crate::semantic_search::quantisation::rabitq;
 use std::collections::HashMap;
 
-/// `(cluster_id, [(doc_id_bytes, raw_rkyv_bytes)])` pairs — the fetched sparse entries
-/// moved into a flat list so the parallel MaxSim fold splits evenly over them.
-type ClusterEntryList = Vec<(u32, Vec<(Vec<u8>, Vec<u8>)>)>;
+/// One fetched Pass-1 entry, borrowed from the scan result:
+/// `(cluster_id, per-query-vector estimators for that cluster, doc_id, raw rkyv bytes)`.
+type SparseEntryRef<'a> = (u32, &'a [SingleBitQuanDotProductEstimator], &'a [u8], &'a [u8]);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
@@ -359,120 +359,134 @@ where
 
     // Score using ColBERT MaxSim across all probed clusters — in parallel.
     //
-    // For each document `d` we accumulate, per query vector `q_i` (ColBERT's "query
+    // For each document `d` we take, per query vector `q_i` (ColBERT's "query
     // token"; one whole-query vector in production), the best estimated similarity
     // over all chunks of `d` found in any probed cluster.  The final sparse score is
     // the sum of those per-vector maxima:
     //   S(q, d) = Σ_i  max_j ⟨q_i, d_j⟩
-    // where `i` ranges over query vectors and `j` over document chunks seen so far.
+    // where `i` ranges over query vectors and `j` over the document's probed chunks.
     // Query vectors for which no chunk of `d` falls in a probed cluster contribute 0.
     let n_query = query_sparse_embeddings.len();
 
-    // Fold state: doc_id → Vec<f32> where Vec[i] = running max of ⟨q_i, d_j⟩ over all
-    // chunks d_j of that document seen so far.  Initialised to NEG_INFINITY per token so
-    // an observed-but-negative max is kept (true ColBERT MaxSim, no clipping to 0). A
-    // token never matched against any probed chunk stays NEG_INFINITY and is converted to
-    // 0 only at the final sum below — absence is neutral, anti-correlation is not.
-    //
-    // We consume `sparse_by_cluster` by value (into_par_iter) rather than cloning every
-    // cluster's entries into a separate list, and move each `doc_id` straight into the
-    // map key. Scoring reads each entry zero-copy from its rkyv archive (packed words
-    // copied into a per-cluster reused buffer), avoiding a per-entry owned `VectorIndex`.
-    // Move (don't clone) the fetched entries into a Vec so the parallel fold splits over
-    // a flat slice — rayon load-balances a Vec far better than a HashMap's bucket table.
-    let cluster_scan_pairs: ClusterEntryList = sparse_by_cluster.into_iter().collect();
-    let maxsim_state: HashMap<Vec<u8>, Vec<f32>> = cluster_scan_pairs
-        .into_par_iter()
-        .fold(HashMap::new, |mut map, (cluster_id, entries)| {
-            let Some(cluster) = cluster_index.clusters.get(&cluster_id) else {
-                return map;
-            };
-            // Pre-compute one estimator per query token for this cluster.
-            // query_to_centroid_dot_product and scaled_query_sum are constant across all
-            // document entries in the same cluster, so we compute them only once here.
-            let estimators: Vec<SingleBitQuanDotProductEstimator> = query_sparse_embeddings
+    // One estimator per (probed cluster, query vector): query_to_centroid_dot_product
+    // and scaled_query_sum are constant across a cluster's entries. A probed id with
+    // no centroid in the index contributes no candidates.
+    let cluster_estimators: HashMap<u32, Vec<SingleBitQuanDotProductEstimator>> = sparse_by_cluster
+        .keys()
+        .filter_map(|&cluster_id| {
+            let cluster = cluster_index.clusters.get(&cluster_id)?;
+            let estimators = query_sparse_embeddings
                 .iter()
                 .map(|q| SingleBitQuanDotProductEstimator::new(cluster_id, q, &cluster.centroid))
                 .collect();
-
-            // Reused across this cluster's chunks: copy_packed_into clears then refills it,
-            // so scoring never allocates per chunk.
-            let mut words_buf: Vec<u64> = Vec::new();
-
-            for (doc_id, raw_bytes) in entries {
-                if doc_filter.as_ref().is_some_and(|f| !f(&doc_id)) {
-                    continue;
-                }
-                let vi_list = match VectorIndex::access_list(&raw_bytes) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        // Corrupt sparse entry: skip it, but make it visible so a degraded
-                        // index is distinguishable from "no semantic match".
-                        crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
-                        warn!(
-                            "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
-                            doc_id_hex(&doc_id),
-                            raw_bytes.len(),
-                        );
-                        continue;
-                    }
-                };
-                if vi_list.is_empty() {
-                    continue;
-                }
-                // The sparse namespace must hold only SingleBit chunks; a MultiBit (or
-                // any other) entry here would be scored with the single-bit estimator
-                // over the wrong packed layout, yielding garbage. Reject the blob
-                // instead — a wrong style is a write-path bug or corruption, not data.
-                if let Some(bad) = vi_list.iter().map(|vi| vi.style()).find(|s| *s != QuantisationStyle::SingleBit) {
-                    warn!(
-                        "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected SingleBit, found {bad:?}",
-                        doc_id_hex(&doc_id),
-                    );
-                    continue;
-                }
-
-                let per_query_maxes = map.entry(doc_id).or_insert_with(|| vec![f32::NEG_INFINITY; n_query]);
-
-                // Per chunk: copy its packed words once, then update every query token's
-                // running max — same result as max_j ⟨q_i, d_j⟩ per token, but the packed
-                // buffer is filled once per chunk instead of once per (token, chunk).
-                for vi in vi_list.iter() {
-                    vi.copy_packed_into(&mut words_buf);
-                    let scaling_factor = vi.scaling_factor();
-                    for (q_idx, (q, estimator)) in query_sparse_embeddings.iter().zip(estimators.iter()).enumerate() {
-                        let score = estimator.estimate_from_parts(q, &words_buf, scaling_factor);
-                        if score > per_query_maxes[q_idx] {
-                            per_query_maxes[q_idx] = score;
-                        }
-                    }
-                }
-            }
-            map
+            Some((cluster_id, estimators))
         })
-        .reduce(HashMap::new, |mut a, b| {
-            for (doc_id, scores_b) in b {
-                let scores_a = a.entry(doc_id).or_insert_with(|| vec![f32::NEG_INFINITY; n_query]);
-                for i in 0..n_query {
-                    if scores_b[i] > scores_a[i] {
-                        scores_a[i] = scores_b[i];
-                    }
-                }
-            }
-            a
-        });
-
-    // Collapse each doc's per-token maxes to its MaxSim score S(q, d) = Σ_i max_j ⟨q_i, d_j⟩
-    // straight into the ranking Vec — no intermediate score map (it would just re-hash
-    // every doc id to immediately drain back into a Vec).
-    let mut sparse_ranked: Vec<(Vec<u8>, f32)> = maxsim_state
-        .into_iter()
-        .map(|(doc_id, per_query_maxes)| (doc_id, maxsim_score(&per_query_maxes)))
         .collect();
 
-    // Keep top first_pass_sparse_search_top_k candidates.
-    sparse_ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    sparse_ranked.truncate(config.first_pass_sparse_search_top_k);
+    // Flatten every probed entry into one list so rayon splits the *entries*, not the
+    // clusters: IVF clusters are heavily skewed (one cluster can hold a third of a
+    // corpus), and splitting by cluster left that cluster's scan on a single thread.
+    // Entries are borrowed from `sparse_by_cluster`; nothing is copied.
+    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster
+        .iter()
+        .filter_map(|(cluster_id, cluster_entries)| Some((*cluster_id, cluster_estimators.get(cluster_id)?.as_slice(), cluster_entries)))
+        .flat_map(|(cluster_id, estimators, cluster_entries)| {
+            cluster_entries
+                .iter()
+                .map(move |(doc_id, raw_bytes)| (cluster_id, estimators, doc_id.as_slice(), raw_bytes.as_slice()))
+        })
+        .collect();
+
+    // Score each entry into its own row of a flat `n_query`-wide matrix: row[i] is
+    // max_j ⟨q_i, d_j⟩ over that entry's chunks. Rows start at NEG_INFINITY so an
+    // observed-but-negative max is kept (true ColBERT MaxSim, no clipping to 0).
+    // Skipped entries (filtered, corrupt, wrong style, empty) are marked in `kept`.
+    // Scoring reads each entry zero-copy from its rkyv archive (packed words copied
+    // into a per-worker reused buffer), so no per-entry or per-doc allocation.
+    let mut entry_maxes = vec![f32::NEG_INFINITY; entries.len() * n_query];
+    let mut kept = vec![false; entries.len()];
+    entry_maxes
+        .par_chunks_mut(n_query)
+        .zip(kept.par_iter_mut())
+        .zip(entries.par_iter())
+        .for_each_init(Vec::<u64>::new, |words_buf, ((row, kept), &(cluster_id, estimators, doc_id, raw_bytes))| {
+            if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) {
+                return;
+            }
+            let vi_list = match VectorIndex::access_list(raw_bytes) {
+                Ok(list) => list,
+                Err(e) => {
+                    // Corrupt sparse entry: skip it, but make it visible so a degraded
+                    // index is distinguishable from "no semantic match".
+                    crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
+                    warn!(
+                        "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
+                        doc_id_hex(doc_id),
+                        raw_bytes.len(),
+                    );
+                    return;
+                }
+            };
+            if vi_list.is_empty() {
+                return;
+            }
+            // The sparse namespace must hold only SingleBit chunks; a MultiBit (or
+            // any other) entry here would be scored with the single-bit estimator
+            // over the wrong packed layout, yielding garbage. Reject the blob
+            // instead — a wrong style is a write-path bug or corruption, not data.
+            if let Some(bad) = vi_list.iter().map(|vi| vi.style()).find(|s| *s != QuantisationStyle::SingleBit) {
+                warn!(
+                    "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected SingleBit, found {bad:?}",
+                    doc_id_hex(doc_id),
+                );
+                return;
+            }
+            // Per chunk: copy its packed words once, then update every query token's
+            // running max.
+            for vi in vi_list.iter() {
+                vi.copy_packed_into(words_buf);
+                let scaling_factor = vi.scaling_factor();
+                for ((q, estimator), row_max) in query_sparse_embeddings.iter().zip(estimators).zip(row.iter_mut()) {
+                    let score = estimator.estimate_from_parts(q, words_buf, scaling_factor);
+                    if score > *row_max {
+                        *row_max = score;
+                    }
+                }
+            }
+            *kept = true;
+        });
+
+    // Group entries by document (a document's chunks can sit in several probed
+    // clusters) by sorting entry indices on doc_id, then fold each group's rows
+    // with an element-wise max and collapse it to S(q, d). Sorting borrowed keys
+    // replaces a per-document HashMap entry — and its key/row allocations — per
+    // worker, plus the cross-worker merge of those maps.
+    let mut order: Vec<usize> = (0..entries.len()).filter(|&i| kept[i]).collect();
+    order.par_sort_unstable_by(|&a, &b| entries[a].2.cmp(entries[b].2));
+    let mut doc_maxes = vec![f32::NEG_INFINITY; n_query];
+    let mut sparse_ranked: Vec<(&[u8], f32)> = order
+        .chunk_by(|&a, &b| entries[a].2 == entries[b].2)
+        .map(|group| {
+            doc_maxes.fill(f32::NEG_INFINITY);
+            for &i in group {
+                for (doc_max, &entry_max) in doc_maxes.iter_mut().zip(&entry_maxes[i * n_query..(i + 1) * n_query]) {
+                    if entry_max > *doc_max {
+                        *doc_max = entry_max;
+                    }
+                }
+            }
+            (entries[group[0]].2, maxsim_score(&doc_maxes))
+        })
+        .collect();
+
+    // Keep the top first_pass_sparse_search_top_k candidates. Pass 2 re-scores and
+    // heap-ranks them, so their order here is irrelevant: an O(n) partition is enough
+    // (a full sort of every probed document was ~4 ms on a 57k-doc corpus).
+    let first_pass_k = config.first_pass_sparse_search_top_k;
+    if sparse_ranked.len() > first_pass_k {
+        sparse_ranked.select_nth_unstable_by(first_pass_k, |a, b| b.1.total_cmp(&a.1));
+        sparse_ranked.truncate(first_pass_k);
+    }
 
     debug!("ANN search: {} sparse candidates after pass 1", sparse_ranked.len());
 
@@ -483,7 +497,7 @@ where
     // ── Pass 2: dense multi-bit re-ranking ───────────────────────────────────
 
     // Fetch all dense entries in one batch operation (single blocking task in production).
-    let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.clone()).collect();
+    let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.to_vec()).collect();
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await;
 
     debug!("ANN search: dense pass over {} candidates", dense_doc_ids.len());
@@ -1973,6 +1987,68 @@ mod tests {
         assert_eq!(
             results[0].document_id, b"doc_multi",
             "doc_multi's best chunk (0.8) must beat doc_solo (0.5)"
+        );
+    }
+
+    /// A document's chunks can land in different probed clusters; Pass 1 must merge
+    /// them into one candidate whose MaxSim takes each query vector's best chunk
+    /// across *all* of its entries, not just one of them.
+    ///
+    /// Two query vectors, each aligned with one cluster's centroid. With empty packed
+    /// words a chunk scores ⟨q, c⟩ − scaling_factor·Σq, so a chunk in cluster 1 scores
+    /// (1 − s, −s) for (q1, q2) and a chunk in cluster 2 scores (−s, 1 − s).
+    ///
+    /// * doc_split — s = 0.1 in both clusters: correct S = 0.9 + 0.9 = 1.8, but any
+    ///   *single* entry gives only 0.9 + (−0.1) = 0.8.
+    /// * doc_rival — one chunk in cluster 1 with s = 0: S = 1.0 + 0.0 = 1.0.
+    ///
+    /// doc_split must win the single first-pass slot. Merging only one of its entries
+    /// (whichever the grouping happens to see first) would let doc_rival win, whatever
+    /// the entry order.
+    #[tokio::test]
+    async fn test_pass1_merges_one_doc_across_clusters() {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+
+        let chunk = |cluster_id: u32, scaling_factor: f32| {
+            VectorIndex::list_to_bytes(&[VectorIndex::new(
+                cluster_id,
+                QuantisationStyle::SingleBit,
+                0.0,
+                scaling_factor,
+                0.01,
+                vec![],
+            )])
+        };
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
+
+        let mut store = MockVectorKvStore::new();
+        store.sparse_data.entry(1).or_default().push((b"doc_split".to_vec(), chunk(1, 0.1)));
+        store.sparse_data.entry(1).or_default().push((b"doc_rival".to_vec(), chunk(1, 0.0)));
+        store.sparse_data.entry(2).or_default().push((b"doc_split".to_vec(), chunk(2, 0.1)));
+        store.add_dense_entry(1, b"doc_split", 0.1);
+        store.add_dense_entry(1, b"doc_rival", 0.1);
+
+        let config = SemanticSearchConfig {
+            n_probes: 2,
+            first_pass_sparse_search_top_k: 1,
+            ..Default::default()
+        };
+        let results = search(
+            &config,
+            "test_ns",
+            &cluster_index,
+            &[vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0f32, 1.0, 0.0, 0.0]],
+            &[1.0f32, 0.0, 0.0, 0.0],
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1, "one merged candidate per document, cut to top 1");
+        assert_eq!(
+            results[0].document_id, b"doc_split",
+            "doc_split merged across clusters (1.8) must beat doc_rival (1.0)"
         );
     }
 
