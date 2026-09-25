@@ -9,7 +9,8 @@ impl DocStore {
     /// Fetch the query embeddings needed for a two-pass semantic search.
     ///
     /// Returns `(dense, sparse)`: the single whole-query embedding used in Pass 2
-    /// dense re-ranking, and the sliding-window chunk embeddings used in Pass 1.
+    /// dense re-ranking, and Pass 1's query vectors (that same vector: queries are
+    /// not chunked).
     /// Uses the system-wide TTL cache when possible, falling back to the embedding
     /// service (then populating the cache) on a miss.
     #[cfg(feature = "semantic-search")]
@@ -21,26 +22,26 @@ impl DocStore {
         query_text: &str,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>), DocStoreError> {
         let ttl = ctx.config.query_embedding_cache_ttl;
-        if let Some(cached) = vector_kv::get_cached_query_embedding(&self.db, query_text, ctx.config.embedding_dim, ttl).await {
+        // Queries are not chunked: one whole-query vector serves both passes.
+        if let Some(dense) = vector_kv::get_cached_query_embedding(&self.db, query_text, ctx.config.embedding_dim, ttl).await {
             debug!("query embedding cache hit");
-            return Ok(cached);
+            return Ok((dense.clone(), vec![dense]));
         }
         debug!("query embedding cache miss, calling embedding service");
         let q = crate::semantic_search::service::embed_query(&ctx.config, query_text)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-        vector_kv::put_cached_query_embedding(&self.db, query_text, &q.dense, &q.sparse, ttl).await;
+        vector_kv::put_cached_query_embedding(&self.db, query_text, &q.dense, ttl).await;
         Ok((q.dense, q.sparse))
     }
 
     /// Clear the system-wide query-embedding cache, returning the number of
     /// entries removed.
     ///
-    /// The cache is keyed only by query text, so it must be cleared after any
-    /// change to the chunking parameters (`window_size` / `sliding_size`) —
-    /// otherwise cached sparse vectors built under the old chunking keep being
-    /// served (up to the configured TTL) and silently degrade recall against
-    /// freshly-indexed documents. Exposed via the admin API for this purpose.
+    /// Entries are keyed by query text and hold the whole-query embedding, so
+    /// chunking settings (which only affect documents) never invalidate them.
+    /// Clear it after changing the embedding *model* or service, or stale
+    /// vectors are served until the TTL expires. Exposed via the admin API.
     #[cfg(feature = "semantic-search")]
     pub async fn clear_query_embedding_cache(&self) -> Result<usize, DocStoreError> {
         let ttl = self

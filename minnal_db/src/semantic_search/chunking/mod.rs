@@ -1,20 +1,16 @@
-//! Text chunking for embedding.
+//! Document chunking for embedding.
 //!
 //! Chunking used to live in the external embedding service; it now lives here so
 //! minnal sends the service pre-chunked strings (one embedding is returned per
 //! string). The service no longer splits text.
 //!
-//! Two boundary strategies, matching how the two kinds of text are embedded:
-//!
-//! - **Documents** (generally longer) are split on **sentence** boundaries via
-//!   [`split_sentences`].
-//! - **Queries** (generally shorter) are tokenised on **word** boundaries via
-//!   [`split_words`].
-//!
-//! The resulting base units are then grouped into overlapping **sliding
-//! windows** by [`sliding_windows`]: each window concatenates `window_size`
-//! consecutive units, and the window start advances by `sliding_size` units
-//! between chunks. The final window keeps whatever units remain.
+//! Only **documents** are chunked: [`chunk_document`] splits the text on
+//! **sentence** boundaries ([`split_sentences`]) and groups the sentences into
+//! overlapping **sliding windows** ([`sliding_windows`]). Each window becomes one
+//! Pass-1 (SingleBit, ColBERT MaxSim) chunk embedding. Each window concatenates
+//! `window_size` consecutive sentences, and the window start advances by
+//! `sliding_size` sentences between chunks. The final window keeps whatever
+//! units remain.
 //!
 //! ```text
 //! units = [a, b, c, d, e],  window_size = 2,  sliding_size = 1
@@ -24,11 +20,18 @@
 //!   → "a b", "c d", "e"          (last window = remainder)
 //! ```
 //!
-//! `window_size` and `sliding_size` are the same knobs as
-//! [`crate::semantic_search::service::SemanticSearchConfig`] / the TOML `[semantic_search]`
-//! section. They are effectively an on-disk decision: queries must be chunked
-//! with the *same* values used to index documents, or Pass-1 ColBERT MaxSim
-//! compares mismatched chunkings (see `semantic_search/CLAUDE.md`).
+//! **Queries are not chunked.** A query is embedded once, whole, and that one
+//! vector serves both passes (see
+//! [`embed_query`](crate::semantic_search::service::embed_query)). Earlier
+//! versions split queries into 4-word windows; a BEIR evaluation found the
+//! whole-query vector never worse, often better, and much cheaper
+//! (`semantic_search/query-embedding-report.md`).
+//!
+//! `window_size` and `sliding_size` are the knobs of
+//! [`crate::semantic_search::service::SemanticSearchConfig`] / the TOML
+//! `[semantic_search]` section. They are effectively an on-disk decision:
+//! changing them requires re-indexing the corpus, since stored chunk vectors
+//! keep the old chunking.
 //!
 //! The sentence splitter is a deterministic, intentionally dependency-free
 //! heuristic (a terminator `.`/`!`/`?` followed by whitespace ends a sentence).
@@ -37,47 +40,13 @@
 //! [`split_sentences`] for the enumerated limitations and the characterisation
 //! tests that pin each one.
 
-/// Which boundary to split raw text on before windowing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkBoundary {
-    /// Split on sentence boundaries — used for documents.
-    Sentence,
-    /// Split on whitespace word boundaries — used for queries.
-    Word,
-}
-
-/// Chunk `text` into sliding-window strings ready to send to the embedding service.
+/// Chunk a document: sentence-split, then group into sliding windows.
 ///
-/// Splits `text` into base units according to `boundary`, then groups them into
-/// overlapping windows with [`sliding_windows`]. Returns an empty vector when
-/// `text` contains no units.
-///
-/// `window_size` and `sliding_size` are clamped to a minimum of 1; a
-/// `sliding_size` of 0 would otherwise never advance.
-pub fn chunk_text(text: &str, boundary: ChunkBoundary, window_size: usize, sliding_size: usize) -> Vec<String> {
-    let units = match boundary {
-        ChunkBoundary::Sentence => split_sentences(text),
-        ChunkBoundary::Word => split_words(text),
-    };
-    sliding_windows(&units, window_size, sliding_size)
-}
-
-/// Chunk a document: sentence-split then sliding-window. See [`chunk_text`].
+/// Returns an empty vector when `text` contains no sentences. `window_size` and
+/// `sliding_size` are clamped to a minimum of 1; a `sliding_size` of 0 would
+/// otherwise never advance.
 pub fn chunk_document(text: &str, window_size: usize, sliding_size: usize) -> Vec<String> {
-    chunk_text(text, ChunkBoundary::Sentence, window_size, sliding_size)
-}
-
-/// Chunk a query: word-tokenise then sliding-window. See [`chunk_text`].
-pub fn chunk_query(text: &str, window_size: usize, sliding_size: usize) -> Vec<String> {
-    chunk_text(text, ChunkBoundary::Word, window_size, sliding_size)
-}
-
-/// Split `text` into whitespace-delimited word tokens.
-///
-/// Punctuation stays attached to its word (`"when?"` is one token), matching the
-/// IR-style whitespace tokenisation the embedding service previously used.
-pub fn split_words(text: &str) -> Vec<String> {
-    text.split_whitespace().map(str::to_string).collect()
+    sliding_windows(&split_sentences(text), window_size, sliding_size)
 }
 
 /// Split `text` into sentences using a deterministic heuristic.
@@ -190,24 +159,6 @@ fn push_trimmed(chars: &[char], out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── split_words ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn split_words_basic() {
-        assert_eq!(split_words("who filed the complaint"), vec!["who", "filed", "the", "complaint"]);
-    }
-
-    #[test]
-    fn split_words_keeps_punctuation_and_collapses_whitespace() {
-        assert_eq!(split_words("  What is\tLlama?  and\nwhy "), vec!["What", "is", "Llama?", "and", "why"]);
-    }
-
-    #[test]
-    fn split_words_empty() {
-        assert!(split_words("   ").is_empty());
-        assert!(split_words("").is_empty());
-    }
 
     // ── split_sentences ───────────────────────────────────────────────────────
 
@@ -376,7 +327,7 @@ mod tests {
         assert_eq!(sliding_windows(&u, 2, 2), vec!["a b", "c d", "e"]);
     }
 
-    // ── chunk_document / chunk_query ──────────────────────────────────────────
+    // ── chunk_document ────────────────────────────────────────────────────────
 
     #[test]
     fn chunk_document_sentences_with_window() {
@@ -386,22 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn chunk_query_words_with_window() {
-        let text = "who filed the complaint";
-        // words: [who, filed, the, complaint], W=2 S=1
-        assert_eq!(chunk_query(text, 2, 1), vec!["who filed", "filed the", "the complaint"],);
-    }
-
-    #[test]
-    fn chunk_text_dispatches_on_boundary() {
-        let text = "one two. three four.";
-        assert_eq!(chunk_text(text, ChunkBoundary::Word, 4, 4), vec!["one two. three four."],);
-        assert_eq!(chunk_text(text, ChunkBoundary::Sentence, 1, 1), vec!["one two.", "three four."],);
+    fn chunk_document_one_sentence_per_window() {
+        assert_eq!(chunk_document("one two. three four.", 1, 1), vec!["one two.", "three four."],);
     }
 
     #[test]
     fn chunk_empty_text_yields_no_chunks() {
         assert!(chunk_document("   ", 2, 1).is_empty());
-        assert!(chunk_query("", 2, 1).is_empty());
+        assert!(chunk_document("", 2, 1).is_empty());
     }
 }

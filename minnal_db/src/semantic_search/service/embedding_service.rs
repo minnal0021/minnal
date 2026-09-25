@@ -9,8 +9,9 @@
 //! POST {base}/embedding/query      (same request/response shape)
 //! ```
 //!
-//! A "single" whole-text embedding is just a one-element `payloads` array;
-//! chunked embeddings pass one payload per sliding-window chunk.  The old
+//! A "single" whole-text embedding is just a one-element `payloads` array (a
+//! query is always one payload: queries are not chunked); a document passes its
+//! whole text plus one payload per sentence-window chunk.  The old
 //! `{model}` path segment is gone (the model is fixed server-side).
 
 use std::sync::OnceLock;

@@ -106,14 +106,15 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 ///
 /// Clusters are probed by **exact** nearest-centroid distance. Coarse assignment is an
 /// exhaustive scan: [`find_top_n_cluster_ids_batch`](ClusterIndex::find_top_n_cluster_ids_batch)
-/// computes the distance from every query chunk to every centroid and returns the
-/// `n_probes` nearest per chunk (see [`crate::semantic_search::service::search`]). There is deliberately
-/// **no precomputed neighbour graph** — coarse-assignment cost is `T·C·D` (query chunks ×
+/// computes the distance from every Pass-1 query vector to every centroid and returns the
+/// `n_probes` nearest per vector (see [`crate::semantic_search::service::search`]). There is deliberately
+/// **no precomputed neighbour graph** — coarse-assignment cost is `T·C·D` (query vectors ×
 /// centroids × dim), which at the cluster counts in use (a few hundred) is microseconds
-/// per chunk; a graph is approximate on the most recall-sensitive stage and does nothing
-/// about the per-chunk `T` factor. Revisit graph-over-centroids only if `C` reaches tens
-/// of thousands. (Parallelising the per-chunk scans was benchmarked and *regressed* —
-/// the work is too small to amortise a thread pool; see `find_top_n_cluster_ids_batch`.)
+/// per vector. Production queries are not chunked, so `T = 1`. A graph would be approximate
+/// on the most recall-sensitive stage for no real saving; revisit graph-over-centroids only
+/// if `C` reaches tens of thousands. (Parallelising the per-vector scans was benchmarked and
+/// *regressed* — the work is too small to amortise a thread pool; see
+/// `find_top_n_cluster_ids_batch`.)
 ///
 /// To make that scan cache-friendly the centroids are held **twice**: once as the
 /// `clusters` map (id lookup) and once as a row-major `centroids` matrix with a parallel
@@ -216,21 +217,21 @@ impl ClusterIndex {
         self.centroid_ids.is_empty()
     }
 
-    /// Batched coarse assignment: for each query chunk in `queries`, the ids of the `n`
+    /// Batched coarse assignment: for each query vector in `queries`, the ids of the `n`
     /// centroids closest to it (ascending distance), returned as one `Vec<u32>` per
     /// query in input order.
     ///
     /// This is the Pass-1 cluster-probing primitive, called once per search over all
-    /// query chunks. It is exact and exhaustive — every query is compared against every
+    /// Pass-1 query vectors (one in production: queries are not chunked). It is exact and exhaustive — every query is compared against every
     /// centroid — and differs from the historical per-query [`find_top_n_cluster_ids`]
     /// loop over the `clusters` map only in that each query streams the contiguous,
     /// row-major `centroids` matrix in order instead of pointer-chasing the map's
     /// scattered per-`Cluster` `Vec`s. At the cluster counts in use (a few hundred) that
-    /// contiguous layout is a measured ~12% win at 100 query chunks (`bench_distance_estimation`,
-    /// `coarse_assignment`).
+    /// contiguous layout is a measured ~12% win at 100 query vectors (`bench_distance_estimation`,
+    /// `coarse_assignment`, from when queries were chunked).
     ///
-    /// The scan is deliberately **serial** across query chunks. Parallelising it with
-    /// rayon was benchmarked and *regressed* (~2.4× slower at 100 chunks): each per-query
+    /// The scan is deliberately **serial** across query vectors. Parallelising it with
+    /// rayon was benchmarked and *regressed* (~2.4× slower at 100 vectors): each per-query
     /// scan is only microseconds, so the pool's dispatch/sync overhead dwarfs the work.
     /// Batching only becomes worth parallelising via a blocked GEMM (reusing each
     /// centroid tile across queries), which is worth revisiting only at far larger `C`.
@@ -323,7 +324,7 @@ pub fn find_closest_cluster_id(clusters: &HashMap<u32, Cluster>, embedding: &[f3
 /// `HashMap<u32, Cluster>` directly (and as the reference the batched path is tested
 /// against). The search path uses
 /// [`ClusterIndex::find_top_n_cluster_ids_batch`], which produces the same per-query
-/// result but scans a contiguous centroid matrix in parallel across query chunks.
+/// result but scans a contiguous centroid matrix (serially across query vectors).
 pub fn find_top_n_cluster_ids(clusters: &HashMap<u32, Cluster>, embedding: &[f32], n: usize) -> Vec<u32> {
     let mut distances: Vec<(u32, f32)> = clusters.values().map(|c| (c.cluster_id, c.euclidean_distance(embedding))).collect();
     let by_distance = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1);
