@@ -206,6 +206,141 @@ fn check_frame_len(size: u64, file_len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Buffered, positional reader of consecutive SSTable frames (`u32 LE len ‖ body`).
+///
+/// Replaces two `pread` syscalls per entry (length, then body) with one `pread`
+/// per buffer refill. Sparse-vector entries are ~60 bytes, so a per-entry read
+/// made syscalls — not parsing — the dominant cost of a cluster range walk.
+///
+/// The refill size starts at [`MIN_READ`](Self::MIN_READ) and doubles up to
+/// [`MAX_READ`](Self::MAX_READ): most range walks are short (a median IVF cluster
+/// is a few dozen entries per bucket), so a large fixed read-ahead would copy far
+/// more page cache than the walk consumes, while long walks quickly reach the
+/// large reads. A frame larger than the buffer grows it to fit.
+///
+/// EOF semantics match [`LSMTree::read_exact_at`]: a clean EOF exactly at a frame
+/// boundary ends the walk (`Ok(None)`); EOF inside a length prefix or body is
+/// `UnexpectedEof`. Frame lengths are checked with [`check_frame_len`] before the
+/// buffer is sized for them.
+struct FrameReader<'a> {
+    file: &'a File,
+    buf: Vec<u8>,
+    /// First unconsumed byte in `buf`.
+    pos: usize,
+    /// End of the valid bytes in `buf`.
+    len: usize,
+    /// File offset of `buf[len]` — where the next refill reads from.
+    next_offset: u64,
+    /// Size of the next refill read.
+    read_size: usize,
+}
+
+impl<'a> FrameReader<'a> {
+    const MIN_READ: usize = 8 * 1024;
+    const MAX_READ: usize = 256 * 1024;
+
+    fn new(file: &'a File, offset: u64) -> Self {
+        Self {
+            file,
+            buf: Vec::new(),
+            pos: 0,
+            len: 0,
+            next_offset: offset,
+            read_size: Self::MIN_READ,
+        }
+    }
+
+    /// Buffer at least `n` unconsumed bytes, reading more only if needed. Returns
+    /// the number of unconsumed bytes, which is below `n` only at end of file.
+    fn fill(&mut self, n: usize) -> Result<usize> {
+        if self.len - self.pos >= n {
+            return Ok(self.len - self.pos);
+        }
+        self.buf.copy_within(self.pos..self.len, 0);
+        self.len -= self.pos;
+        self.pos = 0;
+        let want = self.len + n.max(self.read_size);
+        if self.buf.len() < want {
+            self.buf.resize(want, 0);
+        }
+        self.read_size = (self.read_size * 2).min(Self::MAX_READ);
+        while self.len < n {
+            match self.file.read_at(&mut self.buf[self.len..], self.next_offset) {
+                Ok(0) => break,
+                Ok(read) => {
+                    self.len += read;
+                    self.next_offset += read as u64;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(LSMError::Io(err)),
+            }
+        }
+        Ok(self.len - self.pos)
+    }
+
+    /// The next frame's body (`crc32 ‖ payload`), or `None` at a clean EOF.
+    fn next_frame(&mut self, file_len: u64) -> Result<Option<&[u8]>> {
+        let unexpected_eof = || LSMError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF"));
+        match self.fill(4)? {
+            0 => return Ok(None),
+            1..=3 => return Err(unexpected_eof()),
+            _ => {}
+        }
+        let size = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        check_frame_len(size as u64, file_len)?;
+        self.pos += 4;
+        if self.fill(size)? < size {
+            return Err(unexpected_eof());
+        }
+        let body = &self.buf[self.pos..self.pos + size];
+        self.pos += size;
+        Ok(Some(body))
+    }
+}
+
+/// Resolve a prefix scan's layers into live `(key, pointer)` pairs in ascending key order.
+///
+/// `l1` is the oldest layer, in the order its entries were read: bucket by bucket,
+/// each bucket's run key-sorted. `newer` holds every newer layer (L0, read-only and
+/// active memtables) already merged oldest→newest with overwrite. The result is what
+/// inserting `l1` in order and then `newer` into one map with overwrite would yield,
+/// minus tombstones — without paying a map insert per L1 entry:
+///
+/// * a **stable** sort puts equal keys in read order, so keeping the last of each
+///   run of equal keys matches a map's last-insert-wins (and costs little: the
+///   input is a handful of pre-sorted runs, which the sort merges);
+/// * a sorted two-way merge then lets `newer` shadow `l1` on equal keys.
+fn merge_scan_layers(mut l1: Vec<(Vec<u8>, Option<u128>)>, newer: std::collections::BTreeMap<Vec<u8>, Option<u128>>) -> Vec<(Vec<u8>, u128)> {
+    l1.sort_by(|a, b| a.0.cmp(&b.0));
+    // `later` is removed when it repeats `kept`'s key; carry its value over first.
+    l1.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 = later.1;
+        }
+        same
+    });
+    if newer.is_empty() {
+        return l1.into_iter().filter_map(|(key, val)| val.map(|v| (key, v))).collect();
+    }
+
+    let mut out = Vec::with_capacity(l1.len() + newer.len());
+    let mut older = l1.into_iter().peekable();
+    for (key, val) in newer {
+        while let Some((older_key, older_val)) = older.next_if(|(k, _)| *k < key) {
+            if let Some(v) = older_val {
+                out.push((older_key, v));
+            }
+        }
+        older.next_if(|(k, _)| *k == key); // shadowed by the newer layer
+        if let Some(v) = val {
+            out.push((key, v));
+        }
+    }
+    out.extend(older.filter_map(|(key, val)| val.map(|v| (key, v))));
+    out
+}
+
 /// Open a **registered** Level-0 file — one reachable from `level0_files` — for a
 /// positional reader, skipping header validation.
 ///
@@ -2229,24 +2364,16 @@ impl LSMTree {
             index.as_ref().map(|i| i.block_start(start)).unwrap_or(0)
         };
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut offset = if start_offset != 0 && Self::valid_scan_start(file, start_offset, file_len, start) {
+        let offset = if start_offset != 0 && Self::valid_scan_start(file, start_offset, file_len, start) {
             start_offset
         } else {
             SSTABLE_DATA_START
         };
 
         let mut live_seen = 0usize;
-        let mut entry_bytes = Vec::new();
-        loop {
-            let mut size_buf = [0u8; 4];
-            if !Self::read_exact_at(file, &mut size_buf, &mut offset)? {
-                break;
-            }
-            let size = u32::from_le_bytes(size_buf) as usize;
-            check_frame_len(size as u64, file_len)?;
-            entry_bytes.resize(size, 0);
-            Self::read_exact_at(file, &mut entry_bytes[..size], &mut offset)?;
-            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
+        let mut frames = FrameReader::new(file, offset);
+        while let Some(body) = frames.next_frame(file_len)? {
+            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
             let key = archived.key.as_slice();
             // Sorted order: once we reach `end`, no later key can match.
             if end.is_some_and(|e| key >= e) {
@@ -2378,11 +2505,18 @@ impl LSMTree {
             return Ok(vec![]);
         }
 
-        // Merge stays oldest→newest into a BTreeMap<key, Option<pointer>> with
-        // overwrite (L1 → L0 → ro_memtables → active), so tombstone precedence is
-        // unchanged. Only the *capture* order is reversed to newest-first so a
-        // concurrent flush/compaction cannot drop a live key — see `scan_prefix`.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<u128>> = std::collections::BTreeMap::new();
+        // Merge stays oldest→newest with overwrite (L1 → L0 → ro_memtables →
+        // active), so tombstone precedence is unchanged. Only the *capture* order is
+        // reversed to newest-first so a concurrent flush/compaction cannot drop a
+        // live key — see `scan_prefix`.
+        //
+        // L1 — the bulk of a large scan — is gathered into a Vec and resolved by
+        // `merge_scan_layers`, not inserted into the map: a per-entry BTreeMap insert
+        // of an owned key was ~8 ms of a ~10 ms scan over 87k entries, while the
+        // parallel L1 reads were ~1 ms. The newer layers (usually small) still merge
+        // through `newer` with overwrite.
+        let mut l1_entries: Vec<(Vec<u8>, Option<u128>)> = Vec::new();
+        let mut newer: std::collections::BTreeMap<Vec<u8>, Option<u128>> = std::collections::BTreeMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()`
         // guard so a flush cannot split a key between active and RO.
@@ -2448,11 +2582,7 @@ impl LSMTree {
                         .join()
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
-                        Ok(entries) => {
-                            for (k, v) in entries {
-                                all_entries.insert(k, v);
-                            }
-                        }
+                        Ok(entries) => l1_entries.extend(entries),
                         Err(e) => {
                             if first_err.is_none() {
                                 first_err = Some(e);
@@ -2517,7 +2647,7 @@ impl LSMTree {
                     {
                         Ok(entries) => {
                             for (k, v) in entries {
-                                all_entries.insert(k, v);
+                                newer.insert(k, v);
                             }
                         }
                         Err(e) => {
@@ -2539,7 +2669,7 @@ impl LSMTree {
                 if record.key.len() >= 4 {
                     let prefix_id = u32::from_be_bytes(record.key[..4].try_into().unwrap());
                     if prefix_ids.contains(&prefix_id) {
-                        all_entries.insert(record.key.clone(), if record.tombstone { None } else { Some(record.value) });
+                        newer.insert(record.key.clone(), if record.tombstone { None } else { Some(record.value) });
                     }
                 }
             }
@@ -2547,10 +2677,10 @@ impl LSMTree {
 
         // ── 4. Active memtable (newest layer) — overwrites everything below ────
         for (key, value) in active_snapshot {
-            all_entries.insert(key, value);
+            newer.insert(key, value);
         }
 
-        Ok(all_entries.into_iter().filter_map(|(key, val)| val.map(|v| (key, v))).collect())
+        Ok(merge_scan_layers(l1_entries, newer))
     }
 
     /// Fetch multiple keys in a **single pass per bucket**.
@@ -3647,6 +3777,110 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Write `bodies` as consecutive `u32 LE len ‖ body` frames after `lead` junk bytes.
+    fn write_frames(path: &Path, lead: usize, bodies: &[Vec<u8>]) -> Result<()> {
+        let mut f = File::create(path)?;
+        f.write_all(&vec![0xEEu8; lead])?;
+        for body in bodies {
+            f.write_all(&(body.len() as u32).to_le_bytes())?;
+            f.write_all(body)?;
+        }
+        f.sync_all()?;
+        Ok(())
+    }
+
+    // The buffered frame reader must return exactly the frames the per-entry
+    // `read_exact_at` loop did — including frames that straddle a refill boundary
+    // and a frame larger than the maximum read size — starting from a mid-file
+    // offset (the sparse-index seek), and end cleanly at EOF.
+    #[test]
+    fn test_frame_reader_returns_every_frame_across_refills() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("frames.dat");
+        let mut bodies: Vec<Vec<u8>> = (0..5000u32).map(|i| vec![(i % 251) as u8; 1 + (i as usize * 7) % 97]).collect();
+        bodies.insert(2500, vec![0x5Au8; FrameReader::MAX_READ + 12_345]); // bigger than any refill
+        let lead = 16;
+        write_frames(&path, lead, &bodies)?;
+
+        let file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = FrameReader::new(&file, lead as u64);
+        let mut read = Vec::new();
+        while let Some(body) = reader.next_frame(file_len)? {
+            read.push(body.to_vec());
+        }
+        assert_eq!(read.len(), bodies.len());
+        assert!(read == bodies, "frames must round-trip byte for byte");
+        Ok(())
+    }
+
+    // EOF inside a frame is corruption, not a clean end: a truncated length prefix
+    // or a truncated body must surface `UnexpectedEof`, exactly as `read_exact_at`
+    // did, rather than silently ending the scan early.
+    #[test]
+    fn test_frame_reader_truncated_frame_is_an_error() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("frames.dat");
+        write_frames(&path, 0, &[vec![1u8; 10], vec![2u8; 10]])?;
+        let full = std::fs::read(&path)?;
+
+        // Cut 1: inside the second frame's body. Cut 2: inside its length prefix.
+        for cut in [full.len() - 3, 14 + 2] {
+            std::fs::write(&path, &full[..cut])?;
+            let file = File::open(&path)?;
+            let file_len = file.metadata()?.len();
+            let mut reader = FrameReader::new(&file, 0);
+            assert_eq!(reader.next_frame(file_len)?.map(<[u8]>::to_vec), Some(vec![1u8; 10]));
+            match reader.next_frame(file_len) {
+                Err(LSMError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "cut at {cut}"),
+                other => panic!("cut at {cut}: expected UnexpectedEof, got {:?}", other.map(|o| o.map(<[u8]>::to_vec))),
+            }
+        }
+        Ok(())
+    }
+
+    // `merge_scan_layers` replaced a single BTreeMap that took L1 then every newer
+    // layer with overwrite. It must give exactly that map's live entries, in key
+    // order, for any mix of: duplicate keys within L1 (last read wins), L1 tombstones,
+    // newer-layer values and tombstones shadowing L1, and newer-only keys. Checked
+    // against that reference over many generated layer sets, with a tiny key space
+    // so collisions are common.
+    #[test]
+    fn test_merge_scan_layers_matches_btreemap_overwrite() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64; // deterministic LCG, no RNG dependency
+        let mut next = |bound: u64| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for case in 0..2_000 {
+            // L1 as the scan reads it: several buckets, each run key-sorted.
+            let mut l1: Vec<(Vec<u8>, Option<u128>)> = Vec::new();
+            for _bucket in 0..next(4) {
+                let mut run: Vec<(Vec<u8>, Option<u128>)> = (0..next(12))
+                    .map(|_| (vec![next(3) as u8, next(6) as u8], (next(4) != 0).then(|| u128::from(next(1000)))))
+                    .collect();
+                run.sort_by(|a, b| a.0.cmp(&b.0));
+                l1.extend(run);
+            }
+            let mut newer = std::collections::BTreeMap::new();
+            for _ in 0..next(6) {
+                newer.insert(vec![next(3) as u8, next(6) as u8], (next(3) != 0).then(|| u128::from(next(1000))));
+            }
+
+            let mut reference = std::collections::BTreeMap::new();
+            for (k, v) in l1.iter().cloned().chain(newer.clone()) {
+                reference.insert(k, v);
+            }
+            let expected: Vec<(Vec<u8>, u128)> = reference.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+
+            assert_eq!(
+                merge_scan_layers(l1.clone(), newer.clone()),
+                expected,
+                "case {case}: l1={l1:?} newer={newer:?}"
+            );
+        }
     }
 
     // The L1 publish must never leave the bucket's L1 path missing. It used to move the
