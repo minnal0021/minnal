@@ -591,19 +591,45 @@
     ]
   },
   {
-    "file": "semantic_pass1_layers.png",
-    "title": "bench_distance_estimation \u2014 first pass, peeled apart into cumulative layers",
-    "ylabel": "Mean latency, us (log scale)",
+    "file": "semantic_pass1_layers_4.png",
+    "title": "bench_distance_estimation \u2014 first pass in cumulative layers, 4 query vectors",
+    "ylabel": "Mean latency, us",
     "unit": "us",
-    "scale": "log",
+    "scale": "linear",
+    "zero_based": true,
     "relabel": [
       [
         "^pass1_scoring/",
         ""
+      ],
+      [
+        "/4$",
+        ""
       ]
     ],
     "cases": [
-      "pass1_scoring/.*"
+      "pass1_scoring/.*/4$"
+    ]
+  },
+  {
+    "file": "semantic_pass1_layers_40.png",
+    "title": "bench_distance_estimation \u2014 first pass in cumulative layers, 40 query vectors",
+    "ylabel": "Mean latency, us",
+    "unit": "us",
+    "scale": "linear",
+    "zero_based": true,
+    "relabel": [
+      [
+        "^pass1_scoring/",
+        ""
+      ],
+      [
+        "/40$",
+        ""
+      ]
+    ],
+    "cases": [
+      "pass1_scoring/.*/40$"
     ]
   },
   {

@@ -397,19 +397,28 @@ trades off:
     cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_recall_vs_nprobes --release -- --ignored --nocapture
   ```
 
-Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency: 5000-doc
-synthetic store, 8 chunks/doc, warm cache):
+Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency:
+5000-doc synthetic store, 8 chunks/doc, 4 query vectors, warm cache, re-measured
+2026-09-26 after the hot-path work):
 
-| `n_probes` | recall@10 | recall@100 | entire `search()` |
-|---|---|---|---|
-| 10 | 0.968 | 0.935 | 14.5 ms |
-| **32 (default)** | **0.986** | **0.978** | **18.7 ms** |
-| 128 | 1.000 | 0.999 | 26.4 ms |
+| `n_probes` | recall@10 | recall@100 | sparse entries scanned | entire `search()` |
+|---|---|---|---|---|
+| 10 | 0.968 | 0.935 | 7,320 | 3.5 ms |
+| **32 (default)** | **0.986** | **0.978** | **17,278** | **6.7 ms** |
+| 128 | 1.000 | 0.999 | 37,337 | 13.1 ms |
 
-`32` is the default: it recovers most of the recall lost at `10` while staying ~29% cheaper
-than `128`. The dominant lever is **Pass-1 sparse-scan I/O**, which scales roughly linearly
-with `n_probes` (entries scanned grow in step); the SIMD dot products are a minority of the
-cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
+The latency column was 14.5 / 18.7 / 26.4 ms before the hot-path work. The
+recall columns come from the earlier measurement: recall depends on the probe
+set, quantisation and re-ranking, none of which changed. Note that the profile
+harness silently measured an **empty** index from 2026-07-30 until
+2026-09-26: `upsert_vectors` skips unregistered namespaces (so a dropped store
+is never resurrected), and the harness never registered its own. It now
+registers the namespace and asserts the index is non-empty before timing.
+
+`32` is the default: it recovers most of the recall lost at `10` while staying ~49% cheaper
+than `128`. The dominant lever is **Pass-1 sparse-scan I/O** (54–78% of `search()` at 8
+chunks/doc), which scales roughly linearly with `n_probes` (entries scanned grow in step);
+the SIMD dot products are a minority of the cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
 `first_pass_sparse_search_top_k` candidate set — so its share *shrinks* as `n_probes` rises.
 
 ---

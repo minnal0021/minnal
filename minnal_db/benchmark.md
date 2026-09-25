@@ -19,14 +19,14 @@ checked against; the final section here closes the loop on that comparison.
 
 | | |
 |---|---|
-| OS | Ubuntu 26.04 LTS, kernel 7.0.0-30-generic, x86_64 — bare metal (no virtualisation layer between the benchmarks and the disk) |
+| OS | Ubuntu 26.04 LTS, kernel 7.0.0-34-generic, x86_64 — bare metal (no virtualisation layer between the benchmarks and the disk) |
 | CPU | AMD Ryzen 9 9950X3D — 16 cores / 32 threads, boost to 5.76 GHz, AVX-512 |
 | RAM | 96 GB |
 | Disk | NVMe SSD (`nvme0n1`, non-rotational, 1.8 TB) — `target/` and all benchmark temp dirs live here |
 | rustc / cargo | 1.96.0 |
 | gnuplot | 6.0 patchlevel 2 (used to render the charts in this report) |
-| Repo | commit `fea627a` |
-| Date | 2026-08-22 |
+| Repo | commit `e5d15c9` (branch `fix/search-concurrency`) |
+| Date | 2026-09-26 |
 
 ---
 
@@ -93,6 +93,15 @@ paging — holds to ±5%, and the sub-microsecond cases (memtable hits, miss pat
 swing 20-40% if the machine is doing anything else at the time. Read the small
 numbers as orders of magnitude unless the host is idle.
 
+Those bounds hold within one setup, not across a system update. Between the
+previous run (2026-08-22, kernel 7.0.0-30) and this one (kernel 7.0.0-34), the
+only engine changes were the semantic-search hot-path commits, which touched
+the L1 scan path and search itself. Yet some rows whose code did not change
+moved further than the bounds above: point reads 5-8% faster, predicate
+evaluation up to 7% faster, and the multi-bit second-pass estimator 20% faster.
+Treat a cross-run difference under ~10% as the environment unless the code
+changed, and compare runs from the same kernel and firmware where it matters.
+
 ### A word on memory versus disk
 
 minnal_db keeps recently-written data in an in-memory table (very fast to read)
@@ -124,8 +133,8 @@ as its own tier.
 Every write is a fully durable transaction — the change is synced to disk before
 the call returns, with no batching and no way to relax that per call. That
 durability has a fixed cost, and it shows. Writing a 128-byte value takes
-2.270 ms; writing a 64-kilobyte value — 512 times more data — takes 2.344 ms, a
-3.3% difference. Latency is essentially flat across that entire value-size range,
+2.272 ms; writing a 64-kilobyte value — 512 times more data — takes 2.336 ms, a
+2.8% difference. Latency is essentially flat across that entire value-size range,
 because the disk sync itself, not the amount of data, is what a write pays for.
 Payload size only starts to move the needle once the synced write is large
 enough to matter on its own.
@@ -143,15 +152,15 @@ put both pay exactly one WAL fsync and everything else is rounding error.
 
 | Operation | Mean | Against `put/2KiB` |
 |---|---:|---:|
-| `crud/put/2KiB` | 2.333 ms | — |
-| `crud/put/8B` | 2.286 ms | −1.97% |
-| `crud/merge_sorted_set/2KiB` | 2.277 ms | −2.38% |
-| `crud/get_then_put_sorted_set/2KiB` | 2.277 ms | −2.37% |
-| `crud/merge_counter/8B` | 2.272 ms | −2.60% |
-| `crud/delete/2KiB` | 2.269 ms | −2.71% |
-| `crud/get/2KiB` | 452 ns | — |
+| `crud/put/2KiB` | 2.329 ms | — |
+| `crud/delete/2KiB` | 2.311 ms | −0.78% |
+| `crud/get_then_put_sorted_set/2KiB` | 2.284 ms | −1.94% |
+| `crud/merge_sorted_set/2KiB` | 2.283 ms | −2.00% |
+| `crud/put/8B` | 2.265 ms | −2.74% |
+| `crud/merge_counter/8B` | 2.264 ms | −2.80% |
+| `crud/get/2KiB` | 435 ns | — |
 
-All six write rows sit inside a 2.8% band, and every one of them is the same
+All six write rows sit inside a 2.9% band, and every one of them is the same
 number: the drive's fsync latency.
 
 Read the sign of that table before anything else. **Every merge row measures
@@ -168,21 +177,21 @@ which reproduce to within a couple of percent:
 
 | Component | Mean |
 |---|---:|
-| the read a merge does that a put doesn't (`crud/get/2KiB`) | 452 ns |
+| the read a merge does that a put doesn't (`crud/get/2KiB`) | 435 ns |
 | the per-key stripe: hash + uncontended lock (`stripe/*`) | 51 ns |
-| the caller's own closure — counter (`closure/counter`) | 9.8 ns |
-| the caller's own closure — 2 KiB sorted set (`closure/sorted_set`) | 172 ns |
+| the caller's own closure — counter (`closure/counter`) | 9.7 ns |
+| the caller's own closure — 2 KiB sorted set (`closure/sorted_set`) | 170 ns |
 
-Summed, a merge does **0.51–0.67 µs** of work a blind `put` does not, or
+Summed, a merge does **0.50–0.66 µs** of work a blind `put` does not, or
 **0.03%** of the 2.27 ms the fsync costs — about a hundredth of the noise floor
 the table above establishes, which is why no write row can see it. Two
 consequences worth stating plainly:
 
 - **Atomicity is free here.** `get_then_put_sorted_set` is the same work with no
   guarantee — the hand-rolled version a caller writes without `merge` — and the
-  two land 0.01% apart, indistinguishable. The striped lock costs 51 ns; nothing
+  two land 0.06% apart, indistinguishable. The striped lock costs 51 ns; nothing
   in the durable write path notices.
-- **The closure is the only part you control.** At 172 ns for a 2 KiB sorted-set
+- **The closure is the only part you control.** At 170 ns for a 2 KiB sorted-set
   splice it is still four orders of magnitude under the fsync, so a merge stays
   fsync-bound until the closure does something genuinely expensive.
 
@@ -195,7 +204,7 @@ between two write rows.
 
 ![The durable CRUD operations, every one an fsync](docs/benchmarks/merge_writes.png)
 
-*The six durable operations on a linear axis, which is the only way a 2.8%
+*The six durable operations on a linear axis, which is the only way a 2.9%
 spread is visible. Note `put_2KiB` sitting at the top and both merges below it —
 the impossible ordering described above.*
 
@@ -213,12 +222,12 @@ bench cannot call it directly).*
 Reading a key that's still in memory is fast and stays fast regardless of value
 size — under a microsecond for small and medium values. Pushing the same read
 onto disk adds a roughly constant penalty: a small-value lookup goes from
-0.40 µs in memory to 3.50 µs on disk, and that gap of roughly 3.1 µs holds
-steady across small and medium values (4 KiB: 0.55 µs against 3.69 µs, a 3.14 µs
+0.37 µs in memory to 3.22 µs on disk, and that gap of roughly 2.85 µs holds
+steady across small and medium values (4 KiB: 0.54 µs against 3.37 µs, a 2.83 µs
 step). It's a fixed per-lookup disk cost — the bloom-filter check, the index
 probe, and one read from the value log — that value size barely affects until
 the payload gets big enough that reading the bytes themselves starts to count (a
-64-kilobyte value takes 3.90 µs in memory and 6.81 µs on disk, where the extra
+64-kilobyte value takes 3.67 µs in memory and 6.41 µs on disk, where the extra
 bytes finally show up).
 
 The miss path — looking up a key that was never written — is a special case
@@ -234,7 +243,7 @@ clearly, in the point-lookup sweep below.
 ![Get latency from the on-disk SSTable](docs/benchmarks/read_l1.png)
 
 *One chart per tier, drawn on a shared axis so bar heights are directly
-comparable between them — the whole l1 chart sits about 3.1 µs above its
+comparable between them — the whole l1 chart sits about 2.8 µs above its
 memtable twin, which is the fixed disk cost. Within each tier the 64 KiB bar is
 the value log making itself felt: values live in the value log whichever tier
 holds the key, so a large value pays for the bytes in both. `miss` is a lookup
@@ -251,14 +260,14 @@ one resident on disk, so its cost is the blended price of a 50/50 tier mix —
 a closer approximation of a real steady-state database than either pure extreme.
 
 The headline is that an on-disk hit barely gets slower as the store grows: it
-rises only 6.6% (3.43 to 3.65 µs) across a hundredfold increase in key
+rises only 6.1% (3.17 to 3.36 µs) across a hundredfold increase in key
 count. That near-flat curve is the intended behaviour, not a fluke — the on-disk
 lookup fast-rejects using the key range, then a bloom filter, then a bounded
 index search that caps any residual scanning to a fixed number of entries no
-matter how large the file gets. In-memory reads stay faster throughout (0.36 to
-0.61 µs), though that gap narrows as the store grows, since the on-disk side
+matter how large the file gets. In-memory reads stay faster throughout (0.35 to
+0.59 µs), though that gap narrows as the store grows, since the on-disk side
 stays flat while the in-memory skip-list search cost creeps up mildly with key
-count — a 67% rise over the same hundredfold sweep, against the on-disk 6.6%.
+count — a 71% rise over the same hundredfold sweep, against the on-disk 6.1%.
 
 Two findings here are counterintuitive.
 
@@ -272,7 +281,7 @@ find a real key. So an in-memory miss costs about the same as an in-memory hit
 the store grows (0.48 to 0.67 µs) — the two tiers end up flipped for misses
 compared to hits, by roughly 3x at the largest key count.
 
-The second is about the mixed workload: reading it costs 6-10% more
+The second is about the mixed workload: reading it costs 6-12% more
 than simply averaging the memory and disk numbers would predict, and the
 overhead widens with key count. The likely
 reason is that memory and disk lookups go through two quite different code
@@ -297,22 +306,27 @@ This suite covers the four ways to read many keys at once — prefix scan, range
 scan, cursor pagination, and a full async iteration — each measured against data
 in memory and on disk.
 
-Prefix and range scans give the cleanest comparison: on disk they cost a
-consistent **~2x** their in-memory equivalent across every result-set size
-(2.00x–2.24x, with the ratio drifting up only slightly as the result grows). So
-the on-disk penalty here is close to a constant per-scan overhead rather than a
-per-element one. Full iteration shows the mildest tier gap of the four — 2.08x
-for 128-byte values, shrinking to 1.24x at 4 KiB — because iteration resolves
-every value, so value-log I/O already dominates its cost before the tier
-distinction even enters, and the larger the values, the more that dominates.
+Prefix and range scans give the cleanest comparison: on disk they now cost
+**1.2x–1.6x** their in-memory equivalent, and the ratio *shrinks* as the result
+grows (prefix: 1.51x at 100 keys down to 1.21x at 5,000; range: 1.57x at 100
+down to 1.31x at 1,000). The previous run put this at a flat ~2x. The change is
+the buffered L1 range reader added for semantic search (`e414cdb`): an on-disk
+scan used to read each ~60-byte entry with two `pread` calls, and now reads
+consecutive entries out of one buffer, so what is left of the on-disk penalty
+is per-scan setup that a large result amortises. On-disk scans got 26–47%
+faster between the two runs; in-memory ones moved within 8%. Full iteration
+shows the mildest tier gap of the four — 1.41x for 128-byte values, shrinking to
+1.09x at 4 KiB — because iteration resolves every value, so value-log I/O
+already dominates its cost before the tier distinction even enters, and the
+larger the values, the more that dominates.
 
 Cursor pagination has the surprise. At its smallest page size it runs *faster*
-on disk than in memory (97 µs versus 145 µs), the reverse of everything else
-here. By the largest page size the expected order returns and disk is slower
-again (722 µs versus 387 µs). The most likely explanation is that at very small
-pages the pagination bookkeeping itself dominates the cost regardless of which
-tier the data sits in, so the usual tier gap simply doesn't get a chance to
-show.
+on disk than in memory (75 µs versus 144 µs), the reverse of everything else
+here. At 500 the two tiers are level (267 µs versus 256 µs), and by the largest
+page size the expected order returns (507 µs versus 389 µs). The most likely
+explanation is that at very small pages the pagination bookkeeping itself
+dominates the cost regardless of which tier the data sits in, so the usual tier
+gap simply doesn't get a chance to show.
 
 ![Prefix scan by tier, matching keys and value size](docs/benchmarks/scan_prefix.png)
 
@@ -324,7 +338,7 @@ show.
 
 *One chart per scan type, and the prefix and range charts share an axis so the
 two can be compared with each other. Sorted by value, each `memtable`/`l1` pair
-at a given size lands on adjacent bars, so the consistent ~2x ratio is the step
+at a given size lands on adjacent bars, so the 1.2x–1.6x ratio is the step
 between neighbours. The cursor chart is a deliberate exception: sorted by value, `l1/100`
 lands first and `memtable/100` second, which is the small-page inversion stated
 above, and tier blocks would have put those two bars at opposite ends. The
@@ -338,7 +352,7 @@ These cases run blended workloads — 80% reads with 20% writes, and an even
 average cost per operation. (This is the suite run at the reduced sample size, so
 its confidence intervals are wider than the rest.)
 
-All four cases land within 0.6% of each other (2.253–2.266 ms per operation).
+All four cases land within 2.4% of each other (2.257–2.310 ms per operation).
 Neither the tier nor the read/write ratio makes a visible difference, and the
 reason is the same in both cases: a write costs about 2.27 ms (the disk sync)
 while a read costs a few
@@ -362,30 +376,30 @@ than one crowded chart spanning six orders of magnitude.
 
 The clearest result is how little of the write cost is anything *but* the disk
 sync — and the cleanest way to see it is to turn the sync off. A durable append
-costs 2.276 ms; the same append unsynced costs **1.60 µs**. The fsync is
-**1,421x** the cost of everything else the WAL append does.
+costs 2.328 ms; the same append unsynced costs **1.55 µs**. The fsync is
+**1,497x** the cost of everything else the WAL append does.
 
 Everything else in this group is consistent with that. The full write path (WAL
-plus value log plus in-memory index) measures 2.265 ms against the isolated
-durable append's 2.276 ms — that is, the whole write came out 0.5% *cheaper*
+plus value log plus in-memory index) measures 2.277 ms against the isolated
+durable append's 2.328 ms — that is, the whole write came out 2.2% *cheaper*
 than one of its own components, which is impossible and therefore informative:
 the value log and memtable insert are below what these rows can resolve.
-Namespace tagging tells the same story from the other side, 2.262 ms for the
-default namespace against 2.293 ms for an arbitrary non-default one; writing a
-`u32` into a record cannot cost 31 µs. In other words, the disk sync *is* the
+Namespace tagging agrees: 2.288 ms for the default namespace against 2.287 ms
+for an arbitrary non-default one, indistinguishable (the previous run had them
+31 µs apart the other way, which is the same noise). In other words, the disk sync *is* the
 write path's cost: the per-write sync is a deliberate durability choice, and
 this confirms it in measurement, not just in design intent.
 
 Unsynced appends also show what payload size costs once the fsync is out of the
 way, which is the one place in this report where it is visible rather than
-swamped: 1.60 µs at 128 bytes, 2.54 µs at 4 KiB, 10.55 µs at 64 KiB. That is the
+swamped: 1.55 µs at 128 bytes, 2.48 µs at 4 KiB, 10.26 µs at 64 KiB. That is the
 real shape of the write path underneath its durability guarantee.
 
 ![Durable write cost: fsync'd append, full put, and namespace tagging](docs/benchmarks/wal_durable_writes.png)
 
 ![The same append with the fsync omitted](docs/benchmarks/wal_unsynced_appends.png)
 
-*Two charts rather than one, because at 1,421x apart the unsynced bars are
+*Two charts rather than one, because at 1,497x apart the unsynced bars are
 invisible next to the durable ones — the contrast is the ratio in the text, and
 each chart's own axis is what makes its internal spread readable. The second
 chart is also the only place in this report where payload size drives the shape.
@@ -397,9 +411,9 @@ raw append tagged with a namespace id (`ns_id_0` is the default namespace, `ns_i
 non-default one, to check tagging isn't adding cost).*
 
 Serializing and deserializing a WAL entry, by contrast, is three to five
-orders of magnitude cheaper than the sync itself — serializing runs 45 ns for a
-128-byte entry up to 1.07 µs at 64 KiB, deserializing 13 ns to 540 ns, against
-2.28 ms — so it's nowhere near the critical path.
+orders of magnitude cheaper than the sync itself — serializing runs 43 ns for a
+128-byte entry up to 0.97 µs at 64 KiB, deserializing 14 ns to 537 ns, against
+2.33 ms — so it's nowhere near the critical path.
 
 ![Serialization round-trip cost](docs/benchmarks/wal_serialization.png)
 
@@ -407,9 +421,9 @@ orders of magnitude cheaper than the sync itself — serializing runs 45 ns for 
 deserializing one back.*
 
 The recovery scan, which reads entries back the way a restart would, runs at
-about 3.5 million entries per second for small values — 284 µs for 1,000
-128-byte entries, 1.43 ms for 5,000 of them, so the rate holds as the scan grows
-— and 2.6 million/s at 4 KiB.
+about 3.8 million entries per second for small values — 259 µs for 1,000
+128-byte entries, 1.31 ms for 5,000 of them, so the rate holds as the scan grows
+— and 2.7 million/s at 4 KiB.
 
 ![Recovery scan throughput](docs/benchmarks/wal_scan.png)
 
@@ -420,20 +434,20 @@ own types with zero-copy on top of the raw-bytes API. The question this suite
 answers is what that convenience costs, and the answer is essentially nothing on
 top of what the underlying operation already costs.
 
-Typed writes and deletes land within noise of raw writes (2.285 ms and 2.250 ms
-against the raw 2.270 ms) — the disk sync swamps everything else regardless of
-which API you call. On the read side, a typed read shows a 3.00 µs
-memory-to-disk step against the raw path's 3.10 µs, so the zero-copy
+Typed writes and deletes land within noise of raw writes (2.281 ms and 2.263 ms
+against the raw 2.272 ms) — the disk sync swamps everything else regardless of
+which API you call. On the read side, a typed read shows a 2.76 µs
+memory-to-disk step against the raw path's 2.85 µs, so the zero-copy
 deserialization adds no tier penalty of its own. The typed iteration, range, and
-prefix scans all sit in the same consistent ~2x on-disk-versus-memory band as
-their raw counterparts (1.96x–2.05x), inheriting their tier sensitivity directly
-from the underlying scan rather than from anything specific to the typed
-layer.
+prefix scans sit in the same 1.2x–1.7x on-disk-versus-memory band as their raw
+counterparts, shrinking the same way as results grow (typed iteration: 1.66x at
+100 keys, 1.38x at 1,000), so they inherit their tier sensitivity directly from
+the underlying scan rather than from anything specific to the typed layer.
 
 The keys-only operation is the one that behaves differently. Fetching just the
 keys shows *no* memory-versus-disk gap at small key counts — at 100 keys the
-on-disk case is marginally *faster* (253 µs against 256 µs in memory, i.e. the
-two are indistinguishable) — and only opens up a gap (1.77x) at 1,000. That fits: fetching keys
+on-disk case is marginally *faster* (261 µs against 263 µs in memory, i.e. the
+two are indistinguishable) — and only opens up a gap (1.68x) at 1,000. That fits: fetching keys
 never touches the value log, so at small counts the tier difference is too small
 to clear the noise floor, and only becomes visible once there are enough keys
 for it to accumulate.
@@ -454,11 +468,11 @@ for it to accumulate.
 so they get their own charts; the four multi-key operations then get one chart
 each, all four drawn on a single shared axis so they remain comparable with one
 another. One operation per chart is what makes the tier ratio legible: sorted by
-value, each `memtable`/`l1` pair falls on adjacent bars, so the ~2x step is the
+value, each `memtable`/`l1` pair falls on adjacent bars, so the tier step is the
 gap between neighbours rather than something to hunt for across eighteen bars.
 
 The keys-only chart is the one to look at twice — it is the only one where the
-on-disk bar comes *first* (`l1/100` at 253 µs against `memtable/100` at 256 µs),
+on-disk bar comes *first* (`l1/100` at 261 µs against `memtable/100` at 263 µs),
 which is the no-tier-gap-at-small-counts result described above, and by 1,000
 keys the usual order has returned. Bar labels:
 `get`/`put`/`delete`/`iter`/`keys`/`range`/`scan_prefix` are the typed
@@ -471,17 +485,17 @@ These benchmarks evaluate field-index queries — the bitmap-backed predicate
 engine — over a hundred thousand rows across three indexed fields.
 
 Equality lookups are cheap: a string-equality predicate runs at 11.4 µs, and
-combining two equality predicates with AND or OR costs 33.0 µs. A *range*
-predicate over an integer field is a different story entirely — 1.11 ms,
+combining two equality predicates with AND or OR costs 33.1 µs. A *range*
+predicate over an integer field is a different story entirely — 1.10 ms,
 97x more expensive than equality and the single costliest operation in the suite
 by a wide margin. Parsing overhead, by contrast, is negligible: evaluating a
-query from its string form (789 µs) and evaluating an already-parsed one
-(781 µs) differ by 1%, so the query parser is not where the cost lives.
+query from its string form (730 µs) and evaluating an already-parsed one
+(728 µs) differ by 0.3%, so the query parser is not where the cost lives.
 
 One result runs against intuition: selectivity doesn't track cost. Sweeping a
 compound query so that it matches progressively *fewer* rows makes it *slower*,
-not faster — 11.3 µs at 25% of rows, 33.6 µs at 12%, and 502 µs at 6%. The most
-selective case in the sweep is the slowest one by 45x. Narrowing the result set
+not faster — 11.3 µs at 25% of rows, 32.7 µs at 12%, and 465 µs at 6%. The most
+selective case in the sweep is the slowest one by 41x. Narrowing the result set
 here does not mean less work.
 
 ![Predicate evaluation latencies](docs/benchmarks/predicate.png)
@@ -507,10 +521,10 @@ how deep into the result set the page sits:
 
 | Page offset | `iter().skip(n)` | `iter_page(n)` | Speedup |
 |---|---:|---:|---:|
-| 0 | 76.7 µs | 0.45 µs | 170x |
-| 1,000 | 76.8 µs | 0.80 µs | 96x |
-| 50,000 | 79.1 µs | 17.8 µs | 4.5x |
-| 199,000 | 243.5 µs | 0.34 µs | 713x |
+| 0 | 78.4 µs | 0.45 µs | 174x |
+| 1,000 | 77.2 µs | 0.81 µs | 96x |
+| 50,000 | 79.4 µs | 17.6 µs | 4.5x |
+| 199,000 | 243.3 µs | 0.35 µs | 693x |
 
 The 50,000 row is the weak case and the interesting one: that offset lands in
 the *middle* of a container, so the walk within that one container still has to
@@ -520,7 +534,7 @@ paging deep into the set (199,000) is actually *cheaper* than paging near the
 front, because there is less of a partial container left to walk.
 
 Walking every page of the result set end to end — the realistic client
-behaviour — is **5.2x** faster overall (2.46 ms against 468 µs). That is the
+behaviour — is **5.3x** faster overall (2.47 ms against 467 µs). That is the
 quadratic-versus-linear difference: the old path re-walks the bitmap from the
 start on every page, so its cost grows with the square of the number of pages,
 while container-skipping stays linear.
@@ -529,8 +543,8 @@ while container-skipping stays linear.
 
 ![Walking every page of the result set](docs/benchmarks/bitmap_full_walk.png)
 
-*The single-page chart keeps a log axis — it spans 713x, which is the finding —
-while the full-walk chart is linear so the 5.2x is read directly off the axis.
+*The single-page chart keeps a log axis — it spans 693x, which is the finding —
+while the full-walk chart is linear so the 5.3x is read directly off the axis.
 `iter_skip` is the old path, `iter_page` the current one; the trailing number on
 the first chart is the page offset.*
 
@@ -541,23 +555,38 @@ run against the real cluster centroids bundled with the project (256 clusters)
 and synthetic 768-dimension embeddings, so no external embedding service needs
 to be running.
 
-Scoring a batch of candidate documents against a query is fast and cheap — a
-1.6 µs for a hundred candidates up to 15.9 µs for a thousand, scaling linearly,
-and roughly the same whether it's the coarse first pass (15.9 µs) or the more
-precise second pass (15.1 µs). The extra precision of the second pass
-costs nothing extra at this scale. Picking out which few clusters are worth
+Scoring a batch of candidate documents against a query is fast and cheap:
+1.6 µs for a hundred candidates up to 15.9 µs for a thousand for the coarse
+first pass, scaling linearly, and 1.2 µs to 12.2 µs for the more precise second
+pass. The extra precision of the second pass costs nothing extra at this scale;
+it measures 20% *cheaper* here with no code change since the previous run (see
+*How much a repeat run moves*). Picking out which few clusters are worth
 searching, the equivalent of choosing the right shelf before scanning it, takes
-under 10 µs and barely changes whether 8 clusters are requested (8.4 µs) or 128
-(9.4 µs).
+under 10 µs and barely changes whether 8 clusters are requested (8.3 µs) or 128
+(9.0 µs).
 
-A full end-to-end search's cost tracks how long the *query* is, not how many
-clusters get probed (that's held fixed). A query ten times longer costs only
-2.19x as much — sub-linear — because the final re-ranking step only ever
-looks at a capped number of candidates no matter how many fed into it. Growing
-the *document* side instead, by giving each document more searchable chunks,
-doesn't get that cap: cost there scales roughly in step with the extra chunks
-(eight times the chunks per document costs 5.36x as much), because the first
-pass scans all of them rather than capping.
+A full end-to-end search got **28–44% faster** since the previous run, from the
+semantic-search hot-path work (`e414cdb`, `d14d73e`): scoring parallel over
+entries rather than clusters, per-document grouping by sort instead of a hash
+map, buffered on-disk range reads, and an O(n) first-pass cut. A 4-vector query
+over 5,000 documents went from 2.25 ms to 1.62 ms, and 8 chunks per document
+from 11.9 ms to 6.7 ms. Because the first pass scans every probed chunk, cost
+still grows with the chunks per document (eight times the chunks costs 4.18x as
+much), but less steeply than before (5.36x).
+
+**One case got slower: a 40-vector query, 4.92 ms → 6.06 ms (+23%).** An A/B
+across the three commits puts all of it in the hot-path work (4.85 ms before it,
+5.95 ms after it, 6.04 ms with the concurrency fix on top). The likely cause,
+not yet measured in isolation, is that the per-document fold after scoring now
+runs single-threaded, and at 40 vectors it takes a 40-wide max per entry. The
+old code did that fold inside its parallel per-cluster tasks. Production embeds
+the whole query once (one vector), so it does not pay this; the query-length
+sweep now measures a general-MaxSim path that production does not use. As a
+result, ten times the query now costs 3.75x as much, not 2.19x.
+
+The concurrency fix itself (`6d38cc1`) costs 2–5% on the 1-chunk and 4-vector
+cases of this single-threaded benchmark, the same single-client cost the
+concurrency report measured on real data.
 
 ![Candidate scoring, first pass against second](docs/benchmarks/semantic_scoring.png)
 
@@ -583,22 +612,29 @@ against a single contiguous matrix of cluster centroids. That contiguity is what
 produces the speedup, through better cache locality and more vectorizable math,
 and the chart shows it as the gap within each adjacent pair.*
 
-![First pass, peeled apart into cumulative layers](docs/benchmarks/semantic_pass1_layers.png)
+![First pass in cumulative layers, 4 query vectors](docs/benchmarks/semantic_pass1_layers_4.png)
 
-*The first pass in cumulative layers, starting from the bare distance math
-(`dot_arithmetic`), then adding the cost of reading the on-disk format
-(`plus_archived`), and finally the real scoring data structure (`plus_hashmap`),
-which is the closest of the three to what production actually pays. Each layer
-is dearer than the one below it at both query sizes.*
+![First pass in cumulative layers, 40 query vectors](docs/benchmarks/semantic_pass1_layers_40.png)
+
+*One chart per query size, each on a linear axis from zero, because on the
+single log axis the previous run used the layer steps were invisible. The first
+pass in cumulative layers, single-threaded, starting from the bare
+distance math (`dot_arithmetic`), then adding the cost of reading the on-disk
+format (`plus_archived`), then production's per-document grouping
+(`plus_grouping`: one row per entry, sorted by document id and folded). The
+fourth bar, `plus_hashmap`, is the hash-map fold that grouping replaced, kept
+for comparison. At 4 query vectors grouping adds 9 µs over reading the archive
+where the map added 107 µs. At 40 it is the other way round, 165 µs against
+128 µs, which fits the 40-vector end-to-end regression above.*
 
 ![Complete search as the query grows](docs/benchmarks/semantic_query_length.png)
 
 ![Complete search as documents gain chunks](docs/benchmarks/semantic_chunks_per_doc.png)
 
 *The two end-to-end sweeps, on a shared millisecond axis so they can be read
-against each other: the query-length sweep is visibly sub-linear (ten times the
-query for 2.19x the cost) while the chunk sweep is not (eight times the chunks
-for 5.36x), which is the capped-re-ranking argument above in picture form.*
+against each other: ten times the query costs 3.75x as much and eight times the
+chunks 4.18x. The query sweep was the sub-linear one in the previous run (2.19x);
+see the 40-vector regression above.*
 
 ---
 
@@ -609,28 +645,30 @@ measurements here corroborate them:
 
 | Operation | README ballpark | Measured here |
 |---|---|---|
-| Write (small values, single writer) | ~400–500 ops/s | 441 ops/s — in range |
-| `merge` (small values, single writer) | ~400–500 ops/s | 440 ops/s — in range |
-| Read (warm, from memory) | 1M–2.5M ops/s | 2.51M ops/s — top of range |
-| Read (cold, from disk) | 100k–300k ops/s | 285k ops/s — in range |
+| Write (small values, single writer) | ~400–500 ops/s | 440 ops/s — in range |
+| `merge` (small values, single writer) | ~400–500 ops/s | 442 ops/s — in range |
+| Read (warm, from memory) | 1M–2.5M ops/s | 2.69M ops/s — above range |
+| Read (cold, from disk) | 100k–300k ops/s | 311k ops/s — just above range |
 | Range / prefix scan | bounded by result size | consistent — see the Scans section |
 
 Write throughput lands squarely in the published range. The WAL is synced on
-every write by design — only the value log's sync cadence is tunable — so 441
+every write by design — only the value log's sync cadence is tunable — so 440
 writes per second is the expected, sync-bound ceiling for a single writer at
 2.27 ms per sync on this drive, not a number a configuration change could raise.
 The unsynced WAL benchmark puts a number on what that guarantee costs: without
-the sync the same append runs 1,421x faster. `merge` inherits exactly that
+the sync the same append runs 1,497x faster. `merge` inherits exactly that
 ceiling, which is the point of its own section above.
 
 The cold-read figure is corroborated twice over. Two different benchmarks — one
 in the reads section, one in the point-lookup section — both measure a
 small-value lookup forced onto disk, using different setups, and arrive within
-2.3% of each other (285k and 292k ops/s). Read throughput meets the README's
-ballpark on both tiers.
+1.6% of each other (311k and 316k ops/s). Read throughput now sits slightly
+above the top of the README's ballpark on both tiers; see *How much a repeat run
+moves* for why a 5-8% cross-run shift in reads is not, by itself, a code
+change.
 
 Sharding gives concurrent writers real headroom beyond that single-writer
-figure: writes fan out across the buckets (16 by default), so at 441 writes per
+figure: writes fan out across the buckets (16 by default), so at 440 writes per
 second per writer, sixteen writers spread one-per-bucket would land somewhere
 around 7k writes per second. That aggregate concurrent number isn't measured
 here — this whole report covers single-threaded latency only — and would be
