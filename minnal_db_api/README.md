@@ -1189,7 +1189,7 @@ top-level `uptime_s`.
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
 | `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads, query-embedding cache) | **No** |
-| `no_wal_deletes` | writes | Deletes written bypassing the WAL (query-embedding cache populate/clear) | **No** |
+| `no_wal_deletes` | writes | Deletes written bypassing the WAL (`delete_no_wal` callers) | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
 | `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |

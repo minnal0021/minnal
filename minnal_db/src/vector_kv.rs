@@ -90,12 +90,17 @@ pub fn companion_base(name: &str) -> Option<&str> {
 /// (configurable via `[semantic_search] query_embedding_cache_ttl_secs`), so
 /// stale embeddings are evicted automatically.
 ///
-/// **Durability:** all writes to this namespace (cache populate and clear) use
-/// the **no-WAL** path (`put_no_wal` / `delete_no_wal`). The cache is
-/// best-effort and fully regenerable — every entry can be recomputed by calling
-/// the embedding service — so paying a per-write WAL fsync would add query
-/// latency for no durability benefit. A crash that drops un-flushed cache writes
-/// just produces future cache misses.
+/// **Durability:** cache populates use the **no-WAL** path (`put_no_wal`). The
+/// cache is best-effort and fully regenerable — every entry can be recomputed
+/// by calling the embedding service — so paying a per-write WAL fsync would add
+/// query latency for no durability benefit. A crash that drops un-flushed
+/// populates just produces future cache misses.
+///
+/// The administrative clear ([`clear_cached_query_embeddings`]) is the
+/// exception: its deletes are **WAL-backed**. Cached entries are periodically
+/// flushed to disk, so a no-WAL tombstone lost to a crash before the next flush
+/// tick would resurrect an entry the operator explicitly cleared — and keep
+/// serving it until the TTL expires.
 const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
 
 // ── Query embedding cache ─────────────────────────────────────────────────────
@@ -161,9 +166,11 @@ pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Resul
     let keys = cache_ns.keys().await?;
     let mut deleted = 0usize;
     for key in keys {
-        // No-WAL: matches the no-WAL populate path. A lost clear-delete just
-        // leaves a regenerable entry that the TTL worker evicts anyway.
-        cache_ns.delete_no_wal(key).await?;
+        // WAL-backed, unlike the populate path: the entries being cleared may
+        // already be flushed to disk, so a no-WAL tombstone lost to a crash
+        // before the next flush tick would bring them back. A clear is a rare
+        // admin operation; the per-delete fsync is off the query path.
+        cache_ns.delete(key).await?;
         deleted += 1;
     }
     Ok(deleted)
@@ -1592,11 +1599,11 @@ mod query_embedding_cache_tests {
         assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
     }
 
-    /// The cache must stay off the WAL: populating and clearing it should drive
-    /// the *no-WAL* counters and add no WAL fsync to the query path. This pins
-    /// the latency-motivated durability choice for the TTL cache namespace.
+    /// Cache populates must stay off the WAL (no fsync on the query path),
+    /// while the admin clear goes through it so it survives a crash. This pins
+    /// the durability split for the TTL cache namespace.
     #[tokio::test]
-    async fn test_cache_writes_bypass_wal() {
+    async fn test_cache_populates_bypass_wal_and_clears_use_it() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
 
@@ -1610,10 +1617,51 @@ mod query_embedding_cache_tests {
 
         let after = db.ops_metrics();
         assert_eq!(after.no_wal_puts - before.no_wal_puts, 2, "two cache populates use put_no_wal");
-        assert_eq!(after.no_wal_deletes - before.no_wal_deletes, 2, "two cache clears use delete_no_wal");
         assert_eq!(after.puts - before.puts, 0, "no WAL-backed puts from the cache");
-        assert_eq!(after.deletes - before.deletes, 0, "no WAL-backed deletes from the cache");
-        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 0, "cache writes add no WAL fsync");
+        assert_eq!(after.deletes - before.deletes, 2, "two cache clears use the WAL-backed delete");
+        assert_eq!(after.no_wal_deletes - before.no_wal_deletes, 0, "no cache clear bypasses the WAL");
+    }
+
+    /// Populate the cache and flush it to L0 — the state a long-running server
+    /// is in once the periodic no-WAL flush tick has persisted cache entries.
+    async fn populate_and_flush(db: &AsyncDb) {
+        put_cached_query_embedding(db, "q1", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(db, "q2", &[0.0f32, 1.0], TEST_TTL).await;
+        assert!(db.coordinator_for_test().flush_no_wal_memtables() >= 1);
+    }
+
+    /// A clear must survive a graceful restart.
+    #[tokio::test]
+    async fn test_cache_clear_survives_graceful_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            populate_and_flush(&db).await;
+            assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 2);
+            db.shutdown().await.unwrap();
+        }
+        let db = open_db(&dir).await;
+        assert!(get_cached_query_embedding(&db, "q1", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, "q2", 2, TEST_TTL).await.is_none());
+    }
+
+    /// A clear must survive a crash that lands before the next no-WAL flush
+    /// tick. The cleared entries were already flushed to disk, so if the
+    /// clear's tombstones only lived in the memtable, the crash would drop them
+    /// and resurrect every cleared entry on reopen.
+    #[tokio::test]
+    async fn test_cache_clear_survives_crash_before_flush_tick() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            populate_and_flush(&db).await;
+            assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 2);
+            // Crash: skip shutdown and every Drop-time flush.
+            std::mem::forget(db);
+        }
+        let db = open_db(&dir).await;
+        assert!(get_cached_query_embedding(&db, "q1", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, "q2", 2, TEST_TTL).await.is_none());
     }
 
     /// Re-embedding the same query overwrites its entry.
