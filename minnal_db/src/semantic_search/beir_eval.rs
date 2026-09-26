@@ -10,7 +10,7 @@
 //!   first-pass 100 as well as the production 1000, because a tight cut exposes
 //!   Pass 1's own (MaxSim) ranking quality.
 //! - **Cost:** clusters probed, query vectors, embedding time per query, and
-//!   median search latency, at `n_probes` 32 (production) and 256 (exhaustive).
+//!   median search latency, at `n_probes` 64 (production) and 256 (exhaustive).
 //!
 //! It was used to choose whole-query Pass-1 embedding over chunked queries
 //! (`semantic_search/query-embedding-report.md`); rerun it to evaluate any
@@ -49,7 +49,7 @@ const NS: &str = "beir";
 const INDEX_CONCURRENCY: usize = 32;
 const NDCG_K: usize = 10;
 const RECALL_K: usize = 100;
-const NPROBES: [usize; 2] = [32, 256];
+const NPROBES: [usize; 2] = [64, 256];
 const FIRST_PASS: [usize; 2] = [1000, 100];
 
 fn env_or(key: &str, default: &str) -> String {

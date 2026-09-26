@@ -369,7 +369,7 @@ All parameters are under `[semantic_search]` in the TOML config:
 | Parameter | Default | Description |
 |---|---|---|
 | `number_of_bits_for_dense_quantisation` | `8` | Bits per dimension for MultiBit (dense) quantisation. 4 = compact, 8 = high recall. Only affects Pass 2 precision. |
-| `n_probes` | `32` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower — see *Tuning & profiling* below. |
+| `n_probes` | `64` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower — see *Tuning & profiling* below. |
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
 | `window_size` | `4` | Sentences per sliding-window chunk for **document** SingleBit embeddings (queries are not chunked). Changing it requires a corpus re-index. |
 | `sliding_size` | `2` | Document window advance step, in sentences. Smaller than `window_size` → overlapping chunks. |
@@ -387,7 +387,7 @@ trades off:
 - **Latency** — `real_kv_search_profile` runs the real two-pass `search()` over a real
   `minnal_db`-backed store (synthetic vectors, but real LSM + value-log `pread` I/O) and
   phase-times coarse cluster pick, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the
-  scoring remainder, and the whole query — sweeping `n_probes ∈ {10, 32, 128}` at several
+  scoring remainder, and the whole query — sweeping `n_probes ∈ {10, 32, 64, 128}` at several
   chunks-per-doc. It needs no embedding service.
   ```sh
   cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_kv_search_profile --release -- --ignored --nocapture
@@ -412,20 +412,26 @@ Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency:
 | `n_probes` | recall@10 | recall@100 | sparse entries scanned | entire `search()` |
 |---|---|---|---|---|
 | 10 | 0.968 | 0.935 | 7,320 | 3.5 ms |
-| **32 (default)** | **0.986** | **0.978** | **17,278** | **6.7 ms** |
+| 32 | 0.986 | 0.978 | 17,278 | 6.7 ms |
+| **64 (default)** | — | — | **27,537** | **9.8 ms** |
 | 128 | 1.000 | 0.999 | 37,337 | 13.1 ms |
 
 The latency column was 14.5 / 18.7 / 26.4 ms before the hot-path work. The
 recall columns come from the earlier measurement: recall depends on the probe
-set, quantisation and re-ranking, none of which changed. Note that the profile
+set, quantisation and re-ranking, none of which changed. That measurement did
+not record 64, and the 64 row's latency was added on 2026-09-26. Note that the profile
 harness silently measured an **empty** index from 2026-07-30 until
 2026-09-26: `upsert_vectors` skips unregistered namespaces (so a dropped store
 is never resurrected), and the harness never registered its own. It now
 registers the namespace and asserts the index is non-empty before timing.
 
-`32` is the default: it recovers most of the recall lost at `10` while staying ~49% cheaper
-than `128`. The dominant lever is **Pass-1 sparse-scan I/O** (54–78% of `search()` at 8
-chunks/doc), which scales roughly linearly with `n_probes` (entries scanned grow in step);
+`64` is the default. End-to-end BEIR runs with the gemma centroids (2026-09-26) put it
+within 0.003 nDCG@10 of exhaustive on both SciFact (5.2k docs) and FiQA (57.6k docs), while
+`32` lost 0.010 on SciFact and metric-lossless needed `128` (FiQA warm query: 13.9 / 17.3 /
+21.0 ms at 32 / 64 / 128). The earlier choice of `32` was measured against an index whose
+(qwen) centroids did not match the embedding model; one oversized cluster made 32 probes
+read nearly the whole index. The dominant lever is **Pass-1 sparse-scan I/O** (54–88% of
+`search()` at 8 chunks/doc), which scales roughly linearly with `n_probes` (entries scanned grow in step);
 the SIMD dot products are a minority of the cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
 `first_pass_sparse_search_top_k` candidate set — so its share *shrinks* as `n_probes` rises.
 
