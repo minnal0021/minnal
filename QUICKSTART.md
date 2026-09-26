@@ -192,6 +192,14 @@ Use `release.sh` to build optimised binaries and stage everything under
 data paths rewritten to `./work/doc_store/` as the base.  Run both commands from
 the workspace root.
 
+It stages the cluster centroids for the model `config/sample.toml` names
+(`[semantic_search] model`), as `./work/bin/clusters.bin`. If that file already
+holds different centroids and a database exists under `./work/doc_store`, the
+script stops before building anything: every stored vector is quantised against
+the current file, so swapping it makes semantic search silently wrong. Pass `-c`
+to replace it deliberately, then re-index each semantic-search store
+(`POST /admin/indices/{ns}/vector/reindex-all`).
+
 #### Development workflow
 
 ```bash

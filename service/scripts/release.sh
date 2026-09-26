@@ -7,7 +7,12 @@
 #      otherwise inline — waits up to 30 s before aborting).
 #   3. Creates ./work/bin/ (if needed) and copies both binaries into it.
 #   4. Copies minnal_tools/sample_data/ → ./work/sample_data/  (only with -s flag).
-#   5. Copies service/embedding_support/qwen/clusters.json → ./work/bin/clusters.bin.
+#   5. Copies the centroids for the configured model —
+#      service/embedding_support/{model}/clusters.json, where {model} is
+#      config/sample.toml's [semantic_search] model — → ./work/bin/clusters.bin.
+#      Refuses to replace a different centroid file while a database exists
+#      under ./work/doc_store (stored vectors are quantised against the old set)
+#      unless -c is given.
 #   6. Generates ./work/bin/minnal.toml from config/sample.toml, rewriting
 #      all data paths to use ./work/doc_store as the base directory.
 #   7. Generates ./work/bin/stop.sh   — gracefully stops the server.
@@ -17,14 +22,18 @@
 # Run from the workspace root:
 #   ./service/scripts/release.sh          # skip sample data
 #   ./service/scripts/release.sh -s       # also copy sample data
+#   ./service/scripts/release.sh -c       # allow the centroid file to change
+#                                         # (then re-index every semantic store)
 
 set -euo pipefail
 
 COPY_SAMPLE_DATA=false
-while getopts ":s" opt; do
+ALLOW_CENTROID_CHANGE=false
+while getopts ":sc" opt; do
     case $opt in
         s) COPY_SAMPLE_DATA=true ;;
-        *) echo "usage: $0 [-s]" >&2; exit 1 ;;
+        c) ALLOW_CENTROID_CHANGE=true ;;
+        *) echo "usage: $0 [-s] [-c]" >&2; exit 1 ;;
     esac
 done
 
@@ -34,6 +43,34 @@ WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BIN_DIR="${WORKSPACE_ROOT}/work/bin"
 CONFIG_SRC="${WORKSPACE_ROOT}/config/sample.toml"
 STOP_TIMEOUT=30
+
+# ── 0. Resolve and check the cluster centroids (before building or stopping) ─
+# The centroids must be the ones fitted for the model the embedding service
+# serves: both bundled sets are 768-dim, so a mismatch passes every load-time
+# check and silently skews the IVF partition (this script used to hard-code
+# qwen while the config said gemma, so a FiQA query read 92% of its index).
+MODEL="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${CONFIG_SRC}" | head -n 1 | tr '[:upper:]' '[:lower:]')"
+if [[ -z "${MODEL}" ]]; then
+    echo "ERROR: no [semantic_search] model = \"…\" line in ${CONFIG_SRC}" >&2
+    exit 1
+fi
+CLUSTER_SRC="${WORKSPACE_ROOT}/service/embedding_support/${MODEL}/clusters.json"
+if [[ ! -f "${CLUSTER_SRC}" ]]; then
+    echo "ERROR: model '${MODEL}' has no centroids at ${CLUSTER_SRC}" >&2
+    exit 1
+fi
+# Replacing the centroids under an existing database invalidates every stored
+# vector (both passes are quantised relative to a centroid), and search then
+# returns wrong results without any error. Only do it on purpose.
+if [[ -f "${BIN_DIR}/clusters.bin" ]] && ! cmp -s "${CLUSTER_SRC}" "${BIN_DIR}/clusters.bin" \
+    && [[ -n "$(ls -A "${WORKSPACE_ROOT}/work/doc_store/db" 2>/dev/null)" ]] && [[ "${ALLOW_CENTROID_CHANGE}" != true ]]; then
+    echo "ERROR: ${BIN_DIR}/clusters.bin differs from the ${MODEL} centroids, and a database" >&2
+    echo "       exists under ./work/doc_store. Its vector indices were quantised against the" >&2
+    echo "       current file; replacing it would make semantic search silently wrong." >&2
+    echo "       Re-run with -c to replace it anyway, then re-index every semantic-search store" >&2
+    echo "       (POST /admin/indices/{ns}/vector/reindex-all)." >&2
+    exit 1
+fi
 
 cd "${WORKSPACE_ROOT}"
 
@@ -107,9 +144,9 @@ fi
 
 # ── 5. Copy cluster centroids ─────────────────────────────────────────────────
 echo ""
-echo "==> [5/9] Copying cluster centroids → ${BIN_DIR}/clusters.bin"
-cp "${WORKSPACE_ROOT}/service/embedding_support/qwen/clusters.json" "${BIN_DIR}/clusters.bin"
-echo "  Copied clusters.bin"
+echo "==> [5/9] Copying ${MODEL} cluster centroids → ${BIN_DIR}/clusters.bin"
+cp "${CLUSTER_SRC}" "${BIN_DIR}/clusters.bin"
+echo "  Copied clusters.bin (${MODEL})"
 
 # ── 6. Generate config ────────────────────────────────────────────────────────
 echo ""
