@@ -273,7 +273,12 @@ The embedding service being unreachable is **never fatal**:
 - Scans all pending queue entries and **skips exhausted ones** (`retry_count ≥ max_retries`).
 - Groups the remainder by namespace and visits them in **round-robin** order so no single namespace can starve others.
 - Calls `embed_document` (one embedding call per document — whole text + chunks in a single ordered batch) for up to `concurrency` entries at once.
-- **On success:** writes the `VectorIndex` entries across all three companion namespaces, then removes the queue entry. These are independent writes (not atomic), so a crash between them just re-processes the entry idempotently on the next pass.
+- **On success:** writes the `VectorIndex` entries across all three companion namespaces, then **completes** the entry. These are independent writes (not atomic), so a crash between them just re-processes the entry idempotently on the next pass.
+- **Completion is conditional.** A pass works from a snapshot of the whole queue, so an upsert or delete of a document can land between the snapshot and that entry's completion, for minutes during a bulk load. Completion (and failure bookkeeping) is an atomic `merge` on the queue key that only acts if the stored entry is still the one the worker took (same kind and text):
+  - a newer upsert's entry is left for the next pass, instead of being deleted with the stale vectors kept (the lost-update race, R1);
+  - a failure never rewrites a newer entry with the older text (R2);
+  - if the entry has become a `Clear` tombstone, the document was deleted mid-embed, so the worker deletes the vectors it just wrote and retires the tombstone (R3).
+- **Clear tombstones.** Deletes, and upserts whose embedding text is now empty, write a `Clear` entry *before* deleting the vectors synchronously. The worker retires it by deleting the vectors again (idempotent) and removing it, unless a re-upsert has replaced it meanwhile. An empty-text upsert of a document that never had vectors or a pending entry writes nothing.
 - **On failure:** increments the entry's `retry_count`, persists it, and logs a `WARN` with namespace, doc-id, attempt number, and whether the budget is now exhausted.
 
 The worker's behaviour is tuned by the `[vector_index]` TOML section: `concurrency` (default `4`), `max_retries` (default `5`), and `retry_wait_secs` (default `2`, slept after any pass containing a failure).
@@ -301,16 +306,19 @@ The queue is keyed by `(namespace, doc_id)`, so an entry is a **single row that 
 | Trigger | Endpoint / call | Effect on an exhausted entry |
 |---|---|---|
 | A fresh write to the same document | `put` / `kv_put` → `enqueue_embed` | Overwrites the key → `retry_count = 0` |
-| Re-index one entry | `POST /admin/indices/{ns}/vector/queue/{doc_id}/retry` | Resets that entry → `retry_count = 0` |
-| Re-index all failed | `POST /admin/indices/{ns}/vector/reindex-failed` | Resets every exhausted entry in `{ns}` → `retry_count = 0` |
+| Re-index one entry | `POST /admin/indices/{ns}/vector/queue/{doc_id}/retry` | Resets that entry → `retry_count = 0`, atomically, keeping its kind and text |
+| Re-index all failed | `POST /admin/indices/{ns}/vector/reindex-failed` | Resets every exhausted entry in `{ns}` → `retry_count = 0`, the same way |
 | Full re-index | `POST /admin/indices/{ns}/vector/reindex-all` | **Deletes** existing exhausted entries, then re-enqueues every document at `retry_count = 0` |
 
 ### Queue entry format
 
-Queue keys encode `(namespace, doc_id)` (length-prefixed namespace ‖ doc-id bytes) so rapid successive writes to the same document overwrite the entry — the worker makes exactly one dual-embedding call for the most-recent text. Queue values are versioned binary, holding the `retry_count` and (v2) the last error text:
+Queue keys encode `(namespace, doc_id)` (length-prefixed namespace ‖ doc-id bytes) so rapid successive writes to the same document overwrite the entry — the worker makes exactly one dual-embedding call for the most-recent text. Queue values are versioned binary, holding the entry kind (v3), the `retry_count`, and (v2+) the last error text:
 
 - v1: `0x01 ‖ retry_count (4 B BE) ‖ text_bytes`
 - v2: `0x02 ‖ retry_count (4 B BE) ‖ error_len (4 B BE) ‖ error_bytes ‖ text_bytes`
+- v3 (written today): `0x03 ‖ kind (1 B: 0 = embed, 1 = clear) ‖ retry_count (4 B BE) ‖ error_len (4 B BE) ‖ error_bytes ‖ text_bytes`
+
+v1 and v2 entries still decode, as embed entries. The admin queue listing shows each entry's `kind`.
 
 ### Durability guarantees
 

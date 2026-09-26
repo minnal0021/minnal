@@ -382,6 +382,24 @@ pub async fn has_complete_vector_index(db: &AsyncDb, namespace: &str, doc_id_byt
     Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
 }
 
+/// Return `true` if a document has **any** vector-index state that clearing it
+/// would have to remove: a sparse meta record, a dense entry, or a queue entry.
+///
+/// Sound as a "nothing to clear" test even while the worker is running: the
+/// worker writes vectors before it removes the queue entry, so at every moment an
+/// in-flight document shows either its queue entry or its vectors.
+pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<bool, crate::KVError> {
+    if get_queue_entry(db, namespace, doc_id_bytes).await?.is_some() {
+        return Ok(true);
+    }
+    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    if sparse_meta_ns.get(doc_id_bytes.to_vec()).await?.is_some() {
+        return Ok(true);
+    }
+    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
+    Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
+}
+
 /// Like [`has_complete_vector_index`], but also verifies the committed bytes
 /// **deserialize** — catching entries that are present but corrupt, which the
 /// presence-only check counts as indexed.
@@ -506,6 +524,18 @@ impl VectorKvStore for DbVectorStore {
 /// embedding call for the most-recent text (natural deduplication).
 pub const PENDING_VEC_INDEX_NS: &str = "system_pending_vec_index";
 
+/// What a queue entry asks the worker to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueEntryKind {
+    /// Embed `text` and write the document's vectors.
+    Embed,
+    /// Tombstone: the document must end up with **no** vectors — it was deleted,
+    /// or its embedding text became empty. Deletes write this instead of removing
+    /// the entry, so a worker that was already embedding the document's older text
+    /// finds it when it completes and removes what it wrote (see [`finish_embed`]).
+    Clear,
+}
+
 /// One entry in the async vector-index embedding queue.
 #[derive(Clone, Debug)]
 pub struct QueueEntry {
@@ -513,7 +543,9 @@ pub struct QueueEntry {
     pub namespace: String,
     /// Raw document key bytes (big-endian encoded ID).
     pub doc_id_bytes: Vec<u8>,
-    /// Text to embed.
+    /// What the worker must do for this document.
+    pub kind: QueueEntryKind,
+    /// Text to embed (empty for [`QueueEntryKind::Clear`]).
     pub text: String,
     /// Number of failed embedding attempts so far.
     pub retry_count: u32,
@@ -524,12 +556,22 @@ pub struct QueueEntry {
 /// Version `0x01`: `[version] [retry_count: 4B BE] [text bytes]`
 const QUEUE_VALUE_V1: u8 = 0x01;
 /// Version `0x02`: `[version] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
-const QUEUE_VALUE_VERSION: u8 = 0x02;
+const QUEUE_VALUE_V2: u8 = 0x02;
+/// Version `0x03`: `[version] [kind: 1B] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
+/// — v2 plus the entry kind (`0` = embed, `1` = clear). v1/v2 entries decode as embed.
+const QUEUE_VALUE_VERSION: u8 = 0x03;
 
-fn encode_queue_value(text: &str, retry_count: u32, last_error: Option<&str>) -> Vec<u8> {
+const KIND_EMBED: u8 = 0;
+const KIND_CLEAR: u8 = 1;
+
+fn encode_queue_value(kind: QueueEntryKind, text: &str, retry_count: u32, last_error: Option<&str>) -> Vec<u8> {
     let error_bytes = last_error.unwrap_or("").as_bytes();
-    let mut value = Vec::with_capacity(1 + 4 + 4 + error_bytes.len() + text.len());
+    let mut value = Vec::with_capacity(1 + 1 + 4 + 4 + error_bytes.len() + text.len());
     value.push(QUEUE_VALUE_VERSION);
+    value.push(match kind {
+        QueueEntryKind::Embed => KIND_EMBED,
+        QueueEntryKind::Clear => KIND_CLEAR,
+    });
     value.extend_from_slice(&retry_count.to_be_bytes());
     value.extend_from_slice(&(error_bytes.len() as u32).to_be_bytes());
     value.extend_from_slice(error_bytes);
@@ -537,37 +579,88 @@ fn encode_queue_value(text: &str, retry_count: u32, last_error: Option<&str>) ->
     value
 }
 
-/// Returns `(text, retry_count, last_error)`.  Handles both v1 and v2 on-disk formats.
-fn decode_queue_value(value: &[u8]) -> Option<(String, u32, Option<String>)> {
+/// A decoded queue value.
+#[derive(Clone, Debug, PartialEq)]
+struct QueueValue {
+    kind: QueueEntryKind,
+    text: String,
+    retry_count: u32,
+    last_error: Option<String>,
+}
+
+impl QueueValue {
+    /// Whether this value is still the entry `entry` was taken from: same kind and
+    /// same text. Retry bookkeeping is ignored — only the worker and admin retries
+    /// change it, and neither changes what the entry asks for.
+    fn is(&self, entry: &QueueEntry) -> bool {
+        self.kind == entry.kind && self.text == entry.text
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        encode_queue_value(self.kind, &self.text, self.retry_count, self.last_error.as_deref())
+    }
+
+    fn into_entry(self, namespace: &str, doc_id_bytes: &[u8]) -> QueueEntry {
+        QueueEntry {
+            namespace: namespace.to_owned(),
+            doc_id_bytes: doc_id_bytes.to_vec(),
+            kind: self.kind,
+            text: self.text,
+            retry_count: self.retry_count,
+            last_error: self.last_error,
+        }
+    }
+}
+
+/// Decode any on-disk queue value version (v1, v2, v3).
+fn decode_queue_value(value: &[u8]) -> Option<QueueValue> {
     let version = *value.first()?;
-    match version {
+    // v1 has no error field; v2 and v3 share the retry/error/text tail, v3 behind a kind byte.
+    let (kind, tail) = match version {
         v if v == QUEUE_VALUE_V1 => {
             if value.len() < 5 {
                 return None;
             }
             let retry_count = u32::from_be_bytes(value[1..5].try_into().ok()?);
             let text = std::str::from_utf8(&value[5..]).ok()?.to_owned();
-            Some((text, retry_count, None))
+            return Some(QueueValue {
+                kind: QueueEntryKind::Embed,
+                text,
+                retry_count,
+                last_error: None,
+            });
         }
+        v if v == QUEUE_VALUE_V2 => (QueueEntryKind::Embed, &value[1..]),
         v if v == QUEUE_VALUE_VERSION => {
-            if value.len() < 9 {
-                return None;
-            }
-            let retry_count = u32::from_be_bytes(value[1..5].try_into().ok()?);
-            let error_len = u32::from_be_bytes(value[5..9].try_into().ok()?) as usize;
-            if value.len() < 9 + error_len {
-                return None;
-            }
-            let last_error = if error_len > 0 {
-                Some(std::str::from_utf8(&value[9..9 + error_len]).ok()?.to_owned())
-            } else {
-                None
+            let kind = match *value.get(1)? {
+                KIND_EMBED => QueueEntryKind::Embed,
+                KIND_CLEAR => QueueEntryKind::Clear,
+                _ => return None,
             };
-            let text = std::str::from_utf8(&value[9 + error_len..]).ok()?.to_owned();
-            Some((text, retry_count, last_error))
+            (kind, &value[2..])
         }
-        _ => None,
+        _ => return None,
+    };
+    if tail.len() < 8 {
+        return None;
     }
+    let retry_count = u32::from_be_bytes(tail[0..4].try_into().ok()?);
+    let error_len = u32::from_be_bytes(tail[4..8].try_into().ok()?) as usize;
+    if tail.len() < 8 + error_len {
+        return None;
+    }
+    let last_error = if error_len > 0 {
+        Some(std::str::from_utf8(&tail[8..8 + error_len]).ok()?.to_owned())
+    } else {
+        None
+    };
+    let text = std::str::from_utf8(&tail[8 + error_len..]).ok()?.to_owned();
+    Some(QueueValue {
+        kind,
+        text,
+        retry_count,
+        last_error,
+    })
 }
 
 fn queue_key(namespace: &str, doc_id_bytes: &[u8]) -> Vec<u8> {
@@ -607,7 +700,10 @@ fn decode_queue_key(key: &[u8]) -> Option<(&str, &[u8])> {
 pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<(), crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     queue_ns
-        .put(queue_key(namespace, doc_id_bytes), encode_queue_value(text, 0, None))
+        .put(
+            queue_key(namespace, doc_id_bytes),
+            encode_queue_value(QueueEntryKind::Embed, text, 0, None),
+        )
         .await?;
     Ok(())
 }
@@ -625,7 +721,10 @@ pub async fn update_queue_retry(
 ) -> Result<(), crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     queue_ns
-        .put(queue_key(namespace, doc_id_bytes), encode_queue_value(text, retry_count, last_error))
+        .put(
+            queue_key(namespace, doc_id_bytes),
+            encode_queue_value(QueueEntryKind::Embed, text, retry_count, last_error),
+        )
         .await?;
     Ok(())
 }
@@ -657,15 +756,9 @@ pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::
     let mut result = Vec::with_capacity(entries.len());
     for (key, value) in entries {
         if let Some((namespace, doc_id_bytes)) = decode_queue_key(&key)
-            && let Some((text, retry_count, last_error)) = decode_queue_value(&value)
+            && let Some(value) = decode_queue_value(&value)
         {
-            result.push(QueueEntry {
-                namespace: namespace.to_owned(),
-                doc_id_bytes: doc_id_bytes.to_vec(),
-                text,
-                retry_count,
-                last_error,
-            });
+            result.push(value.into_entry(namespace, doc_id_bytes));
         }
     }
     Ok(result)
@@ -680,16 +773,462 @@ pub async fn get_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8])
     let key = queue_key(namespace, doc_id_bytes);
     match queue_ns.get(key).await? {
         None => Ok(None),
-        Some(value) => match decode_queue_value(&value) {
-            Some((text, retry_count, last_error)) => Ok(Some(QueueEntry {
-                namespace: namespace.to_owned(),
-                doc_id_bytes: doc_id_bytes.to_vec(),
-                text,
-                retry_count,
-                last_error,
-            })),
-            None => Ok(None),
-        },
+        Some(value) => Ok(decode_queue_value(&value).map(|v| v.into_entry(namespace, doc_id_bytes))),
+    }
+}
+
+// ── Conditional queue updates ─────────────────────────────────────────────────
+//
+// The worker snapshots the whole queue at the start of a pass, then embeds the
+// snapshot entries one by one, so an upsert or delete of a document can land at
+// any point between the snapshot and that entry's completion — minutes, during a
+// bulk load. Every write the worker makes *after* embedding is therefore
+// conditional on the entry still being the one it took, checked atomically
+// under the key's stripe lock via `merge`:
+//
+// * R1 — completing: only delete the entry if it still asks for this text;
+//   a newer upsert's entry is left for the next pass.
+// * R2 — failing: only bump the retry count if the entry is unchanged; never
+//   rewrite a newer entry with the older text.
+// * R3 — a delete that lands mid-embed leaves a `Clear` tombstone (it no longer
+//   removes the entry), so the completing worker sees it and removes the vectors
+//   it just wrote.
+
+/// `MergeAborted` reasons used to report why a conditional update wrote nothing.
+const ABORT_SUPERSEDED: &str = "queue entry superseded";
+const ABORT_CLEARED: &str = "queue entry is a clear tombstone";
+
+/// What completing a queue entry found.
+enum Completion {
+    /// The entry was still `entry` and has been removed (or was already gone).
+    Done,
+    /// A newer entry replaced it; that entry stays queued for the next pass.
+    Superseded,
+    /// The document was cleared meanwhile: a `Clear` tombstone replaced it.
+    Cleared,
+}
+
+/// Remove `entry` from the queue only if the stored entry is still `entry`.
+async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let expected = entry.clone();
+    let result = queue_ns
+        .merge(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
+            let Some(existing) = existing else {
+                return Ok(None); // already gone (an admin removed it): nothing to do
+            };
+            match decode_queue_value(existing) {
+                Some(v) if v.is(&expected) => Ok(None), // still ours: delete it
+                Some(v) if v.kind == QueueEntryKind::Clear => Err(crate::KVError::MergeAborted(ABORT_CLEARED.into())),
+                _ => Err(crate::KVError::MergeAborted(ABORT_SUPERSEDED.into())),
+            }
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(Completion::Done),
+        Err(crate::KVError::MergeAborted(reason)) if reason == ABORT_CLEARED => Ok(Completion::Cleared),
+        Err(crate::KVError::MergeAborted(_)) => Ok(Completion::Superseded),
+        Err(e) => Err(e),
+    }
+}
+
+/// The worker's step after embedding an [`QueueEntryKind::Embed`] entry: write the
+/// document's vectors, then complete the entry — conditionally (see the section
+/// comment). If the document was cleared while it was being embedded, the vectors
+/// just written are removed again.
+pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
+    upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, vector_indexes).await?;
+    match complete_entry(db, entry).await? {
+        Completion::Done | Completion::Superseded => Ok(()),
+        Completion::Cleared => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
+    }
+}
+
+/// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
+/// then remove the tombstone unless a newer upsert has replaced it (in which case
+/// the next pass embeds that).
+pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+    delete_vector(db, namespace, doc_id_bytes).await?;
+    let tombstone = QueueEntry {
+        namespace: namespace.to_owned(),
+        doc_id_bytes: doc_id_bytes.to_vec(),
+        kind: QueueEntryKind::Clear,
+        text: String::new(),
+        retry_count: 0,
+        last_error: None,
+    };
+    complete_entry(db, &tombstone).await.map(|_| ())
+}
+
+/// Record a failed attempt at `entry`: bump its retry count and store `error` —
+/// only if the stored entry is still `entry`. Returns the new retry count, or
+/// `None` when the entry was replaced or removed meanwhile (nothing written).
+pub async fn record_queue_failure(db: &AsyncDb, entry: &QueueEntry, error: &str) -> Result<Option<u32>, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let expected = entry.clone();
+    let error = error.to_owned();
+    let result = queue_ns
+        .merge(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
+            match existing.and_then(decode_queue_value) {
+                Some(v) if v.is(&expected) => Ok(Some(
+                    QueueValue {
+                        retry_count: v.retry_count + 1,
+                        last_error: Some(error),
+                        ..v
+                    }
+                    .encode(),
+                )),
+                // Replaced or removed: never write the older entry back.
+                _ => Err(crate::KVError::MergeAborted(ABORT_SUPERSEDED.into())),
+            }
+        })
+        .await;
+    match result {
+        Ok(written) => Ok(written.as_deref().and_then(decode_queue_value).map(|v| v.retry_count)),
+        Err(crate::KVError::MergeAborted(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write a `Clear` tombstone for a document, then delete its vectors.
+///
+/// Used by document deletes and by upserts whose embedding text is now empty. The
+/// tombstone is written **first**, so a worker already embedding the document's
+/// older text finds it when it completes and removes what it wrote (R3). The
+/// vectors are also deleted here, synchronously, so they stop matching
+/// immediately; the worker's later [`process_clear`] is an idempotent repeat that
+/// also removes the tombstone. Both writes are WAL-backed (see [`delete_vector`]).
+pub async fn clear_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    queue_ns
+        .put(queue_key(namespace, doc_id_bytes), encode_queue_value(QueueEntryKind::Clear, "", 0, None))
+        .await?;
+    delete_vector(db, namespace, doc_id_bytes).await
+}
+
+/// Reset a queue entry's retry count to zero (and clear its error) so the worker
+/// tries it again, keeping its kind and text. Returns the entry as it was before
+/// the reset, or `None` if there is no entry.
+///
+/// Atomic, unlike reading the entry and re-enqueueing its text: an upsert landing
+/// between those two steps would be overwritten with the older text, and a `Clear`
+/// tombstone would turn back into an embed.
+pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<Option<QueueEntry>, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let before = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&before);
+    let result = queue_ns
+        .merge(queue_key(namespace, doc_id_bytes), Vec::new(), move |existing, _| {
+            let Some(v) = existing.and_then(decode_queue_value) else {
+                return Err(crate::KVError::MergeAborted("no queue entry".into()));
+            };
+            let reset = QueueValue {
+                retry_count: 0,
+                last_error: None,
+                ..v.clone()
+            };
+            *slot.lock() = Some(v);
+            Ok(Some(reset.encode()))
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(before.lock().take().map(|v| v.into_entry(namespace, doc_id_bytes))),
+        Err(crate::KVError::MergeAborted(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// ── Queue race tests (R1–R3) ──────────────────────────────────────────────────
+//
+// The worker snapshots the whole queue at the start of a pass, then embeds each
+// snapshot entry. These tests stand in for the embedding step: they take the
+// snapshot entry, apply a racing operation, then run the worker's post-embed step
+// with vectors "embedded" from the snapshot text.
+#[cfg(test)]
+mod queue_race_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn open_db(dir: &TempDir) -> AsyncDb {
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        db.namespace("docs".to_string()).await.unwrap();
+        db
+    }
+
+    /// A doc's vectors as embedded from some text: one dense + one sparse chunk.
+    /// `tag` makes different texts produce distinguishable dense entries.
+    fn vectors_for(tag: f32) -> Vec<VectorIndex> {
+        vec![
+            VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, tag, 0.0, 0.01, vec![]),
+            VectorIndex::new(3, QuantisationStyle::SingleBit, tag, 0.0, 0.01, vec![]),
+        ]
+    }
+
+    async fn snapshot(db: &AsyncDb, doc: &[u8]) -> QueueEntry {
+        get_queue_entry(db, "docs", doc).await.unwrap().expect("entry queued")
+    }
+
+    async fn dense_tag(db: &AsyncDb, doc: &[u8]) -> Option<f32> {
+        let store = DbVectorStore::new(db, "docs").await.unwrap();
+        let raw = store.get_dense_entry(doc).await?;
+        let list = VectorIndex::access_list(&raw).unwrap();
+        Some(list.iter().next().unwrap().addition_factor())
+    }
+
+    /// R1: an upsert that lands while its doc's older text is being embedded must
+    /// not be lost. The worker used to delete the queue key unconditionally after
+    /// writing the stale vectors, destroying the newer entry.
+    #[tokio::test]
+    async fn r1_upsert_during_embed_is_not_lost() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+
+        enqueue_embed(&db, "docs", b"x", "new text").await.unwrap(); // racing upsert
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap();
+        assert_eq!(
+            pending.map(|e| e.text).as_deref(),
+            Some("new text"),
+            "the newer upsert's entry must survive the older embed's completion"
+        );
+    }
+
+    /// R2: a failed embed of the older text must not rewrite the entry back to it.
+    #[tokio::test]
+    async fn r2_failure_does_not_overwrite_newer_text() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+
+        enqueue_embed(&db, "docs", b"x", "new text").await.unwrap(); // racing upsert
+        record_queue_failure(&db, &in_flight, "embedding service timeout").await.unwrap();
+
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("entry kept");
+        assert_eq!(pending.text, "new text", "a failure must not resurrect the older text");
+        assert_eq!(pending.retry_count, 0, "the newer entry has not failed yet");
+    }
+
+    /// R3: a delete that lands while the doc is being embedded must leave no
+    /// vectors behind once the embed completes.
+    #[tokio::test]
+    async fn r3_delete_during_embed_leaves_no_vectors() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+
+        clear_vectors(&db, "docs", b"x").await.unwrap(); // racing delete
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+
+        assert!(
+            !has_complete_vector_index(&db, "docs", b"x").await.unwrap() && dense_tag(&db, b"x").await.is_none(),
+            "a deleted doc must not keep vectors written by an embed that was in flight"
+        );
+    }
+
+    /// R3, continued: the in-flight worker also retires the tombstone it found.
+    #[tokio::test]
+    async fn r3_inflight_worker_retires_the_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+        clear_vectors(&db, "docs", b"x").await.unwrap();
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+    }
+
+    /// A tombstone with no worker in flight: processing it removes the vectors and itself.
+    #[tokio::test]
+    async fn clear_tombstone_removes_vectors_and_itself() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap();
+        clear_vectors(&db, "docs", b"x").await.unwrap();
+        let tombstone = snapshot(&db, b"x").await;
+        assert_eq!(tombstone.kind, QueueEntryKind::Clear);
+        assert!(dense_tag(&db, b"x").await.is_none(), "clear_vectors deletes synchronously");
+
+        process_clear(&db, "docs", b"x").await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+        assert!(!has_any_vector_state(&db, "docs", b"x").await.unwrap());
+    }
+
+    /// Delete, then re-create before the worker gets to the tombstone: the
+    /// re-created document's embed must survive the tombstone's processing.
+    #[tokio::test]
+    async fn reupsert_after_clear_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        clear_vectors(&db, "docs", b"x").await.unwrap();
+        let tombstone = snapshot(&db, b"x").await;
+        enqueue_embed(&db, "docs", b"x", "reborn").await.unwrap();
+
+        process_clear(&db, &tombstone.namespace, &tombstone.doc_id_bytes).await.unwrap();
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("embed kept");
+        assert_eq!((pending.kind, pending.text.as_str()), (QueueEntryKind::Embed, "reborn"));
+    }
+
+    /// The same text re-enqueued while it is being embedded completes normally:
+    /// the vectors just written are for the latest text.
+    #[tokio::test]
+    async fn same_text_reenqueued_mid_embed_completes() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "same").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+        enqueue_embed(&db, "docs", b"x", "same").await.unwrap();
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+    }
+
+    /// A failure is recorded against an unchanged entry, and never re-creates one
+    /// that was removed meanwhile.
+    #[tokio::test]
+    async fn failure_is_recorded_only_against_the_same_entry() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+        assert_eq!(record_queue_failure(&db, &in_flight, "boom").await.unwrap(), Some(1));
+        let failed = snapshot(&db, b"x").await;
+        assert_eq!((failed.retry_count, failed.last_error.as_deref()), (1, Some("boom")));
+
+        remove_queue_entry(&db, "docs", b"x").await.unwrap();
+        assert_eq!(record_queue_failure(&db, &failed, "again").await.unwrap(), None);
+        assert!(
+            get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(),
+            "must not re-create the entry"
+        );
+    }
+
+    /// An admin retry resets the count but keeps what the entry asks for: an
+    /// exhausted tombstone stays a tombstone.
+    #[tokio::test]
+    async fn reset_keeps_kind_and_text() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        clear_vectors(&db, "docs", b"x").await.unwrap();
+        let tombstone = snapshot(&db, b"x").await;
+        record_queue_failure(&db, &tombstone, "io").await.unwrap();
+
+        let before = reset_queue_entry(&db, "docs", b"x").await.unwrap().expect("entry existed");
+        assert_eq!(before.retry_count, 1);
+        let after = snapshot(&db, b"x").await;
+        assert_eq!((after.kind, after.retry_count, after.last_error), (QueueEntryKind::Clear, 0, None));
+        assert!(reset_queue_entry(&db, "docs", b"missing").await.unwrap().is_none());
+        assert!(
+            get_queue_entry(&db, "docs", b"missing").await.unwrap().is_none(),
+            "reset must not create entries"
+        );
+    }
+
+    // ── Crash + WAL replay ────────────────────────────────────────────────────
+    //
+    // Queue writes (enqueues, tombstones, and every conditional update, which the
+    // WAL records as its resulting Upsert/Delete) are WAL-backed; vector writes
+    // are no-WAL. A crash is `std::mem::forget(db)` (no shutdown, no Drop-time
+    // flush), so reopening replays the WAL.
+
+    /// The worst case for R3: a delete races an embed, the worker's no-WAL vector
+    /// writes reach disk, and the process dies before the worker can clean up.
+    /// Only the **vector** namespaces are flushed — as a size-triggered flush of
+    /// the busy vector memtables would, while the small queue memtable is not —
+    /// so the tombstone survives only because it is WAL-backed. Replay restores
+    /// it, and processing it (as the worker's startup drain does) removes the
+    /// orphaned vectors.
+    #[tokio::test]
+    async fn crash_after_racing_delete_keeps_tombstone_that_removes_orphans() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+            let _in_flight = snapshot(&db, b"x").await;
+            clear_vectors(&db, "docs", b"x").await.unwrap(); // racing delete
+            upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap(); // worker's write lands after it
+            for ns in [sparse_vectors_ns("docs"), sparse_vectors_meta_ns("docs"), dense_vectors_ns("docs")] {
+                db.coordinator_for_test()
+                    .get_store_by_name(&ns)
+                    .unwrap()
+                    .flush_memtable_to_level0()
+                    .unwrap();
+            }
+            std::mem::forget(db); // crash before the worker completes
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("tombstone survives replay");
+        assert_eq!(pending.kind, QueueEntryKind::Clear);
+        assert!(
+            has_any_vector_state(&db, "docs", b"x").await.unwrap(),
+            "orphan is on disk until the tombstone runs"
+        );
+
+        process_clear(&db, "docs", b"x").await.unwrap();
+        assert!(!has_any_vector_state(&db, "docs", b"x").await.unwrap());
+    }
+
+    /// R1 across a crash: the newer upsert's entry, left in place by the
+    /// conditional completion, is still queued after replay.
+    #[tokio::test]
+    async fn crash_after_superseded_completion_keeps_newer_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+            let in_flight = snapshot(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+            finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+            std::mem::forget(db);
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("newer entry survives replay");
+        assert_eq!(pending.text, "new text");
+    }
+
+    /// A completion is durable: after a crash the finished entry does not come
+    /// back, and a failure's bookkeeping is replayed as written — replay applies
+    /// the merge's recorded result and never re-runs the conditional closure.
+    #[tokio::test]
+    async fn crash_replays_completion_and_failure_results() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"done", "a").await.unwrap();
+            let e = snapshot(&db, b"done").await;
+            finish_embed(&db, &e, &vectors_for(1.0)).await.unwrap();
+            enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
+            let f = snapshot(&db, b"failed").await;
+            record_queue_failure(&db, &f, "timeout").await.unwrap();
+            std::mem::forget(db);
+        }
+        let db = open_db(&dir).await;
+        assert!(
+            get_queue_entry(&db, "docs", b"done").await.unwrap().is_none(),
+            "completion survives replay"
+        );
+        let failed = get_queue_entry(&db, "docs", b"failed").await.unwrap().expect("failed entry kept");
+        assert_eq!(
+            (failed.text.as_str(), failed.retry_count, failed.last_error.as_deref()),
+            ("b", 1, Some("timeout"))
+        );
+    }
+
+    /// No race: the ordinary path still indexes and empties the queue.
+    #[tokio::test]
+    async fn uncontended_embed_indexes_and_completes() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let in_flight = snapshot(&db, b"x").await;
+        finish_embed(&db, &in_flight, &vectors_for(2.0)).await.unwrap();
+        assert_eq!(dense_tag(&db, b"x").await, Some(2.0));
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
     }
 }
 
@@ -1144,38 +1683,39 @@ mod queue_tests {
 
     // ── encode / decode roundtrip ─────────────────────────────────────────────
 
+    const E: QueueEntryKind = QueueEntryKind::Embed;
+
     #[test]
     fn test_value_encoding_roundtrip_zero_retries() {
-        let encoded = encode_queue_value("hello", 0, None);
-        let (text, retry_count, last_error) = decode_queue_value(&encoded).unwrap();
-        assert_eq!(text, "hello");
-        assert_eq!(retry_count, 0);
-        assert!(last_error.is_none());
+        let v = decode_queue_value(&encode_queue_value(E, "hello", 0, None)).unwrap();
+        assert_eq!((v.kind, v.text.as_str(), v.retry_count, v.last_error), (E, "hello", 0, None));
     }
 
     #[test]
     fn test_value_encoding_roundtrip_nonzero_retries() {
-        let encoded = encode_queue_value("embed this", 3, None);
-        let (text, retry_count, _) = decode_queue_value(&encoded).unwrap();
-        assert_eq!(text, "embed this");
-        assert_eq!(retry_count, 3);
+        let v = decode_queue_value(&encode_queue_value(E, "embed this", 3, None)).unwrap();
+        assert_eq!((v.text.as_str(), v.retry_count), ("embed this", 3));
     }
 
     #[test]
     fn test_value_encoding_with_last_error() {
-        let encoded = encode_queue_value("some text", 2, Some("connection refused"));
-        let (text, retry_count, last_error) = decode_queue_value(&encoded).unwrap();
-        assert_eq!(text, "some text");
-        assert_eq!(retry_count, 2);
-        assert_eq!(last_error.as_deref(), Some("connection refused"));
+        let v = decode_queue_value(&encode_queue_value(E, "some text", 2, Some("connection refused"))).unwrap();
+        assert_eq!((v.text.as_str(), v.retry_count), ("some text", 2));
+        assert_eq!(v.last_error.as_deref(), Some("connection refused"));
     }
 
     #[test]
     fn test_value_encoding_empty_text() {
-        let encoded = encode_queue_value("", 1, None);
-        let (text, retry_count, _) = decode_queue_value(&encoded).unwrap();
-        assert_eq!(text, "");
-        assert_eq!(retry_count, 1);
+        let v = decode_queue_value(&encode_queue_value(E, "", 1, None)).unwrap();
+        assert_eq!((v.text.as_str(), v.retry_count), ("", 1));
+    }
+
+    /// A tombstone keeps its kind through encode/decode, and its bookkeeping too.
+    #[test]
+    fn test_clear_entry_roundtrip() {
+        let v = decode_queue_value(&encode_queue_value(QueueEntryKind::Clear, "", 2, Some("io"))).unwrap();
+        assert_eq!(v.kind, QueueEntryKind::Clear);
+        assert_eq!((v.text.as_str(), v.retry_count, v.last_error.as_deref()), ("", 2, Some("io")));
     }
 
     #[test]
@@ -1183,16 +1723,31 @@ mod queue_tests {
         // Simulate an on-disk v1 value: [0x01] [retry_count: 4B] [text bytes]
         let mut v1 = vec![0x01u8, 0x00, 0x00, 0x00, 0x02];
         v1.extend_from_slice(b"old text");
-        let (text, retry_count, last_error) = decode_queue_value(&v1).unwrap();
-        assert_eq!(text, "old text");
-        assert_eq!(retry_count, 2);
-        assert!(last_error.is_none());
+        let v = decode_queue_value(&v1).unwrap();
+        assert_eq!((v.kind, v.text.as_str(), v.retry_count, v.last_error), (E, "old text", 2, None));
+    }
+
+    /// Entries written before the kind byte existed are embed entries.
+    #[test]
+    fn test_v2_backward_compat() {
+        // [0x02] [retry_count: 4B] [error_len: 4B] [error] [text]
+        let mut v2 = vec![0x02u8, 0, 0, 0, 1, 0, 0, 0, 3];
+        v2.extend_from_slice(b"errold text");
+        let v = decode_queue_value(&v2).unwrap();
+        assert_eq!((v.kind, v.text.as_str(), v.retry_count), (E, "old text", 1));
+        assert_eq!(v.last_error.as_deref(), Some("err"));
     }
 
     #[test]
     fn test_value_decoding_rejects_unknown_version() {
-        // 0x03 is not a known version.
-        let bad = b"\x03\x00\x00\x00\x00\x00\x00\x00\x00hello";
+        // 0x04 is not a known version.
+        let bad = b"\x04\x00\x00\x00\x00\x00\x00\x00\x00hello";
+        assert!(decode_queue_value(bad).is_none());
+    }
+
+    #[test]
+    fn test_value_decoding_rejects_unknown_kind() {
+        let bad = b"\x03\x07\x00\x00\x00\x00\x00\x00\x00\x00hello";
         assert!(decode_queue_value(bad).is_none());
     }
 

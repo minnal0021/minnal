@@ -38,7 +38,7 @@ pub use self::index_manager::IndexBuildManager;
 #[cfg(feature = "semantic-search")]
 pub use self::vec_index_worker::VectorIndexConfig;
 #[cfg(feature = "semantic-search")]
-pub use crate::vector_kv::QueueEntry;
+pub use crate::vector_kv::{QueueEntry, QueueEntryKind};
 
 // ── Engine diagnostic types (re-exported for API consumers) ───────────────
 pub use crate::{GCStats, KVError, LsmManifest, ManifestBucket, ManifestFile, ManifestLevel, Stats, ValueLogMetadata, WalMetadata};

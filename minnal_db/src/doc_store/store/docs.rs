@@ -36,15 +36,19 @@ impl DocStore {
             && schema.is_semantic_search_enabled()
         {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
-            if !text.is_empty() {
-                // Write the document first, then enqueue the embed marker as a
-                // separate single op (no cross-namespace atomicity needed).
-                let ns = self.db.namespace(namespace.to_owned()).await?;
-                ns.put(key.clone(), value).await?;
+            // Write the document first, then the vector-queue op as a separate
+            // single op (no cross-namespace atomicity needed).
+            let ns = self.db.namespace(namespace.to_owned()).await?;
+            ns.put(key.clone(), value).await?;
+            if text.is_empty() {
+                // No embedding text any more: drop the vectors, and any pending
+                // embed, of the document's older text.
+                self.clear_doc_vectors_if_any(namespace, &key).await?;
+            } else {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
                 notify.notify_one();
-                return Ok(());
             }
+            return Ok(());
         }
 
         let ns = self.db.namespace(namespace.to_owned()).await?;
@@ -73,7 +77,9 @@ impl DocStore {
             && schema.is_semantic_search_enabled()
         {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
-            if !text.is_empty() {
+            if text.is_empty() {
+                self.clear_doc_vectors_if_any(namespace, &key).await?;
+            } else {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
                 notify.notify_one();
             }
@@ -85,11 +91,12 @@ impl DocStore {
     /// Delete a document by ID.  No-op if the document does not exist.
     ///
     /// When semantic search is configured and the namespace has
-    /// `semantic_search_enabled = true`, the pending queue entry and the vector
-    /// index are removed first, then the document is deleted.  Each is a separate
-    /// single-op write; ordering derived data before the document means a crash
-    /// between them leaves an un-indexed document (reconciliation cleans it up),
-    /// never an orphaned vector.
+    /// `semantic_search_enabled = true`, the document is removed from the vector
+    /// index first (a `Clear` tombstone in the queue, then the vectors — see
+    /// [`DocStore::clear_doc_vectors`]), then the document is deleted.  Each is a
+    /// separate single-op write; ordering derived data before the document means a
+    /// crash between them leaves an un-indexed document (reconciliation cleans it
+    /// up), never an orphaned vector.
     pub async fn delete(&self, namespace: &str, id: DocId) -> Result<(), DocStoreError> {
         debug!("delete namespace='{}' id={:?}", namespace, id);
         let key = id.to_bytes();
@@ -98,8 +105,7 @@ impl DocStore {
         let schema = self.load_schema(namespace)?;
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
-            vector_kv::remove_queue_entry(&self.db, namespace, &key).await?;
-            vector_kv::delete_vector(&self.db, namespace, &key).await?;
+            self.clear_doc_vectors(namespace, &key).await?;
             let ns = self.db.namespace(namespace.to_owned()).await?;
             ns.delete(key).await?;
             return Ok(());

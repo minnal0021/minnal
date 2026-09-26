@@ -4,6 +4,40 @@
 use super::*;
 
 impl DocStore {
+    /// Remove a document from the vector index: it was deleted, or its embedding
+    /// text is now empty.
+    ///
+    /// With a worker running, this writes a `Clear` tombstone before deleting the
+    /// vectors ([`vector_kv::clear_vectors`]), so a worker already embedding the
+    /// document's older text removes what it writes when it completes, and wakes
+    /// the worker to retire the tombstone. With no worker nothing can be in
+    /// flight, so the queue entry and the vectors are removed directly.
+    #[cfg(feature = "semantic-search")]
+    pub(super) async fn clear_doc_vectors(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
+        match &self.notify {
+            Some(notify) => {
+                vector_kv::clear_vectors(&self.db, namespace, key).await?;
+                notify.notify_one();
+            }
+            None => {
+                vector_kv::remove_queue_entry(&self.db, namespace, key).await?;
+                vector_kv::delete_vector(&self.db, namespace, key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// For an upsert whose embedding text is empty: clear the document's vectors
+    /// and any pending embed of its older text — but only if it has some, so a
+    /// bulk load of documents without embedding text pays no extra writes.
+    #[cfg(feature = "semantic-search")]
+    pub(super) async fn clear_doc_vectors_if_any(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
+        if vector_kv::has_any_vector_state(&self.db, namespace, key).await? {
+            self.clear_doc_vectors(namespace, key).await?;
+        }
+        Ok(())
+    }
+
     /// Number of entries currently waiting in the async vector-index queue.
     ///
     /// This is the count of documents that have been written but whose
@@ -129,11 +163,12 @@ impl DocStore {
     /// without waiting for the next scheduled wake-up.
     #[cfg(feature = "semantic-search")]
     pub async fn retry_queue_entry(&self, namespace: &str, doc_id_bytes: &[u8]) -> Result<Option<vector_kv::QueueEntry>, DocStoreError> {
-        let entry = match vector_kv::get_queue_entry(&self.db, namespace, doc_id_bytes).await? {
-            None => return Ok(None),
-            Some(e) => e,
+        // Atomic reset that keeps the entry's kind and text: re-enqueueing a text
+        // read a moment earlier could overwrite a newer upsert, or turn a `Clear`
+        // tombstone into an embed.
+        let Some(entry) = vector_kv::reset_queue_entry(&self.db, namespace, doc_id_bytes).await? else {
+            return Ok(None);
         };
-        vector_kv::enqueue_embed(&self.db, namespace, doc_id_bytes, &entry.text).await?;
         if let Some(notify) = &self.notify {
             notify.notify_one();
         }
@@ -159,7 +194,7 @@ impl DocStore {
             return Ok(0);
         }
         for entry in &exhausted {
-            vector_kv::enqueue_embed(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text).await?;
+            vector_kv::reset_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
         }
         if let Some(notify) = &self.notify {
             notify.notify_one();
@@ -1292,5 +1327,102 @@ mod tests {
         // no-op because every doc now has a pending entry.
         assert_eq!(store.reconcile_vector_indexes().await, 0);
         assert_eq!(store.pending_vector_index_count().await, 5);
+    }
+
+    // ── Queue races through the store's write paths (R3, R4) ─────────────────
+
+    #[cfg(feature = "semantic-search")]
+    fn race_vectors() -> Vec<crate::semantic_search::VectorIndex> {
+        use crate::semantic_search::QuantisationStyle;
+        vec![
+            crate::semantic_search::VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.5, 0.0, 0.01, vec![]),
+            crate::semantic_search::VectorIndex::new(2, QuantisationStyle::SingleBit, 0.5, 0.0, 0.01, vec![]),
+        ]
+    }
+
+    #[cfg(feature = "semantic-search")]
+    async fn open_kv_semantic(db_dir: &TempDir, schema_dir: &TempDir) -> DocStore {
+        let store = with_worker_notify(open_fresh(db_dir.path(), schema_dir.path()).await);
+        let mut schema = make_kv_schema("sem_kv", KvKeyType::Str, KvValueType::Str);
+        schema.semantic_search_enabled = true;
+        store.create_kv(schema).await.unwrap();
+        store
+    }
+
+    /// R3 through the real delete path: deleting a key whose older value is being
+    /// embedded leaves no vectors once that embed completes.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn kv_delete_during_embed_leaves_no_vectors() {
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        store
+            .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
+            .await
+            .unwrap();
+        let in_flight = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().expect("queued");
+
+        store.kv_delete("sem_kv", "x").await.unwrap();
+        vector_kv::finish_embed(&store.db, &in_flight, &race_vectors()).await.unwrap();
+
+        assert!(!vector_kv::has_any_vector_state(&store.db, "sem_kv", b"x").await.unwrap());
+    }
+
+    /// R4: a KV value updated to empty text must stop matching its old text —
+    /// the vectors and any pending embed of the older value are cleared.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn kv_put_empty_text_clears_old_vectors() {
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        store
+            .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
+            .await
+            .unwrap();
+        let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
+        vector_kv::finish_embed(&store.db, &entry, &race_vectors()).await.unwrap();
+        assert!(vector_kv::has_complete_vector_index(&store.db, "sem_kv", b"x").await.unwrap());
+
+        store.kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("")).await.unwrap();
+
+        assert!(
+            !vector_kv::has_complete_vector_index(&store.db, "sem_kv", b"x").await.unwrap(),
+            "vectors of the old text must be gone"
+        );
+        let pending = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().expect("tombstone");
+        assert_eq!(pending.kind, vector_kv::QueueEntryKind::Clear);
+    }
+
+    /// R4, doc store: a document whose embedding field is emptied is cleared the
+    /// same way, including a pending embed of its older text.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn doc_put_empty_embedding_text_clears_pending_embed() {
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = with_worker_notify(open_fresh(db_dir.path(), schema_dir.path()).await);
+        create_semantic_schema(&store, "sem").await;
+        store.put("sem", DocId::U64(1), serde_json::json!({"title": "old title"})).await.unwrap();
+        let key = DocId::U64(1).to_bytes();
+        assert_eq!(
+            vector_kv::get_queue_entry(&store.db, "sem", &key).await.unwrap().unwrap().kind,
+            vector_kv::QueueEntryKind::Embed
+        );
+
+        store.put("sem", DocId::U64(1), serde_json::json!({})).await.unwrap();
+
+        let pending = vector_kv::get_queue_entry(&store.db, "sem", &key).await.unwrap().expect("tombstone");
+        assert_eq!(pending.kind, vector_kv::QueueEntryKind::Clear, "the stale embed must not survive");
+    }
+
+    /// Writing empty text for a document that never had vectors costs nothing:
+    /// no tombstone, so bulk loads of documents without embedding text pay no
+    /// extra writes.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn empty_text_on_unindexed_doc_writes_no_queue_entry() {
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        store.kv_put("sem_kv", &serde_json::json!("y"), &serde_json::json!("")).await.unwrap();
+        assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"y").await.unwrap().is_none());
     }
 }
