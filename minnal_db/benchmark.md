@@ -25,7 +25,7 @@ checked against; the final section here closes the loop on that comparison.
 | Disk | NVMe SSD (`nvme0n1`, non-rotational, 1.8 TB) — `target/` and all benchmark temp dirs live here |
 | rustc / cargo | 1.96.0 |
 | gnuplot | 6.0 patchlevel 2 (used to render the charts in this report) |
-| Repo | commit `e5d15c9` (branch `fix/search-concurrency`) |
+| Repo | commit `e5d15c9` (branch `fix/search-concurrency`); the semantic-search suite re-run at `2559786` |
 | Date | 2026-09-26 |
 
 ---
@@ -93,14 +93,17 @@ paging — holds to ±5%, and the sub-microsecond cases (memtable hits, miss pat
 swing 20-40% if the machine is doing anything else at the time. Read the small
 numbers as orders of magnitude unless the host is idle.
 
-Those bounds hold within one setup, not across a system update. Between the
-previous run (2026-08-22, kernel 7.0.0-30) and this one (kernel 7.0.0-34), the
-only engine changes were the semantic-search hot-path commits, which touched
-the L1 scan path and search itself. Yet some rows whose code did not change
-moved further than the bounds above: point reads 5-8% faster, predicate
-evaluation up to 7% faster, and the multi-bit second-pass estimator 20% faster.
-Treat a cross-run difference under ~10% as the environment unless the code
-changed, and compare runs from the same kernel and firmware where it matters.
+Those bounds are optimistic across runs. Between the previous run (2026-08-22,
+kernel 7.0.0-30) and this one (kernel 7.0.0-34), the only engine changes were
+the semantic-search hot-path commits, which touched the L1 scan path and search
+itself. Yet rows whose code did not change moved further than the bounds above:
+point reads 5-8% faster and predicate evaluation up to 7% faster. The clearest
+case is the multi-bit second-pass estimator, which measured 20% faster than
+August in the full run and then back at August's value (+30%) when its suite was
+re-run three hours later, with identical code on the same kernel. So it is not
+the kernel update; some CPU-bound microbenchmarks here simply move 20-30% from
+run to run. Treat a cross-run difference under ~10% as the environment unless
+the code changed, and confirm anything larger with an A/B on one boot.
 
 ### A word on memory versus disk
 
@@ -555,39 +558,36 @@ run against the real cluster centroids bundled with the project (256 clusters)
 and synthetic 768-dimension embeddings, so no external embedding service needs
 to be running.
 
-Scoring a batch of candidate documents against a query is fast and cheap:
-1.6 µs for a hundred candidates up to 15.9 µs for a thousand for the coarse
-first pass, scaling linearly, and 1.2 µs to 12.2 µs for the more precise second
-pass. The extra precision of the second pass costs nothing extra at this scale;
-it measures 20% *cheaper* here with no code change since the previous run (see
-*How much a repeat run moves*). Picking out which few clusters are worth
+Scoring a batch of candidate documents against a query is fast and cheap —
+1.7 µs for a hundred candidates up to 17.0 µs for a thousand, scaling linearly,
+and roughly the same whether it's the coarse first pass (17.0 µs) or the more
+precise second pass (15.7 µs). The extra precision of the second pass
+costs nothing extra at this scale. Picking out which few clusters are worth
 searching, the equivalent of choosing the right shelf before scanning it, takes
-under 10 µs and barely changes whether 8 clusters are requested (8.3 µs) or 128
-(9.0 µs).
+under 10 µs and barely changes whether 8 clusters are requested (8.8 µs) or 128
+(9.3 µs).
 
-A full end-to-end search got **28–44% faster** since the previous run, from the
-semantic-search hot-path work (`e414cdb`, `d14d73e`): scoring parallel over
-entries rather than clusters, per-document grouping by sort instead of a hash
-map, buffered on-disk range reads, and an O(n) first-pass cut. A 4-vector query
-over 5,000 documents went from 2.25 ms to 1.62 ms, and 8 chunks per document
-from 11.9 ms to 6.7 ms. Because the first pass scans every probed chunk, cost
-still grows with the chunks per document (eight times the chunks costs 4.18x as
-much), but less steeply than before (5.36x).
+A full end-to-end search got **29–44% faster** since the previous run, from the
+semantic-search hot-path work (`e414cdb`, `d14d73e`, `2559786`): scoring
+parallel over entries rather than clusters, per-document grouping by sort
+instead of a hash map, buffered on-disk range reads, an O(n) first-pass cut, and
+each query vector's sum computed once rather than once per probed cluster. A
+4-vector query over 5,000 documents went from 2.25 ms to 1.56 ms, a 40-vector
+one from 4.92 ms to 3.21 ms, and 8 chunks per document from 11.9 ms to 6.6 ms.
+Ten times the query now costs 2.07x as much (2.19x before), and because the
+first pass scans every probed chunk, eight times the chunks per document costs
+4.22x (5.36x before).
 
-**One case got slower: a 40-vector query, 4.92 ms → 6.06 ms (+23%).** An A/B
-across the three commits puts all of it in the hot-path work (4.85 ms before it,
-5.95 ms after it, 6.04 ms with the concurrency fix on top). The likely cause,
-not yet measured in isolation, is that the per-document fold after scoring now
-runs single-threaded, and at 40 vectors it takes a 40-wide max per entry. The
-old code did that fold inside its parallel per-cluster tasks. Production embeds
-the whole query once (one vector), so it does not pay this; the query-length
-sweep now measures a general-MaxSim path that production does not use. As a
-result, ten times the query now costs 3.75x as much, not 2.19x.
-
-The concurrency fix itself (`6d38cc1`) costs 2–5% on the 1-chunk and 4-vector
-cases of this single-threaded benchmark, the same single-client cost the
-concurrency report measured on real data.
-
+For one intermediate commit the 40-vector case was the exception. The hot-path
+rewrite moved Pass-1 estimator construction, one per probed cluster × query
+vector, out of the old parallel per-cluster fold into a single-threaded
+pre-pass, and each construction recomputed the query's 768-element sum, which
+depends only on the query. At 40 vectors that was 2.9 ms of a 6.0 ms search
+(+23% against the previous run). Computing the sum once per query vector
+(`2559786`) cut the stage to 0.3 ms with bit-identical scores. Production embeds
+one query vector, so it was never exposed; the concurrency fix (`6d38cc1`)
+costs 2–5% on the single-threaded 1-chunk and 4-vector cases, which that change
+recovered.
 ![Candidate scoring, first pass against second](docs/benchmarks/semantic_scoring.png)
 
 *`first_pass` is the coarse pass and `second_pass` the more precise one. Sorted
@@ -618,23 +618,25 @@ and the chart shows it as the gap within each adjacent pair.*
 
 *One chart per query size, each on a linear axis from zero, because on the
 single log axis the previous run used the layer steps were invisible. The first
-pass in cumulative layers, single-threaded, starting from the bare
-distance math (`dot_arithmetic`), then adding the cost of reading the on-disk
-format (`plus_archived`), then production's per-document grouping
-(`plus_grouping`: one row per entry, sorted by document id and folded). The
-fourth bar, `plus_hashmap`, is the hash-map fold that grouping replaced, kept
-for comparison. At 4 query vectors grouping adds 9 µs over reading the archive
-where the map added 107 µs. At 40 it is the other way round, 165 µs against
-128 µs, which fits the 40-vector end-to-end regression above.*
+pass in cumulative layers, single-threaded, starting from the bare distance math
+(`dot_arithmetic`), then adding the cost of reading the on-disk format
+(`plus_archived`), then production's per-document grouping (`plus_grouping`: one
+row per entry, sorted by document id and folded). The fourth bar,
+`plus_hashmap`, is the hash-map fold that grouping replaced, kept for
+comparison. Grouping adds 22 µs over reading the archive at 4 query vectors and
+57 µs at 40, where the map added 109 µs and 172 µs. At 40 vectors every layer is
+within 2%, the size of run-to-run noise, so read that chart for the ordering
+only.*
 
 ![Complete search as the query grows](docs/benchmarks/semantic_query_length.png)
 
 ![Complete search as documents gain chunks](docs/benchmarks/semantic_chunks_per_doc.png)
 
 *The two end-to-end sweeps, on a shared millisecond axis so they can be read
-against each other: ten times the query costs 3.75x as much and eight times the
-chunks 4.18x. The query sweep was the sub-linear one in the previous run (2.19x);
-see the 40-vector regression above.*
+against each other: the query-length sweep is sub-linear (ten times the query
+for 2.07x the cost) while the chunk sweep is not (eight times the chunks for
+4.22x), because Pass 2 re-ranks a capped candidate set but Pass 1 scans every
+probed chunk.*
 
 ---
 
