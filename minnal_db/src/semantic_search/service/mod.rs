@@ -394,13 +394,18 @@ where
     // One estimator per (probed cluster, query vector): query_to_centroid_dot_product
     // and scaled_query_sum are constant across a cluster's entries. A probed id with
     // no centroid in the index contributes no candidates.
+    let query_sums: Vec<f32> = query_sparse_embeddings
+        .iter()
+        .map(|q| SingleBitQuanDotProductEstimator::query_sum(q))
+        .collect();
     let cluster_estimators: HashMap<u32, Vec<SingleBitQuanDotProductEstimator>> = sparse_by_cluster
         .keys()
         .filter_map(|&cluster_id| {
             let cluster = cluster_index.clusters.get(&cluster_id)?;
             let estimators = query_sparse_embeddings
                 .iter()
-                .map(|q| SingleBitQuanDotProductEstimator::new(cluster_id, q, &cluster.centroid))
+                .zip(&query_sums)
+                .map(|(q, &sum)| SingleBitQuanDotProductEstimator::with_query_sum(cluster_id, q, &cluster.centroid, sum))
                 .collect();
             Some((cluster_id, estimators))
         })
