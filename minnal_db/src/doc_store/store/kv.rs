@@ -47,13 +47,18 @@ impl DocStore {
         #[cfg(feature = "semantic-search")]
         if let Some(notify) = &self.notify
             && schema.is_semantic_search_enabled()
-            && let Some(text) = value.as_str()
-            && !text.is_empty()
         {
-            // Enqueue the embed marker as a separate single op (no cross-namespace
+            // The vector-queue op is a separate single op (no cross-namespace
             // atomicity needed — see kv_put docs).
-            vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
-            notify.notify_one();
+            match value.as_str() {
+                Some(text) if !text.is_empty() => {
+                    vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
+                    notify.notify_one();
+                }
+                // No embedding text any more: drop the vectors, and any pending
+                // embed, of the older value.
+                _ => self.clear_doc_vectors_if_any(namespace, &key_bytes).await?,
+            }
         }
 
         Ok(())
@@ -91,19 +96,19 @@ impl DocStore {
     /// Delete a key from a KV namespace.  No-op when the key does not exist.
     ///
     /// When semantic search is configured and the namespace has
-    /// `semantic_search_enabled = true`, the pending queue entry and the vector
-    /// index are removed first, then the KV value is deleted.  Each is a separate
-    /// single-op write; ordering derived data before the value means a crash
-    /// between them leaves an un-indexed value (reconciliation cleans it up),
-    /// never an orphaned vector.
+    /// `semantic_search_enabled = true`, the key is removed from the vector index
+    /// first (a `Clear` tombstone in the queue, then the vectors — see
+    /// [`DocStore::clear_doc_vectors`]), then the KV value is deleted.  Each is a
+    /// separate single-op write; ordering derived data before the value means a
+    /// crash between them leaves an un-indexed value (reconciliation cleans it
+    /// up), never an orphaned vector.
     pub async fn kv_delete(&self, namespace: &str, raw_key: &str) -> Result<(), DocStoreError> {
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
 
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
-            vector_kv::remove_queue_entry(&self.db, namespace, &key_bytes).await?;
-            vector_kv::delete_vector(&self.db, namespace, &key_bytes).await?;
+            self.clear_doc_vectors(namespace, &key_bytes).await?;
             let ns = self.db.namespace(namespace.to_owned()).await?;
             ns.delete(key_bytes).await?;
             return Ok(());

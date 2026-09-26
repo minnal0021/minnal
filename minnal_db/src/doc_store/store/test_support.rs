@@ -38,3 +38,13 @@ pub(super) fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: K
         semantic_search_enabled: false,
     }
 }
+
+/// Give `store` a worker notifier **without starting a worker**, so the write and
+/// delete paths do their vector-queue work exactly as they do beside a running
+/// worker, while a test drives the worker's steps by hand
+/// (`vector_kv::finish_embed`, `vector_kv::process_clear`) at chosen points.
+#[cfg(feature = "semantic-search")]
+pub(super) fn with_worker_notify(mut store: DocStore) -> DocStore {
+    store.notify = Some(Arc::new(tokio::sync::Notify::new()));
+    store
+}

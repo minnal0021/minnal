@@ -56,7 +56,7 @@ use tokio::task::JoinSet;
 
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::store::SemanticSearchContext;
-use crate::vector_kv::{self, QueueEntry};
+use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -385,32 +385,46 @@ impl VecIndexWorker {
         }
     }
 
-    /// Embed `text`, quantise it with both multi-bit (single embedding) and single-bit
-    /// (chunked embeddings), write all vector indexes, then remove the queue entry.
+    /// Carry out one queue entry.
     ///
-    /// The vector writes happen before the queue delete: a crash in between leaves
-    /// the entry queued and the next pass re-processes it idempotently.
+    /// **Embed:** embed `text`, quantise it with both multi-bit (single embedding)
+    /// and single-bit (chunked embeddings), then [`vector_kv::finish_embed`] writes
+    /// the vectors and completes the entry. The vector writes happen before the
+    /// completion: a crash in between leaves the entry queued and the next pass
+    /// re-processes it idempotently. The completion is conditional — `entry` comes
+    /// from this pass's snapshot, and the document may have been upserted or
+    /// deleted since (see `vector_kv`'s conditional queue updates).
+    ///
+    /// **Clear:** delete the document's vectors and remove the tombstone.
     async fn process_one(&self, entry: &QueueEntry) -> Result<(), DocStoreError> {
-        let vector_indexes = crate::semantic_search::service::embed_document(&self.ctx.config, &self.ctx.cluster_index, &entry.text)
-            .await
-            .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-
-        vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &vector_indexes).await?;
-        vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
-
+        match entry.kind {
+            QueueEntryKind::Embed => {
+                let vector_indexes = crate::semantic_search::service::embed_document(&self.ctx.config, &self.ctx.cluster_index, &entry.text)
+                    .await
+                    .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+                vector_kv::finish_embed(&self.db, entry, &vector_indexes).await?;
+            }
+            QueueEntryKind::Clear => vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?,
+        }
         Ok(())
     }
 
-    /// Increment the retry count and record the last error for a failed queue entry.
+    /// Increment the retry count and record the last error for a failed queue
+    /// entry — only if the entry was not replaced while it was being processed.
     async fn increment_retry(&self, entry: &QueueEntry, error: &str) {
-        let new_count = entry.retry_count + 1;
-        if let Err(e) = vector_kv::update_queue_retry(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, new_count, Some(error)).await {
-            warn!(
+        match vector_kv::record_queue_failure(&self.db, entry, error).await {
+            Ok(Some(_)) => {}
+            Ok(None) => debug!(
+                "vec index worker: ns='{}' doc='{}' was updated or deleted while failing; the newer entry is kept",
+                entry.namespace,
+                doc_id_display(&entry.doc_id_bytes),
+            ),
+            Err(e) => warn!(
                 "vec index worker: failed to persist retry count for \
                  ns='{}' doc='{}': {e}",
                 entry.namespace,
                 doc_id_display(&entry.doc_id_bytes),
-            );
+            ),
         }
     }
 }

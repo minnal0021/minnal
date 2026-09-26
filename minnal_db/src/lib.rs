@@ -278,7 +278,7 @@ pub use doc_store::{
 
 // Document-store types that only exist alongside `semantic-search`.
 #[cfg(all(feature = "doc-store", feature = "semantic-search"))]
-pub use doc_store::{QueueEntry, ReindexStats, SemanticSearchContext, VecReindexProgress, VectorIndexConfig, VectorReindexOutcome};
+pub use doc_store::{QueueEntry, QueueEntryKind, ReindexStats, SemanticSearchContext, VecReindexProgress, VectorIndexConfig, VectorReindexOutcome};
 
 // ── rkyv re-exports (for typed API) ──────────────────────────────────────────
 

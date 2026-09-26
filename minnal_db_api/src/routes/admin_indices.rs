@@ -34,7 +34,7 @@ use axum::{
 };
 use minnal_db::doc_store::hex::hex_to_bytes;
 use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
-use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, VectorReindexOutcome};
+use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -716,6 +716,9 @@ pub struct QueueEntryInfo {
     doc_id_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     doc_id_str: Option<String>,
+    /// `"embed"` (index `text`) or `"clear"` (a tombstone: remove the document's
+    /// vectors — written by deletes and by upserts whose embedding text is empty).
+    kind: &'static str,
     retry_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -734,6 +737,10 @@ impl From<QueueEntry> for QueueEntryInfo {
             namespace: e.namespace,
             doc_id_hex,
             doc_id_str,
+            kind: match e.kind {
+                QueueEntryKind::Embed => "embed",
+                QueueEntryKind::Clear => "clear",
+            },
             retry_count: e.retry_count,
             last_error: e.last_error,
             text_preview,
