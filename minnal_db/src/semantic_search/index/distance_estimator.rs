@@ -59,15 +59,29 @@ impl SingleBitQuanDotProductEstimator {
     /// `query_embedding` and `centroid` must share a dimension (see the MultiBit
     /// constructor); `search()` guarantees this on the search path.
     pub fn new(cluster_id: u32, query_embedding: &[f32], centroid: &[f32]) -> Self {
+        Self::with_query_sum(cluster_id, query_embedding, centroid, Self::query_sum(query_embedding))
+    }
+
+    /// `Σ query_embedding`, the query-only term of the estimator. It does not depend
+    /// on the cluster, so a caller building one estimator per (cluster, query vector)
+    /// computes it once per query vector with this and passes it to
+    /// [`with_query_sum`](Self::with_query_sum).
+    pub fn query_sum(query_embedding: &[f32]) -> f32 {
+        query_embedding.iter().sum()
+    }
+
+    /// [`new`](Self::new) with the query's sum precomputed by [`query_sum`](Self::query_sum).
+    /// The scalar sum costs more than the SIMD centroid dot product, and `search()`
+    /// builds an estimator for every probed cluster × query vector.
+    pub fn with_query_sum(cluster_id: u32, query_embedding: &[f32], centroid: &[f32], query_sum: f32) -> Self {
         let query_to_centroid_dot_product = simsimd::SpatialSimilarity::dot(query_embedding, centroid)
             .expect("SingleBit estimator: query/centroid dimension mismatch (search() validates query dim against cluster_index.dim())")
             as f32;
-        let sum_q: f32 = query_embedding.iter().sum();
 
         SingleBitQuanDotProductEstimator(DotProductEstimatorState {
             cluster_id,
             query_to_centroid_dot_product,
-            scaled_query_sum: sum_q,
+            scaled_query_sum: query_sum,
         })
     }
 }
@@ -223,5 +237,19 @@ mod tests {
 
         let got = make_estimator(centroid_dot, sum_q).estimate_distance(&query, &make_vi(scaling_factor, packed));
         assert_relative_eq!(got, centroid_dot - scaling_factor * sum_q, epsilon = 1e-5);
+    }
+
+    /// `search()` builds SingleBit estimators with a query sum computed once per query
+    /// vector; that must produce exactly the estimator `new` does, or Pass-1 scores
+    /// (and so results) would drift.
+    #[test]
+    fn single_bit_with_precomputed_query_sum_matches_new() {
+        let query: Vec<f32> = (0..768).map(|i| ((i * 37 % 101) as f32 - 50.0) / 83.0).collect();
+        let centroid: Vec<f32> = (0..768).map(|i| ((i * 53 % 97) as f32 - 48.0) / 71.0).collect();
+        let a = SingleBitQuanDotProductEstimator::new(7, &query, &centroid).0;
+        let b = SingleBitQuanDotProductEstimator::with_query_sum(7, &query, &centroid, SingleBitQuanDotProductEstimator::query_sum(&query)).0;
+        assert_eq!(a.cluster_id, b.cluster_id);
+        assert_eq!(a.query_to_centroid_dot_product.to_bits(), b.query_to_centroid_dot_product.to_bits());
+        assert_eq!(a.scaled_query_sum.to_bits(), b.scaled_query_sum.to_bits());
     }
 }

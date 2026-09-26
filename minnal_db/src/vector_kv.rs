@@ -1757,6 +1757,10 @@ mod real_kv_profile {
                 .await
                 .unwrap();
 
+            // `upsert_vectors` silently skips a namespace that is not registered (so a
+            // dropped store is never resurrected), so the parent must exist first.
+            db.namespace(ns.to_string()).await.unwrap();
+
             // Populate: one MultiBit dense whole-doc vector + `cpd` SingleBit chunks per
             // doc, quantised against the real centroids and written through the
             // production `upsert_vectors` path (no-WAL, groups sparse by cluster).
@@ -1781,6 +1785,11 @@ mod real_kv_profile {
             }
 
             let store = DbVectorStore::new(&db, ns).await.unwrap();
+            // Refuse to profile an empty index: a silent no-op upsert once made this
+            // harness report microsecond "searches" over nothing.
+            let all_clusters: Vec<u32> = cluster_map.keys().copied().collect();
+            let stored: usize = store.scan_sparse_clusters_batch(&all_clusters).await.values().map(Vec::len).sum();
+            assert!(stored > 0, "profile store is empty — upsert_vectors wrote nothing");
 
             // Pass-2 fetch set is n_probes-independent: first_pass top_k doc ids (bounded by N_DOCS).
             let dense_ids: Vec<Vec<u8>> = (0..N_DOCS.min(base_config.first_pass_sparse_search_top_k as u64))

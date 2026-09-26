@@ -1000,12 +1000,13 @@ impl KVStore {
         (results, retry)
     }
 
-    /// Scan multiple 4-byte BE cluster prefixes in a single pass.
+    /// Scan multiple 4-byte BE cluster prefixes and resolve their values.
     ///
-    /// Uses `lsm.scan_prefixes` to read each bucket's level1 SSTable **once** into
-    /// memory and check all cluster prefixes in a single in-memory pass — replacing
-    /// N_clusters × num_buckets full linear scans with exactly num_buckets large reads
-    /// followed by CPU-only work.
+    /// Collects every live `(key, pointer)` for the whole prefix set in one
+    /// [`LSMTree::scan_prefixes`] call (one pass per layer, not one per prefix), then
+    /// resolves the pointers against the value log with one scoped thread per bucket.
+    /// Each value is its own `pread` (in key order, not file order); the reads are not
+    /// coalesced, so the syscall count equals the number of entries.
     ///
     /// Returns a map from `prefix_id` to `(key_bytes, value_bytes)` pairs. Keys
     /// shorter than 4 bytes or with no matching pointer are silently skipped.

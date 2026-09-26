@@ -149,17 +149,23 @@ Raw query text
 Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
   find top-n_probes cluster IDs for q by Euclidean distance
     (several query vectors → union of their cluster sets)
-  scan_sparse_cluster(cluster_id) for each cluster in parallel
-  for each (cluster, document d):
+  scan_sparse_clusters_batch(probed ids)        ← one LSM pass per layer for all
+                                                  probed clusters, then one value-log
+                                                  pread per entry
+  ── SCORING_GATE permit (see "Concurrency" below) ──
+  flatten every probed entry (cluster, d, chunks) into one list
+  for each entry (rayon parallel over ENTRIES, not clusters):
     apply doc_filter (RoaringBitmap predicate) — skip if fails
-    for each query vector q_i (one in production):
-      score = max_j SingleBitEstimator(q_i, d_j)   ← best chunk of d
-      per_vector_max[doc_id][i] = max(per_vector_max[doc_id][i], score)
-  final sparse score: S(q, d) = Σ_i per_vector_max[d][i]  (= max_j ⟨q, d_j⟩ for one vector)
-  sort descending by score, truncate to first_pass_sparse_search_top_k
+    row[entry][i] = max_j SingleBitEstimator(q_i, d_j)   ← best chunk in this entry
+  sort kept entry indices by doc_id; for each run of one document's entries:
+    per_vector_max[i] = max over the run of row[entry][i]
+    S(q, d) = Σ_i per_vector_max[i]              (= max_j ⟨q, d_j⟩ for one vector)
+  select_nth_unstable → keep first_pass_sparse_search_top_k (unordered)
+  ── release permit; free the scanned entries on the blocking pool ──
 
 Pass 2 — Dense (MultiBit):
-  get_dense_entry(doc_id) for each sparse candidate in parallel
+  get_dense_entries_batch(candidate doc_ids)    ← one batch read
+  ── SCORING_GATE permit ──
   for each candidate (rayon parallel):
     look up its centroid via the stored VectorIndex's cluster_id
     score with MultiBitQuanDotProductEstimator against the single
@@ -167,6 +173,28 @@ Pass 2 — Dense (MultiBit):
   build top-k min-heap
   return sorted descending
 ```
+
+### Where a query's time goes
+
+Measured on FiQA (57,638 docs, `n_probes = 32`, warm query-embedding cache, one
+client) after the 2026-09-25 hot-path work: **~19 ms**, of which about 12.5 ms is
+the sparse scan (LSM merge 5.5, value-log reads 4.7, decode 2.3), 3 ms grouping
+per document, 1.2 ms scoring and 1.6 ms the dense pass. Everything but the dense
+pass scales with the number of sparse entries a query touches, which on this
+corpus is ~87k, 97% of the index: the bundled general-purpose centroids put ~38%
+of FiQA's chunks in one cluster, so 32 probes prune almost nothing. A partition
+that matches the corpus is the remaining lever (see *Cluster centroids* in
+`CLAUDE.md`).
+
+### Concurrency
+
+Pass 1 and Pass 2 each run their parallel scoring on rayon's global pool, which
+every concurrent search shares. A rayon worker blocked in a `join` steals any
+queued job, including another search's root job, and cannot return to its own
+search until the stolen one finishes; under steady load that nesting never
+unwinds, and requests starve. `SCORING_GATE` caps concurrent scoring sections at
+2, process-wide, and admits waiters in FIFO order. The measurements and the rules
+that keep it sound are in `CLAUDE.md` → *Concurrency: the scoring gate*.
 
 ### Why two passes?
 
@@ -228,7 +256,7 @@ Vector indexing is **asynchronous and decoupled from document writes**. A docume
 ### Write path
 
 1. `put` / `kv_put` writes the document, then extracts the embedding field and enqueues a `(namespace, doc_id, text)` entry in the durable `system_pending_vec_index` KV namespace as a separate, independent write — the document write and the enqueue are not atomic. The document write returns immediately without contacting the embedding service. A crash between the two writes leaves the document un-indexed (reconciled by re-index), never acked-but-lost.
-2. `VecIndexWorker` (`minnal_doc_store/src/vec_index_worker.rs`) consumes the queue in the background — see [Background worker](#background-worker).
+2. `VecIndexWorker` (`minnal_db/src/doc_store/vec_index_worker.rs`) consumes the queue in the background — see [Background worker](#background-worker).
 
 ### Embedding service availability
 
@@ -345,8 +373,8 @@ All parameters are under `[semantic_search]` in the TOML config:
 ### Tuning & profiling `n_probes`
 
 `n_probes` is the primary recall/latency knob. Two on-demand harnesses in
-`minnal_doc_store/src/vector_kv.rs` (both `#[ignore]`d tests, run from the
-`minnal_doc_store/` crate root) measure the two axes it trades off:
+`minnal_db/src/vector_kv.rs` (both `#[ignore]`d tests) measure the two axes it
+trades off:
 
 - **Latency** — `real_kv_search_profile` runs the real two-pass `search()` over a real
   `minnal_db`-backed store (synthetic vectors, but real LSM + value-log `pread` I/O) and
@@ -369,19 +397,28 @@ All parameters are under `[semantic_search]` in the TOML config:
     cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_recall_vs_nprobes --release -- --ignored --nocapture
   ```
 
-Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency: 5000-doc
-synthetic store, 8 chunks/doc, warm cache):
+Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency:
+5000-doc synthetic store, 8 chunks/doc, 4 query vectors, warm cache, re-measured
+2026-09-26 after the hot-path work):
 
-| `n_probes` | recall@10 | recall@100 | entire `search()` |
-|---|---|---|---|
-| 10 | 0.968 | 0.935 | 14.5 ms |
-| **32 (default)** | **0.986** | **0.978** | **18.7 ms** |
-| 128 | 1.000 | 0.999 | 26.4 ms |
+| `n_probes` | recall@10 | recall@100 | sparse entries scanned | entire `search()` |
+|---|---|---|---|---|
+| 10 | 0.968 | 0.935 | 7,320 | 3.5 ms |
+| **32 (default)** | **0.986** | **0.978** | **17,278** | **6.7 ms** |
+| 128 | 1.000 | 0.999 | 37,337 | 13.1 ms |
 
-`32` is the default: it recovers most of the recall lost at `10` while staying ~29% cheaper
-than `128`. The dominant lever is **Pass-1 sparse-scan I/O**, which scales roughly linearly
-with `n_probes` (entries scanned grow in step); the SIMD dot products are a minority of the
-cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
+The latency column was 14.5 / 18.7 / 26.4 ms before the hot-path work. The
+recall columns come from the earlier measurement: recall depends on the probe
+set, quantisation and re-ranking, none of which changed. Note that the profile
+harness silently measured an **empty** index from 2026-07-30 until
+2026-09-26: `upsert_vectors` skips unregistered namespaces (so a dropped store
+is never resurrected), and the harness never registered its own. It now
+registers the namespace and asserts the index is non-empty before timing.
+
+`32` is the default: it recovers most of the recall lost at `10` while staying ~49% cheaper
+than `128`. The dominant lever is **Pass-1 sparse-scan I/O** (54–78% of `search()` at 8
+chunks/doc), which scales roughly linearly with `n_probes` (entries scanned grow in step);
+the SIMD dot products are a minority of the cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
 `first_pass_sparse_search_top_k` candidate set — so its share *shrinks* as `n_probes` rises.
 
 ---
@@ -390,14 +427,14 @@ cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
 
 | Component | File |
 |---|---|
-| Embedding service client + two-pass search | `semantic_search/src/service/mod.rs` |
-| RaBitQ quantisation (encode + decode) | `semantic_search/src/quantisation/rabitq/mod.rs` |
-| `VectorIndex` struct + `VectorKvStore` trait | `semantic_search/src/index/vector_index.rs` |
-| Distance estimators (SingleBit, MultiBit) | `semantic_search/src/index/distance_estimator.rs` |
-| Cluster index (centroids) + exact top-`n_probes` probing | `semantic_search/src/cluster/mod.rs` |
-| Composite key encoding (cluster ‖ doc_id) | `semantic_search/src/index/composite_key.rs` |
-| Coarse-assignment micro-benchmarks | `semantic_search/benches/bench_distance_estimation.rs` |
-| Vector KV storage (three namespaces) + query cache | `minnal_doc_store/src/vector_kv.rs` |
-| Latency + recall profiling harnesses (see §9) | `minnal_doc_store/src/vector_kv.rs` (ignored tests) |
-| Async vector-index background worker | `minnal_doc_store/src/vec_index_worker.rs` |
-| Document store | `minnal_doc_store/src/store.rs` |
+| Embedding service client + two-pass search | `minnal_db/src/semantic_search/service/mod.rs` |
+| RaBitQ quantisation (encode + decode) | `minnal_db/src/semantic_search/quantisation/rabitq/mod.rs` |
+| `VectorIndex` struct + `VectorKvStore` trait | `minnal_db/src/semantic_search/index/vector_index.rs` |
+| Distance estimators (SingleBit, MultiBit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
+| Cluster index (centroids) + exact top-`n_probes` probing | `minnal_db/src/semantic_search/cluster/mod.rs` |
+| Composite key encoding (cluster ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
+| Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/bench_distance_estimation.rs` |
+| Vector KV storage (three namespaces) + query cache | `minnal_db/src/vector_kv.rs` |
+| Latency + recall profiling harnesses (see §9) | `minnal_db/src/vector_kv.rs` (ignored tests) |
+| Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
+| Document store | `minnal_db/src/doc_store/store/` |
