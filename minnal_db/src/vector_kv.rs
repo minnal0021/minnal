@@ -1129,6 +1129,96 @@ mod queue_race_tests {
         );
     }
 
+    // ── Crash + WAL replay ────────────────────────────────────────────────────
+    //
+    // Queue writes (enqueues, tombstones, and every conditional update, which the
+    // WAL records as its resulting Upsert/Delete) are WAL-backed; vector writes
+    // are no-WAL. A crash is `std::mem::forget(db)` (no shutdown, no Drop-time
+    // flush), so reopening replays the WAL.
+
+    /// The worst case for R3: a delete races an embed, the worker's no-WAL vector
+    /// writes reach disk, and the process dies before the worker can clean up.
+    /// Only the **vector** namespaces are flushed — as a size-triggered flush of
+    /// the busy vector memtables would, while the small queue memtable is not —
+    /// so the tombstone survives only because it is WAL-backed. Replay restores
+    /// it, and processing it (as the worker's startup drain does) removes the
+    /// orphaned vectors.
+    #[tokio::test]
+    async fn crash_after_racing_delete_keeps_tombstone_that_removes_orphans() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+            let _in_flight = snapshot(&db, b"x").await;
+            clear_vectors(&db, "docs", b"x").await.unwrap(); // racing delete
+            upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap(); // worker's write lands after it
+            for ns in [sparse_vectors_ns("docs"), sparse_vectors_meta_ns("docs"), dense_vectors_ns("docs")] {
+                db.coordinator_for_test()
+                    .get_store_by_name(&ns)
+                    .unwrap()
+                    .flush_memtable_to_level0()
+                    .unwrap();
+            }
+            std::mem::forget(db); // crash before the worker completes
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("tombstone survives replay");
+        assert_eq!(pending.kind, QueueEntryKind::Clear);
+        assert!(
+            has_any_vector_state(&db, "docs", b"x").await.unwrap(),
+            "orphan is on disk until the tombstone runs"
+        );
+
+        process_clear(&db, "docs", b"x").await.unwrap();
+        assert!(!has_any_vector_state(&db, "docs", b"x").await.unwrap());
+    }
+
+    /// R1 across a crash: the newer upsert's entry, left in place by the
+    /// conditional completion, is still queued after replay.
+    #[tokio::test]
+    async fn crash_after_superseded_completion_keeps_newer_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+            let in_flight = snapshot(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+            finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+            std::mem::forget(db);
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("newer entry survives replay");
+        assert_eq!(pending.text, "new text");
+    }
+
+    /// A completion is durable: after a crash the finished entry does not come
+    /// back, and a failure's bookkeeping is replayed as written — replay applies
+    /// the merge's recorded result and never re-runs the conditional closure.
+    #[tokio::test]
+    async fn crash_replays_completion_and_failure_results() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            enqueue_embed(&db, "docs", b"done", "a").await.unwrap();
+            let e = snapshot(&db, b"done").await;
+            finish_embed(&db, &e, &vectors_for(1.0)).await.unwrap();
+            enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
+            let f = snapshot(&db, b"failed").await;
+            record_queue_failure(&db, &f, "timeout").await.unwrap();
+            std::mem::forget(db);
+        }
+        let db = open_db(&dir).await;
+        assert!(
+            get_queue_entry(&db, "docs", b"done").await.unwrap().is_none(),
+            "completion survives replay"
+        );
+        let failed = get_queue_entry(&db, "docs", b"failed").await.unwrap().expect("failed entry kept");
+        assert_eq!(
+            (failed.text.as_str(), failed.retry_count, failed.last_error.as_deref()),
+            ("b", 1, Some("timeout"))
+        );
+    }
+
     /// No race: the ordinary path still indexes and empties the queue.
     #[tokio::test]
     async fn uncontended_embed_indexes_and_completes() {
