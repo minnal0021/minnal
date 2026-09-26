@@ -30,7 +30,7 @@
 //! number_of_bits_for_dense_quantisation = 8
 //! # cluster_path = "service/embedding_support/qwen/clusters.json"   # {model}/clusters.json — must match `model` below
 //! embedding_dim = 768
-//! n_probes = 32
+//! n_probes = 64
 //! embedding_service_url = "http://192.168.1.155:8001"
 //! model = "qwen"
 //! ```
@@ -732,7 +732,7 @@ fn default_embedding_dim() -> usize {
     768
 }
 fn default_n_probes() -> usize {
-    32
+    64
 }
 fn default_first_pass_sparse_search_top_k() -> usize {
     1000

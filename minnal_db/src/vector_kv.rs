@@ -2289,10 +2289,10 @@ mod real_kv_profile {
         const T: usize = 4;
         const ITERS: usize = 25;
 
-        // Sweep n_probes to compare the tuned default (32) against the old 10 and the
-        // upstream 128. The store depends only on cpd (not n_probes), so it is built once
-        // per cpd and every n_probes value is profiled against the same on-disk data.
-        const N_PROBES_SWEEP: [usize; 3] = [10, 32, 128];
+        // Sweep n_probes to compare the default (64) against the earlier defaults 10 and 32
+        // and the upstream 128. The store depends only on cpd (not n_probes), so it is built
+        // once per cpd and every n_probes value is profiled against the same on-disk data.
+        const N_PROBES_SWEEP: [usize; 4] = [10, 32, 64, 128];
 
         let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
         let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();

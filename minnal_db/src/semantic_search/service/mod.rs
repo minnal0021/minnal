@@ -120,7 +120,7 @@ impl Default for SemanticSearchConfig {
             embedding_dim: 768,
             top_k_results: 100,
             number_of_bits_for_dense_quantisation: 8,
-            n_probes: 32,
+            n_probes: 64,
             window_size: 4,
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
