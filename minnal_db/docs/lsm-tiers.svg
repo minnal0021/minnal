@@ -46,7 +46,7 @@
 <text class="t3 mono" x="348" y="110" font-size="11">L0 files — bucket 3</text>
 <rect class="tier" x="668" y="132" width="228" height="108" rx="9"/>
 <text class="t2 mono" x="682" y="152" font-size="11">L1 SSTable — bucket 3</text>
-<text class="t3" x="882" y="152" font-size="10" text-anchor="end">sorted, one per bucket</text>
+<text class="t3" x="782" y="256" font-size="10" text-anchor="middle">sorted, one per bucket</text>
 <rect class="empty" x="60" y="184" width="30" height="30" rx="5" stroke-dasharray="3 3"><animate attributeName="opacity" calcMode="discrete" values="0;0;0;1;0;1;0;1;1;1;1;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/></rect>
 <g><animate attributeName="opacity" calcMode="discrete" values="1;1;1;0;0;0;0;0;0;0;0;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><rect x="60" y="184" width="30" height="30" rx="5" fill="#eda100"/><text class="mono" x="75.0" y="203.0" font-size="12" font-weight="600" text-anchor="middle" fill="#ffffff">a</text></g>
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;1;0;0;0;0;0;0;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><rect x="60" y="184" width="30" height="30" rx="5" fill="#eda100"/><text class="mono" x="75.0" y="203.0" font-size="12" font-weight="600" text-anchor="middle" fill="#ffffff">d</text></g>
@@ -99,7 +99,7 @@
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;1;0;0;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><circle cx="50" cy="296" r="4" fill="#1baf7a"/><text class="t1" x="64" y="300" font-size="12.5">Compaction: a background worker merge-sorts every L0 file of the bucket together with L1.</text></g>
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;1;0;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><circle cx="50" cy="296" r="4" fill="#1baf7a"/><text class="t1" x="64" y="300" font-size="12.5">One sorted L1 SSTable per bucket. Duplicate a collapses to its newest version; b's tombstone drops the key.</text></g>
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;0;1;0" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><circle cx="50" cy="296" r="4" fill="#1baf7a"/><text class="t1" x="64" y="300" font-size="12.5">The L0 files are deleted: 7 L0 entries became 4 L1 entries — compaction reclaims the overlap.</text></g>
-<g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;0;0;1" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><circle cx="50" cy="296" r="4" fill="#86857f"/><text class="t1" x="64" y="300" font-size="12.5">The cycle repeats. A read checks MemTable → L0 → L1, and one bucket's L1 is 1/16th of the keyspace.</text></g>
+<g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;0;0;1" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/><circle cx="50" cy="296" r="4" fill="#86857f"/><text class="t1" x="64" y="300" font-size="12.5">The cycle repeats. A read checks every tier and keeps the newest version of the key.</text></g>
 <text class="t3" x="44" y="338" font-size="12" letter-spacing="0.06em">KEYS HELD PER TIER, OVER TIME</text>
 <line class="grid" x1="96" y1="478.0" x2="896" y2="478.0" stroke-width="1"/>
 <text class="t3 mono" x="86" y="482.0" font-size="10" text-anchor="end">0</text>
@@ -144,7 +144,7 @@
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;1;1;1" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/>
 <rect x="706.7" y="417.0" width="44.0" height="61.0" rx="3" fill="#1baf7a"/>
 <line class="axis" x1="728.7" y1="365.2" x2="728.7" y2="411.0" stroke-width="1.5" stroke-dasharray="3 3"/>
-<text class="t3" x="728.7" y="359.2" font-size="10" text-anchor="middle">−3</text>
+<text class="t3" x="728.7" y="359.2" font-size="10" text-anchor="middle">−3: duplicates and a deleted key dropped</text>
 </g>
 <g><animate attributeName="opacity" calcMode="discrete" values="0;0;0;0;0;0;0;0;0;0;1;1" keyTimes="0.00000;0.08333;0.16667;0.25000;0.33333;0.41667;0.50000;0.58333;0.66667;0.75000;0.83333;0.91667" dur="22.8s" repeatCount="indefinite"/>
 <rect x="773.3" y="417.0" width="44.0" height="61.0" rx="3" fill="#1baf7a"/>

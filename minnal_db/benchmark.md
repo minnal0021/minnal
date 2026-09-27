@@ -22,8 +22,9 @@ to other hardware much better than the raw microseconds do.
 The one number that shapes everything else: **a write costs 2.3 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The rest of the
 write path costs about 1.5 µs. That is a deliberate choice — a write that
-returns has survived a power cut — and it caps one writer at about 440 writes
-per second on this drive.
+returns has survived a power cut — and it caps the database at about 440 writes
+per second on this drive. Adding writer threads does not raise that ceiling,
+because writes fsync one at a time.
 
 ## Terms used here
 
@@ -367,8 +368,10 @@ single-writer throughput. This run agrees:
 Two separate benchmarks measure a small-value read from disk, with different
 setups, and agree within 2% (311k and 316k reads per second).
 
-The write figure is the fsync limit for one writer and no setting raises it.
-The WAL is always fsynced per write, and only the value log's sync cadence is
-configurable. Several writers do better in total, because writes are spread
-across 16 buckets by default. This report measures single-threaded latency only,
-so that aggregate figure is not measured here.
+The write figure is the fsync limit, and no setting raises it: the WAL is
+always fsynced per write, and only the value log's sync cadence is configurable.
+It is also the limit for the whole database, not per writer. Each write holds
+the one WAL lock while it fsyncs, so writes from any number of threads or
+namespaces reach the disk one at a time. This report measures single-threaded
+latency only, so it does not measure how latency behaves when writers queue for
+that lock.
