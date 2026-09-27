@@ -83,6 +83,11 @@ impl DocStore {
     }
 
     /// Run WAL garbage collection (reclaims fully-persisted WAL segments).
+    ///
+    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
+    /// files deleted by this pass, and the WAL entries not yet persisted to an
+    /// SSTable afterwards. If another pass is already running, nothing is
+    /// reclaimed and the result is `(0, unpersisted_entries)`.
     pub async fn garbage_collect_wal(&self) -> Result<(u64, u64), crate::KVError> {
         self.db.garbage_collect_wal().await
     }

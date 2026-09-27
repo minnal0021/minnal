@@ -447,6 +447,11 @@ impl Db {
     }
 
     /// Run WAL garbage collection (reclaims fully-persisted segments).
+    ///
+    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
+    /// files deleted by this pass, and the WAL entries not yet persisted to an
+    /// SSTable afterwards. If another pass is already running, nothing is
+    /// reclaimed and the result is `(0, unpersisted_entries)`.
     pub fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.inner.garbage_collect_wal()
     }
@@ -1454,6 +1459,11 @@ impl AsyncDb {
     }
 
     /// Run WAL garbage collection (reclaims fully-persisted segments).
+    ///
+    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
+    /// files deleted by this pass, and the WAL entries not yet persisted to an
+    /// SSTable afterwards. If another pass is already running, nothing is
+    /// reclaimed and the result is `(0, unpersisted_entries)`.
     pub async fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.garbage_collect_wal())

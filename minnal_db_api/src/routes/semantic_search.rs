@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! POST /stores/{ns}/semantic-search          → ANN query, no predicate filter
-//! POST /stores/{ns}/semantic-search/filtered → ANN query restricted by index predicate
+//! POST /stores/{ns}/semantic-search/filtered → ANN query restricted by an index predicate
 //! ```
 //!
 //! # Request bodies
@@ -20,37 +20,44 @@
 //! }
 //! ```
 //!
-//! # Response (both endpoints)
+//! Both also take optional `top_k`, `page_no` and `page_size` (`limit` is accepted
+//! as a query-parameter alias for `page_size`).
 //!
-//! An ordered array of results, highest similarity first:
+//! # Response
+//!
+//! A page of results, highest similarity first:
 //! ```json
-//! [
-//!   {
-//!     "id": "550e8400-e29b-41d4-a716-446655440000",
-//!     "dot_product": 0.94,
-//!     "error_bound": 0.02,
-//!     "document": { "id": 1, "text": "Senior Rust engineer with distributed systems experience." }
-//!   }
-//! ]
+//! {
+//!   "results": [
+//!     {
+//!       "id": "550e8400-e29b-41d4-a716-446655440000",
+//!       "dot_product": 0.94,
+//!       "error_bound": 0.02,
+//!       "document": { "text": "Senior Rust engineer with distributed systems experience." }
+//!     }
+//!   ],
+//!   "page_no": 1,
+//!   "page_size": 20,
+//!   "total": 1
+//! }
 //! ```
 //!
-//! `document` is the full stored document object for the result.
-//! It is `null` when the document could not be found (e.g. deleted since indexing).
+//! The filtered endpoint adds `degraded_fields`: the predicate's fields whose
+//! index is known to be missing updates (empty when the result is complete).
 //!
-//! `id` is rendered according to the namespace's `key_type`:
-//! - `uuid`  → hyphenated UUID string
-//! - `u64`   → JSON number
-//! - `u128`  → decimal string
+//! `document` is the stored document. Candidates whose document has been deleted
+//! since indexing are dropped, so it is never `null`. `id` is rendered according
+//! to the namespace's `key_type`: a hyphenated string for `uuid`, a number for
+//! `u64`, a decimal string for `u128`, the key itself for `str`.
 //!
 //! # Error responses
 //!
-//! | Condition                                          | Status |
-//! |----------------------------------------------------|--------|
-//! | Namespace not found                                | 404    |
-//! | `semantic_search_enabled` is false for namespace   | 500    |
-//! | Cluster index not loaded at startup                | 500    |
-//! | Embedding service unreachable / returned an error  | 500    |
-//! | Predicate references an un-indexed field (filtered)| 500    |
+//! | Condition                                             | Status |
+//! |-------------------------------------------------------|--------|
+//! | Namespace not found, or it is a KV store              | 404    |
+//! | `semantic_search_enabled` is false for the namespace  | 422    |
+//! | Predicate is malformed or names an un-indexed field   | 400    |
+//! | Embedding service unreachable or returned an error    | 500    |
 
 use crate::limits::Limit;
 use std::sync::Arc;

@@ -866,18 +866,21 @@ pub async fn trigger_gc(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Serialize)]
 pub struct WalGCResponse {
-    total_entries: u64,
-    persisted_entries: u64,
+    /// Bytes of WAL segment files deleted by this pass.
+    bytes_reclaimed: u64,
+    /// WAL entries not yet persisted to an SSTable after the pass; they keep
+    /// their segments on disk.
+    unpersisted_entries: u64,
 }
 
 pub async fn trigger_gc_wal(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     info!("admin: WAL GC triggered manually");
     match state.store.garbage_collect_wal().await {
-        Ok((total, persisted)) => {
-            info!(total_entries = total, persisted_entries = persisted, "admin: WAL GC complete");
+        Ok((bytes_reclaimed, unpersisted_entries)) => {
+            info!(bytes_reclaimed, unpersisted_entries, "admin: WAL GC complete");
             Ok(Json(WalGCResponse {
-                total_entries: total,
-                persisted_entries: persisted,
+                bytes_reclaimed,
+                unpersisted_entries,
             }))
         }
         Err(e) => Err((StatusCode::CONFLICT, Json(serde_json::json!({ "error": e.to_string() })))),
