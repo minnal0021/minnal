@@ -1,6 +1,6 @@
 # Semantic Search Architecture
 
-This document describes how semantic search works end-to-end: embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search.
+This document describes how semantic search works end to end: embedding generation, dual quantisation, index structure, two-pass query execution (with optional predicate filtering), storage layout, and crash recovery.
 
 ---
 
@@ -14,7 +14,7 @@ Minnal does **not** generate embeddings itself. It relies on an **external embed
 
 The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`. Minnal does not negotiate or version models with the service — every request goes to fixed endpoints with no model identifier in the URL or body. Choosing the concrete model, and pinning its exact version, is entirely the embedding service's responsibility, decided server-side and applied uniformly to every request.
 
-The `model` name in the config (e.g. `qwen`) is therefore *not* used to select or version a model at request time. It is only an indication of which *family* of model the deployment is built around, and within minnal it serves a single purpose: selecting the matching cluster-centroid file and embedding dimension for this instance (validated at startup against `[[semantic_search.supported_models]]`). Keeping the config name aligned with whatever the embedding service actually serves is an operational convention, not something minnal enforces against the service.
+The `model` name in the config (e.g. `gemma`) is therefore *not* used to select or version a model at request time. It is only an indication of which *family* of model the deployment is built around, and within minnal it serves a single purpose: selecting the matching cluster-centroid file and embedding dimension for this instance (validated at startup against `[[semantic_search.supported_models]]`). Keeping the config name aligned with whatever the embedding service actually serves is an operational convention, not something minnal enforces against the service.
 
 ### Service interface
 
@@ -104,7 +104,7 @@ All quantised entries share the same `VectorIndex` struct:
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
-> **TODO — random rotation not yet implemented.** The current RaBitQ implementation quantises document and query vectors directly, without the **random orthogonal rotation** (random projection) that the RaBitQ paper applies to both the stored embeddings and the query before quantisation. The rotation decorrelates dimensions and tightens the error bound, so until it lands the estimated dot products are noisier than the theoretical guarantee. Applying a shared rotation matrix to both the embedding (at index time) and the query (at search time) is outstanding work.
+> **Limitation: no random rotation.** The RaBitQ paper applies a random orthogonal rotation to both the stored embeddings and the query before quantising. minnal quantises them directly. The rotation decorrelates dimensions and tightens the error bound, so minnal's estimated dot products are noisier than the paper's guarantee. Adding it means applying one shared rotation matrix at index time and at query time.
 
 ---
 
@@ -114,7 +114,7 @@ The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
 
 - A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
 - **Cluster probing is exact and exhaustive.** For the Pass-1 query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. Production queries are not chunked, so there is **one** Pass-1 query vector and exactly `n_probes` clusters are scanned (`search()` still accepts several vectors, in which case the union of their sets is scanned once).
-- **Coarse-assignment cost is cheap at this scale.** The cost is **T·C·D** (query vectors × centroids × dim), and production `T = 1`: one distance scan per query, ~microseconds at C≈256 (`bench_distance_estimation` → `coarse_assignment` measures larger T, ~50 µs at 4 and ~1.1 ms at 100, from when queries were split into word-window chunks and the cost grew with query length).
+- **Choosing clusters is cheap at this scale.** The cost is **T·C·D** (query vectors × centroids × dimensions), and in production `T = 1`, so it is one distance scan per query: about 9 µs at C = 256.
 
 Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
 
@@ -176,25 +176,29 @@ Pass 2 — Dense (MultiBit):
 
 ### Where a query's time goes
 
-Measured on FiQA (57,638 docs, `n_probes = 32`, warm query-embedding cache, one
-client) after the 2026-09-25 hot-path work: **~19 ms**, of which about 12.5 ms is
-the sparse scan (LSM merge 5.5, value-log reads 4.7, decode 2.3), 3 ms grouping
-per document, 1.2 ms scoring and 1.6 ms the dense pass. Everything but the dense
-pass scales with the number of sparse entries a query touches, which on this
-corpus is ~87k, 97% of the index: the bundled general-purpose centroids put ~38%
-of FiQA's chunks in one cluster, so 32 probes prune almost nothing. A partition
-that matches the corpus is the remaining lever (see *Cluster centroids* in
-`CLAUDE.md`).
+Almost all of a warm query's time goes into Pass 1's sparse scan: merging the
+LSM layers for each probed cluster, then one value-log read per entry, then
+decoding and scoring. Pass 2 is small and roughly fixed, since it re-scores a
+capped candidate set. So latency follows **how many sparse entries the probed
+clusters hold**. On FiQA (57,638 documents) with matching gemma centroids and
+the default 64 probes, a warm query takes about 17 ms.
+
+That makes cluster balance the main lever. The bundled centroids are fitted on
+general text; on a specialist corpus most chunks can land in a few clusters
+(43% of SciFact's documents fall in one), and then each probe reads a large
+share of the index. Centroids fitted on the corpus itself spread the entries
+out, so the same recall needs far fewer entries read.
 
 ### Concurrency
 
-Pass 1 and Pass 2 each run their parallel scoring on rayon's global pool, which
-every concurrent search shares. A rayon worker blocked in a `join` steals any
-queued job, including another search's root job, and cannot return to its own
-search until the stolen one finishes; under steady load that nesting never
-unwinds, and requests starve. `SCORING_GATE` caps concurrent scoring sections at
-2, process-wide, and admits waiters in FIFO order. The measurements and the rules
-that keep it sound are in `CLAUDE.md` → *Concurrency: the scoring gate*.
+Pass 1 and Pass 2 each score in parallel on rayon's global pool, which every
+concurrent search shares. A rayon worker waiting inside a `join` can steal
+another search's job and cannot return to its own search until that one
+finishes; under steady load those nestings pile up and requests stall.
+`SCORING_GATE` allows at most 2 scoring sections at a time, process-wide, and
+admits waiters in FIFO order. On FiQA with 32 concurrent clients this took p99
+latency from 9.7 s to 308 ms and raised throughput from 110 to 125 queries per
+second. Rules for changing it are in `CLAUDE.md` → *Concurrency: the scoring gate*.
 
 ### Why two passes?
 
@@ -211,7 +215,7 @@ S(q, d) = Σ_i  max_j ⟨q_i, d_j⟩
 
 where `i` iterates over query vectors and `j` over document chunks. For each query vector, the best-matching chunk of the document wins (inner `max`); those per-vector bests are then **summed** (outer `Σ`).
 
-**In production there is one query vector** — the whole-query embedding — so this reduces to `S(q, d) = max_j ⟨q, d_j⟩`: a document scores by its single best-matching chunk. Queries used to be split into 4-word sliding windows (one `q_i` per window), which let a document score by matching many fragments. A BEIR evaluation (`query-embedding-report.md`) found that signal weaker, not stronger. 4-word fragments carry little meaning on their own, and with a tight first-pass cut they let relevant documents drop out (ArguAna candidate recall 0.870 vs 0.991). They were also far costlier: 96 query vectors and 171 probed clusters per ArguAna query vs 1 and 32. Sentence-window query chunks matched the whole query on quality at extra cost, so the query is not chunked at all. The general `Σ_i` form stays in `search()`.
+**In production there is one query vector** — the whole-query embedding — so this reduces to `S(q, d) = max_j ⟨q, d_j⟩`: a document scores by its single best-matching chunk. `search()` keeps the general `Σ_i` form, which would let a document score by matching several query fragments. Splitting queries that way was evaluated on BEIR (`query-embedding-report.md`) and lost: 4-word fragments carry little meaning on their own and, with a tight first-pass cut, let relevant documents drop out (ArguAna candidate recall 0.870 against 0.991 for the whole query), while costing 96 query vectors and 171 probed clusters per query against 1 and 32. Sentence-sized query chunks matched the whole query on quality at extra cost. So queries are not chunked.
 
 Chunks whose cluster is not probed contribute **0** to their query vector's term (rather than −∞), so documents are never penalised for having chunks in far-away clusters.
 
@@ -223,7 +227,7 @@ Pass 2 scores each candidate against a **single whole-query dense embedding** �
 
 `doc_filter` is an optional closure `Fn(&[u8]) -> bool` applied **only in Pass 1**, per document, before scoring. Documents that fail the filter are excluded from both passes. Pass 2 operates on the already-filtered `sparse_ranked` list and never re-evaluates the predicate.
 
-This is how the `search_semantic_filtered` REST endpoint works: it resolves the bitmap predicate into a `HashSet<Vec<u8>>` of matching doc IDs and passes a membership check as the `doc_filter` closure.
+This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtered`) works: it evaluates the index predicate into the set of matching doc IDs and passes a membership check as the `doc_filter` closure. That combines "semantically similar to X" with "and `status = 'active'`" in one query, with predicate evaluation kept outside the vector pipeline.
 
 ---
 
@@ -245,7 +249,7 @@ Three companion KVStore namespaces per semantic-search-enabled store (`vector_kv
 
 Query embeddings are cached in a system-wide TTL namespace `system_qemb_cache` shared across all doc-store namespaces. Keys are raw UTF-8 query strings; values are packed big-endian `f32` vectors. The TTL is **configurable** via `[semantic_search] query_embedding_cache_ttl_secs` and **defaults to 1 day** (86400 s) — once it elapses, stale entries are evicted automatically by the TTL worker. Cache misses fall back to the embedding service transparently.
 
-**Durability — no-WAL populate, WAL-backed clear.** Populating an entry on a cache miss is no-WAL (`put_no_wal`): the cache is TTL-bounded and fully regenerable, so a dropped populate just produces a future cache miss that re-fetches from the embedding service, and staying off the WAL removes a per-populate fsync from the query hot path (the latency motivation for caching in the first place). Clearing the cache (`DELETE /admin/indices/vector/query-cache`) uses WAL-backed deletes, like the vector-payload cleanup deletes (§ above): the periodic no-WAL flush tick has usually already persisted the cached entries, so a clear tombstone lost to a crash before the next tick would resurrect entries the operator explicitly cleared.
+**Durability — no-WAL populate, WAL-backed clear.** Populating an entry on a cache miss is no-WAL (`put_no_wal`): the cache is TTL-bounded and fully regenerable, so a dropped populate just produces a future cache miss that re-fetches from the embedding service, and staying off the WAL removes a per-populate fsync from the query hot path (the latency motivation for caching in the first place). Clearing the cache (`DELETE /admin/indices/vector/query-cache`) uses WAL-backed deletes, like the vector-index cleanup deletes (see §7, *Durability guarantees*): the periodic no-WAL flush tick has usually already persisted the cached entries, so a clear tombstone lost to a crash before the next tick would resurrect entries the operator explicitly cleared.
 
 ---
 
@@ -275,9 +279,9 @@ The embedding service being unreachable is **never fatal**:
 - Calls `embed_document` (one embedding call per document — whole text + chunks in a single ordered batch) for up to `concurrency` entries at once.
 - **On success:** writes the `VectorIndex` entries across all three companion namespaces, then **completes** the entry. These are independent writes (not atomic), so a crash between them just re-processes the entry idempotently on the next pass.
 - **Completion is conditional.** A pass works from a snapshot of the whole queue, so an upsert or delete of a document can land between the snapshot and that entry's completion, for minutes during a bulk load. Completion (and failure bookkeeping) is an atomic `merge` on the queue key that only acts if the stored entry is still the one the worker took (same kind and text):
-  - a newer upsert's entry is left for the next pass, instead of being deleted with the stale vectors kept (the lost-update race, R1);
-  - a failure never rewrites a newer entry with the older text (R2);
-  - if the entry has become a `Clear` tombstone, the document was deleted mid-embed, so the worker deletes the vectors it just wrote and retires the tombstone (R3).
+  - a newer upsert's entry is left for the next pass, so its text still gets embedded (otherwise the entry would be deleted and the stale vectors kept);
+  - a failure never overwrites a newer entry with the older text;
+  - if the entry has become a `Clear` tombstone, the document was deleted mid-embed, so the worker deletes the vectors it just wrote and retires the tombstone.
 - **Clear tombstones.** Deletes, and upserts whose embedding text is now empty, write a `Clear` entry *before* deleting the vectors synchronously. The worker retires it by deleting the vectors again (idempotent) and removing it, unless a re-upsert has replaced it meanwhile. An empty-text upsert of a document that never had vectors or a pending entry writes nothing.
 - **On failure:** increments the entry's `retry_count`, persists it, and logs a `WARN` with namespace, doc-id, attempt number, and whether the budget is now exhausted.
 
@@ -312,13 +316,13 @@ The queue is keyed by `(namespace, doc_id)`, so an entry is a **single row that 
 
 ### Queue entry format
 
-Queue keys encode `(namespace, doc_id)` (length-prefixed namespace ‖ doc-id bytes) so rapid successive writes to the same document overwrite the entry — the worker makes exactly one dual-embedding call for the most-recent text. Queue values are versioned binary, holding the entry kind (v3), the `retry_count`, and (v2+) the last error text:
+Queue keys encode `(namespace, doc_id)` (length-prefixed namespace ‖ doc-id bytes) so rapid successive writes to the same document overwrite the entry — the worker makes exactly one dual-embedding call for the most-recent text. A queue value is:
 
-- v1: `0x01 ‖ retry_count (4 B BE) ‖ text_bytes`
-- v2: `0x02 ‖ retry_count (4 B BE) ‖ error_len (4 B BE) ‖ error_bytes ‖ text_bytes`
-- v3 (written today): `0x03 ‖ kind (1 B: 0 = embed, 1 = clear) ‖ retry_count (4 B BE) ‖ error_len (4 B BE) ‖ error_bytes ‖ text_bytes`
+```
+0x03 ‖ kind (1 B: 0 = embed, 1 = clear) ‖ retry_count (4 B BE) ‖ error_len (4 B BE) ‖ error_bytes ‖ text_bytes
+```
 
-v1 and v2 entries still decode, as embed entries. The admin queue listing shows each entry's `kind`.
+The leading byte is a format version. The decoder also reads versions 1 and 2, which lack the kind (and, in version 1, the error) and are treated as embed entries. The admin queue listing shows each entry's `kind`.
 
 ### Durability guarantees
 
@@ -350,19 +354,7 @@ Reverse reconciliation — deleting orphan index entries for documents that were
 
 ---
 
-## 8. Hybrid Search
-
-The `search()` function accepts an optional `doc_filter: Option<F>` closure (`service/mod.rs`). It is applied **only in Pass 1** (`line ~281`), so only documents passing the predicate are scored:
-
-```rust
-if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) { continue; }
-```
-
-This enables queries like "find documents semantically similar to X **and** matching status='active'". The filter operates on raw `doc_id` bytes, so predicate evaluation is external to the vector pipeline. Pass 2 receives the already-filtered candidate list from Pass 1 and does not re-evaluate the filter.
-
----
-
-## 9. Configuration
+## 8. Configuration
 
 All parameters are under `[semantic_search]` in the TOML config:
 
@@ -373,6 +365,8 @@ All parameters are under `[semantic_search]` in the TOML config:
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
 | `window_size` | `4` | Sentences per sliding-window chunk for **document** SingleBit embeddings (queries are not chunked). Changing it requires a corpus re-index. |
 | `sliding_size` | `2` | Document window advance step, in sentences. Smaller than `window_size` → overlapping chunks. |
+| `model` | `qwen` | Name of the embedding model, used to pick and validate the cluster file (the sample config sets `gemma`). |
+| `embedding_dim` | `768` | Dimension of the vectors the service returns; must match the cluster file. |
 | `cluster_path` | — | Path to the JSONL cluster centroids file. |
 | `embedding_service_url` | `http://localhost:8001` | Base URL of the external embedding service. |
 | `top_k_results` | `100` | Maximum results returned per query (overridable per-request). |
@@ -405,35 +399,29 @@ trades off:
     cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_recall_vs_nprobes --release -- --ignored --nocapture
   ```
 
-Measured tradeoff (recall: 2000-doc real news corpus, 50 queries; latency:
-5000-doc synthetic store, 8 chunks/doc, 4 query vectors, warm cache, re-measured
-2026-09-26 after the hot-path work):
+Measured tradeoff (recall: 2,000-document news corpus, 50 queries; latency:
+5,000-document synthetic store, 8 chunks per document, 4 query vectors, warm
+cache):
 
 | `n_probes` | recall@10 | recall@100 | sparse entries scanned | entire `search()` |
 |---|---|---|---|---|
 | 10 | 0.968 | 0.935 | 7,320 | 3.5 ms |
 | 32 | 0.986 | 0.978 | 17,278 | 6.7 ms |
-| **64 (default)** | — | — | **27,537** | **9.8 ms** |
+| **64 (default)** | not measured | not measured | **27,537** | **9.8 ms** |
 | 128 | 1.000 | 0.999 | 37,337 | 13.1 ms |
 
-The latency column was 14.5 / 18.7 / 26.4 ms before the hot-path work. The
-recall columns come from the earlier measurement: recall depends on the probe
-set, quantisation and re-ranking, none of which changed. That measurement did
-not record 64, and the 64 row's latency was added on 2026-09-26. Note that the profile
-harness silently measured an **empty** index from 2026-07-30 until
-2026-09-26: `upsert_vectors` skips unregistered namespaces (so a dropped store
-is never resurrected), and the harness never registered its own. It now
-registers the namespace and asserts the index is non-empty before timing.
+`64` is the default because it is the smallest setting that stays close to
+exhaustive search on real data. End-to-end BEIR runs with the gemma centroids put
+it within 0.003 nDCG@10 of probing every cluster on both SciFact (5.2k documents)
+and FiQA (57.6k). `32` lost 0.010 on SciFact, and matching exhaustive search
+exactly needed `128`. FiQA warm-query latency was 13.9, 17.3 and 21.0 ms at 32,
+64 and 128.
 
-`64` is the default. End-to-end BEIR runs with the gemma centroids (2026-09-26) put it
-within 0.003 nDCG@10 of exhaustive on both SciFact (5.2k docs) and FiQA (57.6k docs), while
-`32` lost 0.010 on SciFact and metric-lossless needed `128` (FiQA warm query: 13.9 / 17.3 /
-21.0 ms at 32 / 64 / 128). The earlier choice of `32` was measured against an index whose
-(qwen) centroids did not match the embedding model; one oversized cluster made 32 probes
-read nearly the whole index. The dominant lever is **Pass-1 sparse-scan I/O** (54–88% of
-`search()` at 8 chunks/doc), which scales roughly linearly with `n_probes` (entries scanned grow in step);
-the SIMD dot products are a minority of the cost. Pass-2 dense fetch is roughly fixed — it re-ranks a probe-independent
-`first_pass_sparse_search_top_k` candidate set — so its share *shrinks* as `n_probes` rises.
+Pass-1 sparse-scan I/O is 54–88% of `search()` at 8 chunks per document and
+grows roughly linearly with `n_probes`, because the entries scanned grow in
+step. The SIMD dot products are a minority of the cost. Pass 2 re-scores a fixed
+`first_pass_sparse_search_top_k` candidates, so its share shrinks as `n_probes`
+rises.
 
 ---
 
@@ -449,6 +437,6 @@ the SIMD dot products are a minority of the cost. Pass-2 dense fetch is roughly 
 | Composite key encoding (cluster ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/bench_distance_estimation.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_db/src/vector_kv.rs` |
-| Latency + recall profiling harnesses (see §9) | `minnal_db/src/vector_kv.rs` (ignored tests) |
+| Latency + recall profiling harnesses (see §8) | `minnal_db/src/vector_kv.rs` (ignored tests) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
 | Document store | `minnal_db/src/doc_store/store/` |

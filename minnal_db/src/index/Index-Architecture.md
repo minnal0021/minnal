@@ -1,18 +1,18 @@
 # Index Architecture
 
-This document describes the `index` crate end to end: the custom RoaringBitmap
+This document describes the field index end to end: the custom RoaringBitmap
 engine at its core, how per-field indexes are defined and built on top of it, how
 they are stored and kept compact, and how the whole structure is brought back
 after a crash. It is meant to be read in order — each section builds on the one
 before it, from the raw bitmap up to the recovery model.
 
-Two crates share the work. The bitmap engine itself — `bitmap.rs`, `container/`,
-`container_store.rs`, `blob_store.rs`, `rowmap.rs`, `storage.rs` — lives in the
-`index` crate and knows nothing about databases. The *lifecycle* around it —
-schema registration, activation, checkpointing, WAL replay — lives in `minnal_db`
-(`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one set of
-indexes per namespace. File and line references throughout point at the code as
-of this writing.
+Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap.rs`,
+`container/`, `container_store.rs`, `blob_store.rs`, `rowmap.rs`, `storage.rs`,
+all under `src/index/` — knows nothing about databases. The *lifecycle* around
+it — schema registration, activation, checkpointing, WAL replay — lives in the
+engine (`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one
+set of indexes per namespace. Paths below are relative to `minnal_db/src/index/`
+unless they start with `minnal_db/`.
 
 ---
 
@@ -48,8 +48,8 @@ Two design choices shape everything that follows, and are worth holding in mind
 before the details.
 
 The first is that **the RoaringBitmap is written from scratch.** There is no
-`roaring` crate dependency — `index/Cargo.toml` pulls only `memmap2`,
-`parking_lot`, and `rkyv`. The entire container model (array, bitset, run, with
+`roaring` crate dependency; the module uses only `memmap2`, `parking_lot` and
+`rkyv`. The entire container model (array, bitset, run, with
 promotion and demotion between them), every cross-type set operation, and the
 memory-mapped store underneath are all implemented here, in `bitmap.rs` and
 `container/`.
@@ -117,7 +117,7 @@ parts:
 
 | Part | Backing | Role |
 |---|---|---|
-| `key → id` | in-memory open-addressing table (anonymous mmap) | `O(1)` lookup on every put/delete/replay; **rebuilt from the id array on open** — never a persisted source of truth |
+| `key → id` | open-addressing table in `rows.slots` (a file, so the kernel can page it out) | `O(1)` lookup on every put/delete/replay; **rebuilt from the id array on every open** — the file is never trusted as a source of truth |
 | `id → key` | `rows.idarray` (append-only, indexed by ID) → `rows.keybytes` (append-only key bytes) | `O(1)` resolution of query hits back to keys |
 | counter | `next_id`, stored in the `rowmap.ckpt` marker | next dense ID to assign |
 
@@ -256,10 +256,11 @@ Inserting `(value, row_id)` walks that structure top to bottom:
    `BlobStore::upsert`, which **appends** the new blob.
 
 Removal is the mirror image, and when a bitmap empties out its slot is freed
-(`remove_key`) and its `ordering` entry dropped. One helper deserves a name:
-`remove_all_for_row` clears a single row from *every* value bucket at once, which
-is how a document **update** is handled — clear the row from its old values, then
-insert it under the new ones.
+(`remove_key`) and its `ordering` entry dropped. A document **update** removes
+the row from its old value's bitmap and inserts it under the new one. When the
+caller knows the old value — the document store always does — that touches one
+bitmap (`DynFieldIndex::update`). When it does not, `remove_all_for_row` clears
+the row from *every* value bucket, which costs a load of each bucket.
 
 Queries run through `evaluate`, which uses `ordering` to locate the slots a
 predicate needs and then OR-folds their bitmaps together. The lookup shape follows
@@ -292,6 +293,7 @@ Pulling the pieces together, a namespace's index directory looks like this:
   rowmap/                      ← per-namespace dense row-ID map (§2)
     rows.keybytes              ← append-only raw key bytes
     rows.idarray               ← append-only id → (key_off, key_len)
+    rows.slots                 ← key → id hash table, rebuilt from rows.idarray on open
     rowmap.ckpt                ← marker: magic "MINNALRM", next_id, keybytes_pos, wal_offset
   {field_id}/                  ← one directory per indexed field
     blobs.keys                 ← mmap hash table: slot_id → (offset, len) into blobs.vals
@@ -300,6 +302,7 @@ Pulling the pieces together, a namespace's index directory looks like this:
       blobs.keys               ← mmap hash table: slot_id → (offset, len) into keymap/blobs.vals
       blobs.vals               ← append-only: raw value bytes (1B bool, 8B LE i64, UTF-8 str)
     checkpoint                 ← 8-byte LE u64: WAL offset at last flush
+    gap.json                   ← only when the field is missing updates (§8)
 ```
 
 The bitmap blobs in `blobs.vals` warrant a note, because they are **not** a copy
@@ -395,9 +398,17 @@ preserve the ordering (stage+fsync → marker+fsync → rename → drop marker) 
 ## 7. Checkpointing
 
 Checkpointing is the routine that flushes the index to disk and, where needed,
-invokes the compaction of §6. The `index_checkpoint_worker` runs it every **15
-minutes** by default, and the identical sequence runs on clean shutdown and on
-demand via `Database::run_index_checkpoint()`. Each tick processes the namespace's
+invokes the compaction of §6. The `index_checkpoint_worker` runs it every
+**1.75 seconds** by default (`scheduled_tasks.index_checkpoint_interval_ms`), and
+the identical sequence runs on clean shutdown and on demand via
+`Database::run_index_checkpoint()`. The write path can also request one early:
+when a field's reclaimable dead bytes pass
+`thresholds.index_blob_backpressure_bytes` (64 MiB by default), it triggers a
+checkpoint so a high-churn field cannot bloat far between ticks.
+
+The interval matters beyond disk space. After a crash each field replays the WAL
+from its last checkpoint, so the interval bounds how much replay a restart does,
+and WAL GC keeps any segment a field still needs for that replay. Each tick processes the namespace's
 row map first, then each active field in turn:
 
 1. **Flush the `RowMap` first.** `flush_rowmap(wal_tail)` msyncs `rows.*` and
@@ -485,10 +496,29 @@ once is enough.
 
 ### Why recovery lives inside `activate_field_index`
 
-The replay step above deliberately runs *inside* field activation rather than in a
-pass of its own. It did not always. Before commit `9399ff5` ("Simplified index
-recovery process"), WAL replay ran in a separate `recover_indices()` step, which
-opened a race: a concurrent put arriving between recovery and the index being
-registered could have its effect silently overwritten by the replayed state.
-Folding replay into `activate_field_index()` — before the index is wrapped in
-`Arc<RwLock>` and made visible to anyone — closes that window completely.
+The replay step above deliberately runs *inside* field activation rather than in
+a pass of its own. A separate recovery pass would leave a window between
+recovering the index and registering it, and a put arriving in that window could
+be overwritten by the replayed state. Replaying inside `activate_field_index()`,
+before the index is wrapped in `Arc<RwLock>` and made visible to anyone, leaves
+no such window.
+
+### When replay is not possible: gaps
+
+Replay needs the WAL from the field's checkpoint onwards. WAL GC keeps those
+segments, up to a limit (`thresholds.max_pinned_wal_segments`, 32 by default).
+Past the limit it deletes the oldest anyway rather than let the WAL grow without
+bound, and first records which keys those segments touched. That record is a
+**gap**, written to `gap.json` beside the field's checkpoint. Two other
+situations also record one: writes made without the WAL (bulk loads with
+`skip_wal`) followed by an unclean shutdown, and an index update the write path
+could not apply.
+
+A field with a gap stays queryable, but its answers may be missing rows:
+
+- Queries that use the field list it in `degraded_fields`, so a caller can tell
+  "nothing matched" from "the index is incomplete".
+- `GET /admin/indices/{ns}/health` lists every degraded field.
+- `POST /admin/indices/{ns}/attribute/{field}/repair` re-indexes the keys the gap
+  names, or rebuilds the field when the keys could not be captured, then
+  checkpoints and clears the gap.

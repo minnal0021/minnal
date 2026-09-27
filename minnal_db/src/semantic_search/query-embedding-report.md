@@ -1,16 +1,20 @@
 # Pass-1 query embedding: whole query vs chunks — BEIR evaluation
 
+This report is the evidence behind one design decision: minnal embeds a search
+query **whole**, as one vector, rather than splitting it into chunks the way it
+splits documents.
+
 *Run 2026-09-25. Embedding model `google/embeddinggemma-300m` through the PyTorch
 embedding service (full pipeline, bfloat16); gemma centroids regenerated for that
 service (ELI5, k = 256). Harness: [`beir_eval.rs`](beir_eval.rs).*
 
 ## Decision
 
-**Queries are no longer chunked.** One embedding of the whole query now serves
-both passes. It is Pass 2's dense vector and Pass 1's single ColBERT MaxSim
-vector, so the Pass-1 score is `max_j ⟨q, d_j⟩` over document chunks. The
-`query_chunking` option that was prototyped for the comparison was removed.
-`window_size` / `sliding_size` now apply to documents only.
+**Queries are not chunked.** One embedding of the whole query serves both
+passes. It is Pass 2's dense vector and Pass 1's single ColBERT MaxSim vector,
+so the Pass-1 score is `max_j ⟨q, d_j⟩` over document chunks.
+`window_size` / `sliding_size` apply to documents only, and there is no
+query-chunking option.
 
 - **Never worse than 4-word query chunks, often better.** With a tight
   first-pass cut, whole-query probing kept far more relevant documents
@@ -31,7 +35,7 @@ through `search()` under each Pass-1 query mode:
 
 | Mode | Pass-1 query vectors |
 |---|---|
-| `words` (previous behaviour) | 4-word sliding windows (window 4, slide 2), each embedded separately |
+| `words` | 4-word sliding windows (window 4, slide 2), each embedded separately |
 | `whole` (adopted) | the whole-query embedding (reused from Pass 2, no extra embedding) |
 | `sentences` | document-style 4-sentence windows; whole-query vector if the query fits in one window |
 | `auto` | `whole` up to 32 words, `sentences` above |
@@ -45,7 +49,8 @@ which candidates reach Pass 2 and how much Pass 1 costs. Two measurements:
   100. The tight cut exposes MaxSim's own ranking quality.
 
 Also recorded: clusters probed, query vectors, embedding ms/query, and median
-search ms, at `n_probes` 32 (production) and 256 (exhaustive). Significance is a
+search ms, at `n_probes` 32 and 256 (exhaustive). The default is now 64; the
+comparison between modes does not depend on it. Significance is a
 two-sided paired randomization test of per-query nDCG@10 vs `words`.
 
 | Dataset | Docs | Test queries | Query words (median / p90) | Queries > 32 words |
@@ -113,16 +118,13 @@ most of them.
    NFCorpus: 32 → 256 probes lifts nDCG@10 from 0.374 to 0.391 and candidate
    recall from 0.587 to 0.664, far more than any query-side choice.
 
-## What changed in the code
+## Consequences
 
-- `embed_query` sends one payload (the query) and returns it as both the
-  dense and the single sparse vector. `chunk_query`, `split_words` and
-  `ChunkBoundary` were removed; `chunking` is document-only.
-- The query-embedding cache stores only the whole-query vector. Chunking
-  settings no longer affect cached entries, so changing
-  `window_size`/`sliding_size` needs a corpus re-index but no cache clear.
-- `search()` still accepts several Pass-1 query vectors (general MaxSim); only
-  the production caller passes one.
+- The query-embedding cache holds one whole-query vector per query text, so
+  changing `window_size` / `sliding_size` needs a corpus re-index but no cache
+  clear.
+- `search()` still accepts several Pass-1 query vectors (general MaxSim), which
+  is what made this comparison possible; production passes one.
 
 ## Reproduce
 
@@ -133,5 +135,6 @@ MINNAL_EMBED_URL=http://localhost:8001 MINNAL_BEIR_DATASET=scifact MINNAL_BEIR_D
   cargo test -p minnal_db --all-features --release --lib beir_eval -- --ignored --nocapture
 ```
 
-The mode comparison used a temporary `query_chunking` switch, since removed;
-the committed harness evaluates the production pipeline only.
+The harness evaluates the production pipeline, which embeds queries whole. The
+`words` and `sentences` rows need a query-chunking switch that is not in the
+code, so reproducing them means adding one back.
