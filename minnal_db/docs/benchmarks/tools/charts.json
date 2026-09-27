@@ -1,10 +1,11 @@
 [
   {
     "file": "write.png",
-    "title": "bench_write \u2014 put latency by value size",
+    "title": "Durable write (put), by value size",
     "ylabel": "Mean latency, ms",
     "unit": "ms",
     "scale": "linear",
+    "zero_based": true,
     "cases": [
       "write_put/.*"
     ],
@@ -12,658 +13,349 @@
       [
         "^write_put/value_size/",
         ""
-      ]
-    ],
-    "zero_based": true
-  },
-  {
-    "file": "read_memtable.png",
-    "title": "bench_read \u2014 get latency from the in-memory table, by value size",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "ylink": "read",
-    "cases": [
-      "read_get/memtable_value_size/.*",
-      "read_get_miss/memtable"
-    ],
-    "relabel": [
-      [
-        "^read_get/memtable_value_size/",
-        ""
       ],
       [
-        "^read_get_miss/memtable",
-        "miss"
+        "^128B$",
+        "128 B value"
+      ],
+      [
+        "^4096B$",
+        "4 KiB value"
+      ],
+      [
+        "^65536B$",
+        "64 KiB value"
       ]
     ]
   },
   {
-    "file": "read_l1.png",
-    "title": "bench_read \u2014 get latency from the on-disk SSTable, by value size",
-    "ylabel": "Mean latency, us (log scale)",
+    "file": "read.png",
+    "title": "Point read (get), in memory against on disk",
+    "ylabel": "Mean latency, µs",
     "unit": "us",
-    "scale": "log",
-    "ylink": "read",
-    "cases": [
-      "read_get/l1_value_size/.*",
-      "read_get_miss/l1"
-    ],
-    "relabel": [
-      [
-        "^read_get/l1_value_size/",
-        ""
-      ],
-      [
-        "^read_get_miss/l1",
-        "miss"
-      ]
-    ]
-  },
-  {
-    "file": "merge_writes.png",
-    "title": "bench_merge \u2014 the durable CRUD operations (every one an fsync)",
-    "ylabel": "Mean latency, ms",
-    "unit": "ms",
     "scale": "linear",
+    "zero_based": true,
     "cases": [
-      "crud/put_.*",
-      "crud/delete_.*",
-      "crud/merge_.*",
-      "crud/get_then_put_.*"
+      "read_get/.*",
+      "read_get_miss/.*"
     ],
+    "group_by": "(\\d+B$|miss)",
+    "color_by": "(memtable|l1)",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk"
+    },
     "relabel": [
       [
-        "^crud/",
+        "^read_get/\\w+_value_size/",
         ""
       ],
       [
-        "^(put|delete)_(\\d+\\w*)$",
-        "\\1/\\2"
+        "^read_get_miss/\\w+$",
+        "key not/found"
       ],
       [
-        "^merge_(counter|sorted_set)_(\\w+)$",
-        "merge/\\1/\\2"
+        "^128B$",
+        "128 B/value"
       ],
       [
-        "^get_then_put_sorted_set_(\\w+)$",
-        "get_then_put/sorted_set/\\1"
+        "^4096B$",
+        "4 KiB/value"
+      ],
+      [
+        "^65536B$",
+        "64 KiB/value"
       ]
     ]
   },
   {
-    "file": "merge_components.png",
-    "title": "bench_merge \u2014 what merge adds over a blind put (no fsync)",
-    "ylabel": "Mean latency, ns (log scale)",
-    "unit": "ns",
-    "scale": "log",
-    "cases": [
-      "crud/get_2KiB",
-      "stripe/.*",
-      "closure/.*"
-    ],
-    "relabel": [
-      [
-        "^crud/get_2KiB",
-        "get (the extra read)"
-      ],
-      [
-        "^stripe/hash_and_lock_uncontended",
-        "key stripe"
-      ],
-      [
-        "^closure/",
-        "closure: "
-      ]
-    ]
-  },
-  {
-    "file": "sstable_hits.png",
-    "title": "bench_sstable_lookup \u2014 point lookup hits by tier and key count",
-    "ylabel": "Mean latency, us (log scale)",
+    "file": "lookup_hits.png",
+    "title": "Reading a key that exists, as the store grows",
+    "ylabel": "Mean latency, µs",
     "unit": "us",
-    "scale": "log",
+    "scale": "linear",
+    "zero_based": true,
     "cases": [
       "sstable_lookup/.*_hit/.*"
     ],
-    "group_by": "/(memtable|l1|mixed)",
+    "group_by": "/(memtable|l1|mixed)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk",
+      "mixed": "alternating memory / disk"
+    },
     "relabel": [
       [
-        "^sstable_lookup/",
+        "^sstable_lookup/\\w+_hit/",
         ""
       ],
       [
-        "_hit/",
-        "/"
+        "(\\d+)000$",
+        "\\1k"
+      ],
+      [
+        "$",
+        "/keys"
       ]
     ]
   },
   {
-    "file": "sstable_misses.png",
-    "title": "bench_sstable_lookup \u2014 point lookup misses by tier and key count",
-    "ylabel": "Mean latency, us",
+    "file": "lookup_misses.png",
+    "title": "Reading a key that does not exist, as the store grows",
+    "ylabel": "Mean latency, µs",
     "unit": "us",
     "scale": "linear",
+    "zero_based": true,
     "cases": [
       "sstable_lookup/.*_miss/.*"
     ],
-    "group_by": "/(memtable|l1|mixed)",
+    "group_by": "/(memtable|l1|mixed)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk",
+      "mixed": "alternating memory / disk"
+    },
     "relabel": [
       [
-        "^sstable_lookup/",
+        "^sstable_lookup/\\w+_miss/",
         ""
       ],
       [
-        "_miss/",
-        "/"
+        "(\\d+)000$",
+        "\\1k"
+      ],
+      [
+        "$",
+        "/keys"
       ]
     ]
   },
   {
     "file": "scan_prefix.png",
-    "title": "bench_scan \u2014 prefix scan by tier, matching keys and value size",
-    "ylabel": "Mean latency, us (log scale)",
+    "title": "Prefix scan, by number of matching keys",
+    "ylabel": "Mean latency, µs (log scale)",
     "unit": "us",
     "scale": "log",
-    "ylink": "scan_multi",
+    "cases": [
+      "scan_prefix/.*_128B"
+    ],
+    "group_by": "_(\\d+)_keys",
+    "color_by": "/(memtable|l1)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk"
+    },
     "relabel": [
       [
-        "^scan_prefix/",
-        ""
+        "^scan_prefix/\\w+?_(\\d+)_keys_128B$",
+        "\\1"
       ],
       [
-        "_(\\d+)_keys_",
-        "/\\1keys/"
+        "(\\d+)000$",
+        "\\1k"
+      ],
+      [
+        "$",
+        "/keys"
       ]
-    ],
-    "cases": [
-      "scan_prefix/.*"
     ]
   },
   {
     "file": "scan_range.png",
-    "title": "bench_scan \u2014 range scan by tier and result count",
-    "ylabel": "Mean latency, us (log scale)",
+    "title": "Range scan, by number of results",
+    "ylabel": "Mean latency, µs",
     "unit": "us",
-    "scale": "log",
-    "ylink": "scan_multi",
+    "scale": "linear",
+    "zero_based": true,
+    "cases": [
+      "scan_range/.*"
+    ],
+    "group_by": "/(\\d+)$",
+    "color_by": "/(memtable|l1)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk"
+    },
     "relabel": [
       [
-        "^scan_range/",
+        "^scan_range/\\w+_result_count/",
         ""
       ],
       [
-        "_result_count/",
-        "/"
+        "(\\d+)000$",
+        "\\1k"
+      ],
+      [
+        "$",
+        "/results"
       ]
-    ],
-    "cases": [
-      "scan_range/.*"
     ]
   },
   {
     "file": "scan_cursor.png",
-    "title": "bench_scan \u2014 cursor pagination by page size and tier",
-    "ylabel": "Mean latency, us",
+    "title": "One page of a cursor-paginated scan, by page size",
+    "ylabel": "Mean latency, µs",
     "unit": "us",
     "scale": "linear",
+    "zero_based": true,
+    "cases": [
+      "scan_cursor/.*"
+    ],
+    "group_by": "/(\\d+)$",
+    "color_by": "/(memtable|l1)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk"
+    },
     "relabel": [
       [
-        "^scan_cursor/",
+        "^scan_cursor/\\w+_page_size/",
         ""
       ],
       [
-        "_page_size/",
-        "/"
+        "(\\d+)000$",
+        "\\1k"
+      ],
+      [
+        "$",
+        "/per page"
       ]
-    ],
-    "cases": [
-      "scan_cursor/.*"
     ]
   },
   {
     "file": "scan_iter.png",
-    "title": "bench_scan \u2014 full async iteration by value size and tier",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
+    "title": "Reading all 2,000 keys with their values",
+    "ylabel": "Mean latency, ms",
+    "unit": "ms",
     "scale": "linear",
-    "relabel": [
-      [
-        "^scan_iter/",
-        ""
-      ],
-      [
-        "_value_size/",
-        "/"
-      ]
-    ],
+    "zero_based": true,
     "cases": [
       "scan_iter/.*"
-    ]
-  },
-  {
-    "file": "mixed.png",
-    "title": "bench_mixed \u2014 blended read/write workload, per-operation cost",
-    "ylabel": "Mean latency per op, ms",
-    "unit": "ms",
-    "scale": "linear",
-    "cases": [
-      "mixed/.*"
     ],
-    "group_by": "/(memtable|l1|mixed)",
+    "group_by": "/(\\d+B)$",
+    "color_by": "/(memtable|l1)_",
+    "legend": {
+      "memtable": "in memory",
+      "l1": "on disk"
+    },
     "relabel": [
       [
-        "^mixed/",
+        "^scan_iter/\\w+_value_size/",
         ""
       ],
       [
-        "pct_read_",
-        "% read / "
+        "^128B$",
+        "128 B/values"
       ],
       [
-        "pct_write",
-        "% write"
+        "^4096B$",
+        "4 KiB/values"
       ]
-    ],
-    "zero_based": true
+    ]
   },
   {
-    "file": "wal_durable_writes.png",
-    "title": "bench_wal \u2014 durable write cost: fsync'd append, full put, namespace tagging",
-    "ylabel": "Mean latency, ms",
-    "unit": "ms",
-    "scale": "linear",
+    "file": "wal_fsync.png",
+    "title": "One write-ahead log append, with and without the fsync",
+    "ylabel": "Mean latency, µs (log scale)",
+    "unit": "us",
+    "scale": "log",
     "cases": [
       "wal_append_fsync/.*",
-      "wal_full_put_throughput/.*",
-      "wal_namespace_overhead/.*"
-    ],
-    "relabel": [
-      [
-        "^wal_",
-        ""
-      ],
-      [
-        "^append_fsync/value_size/",
-        "append_fsync/"
-      ],
-      [
-        "^full_put_throughput/db_put_with_wal",
-        "full_put/end_to_end"
-      ],
-      [
-        "^namespace_overhead/",
-        "namespace/"
-      ]
-    ],
-    "zero_based": true
-  },
-  {
-    "file": "wal_unsynced_appends.png",
-    "title": "bench_wal \u2014 the same append with the fsync omitted",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "cases": [
       "wal_append_no_fsync/.*"
     ],
+    "group_by": "/(\\d+B)$",
+    "color_by": "^wal_append_(fsync|no_fsync)/",
+    "legend": {
+      "fsync": "synced to disk (every real write)",
+      "no_fsync": "not synced (for comparison)"
+    },
     "relabel": [
       [
-        "^wal_append_no_fsync/value_size/",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "wal_serialization.png",
-    "title": "bench_wal \u2014 WAL entry serialization round-trip",
-    "ylabel": "Mean latency, ns (log scale)",
-    "unit": "ns",
-    "scale": "log",
-    "cases": [
-      "wal_serialization/.*"
-    ],
-    "relabel": [
-      [
-        "^wal_serialization/",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "wal_scan.png",
-    "title": "bench_wal \u2014 recovery scan",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "cases": [
-      "wal_scan/.*"
-    ],
-    "relabel": [
-      [
-        "^wal_scan/",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "typed_writes.png",
-    "title": "bench_typed \u2014 typed (rkyv) writes",
-    "ylabel": "Mean latency, ms",
-    "unit": "ms",
-    "scale": "linear",
-    "cases": [
-      "typed_put/.*",
-      "typed_delete/.*"
-    ],
-    "relabel": [
-      [
-        "^typed_",
+        "^wal_append_\\w+/value_size/",
         ""
       ],
       [
-        "/value_size/",
-        "/"
+        "^128B$",
+        "128 B/value"
+      ],
+      [
+        "^4096B$",
+        "4 KiB/value"
+      ],
+      [
+        "^65536B$",
+        "64 KiB/value"
       ]
-    ],
-    "zero_based": true
-  },
-  {
-    "file": "typed_point_reads.png",
-    "title": "bench_typed \u2014 typed (rkyv) point reads by tier and value size",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "cases": [
-      "typed_get/.*"
-    ],
-    "group_by": "/(memtable|l1|mixed)",
-    "relabel": [
-      [
-        "^typed_get/",
-        ""
-      ],
-      [
-        "_value_size/",
-        "/"
-      ]
-    ]
-  },
-  {
-    "file": "typed_iter.png",
-    "title": "bench_typed \u2014 typed (rkyv) full async iteration by tier",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "ylink": "typed_multikey",
-    "relabel": [
-      [
-        "^typed_iter/",
-        ""
-      ],
-      [
-        "_keys/",
-        "/"
-      ],
-      [
-        "_result_count/",
-        "/"
-      ]
-    ],
-    "cases": [
-      "typed_iter/.*"
-    ]
-  },
-  {
-    "file": "typed_keys.png",
-    "title": "bench_typed \u2014 typed (rkyv) keys-only fetch by tier",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "ylink": "typed_multikey",
-    "relabel": [
-      [
-        "^typed_keys/",
-        ""
-      ],
-      [
-        "_keys/",
-        "/"
-      ],
-      [
-        "_result_count/",
-        "/"
-      ]
-    ],
-    "cases": [
-      "typed_keys/.*"
-    ]
-  },
-  {
-    "file": "typed_range.png",
-    "title": "bench_typed \u2014 typed (rkyv) range scan by tier",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "ylink": "typed_multikey",
-    "relabel": [
-      [
-        "^typed_range/",
-        ""
-      ],
-      [
-        "_keys/",
-        "/"
-      ],
-      [
-        "_result_count/",
-        "/"
-      ]
-    ],
-    "cases": [
-      "typed_range/.*"
-    ]
-  },
-  {
-    "file": "typed_scan_prefix.png",
-    "title": "bench_typed \u2014 typed (rkyv) prefix scan by tier",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "ylink": "typed_multikey",
-    "relabel": [
-      [
-        "^typed_scan_prefix/",
-        ""
-      ],
-      [
-        "_keys/",
-        "/"
-      ],
-      [
-        "_result_count/",
-        "/"
-      ]
-    ],
-    "cases": [
-      "typed_scan_prefix/.*"
     ]
   },
   {
     "file": "predicate.png",
-    "title": "bench_predicate \u2014 field-index predicate evaluation",
-    "ylabel": "Mean latency, us (log scale)",
+    "title": "Field-index query over 100,000 rows, by query",
+    "ylabel": "Mean latency, µs (log scale)",
     "unit": "us",
     "scale": "log",
     "cases": [
-      "predicate_.*"
+      "predicate_str_eq",
+      "predicate_compound_and",
+      "predicate_compound_or",
+      "predicate_int_range",
+      "predicate_three_way_and",
+      "predicate_selectivity/AND/6pct"
     ],
+    "color_by": {
+      "range": "int_range|three_way_and|6pct",
+      "equality": "."
+    },
+    "legend": {
+      "equality": "equality tests only",
+      "range": "includes an age range"
+    },
     "relabel": [
       [
-        "^predicate_",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "bitmap_page_at_offset.png",
-    "title": "bench_bitmap_paging \u2014 one page fetched at increasing offsets",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "cases": [
-      "bitmap_page_at_offset/.*"
-    ],
-    "relabel": [
-      [
-        "^bitmap_page_at_offset/",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "bitmap_full_walk.png",
-    "title": "bench_bitmap_paging \u2014 walking every page of the result set",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "cases": [
-      "bitmap_full_paged_walk/.*"
-    ],
-    "relabel": [
-      [
-        "^bitmap_full_paged_walk/",
-        ""
-      ]
-    ]
-  },
-  {
-    "file": "semantic_scoring.png",
-    "title": "bench_distance_estimation \u2014 candidate scoring and cluster selection",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "cases": [
-      "first_pass_single_bit/.*",
-      "second_pass_multi_bit/.*"
-    ],
-    "relabel": [
-      [
-        "^first_pass_single_bit/",
-        "first_pass/"
+        "^predicate_str_eq$",
+        "status = a"
       ],
       [
-        "^second_pass_multi_bit/",
-        "second_pass/"
-      ]
-    ]
-  },
-  {
-    "file": "semantic_cluster_selection.png",
-    "title": "bench_distance_estimation \u2014 choosing which clusters to search",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "relabel": [
-      [
-        "^top_n_cluster_selection/",
-        ""
-      ]
-    ],
-    "cases": [
-      "top_n_cluster_selection/.*"
-    ]
-  },
-  {
-    "file": "semantic_cluster_assignment.png",
-    "title": "bench_distance_estimation \u2014 assigning a query's chunks to clusters",
-    "ylabel": "Mean latency, us (log scale)",
-    "unit": "us",
-    "scale": "log",
-    "relabel": [
-      [
-        "^coarse_assignment/",
-        ""
-      ]
-    ],
-    "cases": [
-      "coarse_assignment/.*"
-    ]
-  },
-  {
-    "file": "semantic_pass1_layers_4.png",
-    "title": "bench_distance_estimation \u2014 first pass in cumulative layers, 4 query vectors",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "zero_based": true,
-    "relabel": [
-      [
-        "^pass1_scoring/",
-        ""
+        "^predicate_compound_and$",
+        "status = a/AND active"
       ],
       [
-        "/4$",
-        ""
-      ]
-    ],
-    "cases": [
-      "pass1_scoring/.*/4$"
-    ]
-  },
-  {
-    "file": "semantic_pass1_layers_40.png",
-    "title": "bench_distance_estimation \u2014 first pass in cumulative layers, 40 query vectors",
-    "ylabel": "Mean latency, us",
-    "unit": "us",
-    "scale": "linear",
-    "zero_based": true,
-    "relabel": [
-      [
-        "^pass1_scoring/",
-        ""
+        "^predicate_compound_or$",
+        "status = a/OR status = b"
       ],
       [
-        "/40$",
-        ""
+        "^predicate_int_range$",
+        "age 30-50"
+      ],
+      [
+        "^predicate_three_way_and$",
+        "status = a/AND active/AND age >= 25"
+      ],
+      [
+        "^predicate_selectivity/AND/6pct$",
+        "status = a/AND active/AND age >= 50"
       ]
-    ],
-    "cases": [
-      "pass1_scoring/.*/40$"
     ]
   },
   {
-    "file": "semantic_query_length.png",
-    "title": "bench_distance_estimation \u2014 complete search as the query grows",
+    "file": "semantic_search.png",
+    "title": "Semantic search over 5,000 documents, by chunks per document",
     "ylabel": "Mean latency, ms",
     "unit": "ms",
     "scale": "linear",
-    "ylink": "semantic_e2e",
-    "relabel": [
-      [
-        "^end_to_end_search/",
-        "query_chunks/"
-      ]
-    ],
-    "cases": [
-      "end_to_end_search/.*"
-    ]
-  },
-  {
-    "file": "semantic_chunks_per_doc.png",
-    "title": "bench_distance_estimation \u2014 complete search as documents gain chunks",
-    "ylabel": "Mean latency, ms",
-    "unit": "ms",
-    "scale": "linear",
-    "ylink": "semantic_e2e",
-    "relabel": [
-      [
-        "^end_to_end_multichunk/chunks_per_doc/",
-        "chunks_per_doc/"
-      ]
-    ],
+    "zero_based": true,
     "cases": [
       "end_to_end_multichunk/.*"
+    ],
+    "relabel": [
+      [
+        "^end_to_end_multichunk/chunks_per_doc/1$",
+        "1 chunk/per document"
+      ],
+      [
+        "^end_to_end_multichunk/chunks_per_doc/(\\d+)$",
+        "\\1 chunks/per document"
+      ]
     ]
   }
 ]

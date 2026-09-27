@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Render criterion means as gnuplot bar charts, matching the existing
-minnal_db/docs/benchmarks/*.png style (log-scale y, rotated labels).
+"""Render Criterion means as the gnuplot bar charts in minnal_db/docs/benchmarks/.
 
 Usage: plot.py <tsv> <outdir> <chartspec.json>
 
@@ -8,6 +7,9 @@ chartspec.json: [{"file": "write.png", "title": "...", "ylabel": "...",
                   "unit": "us"|"ns"|"ms", "scale": "log"|"linear",
                   "group_by": "<regex with one capture group>",
                   "ylink": "<name>",
+                  "color_by": "<regex with one capture group>"
+                              | {"<category>": "<regex>", ...},
+                  "legend": {"<captured>": "<legend text>", ...},
                   "cases": ["<regex>", ...]}]
 
 Bars are sorted ASCENDING BY VALUE, whatever order the patterns are written in.
@@ -22,6 +24,17 @@ technically ascending.
 `ylink` gives every chart sharing that name one common y-range, so charts split
 apart for readability can still be compared bar-height to bar-height. Splitting
 without it silently rescales each half and invites the wrong conclusion.
+
+`color_by` colours each bar by the captured substring and draws a legend, so
+the compared categories (in memory against on disk, say) read by colour rather
+than by decoding labels. It defaults to `group_by`. As a map of category to
+regex, the first regex that matches a benchmark name picks its category. `legend` maps a captured
+value to its legend text, and its order fixes the colour slots: list the same
+categories in the same order on every chart and each keeps one colour
+throughout the report. Colours are the first three slots of a palette validated
+for colour-blind separation, so a chart can have at most three categories.
+
+Every bar carries its value, because a PNG has no hover to read it from.
 
 `scale` defaults to "log"; use "linear" for any chart whose bars share a
 magnitude, which is the only way a few-percent spread shows up. A chart spanning
@@ -104,6 +117,32 @@ for chart in charts:
     # finding. Ties keep a stable name order so redeploys don't reshuffle.
     picked = sorted(set(picked), key=lambda n: (rows[n], n))
 
+    PALETTE = ["#2a78d6", "#eb6834", "#1baf7a"]
+    # `color_by` is a regex whose capture names the category, or a map of
+    # category -> regex where the first regex to match a benchmark name wins.
+    cby = chart.get("color_by", chart.get("group_by"))
+    legend = chart.get("legend", {})
+
+    def category_of(n):
+        if isinstance(cby, dict):
+            return next((cat for cat, rx in cby.items() if re.search(rx, n)), "")
+        m = re.search(cby, n)
+        return m.group(1) if m else ""
+
+    # The legend map fixes each category's colour slot, so a category keeps its
+    # colour on every chart even when a chart shows only some of them.
+    slots = list(legend)
+    series = []  # categories present in this chart, in slot order
+    if cby:
+        found = {category_of(n) for n in picked}
+        slots += sorted(k for k in found if k not in slots)
+        series = [k for k in slots if k in found]
+        if len(slots) > len(PALETTE):
+            sys.exit(f"{chart['file']}: {len(slots)} colour categories, palette has {len(PALETTE)}")
+
+    def colour_of(n):
+        return slots.index(category_of(n)) if cby else 0
+
     if chart.get("group_by"):
         grx = re.compile(chart["group_by"])
         def group_of(n):
@@ -112,11 +151,20 @@ for chart in charts:
         groups = {}
         for n in picked:
             groups.setdefault(group_of(n), []).append(n)
-        # Order the groups by median so the chart still reads left-to-right
-        # cheapest-to-dearest at the group level, while each group stays whole.
+        # Order the groups by their lower median so the chart still reads
+        # left-to-right cheapest-to-dearest at the group level, while each group
+        # stays whole.
         def median(vals):
             v = sorted(rows[n] for n in vals)
-            return v[len(v) // 2]
+            return v[(len(v) - 1) // 2]
+        # When colour marks a different dimension than the grouping (tier within
+        # a key count, say), bars inside a group follow the legend order, so
+        # "in memory" always stands left of "on disk" and a pair reads the same
+        # way everywhere. An inversion then shows as a shorter right-hand bar
+        # instead of silently swapping the pair.
+        if cby and cby != chart.get("group_by"):
+            for names in groups.values():
+                names.sort(key=lambda n: (colour_of(n), rows[n], n))
         picked = [n for _, names in sorted(groups.items(), key=lambda kv: median(kv[1])) for n in names]
 
     span = rows[picked[-1]] / rows[picked[0]] if picked and rows[picked[0]] else 0
@@ -124,6 +172,9 @@ for chart in charts:
         print(f"WARN {chart['file']}: {span:.0f}x span on a linear scale", file=sys.stderr)
     if span > 1000:
         print(f"WARN {chart['file']}: {span:.0f}x span — consider splitting by magnitude band", file=sys.stderr)
+
+    def fmt(v):
+        return f"{v:.3g}" if v < 1000 else f"{v:,.0f}"
 
     label = chart.get("strip", "")
     relabel = chart.get("relabel", [])
@@ -138,7 +189,7 @@ for chart in charts:
                 short = re.sub(label, "", short)
             short = short or name
             labels.append(short)
-            f.write(f'{i}\t{rows[name] / div:.6g}\t"{short}"\n')
+            f.write(f'{i}\t{rows[name] / div:.6g}\t"{short}"\t{colour_of(name)}\t"{fmt(rows[name] / div)}"\n')
 
     # Linear is the default for a chart whose bars share a magnitude: it is the
     # only way a few-percent spread is visible at all. Log is for charts that
@@ -161,7 +212,7 @@ for chart in charts:
             # The finding is "no meaningful difference", and a truncated axis
             # would turn sub-1% noise into a staircase the reader reads as a
             # trend. Anchoring at zero makes equal values look equal.
-            yrange = f"[0:{hi * 1.15:.6g}]"
+            yrange = f"[0:{hi * 1.18:.6g}]"
         else:
             pad = (hi - lo) * 0.15 or hi * 0.05
             yrange = f"[{max(0, lo - pad):.6g}:{hi + pad:.6g}]"
@@ -188,17 +239,32 @@ for chart in charts:
         xtics_rotate = "set xtics scale 0 noenhanced"
         with dat.open("w") as f:
             for i, lbl in enumerate(labels):
-                f.write(f'{i}\t{rows[picked[i]] / div:.6g}\t"{lbl.replace("/", chr(92) + "n")}"\n')
+                v = rows[picked[i]] / div
+                f.write(f'{i}\t{v:.6g}\t"{lbl.replace("/", chr(92) + "n")}"\t{colour_of(picked[i])}\t"{fmt(v)}"\n')
     else:
         longest = max(len(lbl) for lbl in labels)
         bmargin = max(4, min(24, round(longest * 0.72)))
         xtics_rotate = "set xtics rotate by -90 scale 0 noenhanced"
 
+    if series:
+        key = 'set key at graph 0.5, 1.01 center bottom horizontal reverse Left samplen 2 width 2\nset tmargin 5.5'
+        legend_entries = "".join(
+            f', \\\n     keyentry with boxes fill solid 1.0 border rgb "black" lc rgb "{PALETTE[i]}" title "{legend.get(k, k)}"'
+            for k in series for i in [slots.index(k)])
+    else:
+        key, legend_entries = "set key off", ""
+    # Bar colour comes from column 4 (the series index) through a palette whose
+    # integer points are exactly the series colours.
+    palette_defs = (f"set palette defined ({', '.join(f'{i} \"{c}\"' for i, c in enumerate(PALETTE))})\n"
+                    f"set cbrange [0:{len(PALETTE) - 1}]\nunset colorbox")
+
+    title_offset = "offset 0,1.2" if series else ""
+
     gp = work / (chart["file"].replace(".png", ".gp"))
     gp.write_text(f"""
 set terminal pngcairo size 960,820 font "DejaVu Sans,10"
 set output "{outdir / chart["file"]}"
-set title "{chart["title"]}" font "DejaVu Sans,12 bold" noenhanced
+set title "{chart["title"]}" font "DejaVu Sans,12 bold" noenhanced {title_offset}
 set ylabel "{chart["ylabel"]}"
 set style data histograms
 set style fill solid 1.0 border rgb "black"
@@ -207,10 +273,12 @@ set boxwidth 0.7
 {ytics}
 set grid ytics lc rgb "#dddddd"
 {xtics_rotate}
-set key off
+{key}
 set bmargin {bmargin}
 set yrange {yrange}
-plot "{dat}" using 2:xtic(3) with boxes lc rgb "#6a8fc4"
+{palette_defs}
+plot "{dat}" using 1:2:4:xtic(3) with boxes lc palette notitle, \
+     "{dat}" using 1:2:5 with labels offset 0,0.8 font "DejaVu Sans,9" notitle{legend_entries}
 """)
     subprocess.run(["gnuplot", str(gp)], check=True)
     print(f"wrote {outdir / chart['file']} ({len(picked)} bars, {span:.0f}x span, {chart.get('scale','log')})")
