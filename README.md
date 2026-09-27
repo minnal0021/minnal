@@ -2,14 +2,6 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this software except in compliance with the License. You may obtain a copy of the License at:
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
-
----
-
 **minnal** (மின்னல்) means *lightning* in Tamil.
 
 Minnal is a layered document database written in Rust. It combines a high-performance LSM + value-log key-value engine with a JSON document layer, RoaringBitmap field indexing, and quantised approximate nearest-neighbour semantic search.
@@ -43,6 +35,7 @@ For a hands-on server walkthrough — build, bulk-load, and every endpoint — s
 - [Quickstart & Usage](#quickstart--usage)
 - [Repository Structure](#repository-structure)
 - [Acknowledgements](#acknowledgements)
+- [License](#license)
 
 ---
 
@@ -105,9 +98,9 @@ Key design choices:
 | Property | Detail |
 |---|---|
 | Key storage | Single skip-list memtable → sharded L0/L1 SSTables (per-bucket LSM) |
-| Value storage | Sharded append-only value log (configurable page size, 64 MiB default) |
-| Durability | Write-ahead log (WAL) with configurable fsync cadence |
-| Concurrency | A reader/writer lock per bucket, plus lock-free reclamation so readers never block a cleanup pass |
+| Value storage | Sharded append-only value log, split into segment files (256 MiB by default) |
+| Durability | Write-ahead log (WAL), fsynced on every write before the call returns |
+| Concurrency | Reads run in parallel; value-log writes lock one bucket; every write takes the one WAL lock for its fsync; lock-free reclamation so readers never block a cleanup pass |
 | Serialization | Compact binary encoding for typed values, with a checksum on every record |
 | TTL | Native per-record expiry tracked in the value log |
 | Namespaces | Logical isolation within a single DB; each namespace has its own LSM shards and value-log shards |
@@ -153,7 +146,7 @@ multi-key transaction primitive.
 
 #### Prefix scan with SIMD acceleration
 
-`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. The full API is available on `Db`, `Namespace`, `AsyncDb`, and `AsyncNamespace`, including a zero-copy typed variant for callers who store typed values.
+`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. The full API is available on `Db`, `Namespace`, `AsyncDb`, and `AsyncNamespace`, including a typed variant for callers who store typed values.
 
 Three layers of acceleration keep prefix scans fast even as data accumulates across layers:
 
@@ -167,17 +160,17 @@ Each SSTable file records the smallest and largest key prefix it contains. Befor
 
 **3 — SIMD key comparison in skip-list traversal**
 
-When two keys share the same 8-byte prefix, the skip list falls back to a full byte-by-byte comparison to resolve the order — and that comparison itself is SIMD-accelerated on x86_64 (processing many bytes per CPU cycle instead of one). On Apple Silicon this particular comparison currently runs as a plain, non-SIMD loop; it's still correct, just not vectorised yet. (SIMD acceleration elsewhere in the engine, such as the field-index bitmap operations and vector search, does cover Apple Silicon — see [SIMD coverage by architecture](minnal_db/README.md#simd-coverage-by-architecture) for the full breakdown.)
+When two keys share the same 8-byte prefix, the skip list falls back to a full byte-by-byte comparison to resolve the order — and that comparison itself is SIMD-accelerated, with AVX-512/AVX2 on x86_64 and NEON on Apple Silicon, comparing 16 or more bytes per step instead of one. See [SIMD coverage by architecture](minnal_db/README.md#simd-coverage-by-architecture) for the full breakdown.
 
 The SIMD paths are also used for all ordered key lookups and range scans in the skip list, not just prefix scans, so the benefit extends across all read paths.
 
 ### Layer 2 — Field Indexing (RoaringBitmap, part of `kv-store`)
 
-The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. Field indexing is built into the engine (the folded `index` module): fast predicate queries over document fields.
+The KV engine can find a document by its primary key, but answering a question like "which documents have `status = active` and `age >= 18`?" needs a secondary index. Field indexing is built into the engine (the `index` module): fast predicate queries over document fields.
 
-Each indexed field maintains a `FieldIndex` — a persistent hash table that maps field values to `RoaringBitmap` sets of document row IDs. The bitmaps live in memory-mapped files, so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated on both x86_64 and Apple Silicon. A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
+Each indexed field maintains a `FieldIndex` — an ordered map from each field value to a `RoaringBitmap` of the row IDs holding it. Being ordered is what lets a range predicate (`age >= 18`) walk just the values in range. The bitmaps live in memory-mapped files, so the OS page cache handles warm and cold access naturally, and the bitwise `AND`/`OR`/`NOT` operations that combine them are SIMD-accelerated on both x86_64 and Apple Silicon. A query string such as `status = "active" AND age >= 18` is turned into an AST by a small lexer and parser, then evaluated against the live indices. Three value types are supported — `str`, `int`, and `bool`.
 
-Index writes are checkpointed against WAL offsets, so a crash partway through a rebuild resumes exactly where it left off rather than starting over.
+Each field index is updated in memory on every write and checkpointed to disk every couple of seconds, recording the WAL position it reflects. After a crash, the index replays the WAL from that position, so it never has to be rebuilt from scratch.
 
 For the full design — how field attributes are created, updated, stored, and recovered after a crash — see [`Index-Architecture.md`](minnal_db/src/index/Index-Architecture.md).
 
@@ -274,7 +267,7 @@ The engine, field indexing, and vector search are independent capabilities — o
 **Document stores (`DocStoreSchema`)**
 
 Each document namespace declares:
-- A primary key type (`uuid`, `u64`, or `u128`)
+- A primary key type (`uuid`, `u64`, `u128`, or `str` of up to 50 bytes)
 - Up to 5 field indices (typed: `str`, `int`, or `bool`)
 - Any number of non-indexed attribute declarations
 - Whether semantic search is enabled and which fields to embed
@@ -329,7 +322,7 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **Quantisation error bounds** | Per-document `error_bound` field gives a theoretical guarantee on the dot-product estimate. |
 | **Filtered semantic search** | Combine ANN scoring with an index predicate in a single request. |
 | **Schema amendments** | Non-indexed attributes can be added, updated, or removed at any time without downtime. |
-| **Three doc key types** | `uuid`, `u64`, `u128` — stored big-endian so range scans return ascending order. |
+| **Four doc key types** | `uuid`, `u64`, `u128` (stored big-endian so range scans return ascending order), and `str` (up to 50 bytes, stored as-is so byte order is string order). |
 | **KV store** | Schema-lite namespaces (`store_type: "kv"`, data under `/stores/{ns}/kv`) for raw key-value data. Key types: `str`, `int`. Value types: `str`, `int`, `f32`, `vec_f32`. Range scan and prefix scan exposed via REST. Same durability guarantees as doc stores; no field indices. |
 | **JSONL bulk loader** | `minnal_tools bulk_load` streams arbitrarily large JSONL files into a namespace via the REST API — document stores by default, KV stores with `--kv` — optionally importing the store's schema first (`--schema`). |
 | **Self-contained core** | Storage, field indexing, vector quantisation, ANN search, and the server all run in a single Rust process. The **one** external dependency is the embedding service — and only when semantic search is enabled: embedding *generation* is delegated to an HTTP endpoint, while quantisation and search stay in-process. KV and document storage, field indexing, and predicate queries need nothing external. |
@@ -355,8 +348,8 @@ It is organised by how you run minnal and which store type you use:
 ## Repository Structure
 
 The workspace is a **single publishable library crate** (`minnal_db`, with the
-former `index`, `semantic_search`, and `minnal_doc_store` crates folded in as
-feature-gated modules) plus two binary crates.
+field index, semantic search and document store as feature-gated modules) plus
+two binary crates.
 
 ```
 minnal/
@@ -377,8 +370,8 @@ minnal/
 │   ├── docker/Dockerfile
 │   └── embedding_support/{gemma,qwen}/clusters.json  ← pre-computed IVF centroids (JSONL), one set per model
 ├── config/sample.toml      ← annotated reference configuration
-└── work/bin/               ← generated by release.sh (not committed)
-    ├── minnal_db_api        ├── minnal.toml    ├── start.sh    └── run_tool.sh
+└── work/bin/               ← generated by release.sh (not committed):
+                               minnal_db_api, minnal.toml, start.sh, run_tool.sh
 ```
 
 Feature selection (`kv-store` default, `doc-store`, `semantic-search`) and the
@@ -415,7 +408,7 @@ The reference C++ implementation of RaBitQ, which informed the multi-bit quantis
 
 ### RoaringBitmap
 
-The field indexing layer (the folded `index` module) uses Roaring Bitmaps as its compressed bitmap representation. Roaring Bitmaps partition a 32-bit integer space into 65 536 chunks and choose the most space-efficient container type (array, bitset, or run-length encoded) per chunk, giving excellent compression on both sparse and dense sets while keeping set operations fast.
+The field indexing layer (the `index` module) uses Roaring Bitmaps as its compressed bitmap representation. Roaring Bitmaps partition a 32-bit integer space into 65 536 chunks and choose the most space-efficient container type (array, bitset, or run-length encoded) per chunk, giving excellent compression on both sparse and dense sets while keeping set operations fast.
 
 > **Roaring Bitmaps: Implementation of an Optimized Software Library**
 > Daniel Lemire, Owen Kaser, Nathan Kurz, Luca Deri, Chris O'Hern, François Saint-Jacques, Gregory Ssi-Yan-Kai
@@ -425,3 +418,9 @@ The field indexing layer (the folded `index` module) uses Roaring Bitmaps as its
 The canonical Java reference implementation, which established the on-disk format and container selection heuristics, is available at:
 
 > https://github.com/RoaringBitmap/RoaringBitmap
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0). Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See [LICENSE](LICENSE) for the terms.

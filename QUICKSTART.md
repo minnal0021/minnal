@@ -145,8 +145,13 @@ curl -s -X POST http://localhost:8080/stores/jobs/query \
 # → {"results":[{"id":13354909,"doc":{...}},
 #               {"id":13354910,"doc":{...}},
 #               {"id":15120777,"doc":{...}}],
-#    "total":3,"page_no":1,"page_size":20}
+#    "page_no":1,"page_size":20,"total":3,"degraded_fields":[]}
 ```
+
+`degraded_fields` lists any index the query used that is known to be missing
+updates (after a crash, say). When it is non-empty, the results may be
+incomplete; the [admin index endpoints](minnal_db_api/README.md#admin-indices-api)
+report and repair it.
 
 > **Semantic search needs an external embedding service.** The schema above sets
 > `semantic_search_enabled: true`, but the actual embeddings are produced
@@ -230,7 +235,7 @@ max_capacity = 100_000         # skip-list capacity before flush
 num_buckets = 8                # value-log shards (fixed at DB creation)
 
 [sync]
-records_per_sync = 1_000       # WAL fsync cadence
+records_per_sync = 1_000       # value-log fsync cadence (the WAL is fsynced on every write)
 
 [thresholds]
 value_log_waste_threshold = 30.0   # GC when >30% of value-log is stale
@@ -245,11 +250,11 @@ ttl_cleanup_interval_secs    = 3_600
 segment_size_bytes = 67_108_864    # 64 MiB per WAL segment
 
 [value_log]
-page_size_bytes = 67_108_864       # 64 MiB per value-log page
+segment_size_bytes = 268_435_456   # 256 MiB per value-log segment file
 
 [vector_index]
 # Seconds to wait after a pass with at least one embedding failure before re-scanning.
-retry_wait_secs = 2
+retry_wait_secs = 5
 # Max embedding attempts per queue entry; exhausted entries need manual removal.
 max_retries = 5
 # Max concurrent embedding calls in flight at once (entries are round-robin across namespaces).
@@ -495,13 +500,17 @@ Each file is a JSON document with this structure:
       "name": "put_doc",
       "operation": "Put",
       "namespace_id": 3,
-      "key": "550e8400-e29b-41d4-a716-446655440000",
+      "key": "hex:550e8400e29b41d4a716446655440000",
       "value": { "name": "Alice", "status": "active" },
       "error": "..."
     }
   ]
 }
 ```
+
+Keys and values are written as nested JSON when they hold JSON, as a string when
+they hold other UTF-8 text, and as `hex:`-prefixed hex otherwise (a UUID key is
+16 binary bytes, so it appears as hex, as above).
 
 A user or operator can inspect these files and take corrective action — replay the
 missing writes via the REST API, delete the affected keys, or ignore them if the
