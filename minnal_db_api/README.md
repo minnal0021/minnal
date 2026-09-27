@@ -1396,6 +1396,24 @@ curl -X POST http://localhost:8080/admin/storage/gc
 
 ---
 
+#### `POST /admin/storage/gc/wal`
+
+Run WAL garbage collection now instead of waiting for the next tick. It deletes
+the WAL segments whose entries are all persisted to SSTables (never the segment
+being written), keeping any a field index still needs to replay.
+
+```bash
+curl -X POST http://localhost:8080/admin/storage/gc/wal
+# → {"bytes_reclaimed": 67108864, "unpersisted_entries": 12}
+```
+
+`bytes_reclaimed` is the size of the segment files deleted by this pass.
+`unpersisted_entries` is the number of WAL entries not yet persisted to an
+SSTable; their segments stay until a memtable flush persists them. If a WAL GC
+pass is already running, this one reclaims nothing and reports `0`.
+
+---
+
 #### `POST /admin/storage/compact`
 
 Trigger LSM compaction across all namespaces.
