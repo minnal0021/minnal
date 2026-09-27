@@ -112,7 +112,8 @@ curl -s \
 curl -s -X POST http://localhost:8080/stores/users/query \
   -H 'Content-Type: application/json' \
   -d '{"predicate": "status = \"active\" AND age >= 18"}'
-# → [{"id":"550e8400-...","doc":{"name":"Alice","status":"active","age":30}}]
+# → {"results":[{"id":"550e8400-e29b-41d4-a716-446655440000","doc":{"age":30,"name":"Alice","status":"active"}}],
+#    "page_no":1,"page_size":20,"total":1,"degraded_fields":[]}
 ```
 
 ---
@@ -186,7 +187,7 @@ listen_addr = "0.0.0.0:8080"
 # ── tuning (optional) ──────────────────────────────────────────────────────
 
 [sync]
-records_per_sync = 1000        # flush WAL after this many writes
+records_per_sync = 1000        # fsync the value log every N writes (the WAL is fsynced on every write)
 
 [scheduled_tasks]
 value_log_gc_interval_secs   = 60
@@ -207,7 +208,7 @@ num_buckets = 8                # value-log shards
 segment_size_bytes = 67108864  # 64 MiB per WAL segment
 
 [value_log]
-page_size_bytes = 67108864     # 64 MiB per value-log page
+segment_size_bytes = 268435456 # 256 MiB per value-log segment file
 
 [vector_index]
 retry_wait_secs = 2            # seconds to wait before retrying after an embedding failure
@@ -356,19 +357,23 @@ curl http://localhost:8080/stores
 [
   {
     "namespace": "users",
+    "ns_id": 3,
     "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
     "indices": [
       {"field": "status", "index_type": "str"},
       {"field": "age",    "index_type": "int"}
-    ]
+    ],
+    "semantic_search_enabled": false
   },
   {
     "namespace": "session-cache",
+    "ns_id": 5,
     "store_type": "kv",
     "key_type": "str",
-    "value_type": "str"
+    "value_type": "str",
+    "semantic_search_enabled": false
   }
 ]
 ```
@@ -390,6 +395,8 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 | `key_type`   | `uuid`/`u64`/`u128`/`str` | yes | Primary key type                |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
 | `attributes` | array            | no       | Non-indexed field declarations       |
+| `semantic_search_enabled` | bool | no      | Embed documents for semantic search (default `false`) |
+| `embedding_fields` | array of strings | with semantic search | The `str` fields whose text is embedded |
 
 **Index spec:**
 
@@ -450,6 +457,7 @@ curl http://localhost:8080/stores/users/schema
 ```json
 {
   "namespace": "users",
+  "ns_id": 3,
   "store_type": "doc",
   "key_type": "uuid",
   "indices": [
@@ -459,10 +467,12 @@ curl http://localhost:8080/stores/users/schema
   "attributes": [
     {"name": "email", "attr_type": "str", "description": "contact email"}
   ],
-  "semantic_search_enabled": false,
-  "embedding_fields": []
+  "semantic_search_enabled": false
 }
 ```
+
+`ns_id` is the engine's internal id for the namespace. `embedding_fields` appears
+when semantic search is enabled.
 
 Returns `404 Not Found` if the namespace does not exist.
 
@@ -557,7 +567,7 @@ List all active or recently completed field-index builds and the vector campaign
 curl http://localhost:8080/stores/users/indices
 ```
 
-Returns an array of `IndexBuildSnapshot` objects. Use `GET /admin/indices/{ns}/progress` for the live monitoring view including queue depth.
+Returns an array of build-progress entries, in the same shape as `attribute_builds` in [`GET /admin/indices/progress`](#get-adminindicesprogress). It is empty when no build has run since the server started. Use `GET /admin/indices/{ns}/progress` for the monitoring view that also includes the vector queue.
 
 ---
 
@@ -749,9 +759,15 @@ Response — `{id, doc}` pairs plus the pagination envelope:
   ],
   "page_no": 1,
   "page_size": 5,
-  "total": 1
+  "total": 1,
+  "degraded_fields": []
 }
 ```
+
+`degraded_fields` names any index this predicate used that is known to be
+missing updates, for example after a crash that outran the index's WAL
+retention. When it is non-empty the results may be incomplete: check
+[`GET /admin/indices/{ns}/health`](#get-adminindicesnshealth) and repair the field.
 
 ---
 
@@ -832,7 +848,8 @@ curl -X POST http://localhost:8080/stores/profiles/semantic-search/filtered \
   }'
 ```
 
-The response shape is identical to the unfiltered endpoint.
+The response has the same shape as the unfiltered endpoint, plus
+`degraded_fields` as in [`POST /stores/{ns}/query`](#post-storesnsquery).
 
 ---
 
@@ -1038,7 +1055,7 @@ Requires `semantic_search_enabled = true` and `value_type = str` on the KV store
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `query` | string | yes | Query text to embed and search |
-| `top_k` | integer | no | Maximum number of candidates to return (default: all in probed clusters) |
+| `top_k` | integer | no | Maximum number of candidates to return (default: the server-side config value) |
 | `page_size` | integer | no | Page size (default: 20). Also accepts `limit` as an alias (query param); `page_size` wins if both are given. |
 | `page_no` | integer | no | 1-based page number (default: 1) |
 
@@ -1057,8 +1074,6 @@ Response:
       "key": "sku-1042",
       "dot_product": 0.93,
       "error_bound": 0.02,
-      "cluster_id": 7,
-      "is_primary": true,
       "value": "Ultra-light trail runner with waterproof membrane"
     }
   ],
@@ -1073,9 +1088,7 @@ Response:
 | `key` | The key, serialised as a JSON string or number according to `key_type` |
 | `dot_product` | Estimated cosine similarity (higher = more similar) |
 | `error_bound` | Theoretical max deviation of the estimate from the true dot product |
-| `cluster_id` | IVF cluster this entry was indexed under |
-| `is_primary` | `true` if the entry's cluster is the closest cluster to the query |
-| `value` | The stored value, or `null` if the key no longer exists |
+| `value` | The stored value. Keys deleted since they were indexed are left out of the results. |
 
 ---
 
@@ -1157,7 +1170,7 @@ value. There are two distinct kinds:
 | `GET /admin/storage/wal` | WAL metadata | **Yes** |
 | `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
 | `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
-| `GET /admin/storage/value-log/{ns}/pages` | Value-log per page | **Yes** |
+| `GET /admin/storage/value-log/{ns}/segments` | Value-log per segment | **Yes** |
 | `GET /admin/storage/index-waste` | Field-index dead space | **Yes** (derived from on-disk state, not a stored counter) |
 | `GET /admin/storage/namespaces` | Registry + schema | **Yes** |
 | `GET /admin/storage/namespaces/physical` | Physical engine namespaces | **Yes** |
@@ -1236,13 +1249,14 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 
 | Field | Meaning |
 |-------|---------|
-| `head`, `tail` | Value-log logical start/end offsets |
-| `garbage_bytes` | Reclaimable dead bytes across the value log |
-| `waste_ratio_pct` | Dead / total written (%) |
-| `free_space_ratio_pct` | Free fraction of the allocated region (%) |
+| `namespaces` | Number of namespaces counted |
+| `segment_count` | Value-log segment files across all namespaces and buckets |
+| `disk_bytes` | Bytes those files occupy on disk |
+| `live_bytes` | Bytes of records still referenced |
+| `garbage_bytes` | Bytes of records that were overwritten or deleted, reclaimable by GC |
+| `waste_ratio_pct` | `garbage / (live + garbage)` (%) |
 | `total_gc_runs` | Value-log GC passes ever run (persisted in metadata) |
 | `total_bytes_reclaimed` | Bytes ever reclaimed by value-log GC (persisted) |
-| `live_bytes` | Live (non-garbage) bytes |
 
 **`GET /admin/storage/wal`** — WAL metadata:
 
@@ -1274,19 +1288,26 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | Field | Meaning |
 |-------|---------|
 | `total_live_bytes`, `total_garbage_bytes`, `waste_ratio_pct`, `total_physical_bytes` | Namespace rollups across shards |
-| `shards[].bucket`, `head`, `tail` | Shard id and offsets |
+| `shards[].bucket` | Shard (bucket) id |
+| `shards[].segment_count`, `sealed_segment_count` | Segment files in the shard, and how many are sealed (no longer appended to) |
+| `shards[].active_segment_id`, `next_segment_id` | The segment being appended to, and the id the next new segment will get (ids are never reused) |
 | `shards[].live_bytes`, `garbage_bytes`, `waste_ratio_pct` | Per-shard utilisation |
 | `shards[].total_gc_runs`, `total_bytes_reclaimed` | Per-shard GC activity (persisted) |
-| `shards[].physical_bytes` | Blocks actually allocated on disk (`st_blocks`; excludes sparse holes) |
-| `shards[].logical_bytes` | File length including sparse holes (≥ `physical_bytes`) |
+| `shards[].physical_bytes` | Bytes the shard's segment files occupy on disk |
+| `shards[].logical_bytes` | Record bytes (live + garbage), excluding each file's 16-byte header |
+| `shards[].segments[]` | Per-segment breakdown, as below |
 
-**`GET /admin/storage/value-log/{ns}/pages`** — per-page garbage breakdown:
+**`GET /admin/storage/value-log/{ns}/segments`** — per-segment garbage breakdown
+for one namespace, showing which segments GC would collect next. It reads only
+in-memory counters, so it is cheap:
 
 | Field | Meaning |
 |-------|---------|
-| `shards[].pages[].page_offset` | Page start offset within the shard |
-| `live_bytes`, `garbage_bytes`, `garbage_ratio_pct` | Per-page live/dead bytes and ratio |
-| `total_records`, `garbage_records` | Records on the page, and how many are garbage |
+| `shards[].bucket`, `segment_count` | Shard id and its number of segment files |
+| `shards[].segments[].segment_id` | Segment id (monotonic, never reused) |
+| `file_bytes` | Size of the segment file |
+| `total_bytes`, `live_bytes`, `garbage_bytes`, `garbage_ratio_pct` | Record bytes in the segment, split into live and garbage |
+| `sealed` | `false` for the active segment still being appended to; GC only collects sealed segments |
 
 **`GET /admin/storage/index-waste`** — field-index dead space:
 
@@ -1334,7 +1355,7 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
-| `GET` | `/admin/storage/value-log/{ns}/pages` | `200` | Per-page garbage breakdown for one namespace |
+| `GET` | `/admin/storage/value-log/{ns}/segments` | `200` | Per-segment garbage breakdown for one namespace |
 | `GET` | `/admin/storage/namespaces` | `200` | Namespace registry (doc stores + KV stores) |
 | `GET` | `/admin/storage/namespaces/physical` | `200` | Every physical engine namespace, annotated by role |
 | `GET` | `/admin/storage/stores/{ns}/kv-meta` | `200` | Engine (LSM+value-log) metrics for one store, doc or KV |
@@ -1422,7 +1443,7 @@ curl http://localhost:8080/admin/storage/index-waste
 
 #### `POST /admin/storage/index-checkpoint`
 
-Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (default every 15 min) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
+Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (every 1.75 s by default, `scheduled_tasks.index_checkpoint_interval_ms`) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
 
 This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem.
 
@@ -1452,6 +1473,9 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/progress` | `200` | All active index builds across every namespace |
 | `GET` | `/admin/indices/vector/queue/summary` | `200` | Global queue depth / lag by namespace |
 | `GET` | `/admin/indices/vector/queue/retried` | `200` | All entries with `retry_count > 0` (global) |
+| `DELETE` | `/admin/indices/vector/query-cache` | `200` | Clear the cache of query embeddings (all namespaces) |
+| `GET` | `/admin/indices/{ns}/health` | `200` | Health of every field index in one namespace: which are missing updates |
+| `POST` | `/admin/indices/{ns}/attribute/{field}/repair` | `200` | Repair a field index that is missing updates |
 | `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Per-namespace counts of vector entries skipped during search due to corrupt bytes (all namespaces) |
 | `GET` | `/admin/indices/{ns}/vector/corruption-metrics` | `200` | Corrupt-skip counts for a single namespace |
 | `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
@@ -1510,6 +1534,76 @@ curl http://localhost:8080/admin/indices/progress
 `progress_pct = indexed_approx / (indexed_approx + pending) * 100`. Exhausted entries are excluded from the denominator.
 
 Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace.
+
+---
+
+#### `GET /admin/indices/{ns}/health`
+
+Reports every field index in a document store and whether it is missing
+updates. A field index is kept up to date in memory on every write and
+checkpointed to disk every couple of seconds; after a crash it replays the WAL
+from its checkpoint. If that replay cannot happen (the WAL it needed was
+reclaimed, for example), the index records a **gap**: which keys it may be
+missing, or that it needs a full rebuild. Queries that use such a field report
+it in `degraded_fields`; this endpoint is the operator's view of the same
+condition.
+
+```bash
+curl http://localhost:8080/admin/indices/users/health
+```
+```json
+{
+  "namespace": "users",
+  "degraded": false,
+  "degraded_fields": [],
+  "fields": [
+    {"field_id": 0, "field_name": "status", "namespace_id": 3, "active": true, "checkpoint_offset": 396, "gap": null},
+    {"field_id": 1, "field_name": "age",    "namespace_id": 3, "active": true, "checkpoint_offset": 396, "gap": null}
+  ]
+}
+```
+
+`checkpoint_offset` is the WAL position the field's on-disk state reflects.
+`gap` is `null` for a healthy field; otherwise it describes what is missing and
+how it will be repaired. Returns `404` if the document store does not exist.
+
+---
+
+#### `POST /admin/indices/{ns}/attribute/{field}/repair`
+
+Repairs a field index that has a gap (see above) and clears it. When the gap
+names the affected keys, only those rows are re-indexed; otherwise the field is
+rebuilt from every document. Documents are not rewritten, so the repair creates
+no WAL traffic and no vector re-embedding. It runs synchronously, so a full
+rebuild of a large store takes a while.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/users/attribute/status/repair
+```
+```json
+{"status": "not_degraded", "namespace": "users", "field": "status", "message": "the index has no outstanding gap; nothing to repair"}
+```
+
+After a real repair, `status` is `"repaired"` and `result` describes the work
+done. Returns `404` if the store does not exist or `{field}` is not one of its
+indexed fields.
+
+---
+
+#### `DELETE /admin/indices/vector/query-cache`
+
+Clears the cache of query embeddings. Semantic search caches each query's
+embedding for a day (`query_embedding_cache_ttl_secs`), keyed only by the query
+text and shared by every namespace. Clear it whenever the embedding service
+starts serving a different model; otherwise repeated queries keep using vectors
+from the old model until they expire.
+
+```bash
+curl -X DELETE http://localhost:8080/admin/indices/vector/query-cache
+# → {"cleared": 0}
+```
+
+`cleared` is the number of cached query embeddings removed.
 
 ---
 
@@ -1642,7 +1736,7 @@ Reindex a **single document's** entry in **one** field index. The field value is
 Document stores only — field indices do not exist on KV stores. `{doc_id}` is parsed in the namespace's key format (the same format as `GET /stores/{ns}/docs/{id}`).
 
 ```bash
-curl -X POST http://localhost:8080/admin/indices/users/status/reindex/42
+curl -X POST http://localhost:8080/admin/indices/users/attribute/status/reindex/42
 ```
 ```json
 { "status": "reindexed", "namespace": "users", "field": "status", "doc_id": "42" }
@@ -1804,7 +1898,8 @@ Predicates reference indexed field names. Operators and examples:
 | `>=`       | `age >= 18`                      | int                |
 | `AND`      | `status = "active" AND age >= 18` | —                 |
 | `OR`       | `status = "active" OR status = "trial"` | —          |
-| `NOT`      | `NOT paid = false`               | —                  |
+| `IN`       | `status IN ("active", "trial")`  | str, int, bool     |
+| `NOT`      | `NOT status = "deleted"`         | —                  |
 
 String values must be quoted with `"`. Boolean values are `true` or `false` (unquoted).
 
@@ -1858,7 +1953,11 @@ cargo build --release -p minnal_tools
 ### Usage
 
 ```
+# Document store
 minnal_tools bulk_load [--no-wal] [--schema <schema.json>] <url> <namespace> <id_field> <data.jsonl>
+
+# KV store
+minnal_tools bulk_load --kv [--no-wal] [--schema <schema.json>] <url> <namespace> <key_field> <value_field> <data.jsonl>
 ```
 
 | Argument     | Description                                                  |
@@ -1866,10 +1965,12 @@ minnal_tools bulk_load [--no-wal] [--schema <schema.json>] <url> <namespace> <id
 | `url`        | Base URL of the running doc store REST API (e.g. `http://localhost:8080`) |
 | `namespace`  | Name of the target doc store                                |
 | `id_field`   | JSON field name whose value becomes the document ID          |
+| `key_field`, `value_field` | (`--kv`) JSON field names holding each row's key and value |
 | `data.jsonl` | Path to the JSONL file                                       |
 
 | Flag                | Description                                                  |
 |---------------------|-------------------------------------------------------------|
+| `--kv`              | Load a KV store instead of a document store. |
 | `--schema <file>`   | Import the schema (`POST /admin/stores/import`) before loading. An existing store is reused, so re-runs are safe. The schema's `namespace` must match the `namespace` argument. Without this flag the namespace must already exist. |
 | `--no-wal`          | Append `?skip_wal=true` to each write for maximum throughput. Data written this way is **unrecoverable on a crash** — only use when re-running the load is acceptable (e.g. an initial import from a source of truth). |
 
@@ -1907,24 +2008,33 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 
 ```
 {db_path}/
+  namespace_registry          ← namespace name → id map, plus TTL settings
+  wal.log, wal.log.seg*       ← the shared write-ahead log (64 MiB segments)
+  wal_metadata, wal_segment_size
+  fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
-    wal/                      ← write-ahead log segments (64 MiB each)
-    lsm/                      ← LSM tree (sorted key files)
-    value_log/                ← value blobs (sharded)
-  ns_{namespace}_sparse_vector/      ← companion store: 1-bit sliding-window chunk embeddings, keyed by [cluster_id ‖ doc_id] (pass-1 ANN)
-  ns_{namespace}_dense_vector/       ← companion store: multi-bit whole-doc embeddings, keyed by doc_id (pass-2 re-rank)
-  ns_{namespace}_sparse_vector_meta/ ← companion store: per-doc cluster membership, used only by delete/upsert cleanup
+    config.json               ← namespace settings
+    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
+    value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
+  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [cluster_id ‖ doc_id] (Pass 1)
+  ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)
+  ns_{namespace}_sparse_vector_meta/ ← each document's clusters, used to clean up on update and delete
+  ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
+  ns_system_qemb_cache/              ← cached query embeddings
   index/
-    {ns_id}/
-      {field_id}/             ← doc stores only — KV stores have no field indices
-        blobs.keys            ← RoaringBitmap key file (mmap hash table)
-        blobs.vals            ← RoaringBitmap blob data
-        keymap.idx            ← field-value → slot mapping
-        checkpoint            ← WAL offset at last index flush
-        build_progress.json   ← index rebuild progress (created on add_index)
+    {ns_id}/                  ← doc stores only; KV stores have no field indices
+      {field_id}/
+        blobs.keys, blobs.vals ← one RoaringBitmap per field value (append-only blob store)
+        keymap                ← field value → bitmap slot
+        checkpoint            ← WAL position the field's on-disk state reflects
+        gap.json              ← present only when the field is missing updates
+      rowmap/                 ← document key ↔ dense row id, shared by the namespace's fields
 
 {schema_dir}/
-  {namespace}.json            ← schema for each store (doc or KV — distinguished by mandatory store_type field)
+  {namespace}.json            ← one schema per store, doc or KV
 ```
 
-Schema files are written atomically (tmp-then-rename). Every schema declares a mandatory `store_type` field — `"doc"` or `"kv"` — which is the authoritative on-disk discriminant between the two store kinds (doc schemas additionally use `key_type` values `"uuid"`/`"u64"`/`"u128"`, KV schemas `"str"`/`"int"`, but that is no longer what distinguishes them). Both types are stored in the same directory and are mutually exclusive — you cannot create a doc store and a KV store with the same namespace name.
+Schema files are written atomically (tmp-then-rename). Every schema declares a
+mandatory `store_type` field — `"doc"` or `"kv"` — which tells the two kinds
+apart on disk. Both kinds share the directory and the namespace names, so a doc
+store and a KV store cannot have the same name.
