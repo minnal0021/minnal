@@ -554,7 +554,7 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
-folded in as cargo features (`doc-store`, `semantic-search`) that you opt into.
+provided as cargo features (`doc-store`, `semantic-search`) that you opt into.
 The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
 secondary (field-level) indexing is a capability of the engine itself, not
 something layered on by the document store.
@@ -678,4 +678,4 @@ Run it on an otherwise idle machine: several suites measure sub-microsecond oper
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](../LICENSE).

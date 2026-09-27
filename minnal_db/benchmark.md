@@ -298,10 +298,13 @@ parsed from text and 728 µs pre-parsed.
 
 ## Paging through query results
 
-A query result is a bitmap of matching rows. Returning page *n* of it means
-skipping the first *n* rows. The engine skips whole bitmap containers (blocks of
-up to 65,536 rows) using their stored row counts, instead of stepping through
-rows one at a time. Over 200,000 matching rows with 50 rows per page:
+A query result is a bitmap of matching rows. Returning a page means skipping
+the rows before it. Bitmaps store rows in containers of up to 65,536, each of
+which records how many rows it holds. The engine uses those counts to skip whole
+containers without opening them. The simple alternative, stepping through the
+rows one by one, decodes every container it passes into a list, so it pays for
+a full 65,536-row container even on the first page. One page of 50 rows, from a
+result of 200,000:
 
 | Page starts at row | Stepping through rows | Skipping containers (used) |
 |---|---:|---:|
@@ -310,10 +313,13 @@ rows one at a time. Over 200,000 matching rows with 50 rows per page:
 | 50,000 | 79 µs | 17.6 µs |
 | 199,000 | 243 µs | 0.35 µs |
 
-Container skipping is fast wherever the page starts, but not uniformly. At row 50,000 the page begins partway through a
-container, and the rows before it in that container still have to be stepped
-through. Paging through the whole result, all 4,000 pages, takes 0.47 ms with
-container skipping and 2.47 ms by stepping through rows.
+Container skipping still steps through the rows *inside* the container where the
+page starts. Row 50,000 is 50,000 rows into its container, which is why that page
+costs more than the others.
+
+Paging through a whole 20,000-row result, 200 rows at a time (100 pages), takes
+0.47 ms with container skipping and 2.47 ms by stepping through rows, which
+starts again from the first row on every page.
 
 ## Semantic search
 
