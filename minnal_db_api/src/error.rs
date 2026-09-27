@@ -84,6 +84,11 @@ impl IntoResponse for AppError {
             // fix it — the parser's message.
             DocStoreError::Db(minnal_db::KVError::Query(_)) => StatusCode::BAD_REQUEST,
 
+            // Semantic search on a store that does not have it enabled is a
+            // request the server understood but cannot apply to this store —
+            // the same 422 the admin vector endpoints return for it.
+            DocStoreError::SemanticSearchNotEnabled { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

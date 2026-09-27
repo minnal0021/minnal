@@ -20,7 +20,7 @@
 //!       {field_id}/       ← field index: bitmap blob, keymap, checkpoint, gap.json
 //!       rowmap/           ← dense row-ID map sidecar
 //!       no_wal_pending    ← marker: uncheckpointed no-WAL writes (FR-001)
-//!   wal/                  ← shared write-ahead log
+//!   wal.log, wal.log.seg* ← shared write-ahead log segments, plus wal_metadata
 //!   fail_logs/            ← recovery failures
 //! ```
 

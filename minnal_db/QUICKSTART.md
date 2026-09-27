@@ -53,7 +53,7 @@ Capabilities are opt-in through cargo features, so you compile — and pull
 dependencies for — only what you actually use. There are three to choose from.
 
 **`kv-store`** is the default, and it is really a name for the base engine: the
-LSM tree and value log, namespaces, TTL expiry, typed zero-copy values, and
+LSM tree and value log, namespaces, TTL expiry, typed values (via `rkyv`), and
 RoaringBitmap field indexing with its predicate query DSL. The engine and the
 field index are compiled in no matter which features you pick, so this one adds
 nothing beyond the base dependencies — it exists so you can name the default
@@ -206,7 +206,7 @@ let total: Option<u64> = db.merge_typed(&"visits".to_string(), &1u64, |current, 
 })?;
 ```
 
-Both are available on `Db`, `Namespace`, `AsyncDb` and `AsyncNamespace`. Two
+Both are available on `Db`, `Namespace`, `AsyncDb` and `AsyncNamespace`. Three
 things to know:
 
 - **The guarantee is per key, not a transaction.** A merge is indivisible for the
@@ -290,9 +290,12 @@ fn main() -> Result<(), KVError> {
     db.put(b"user:3", br#"{"status":"active","age":42}"#)?;
     db.put(b"user:4", br#"{"status":"active","age":18}"#)?;
 
-    // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, AND, OR, BETWEEN, IN).
-    let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
-    for key in keys {
+    // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, IN, AND, OR, NOT).
+    let outcome = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
+    if !outcome.degraded_fields.is_empty() {
+        eprintln!("an index is missing updates; results may be incomplete");
+    }
+    for key in outcome.keys {
         if let Some(value) = db.get(&key)? {
             println!("{} => {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
         }
@@ -304,12 +307,17 @@ fn main() -> Result<(), KVError> {
 }
 ```
 
-Two things are worth knowing before you build on this. The `IndexValue` your
-extractor returns has to match the type you registered the field with — one of
-`Bool`, `Int` (an `i64`), or `Str`. And when a query can match a large number of
-records, reach for `query_index_paginated(ns, predicate, offset, limit)` instead:
-paired with a `RowToKeyFn` registered through `set_row_id_fn`, it resolves only
-`offset + limit` keys rather than the whole match set.
+A few things are worth knowing before you build on this:
+
+- The `IndexValue` your extractor returns has to match the type you registered
+  the field with — one of `Bool`, `Int` (an `i64`), or `Str`.
+- A query returns a `QueryOutcome`: the matching `keys`, the `total` number of
+  matches, and `degraded_fields`. A field lands in `degraded_fields` when its
+  index is known to be missing updates (after a crash that outran its WAL
+  retention, say), so a non-empty list means the result may be incomplete.
+- When a query can match many records, use
+  `query_index_paginated(ns, predicate, offset, limit)`: it resolves only the
+  requested window of keys rather than the whole match set.
 
 ---
 

@@ -60,67 +60,60 @@ The rest of this document works from the top of the stack down to these componen
 The diagram below shows how a request flows through MinnalDB. At the top, callers use the public API; underneath, a single **Database Coordinator** routes each operation to the right place; and at the bottom sit the storage components that actually persist data.
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Public API Layer                             │
-│                                                                      │
-│   Db / AsyncDb               Namespace / AsyncNamespace             │
-│   (raw bytes)                (scoped to a single namespace)         │
-│   put / get / delete         put_typed / get_typed (rkyv)           │
-│   iter / range / scan_prefix                                        │
-└──────────────────────────────┬───────────────────────────────────────┘
-                               │
-                ┌──────────────▼──────────────┐
-                │       Database Coordinator   │
-                │       (db/database.rs)        │
-                │                              │
-                │  • Namespace registry        │
-                │  • Shared WAL                │
-                │  • KVStore map (per NS)      │
-                │  • Worker lifecycle          │
-                └──────────────┬──────────────┘
-                               │
-         ┌─────────────────────┼────────────────────┐
-         │                     │                    │
-         ▼                     ▼                    ▼
-┌────────────────┐   ┌──────────────────┐   ┌──────────────┐
-│ KVStore (per   │   │ Write-Ahead Log  │   │  Namespace   │
-│ namespace)     │   │ (shared, global) │   │  Registry    │
-│                │   │                  │   │              │
-│ • LSM tree     │   │ • Append-only    │   │ • Name → u32 │
-│ • Value log    │   │ • Segmented      │   │ • Persistent │
-│ • GC worker    │   │ • CRC-validated  │   │ • Monotonic  │
-│ • TTL worker   │   │ • GC on persist  │   │   IDs        │
-└───────┬────────┘   └──────────────────┘   └──────────────┘
-        │
-        ├─────────────────────────────────────────────┐
-        │                                             │
-        ▼                                             ▼
-┌───────────────────────────────┐     ┌─────────────────────────────────┐
-│         LSM Tree              │     │         Sharded Value Log        │
-│                               │     │                                  │
-│  ┌─────────────────────────┐  │     │  Bucket 0   Bucket 1  ... B15   │
-│  │ MemTable (SkipList)     │  │     │  ┌───────┐  ┌───────┐   ┌────┐ │
-│  │ • Max 100k entries      │  │     │  │ 256MB │  │ 256MB │   │... │ │
-│  │ • Arena-allocated       │  │     │  │ segs  │  │ segs  │   │    │ │
-│  │ • SIMD key comparison   │  │     │  └───────┘  └───────┘   └────┘ │
-│  └────────────┬────────────┘  │     │  Immutable, append-only segments│
-│               │ flush         │     │  Ids monotone, never reused     │
-│  ┌────────────▼────────────┐  │     │  Record: hdr+value+key (+CRC32) │
-│  │ L0 Files (per bucket)   │  │     │  GC = rewrite a segment, unlink │
-│  │ Staged before L1 merge  │  │     └─────────────────────────────────┘
-│  └────────────┬────────────┘  │
-│               │ compact       │
-│  ┌────────────▼────────────┐  │
-│  │ L1 SSTables (16 files)  │  │
-│  └─────────────────────────┘  │
-└───────────────────────────────┘
-        │                     │
-        ▼                     ▼
-┌───────────────┐   ┌──────────────────────────────────────┐
-│  LSM Worker   │   │       Background Workers             │
-│  • Compaction │   │  GCWorker   WalGcWorker  TTLWorker   │
-│  • L0→L1 merge│   │  (global)   (global)    (global)     │
-└───────────────┘   └──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Public API                                                               │
+│                                                                          │
+│ Db / AsyncDb                  Namespace / AsyncNamespace                 │
+│   the default namespace, plus   one named namespace                      │
+│   engine-wide operations                                                 │
+│                                                                          │
+│ put · get · delete · merge (and _typed forms via rkyv)                   │
+│ iter · range · scan_prefix · scan (cursor-paginated)                     │
+└──────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                      ┌──────────────────────────────┐
+                      │ Database coordinator         │
+                      │ (db/database.rs)             │
+                      │                              │
+                      │ • namespace registry         │
+                      │ • the shared WAL             │
+                      │ • one KVStore per namespace  │
+                      │ • background workers         │
+                      └──────────────────────────────┘
+                                      │
+            ┌─────────────────────────┴─────────────────────────┐
+            ▼                         ▼                         ▼
+┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│ KVStore              │  │ Write-ahead log      │  │ Namespace registry   │
+│ (one per namespace)  │  │ (one, shared)        │  │                      │
+│                      │  │                      │  │ • name → u32 id      │
+│ • LSM tree (keys)    │  │ • append-only        │  │ • ids never reused   │
+│ • value log (values) │  │ • 64 MB segments     │  │ • TTL settings       │
+│                      │  │ • CRC-checked        │  │                      │
+│                      │  │ • fsync per write    │  │                      │
+└──────────────────────┘  └──────────────────────┘  └──────────────────────┘
+            │
+            ├────────────────────────────────────────────┐
+            ▼                                            ▼
+┌──────────────────────────────────┐  ┌────────────────────────────────────┐
+│ LSM tree (keys + pointers)       │  │ Value log (values)                 │
+│                                  │  │                                    │
+│ MemTable: a skip list in memory, │  │ 16 buckets, each a series of       │
+│   up to 100k entries             │  │ 256 MB segment files               │
+│       │ flush when full          │  │                                    │
+│       ▼                          │  │ • append-only; sealed segments     │
+│ L0 files, per bucket             │  │   never change                     │
+│       │ compact                  │  │ • segment ids never reused         │
+│       ▼                          │  │ • record = header + value + key    │
+│ L1 SSTable, one per bucket       │  │ • GC rewrites one segment,         │
+└──────────────────────────────────┘  │   then deletes it                  │
+                                      └────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Background workers: one task each, visiting every namespace              │
+│ LSM compaction · value-log GC · WAL GC · TTL expiry                      │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 A few things are worth pulling out of the diagram, because they shape everything that follows:
@@ -128,7 +121,7 @@ A few things are worth pulling out of the diagram, because they shape everything
 - **Each namespace owns a private `KVStore`** — its own LSM tree and value log. Namespaces never share key data.
 - **The WAL is the one global, shared component.** Every write from every namespace lands in the same log first, which is what makes crash recovery a single, ordered replay.
 - **A write fans out into two stores.** The LSM tree records the *key* and a pointer; the value log holds the *value*. A read reverses this: find the pointer in the LSM, then follow it into the value log.
-- **Background workers do the slow work off the critical path** — compaction, garbage collection, WAL cleanup, and TTL expiry all run on their own schedules so foreground reads and writes stay fast.
+- **Background workers do the slow work off the critical path** — compaction, garbage collection, WAL cleanup, and TTL expiry all run on their own schedules so foreground reads and writes stay fast. Each is a single task for the whole database that visits every namespace in turn.
 
 > **A note on bucket count.** Throughout this document we use **16 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "16-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
 
@@ -156,7 +149,7 @@ Because the same key can exist in several tiers at once, a read must decide whic
 
 Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
-Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
+Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
 
 #### Skip List
 
@@ -191,7 +184,7 @@ The structure's other properties:
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
 - **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
 - Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
-- A monotonic **`u32` sequence counter** records insertion order within the table.
+- Every node carries its write's **`u64` sequence number** — the same global number the WAL and SSTables use — which is what resolves two writes to the same key.
 
 ### Value Log
 
@@ -202,7 +195,7 @@ Two properties make everything else fall out:
 - **A sealed segment is immutable.** Only the bucket's *active tail* is ever appended to; once it fills it is sealed and never modified again.
 - **Segment ids are monotone and never reused** — not within a process, and not across restarts (a high-water mark is persisted alongside the segment inventory).
 
-![Animated diagram of the segmented value log: records are appended to the active tail segment; an update appends a new record and only adds the old one's size to a garbage counter; GC rewrites one segment's survivors into a new segment, re-points the keys, flushes, and unlinks the old file — while a reader holding an old pointer either reads the same record or gets a clean not-found and re-resolves](docs/vlog-segments.svg)
+![Animated diagram of value-log garbage collection: an update or delete turns the old record into garbage without touching it; GC scans one sealed segment without a lock, appends its live records to the active tail and re-points them, flushes, then deletes the file; a reader holding an old pointer reads the same value, or gets SegmentMissing and looks the key up again; segment ids are never reused](docs/vlog-segments.svg)
 
 #### A record
 
@@ -237,7 +230,7 @@ So an update appends a *new* record and a delete writes an LSM tombstone; in bot
 GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
-2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so liveness is one LSM point-get: a record survives iff the LSM still points at exactly this location.
+2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
 3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert preserves the key's existing sequence, so relocating a record never changes its version.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
@@ -283,7 +276,7 @@ Every write is a **single-op transaction**: one `put` or `delete` is one WAL app
 
 The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
 
-Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Once every entry in a segment is marked `Persisted` — meaning the data is safely in an L0 or L1 SSTable on disk — the WAL garbage collector deletes the whole segment, decrements the global `total_entries`/`persisted_entries` counters, and advances the WAL head pointer past any consecutively deleted segments so a later startup scan never tries to open a file that is gone.
+Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Once every entry in a segment is marked `Persisted` — meaning the data is safely in an L0 or L1 SSTable on disk — and every field index has checkpointed past it (field indexes rebuild themselves after a crash by replaying the WAL from their last checkpoint), the WAL garbage collector deletes the whole segment, decrements the global `total_entries`/`persisted_entries` counters, and advances the WAL head pointer past any consecutively deleted segments so a later startup scan never tries to open a file that is gone.
 
 #### How WAL storage evolves over time
 
@@ -305,7 +298,9 @@ Sharding is what lets MinnalDB do its slow work in parallel. Every storage compo
 
 - Garbage collection runs across 16 independent value-log files at once.
 - Compaction runs across 16 independent L1 SSTables at once.
-- Writes contend on a **per-bucket lock** rather than one global value-log lock.
+- Value-log writes take a **per-bucket lock** rather than one global value-log lock.
+
+Sharding does not parallelise durable writes, though. Every write appends to the one shared WAL and fsyncs it while holding the WAL lock, so writes from all threads and namespaces reach the disk one at a time. Write throughput is set by the drive's fsync latency, not by the bucket count (see [Performance](#performance)).
 
 A key is assigned to a bucket by hashing its first eight bytes:
 
@@ -362,40 +357,43 @@ These workers don't poll blindly; they are driven by an **observer pattern** tha
 
 ## Storage Layout
 
-Putting the pieces together, here is how a database lays itself out on disk. The top level holds the shared structures (registry, WAL, fail logs); each namespace then gets its own subtree containing the value log and LSM data described above.
+Putting the pieces together, here is how a database lays itself out on disk. The top level holds the shared structures (registry, WAL, fail logs, field indexes); each namespace then gets its own directory containing the value log and LSM data described above.
 
 ```
 <db_path>/
-├── namespace_registry          # Persistent namespace name→ID map (rkyv)
+├── namespace_registry          # Namespace name → ID map, plus TTL settings (rkyv)
 │
-├── wal_metadata                # WAL head/tail/stats (CRC32-protected)
+├── wal_metadata                # WAL head/tail/counters (CRC32-protected)
+├── wal_segment_size            # WAL segment size, fixed when the WAL is created
 ├── wal.log                     # WAL segment 0 (64 MB)
 ├── wal.log.seg000001           # WAL segment 1
-├── wal.log.seg000002           # WAL segment 2 (deleted segments are removed)
-├── ...
+├── ...                         # (reclaimed segments are deleted)
 │
 ├── fail_logs/                  # Recovery fail-log files (one per recovery run)
 │   └── fail_log_<timestamp>.json
 │
+├── index/                      # Field indexes, keyed by namespace ID
+│   └── <ns_id>/
+│       ├── <field_id>/         # One field: bitmaps, value→bitmap map, checkpoint
+│       └── rowmap/             # Dense row-ID map shared by the namespace's fields
+│
 ├── ns_default/                 # Default namespace (always present)
+│   ├── config.json             # Namespace settings (and, with doc-store, its schema)
 │   ├── value_logs/
 │   │   ├── value_log_0.seg000007   # Bucket 0, sealed segment (immutable)
 │   │   ├── value_log_0.seg000008   # Bucket 0, active tail
 │   │   ├── value_log_0.metadata    # Segment inventory + id high-water mark
-│   │   ├── ...                     # Buckets 0–15
-│   ├── lsm_data/
-│   │   ├── level0/
-│   │   │   ├── level0_0/       # L0 files for bucket 0
-│   │   │   └── ...
-│   │   └── level1/
-│   │       ├── level1_0.dat    # Stable L1 SSTable for bucket 0
-│   │       └── ...
-│   └── lsm_manifest
+│   │   └── ...                     # Buckets 0–15
+│   └── lsm/
+│       ├── level0/
+│       │   ├── level0_0/       # L0 files for bucket 0
+│       │   └── ...
+│       ├── level1/
+│       │   ├── level1_0.dat    # L1 SSTable for bucket 0
+│       │   └── ...
+│       └── manifest
 │
-└── ns_<name>/                  # Additional named namespaces (e.g. ns_orders)
-    ├── value_logs/
-    ├── lsm_data/
-    └── lsm_manifest
+└── ns_<name>/                  # Each named namespace (e.g. ns_orders), same shape
 ```
 
 ---
@@ -498,23 +496,23 @@ The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush
 
 ### Value Log GC
 
-Value-log GC is gated by two separate bars. A **trigger** decides whether a namespace is worth collecting at all: it fires once the namespace's overall waste (garbage bytes ÷ total bytes) climbs past 30%. Once triggered, a lower **per-segment selection** bar (10%) picks *which* sealed segments are dirty enough to be worth rewriting — a segment cleaner than that is left in place.
+Value-log GC is gated by two separate bars. A **trigger** decides whether a namespace is worth collecting at all: it fires once the namespace's overall waste (garbage bytes ÷ total bytes), or any single bucket's, climbs past 30%. Once triggered, a lower **per-segment selection** bar (10%) picks *which* sealed segments are dirty enough to be worth rewriting — a segment cleaner than that is left in place.
 
-Keeping those two bars separate is load-bearing. A segment below the selection bar keeps its garbage, so if the two were equal, garbage sitting just under the trigger could never be collected at all: every pass would skip those segments, report success, and leave the namespace still over its trigger. (That is not hypothetical — it is exactly the treadmill the engine used to be on, when one value did both jobs.)
+Keeping those two bars separate is load-bearing. A segment below the selection bar keeps its garbage, so if the two were equal, garbage sitting just under the trigger could never be collected at all: every pass would skip those segments, report success, and leave the namespace still over its trigger.
 
-The pass itself is described in full under [Value Log](#value-log): pick the worst sealed segments, scan each one *without a lock* (every record carries its key, so liveness is one LSM point-get), relocate the survivors under a compare-and-set that respects concurrent writes and deletes, flush the re-point to L0, and only then unlink the old files.
+The pass itself is described in full under [Value Log](#value-log): pick the worst sealed segments, scan each one *without a lock* (every record carries its key, so liveness is one batched LSM lookup), relocate the survivors under a compare-and-set that respects concurrent writes and deletes, flush the re-point to L0, and only then unlink the old files.
 
 Two consequences worth stating plainly:
 
 - **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
-- **A crash mid-GC needs no repair.** Because the old segment is unlinked only *after* the re-point has been flushed to durable L0 storage, at every point a crash could interrupt the pass the on-disk LSM still points at a segment that exists on disk. The worst a crash can leave behind is an already-copied old segment that nothing points at any more — dead weight the next pass reclaims — never a pointer into a missing file. That single ordering rule is the whole crash-safety story, which is why GC keeps none of the recovery bookkeeping such schemes usually need: no write-ahead journal, no commit marker, and no `.new`/`.old` shadow files to replay or clean up on startup.
+- **A crash mid-GC needs no repair**, because the old segment is unlinked only after the re-point is durable (see [Garbage collection](#garbage-collection)).
 
 ### WAL GC
 
 WAL GC runs every 60s. Its job is simply to drop segments whose every entry is already safely in an SSTable:
 
 1. For each segment other than the current write segment, compare its `total_entries` against its `persisted_entries`.
-2. If every entry is `Persisted`, delete the segment file and subtract its counts from the global totals.
+2. If every entry is `Persisted`, and every active field index has checkpointed past the segment, delete the segment file and subtract its counts from the global totals. A field index replays the WAL from its last checkpoint after a crash, so a segment it still needs is kept. If too many segments pile up waiting on an index (`thresholds.max_pinned_wal_segments`, default 32), GC deletes the oldest anyway and records a gap on the index, which the index health and repair endpoints then report and fix.
 3. Advance the WAL `head` past all consecutively deleted segments, so the next startup scan begins at a live file.
 
 An entry becomes `Persisted` the moment its key is flushed from the MemTable to an on-disk L0 file — that is, once a durable copy exists in the LSM and the WAL no longer needs to protect it. See [How WAL storage evolves over time](#how-wal-storage-evolves-over-time) for the resulting sawtooth in on-disk size.
@@ -556,7 +554,7 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
-folded in as cargo features (`doc-store`, `semantic-search`) that you opt into.
+provided as cargo features (`doc-store`, `semantic-search`) that you opt into.
 The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
 secondary (field-level) indexing is a capability of the engine itself, not
 something layered on by the document store.
@@ -602,10 +600,10 @@ Each design choice in MinnalDB pays off as a specific performance property:
 |---|---|
 | Key/value separation (WiscKey) | Low write amplification — LSM compaction never rewrites values |
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
-| 16-bucket sharding | 16× parallel GC and compaction; 16× write parallelism |
+| 16-bucket sharding | GC and compaction work on 16 independent shards; value-log writes lock one bucket, not the whole log |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
 | SIMD key comparison | Faster skip-list traversal on x86_64 (AVX-512/AVX2) and Apple Silicon (NEON). See [SIMD coverage by architecture](#simd-coverage-by-architecture) below. |
-| Zero-copy serialization | No deserialization overhead on typed reads |
+| `rkyv` serialization | Typed reads and writes cost the same as raw-byte ones (within noise in [`benchmark.md`](benchmark.md#typed-api)) |
 | Epoch-based memory reclamation | Lock-free L0 cleanup without stopping readers |
 
 ### SIMD coverage by architecture
@@ -623,21 +621,20 @@ In short: on Apple Silicon, key comparison, field-index queries, and vector sear
 
 ### Expected throughput
 
-These are single-threaded ballpark figures; treat them as orders of magnitude rather than guarantees. Note that only the *value log's* fsync cadence is configurable (`records_per_sync`) — the WAL is fsynced on every single write regardless, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so `put` throughput is fsync-latency-bound, not something a sync-cadence setting can raise.
+These are ballpark figures; treat them as orders of magnitude rather than guarantees. Only the *value log's* fsync cadence is configurable (`records_per_sync`). The WAL is fsynced on every write, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so write throughput is set by the drive's fsync latency, and no setting raises it.
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values, single writer) | ~400–500 ops/s on NVMe without power-loss protection, bound by the per-write WAL fsync; scales roughly with concurrent writers spread across `num_buckets` |
-| `delete` (single writer) | ~400–500 ops/s — same fsync bound as `put` |
-| `merge` (small values, single writer) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
-| `get` (cache-warm) | 1M–2.5M ops/s |
-| `get` (cold, hits L1 SSTable) | 100k–300k ops/s |
-| Range / prefix scan | Bounded by result-set size |
-| Value-log GC throughput | 100–500 MB/s |
+| `put` (small values) | ~400–500 ops/s on an NVMe drive without power-loss protection. This is the limit for the whole database, not per writer: writes fsync one at a time under the WAL lock. |
+| `delete` | ~400–500 ops/s — same fsync bound as `put` |
+| `merge` (small values) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
+| `get` from memory | 1M–2.5M ops/s per thread |
+| `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
+| Range / prefix scan | Proportional to the number of results |
 
-Actual numbers depend heavily on value size, the underlying storage hardware's fsync latency, and (for `put`) how many buckets are being written concurrently. Every figure above is checked against [`benchmark.md`](benchmark.md), a dated full measurement run with hardware spec, per-suite tables and charts — most recently **2026-08-22** on bare-metal Linux, which measured 441 `put`/s, 440 `merge`/s, 2.51M warm `get`/s and 285k cold `get`/s. Treat any write figure not backed by that report with suspicion: the per-write fsync dominates by three orders of magnitude — the same WAL append measured **1,421x faster** with the sync omitted — and it is easy to publish a write throughput that quietly assumes it away.
+Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs about 1,500 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
 
-**Every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#merge-against-the-rest-of-crud) for the decomposition.
+**Every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
 
 ---
 
@@ -672,7 +669,7 @@ Benchmark reports are written to `target/criterion/`. The helpers in `benches/co
 To regenerate [`benchmark.md`](benchmark.md)'s dataset and charts in one step — every suite, then Criterion's means extracted and the charts re-rendered — run:
 
 ```bash
-minnal_db/docs/benchmarks/tools/run_report.sh    # ~95 min; archives any previous target/criterion
+minnal_db/docs/benchmarks/tools/run_report.sh    # ~100 min; archives any previous target/criterion
 ```
 
 Run it on an otherwise idle machine: several suites measure sub-microsecond operations, where a busy host shows up as a 20-40% swing.
@@ -681,4 +678,4 @@ Run it on an otherwise idle machine: several suites measure sub-microsecond oper
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](../LICENSE).

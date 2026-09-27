@@ -58,9 +58,10 @@ impl DocStore {
     /// every quantised vector in the namespace's companion KV store and returns
     /// the top results sorted by descending dot-product similarity.
     ///
-    /// Returns [`DocStoreError::EmbeddingFailed`] if no [`SemanticSearchContext`]
-    /// is attached, if the namespace does not have `semantic_search_enabled`, or
-    /// if the embedding service call fails.
+    /// Returns [`DocStoreError::SemanticSearchNotEnabled`] if the namespace does
+    /// not have `semantic_search_enabled`, and [`DocStoreError::EmbeddingFailed`]
+    /// if no [`SemanticSearchContext`] is attached or the embedding service call
+    /// fails.
     #[cfg(feature = "semantic-search")]
     pub async fn search_semantic(
         &self,
@@ -76,9 +77,9 @@ impl DocStore {
 
         let schema = self.load_schema(namespace)?;
         if !schema.semantic_search_enabled {
-            return Err(DocStoreError::EmbeddingFailed(format!(
-                "namespace '{namespace}' does not have semantic_search_enabled"
-            )));
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_string(),
+            });
         }
 
         debug!("semantic search namespace='{}' top_k={:?}", namespace, top_k);
@@ -114,8 +115,8 @@ impl DocStore {
     ///    that set — so only documents that pass both the semantic ranking *and*
     ///    the predicate are returned.
     ///
-    /// Returns [`DocStoreError::EmbeddingFailed`] under the same conditions as
-    /// [`search_semantic`], and propagates any index query errors from `predicate`.
+    /// Returns the same errors as [`search_semantic`], and propagates any index
+    /// query errors from `predicate`.
     ///
     /// [`query`]: DocStore::query
     /// [`search_semantic`]: DocStore::search_semantic
@@ -128,6 +129,20 @@ impl DocStore {
         top_k: Option<usize>,
         pagination: Pagination,
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
+        // Refuse before evaluating the predicate: a store without semantic
+        // search cannot answer, however cheap or costly the predicate is.
+        let ctx = self
+            .semantic_ctx
+            .as_ref()
+            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+
+        let schema = self.load_schema(namespace)?;
+        if !schema.semantic_search_enabled {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_string(),
+            });
+        }
+
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
         // here — the full set is needed as an ANN filter before scoring).
         // A degraded predicate index means the candidate set itself is short, so
@@ -137,18 +152,6 @@ impl DocStore {
         let allowed_ids: std::collections::HashSet<Vec<u8>> = all_keys.into_iter().collect();
 
         // Phase 2: ANN search with the filter closure.
-        let ctx = self
-            .semantic_ctx
-            .as_ref()
-            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
-
-        let schema = self.load_schema(namespace)?;
-        if !schema.semantic_search_enabled {
-            return Err(DocStoreError::EmbeddingFailed(format!(
-                "namespace '{namespace}' does not have semantic_search_enabled"
-            )));
-        }
-
         let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
@@ -694,5 +697,49 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    /// Semantic search on a store without it enabled is the caller's mistake,
+    /// so it must surface as `SemanticSearchNotEnabled` (422 over REST), not as
+    /// `EmbeddingFailed`, which blames the embedding service and becomes a 500.
+    /// The check runs before any embedding call, so no service is needed here.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn semantic_search_on_a_store_without_it_reports_not_enabled() {
+        use crate::semantic_search::{ClusterIndex, cluster::Cluster, service::SemanticSearchConfig};
+
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let mut store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let clusters = std::collections::HashMap::from([(0, Cluster::new(0, vec![1.0, 0.0]))]);
+        store.semantic_ctx = Some(Arc::new(SemanticSearchContext {
+            config: SemanticSearchConfig::default(),
+            cluster_index: Arc::new(ClusterIndex::from_clusters(clusters)),
+        }));
+        store.create(make_schema("plain", vec![])).await.unwrap();
+        store
+            .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))
+            .await
+            .unwrap();
+
+        let err = store.search_semantic("plain", "q", None, Pagination::default()).await.unwrap_err();
+        assert!(matches!(err, DocStoreError::SemanticSearchNotEnabled { .. }), "search_semantic: {err:?}");
+
+        let err = store
+            .search_semantic_filtered("plain", "q", "x = 1", None, Pagination::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DocStoreError::SemanticSearchNotEnabled { .. }),
+            "search_semantic_filtered: {err:?}"
+        );
+
+        let err = store.kv_search_semantic("plain_kv", "q", None, Pagination::default()).await.unwrap_err();
+        assert!(
+            matches!(err, DocStoreError::SemanticSearchNotEnabled { .. }),
+            "kv_search_semantic: {err:?}"
+        );
+
+        store.shutdown().await.unwrap();
     }
 }

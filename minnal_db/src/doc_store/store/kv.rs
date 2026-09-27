@@ -188,9 +188,10 @@ impl DocStore {
 
     /// Run an ANN semantic search against a KV namespace with `value_type = str`.
     ///
-    /// Returns [`DocStoreError::EmbeddingFailed`] when no [`SemanticSearchContext`]
-    /// is configured, when the namespace does not have `semantic_search_enabled`,
-    /// or when the embedding service call fails.
+    /// Returns [`DocStoreError::SemanticSearchNotEnabled`] when the namespace does
+    /// not have `semantic_search_enabled`, and [`DocStoreError::EmbeddingFailed`]
+    /// when no [`SemanticSearchContext`] is configured or the embedding service
+    /// call fails.
     #[cfg(feature = "semantic-search")]
     pub async fn kv_search_semantic(
         &self,
@@ -206,9 +207,9 @@ impl DocStore {
 
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
-            return Err(DocStoreError::EmbeddingFailed(format!(
-                "KV namespace '{namespace}' does not have semantic_search_enabled"
-            )));
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_string(),
+            });
         }
 
         let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;

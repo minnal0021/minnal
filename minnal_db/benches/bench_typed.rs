@@ -66,11 +66,16 @@ impl AutoCloseDb {
 // the archived key started with `id`'s bytes and "bench_kk" landed at
 // offset 8, so every prefix scan matched zero entries and reported a
 // near-instant, meaningless latency instead of a real scan cost.
+//
+// `id` is stored as big-endian bytes, not a `u64`: rkyv archives integers
+// little-endian, whose byte order is not numeric order, so a byte range from
+// key 0 to key 100 would not select ids 0..100 and `typed/range`'s result
+// counts would be wrong. Big-endian bytes make key order match id order.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 struct BenchKey {
     prefix: [u8; 8],
-    id: u64,
+    id: [u8; 8],
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -84,7 +89,10 @@ impl BenchKey {
     fn new(seq: u64) -> Self {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(b"bench_kk");
-        Self { prefix, id: seq }
+        Self {
+            prefix,
+            id: seq.to_be_bytes(),
+        }
     }
 }
 
@@ -271,6 +279,9 @@ fn bench_range_typed(c: &mut Criterion) {
         for result_count in [100u64, 500, 1_000] {
             let start = BenchKey::new(0);
             let end = BenchKey::new(result_count);
+            // The label is the result count, so check the range really returns it.
+            let n = db.db().range_typed::<BenchKey, BenchValue>(&start, Some(&end)).unwrap().len();
+            assert_eq!(n as u64, result_count, "typed/range: [0, {result_count}) returned {n} keys");
 
             group.throughput(Throughput::Elements(result_count));
             let label = format!("{tier}_result_count");

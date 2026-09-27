@@ -244,6 +244,14 @@ fn synthetic_query_chunks(t: usize) -> Vec<Vec<f32>> {
     (0..t).map(|_| (0..DIM).map(|_| next_f32()).collect()).collect()
 }
 
+/// Pass-1 query vectors for a `t`-vector query. `t == 1` is what production
+/// sends — the whole-query embedding, reused as the single sparse vector
+/// (`QueryEmbeddings { sparse: vec![dense.clone()], dense }`); larger `t` uses
+/// synthetic vectors to exercise multi-vector MaxSim.
+fn production_or_synthetic_query(t: usize, dense_query: &[f32]) -> Vec<Vec<f32>> {
+    if t == 1 { vec![dense_query.to_vec()] } else { synthetic_query_chunks(t) }
+}
+
 /// Union the top-`n` clusters across query chunks, the way `service::search` does —
 /// so the bench measures the whole Pass-1 coarse-assignment step, not just one scan.
 fn union_dedup(per_query: Vec<Vec<u32>>) -> Vec<u32> {
@@ -406,8 +414,11 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("end_to_end_search");
     group.measurement_time(Duration::from_secs(10));
 
-    for &t in &[4usize, 40] {
-        let sparse_query = synthetic_query_chunks(t);
+    // T = 1 is production's shape: the query is embedded whole, and that one
+    // vector is both the Pass-1 MaxSim vector and the Pass-2 dense vector.
+    // T = 4 and 40 exercise the general multi-vector MaxSim `search()` accepts.
+    for &t in &[1usize, 4, 40] {
+        let sparse_query = production_or_synthetic_query(t, &dense_query);
         group.throughput(Throughput::Elements(t as u64));
         group.bench_with_input(BenchmarkId::from_parameter(t), &t, |b, _| {
             b.iter(|| {
@@ -444,12 +455,12 @@ fn bench_end_to_end_search(c: &mut Criterion) {
 // share — the number that decides whether pruning Pass-1 (lever #2) is worth pursuing.
 fn bench_end_to_end_multichunk(c: &mut Criterion) {
     const N_DOCS: usize = 5_000;
-    const T: usize = 4; // representative query length
+    const T: usize = 1; // production: one whole-query vector
     let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let dense_query = load_or_generate_embeddings().query;
-    let sparse_query = synthetic_query_chunks(T);
+    let sparse_query = production_or_synthetic_query(T, &dense_query);
     let config = SemanticSearchConfig::default();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
