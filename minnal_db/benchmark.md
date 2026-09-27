@@ -17,7 +17,7 @@ to other hardware much better than the raw microseconds do.
 | Scanning 1,000 keys with their values | 0.3–0.5 ms | [Scans](#scans) |
 | A field-index equality query over 100,000 rows | 11–33 µs | [Field-index queries](#field-index-queries) |
 | A field-index range query over 100,000 rows | 0.5–1.1 ms | [Field-index queries](#field-index-queries) |
-| A semantic search over 5,000 documents | 1.6–6.6 ms, excluding the embedding call | [Semantic search](#semantic-search) |
+| A semantic search over 5,000 documents | 1.3–3.7 ms, excluding the embedding call | [Semantic search](#semantic-search) |
 
 The one number that shapes everything else: **a write costs 2.3 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The rest of the
@@ -50,8 +50,8 @@ because writes fsync one at a time.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-34 |
 | Rust | 1.96.0 |
-| Code | commit `e5d15c9`; the semantic-search suite at `2559786` |
-| Date | 2026-09-26 |
+| Code | commit `e5d15c9`; the typed and semantic-search suites re-run on 2026-09-27 |
+| Date | 2026-09-26 (typed and semantic search: 2026-09-27) |
 
 To reproduce everything, including the charts:
 
@@ -242,22 +242,32 @@ it adds nothing measurable:
 
 | Operation | Raw bytes | Typed |
 |---|---:|---:|
-| `put`, 128 B | 2.272 ms | 2.281 ms |
-| `put`, 4 KiB | 2.293 ms | 2.298 ms |
+| `put`, 128 B | 2.272 ms | 2.296 ms |
+| `put`, 4 KiB | 2.293 ms | 2.326 ms |
 | `get` from memory, 128 B | 0.37 µs | 0.33 µs |
-| `get` from disk, 128 B | 3.22 µs | 3.09 µs |
-| `get` from disk, 4 KiB | 3.37 µs | 3.28 µs |
+| `get` from disk, 128 B | 3.22 µs | 3.11 µs |
+| `get` from disk, 4 KiB | 3.37 µs | 3.32 µs |
 
 The typed reads come out slightly faster than the raw ones. That is within the
 noise for sub-microsecond cases, not a real speed-up.
 
-Scans cost 9–25% more typed, because every returned pair is deserialised. A prefix scan of 100 keys takes 54 µs
-typed against 49 µs raw in memory, and 85 µs against 74 µs on disk.
+Scans cost more typed, because every returned pair is deserialised:
+
+| Scan | Raw bytes | Typed | Extra |
+|---|---:|---:|---:|
+| range, 100 results, in memory | 54 µs | 57 µs | +6% |
+| range, 1,000 results, in memory | 353 µs | 383 µs | +8% |
+| range, 100 results, on disk | 84 µs | 89 µs | +5% |
+| range, 1,000 results, on disk | 463 µs | 468 µs | +1% |
+| prefix, 100 keys, in memory | 49 µs | 57 µs | +15% |
+| prefix, 1,000 keys, in memory | 290 µs | 362 µs | +25% |
+| prefix, 100 keys, on disk | 74 µs | 85 µs | +15% |
+| prefix, 1,000 keys, on disk | 406 µs | 466 µs | +15% |
 
 One typed operation is slow for a structural reason. `keys_typed`, which lists
 keys without values, takes about 260 µs even for 100 keys, in memory or on disk.
-That is five times as long as reading the same 100 keys *with* their values
-(55 µs). Key listing goes through the same full-store merge that value-log
+That is about four and a half times as long as reading the same 100 keys *with*
+their values (57 µs). Key listing goes through the same full-store merge that value-log
 garbage collection uses. Reading with values uses the faster range scan. Until
 that changes, a range or prefix scan is the cheaper way to list keys.
 
@@ -329,13 +339,14 @@ vectors. Pass 2 re-scores the best candidates with more precise vectors. (See
 [Semantic-Search-Architecture.md](src/semantic_search/Semantic-Search-Architecture.md).)
 This benchmark runs the full search over an in-memory store of 5,000
 documents. It uses the project's bundled 256 cluster centroids, synthetic
-768-dimension vectors, and the default settings (64 clusters probed).
+768-dimension vectors, the default settings (64 clusters probed), and a query
+shaped like production's: one vector for the whole query.
 
 ![Semantic search latency by chunks per document](docs/benchmarks/semantic_search.png)
 
 A document is split into overlapping chunks, and Pass 1 scores every chunk in
-the clusters it probes. So search time grows with chunks per document: 1.6 ms
-with one chunk, 3.7 ms with four, 6.6 ms with eight. Pass 2 re-scores a fixed
+the clusters it probes. So search time grows with chunks per document: 1.3 ms
+with one chunk, 2.1 ms with four, 3.7 ms with eight. Pass 2 re-scores a fixed
 number of candidates, so its cost does not grow.
 
 How these numbers relate to a real query:
@@ -343,11 +354,9 @@ How these numbers relate to a real query:
 - **The embedding call is not included.** A real query first sends its text to
   the embedding service, and that round trip usually takes longer than
   everything measured here. Repeated queries are served from a cache.
-- **The query shape differs from production.** The benchmark queries with four
-  vectors, but production embeds a query as one vector. With 40 query vectors the
-  search takes 3.2 ms, against 1.6 ms with four, so a one-vector query should be
-  somewhat cheaper than these figures. Nobody has measured the one-vector case
-  yet.
+- **Multi-vector queries cost more.** `search()` also accepts several query
+  vectors (production sends one). At one chunk per document, a 1-vector query
+  takes 1.25 ms, 4 vectors 1.9 ms and 40 vectors 3.3 ms.
 - **Real data is clumpier.** Synthetic vectors spread evenly across clusters.
   Real embeddings pile into a few, and a query probing those clusters scans far
   more chunks. Latency on real data depends mostly on how many chunks the probed
