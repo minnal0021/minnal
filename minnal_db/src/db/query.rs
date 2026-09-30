@@ -215,6 +215,32 @@ mod tests {
     use crate::db::test_support::*;
     use tempfile::TempDir;
 
+    /// Every L0 flush marks WAL entries persisted, after which recovery skips them
+    /// and WAL GC deletes them, so the value-log records those SSTable entries point
+    /// at must already be on stable storage. Writes fsync the value log only every
+    /// `records_per_sync`, so without the flush observer's fsync a power loss right
+    /// after the flush lost those acknowledged values for good.
+    #[test]
+    fn test_a_flush_to_l0_leaves_no_unsynced_values_behind() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        for i in 0..50u32 {
+            db.put(format!("doc:{i}").as_bytes(), b"a value that is not yet fsynced").unwrap();
+        }
+        let store = db.get_store(DEFAULT_NAMESPACE_ID).unwrap();
+        assert!(
+            store.value_log.unsynced_bytes() > 0,
+            "setup: fewer writes than records_per_sync leave values unsynced"
+        );
+        store.flush_memtable_to_level0().unwrap();
+        assert_eq!(
+            store.value_log.unsynced_bytes(),
+            0,
+            "WAL entries were marked persisted over unsynced values"
+        );
+        db.shutdown().unwrap();
+    }
+
     /// A write that loses its seq race must leave the field index alone, because
     /// the LSM drops it: reads keep showing the winner, so the index must too.
     /// Both halves used to act as if they had won. A delete older than the live

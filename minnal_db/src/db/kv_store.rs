@@ -439,6 +439,12 @@ impl KVStore {
 
     /// Set the LSM flush observer (used to wire up WAL persistence callbacks)
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
+        let observer = observer.map(|inner| {
+            Arc::new(SyncValueLogBeforePersist {
+                inner,
+                logs: self.value_log.bucket_logs(),
+            }) as Arc<dyn LsmFlushObserver>
+        });
         self.lsm.set_flush_observer(observer);
     }
 
@@ -1597,9 +1603,13 @@ impl KVStore {
             return Ok(self.gc_stats_now(0, start_time));
         }
 
-        // Step 3: make the re-points durable BEFORE unlinking anything. Load-bearing —
-        // `test_gc_crash_the_instant_segments_are_unlinked_loses_nothing` fails if these
-        // two steps are ever swapped.
+        // Step 3: make the relocated copies durable, then the re-points to them, BEFORE
+        // unlinking anything. Load-bearing — `test_gc_crash_the_instant_segments_are_
+        // unlinked_loses_nothing` fails if the flush and the unlink are ever swapped.
+        // The fsync matters for power loss rather than a process crash: survivors are
+        // appended without one, so without it the old copy could be unlinked (and the
+        // unlink made durable) while the new copy is still only in the page cache.
+        self.value_log.sync_all()?;
         self.lsm.flush_memtable_to_level0()?;
 
         // Step 4: the old segments are now unreferenced by anything durable.
@@ -1777,8 +1787,10 @@ impl KVStore {
     /// Flush and sync all data for this namespace.
     pub fn shutdown(&self) -> Result<()> {
         self.lsm.cleanup_pending_memtables_on_close();
-        self.lsm.flush_and_compact_all()?;
+        // Values before the LSM entries that point at them (see
+        // `SyncValueLogBeforePersist`).
         self.value_log.sync_all()?;
+        self.lsm.flush_and_compact_all()?;
         // Persist each bucket's segment inventory, its live/garbage counters and its
         // segment-id high-water mark. The high-water mark is what keeps ids unique
         // across restarts; the counters keep GC from under-triggering after a reopen.
@@ -1787,10 +1799,42 @@ impl KVStore {
     }
 }
 
+/// Makes a store's value log durable before any WAL entry is marked persisted.
+///
+/// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
+/// cadence), which is safe only while the WAL still holds the value. When a
+/// memtable reaches L0, `on_ro_memtable_flushed_to_level0` lets the WAL
+/// observer mark its entries persisted — recovery then skips them and WAL GC
+/// deletes them — so the value-log records those SSTable entries point at must
+/// be on stable storage first. Without this, a power loss after the flush lost
+/// up to `records_per_sync` acknowledged values (and any segment sealed since
+/// its last fsync) with nothing left to replay them from. If the fsync fails the
+/// event is withheld: the entries stay un-persisted and recovery replays them.
+struct SyncValueLogBeforePersist {
+    inner: Arc<dyn LsmFlushObserver>,
+    logs: Vec<Arc<crate::store::value_log::ValueLog>>,
+}
+
+impl LsmFlushObserver for SyncValueLogBeforePersist {
+    fn on_memtable_sealed(&self, version: u64) {
+        self.inner.on_memtable_sealed(version);
+    }
+
+    fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before marking memtable {version} persisted; its WAL entries stay replayable: {e:?}");
+                return;
+            }
+        }
+        self.inner.on_ro_memtable_flushed_to_level0(version);
+    }
+}
+
 impl Drop for KVStore {
     fn drop(&mut self) {
-        let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.sync_all();
+        let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.flush_all_metadata();
     }
 }
@@ -2689,6 +2733,25 @@ mod tests {
             // Last written value was round=5
             assert_eq!(store.get(&key).unwrap(), Some(vec![5u8; 64]), "key {i} has wrong value or is missing");
         }
+    }
+
+    /// GC appends its relocated copies without an fsync and then unlinks the
+    /// segments they came from. The copies must be durable before that, or a power
+    /// loss after the unlink loses both. A standalone store has no flush observer,
+    /// so this exercises GC's own fsync rather than the observer's.
+    #[test]
+    fn test_gc_makes_its_relocated_copies_durable() {
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::new(0), 64 * 1024).unwrap();
+        for round in 0..4u8 {
+            for i in 0u32..200 {
+                store.put_to_storage(&format!("key:{i:04}").into_bytes(), &[round; 300]).unwrap();
+            }
+        }
+        store.value_log.sync_all().unwrap(); // start clean: only GC's own writes count
+        let stats = store.garbage_collect_with_threshold(0.0).unwrap();
+        assert!(stats.bytes_reclaimed > 0, "setup: GC must collect segments whose survivors it relocated");
+        assert_eq!(store.value_log.unsynced_bytes(), 0, "relocated copies were left unsynced");
     }
 
     #[test]
