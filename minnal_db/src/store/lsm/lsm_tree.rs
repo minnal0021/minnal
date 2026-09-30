@@ -611,6 +611,10 @@ struct L0Summary {
     max_key: Vec<u8>,
     max_seq: u64,
     bloom: BloomFilter,
+    /// Offsets of every `SAMPLE_INTERVAL`-th frame, so a hit scans a few entries
+    /// instead of the file. Each hint is still validated against the file
+    /// (`valid_scan_start`), so a bad one costs a full scan, never a wrong answer.
+    index: Option<SparseIndex>,
 }
 
 impl L0Summary {
@@ -628,6 +632,7 @@ impl L0Summary {
             max_key: max_key.to_vec(),
             max_seq,
             bloom: BloomFilter::build(records.map(|(key, _)| key), len),
+            index: None,
         })
     }
 }
@@ -667,6 +672,15 @@ impl L0FileEntry {
     /// win (an exact tie stays with the newer layer already visited).
     fn cannot_beat(&self, seq: u64) -> bool {
         self.summary.as_ref().is_some_and(|s| seq_newer_or_eq(seq, s.max_seq))
+    }
+
+    /// Where to start scanning this file for `key`: a sparse-index hint, or the
+    /// head of the file when there is no index.
+    fn scan_start(&self, key: &[u8]) -> u64 {
+        self.summary
+            .as_ref()
+            .and_then(|s| s.index.as_ref())
+            .map_or(0, |index| index.block_start(key))
     }
 
     fn is_obsolete(&self) -> bool {
@@ -865,19 +879,14 @@ impl LSMTree {
         Ok(true)
     }
 
-    /// Tri-state result of looking a key up in one SSTable layer.
-    ///
-    /// The distinction between [`SsLookup::Deleted`] and [`SsLookup::Missing`]
-    /// is load-bearing: a tombstone found in a newer layer (e.g. an L0 file)
-    /// must *shadow* a live value in an older layer (L1). Collapsing both into
-    /// `None` (as the old `search_in_sstable_file` did) let `get` fall through
-    /// an L0 tombstone to a stale L1 value, resurrecting deleted keys.
-    fn lookup_in_sstable_file(&self, file: &File, key: &[u8]) -> Result<SsLookup> {
-        self.lookup_in_sstable_file_from(file, key, 0)
-    }
-
     /// Scan an SSTable file for `key`, starting at `start_offset` (a sparse-index
     /// hint, or 0 for the whole file).
+    ///
+    /// The result is tri-state, and the distinction between
+    /// [`SsLookup::Deleted`] and [`SsLookup::Missing`] is load-bearing: a
+    /// tombstone found in a newer layer (e.g. an L0 file) must *shadow* a live
+    /// value in an older layer (L1). Collapsing both into `None` let `get` fall
+    /// through an L0 tombstone to a stale L1 value, resurrecting deleted keys.
     ///
     /// The hint is validated against the file first: if it does not point at a
     /// complete, CRC-valid frame whose key is `<= key` — e.g. a concurrent
@@ -1183,7 +1192,7 @@ impl LSMTree {
     /// it for the read path. `Ok(None)` when the file is empty or cannot be opened;
     /// a frame that fails its length or CRC check is an error, as in every reader.
     fn level0_file_summary(path: &Path) -> Result<Option<L0Summary>> {
-        let (meta, bloom, _index, max_seq) = match Self::load_metadata_from_file(path) {
+        let (meta, bloom, index, max_seq) = match Self::load_metadata_from_file(path) {
             Ok(loaded) => loaded,
             Err(LSMError::Io(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -1193,6 +1202,7 @@ impl LSMTree {
             max_key: meta.max_key,
             max_seq,
             bloom,
+            index,
         }))
     }
 
@@ -1343,7 +1353,11 @@ impl LSMTree {
         }
 
         bucket_records.sort_by(|a, b| a.key.cmp(&b.key));
-        let summary = L0Summary::of_sorted(bucket_records.iter().map(|r| (r.key.as_slice(), r.seq)));
+        let mut summary = L0Summary::of_sorted(bucket_records.iter().map(|r| (r.key.as_slice(), r.seq)));
+        // Absolute frame offsets, sampled exactly as `write_merged_sstable` and
+        // `load_metadata_from_file` do, so all three agree.
+        let mut index = SparseIndex::new();
+        let mut offset = SSTABLE_DATA_START;
 
         let level0_dir = Self::level0_bucket_dir_from(&self.base_path, bucket);
         std::fs::create_dir_all(&level0_dir)?;
@@ -1353,7 +1367,10 @@ impl LSMTree {
 
         let mut file = std::fs::File::create(&level0_path)?;
         file.write_all(&sstable_header_bytes())?;
-        for entry in bucket_records {
+        for (i, entry) in bucket_records.into_iter().enumerate() {
+            if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
+                index.push(entry.key.clone(), offset);
+            }
             let key_prefix = key_prefix_of(&entry.key);
             let entry_obj = SStableEntry {
                 key: entry.key,
@@ -1365,8 +1382,12 @@ impl LSMTree {
             let payload = encode_sstable_entry(&entry_obj)?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
             file.write_all(&payload)?;
+            offset += 4 + payload.len() as u64;
         }
         file.sync_all()?;
+        if let Some(summary) = summary.as_mut() {
+            summary.index = (!index.is_empty()).then_some(index);
+        }
 
         self.register_level0_file(bucket, level0_path, timestamp_ms, summary);
         Ok(())
@@ -1832,12 +1853,12 @@ impl LSMTree {
     }
 
     /// Tri-state lookup of a key in a specific SSTable file (by path).
-    fn lookup_in_sstable_file_path(&self, path: std::path::PathBuf, key: &[u8]) -> Result<SsLookup> {
+    fn lookup_in_sstable_file_path(&self, path: std::path::PathBuf, key: &[u8], start_offset: u64) -> Result<SsLookup> {
         // The hot path: `search_level0_files` calls this for *every* L0 file in the
         // bucket on every point get that reaches L0. Reads below are positional, so
         // no cursor seek, and the file is registered, so no header re-validation.
         let file = open_registered_l0(&path)?;
-        self.lookup_in_sstable_file(&file, key)
+        self.lookup_in_sstable_file_from(&file, key, start_offset)
     }
 
     /// Load metadata from an existing SSTable file by scanning it, and build the
@@ -1963,7 +1984,7 @@ impl LSMTree {
                 }
             }
             let _guard = L0ReadGuard::new(Arc::clone(&entry));
-            let hit = self.lookup_in_sstable_file_path(entry.path.clone(), key)?;
+            let hit = self.lookup_in_sstable_file_path(entry.path.clone(), key, entry.scan_start(key))?;
             if let Some(seq) = hit.seq()
                 && best.seq().is_none_or(|b| seq_newer(seq, b))
             {
@@ -5266,6 +5287,68 @@ mod tests {
         assert!(m.l0_bloom_rejects > 0, "no L0 file was ever skipped by range/bloom");
         assert!(m.seq_prunes > 0, "no SSTable was ever skipped by max-seq");
         assert!(m.l0_probes > 0 && m.l1_probes > 0, "the slow path never read L0 and L1");
+        Ok(())
+    }
+
+    // The L0 sparse index is built twice: from offsets tracked while the flush
+    // writes the file, and by rescanning the file at open. A wrong offset is
+    // invisible to correctness tests — `valid_scan_start` rejects the hint and the
+    // lookup silently falls back to a full scan — so pin it directly: both builds
+    // must agree, and every hint must be a valid place to start scanning.
+    #[test]
+    fn test_l0_sparse_index_hints_are_valid_and_survive_reopen() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let keys: Vec<Vec<u8>> = (0..500u32).map(|i| format!("key{:05}", i * 2).into_bytes()).collect();
+        // Probe present keys and the gaps between them (odd numbers are absent).
+        let probes: Vec<Vec<u8>> = (0..1000u32).map(|i| format!("key{i:05}").into_bytes()).collect();
+
+        let hints_at_flush: Vec<u64> = {
+            let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+            for (i, key) in keys.iter().enumerate() {
+                // Values of varying width so frames differ in length.
+                lsm.insert_with_seq(key, u128::from(i as u32) << (i % 96), i as u64 + 1)?;
+            }
+            lsm.flush_memtable_to_level0()?;
+            let entries = lsm.level0_entries_snapshot(0);
+            assert_eq!(entries.len(), 1, "setup: one L0 file");
+            let entry = &entries[0];
+            assert!(entry.summary.as_ref().is_some_and(|s| s.index.is_some()), "the flush must build an index");
+            probes.iter().map(|k| entry.scan_start(k)).collect()
+        };
+
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        let entry = lsm.level0_entries_snapshot(0).remove(0);
+        let hints_at_open: Vec<u64> = probes.iter().map(|k| entry.scan_start(k)).collect();
+        if let Some(i) = (0..probes.len()).find(|&i| hints_at_flush[i] != hints_at_open[i]) {
+            panic!(
+                "flush-time and open-time indexes disagree for {:?}: {} at flush, {} at open",
+                String::from_utf8_lossy(&probes[i]),
+                hints_at_flush[i],
+                hints_at_open[i]
+            );
+        }
+
+        let file = File::open(&entry.path)?;
+        let file_len = file.metadata()?.len();
+        let mut hinted = 0;
+        for (key, &hint) in probes.iter().zip(&hints_at_open) {
+            if hint != 0 {
+                hinted += 1;
+                assert!(
+                    LSMTree::valid_scan_start(&file, hint, file_len, key),
+                    "hint {hint} for {:?} is not a valid scan start",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+        assert!(hinted > 900, "almost every probe should get a hint, got {hinted}");
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(lsm.get(key)?, Some(u128::from(i as u32) << (i % 96)), "key {i} after reopen");
+        }
         Ok(())
     }
 
