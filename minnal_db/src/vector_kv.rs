@@ -271,6 +271,7 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     if vector_indexes.is_empty() {
         return Ok(());
     }
+    let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
 
     // Never index into a store that no longer exists.
     //
@@ -338,11 +339,39 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     Ok(())
 }
 
+/// Number of stripes in [`lock_doc_vectors`]; a power of two.
+const DOC_VECTOR_LOCK_STRIPES: usize = 256;
+
+/// Serialise every write to one document's vectors: [`upsert_vectors`] and
+/// [`delete_vector`] each hold this across their whole body.
+///
+/// Both are multi-key read-modify-writes over the document's sparse cluster keys,
+/// its cluster list (`{ns}_sparse_vector_meta`) and its dense entry, and the list
+/// is the only way to find the cluster keys again. Interleaved, a delete could read
+/// the old list, then delete the list the upsert had just replaced — leaving the
+/// upsert's new cluster keys with nothing recording them. Every later clean-up
+/// (the worker's `process_clear`, the next delete) finds keys through the list, so
+/// those keys were orphaned for good: measured 260 orphans in 300 racing rounds.
+/// A document delete racing the vector worker is exactly this shape. The database
+/// has a single owning process (the directory lock), so an in-process lock
+/// suffices; the stripes are shared across namespaces and databases, which only
+/// costs an occasional false conflict.
+async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
+    static STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+        std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    doc_id_bytes.hash(&mut hasher);
+    STRIPES[(hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)].lock().await
+}
+
 /// Delete the quantised vector for a document from the vector KV store.
 ///
 /// No-op if no vector entry exists for `doc_id_bytes` (the document was never
 /// indexed, or was already cleaned up).
 pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+    let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
@@ -935,6 +964,68 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
         Ok(_) => Ok(before.lock().take().map(|v| v.into_entry(namespace, doc_id_bytes))),
         Err(crate::KVError::MergeAborted(_)) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod doc_vector_race_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A delete racing an upsert of the same document's vectors must never leave
+    /// a sparse cluster key that the document's cluster list does not record —
+    /// every clean-up finds keys through that list, so such a key is orphaned for
+    /// good. Unserialised, 260 of 300 rounds of this left one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_upsert_and_delete_leave_no_orphaned_cluster_keys() {
+        let dir = TempDir::new().unwrap();
+        let db = std::sync::Arc::new(
+            AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+                .await
+                .unwrap(),
+        );
+        db.namespace("docs".to_string()).await.unwrap();
+        let vectors = |clusters: &[u32]| -> Vec<VectorIndex> {
+            let mut out = vec![VectorIndex::new(
+                1,
+                QuantisationStyle::MultiBit { number_of_bits: 8 },
+                1.0,
+                0.0,
+                0.01,
+                vec![],
+            )];
+            out.extend(
+                clusters
+                    .iter()
+                    .map(|&c| VectorIndex::new(c, QuantisationStyle::SingleBit, 1.0, 0.0, 0.01, vec![])),
+            );
+            out
+        };
+        let meta_ns = db.namespace(sparse_vectors_meta_ns("docs")).await.unwrap();
+        let sparse_ns = db.namespace(sparse_vectors_ns("docs")).await.unwrap();
+        for round in 0..150 {
+            let doc = format!("d{round}").into_bytes();
+            upsert_vectors(&db, "docs", &doc, &vectors(&[3])).await.unwrap();
+            let (db_a, db_b, doc_a, doc_b) = (db.clone(), db.clone(), doc.clone(), doc.clone());
+            let upsert = tokio::spawn(async move { upsert_vectors(&db_a, "docs", &doc_a, &vectors(&[5, 7])).await.unwrap() });
+            let delete = tokio::spawn(async move { delete_vector(&db_b, "docs", &doc_b).await.unwrap() });
+            upsert.await.unwrap();
+            delete.await.unwrap();
+
+            let listed = meta_ns
+                .get(doc.clone())
+                .await
+                .unwrap()
+                .and_then(|b| decode_sparse_meta(&b))
+                .unwrap_or_default();
+            for cluster in [3u32, 5, 7] {
+                let present = sparse_ns.get(composite_key::encode(cluster, &doc)).await.unwrap().is_some();
+                assert!(
+                    !present || listed.contains(&cluster),
+                    "round {round}: cluster {cluster} key orphaned (list {listed:?})"
+                );
+            }
+        }
     }
 }
 
