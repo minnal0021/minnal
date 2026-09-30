@@ -895,19 +895,37 @@ impl LSMTree {
     /// *any* valid frame boundary with key `<= key` still finds `key` if present;
     /// this makes a stale hint a performance issue, never a correctness one.
     fn lookup_in_sstable_file_from(&self, file: &File, key: &[u8], start_offset: u64) -> Result<SsLookup> {
+        Ok(self.lookup_in_sstable_file_hinted(file, key, start_offset)?.0)
+    }
+
+    /// [`lookup_in_sstable_file_from`](Self::lookup_in_sstable_file_from), also
+    /// reporting whether a non-zero `start_offset` was rejected and the scan fell
+    /// back to the head of the file.
+    ///
+    /// A rejection is never a wrong answer, only a slow one, which is exactly why
+    /// it is counted (`sparse_hint_rejects`): it is otherwise invisible. For L1 it
+    /// happens legitimately while a compaction swaps the file under the index; for
+    /// an immutable L0 file it means the index's offsets are wrong, and the L0
+    /// caller asserts on it in debug builds.
+    fn lookup_in_sstable_file_hinted(&self, file: &File, key: &[u8], start_offset: u64) -> Result<(SsLookup, bool)> {
         // Also the bound for `check_frame_len` below: a frame can never be longer
         // than its file.
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut offset = if start_offset != 0 {
-            if Self::valid_scan_start(file, start_offset, file_len, key) {
-                start_offset
-            } else {
-                SSTABLE_DATA_START
-            }
+        let hint_rejected = start_offset != 0 && !Self::valid_scan_start(file, start_offset, file_len, key);
+        if hint_rejected && let Some(m) = self.metrics() {
+            Metrics::bump(&m.sparse_hint_rejects);
+        }
+        let offset = if start_offset != 0 && !hint_rejected {
+            start_offset
         } else {
             SSTABLE_DATA_START
         };
+        Ok((Self::scan_sstable_file_for(file, key, offset, file_len)?, hint_rejected))
+    }
 
+    /// The forward scan behind [`lookup_in_sstable_file_hinted`](Self::lookup_in_sstable_file_hinted),
+    /// from `offset` (a validated frame boundary) until `key` is found or passed.
+    fn scan_sstable_file_for(file: &File, key: &[u8], mut offset: u64, file_len: u64) -> Result<SsLookup> {
         loop {
             let mut size_buf = [0u8; 4];
             if !Self::read_exact_at(file, &mut size_buf, &mut offset)? {
@@ -1854,11 +1872,22 @@ impl LSMTree {
 
     /// Tri-state lookup of a key in a specific SSTable file (by path).
     fn lookup_in_sstable_file_path(&self, path: std::path::PathBuf, key: &[u8], start_offset: u64) -> Result<SsLookup> {
-        // The hot path: `search_level0_files` calls this for *every* L0 file in the
-        // bucket on every point get that reaches L0. Reads below are positional, so
-        // no cursor seek, and the file is registered, so no header re-validation.
+        // The hot path: `search_level0_files` calls this for every L0 file its
+        // summary cannot rule out. Reads below are positional, so no cursor seek,
+        // and the file is registered, so no header re-validation.
         let file = open_registered_l0(&path)?;
-        self.lookup_in_sstable_file_from(&file, key, start_offset)
+        let (hit, hint_rejected) = self.lookup_in_sstable_file_hinted(&file, key, start_offset)?;
+        // An L0 file is never rewritten, so its sparse-index hint has no
+        // legitimate way to go stale: a rejection means the index's offsets
+        // disagree with the file. Release builds survive it with a full scan (and
+        // count it in `sparse_hint_rejects`); debug builds fail, so every test
+        // that reaches an L0 lookup guards the offsets, not just the dedicated one.
+        debug_assert!(
+            !hint_rejected,
+            "L0 sparse-index hint {start_offset} is not a valid scan start in {}",
+            path.display()
+        );
+        Ok(hit)
     }
 
     /// Load metadata from an existing SSTable file by scanning it, and build the
@@ -4268,6 +4297,8 @@ mod tests {
     fn test_sparse_index_stale_hint_falls_back_correctly() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        let metrics = Arc::new(Metrics::default());
+        lsm.set_metrics(Arc::clone(&metrics));
         let n: u128 = 2000;
         for i in 0..n {
             lsm.insert(format!("k:{i:08}").as_bytes(), i + 1)?; // values are 1-based (non-zero)
@@ -4285,6 +4316,7 @@ mod tests {
             SsLookup::Found(p, _) => p,
             other => panic!("expected present key to be Found, got {other:?}"),
         };
+        assert_eq!(metrics.snapshot().sparse_hint_rejects, 0, "a zero hint is no hint, not a rejection");
 
         // Every bogus offset must yield the same Found pointer: past EOF (overflow
         // guard), mid-frame, near/at EOF, and a hint whose frame key > target.
@@ -4299,6 +4331,14 @@ mod tests {
                 other => panic!("bogus hint {bad} lost a present key: {other:?}"),
             }
         }
+        // A fallback is correct but slow, so it must be counted: that counter is
+        // the only production signal that hints are going wrong. (At least 7 of 8:
+        // the mid-file offset could in principle land on a real frame boundary.)
+        assert!(
+            metrics.snapshot().sparse_hint_rejects >= 7,
+            "rejected hints were not counted: {}",
+            metrics.snapshot().sparse_hint_rejects
+        );
 
         // An in-range absent key must stay Missing regardless of the hint.
         let absent = format!("k:{:08}x", 1234).into_bytes();

@@ -1201,6 +1201,7 @@ top-level `uptime_s`.
 | `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
 | `l0_bloom_rejects` | lsm_lookups | L0 files a lookup skipped unread: key outside the file's key range, or its bloom filter says "definitely absent" | **No** |
 | `seq_prunes` | lsm_lookups | SSTables (L0 files or the L1 file) a lookup skipped unread because a newer layer already held a copy at least as new as anything in them | **No** |
+| `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
 | `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads, query-embedding cache) | **No** |

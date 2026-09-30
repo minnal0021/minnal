@@ -138,6 +138,7 @@ pub struct LsmLookupMetrics {
     bloom_rejects: u64,
     l0_bloom_rejects: u64,
     seq_prunes: u64,
+    sparse_hint_rejects: u64,
 }
 
 #[derive(Serialize)]
@@ -231,6 +232,7 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             bloom_rejects: m.bloom_rejects,
             l0_bloom_rejects: m.l0_bloom_rejects,
             seq_prunes: m.seq_prunes,
+            sparse_hint_rejects: m.sparse_hint_rejects,
         },
         writes: WriteMetrics {
             puts: m.puts,
