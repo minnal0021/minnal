@@ -737,6 +737,29 @@ pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], t
     Ok(())
 }
 
+/// Enqueue an embed for a document **only if it has no queue entry at all**;
+/// returns whether it enqueued. Atomic (a `merge` under the key's stripe).
+///
+/// For callers that decide from a snapshot — reconciliation — and so must never
+/// overwrite what a live write queued since: a newer text (the snapshot's would
+/// win and leave stale vectors) or a `Clear` tombstone (the deleted document
+/// would be embedded again).
+pub async fn enqueue_embed_if_absent(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let entry = encode_queue_value(QueueEntryKind::Embed, text, 0, None);
+    let result = queue_ns
+        .merge(queue_key(namespace, doc_id_bytes), Vec::new(), move |existing, _| match existing {
+            Some(_) => Err(crate::KVError::MergeAborted("a queue entry already exists".into())),
+            None => Ok(Some(entry)),
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(crate::KVError::MergeAborted(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Update an existing queue entry's retry count and last error (durable single-op write).
 ///
 /// The entry's text is preserved unchanged.
@@ -868,9 +891,27 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
 pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
     upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, vector_indexes).await?;
     match complete_entry(db, entry).await? {
-        Completion::Done | Completion::Superseded => Ok(()),
-        Completion::Cleared => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
+        Completion::Done | Completion::Superseded => {}
+        Completion::Cleared => return process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
     }
+    // The vectors just written must belong to a document that still exists. A
+    // delete normally leaves a `Clear` tombstone that the completion above sees,
+    // but an entry written from a snapshot (reconciliation) can land after that
+    // tombstone was already processed, and would otherwise index a deleted
+    // document for good. A delete landing after this check leaves a tombstone
+    // for the next pass, so the two together leave no orphan. (`list_namespaces`
+    // first: resolving a dropped namespace would recreate it.)
+    if db.list_namespaces().iter().any(|(name, _)| *name == entry.namespace)
+        && db
+            .namespace(entry.namespace.clone())
+            .await?
+            .get(entry.doc_id_bytes.clone())
+            .await?
+            .is_none()
+    {
+        delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
+    }
+    Ok(())
 }
 
 /// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
@@ -1315,11 +1356,51 @@ mod queue_race_tests {
     async fn uncontended_embed_indexes_and_completes() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
+        db.namespace("docs".to_string())
+            .await
+            .unwrap()
+            .put(b"x".to_vec(), b"{}".to_vec())
+            .await
+            .unwrap();
         enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
         let in_flight = snapshot(&db, b"x").await;
         finish_embed(&db, &in_flight, &vectors_for(2.0)).await.unwrap();
         assert_eq!(dense_tag(&db, b"x").await, Some(2.0));
         assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+    }
+
+    /// Vectors for a document that no longer exists must not survive. An entry
+    /// written from a snapshot (reconciliation) can land after the delete's
+    /// `Clear` tombstone was already processed, so nothing else would remove them.
+    #[tokio::test]
+    async fn embedding_a_deleted_document_leaves_no_vectors() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await; // "docs" exists, but no document "gone" in it
+        enqueue_embed(&db, "docs", b"gone", "stale text").await.unwrap();
+        let in_flight = snapshot(&db, b"gone").await;
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+        assert_eq!(dense_tag(&db, b"gone").await, None, "vectors of a deleted document were kept");
+        assert!(!has_any_vector_state(&db, "docs", b"gone").await.unwrap(), "no vector state may remain");
+    }
+
+    /// Reconciliation enqueues from a snapshot, so it must never overwrite what a
+    /// live write queued since: newer text, or a delete's `Clear` tombstone (which
+    /// would re-index a deleted document).
+    #[tokio::test]
+    async fn enqueue_if_absent_never_overwrites_a_newer_entry_or_a_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+
+        enqueue_embed(&db, "docs", b"a", "newer text").await.unwrap();
+        assert!(!enqueue_embed_if_absent(&db, "docs", b"a", "snapshot text").await.unwrap());
+        assert_eq!(snapshot(&db, b"a").await.text, "newer text");
+
+        clear_vectors(&db, "docs", b"b").await.unwrap(); // a delete's tombstone
+        assert!(!enqueue_embed_if_absent(&db, "docs", b"b", "snapshot text").await.unwrap());
+        assert_eq!(snapshot(&db, b"b").await.kind, QueueEntryKind::Clear);
+
+        assert!(enqueue_embed_if_absent(&db, "docs", b"c", "text").await.unwrap(), "absent: enqueue");
+        assert_eq!(snapshot(&db, b"c").await.text, "text");
     }
 }
 

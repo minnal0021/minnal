@@ -741,12 +741,18 @@ async fn reconcile_doc_namespace_vectors(
         if indexed {
             continue;
         }
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(value) else {
+        // Re-read the document rather than trusting the snapshot, and enqueue
+        // only if nothing is queued: a write or delete since the snapshot queued
+        // newer work (or a `Clear` tombstone) that must not be overwritten.
+        let _ = value;
+        let Some(current) = ns.get(key.clone()).await? else {
+            continue; // deleted since the snapshot
+        };
+        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&current) else {
             continue;
         };
         let text = build_embedding_text(&doc, &schema.embedding_fields);
-        if !text.is_empty() {
-            vector_kv::enqueue_embed(db, namespace, key, &text).await?;
+        if !text.is_empty() && vector_kv::enqueue_embed_if_absent(db, namespace, key, &text).await? {
             enqueued += 1;
         }
     }
@@ -789,10 +795,15 @@ async fn reconcile_kv_namespace_vectors(
         if indexed {
             continue;
         }
-        if let Ok(text) = std::str::from_utf8(value_bytes)
+        // As for documents: re-read, and enqueue only if nothing is queued.
+        let _ = value_bytes;
+        let Some(current) = ns.get(key.clone()).await? else {
+            continue;
+        };
+        if let Ok(text) = std::str::from_utf8(&current)
             && !text.is_empty()
+            && vector_kv::enqueue_embed_if_absent(db, namespace, key, text).await?
         {
-            vector_kv::enqueue_embed(db, namespace, key, text).await?;
             enqueued += 1;
         }
     }
