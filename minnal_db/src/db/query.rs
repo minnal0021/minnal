@@ -215,6 +215,40 @@ mod tests {
     use crate::db::test_support::*;
     use tempfile::TempDir;
 
+    /// A write that loses its seq race must leave the field index alone, because
+    /// the LSM drops it: reads keep showing the winner, so the index must too.
+    /// Both halves used to act as if they had won. A delete older than the live
+    /// value stripped that live document's row, so it vanished from every query
+    /// on the field; and a put older than a delete counted the key as "absent,
+    /// so I win" and added a row for a key that reads as deleted. Only TTL expiry
+    /// produced these out-of-order seqs in practice (it now takes the key stripe),
+    /// so they are driven here directly with explicit seqs.
+    #[test]
+    fn test_a_write_that_loses_its_seq_race_leaves_the_index_alone() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        activate_status_index(&db, ns);
+        let store = db.get_store(ns).unwrap();
+
+        // A losing delete: the live value (seq 100) must stay indexed.
+        store.put_to_storage_seq(b"doc:A", br#"{"status":"active"}"#, 1_000_100).unwrap();
+        store.delete_from_storage_seq(b"doc:A", 1_000_050).unwrap();
+        // A losing put: the key stays deleted (seq 300), so it must not be indexed.
+        store.put_to_storage_seq(b"doc:B", br#"{"status":"idle"}"#, 1_000_200).unwrap();
+        store.delete_from_storage_seq(b"doc:B", 1_000_300).unwrap();
+        store.put_to_storage_seq(b"doc:B", br#"{"status":"active"}"#, 1_000_250).unwrap();
+
+        assert!(store.get(b"doc:A").unwrap().is_some(), "setup: doc:A is live");
+        assert!(store.get(b"doc:B").unwrap().is_none(), "setup: doc:B is deleted");
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"").unwrap().keys,
+            vec![b"doc:A".to_vec()],
+            "the index must agree with reads: doc:A live, doc:B deleted"
+        );
+        db.shutdown().unwrap();
+    }
+
     /// Item 13: a put that adds/removes the indexed field (absent↔present) must
     /// update the index correctly via the targeted path — the row joins the new
     /// value's bucket and leaves whatever it was in (including "nothing").

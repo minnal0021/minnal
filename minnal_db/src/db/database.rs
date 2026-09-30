@@ -1301,9 +1301,9 @@ impl Database {
     /// are safe but pointless: a read of this key returns the same pre-merge
     /// value the closure was already handed.
     ///
-    /// TTL expiry is the one writer outside the stripe: it deletes straight
-    /// through `KVStore`, so a merge racing an expiry can resurrect a key that
-    /// was about to expire. The next TTL pass expires it again.
+    /// TTL expiry takes the same stripe and deletes by compare-and-set, so a
+    /// merge that rewrites a key about to expire keeps its result; the next TTL
+    /// pass judges the new value on its own epoch.
     pub fn merge_ns<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
@@ -3149,7 +3149,9 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            match store.expire_records(ttl, max_deletes) {
+            // The key stripe keeps expiry out of every same-key write's
+            // seq-to-apply window (see `KVStore::expire_records_locked`).
+            match store.expire_records_locked(ttl, max_deletes, |key| self.key_locks.guard(ns_id, key)) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);

@@ -750,22 +750,30 @@ impl KVStore {
         // resurrecting the key. Taking the lock serialises us with GC so the
         // delete is either fully visible to GC's scan or applied after GC ends.
         let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        self.delete_with_bucket_locked(key, seq, bucket_guard)
+    }
 
+    /// The body of a delete, entered with `key`'s value-log bucket write lock
+    /// already held (`bucket_guard`, released before the field indices are
+    /// touched).
+    ///
+    /// Like the put path, it asks whether this delete actually **wins**: a delete
+    /// older than the key's current copy is dropped by the LSM, so it must not
+    /// strip that live document's rows from the field indices or charge its record
+    /// as garbage. It used to do both unconditionally, so a delete that lost its
+    /// race left a live document missing from every query on the field.
+    fn delete_with_bucket_locked(&self, key: &[u8], seq: u64, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning
         // every bucket. Only when the namespace has indexes to update.
         let want_old_for_index = !self.namespace_index.read().is_empty();
-        let mut old_value: Option<Vec<u8>> = None;
-        let mut displaced: Option<ShardedValuePointer> = None;
-        if let Some(existing) = self.lsm.get(key)?
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
-        {
-            displaced = Some(existing_ptr);
-            if want_old_for_index {
-                old_value = self.value_log.read_value(existing_ptr).ok();
-            }
-        }
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+        let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
+        let old_value = match displaced {
+            Some(existing_ptr) if want_old_for_index => self.value_log.read_value(existing_ptr).ok(),
+            _ => None,
+        };
         self.lsm.delete_with_seq(key, seq)?;
 
         // The deleted key's record is garbage now. Accounting only — the record itself
@@ -774,10 +782,12 @@ impl KVStore {
         if let Some(old) = displaced {
             self.value_log.note_displaced(old, key.len());
         }
-        drop(_bucket_guard);
+        drop(bucket_guard);
 
-        // Remove row from all field indices
-        self.update_indices_on_delete(key, old_value.as_deref());
+        // Remove row from all field indices — only if the key is now deleted.
+        if wins {
+            self.update_indices_on_delete(key, old_value.as_deref());
+        }
 
         Ok(())
     }
@@ -879,6 +889,15 @@ impl KVStore {
         Ok(entries)
     }
 
+    /// Delete records whose creation epoch is older than `ttl`, for a store with
+    /// no concurrent same-key writers to exclude (tests and standalone use). The
+    /// database's TTL worker uses [`expire_records_locked`](Self::expire_records_locked)
+    /// with its key stripe.
+    #[cfg(test)]
+    pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
+        self.expire_records_locked(ttl, max_deletes_per_run, |_| ())
+    }
+
     /// Delete records whose creation epoch is older than `ttl`.
     ///
     /// Scans live keys and reads each record's `epoch` straight from the value log
@@ -886,30 +905,62 @@ impl KVStore {
     /// records are removed per call so a single pass can't stall on a huge backlog;
     /// value-log GC reclaims the physical space afterwards. Returns the number
     /// deleted.
-    pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
+    ///
+    /// Each expired key is deleted by **compare-and-set**: only if it still points
+    /// at the exact record judged expired ([`delete_if_current`](Self::delete_if_current)).
+    /// A key rewritten after the check — its fresh value just acknowledged to a
+    /// writer — is left alone; the old code deleted whatever was current. And the
+    /// delete runs under `lock_key(key)`, which the database supplies as the key
+    /// stripe: a WAL-backed write holds that stripe from allocating its seq to
+    /// applying it, so no same-key write can sit between the two while TTL
+    /// allocates its own seq. Without it TTL deletes carried seqs out of order
+    /// with concurrent puts, the one source of "lower-seq copy in a newer layer"
+    /// that the read paths (and the L1 tombstone-drop contract) had to tolerate.
+    pub(crate) fn expire_records_locked<G>(&self, ttl: Duration, max_deletes_per_run: usize, lock_key: impl Fn(&[u8]) -> G) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
-        let keys = self.keys()?;
-        let entries = self.resolve_entries(keys)?;
-
         let mut deleted = 0usize;
-        for (key, pointer) in entries {
+        for key in self.keys()? {
             if deleted >= max_deletes_per_run {
                 break;
             }
-            // The LSM listed this key, so it is live by definition — there is no
-            // "already tombstoned" record state to skip any more.
+            // Resolved per key as the pass reaches it, not all up front: the
+            // compare-and-set below only holds off writes after this point.
+            let Some(pointer) = self.lsm.get(&key)?.and_then(decode_sharded_pointer) else {
+                continue; // deleted since the key list was taken
+            };
             let Ok(meta) = self.value_log.read_record_meta(pointer) else {
                 continue;
             };
             if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                self.delete_from_storage(&key)?;
-                deleted += 1;
+                let _key_guard = lock_key(&key);
+                if self.delete_if_current(&key, pointer)? {
+                    deleted += 1;
+                }
             }
         }
 
         Ok(deleted)
+    }
+
+    /// Delete `key` only if it still points at `expected` — the record a TTL pass
+    /// judged expired. Returns whether it deleted. A key rewritten (or relocated by
+    /// GC) since is left for the next pass to judge afresh; pointers are unique for
+    /// the life of the database, so pointer equality means "the same write".
+    ///
+    /// The seq is allocated only after the check, under the bucket lock and the
+    /// caller's key lock, so the delete is newer than anything already applied to
+    /// the key and — with the key stripe held — than anything about to be.
+    fn delete_if_current(&self, key: &[u8], expected: ShardedValuePointer) -> Result<bool> {
+        let bucket = self.value_log.bucket_for_key(key);
+        let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        if self.lsm.get(key)?.and_then(decode_sharded_pointer) != Some(expected) {
+            return Ok(false);
+        }
+        let seq = self.alloc_seq();
+        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        Ok(true)
     }
 
     /// Fetch multiple keys in parallel by grouping I/O across value-log buckets.

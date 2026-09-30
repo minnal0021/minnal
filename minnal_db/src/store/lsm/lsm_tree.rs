@@ -1632,6 +1632,15 @@ impl LSMTree {
     /// preserving its sequence, so the relocation neither loses to nor blocks a
     /// real write under highest-sequence-wins resolution.
     pub(crate) fn get_with_seq(&self, key: &[u8]) -> Result<Option<(u128, u64)>> {
+        Ok(self.newest_copy(key)?.and_then(|(value, seq)| value.map(|ptr| (ptr, seq))))
+    }
+
+    /// The winning copy of `key` across every layer — `Some((Some(pointer), seq))`
+    /// for a live value, `Some((None, seq))` when a **tombstone** wins, `None`
+    /// when no layer holds the key at all. [`get_with_seq`](Self::get_with_seq)
+    /// is this with tombstones read as absent; the write path needs the
+    /// tombstone's seq to tell whether a write is newer than the delete.
+    fn newest_copy(&self, key: &[u8]) -> Result<Candidate> {
         // Resolve by highest write sequence across ALL layers. Layer order is no
         // longer assumed to imply recency — a GC re-point can re-insert a value at
         // its old (low) sequence into a newer layer, above a deleting tombstone in
@@ -1656,7 +1665,7 @@ impl LSMTree {
                     if let Some(m) = self.metrics() {
                         Metrics::bump(&m.fast_path_hits);
                     }
-                    return Ok((!tombstone).then_some((value, seq)));
+                    return Ok(Some(((!tombstone).then_some(value), seq)));
                 }
                 Self::merge_candidate(&mut best, (!tombstone).then_some(value), seq);
             }
@@ -1681,7 +1690,7 @@ impl LSMTree {
             SsLookup::Missing => {}
         }
 
-        Ok(best.and_then(|(value, seq)| value.map(|ptr| (ptr, seq))))
+        Ok(best)
     }
 
     /// The pointer currently referenced for `key` (highest sequence across all
@@ -1694,10 +1703,16 @@ impl LSMTree {
     /// higher-sequence one) does not — its own freshly-appended record is the garbage
     /// instead. Deciding this from a pre-lock read (as the old code did) let two writers
     /// see the same old pointer and both mark it displaced, double-counting it while
-    /// leaking the loser's record. `true` when the key is currently absent.
+    /// leaking the loser's record.
+    ///
+    /// A winning **tombstone** counts: the pointer is `None` (nothing to displace),
+    /// but a write older than the delete still loses to it. Reading that case as
+    /// "absent, so any write wins" made a lost put add a field-index row for a
+    /// key that reads as deleted. `true` only when no layer holds the key at all,
+    /// or the write is at least as new as whatever does.
     pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u64) -> Result<(Option<u128>, bool)> {
-        match self.get_with_seq(key)? {
-            Some((ptr, existing_seq)) => Ok((Some(ptr), seq_newer_or_eq(new_seq, existing_seq))),
+        match self.newest_copy(key)? {
+            Some((ptr, existing_seq)) => Ok((ptr, seq_newer_or_eq(new_seq, existing_seq))),
             None => Ok((None, true)),
         }
     }
