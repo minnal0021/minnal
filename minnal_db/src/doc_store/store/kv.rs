@@ -391,6 +391,27 @@ mod tests {
         assert_eq!(got, Some(serde_json::json!("seven")));
     }
 
+    /// A range scan over int keys must follow numeric order across zero. With
+    /// plain two's-complement big-endian keys, `[-10, 10)` had a start that
+    /// sorted after its end and returned nothing, and a full scan listed the
+    /// negatives last.
+    #[tokio::test]
+    async fn test_kv_int_key_range_scan_spans_negative_keys() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Int)).await.unwrap();
+        for k in [-20i64, -10, -3, 0, 3, 10, 20] {
+            store.kv_put("ns", &serde_json::json!(k), &serde_json::json!(k)).await.unwrap();
+        }
+
+        let keys = |page: CursorPage<(serde_json::Value, serde_json::Value)>| page.results.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        let window = store.kv_scan_range("ns", "-10", Some("10"), None, 100).await.unwrap();
+        assert_eq!(keys(window), [-10, -3, 0, 3].map(|k| serde_json::json!(k)));
+        let all = store.kv_scan_range("ns", &i64::MIN.to_string(), None, None, 100).await.unwrap();
+        assert_eq!(keys(all), [-20, -10, -3, 0, 3, 10, 20].map(|k| serde_json::json!(k)));
+    }
+
     #[tokio::test]
     async fn test_kv_wrong_value_type_rejected() {
         let db_dir = TempDir::new().unwrap();

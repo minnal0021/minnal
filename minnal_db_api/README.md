@@ -318,7 +318,7 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 | `key_type` | URL path segment | Storage |
 |-----------|-----------------|---------|
 | `str` | UTF-8 string, 1–50 bytes | raw UTF-8 bytes |
-| `int` | decimal integer | big-endian `i64` (ordered scans work correctly) |
+| `int` | decimal integer | `i64`, big-endian with the sign bit flipped, so byte order is numeric order including negatives (ordered scans work correctly) |
 
 `str` keys are subject to the same rules as string document keys: at most 50 UTF-8 bytes, non-empty, and not equal to a reserved route segment (`prefix`, `semantic-search`). See [Key types](#key-types).
 
@@ -1009,7 +1009,7 @@ Response — a page of `{key, value}` pairs ordered by key, plus `next_cursor`
 
 Scan all entries whose key starts with `prefix`. Most useful for `key_type = str` stores where keys share a common string prefix (e.g. `"user-"` to find all user entries).
 
-For `key_type = int`, `prefix` is parsed as a decimal integer and serialised as a big-endian 8-byte value — this matches only the exact key and is rarely more useful than a point lookup; use range scan for numeric key ranges instead.
+For `key_type = int`, `prefix` is parsed as a decimal integer and serialised as its 8-byte key encoding — this matches only the exact key and is rarely more useful than a point lookup; use range scan for numeric key ranges instead.
 
 Results are returned in ascending key order. **Cursor-paginated** like the range
 scan — each page resolves only its own values.

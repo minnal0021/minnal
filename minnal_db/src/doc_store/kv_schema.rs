@@ -123,11 +123,29 @@ impl KvStoreSchema {
     }
 }
 
+/// Encode an `int` key so that byte order is numeric order: big-endian with the
+/// sign bit flipped.
+///
+/// Plain big-endian two's complement is NOT order-preserving for signed values —
+/// every negative number has its top bit set, so all of them sorted after every
+/// positive one (`-1` = `0xFF…FF` came last), and a range scan such as
+/// `[-10, 10)` had a start that sorted after its end and returned nothing.
+/// Flipping the sign bit maps `i64::MIN..=i64::MAX` onto `0..=u64::MAX` in order.
+fn encode_int_key(n: i64) -> [u8; 8] {
+    ((n as u64) ^ (1 << 63)).to_be_bytes()
+}
+
+/// Inverse of [`encode_int_key`].
+fn decode_int_key(bytes: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(bytes) ^ (1 << 63)) as i64
+}
+
 impl KvKeyType {
     /// Serialize a JSON value as raw key bytes for storage in minnal_db.
     ///
-    /// Int keys use big-endian encoding so that lexicographic byte order
-    /// matches numeric order, enabling range scans. Str keys are stored
+    /// Int keys use an order-preserving encoding ([`encode_int_key`]: big-endian
+    /// with the sign bit flipped) so that byte order matches numeric order,
+    /// negatives included, enabling range scans. Str keys are stored
     /// verbatim after validation through [`StrKey`], which bounds them to
     /// [`MAX_STR_KEY_LEN`](crate::doc_store::key::MAX_STR_KEY_LEN) bytes.
     pub fn serialize_key(&self, key: &serde_json::Value) -> Result<Vec<u8>, SchemaError> {
@@ -138,7 +156,7 @@ impl KvKeyType {
             }
             KvKeyType::Int => {
                 let n = key.as_i64().ok_or(SchemaError::KvKeyTypeMismatch { expected: "integer" })?;
-                Ok(n.to_be_bytes().to_vec())
+                Ok(encode_int_key(n).to_vec())
             }
         }
     }
@@ -154,7 +172,7 @@ impl KvKeyType {
             KvKeyType::Str => Ok(StrKey::new(raw)?.as_bytes().to_vec()),
             KvKeyType::Int => {
                 let n: i64 = raw.parse().map_err(|_| SchemaError::KvKeyTypeMismatch { expected: "integer" })?;
-                Ok(n.to_be_bytes().to_vec())
+                Ok(encode_int_key(n).to_vec())
             }
         }
     }
@@ -168,7 +186,7 @@ impl KvKeyType {
             }
             KvKeyType::Int => {
                 let arr: [u8; 8] = bytes.try_into().map_err(|_| SchemaError::KvValueCorrupt)?;
-                Ok(serde_json::Value::from(i64::from_be_bytes(arr)))
+                Ok(serde_json::Value::from(decode_int_key(arr)))
             }
         }
     }
@@ -393,8 +411,26 @@ mod tests {
     #[test]
     fn kv_key_from_str_int_key() {
         let bytes = KvKeyType::Int.serialize_key_from_str("42").unwrap();
-        let expected = 42i64.to_be_bytes().to_vec();
-        assert_eq!(bytes, expected);
+        assert_eq!(bytes, KvKeyType::Int.serialize_key(&serde_json::json!(42)).unwrap());
+        assert_eq!(KvKeyType::Int.deserialize_key(&bytes).unwrap(), serde_json::json!(42));
+    }
+
+    /// Byte order of encoded int keys must be numeric order, negatives
+    /// included — range scans compare the raw bytes. Plain big-endian two's
+    /// complement put every negative key after every positive one.
+    #[test]
+    fn int_key_byte_order_is_numeric_order_including_negatives() {
+        let values = [i64::MIN, i64::MIN + 1, -1_000_000, -10, -1, 0, 1, 10, 1_000_000, i64::MAX - 1, i64::MAX];
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|&v| KvKeyType::Int.serialize_key(&serde_json::json!(v)).unwrap())
+            .collect();
+        let mut sorted = encoded.clone();
+        sorted.sort();
+        assert_eq!(encoded, sorted, "encoded int keys must sort in numeric order");
+        for (&v, bytes) in values.iter().zip(&encoded) {
+            assert_eq!(KvKeyType::Int.deserialize_key(bytes).unwrap(), serde_json::json!(v), "round trip of {v}");
+        }
     }
 
     #[test]

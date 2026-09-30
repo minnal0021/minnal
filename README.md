@@ -275,7 +275,7 @@ Each document namespace declares:
 **KV stores (`KvStoreSchema`)**
 
 A simpler, schema-lite alternative backed by the same minnal_db namespace. Each KV namespace declares:
-- A key type: `str` (UTF-8 bytes) or `int` (big-endian `i64` for ordered scans)
+- A key type: `str` (UTF-8 bytes) or `int` (an `i64`, encoded so byte order is numeric order — negatives included — for ordered scans)
 - A value type: `int`, `str`, `f32`, or `vec_f32`
 - Optionally `semantic_search_enabled = true` when `value_type = str`
 
