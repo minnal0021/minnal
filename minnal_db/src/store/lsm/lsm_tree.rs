@@ -2612,8 +2612,14 @@ impl LSMTree {
         let mut results = Vec::new();
         let mut entry_bytes = Vec::new();
 
+        // For a prefix of at most 8 bytes, compare the entry's stored 8-byte
+        // `key_prefix` instead of the key. That field is the key ZERO-PADDED to 8
+        // bytes, so a key shorter than the prefix must be rejected first: key "ab"
+        // pads to "ab\0…", which would otherwise match prefix "ab\0".
         let matches_prefix = |archived: &ArchivedSStableEntry, key_slice: &[u8]| -> bool {
-            if prefix.len() <= 8 {
+            if key_slice.len() < prefix.len() {
+                false
+            } else if prefix.len() <= 8 {
                 let prefix_len = prefix.len();
                 let entry_prefix_bytes = archived.key_prefix.to_native().to_be_bytes();
                 &entry_prefix_bytes[..prefix_len] == prefix
@@ -5499,6 +5505,26 @@ mod tests {
                 assert_eq!(lsm.range_keys_bounded(start, 3)?, page_keys, "{label}: range_keys_bounded, limit 3");
             }
         }
+        Ok(())
+    }
+
+    // The L0 prefix filter compares a key's zero-padded 8-byte `key_prefix`, so a
+    // key shorter than a prefix that ends in 0x00 bytes used to match it — but only
+    // while the key sat in L0; the memtable and L1 paths compare real key bytes.
+    // All three layers must agree that "ab" does not start with "ab\0".
+    #[test]
+    fn test_scan_prefix_rejects_a_key_shorter_than_the_prefix_in_every_layer() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        lsm.insert_with_seq(b"ab", 1, 1)?;
+        lsm.insert_with_seq(b"ab\0x", 2, 2)?; // a real match, to show the filter still admits one
+        let expected = vec![(b"ab\0x".to_vec(), 2u128, 2u64)];
+
+        assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "memtable");
+        lsm.flush_memtable_to_level0()?;
+        assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "L0");
+        lsm.compact_all()?;
+        assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "L1");
         Ok(())
     }
 
