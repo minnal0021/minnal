@@ -382,3 +382,289 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod differential_tests {
+    use crate::db::database::Database;
+    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
+    use crate::db::namespace_index::ExtractorFn;
+    use crate::db::test_support::create_db_config;
+    use crate::index::{IndexValue, IndexValueType};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct R(u64);
+    impl R {
+        fn n(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn b(&mut self, k: u64) -> u64 {
+            self.n() % k
+        }
+    }
+    #[derive(Clone, Debug, Default)]
+    struct Doc {
+        status: Option<String>,
+        age: Option<i64>,
+        flag: Option<bool>,
+    }
+    #[derive(Debug)]
+    enum E {
+        Leaf(&'static str, &'static str, V),
+        And(Box<E>, Box<E>),
+        Or(Box<E>, Box<E>),
+        Not(Box<E>),
+    }
+    #[derive(Debug, Clone)]
+    enum V {
+        S(String),
+        I(i64),
+        B(bool),
+        L(Vec<V>),
+    }
+
+    const AGES: [i64; 8] = [i64::MIN, -5, -1, 0, 1, 7, 20, i64::MAX];
+    fn rs(r: &mut R) -> String {
+        ["a", "b", "c", "d"][r.b(4) as usize].to_string()
+    }
+    fn ri(r: &mut R) -> i64 {
+        AGES[r.b(8) as usize]
+    }
+
+    fn gen_e(r: &mut R, depth: u32) -> E {
+        if depth == 0 || r.b(3) == 0 {
+            let ops = ["=", "!=", "<", "<=", ">", ">=", "IN"];
+            return match r.b(3) {
+                0 => {
+                    let op = ops[r.b(7) as usize];
+                    let v = if op == "IN" {
+                        V::L((0..r.b(3) + 1).map(|_| V::S(rs(r))).collect())
+                    } else {
+                        V::S(rs(r))
+                    };
+                    E::Leaf("status", op, v)
+                }
+                1 => {
+                    let op = ops[r.b(7) as usize];
+                    let v = if op == "IN" {
+                        V::L((0..r.b(3) + 1).map(|_| V::I(ri(r))).collect())
+                    } else {
+                        V::I(ri(r))
+                    };
+                    E::Leaf("age", op, v)
+                }
+                _ => {
+                    let op = ["=", "!=", "IN"][r.b(3) as usize];
+                    let v = if op == "IN" { V::L(vec![V::B(r.b(2) == 0)]) } else { V::B(r.b(2) == 0) };
+                    E::Leaf("flag", op, v)
+                }
+            };
+        }
+        match r.b(3) {
+            0 => E::And(Box::new(gen_e(r, depth - 1)), Box::new(gen_e(r, depth - 1))),
+            1 => E::Or(Box::new(gen_e(r, depth - 1)), Box::new(gen_e(r, depth - 1))),
+            _ => E::Not(Box::new(gen_e(r, depth - 1))),
+        }
+    }
+    fn vs(v: &V) -> String {
+        match v {
+            V::S(s) => format!("\"{s}\""),
+            V::I(i) => i.to_string(),
+            V::B(b) => b.to_string(),
+            V::L(l) => format!("({})", l.iter().map(vs).collect::<Vec<_>>().join(", ")),
+        }
+    }
+    fn render(e: &E) -> String {
+        match e {
+            E::Leaf(f, op, v) => format!("{f} {op} {}", vs(v)),
+            E::And(a, b) => format!("({} AND {})", render(a), render(b)),
+            E::Or(a, b) => format!("({} OR {})", render(a), render(b)),
+            E::Not(a) => format!("NOT ({})", render(a)),
+        }
+    }
+    fn fields(e: &E, out: &mut BTreeSet<&'static str>) {
+        match e {
+            E::Leaf(f, ..) => {
+                out.insert(f);
+            }
+            E::And(a, b) | E::Or(a, b) => {
+                fields(a, out);
+                fields(b, out);
+            }
+            E::Not(a) => fields(a, out),
+        }
+    }
+    fn has(d: &Doc, f: &str) -> bool {
+        match f {
+            "status" => d.status.is_some(),
+            "age" => d.age.is_some(),
+            _ => d.flag.is_some(),
+        }
+    }
+    fn cmp<T: Ord>(x: &T, op: &str, y: &T) -> bool {
+        match op {
+            "=" => x == y,
+            "!=" => x != y,
+            "<" => x < y,
+            "<=" => x <= y,
+            ">" => x > y,
+            _ => x >= y,
+        }
+    }
+    fn leaf(d: &Doc, f: &str, op: &str, v: &V) -> bool {
+        match (f, v) {
+            ("status", V::L(l)) => d.status.as_ref().is_some_and(|s| l.iter().any(|x| matches!(x, V::S(y) if y == s))),
+            ("status", V::S(y)) => d.status.as_ref().is_some_and(|s| cmp(s, op, y)),
+            ("age", V::L(l)) => d.age.is_some_and(|a| l.iter().any(|x| matches!(x, V::I(y) if *y == a))),
+            ("age", V::I(y)) => d.age.is_some_and(|a| cmp(&a, op, y)),
+            ("flag", V::L(l)) => d.flag.is_some_and(|a| l.iter().any(|x| matches!(x, V::B(y) if *y == a))),
+            ("flag", V::B(y)) => d.flag.is_some_and(|a| cmp(&a, op, y)),
+            _ => unreachable!(),
+        }
+    }
+    fn model(e: &E, docs: &BTreeMap<Vec<u8>, Doc>) -> BTreeSet<Vec<u8>> {
+        match e {
+            E::Leaf(f, op, v) => docs.iter().filter(|(_, d)| leaf(d, f, op, v)).map(|(k, _)| k.clone()).collect(),
+            E::And(a, b) => model(a, docs).intersection(&model(b, docs)).cloned().collect(),
+            E::Or(a, b) => model(a, docs).union(&model(b, docs)).cloned().collect(),
+            E::Not(a) => {
+                let mut fs = BTreeSet::new();
+                fields(a, &mut fs);
+                let universe: BTreeSet<Vec<u8>> = docs
+                    .iter()
+                    .filter(|(_, d)| fs.iter().any(|f| has(d, f)))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                universe.difference(&model(a, docs)).cloned().collect()
+            }
+        }
+    }
+
+    /// Every query must return exactly what brute-force evaluation of the same
+    /// predicate over the documents returns, with the documented semantics
+    /// (a missing field matches nothing; `NOT` complements against rows that have
+    /// a value for a referenced field). Random documents with fields present or
+    /// absent are put, rewritten and deleted through the real write path, with
+    /// index checkpoints, clean reopens and crash-style reopens (index rebuilt by
+    /// WAL replay) mixed in, and every result is also paged through to check
+    /// `query_keys_paginated` and `total`.
+    #[test]
+    fn test_queries_match_brute_force_across_reopens() {
+        let dir = TempDir::new().unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let open = || {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let reg = |name: &'static str, t: IndexValueType, ex: ExtractorFn| {
+                let id = db.register_index_field(ns, name, t).unwrap();
+                db.activate_field_index(ns, id, t, ex).unwrap();
+            };
+            let json = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).ok();
+            reg(
+                "status",
+                IndexValueType::Str,
+                Arc::new(move |b: &[u8]| Some(IndexValue::Str(json(b)?["status"].as_str()?.to_string()))),
+            );
+            reg(
+                "age",
+                IndexValueType::Int,
+                Arc::new(move |b: &[u8]| Some(IndexValue::Int(json(b)?["age"].as_i64()?))),
+            );
+            reg(
+                "flag",
+                IndexValueType::Bool,
+                Arc::new(move |b: &[u8]| Some(IndexValue::Bool(json(b)?["flag"].as_bool()?))),
+            );
+            db
+        };
+        let mut db = open();
+        let (mut reopens, mut crashes, mut ckpts) = (0, 0, 0);
+
+        let mut r = R(777);
+        let mut docs: BTreeMap<Vec<u8>, Doc> = BTreeMap::new();
+        let mut checked = 0;
+        for round in 0..20 {
+            match r.b(8) {
+                0 => {
+                    db.shutdown().unwrap();
+                    drop(db);
+                    db = open();
+                    reopens += 1;
+                }
+                1 => {
+                    drop(db);
+                    db = open();
+                    crashes += 1;
+                }
+                2 | 3 => {
+                    use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
+                    db.run_index_checkpoint().unwrap();
+                    ckpts += 1;
+                }
+                _ => {}
+            }
+            for _ in 0..40 {
+                let key = format!("doc:{:03}", r.b(50)).into_bytes();
+                if r.b(6) == 0 {
+                    db.delete(&key).unwrap();
+                    docs.remove(&key);
+                } else {
+                    let d = Doc {
+                        status: (r.b(5) != 0).then(|| rs(&mut r)),
+                        age: (r.b(5) != 0).then(|| ri(&mut r)),
+                        flag: (r.b(5) != 0).then(|| r.b(2) == 0),
+                    };
+                    let mut j = serde_json::Map::new();
+                    if let Some(s) = &d.status {
+                        j.insert("status".into(), s.clone().into());
+                    }
+                    if let Some(a) = d.age {
+                        j.insert("age".into(), a.into());
+                    }
+                    if let Some(f) = d.flag {
+                        j.insert("flag".into(), f.into());
+                    }
+                    db.put(&key, serde_json::to_vec(&serde_json::Value::Object(j)).unwrap().as_slice())
+                        .unwrap();
+                    docs.insert(key, d);
+                }
+            }
+            for _ in 0..25 {
+                let e = gen_e(&mut r, 3);
+                let q = render(&e);
+                let got: BTreeSet<Vec<u8>> = db.query_keys(ns, &q).unwrap().keys.into_iter().collect();
+                let want = model(&e, &docs);
+                if got != want {
+                    let show = |s: &BTreeSet<Vec<u8>>| s.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>();
+                    panic!(
+                        "round {round} query `{q}`\n extra: {:?}\n missing: {:?}",
+                        show(&got.difference(&want).cloned().collect()),
+                        show(&want.difference(&got).cloned().collect())
+                    );
+                }
+                // Pagination: pages concatenate to the full result; total is exact.
+                let full = db.query_keys(ns, &q).unwrap();
+                assert_eq!(full.total as usize, want.len(), "round {round} `{q}`: total");
+                let mut paged = Vec::new();
+                let mut off = 0;
+                loop {
+                    let p = db.query_keys_paginated(ns, &q, off, 7).unwrap();
+                    assert_eq!(p.total as usize, want.len(), "round {round} `{q}`: paginated total");
+                    if p.keys.is_empty() {
+                        break;
+                    }
+                    off += p.keys.len();
+                    paged.extend(p.keys);
+                }
+                assert_eq!(paged, full.keys, "round {round} `{q}`: pages differ from the full result");
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0 && reopens + crashes > 0 && ckpts > 0,
+            "the run must exercise reopens and checkpoints"
+        );
+        db.shutdown().unwrap();
+    }
+}
