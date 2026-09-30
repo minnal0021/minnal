@@ -1907,7 +1907,7 @@ Returns `422` if the entry has not yet exhausted its retry budget.
 
 ## Predicate syntax
 
-Predicates reference indexed field names. Operators and examples:
+Predicates reference indexed field names. An index field name is an identifier — a letter or `_` followed by letters, digits or `_` — and cannot be a keyword (`AND`, `OR`, `NOT`, `IN`, `TRUE`, `FALSE`, in any case); creating an index on any other name is rejected with `400`. Indexed fields are top-level document keys. Operators and examples:
 
 | Operator   | Example                          | Applicable types   |
 |-----------|----------------------------------|--------------------|

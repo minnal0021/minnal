@@ -61,6 +61,7 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::EmptyFieldName { .. })
             | DocStoreError::Schema(SchemaError::EmptyAttributeName)
             | DocStoreError::Schema(SchemaError::DuplicateFieldName { .. })
+            | DocStoreError::Schema(SchemaError::InvalidFieldName { .. })
             | DocStoreError::Schema(SchemaError::AttributeIsIndexed { .. })
             | DocStoreError::Schema(SchemaError::AttributeNotFound { .. })
             | DocStoreError::Schema(SchemaError::SemanticSearchMissingField)

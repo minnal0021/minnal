@@ -86,6 +86,9 @@ impl DocStore {
             namespace: namespace.to_owned(),
         })?;
 
+        // `schema.save()` below does not run `validate`, so check the name here.
+        crate::doc_store::schema::validate_index_field_name(&spec.field)?;
+
         if schema.indices.iter().any(|s| s.field == spec.field) {
             return Err(DocStoreError::IndexAlreadyExists {
                 namespace: namespace.to_owned(),
@@ -512,6 +515,36 @@ mod tests {
         assert!(
             err.to_string().contains("unknown field 'status'"),
             "expected unknown field 'status', got: {err}",
+        );
+    }
+
+    /// `add_index` saves the schema without running `validate`, so it must check
+    /// the new field's name itself.
+    #[tokio::test]
+    async fn test_add_index_rejects_a_field_name_no_query_can_reference() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+
+        for bad in ["address.city", "created-at", "in"] {
+            let result = store
+                .add_index(
+                    "ns",
+                    IndexSpec {
+                        field: bad.to_owned(),
+                        index_type: IndexType::Str,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(DocStoreError::Schema(SchemaError::InvalidFieldName { .. }))),
+                "'{bad}' must be rejected"
+            );
+        }
+        assert!(
+            DocStoreSchema::load(schema_dir.path(), "ns").unwrap().indices.is_empty(),
+            "nothing was added"
         );
     }
 

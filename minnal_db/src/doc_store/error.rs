@@ -22,6 +22,9 @@ pub enum SchemaError {
     #[error("duplicate field name: '{field}'")]
     DuplicateFieldName { field: String },
 
+    #[error("field name '{field}' is not usable: {reason}")]
+    InvalidFieldName { field: String, reason: &'static str },
+
     #[error("attribute '{name}' is used by an active index — drop the index first")]
     AttributeIsIndexed { name: String },
 
