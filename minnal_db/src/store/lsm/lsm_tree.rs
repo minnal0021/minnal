@@ -308,42 +308,48 @@ impl<'a> FrameReader<'a> {
 ///
 /// `l1` is the oldest layer, in the order its entries were read: bucket by bucket,
 /// each bucket's run key-sorted. `newer` holds every newer layer (L0, read-only and
-/// active memtables) already merged oldest→newest with overwrite. The result is what
-/// inserting `l1` in order and then `newer` into one map with overwrite would yield,
+/// active memtables) already folded by [`fold_newest`]. The result is what folding
+/// `l1` in order and then `newer` into one map by [`fold_newest`] would yield,
 /// minus tombstones — without paying a map insert per L1 entry:
 ///
-/// * a **stable** sort puts equal keys in read order, so keeping the last of each
-///   run of equal keys matches a map's last-insert-wins (and costs little: the
+/// * a **stable** sort puts equal keys in read order, so keeping the highest seq
+///   of each run (the later one on a tie) matches the fold (and costs little: the
 ///   input is a handful of pre-sorted runs, which the sort merges);
-/// * a sorted two-way merge then lets `newer` shadow `l1` on equal keys.
-fn merge_scan_layers(mut l1: Vec<(Vec<u8>, Option<u128>)>, newer: std::collections::BTreeMap<Vec<u8>, Option<u128>>) -> Vec<(Vec<u8>, u128)> {
+/// * a sorted two-way merge then resolves a key present in both by seq, `newer`
+///   winning a tie.
+fn merge_scan_layers(mut l1: Vec<ScanEntry>, newer: ScanMap) -> Vec<(Vec<u8>, u128)> {
     l1.sort_by(|a, b| a.0.cmp(&b.0));
-    // `later` is removed when it repeats `kept`'s key; carry its value over first.
+    // `later` is removed when it repeats `kept`'s key; keep whichever is newer.
     l1.dedup_by(|later, kept| {
         let same = later.0 == kept.0;
-        if same {
+        if same && seq_newer_or_eq(later.2, kept.2) {
             kept.1 = later.1;
+            kept.2 = later.2;
         }
         same
     });
     if newer.is_empty() {
-        return l1.into_iter().filter_map(|(key, val)| val.map(|v| (key, v))).collect();
+        return l1.into_iter().filter_map(|(key, val, _)| val.map(|v| (key, v))).collect();
     }
 
     let mut out = Vec::with_capacity(l1.len() + newer.len());
     let mut older = l1.into_iter().peekable();
-    for (key, val) in newer {
-        while let Some((older_key, older_val)) = older.next_if(|(k, _)| *k < key) {
+    for (key, (val, seq)) in newer {
+        while let Some((older_key, older_val, _)) = older.next_if(|(k, _, _)| *k < key) {
             if let Some(v) = older_val {
                 out.push((older_key, v));
             }
         }
-        older.next_if(|(k, _)| *k == key); // shadowed by the newer layer
-        if let Some(v) = val {
+        // Same key in both: the higher seq wins, `newer` on a tie.
+        let winner = match older.next_if(|(k, _, _)| *k == key) {
+            Some((_, older_val, older_seq)) if seq_newer(older_seq, seq) => older_val,
+            _ => val,
+        };
+        if let Some(v) = winner {
             out.push((key, v));
         }
     }
-    out.extend(older.filter_map(|(key, val)| val.map(|v| (key, v))));
+    out.extend(older.filter_map(|(key, val, _)| val.map(|v| (key, v))));
     out
 }
 
@@ -431,10 +437,36 @@ type MergedSstableInfo = (Vec<u8>, Vec<u8>, u64, u64, SparseIndex);
 /// `None` when the file has no entries.
 type LoadedSstable = (SStableMetadata, Option<BloomFilter>, Option<SparseIndex>, Option<u64>);
 
-/// A prefix/range scan layer result: `(key, Some((pointer, seq)))` for a live
-/// entry or `(key, None)` for a tombstone — `seq` is the LSM write sequence used
-/// for the read-time value validity check.
-type ScanEntry = (Vec<u8>, Option<(u128, u64)>);
+/// One layer's copy of a key during a scan: `(key, Some(pointer) | None for a
+/// tombstone, seq)`. Tombstones keep their seq so they can be resolved against
+/// other layers' copies by [`fold_newest`], never by layer order.
+type ScanEntry = (Vec<u8>, Option<u128>, u64);
+
+/// A scan's running view of each key: the newest copy seen so far,
+/// `(Some(pointer) | None for a tombstone, seq)`.
+type ScanMap = std::collections::BTreeMap<Vec<u8>, (Option<u128>, u64)>;
+
+/// Fold one layer's copy of `key` into a scan's running view, keeping the
+/// highest `seq`. Callers fold layers **oldest first**, so `>=` lets an exact tie
+/// go to the newer layer — the same rule `get_with_seq` applies.
+///
+/// Every multi-key read resolves through this, never by "the newer layer
+/// overwrites": a lower-seq copy can sit in a newer layer (a TTL delete that
+/// allocated its seq before a put it lost to, or L0 files ordered by a wall clock
+/// that stepped backwards), and overwriting by layer then hides a live key or
+/// surfaces a deleted one (`test_scans_agree_with_brute_force_resolution`).
+fn fold_newest(map: &mut ScanMap, key: Vec<u8>, value: Option<u128>, seq: u64) {
+    match map.entry(key) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if seq_newer_or_eq(seq, e.get().1) {
+                e.insert((value, seq));
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            e.insert((value, seq));
+        }
+    }
+}
 
 /// A key's running winner during cross-layer resolution: the newest-`seq` copy
 /// seen so far, `(Some(pointer) | None for a tombstone, seq)`, or `None` if no
@@ -444,10 +476,6 @@ type Candidate = Option<(Option<u128>, u64)>;
 /// One bucket's share of a `get_multiple` batch: each distinct pending key and
 /// its running [`Candidate`].
 type BatchSlots<'k> = std::collections::HashMap<&'k [u8], Candidate>;
-
-/// A liveness-scan entry from `key_pointer_pairs`' L0 read: `(key, value-or-None
-/// for a tombstone, write seq)`, used for the seq-aware GC liveness merge.
-type KpScanEntry = (Vec<u8>, Option<u128>, u64);
 
 /// A single entry in the SSTable
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -2342,13 +2370,9 @@ impl LSMTree {
     /// extend value-log GC protection — resolving a returned pointer outside that
     /// bracket reopens the wrong-file window closed in commit 420ac8e.
     pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, u64)>> {
-        // Merge stays oldest→newest into a BTreeMap<key, Option<(pointer, seq)>> with
-        // overwrite, so active-memtable tombstones still shadow stale SSTable
-        // entries (the precedence the tombstone fixes established).
-        //
-        // NOTE: this resolves by recency, whereas `get_with_seq` resolves by
-        // `seq`; they agree only under the recency==seq invariant the GC re-point
-        // guard maintains (see `key_pointer_pairs` / `merge_level0_to_level1`).
+        // Layers are folded oldest→newest by `fold_newest`: each key resolves to its
+        // highest-seq copy, exactly as `get_with_seq` resolves it, so a tombstone
+        // shadows only copies older than itself.
         //
         // What changes for concurrency is the *capture* order, which is the
         // reverse — newest layer first. Flush/compaction relocate a key
@@ -2357,7 +2381,7 @@ impl LSMTree {
         // not captured yet, so it is never absent from every captured layer at
         // once. We capture cheap, frozen handles (active+RO snapshot, L0 read
         // guards, L1 `Arc<File>`) up front and do the I/O afterwards, then merge.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u64)>> = std::collections::BTreeMap::new();
+        let mut all_entries = ScanMap::new();
 
         // Capture the memtable layers (newest) first: snapshot the active
         // memtable's matching records and clone the read-only list under a single
@@ -2372,7 +2396,7 @@ impl LSMTree {
                 if !key.starts_with(prefix) {
                     break;
                 }
-                active.push((key.to_vec(), if tombstone { None } else { Some((value, seq)) }));
+                active.push((key.to_vec(), (!tombstone).then_some(value), seq));
             }
             let ro = self.read_only_memtables.read().clone();
             (active, ro)
@@ -2402,8 +2426,8 @@ impl LSMTree {
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
                         Ok(entries) => {
-                            for (key, value) in entries {
-                                all_entries.insert(key, value);
+                            for (key, value, seq) in entries {
+                                fold_newest(&mut all_entries, key, value, seq);
                             }
                         }
                         Err(e) => {
@@ -2419,22 +2443,30 @@ impl LSMTree {
             }
         }
 
-        // Read-only memtables oldest-first — overwrite SSTable data.
+        // Read-only memtables oldest-first.
         for ro_memtable in ro_snapshot.iter() {
             let records = ro_memtable.records();
             for record in records.iter() {
                 if record.key.starts_with(prefix) {
-                    all_entries.insert(record.key.clone(), if record.tombstone { None } else { Some((record.value, record.seq)) });
+                    fold_newest(
+                        &mut all_entries,
+                        record.key.clone(),
+                        (!record.tombstone).then_some(record.value),
+                        record.seq,
+                    );
                 }
             }
         }
 
-        // Active memtable (newest layer) — overwrites everything below.
-        for (key, value) in active_snapshot {
-            all_entries.insert(key, value);
+        // Active memtable (newest layer).
+        for (key, value, seq) in active_snapshot {
+            fold_newest(&mut all_entries, key, value, seq);
         }
 
-        Ok(all_entries.into_iter().filter_map(|(key, val)| val.map(|(v, s)| (key, v, s))).collect())
+        Ok(all_entries
+            .into_iter()
+            .filter_map(|(key, (val, seq))| val.map(|v| (key, v, seq)))
+            .collect())
     }
 
     /// Whether this bucket's L1 file holds any key in `[start, end)`, decided from
@@ -2481,12 +2513,8 @@ impl LSMTree {
         out: &mut Vec<ScanEntry>,
     ) -> Result<()> {
         self.for_each_l1_entry_in_range(bucket, file, start, end, max_live, |archived| {
-            let val = if archived.tombstone {
-                None
-            } else {
-                Some((archived.value.to_native(), archived.seq.to_native()))
-            };
-            out.push((archived.key.as_slice().to_vec(), val));
+            let val = (!archived.tombstone).then(|| archived.value.to_native());
+            out.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
         })
     }
 
@@ -2629,12 +2657,8 @@ impl LSMTree {
 
                 let key_slice = archived.key.as_slice();
                 if matches_prefix(archived, key_slice) {
-                    let val = if archived.tombstone {
-                        None
-                    } else {
-                        Some((archived.value.to_native(), archived.seq.to_native()))
-                    };
-                    results.push((key_slice.to_vec(), val));
+                    let val = (!archived.tombstone).then(|| archived.value.to_native());
+                    results.push((key_slice.to_vec(), val, archived.seq.to_native()));
                 }
             }
         }
@@ -2674,18 +2698,17 @@ impl LSMTree {
             return Ok(vec![]);
         }
 
-        // Merge stays oldest→newest with overwrite (L1 → L0 → ro_memtables →
-        // active), so tombstone precedence is unchanged. Only the *capture* order is
-        // reversed to newest-first so a concurrent flush/compaction cannot drop a
-        // live key — see `scan_prefix`.
+        // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 →
+        // ro_memtables → active). The *capture* order is newest-first so a
+        // concurrent flush/compaction cannot drop a live key — see `scan_prefix`.
         //
         // L1 — the bulk of a large scan — is gathered into a Vec and resolved by
         // `merge_scan_layers`, not inserted into the map: a per-entry BTreeMap insert
         // of an owned key was ~8 ms of a ~10 ms scan over 87k entries, while the
         // parallel L1 reads were ~1 ms. The newer layers (usually small) still merge
-        // through `newer` with overwrite.
-        let mut l1_entries: Vec<(Vec<u8>, Option<u128>)> = Vec::new();
-        let mut newer: std::collections::BTreeMap<Vec<u8>, Option<u128>> = std::collections::BTreeMap::new();
+        // through `newer` by `fold_newest`.
+        let mut l1_entries: Vec<ScanEntry> = Vec::new();
+        let mut newer = ScanMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()`
         // guard so a flush cannot split a key between active and RO.
@@ -2694,11 +2717,11 @@ impl LSMTree {
             let mut active = Vec::new();
             for prefix_id in prefix_ids {
                 let prefix = prefix_id.to_be_bytes();
-                for (key, value, _seq, tombstone) in memtable.skip_list.iter_raw_from(&prefix) {
+                for (key, value, seq, tombstone) in memtable.skip_list.iter_raw_from(&prefix) {
                     if key.len() < 4 || u32::from_be_bytes(key[..4].try_into().unwrap()) != *prefix_id {
                         break;
                     }
-                    active.push((key.to_vec(), if tombstone { None } else { Some(value) }));
+                    active.push((key.to_vec(), (!tombstone).then_some(value), seq));
                 }
             }
             let ro = self.read_only_memtables.read().clone();
@@ -2732,14 +2755,14 @@ impl LSMTree {
                     .enumerate()
                     .filter(|(bucket, _)| self.l1_overlaps(*bucket, &span_start, span_end))
                     .map(|(bucket, file)| {
-                        s.spawn(move || -> Result<Vec<(Vec<u8>, Option<u128>)>> {
+                        s.spawn(move || -> Result<Vec<ScanEntry>> {
                             let mut entries = Vec::new();
                             for &prefix_id in sorted_ids {
                                 let start = prefix_id.to_be_bytes();
                                 let end = prefix_id.checked_add(1).map(u32::to_be_bytes);
                                 self.for_each_l1_entry_in_range(bucket, file, &start, end.as_ref().map(|e| e.as_slice()), None, |archived| {
-                                    let val = if archived.tombstone { None } else { Some(archived.value.to_native()) };
-                                    entries.push((archived.key.as_slice().to_vec(), val));
+                                    let val = (!archived.tombstone).then(|| archived.value.to_native());
+                                    entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
                                 })?;
                             }
                             Ok(entries)
@@ -2766,7 +2789,7 @@ impl LSMTree {
         }
 
         // ── 2. L0 SSTables (newer than L1) — captured guards, oldest-first per
-        //    bucket so newer L0 entries overwrite older ones. Only buckets that hold
+        //    bucket so an exact seq tie goes to the newer file. Only buckets that hold
         //    a captured L0 file spawn a worker (L0 has no min/max or sparse index).
         {
             let mut first_err: Option<LSMError> = None;
@@ -2775,7 +2798,7 @@ impl LSMTree {
                     .iter()
                     .filter(|guards| !guards.is_empty())
                     .map(|guards| {
-                        s.spawn(move || -> Result<Vec<(Vec<u8>, Option<u128>)>> {
+                        s.spawn(move || -> Result<Vec<ScanEntry>> {
                             let mut bucket_entries = Vec::new();
                             for guard in guards {
                                 let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
@@ -2799,8 +2822,8 @@ impl LSMTree {
                                         let prefix_be = archived.key_prefix.to_native().to_be_bytes();
                                         let prefix_id = u32::from_be_bytes(prefix_be[..4].try_into().unwrap());
                                         if prefix_ids.contains(&prefix_id) {
-                                            let val = if archived.tombstone { None } else { Some(archived.value.to_native()) };
-                                            bucket_entries.push((archived.key.as_slice().to_vec(), val));
+                                            let val = (!archived.tombstone).then(|| archived.value.to_native());
+                                            bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
                                         }
                                     }
                                 }
@@ -2815,8 +2838,8 @@ impl LSMTree {
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
                         Ok(entries) => {
-                            for (k, v) in entries {
-                                newer.insert(k, v);
+                            for (k, v, seq) in entries {
+                                fold_newest(&mut newer, k, v, seq);
                             }
                         }
                         Err(e) => {
@@ -2832,21 +2855,21 @@ impl LSMTree {
             }
         }
 
-        // ── 3. Read-only memtables oldest-first — overwrite SSTable data ───────
+        // ── 3. Read-only memtables oldest-first ───────────────────────────────
         for ro_memtable in ro_snapshot.iter() {
             for record in ro_memtable.records().iter() {
                 if record.key.len() >= 4 {
                     let prefix_id = u32::from_be_bytes(record.key[..4].try_into().unwrap());
                     if prefix_ids.contains(&prefix_id) {
-                        newer.insert(record.key.clone(), if record.tombstone { None } else { Some(record.value) });
+                        fold_newest(&mut newer, record.key.clone(), (!record.tombstone).then_some(record.value), record.seq);
                     }
                 }
             }
         }
 
-        // ── 4. Active memtable (newest layer) — overwrites everything below ────
-        for (key, value) in active_snapshot {
-            newer.insert(key, value);
+        // ── 4. Active memtable (newest layer) ─────────────────────────────────
+        for (key, value, seq) in active_snapshot {
+            fold_newest(&mut newer, key, value, seq);
         }
 
         Ok(merge_scan_layers(l1_entries, newer))
@@ -3118,21 +3141,7 @@ impl LSMTree {
         // wins only if its seq is newer-or-equal. The *capture* order stays
         // newest-first (memtables before SSTables) so a concurrent flush/compaction
         // cannot drop a live key; only the conflict *resolution* is seq-based.
-        let mut all_entries = std::collections::BTreeMap::<Vec<u8>, (Option<u128>, u64)>::new();
-        // Seq-aware merge: keep the newest-seq view of each key (ties keep the
-        // later insert, i.e. the newer capture layer).
-        fn merge_kp(map: &mut std::collections::BTreeMap<Vec<u8>, (Option<u128>, u64)>, key: Vec<u8>, value: Option<u128>, seq: u64) {
-            match map.entry(key) {
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    if seq_newer_or_eq(seq, e.get().1) {
-                        e.insert((value, seq));
-                    }
-                }
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert((value, seq));
-                }
-            }
-        }
+        let mut all_entries = ScanMap::new();
 
         let buckets_to_read: Vec<u32> = (0u32..self.config.num_buckets as u32)
             .filter(|&b| qualifying_buckets.is_none_or(|qb| qb[b as usize]))
@@ -3177,7 +3186,7 @@ impl LSMTree {
                     {
                         Ok(kvs) => {
                             for (key, value, seq) in kvs {
-                                merge_kp(&mut all_entries, key, Some(value), seq);
+                                fold_newest(&mut all_entries, key, Some(value), seq);
                             }
                         }
                         Err(e) => {
@@ -3207,7 +3216,7 @@ impl LSMTree {
                 let handles: Vec<_> = buckets_to_read
                     .iter()
                     .map(|&bucket| {
-                        s.spawn(move || -> Result<Vec<KpScanEntry>> {
+                        s.spawn(move || -> Result<Vec<ScanEntry>> {
                             let mut out = Vec::new();
                             for guard in &l0_ref[bucket as usize] {
                                 let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
@@ -3242,7 +3251,7 @@ impl LSMTree {
                     {
                         Ok(kvs) => {
                             for (k, v, seq) in kvs {
-                                merge_kp(&mut all_entries, k, v, seq);
+                                fold_newest(&mut all_entries, k, v, seq);
                             }
                         }
                         Err(e) => {
@@ -3266,10 +3275,10 @@ impl LSMTree {
                 {
                     continue;
                 }
-                merge_kp(
+                fold_newest(
                     &mut all_entries,
                     record.key.clone(),
-                    if record.tombstone { None } else { Some(record.value) },
+                    (!record.tombstone).then_some(record.value),
                     record.seq,
                 );
             }
@@ -3277,7 +3286,7 @@ impl LSMTree {
 
         // 4. Active memtable (captured last, but resolved by seq like the rest).
         for (key, value, seq) in active_snapshot {
-            merge_kp(&mut all_entries, key, value, seq);
+            fold_newest(&mut all_entries, key, value, seq);
         }
 
         // Filter out tombstoned entries and collect results
@@ -3329,21 +3338,21 @@ impl LSMTree {
     ///
     /// Used by cursor-based `scan()` to avoid O(N_total) work per page fetch.
     pub(crate) fn range_keys_bounded(&self, start: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
-        // Merge stays oldest→newest with overwrite (L1 → L0 → RO → active) so
-        // tombstone precedence is unchanged; only the *capture* order is reversed to
-        // newest-first so a concurrent flush/compaction cannot drop a live key. See
-        // `scan_prefix`. The `take(limit)` runs on the fully merged, sorted map, so
-        // limiting is unaffected by the capture order.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, bool> = std::collections::BTreeMap::new();
+        // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 → RO →
+        // active); only the *capture* order is newest-first so a concurrent
+        // flush/compaction cannot drop a live key. See `scan_prefix`. The
+        // `take(limit)` runs on the fully merged, sorted map, so limiting is
+        // unaffected by the capture order.
+        let mut all_entries = ScanMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()` guard
         // so a flush cannot split a key between active and RO.
         let (active_snapshot, ro_snapshot) = {
             let memtable = self.memtable.read();
-            let active: Vec<(Vec<u8>, bool)> = memtable
+            let active: Vec<ScanEntry> = memtable
                 .skip_list
                 .iter_raw_from(start)
-                .map(|(key, _value, _seq, tombstone)| (key.to_vec(), !tombstone))
+                .map(|(key, value, seq, tombstone)| (key.to_vec(), (!tombstone).then_some(value), seq))
                 .collect();
             let ro = self.read_only_memtables.read().clone();
             (active, ro)
@@ -3360,13 +3369,13 @@ impl LSMTree {
         // one list in oldest→newest order — used to bound the L1 scan (over-read by the
         // newer in-range count, a safe upper bound on same-bucket deletes) and replayed over
         // L1 afterwards. See `range_pointers_bounded` for the full rationale.
-        let mut newer: Vec<(Vec<u8>, bool)> = Vec::new();
+        let mut newer: Vec<ScanEntry> = Vec::new();
         let bounded = limit <= BOUNDED_SCAN_LIMIT;
 
-        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
-        // range-filtered (`>= start`). L0 has no min/max or sparse index, so files are scanned
+        // Reads one bucket's L0 files (oldest-first, so an exact seq tie goes to the
+        // newer file), range-filtered (`>= start`). L0 has no min/max or sparse index, so files are scanned
         // in full.
-        let read_l0_bucket = |bucket: usize| -> Result<Vec<(Vec<u8>, bool)>> {
+        let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
             let mut bucket_entries = Vec::new();
             for guard in &l0_guards[bucket] {
                 let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
@@ -3386,7 +3395,8 @@ impl LSMTree {
                     file.read_exact(&mut entry_bytes[..size])?;
                     let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
                     if archived.key.as_slice() >= start {
-                        bucket_entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
+                        let val = (!archived.tombstone).then(|| archived.value.to_native());
+                        bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
                     }
                 }
             }
@@ -3426,7 +3436,7 @@ impl LSMTree {
         for ro_memtable in ro_snapshot.iter() {
             for record in ro_memtable.records().iter() {
                 if record.key.as_slice() >= start {
-                    newer.push((record.key.clone(), !record.tombstone));
+                    newer.push((record.key.clone(), (!record.tombstone).then_some(record.value), record.seq));
                 }
             }
         }
@@ -3440,7 +3450,7 @@ impl LSMTree {
         match bounded {
             true => {
                 let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
-                for (key, _) in newer.iter() {
+                for (key, _, _) in newer.iter() {
                     newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
                 }
                 for (bucket, file) in l1_files.iter().enumerate() {
@@ -3448,9 +3458,11 @@ impl LSMTree {
                         continue;
                     }
                     let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
-                    self.for_each_l1_entry_in_range(bucket, file, start, None, Some(cap), |archived| {
-                        all_entries.insert(archived.key.as_slice().to_vec(), !archived.tombstone);
-                    })?;
+                    let mut entries = Vec::new();
+                    self.scan_l1_range_into(bucket, file, start, None, Some(cap), &mut entries)?;
+                    for (k, v, seq) in entries {
+                        fold_newest(&mut all_entries, k, v, seq);
+                    }
                 }
             }
             false => {
@@ -3461,11 +3473,9 @@ impl LSMTree {
                         .enumerate()
                         .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, None))
                         .map(|(bucket, file)| {
-                            s.spawn(move || -> Result<Vec<(Vec<u8>, bool)>> {
+                            s.spawn(move || -> Result<Vec<ScanEntry>> {
                                 let mut entries = Vec::new();
-                                self.for_each_l1_entry_in_range(bucket, file, start, None, None, |archived| {
-                                    entries.push((archived.key.as_slice().to_vec(), !archived.tombstone));
-                                })?;
+                                self.scan_l1_range_into(bucket, file, start, None, None, &mut entries)?;
                                 Ok(entries)
                             })
                         })
@@ -3476,8 +3486,8 @@ impl LSMTree {
                             .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                         {
                             Ok(entries) => {
-                                for (k, v) in entries {
-                                    all_entries.insert(k, v);
+                                for (k, v, seq) in entries {
+                                    fold_newest(&mut all_entries, k, v, seq);
                                 }
                             }
                             Err(e) => {
@@ -3494,14 +3504,14 @@ impl LSMTree {
             }
         }
 
-        // Replay the newer layers over L1 (oldest→newest).
-        for (key, live) in newer {
-            all_entries.insert(key, live);
+        // Fold the newer layers over L1 (oldest→newest), resolving by seq.
+        for (key, value, seq) in newer {
+            fold_newest(&mut all_entries, key, value, seq);
         }
 
         Ok(all_entries
             .into_iter()
-            .filter_map(|(key, live)| if live { Some(key) } else { None })
+            .filter_map(|(key, (value, _))| value.map(|_| key))
             .take(limit)
             .collect())
     }
@@ -3519,15 +3529,15 @@ impl LSMTree {
     /// returned pointers are LSM-complete but must be resolved against the value log
     /// only inside the value-log generation bracket / GC bucket lock.
     pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u64)>> {
-        // Merge stays oldest→newest with overwrite (L1 → L0 → RO → active) so
-        // tombstone precedence is unchanged; only the *capture* order is reversed to
-        // newest-first so a concurrent flush/compaction cannot drop a live key. See
-        // `scan_prefix`. `take(limit)` runs on the fully merged, sorted map.
+        // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 → RO →
+        // active); only the *capture* order is newest-first so a concurrent
+        // flush/compaction cannot drop a live key. See `scan_prefix`. `take(limit)`
+        // runs on the fully merged, sorted map.
         //
         // `end` (exclusive) bounds the scan to `[start, end)`; entries `>= end` are
         // never inserted so the merge map and the resulting page stay within the
         // requested key window.
-        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Option<(u128, u64)>> = std::collections::BTreeMap::new();
+        let mut all_entries = ScanMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()` guard
         // so a flush cannot split a key between active and RO.
@@ -3537,7 +3547,7 @@ impl LSMTree {
                 .skip_list
                 .iter_raw_from(start)
                 .take_while(|(key, _value, _seq, _tombstone)| end.is_none_or(|e| *key < e))
-                .map(|(key, value, seq, tombstone)| (key.to_vec(), if tombstone { None } else { Some((value, seq)) }))
+                .map(|(key, value, seq, tombstone)| (key.to_vec(), (!tombstone).then_some(value), seq))
                 .collect();
             let ro = self.read_only_memtables.read().clone();
             (active, ro)
@@ -3561,8 +3571,9 @@ impl LSMTree {
         let mut newer: Vec<ScanEntry> = Vec::new();
         let bounded = limit <= BOUNDED_SCAN_LIMIT;
 
-        // Reads one bucket's L0 files (oldest-first so newer L0 entries shadow older ones),
-        // range-filtered. L0 has no min/max or sparse index, so files are scanned in full.
+        // Reads one bucket's L0 files (oldest-first, so an exact seq tie goes to the
+        // newer file), range-filtered. L0 has no min/max or sparse index, so files are
+        // scanned in full.
         let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
             let mut bucket_entries = Vec::new();
             for guard in &l0_guards[bucket] {
@@ -3583,12 +3594,8 @@ impl LSMTree {
                     file.read_exact(&mut entry_bytes[..size])?;
                     let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
                     if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                        let val = if archived.tombstone {
-                            None
-                        } else {
-                            Some((archived.value.to_native(), archived.seq.to_native()))
-                        };
-                        bucket_entries.push((archived.key.as_slice().to_vec(), val));
+                        let val = (!archived.tombstone).then(|| archived.value.to_native());
+                        bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
                     }
                 }
             }
@@ -3628,7 +3635,7 @@ impl LSMTree {
         for ro_memtable in ro_snapshot.iter() {
             for record in ro_memtable.records().iter() {
                 if record.key.as_slice() >= start && end.is_none_or(|e| record.key.as_slice() < e) {
-                    newer.push((record.key.clone(), if record.tombstone { None } else { Some((record.value, record.seq)) }));
+                    newer.push((record.key.clone(), (!record.tombstone).then_some(record.value), record.seq));
                 }
             }
         }
@@ -3648,7 +3655,7 @@ impl LSMTree {
         match bounded {
             true => {
                 let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
-                for (key, _) in newer.iter() {
+                for (key, _, _) in newer.iter() {
                     newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
                 }
                 for (bucket, file) in l1_files.iter().enumerate() {
@@ -3658,8 +3665,8 @@ impl LSMTree {
                     let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
                     let mut entries = Vec::new();
                     self.scan_l1_range_into(bucket, file, start, end, Some(cap), &mut entries)?;
-                    for (k, v) in entries {
-                        all_entries.insert(k, v);
+                    for (k, v, seq) in entries {
+                        fold_newest(&mut all_entries, k, v, seq);
                     }
                 }
             }
@@ -3684,8 +3691,8 @@ impl LSMTree {
                             .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                         {
                             Ok(entries) => {
-                                for (k, v) in entries {
-                                    all_entries.insert(k, v);
+                                for (k, v, seq) in entries {
+                                    fold_newest(&mut all_entries, k, v, seq);
                                 }
                             }
                             Err(e) => {
@@ -3702,15 +3709,14 @@ impl LSMTree {
             }
         }
 
-        // Replay the newer layers over L1 (oldest→newest) so tombstones and updates shadow
-        // the L1 values exactly as before.
-        for (key, value) in newer {
-            all_entries.insert(key, value);
+        // Fold the newer layers over L1 (oldest→newest), resolving by seq.
+        for (key, value, seq) in newer {
+            fold_newest(&mut all_entries, key, value, seq);
         }
 
         Ok(all_entries
             .into_iter()
-            .filter_map(|(key, val)| val.map(|(v, s)| (key, v, s)))
+            .filter_map(|(key, (value, seq))| value.map(|v| (key, v, seq)))
             .take(limit)
             .collect())
     }
@@ -4009,14 +4015,13 @@ mod tests {
         Ok(())
     }
 
-    // `merge_scan_layers` replaced a single BTreeMap that took L1 then every newer
-    // layer with overwrite. It must give exactly that map's live entries, in key
-    // order, for any mix of: duplicate keys within L1 (last read wins), L1 tombstones,
-    // newer-layer values and tombstones shadowing L1, and newer-only keys. Checked
-    // against that reference over many generated layer sets, with a tiny key space
-    // so collisions are common.
+    // `merge_scan_layers` avoids a map insert per L1 entry, but must give exactly
+    // what folding L1 and then every newer layer into one map by `fold_newest`
+    // gives: highest seq wins, a tie goes to the later (newer) copy. Checked over
+    // many generated layer sets with a tiny key and seq space, so duplicate keys
+    // within L1, tombstones on both sides, and exact seq ties are all common.
     #[test]
-    fn test_merge_scan_layers_matches_btreemap_overwrite() {
+    fn test_merge_scan_layers_matches_seq_fold() {
         let mut state = 0x9E37_79B9_7F4A_7C15u64; // deterministic LCG, no RNG dependency
         let mut next = |bound: u64| {
             state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
@@ -4024,24 +4029,38 @@ mod tests {
         };
         for case in 0..2_000 {
             // L1 as the scan reads it: several buckets, each run key-sorted.
-            let mut l1: Vec<(Vec<u8>, Option<u128>)> = Vec::new();
+            let mut l1: Vec<ScanEntry> = Vec::new();
             for _bucket in 0..next(4) {
-                let mut run: Vec<(Vec<u8>, Option<u128>)> = (0..next(12))
-                    .map(|_| (vec![next(3) as u8, next(6) as u8], (next(4) != 0).then(|| u128::from(next(1000)))))
+                let mut run: Vec<ScanEntry> = (0..next(12))
+                    .map(|_| {
+                        (
+                            vec![next(3) as u8, next(6) as u8],
+                            (next(4) != 0).then(|| u128::from(next(1000))),
+                            next(8),
+                        )
+                    })
                     .collect();
                 run.sort_by(|a, b| a.0.cmp(&b.0));
                 l1.extend(run);
             }
-            let mut newer = std::collections::BTreeMap::new();
+            let mut newer = ScanMap::new();
             for _ in 0..next(6) {
-                newer.insert(vec![next(3) as u8, next(6) as u8], (next(3) != 0).then(|| u128::from(next(1000))));
+                fold_newest(
+                    &mut newer,
+                    vec![next(3) as u8, next(6) as u8],
+                    (next(3) != 0).then(|| u128::from(next(1000))),
+                    next(8),
+                );
             }
 
-            let mut reference = std::collections::BTreeMap::new();
-            for (k, v) in l1.iter().cloned().chain(newer.clone()) {
-                reference.insert(k, v);
+            let mut reference = ScanMap::new();
+            for (k, v, seq) in l1.iter().cloned() {
+                fold_newest(&mut reference, k, v, seq);
             }
-            let expected: Vec<(Vec<u8>, u128)> = reference.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+            for (k, (v, seq)) in newer.clone() {
+                fold_newest(&mut reference, k, v, seq);
+            }
+            let expected: Vec<(Vec<u8>, u128)> = reference.into_iter().filter_map(|(k, (v, _))| v.map(|v| (k, v))).collect();
 
             assert_eq!(
                 merge_scan_layers(l1.clone(), newer.clone()),
@@ -5388,6 +5407,82 @@ mod tests {
         assert!(hinted > 900, "almost every probe should get a hint, got {hinted}");
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(lsm.get(key)?, Some(u128::from(i as u32) << (i % 96)), "key {i} after reopen");
+        }
+        Ok(())
+    }
+
+    // Every multi-key scan must resolve each key exactly as a point read does —
+    // highest seq across all layers — never by "the newer layer overwrites". Random
+    // writes carry OUT-OF-ORDER seqs, so a lower-seq copy often sits in a newer
+    // layer (the shape a TTL delete racing a put, or a wall-clock step between two
+    // L0 flushes, produces); flushes, compactions and reopens are mixed in. After
+    // every step each scan must equal the brute-force view built from
+    // `reference_get`, including bounded pages small enough to exercise the L1 cap.
+    #[test]
+    fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = |bound: u64| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        // Two 4-byte prefixes ("key0", "key1") so `scan_prefixes` has ids to probe.
+        let keys: Vec<Vec<u8>> = (0..40).map(|i| format!("key{}_{:02}", i % 2, i).into_bytes()).collect();
+
+        for seed in 0..8u64 {
+            let temp_dir = TempDir::new()?;
+            let mut lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            let mut clock: u64 = 1_000 + seed;
+
+            for step in 0..250 {
+                clock += 8;
+                let key = &keys[next(keys.len() as u64) as usize];
+                let seq = clock - next(40);
+                match next(100) {
+                    0..=54 => lsm.insert_with_seq(key, u128::from(next(1 << 30)) + 1, seq)?,
+                    55..=81 => lsm.delete_with_seq(key, seq)?,
+                    82..=88 => lsm.flush_memtable()?,
+                    89..=94 => lsm.flush_memtable_to_level0()?,
+                    95..=98 => lsm.compact_all()?,
+                    _ => {
+                        lsm.flush_memtable_to_level0()?;
+                        drop(lsm);
+                        lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+                    }
+                }
+
+                // Truth: every key's point-read answer, in key order.
+                let mut truth: Vec<(Vec<u8>, u128, u64)> = Vec::new();
+                for k in &keys {
+                    if let Some((ptr, s)) = reference_get(&lsm, k)? {
+                        truth.push((k.clone(), ptr, s));
+                    }
+                }
+                truth.sort();
+                truth.dedup();
+                let with_prefix = |p: &[u8]| truth.iter().filter(|(k, _, _)| k.starts_with(p)).cloned().collect::<Vec<_>>();
+                let label = format!("seed {seed} step {step}");
+
+                assert_eq!(lsm.scan_prefix(b"key1")?, with_prefix(b"key1"), "{label}: scan_prefix");
+                let ids: std::collections::HashSet<u32> = [u32::from_be_bytes(*b"key0"), u32::from_be_bytes(*b"key1")].into_iter().collect();
+                let pairs = |v: Vec<(Vec<u8>, u128, u64)>| v.into_iter().map(|(k, p, _)| (k, p)).collect::<Vec<_>>();
+                assert_eq!(lsm.scan_prefixes(&ids)?, pairs(truth.clone()), "{label}: scan_prefixes");
+                assert_eq!(lsm.key_pointer_pairs(None)?, pairs(truth.clone()), "{label}: key_pointer_pairs");
+                assert_eq!(
+                    lsm.range_pointers_bounded(b"", None, usize::MAX)?,
+                    truth,
+                    "{label}: range_pointers_bounded, unbounded"
+                );
+                // A small page from the middle: exercises the per-bucket L1 read cap.
+                let start = b"key0_10".as_slice();
+                let page: Vec<_> = truth.iter().filter(|(k, _, _)| k.as_slice() >= start).take(3).cloned().collect();
+                assert_eq!(
+                    lsm.range_pointers_bounded(start, None, 3)?,
+                    page,
+                    "{label}: range_pointers_bounded, limit 3"
+                );
+                let page_keys: Vec<Vec<u8>> = page.iter().map(|(k, _, _)| k.clone()).collect();
+                assert_eq!(lsm.range_keys_bounded(start, 3)?, page_keys, "{label}: range_keys_bounded, limit 3");
+            }
         }
         Ok(())
     }
