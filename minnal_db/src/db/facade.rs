@@ -44,19 +44,22 @@ where
         .map_err(|e| KVError::Serialization(format!("rkyv serialize: {}", e)))
 }
 
-/// Deserialize bytes into a value via rkyv.
+/// Deserialize bytes into a value via rkyv, **validating them first**.
 ///
-/// Bytes here always originate from our own `rkyv_serialize`, so bytecheck
-/// validation is skipped — `access_unchecked` is safe for trusted internal storage.
+/// The bytes are whatever is stored under the key, and nothing ties them to `T`:
+/// a caller can `put` raw bytes and then `get_typed` the key, `put_typed` one type
+/// and `get_typed` another, or run a typed range scan over keys written any way at
+/// all. This used `access_unchecked` on the assumption that the bytes always came
+/// from `rkyv_serialize` of the same `T`, which made a safe public function able
+/// to follow archived relative pointers out of bounds — undefined behaviour. Every
+/// typed entry point already requires `T::Archived: CheckBytes`, so validating
+/// costs no API change; mismatched bytes are now a `Serialization` error.
 fn rkyv_deserialize<T>(bytes: &[u8]) -> Result<T>
 where
     T: rkyv::Archive,
-    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
+    T::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<T, Strategy<rkyv::de::Pool, RkyvError>>,
 {
-    // SAFETY: bytes were written by rkyv_serialize from the same type T,
-    // so the archived layout is valid and correctly aligned.
-    let archived = unsafe { rkyv::access_unchecked::<T::Archived>(bytes) };
-    rkyv::deserialize::<T, RkyvError>(archived).map_err(|e| KVError::Serialization(format!("rkyv deserialize: {:?}", e)))
+    rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|e| KVError::Serialization(format!("rkyv deserialize: {:?}", e)))
 }
 
 // ── Db (sync facade) ──────────────────────────────────────────────────
@@ -846,6 +849,32 @@ impl<'db> Namespace<'db> {
     /// for what that does and does not guarantee about immediate readability.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.db.delete_ns(self.ns_id, key)
+    }
+
+    /// Write a key-value pair without the WAL — see [`Database::put_ns_no_wal`]
+    /// for the crash-safety trade-off. Mirrors [`AsyncNamespace::put_no_wal`].
+    pub fn put_no_wal(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.put_ns_no_wal(self.ns_id, key, value)
+    }
+
+    /// Delete a key without the WAL — for derived or regenerable data such as a
+    /// TTL cache. Mirrors [`AsyncNamespace::delete_no_wal`].
+    pub fn delete_no_wal(&self, key: &[u8]) -> Result<()> {
+        self.db.delete_ns_no_wal(self.ns_id, key)
+    }
+
+    /// Fetch several keys in one pass, one `Option` per key in input order.
+    /// Mirrors [`AsyncNamespace::get_multiple`].
+    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        self.store.get_multiple(keys)
+    }
+
+    /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning each
+    /// prefix id's `(key, value)` pairs. Mirrors
+    /// [`AsyncNamespace::scan_prefixes_batch`], but reports a storage error
+    /// instead of returning an empty map.
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<KeyValue>>> {
+        self.store.scan_prefixes_batch(prefix_ids)
     }
 
     /// Atomically read-modify-write a key in this namespace.
