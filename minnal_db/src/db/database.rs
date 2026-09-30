@@ -2941,7 +2941,15 @@ impl IndexCheckpointTarget for Database {
     }
 
     fn run_index_checkpoint(&self) -> Result<usize> {
-        let wal_tail = self.wal_metadata.read().tail;
+        // The offset this checkpoint claims the indices reflect. NOT the raw tail:
+        // a write registers as in flight when it appends to the WAL and stays so
+        // until its store apply *and index update* are done, so the tail can hold
+        // an entry the index has not seen. Recording that tail let a crash skip
+        // the entry at replay — the document stayed out of every field index,
+        // with no gap recorded (caught by the SIGKILL stress harness: 1–2 docs per
+        // crash). `wal_cut_ceiling` stops below the oldest in-flight write, so
+        // everything under it is applied before the flushes below run.
+        let wal_tail = self.wal_flush_observer.wal_cut_ceiling();
         let fields = self.registry.read().all_indexed_fields();
 
         // Flush mmap bitmap data for each active field index, and collect only

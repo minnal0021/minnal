@@ -2819,3 +2819,40 @@ fn marking_a_range_persisted_costs_one_fsync_per_segment_not_per_entry() {
          not one per entry (the per-entry loop took 218.9 s for 57,735 entries and froze every writer)"
     );
 }
+
+/// The index checkpoint must never claim an offset past a write whose index
+/// update has not happened. A write is in flight from its WAL append until its
+/// apply (index update included) returns; the checkpoint used the raw WAL tail,
+/// which includes such a write, so after a crash replay started past it and the
+/// document stayed out of every field index with no gap recorded. Found by the
+/// SIGKILL stress harness (1–2 documents per crash).
+#[test]
+fn index_checkpoint_stops_below_an_in_flight_write() {
+    use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
+    use crate::db::index_manager::CheckpointState;
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = crate::db::namespace::DEFAULT_NAMESPACE_ID;
+    let field_id = activate_status_index(&db, ns);
+    db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+
+    // A write appended at the current tail but not yet applied...
+    let in_flight_at = db.wal_metadata.read().tail;
+    let in_flight = db.wal_flush_observer.begin_write(in_flight_at);
+    // ...while later writes move the tail on.
+    db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+    let tail = db.wal_metadata.read().tail;
+    assert!(tail > in_flight_at, "setup: the tail must have moved past the in-flight write");
+
+    db.run_index_checkpoint().unwrap();
+    assert_eq!(
+        db.index_manager.read_checkpoint_state(ns, field_id, tail),
+        CheckpointState::At(in_flight_at),
+        "the checkpoint claimed index coverage past a write the index has not seen"
+    );
+
+    drop(in_flight);
+    db.run_index_checkpoint().unwrap();
+    assert_eq!(db.index_manager.read_checkpoint_state(ns, field_id, tail), CheckpointState::At(tail));
+    db.shutdown().unwrap();
+}
