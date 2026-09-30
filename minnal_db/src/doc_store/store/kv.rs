@@ -136,7 +136,7 @@ impl DocStore {
         let schema = self.load_kv_schema(namespace)?;
         let start_bytes = schema.key_type.serialize_key_from_str(start)?;
         let end_bytes = end.map(|e| schema.key_type.serialize_key_from_str(e)).transpose()?;
-        let scan_start = cursor.unwrap_or(start_bytes);
+        let scan_start = clamp_cursor(cursor, start_bytes);
         let ns = self.db.namespace(namespace.to_owned()).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
@@ -170,7 +170,7 @@ impl DocStore {
         let schema = self.load_kv_schema(namespace)?;
         let prefix_bytes = schema.key_type.serialize_key_from_str(prefix)?;
         let end_bytes = prefix_upper_bound(&prefix_bytes);
-        let scan_start = cursor.unwrap_or_else(|| prefix_bytes.clone());
+        let scan_start = clamp_cursor(cursor, prefix_bytes.clone());
         let ns = self.db.namespace(namespace.to_owned()).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
@@ -410,6 +410,22 @@ mod tests {
         assert_eq!(keys(window), [-10, -3, 0, 3].map(|k| serde_json::json!(k)));
         let all = store.kv_scan_range("ns", &i64::MIN.to_string(), None, None, 100).await.unwrap();
         assert_eq!(keys(all), [-20, -10, -3, 0, 3, 10, 20].map(|k| serde_json::json!(k)));
+    }
+
+    /// A cursor below the scan's start (from another query, or edited) must not
+    /// widen the scan: a prefix scan returned keys without the prefix.
+    #[tokio::test]
+    async fn test_kv_scan_prefix_ignores_a_cursor_below_the_prefix() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+        for k in ["apple", "banana", "user-1", "user-2"] {
+            store.kv_put("ns", &serde_json::json!(k), &serde_json::json!("v")).await.unwrap();
+        }
+        let page = store.kv_scan_prefix("ns", "user-", Some(b"apple".to_vec()), 100).await.unwrap();
+        let keys: Vec<_> = page.results.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, [serde_json::json!("user-1"), serde_json::json!("user-2")]);
     }
 
     #[tokio::test]

@@ -192,7 +192,7 @@ impl DocStore {
 
         let start_bytes = start.to_bytes();
         let end_bytes = end.map(|e| e.to_bytes());
-        let scan_start = cursor.unwrap_or(start_bytes);
+        let scan_start = clamp_cursor(cursor, start_bytes);
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
         let results = pairs
@@ -229,7 +229,7 @@ impl DocStore {
     ) -> Result<CursorPage<(DocId, serde_json::Value)>, DocStoreError> {
         let schema = self.load_schema(namespace)?;
         let end_bytes = prefix_upper_bound(&prefix);
-        let scan_start = cursor.unwrap_or(prefix);
+        let scan_start = clamp_cursor(cursor, prefix);
         let ns = self.db.namespace(namespace.to_owned()).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 

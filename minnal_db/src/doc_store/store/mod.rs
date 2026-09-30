@@ -32,7 +32,7 @@ use crate::doc_store::index_observer::{ChainedObserver, DiskProgress, InMemoryPr
 use crate::doc_store::index_progress::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::index_progress::now_ms;
-use crate::doc_store::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
+use crate::doc_store::pagination::{CursorPage, Page, Pagination, clamp_cursor, prefix_upper_bound};
 use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};

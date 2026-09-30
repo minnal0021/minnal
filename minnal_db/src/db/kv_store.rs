@@ -1252,6 +1252,10 @@ impl KVStore {
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
+        // An empty page cannot carry a cursor that advances: with `limit = 0` the
+        // next cursor was the first key at or after this one — the cursor itself —
+        // so a caller following `next_cursor` looped forever. Treat 0 as 1.
+        let limit = limit.max(1);
         let start = cursor.unwrap_or(&[]);
         let key_pointers = self.lsm.range_pointers_bounded(start, end, limit + 1)?;
         let has_more = key_pointers.len() > limit;
@@ -2316,6 +2320,41 @@ mod tests {
         assert!(vals_7.contains(&b"val_7_1".as_slice()));
         assert!(vals_7.contains(&b"val_7_2".as_slice()));
         assert!(vals_7.contains(&b"val_7_3".as_slice()));
+    }
+
+    /// Following `next_cursor` must always make progress. A `limit` of 0 returned
+    /// an empty page whose cursor was the one passed in, so a paging loop never
+    /// ended.
+    #[test]
+    fn test_scan_page_batch_limit_zero_still_advances() {
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(
+            0,
+            "t",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
+        for i in 0..3u8 {
+            store.put_to_storage(&[b'k', i], b"v").unwrap();
+        }
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let (page, next) = store.scan_page_batch(cursor.as_deref(), None, 0).unwrap();
+            seen.extend(page.into_iter().map(|(k, _)| k));
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![vec![b'k', 0], vec![b'k', 1], vec![b'k', 2]],
+            "the walk must advance and finish"
+        );
     }
 
     #[test]

@@ -44,20 +44,10 @@ pub(crate) fn encode_cursor(key: &[u8]) -> String {
 /// Decode a hex scan cursor (as produced by [`encode_cursor`]) back into raw key
 /// bytes. Returns a 400-class error on malformed input.
 pub(crate) fn decode_cursor(s: &str) -> Result<Vec<u8>, AppError> {
-    if !s.len().is_multiple_of(2) {
-        return Err(minnal_db::DocStoreError::InvalidId("cursor must be an even-length hex string".into()).into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| {
-                AppError::from(minnal_db::DocStoreError::InvalidId(format!(
-                    "invalid hex byte '{}' in cursor",
-                    &s[i..i + 2]
-                )))
-            })
-        })
-        .collect()
+    // Byte-level decode (`hex_to_bytes`): slicing the `str` at byte offsets
+    // panicked on multi-byte input, and the server aborts on panic.
+    minnal_db::doc_store::hex::hex_to_bytes(s)
+        .ok_or_else(|| minnal_db::DocStoreError::InvalidId("cursor must be an even-length string of hex digits".into()).into())
 }
 
 pub fn router() -> Router<AppState> {
@@ -157,4 +147,21 @@ pub fn router() -> Router<AppState> {
             "/stores/{ns}/kv/semantic-search",
             post(kv::search_kv_semantic).get(reserved_key).put(reserved_key).delete(reserved_key),
         )
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// A cursor is request input, so malformed ones must be a 400, never a panic
+    /// — the release profile aborts the whole server on panic. Byte-slicing the
+    /// `str` panicked on `aéb` (even length, but `é` is two bytes).
+    #[test]
+    fn a_malformed_cursor_is_an_error_not_a_panic() {
+        for bad in ["aéb", "éé", "+f+f", "zz", "abc"] {
+            assert!(decode_cursor(bad).is_err(), "'{bad}' must be rejected");
+        }
+        assert_eq!(decode_cursor("00ff").unwrap(), vec![0x00, 0xff]);
+        assert_eq!(decode_cursor(&encode_cursor(b"key\x01")).unwrap(), b"key\x01".to_vec());
+    }
 }

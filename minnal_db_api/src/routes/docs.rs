@@ -181,16 +181,9 @@ pub async fn range_query(
 /// (`550e8400e29b41d4`).  Returns [`DocStoreError::InvalidId`] on invalid input.
 fn parse_hex_prefix(s: &str) -> Result<Vec<u8>, AppError> {
     let clean: String = s.chars().filter(|&c| c != '-').collect();
-    if !clean.len().is_multiple_of(2) {
-        return Err(DocStoreError::InvalidId("prefix must be an even-length hex string (hyphens are ignored)".into()).into());
-    }
-    (0..clean.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&clean[i..i + 2], 16)
-                .map_err(|_| AppError::from(DocStoreError::InvalidId(format!("invalid hex byte '{}' in prefix", &clean[i..i + 2]))))
-        })
-        .collect()
+    // Byte-level decode: slicing the `str` panicked on multi-byte input.
+    minnal_db::doc_store::hex::hex_to_bytes(&clean)
+        .ok_or_else(|| DocStoreError::InvalidId("prefix must be an even-length string of hex digits (hyphens are ignored)".into()).into())
 }
 
 /// Query parameters for `GET /stores/{ns}/docs/prefix`.
