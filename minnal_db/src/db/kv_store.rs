@@ -382,6 +382,15 @@ impl KVStore {
     }
 
     /// Resolve a row ID back to its key via the dense map, if loaded.
+    /// The key a field-index row ID stands for, from whichever source assigns
+    /// row IDs here: the registered `RowToKeyFn`, else the dense row map.
+    pub(crate) fn key_for_row(&self, row_id: u128) -> Option<Vec<u8>> {
+        if let Some(inv) = self.row_to_key_fn.read().as_ref() {
+            return Some(inv(row_id));
+        }
+        self.rowmap_key_for(row_id)
+    }
+
     pub(crate) fn rowmap_key_for(&self, row_id: u128) -> Option<Vec<u8>> {
         self.rowmap.read().as_ref().and_then(|rm| rm.key_for(row_id))
     }

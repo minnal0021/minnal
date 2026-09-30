@@ -1730,6 +1730,19 @@ impl Database {
         let Ok(store) = self.get_store(namespace_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
         };
+        self.reindex_key(&store, namespace_id, field_id, key)
+    }
+
+    /// [`KVStore::reindex_field`] under `key`'s stripe — the only way anything
+    /// outside the write path should rewrite an index row.
+    ///
+    /// Reindexing reads the key's current value and then sets its row. A put to
+    /// the same key updates the index after its own apply, under the stripe, so
+    /// without the stripe the two interleave: reindex reads v1, the put applies v2
+    /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
+    /// disagrees with the store until something rewrites the key.
+    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        let _stripe = self.key_locks.guard(namespace_id, key);
         store.reindex_field(field_id, key)
     }
 
