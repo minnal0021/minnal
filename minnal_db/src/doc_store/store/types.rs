@@ -51,6 +51,16 @@ impl DocId {
         }
     }
 
+    /// The store [`KeyType`] this ID belongs to.
+    pub fn key_type(self) -> KeyType {
+        match self {
+            DocId::Uuid(_) => KeyType::Uuid,
+            DocId::U64(_) => KeyType::U64,
+            DocId::U128(_) => KeyType::U128,
+            DocId::Str(_) => KeyType::Str,
+        }
+    }
+
     /// Deserialize bytes back to a `DocId` given the store's [`KeyType`].
     pub fn from_bytes(bytes: &[u8], key_type: KeyType) -> Result<Self, DocStoreError> {
         match key_type {
