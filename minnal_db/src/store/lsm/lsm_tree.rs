@@ -558,6 +558,10 @@ struct ReadOnlyMemTable {
     version: u64,
     /// Whether this memtable has been flushed to Level 0 files
     flushed_to_level0: Arc<AtomicBool>,
+    /// Held across a flush of this memtable to Level 0, so two flushers (the
+    /// compaction worker, a GC pass, the no-WAL unpin) cannot both write it.
+    /// See `flush_ro_memtable_to_level0`.
+    flush_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl ReadOnlyMemTable {
@@ -574,6 +578,7 @@ impl ReadOnlyMemTable {
             reader_count: Arc::new(AtomicU64::new(0)),
             version,
             flushed_to_level0: Arc::new(AtomicBool::new(false)),
+            flush_lock: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -1365,6 +1370,15 @@ impl LSMTree {
     }
 
     fn flush_ro_memtable_to_level0(&self, ro_memtable: &ReadOnlyMemTable) -> Result<()> {
+        // The flushed check and the flush must be one step. Several paths flush
+        // (the compaction worker, a GC pass, the no-WAL unpin) and nothing else
+        // serialises them, so an unlocked check let two write the same memtable:
+        // a duplicate L0 file, or — in the same millisecond — the same file name,
+        // with the second `File::create` truncating the first mid-write. A second
+        // flusher WAITS rather than skipping, because callers rely on the flush
+        // being durable when this returns: GC unlinks value-log segments right
+        // after, and returning early would let it unlink before the fsync.
+        let _flushing = ro_memtable.flush_lock.lock();
         if ro_memtable.is_flushed_to_level0() {
             return Ok(());
         }
@@ -5525,6 +5539,47 @@ mod tests {
         assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "L0");
         lsm.compact_all()?;
         assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "L1");
+        Ok(())
+    }
+
+    // Two threads flushing the same read-only memtable must produce ONE L0 file,
+    // and both must return only once it is durable. Without the per-memtable flush
+    // lock both wrote it (a duplicate file; in the same millisecond, one file name
+    // with the second `File::create` truncating the first).
+    #[test]
+    fn test_concurrent_flushes_of_one_memtable_write_it_once() -> Result<()> {
+        for round in 0..100 {
+            let temp_dir = TempDir::new()?;
+            let lsm = Arc::new(LSMTree::open(
+                temp_dir.path(),
+                LSMConfig {
+                    num_buckets: 1,
+                    ..LSMConfig::default()
+                },
+            )?);
+            for i in 0..500u64 {
+                lsm.insert_with_seq(format!("k{i:05}").as_bytes(), u128::from(i) + 1, i + 1)?;
+            }
+            lsm.flush_memtable()?; // one read-only memtable, not yet on disk
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let flushers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (lsm, barrier) = (Arc::clone(&lsm), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        lsm.flush_memtable_to_level0()
+                    })
+                })
+                .collect();
+            for flusher in flushers {
+                flusher.join().expect("flusher panicked")?;
+            }
+            assert_eq!(lsm.level0_entries_snapshot(0).len(), 1, "round {round}: the memtable was flushed twice");
+            lsm.purge_ro_memtables_for_test(); // read from L0 alone
+            for i in 0..500u64 {
+                assert_eq!(lsm.get(format!("k{i:05}").as_bytes())?, Some(u128::from(i) + 1), "round {round}: key {i}");
+            }
+        }
         Ok(())
     }
 
