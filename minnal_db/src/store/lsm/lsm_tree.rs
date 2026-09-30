@@ -885,6 +885,12 @@ pub(crate) struct LSMTree {
     /// Level 0 files tracked per bucket for reader-safe compaction/deletion.
     level0_files: Vec<Arc<RwLock<Vec<Arc<L0FileEntry>>>>>,
 
+    /// The newest L0 stamp (`created_at_ms`, also the file name) issued or found
+    /// on disk. Every new flush's stamp is clamped above it by
+    /// [`next_l0_stamp`](Self::next_l0_stamp), so file order is flush order even
+    /// when the wall clock steps backwards.
+    last_l0_stamp: parking_lot::Mutex<u128>,
+
     /// Optional observer for flush lifecycle events.
     flush_observer: Arc<RwLock<Option<Arc<dyn LsmFlushObserver>>>>,
 
@@ -1127,6 +1133,15 @@ impl LSMTree {
             max_lower_seq_init = Some(seq);
         }
 
+        // Seed the L0 stamp floor from the newest file on disk, so the first flush
+        // after a restart sorts after every file already there even if the clock
+        // is now behind the one that named them.
+        let last_l0_stamp = level0_files
+            .iter()
+            .flat_map(|bucket| bucket.read().iter().map(|e| e.created_at_ms).collect::<Vec<_>>())
+            .max()
+            .unwrap_or(0);
+
         // Per-bucket compaction flags
         let compaction_in_progress: Vec<Arc<AtomicBool>> = (0..num_buckets).map(|_| Arc::new(AtomicBool::new(false))).collect();
 
@@ -1145,6 +1160,7 @@ impl LSMTree {
             memtable_sequence: Arc::new(AtomicUsize::new(0)),
             pending_old_memtables: Arc::new(RwLock::new(Vec::new())),
             level0_files,
+            last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
             flush_observer: Arc::new(RwLock::new(None)),
             base_path,
         })
@@ -1303,6 +1319,26 @@ impl LSMTree {
         Ok(max_seq)
     }
 
+    /// The stamp for the next L0 flush: `candidate` (wall-clock based, so file names
+    /// stay readable), but never at or below any stamp already issued or on disk.
+    ///
+    /// L0 file order breaks **exact seq ties**, and GC's relocation makes them: it
+    /// re-inserts a key at its existing seq with a new pointer, so the old and the
+    /// relocated copy can sit in two L0 files with the same seq, and only file
+    /// order says the relocation is newer. Ordering by raw wall time let a clock
+    /// step backwards (NTP, a VM or WSL resume) between the two flushes put the
+    /// relocation *first*: every read returned the pre-relocation pointer, the
+    /// L0→L1 merge baked it into L1, and once GC unlinked its segment the key read
+    /// `SegmentMissing` for good (and the next GC pass judged the real record
+    /// dead). Stamps are taken after the per-memtable flush lock, and memtables
+    /// flush in version order, so a later flush always gets a larger stamp.
+    fn next_l0_stamp(&self, candidate: u128) -> u128 {
+        let mut last = self.last_l0_stamp.lock();
+        let stamp = candidate.max(last.saturating_add(1));
+        *last = stamp;
+        stamp
+    }
+
     /// Add a Level-0 file to the in-memory registry.
     ///
     /// One of the two points that establish "a registered L0 file has a valid
@@ -1388,7 +1424,7 @@ impl LSMTree {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let timestamp = now_ms.saturating_mul(1_000_000).saturating_add(ro_memtable.version() as u128);
+        let timestamp = self.next_l0_stamp(now_ms.saturating_mul(1_000_000).saturating_add(ro_memtable.version() as u128));
 
         for bucket in 0u32..self.config.num_buckets as u32 {
             self.create_level0_file_for_records(bucket, &records, timestamp)?;
@@ -5580,6 +5616,53 @@ mod tests {
                 assert_eq!(lsm.get(format!("k{i:05}").as_bytes())?, Some(u128::from(i) + 1), "round {round}: key {i}");
             }
         }
+        Ok(())
+    }
+
+    // GC relocation re-inserts a key at its existing seq with a new pointer, so the
+    // old and relocated copies tie on seq and only L0 file order says which is
+    // newer. File order came from the raw wall clock, so a clock step backwards
+    // between the two flushes inverted it: every read (and the L0→L1 merge) chose
+    // the stale pointer, whose segment GC then unlinks. Simulated here by moving
+    // the first file's stamp into the future — the state a clock step leaves
+    // behind — and reopening, which also checks the stamp floor is seeded from
+    // disk.
+    #[test]
+    fn test_l0_order_survives_the_wall_clock_stepping_back() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let (original, relocated) = (0xA_u128, 0xB_u128);
+        {
+            let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+            lsm.insert_with_seq(b"k", original, 5)?;
+            lsm.flush_memtable_to_level0()?;
+        }
+        // The clock that named that file was an hour ahead of the one we have now.
+        let l0_dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), 0);
+        let first = std::fs::read_dir(&l0_dir)?.next().expect("one L0 file")?.path();
+        let stamp = LSMTree::level0_created_at_from_path(&first);
+        let hour = 3_600_000u128 * 1_000_000;
+        std::fs::rename(&first, l0_dir.join(format!("{}.dat", stamp + hour)))?;
+
+        let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+        lsm.insert_with_seq(b"k", relocated, 5)?; // GC relocation: same seq, new pointer
+        lsm.flush_memtable_to_level0()?;
+        // Drop the read-only memtable (still holding the relocation) so reads must
+        // settle the tie by L0 file order alone.
+        lsm.purge_ro_memtables_for_test();
+
+        assert_eq!(lsm.get(b"k")?, Some(relocated), "point read chose the pre-relocation copy");
+        assert_eq!(lsm.get_multiple(&[b"k".to_vec()])?[0].map(|(p, _)| p), Some(relocated), "get_multiple");
+        lsm.compact_all()?;
+        assert_eq!(lsm.get(b"k")?, Some(relocated), "the L0→L1 merge baked in the stale copy");
+
+        // And in-process: a candidate stamp from a clock that went backwards is
+        // still issued above everything before it.
+        let before = *lsm.last_l0_stamp.lock();
+        assert!(lsm.next_l0_stamp(before - hour) > before, "a stamp went backwards");
         Ok(())
     }
 
