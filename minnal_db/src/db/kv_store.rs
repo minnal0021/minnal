@@ -164,6 +164,10 @@ struct BucketGCResult {
     pending_unlink: Vec<u32>,
 }
 
+/// A batch read's values (one per key) and the positions to re-resolve through
+/// the single-key path because their segment vanished mid-batch.
+type BatchReadWithRetries = (Vec<Option<Vec<u8>>>, Vec<usize>);
+
 impl KVStore {
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
     /// See `DbConfig::verify_checksums_on_read`.
@@ -984,42 +988,33 @@ impl KVStore {
     /// per SSTable bucket (reads each level1 file once into memory), then reads
     /// values from the value-log with `num_buckets` parallel threads.
     ///
-    /// Returns one `Option<Vec<u8>>` per input key in the same order.
-    /// Missing keys and I/O errors both produce `None`.
-    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        let (mut results, retry) = self.get_multiple_inner(keys);
+    /// Returns one `Option<Vec<u8>>` per input key in the same order; `None` means
+    /// the key is absent or deleted. A storage error (an LSM read failure,
+    /// corruption, an IO fault) is an `Err` for the whole call — it used to become
+    /// `None` for the affected keys (or for *every* key, when the LSM lookup
+    /// failed), which a caller could not tell apart from a missing key.
+    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let (mut results, retry) = self.get_multiple_inner(keys)?;
 
         // Keys that resolved to a pointer but whose value could not be read: usually GC
         // reclaimed the segment between the LSM lookup and the read, and the LSM now
         // holds the new pointer, so re-resolving through the single-key `get` succeeds.
-        // But `get` can also return a *hard* error (corruption, IO fault) — which the
-        // reclaimed-segment retry inside `get` no longer masks. This method's public
-        // signature is `Vec<Option>`, so it cannot surface a per-key error; log it so a
-        // genuine corruption is visible rather than silently indistinguishable from a
-        // missing key.
+        // A hard error from `get` (corruption, IO fault) is the caller's to see.
         for idx in retry {
-            match self.get(&keys[idx]) {
-                Ok(value) => results[idx] = value,
-                Err(e) => warn!(
-                    "[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}",
-                    self.name, e
-                ),
-            }
+            results[idx] = self.get(&keys[idx])?;
         }
-        results
+        Ok(results)
     }
 
     /// Returns `(values, retry_indices)` where `retry_indices` are positions that
     /// `lsm.get_multiple` resolved to a pointer but whose value read returned `None`
     /// (a transient GC race the caller should re-resolve via [`get`](Self::get)).
-    fn get_multiple_inner(&self, keys: &[Vec<u8>]) -> (Vec<Option<Vec<u8>>>, Vec<usize>) {
+    fn get_multiple_inner(&self, keys: &[Vec<u8>]) -> Result<BatchReadWithRetries> {
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
 
         // ── Step 1: single-pass LSM lookup for all keys ───────────────────────
         // Reads each bucket's level1 file ONCE instead of once per key.
-        let Ok(pointers) = self.lsm.get_multiple(keys) else {
-            return (results, Vec::new());
-        };
+        let pointers = self.lsm.get_multiple(keys)?;
 
         // ── Step 2: group the pointers by value-log bucket ────────────────────
         let num_buckets = self.value_log.num_buckets();
@@ -1035,7 +1030,7 @@ impl KVStore {
             }
         }
         if resolved.is_empty() {
-            return (results, Vec::new());
+            return Ok((results, Vec::new()));
         }
 
         // ── Step 3: read each bucket's values in parallel ─────────────────────
@@ -1063,7 +1058,7 @@ impl KVStore {
         // the caller re-resolves them through the single-key `get`.
         let retry: Vec<usize> = resolved.into_iter().filter(|&idx| results[idx].is_none()).collect();
 
-        (results, retry)
+        Ok((results, retry))
     }
 
     /// Scan multiple 4-byte BE cluster prefixes and resolve their values.
@@ -2095,8 +2090,8 @@ mod tests {
         // A value-log read error in the batch path used to be swallowed by
         // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
         // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
-        // and `get_multiple` still returns the readable keys — dropping (and logging) only
-        // the corrupt one rather than silently reporting it absent.
+        // and so does `get_multiple`: the batch fails rather than reporting the corrupt
+        // key absent.
         let dir = TempDir::new().unwrap();
         let store = KVStore::open(
             0,
@@ -2133,18 +2128,19 @@ mod tests {
             "corruption must surface as an error, not a missing key"
         );
 
-        // get_multiple returns every readable key and drops only the corrupt one.
-        let got = store.get_multiple(&keys);
-        for (i, k) in keys.iter().enumerate() {
-            if k.as_slice() == b"k2" {
-                assert!(got[i].is_none(), "the corrupt key must not be returned as a value");
-            } else {
-                assert_eq!(
-                    got[i].as_deref(),
-                    Some(format!("value-{i}-payload").as_bytes()),
-                    "readable key {i} must still be returned"
-                );
-            }
+        // get_multiple reports the corruption too: a corrupt key is not "absent",
+        // so the whole batch fails rather than returning `None` for it.
+        assert!(
+            matches!(store.get_multiple(&keys), Err(KVError::ShardedValueLogError(_))),
+            "a batch containing a corrupt key must fail, not report the key missing"
+        );
+
+        // The same batch without the corrupt key still returns every value.
+        let readable: Vec<Vec<u8>> = keys.iter().filter(|k| k.as_slice() != b"k2").cloned().collect();
+        let got = store.get_multiple(&readable).unwrap();
+        for (k, v) in readable.iter().zip(&got) {
+            let i = keys.iter().position(|x| x == k).unwrap();
+            assert_eq!(v.as_deref(), Some(format!("value-{i}-payload").as_bytes()));
         }
     }
 
@@ -2222,7 +2218,7 @@ mod tests {
         }
 
         let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         assert_eq!(batch.len(), keys.len());
         for (i, result) in batch.iter().enumerate() {
@@ -2247,7 +2243,7 @@ mod tests {
         store.put_to_storage(b"exists", b"val").unwrap();
 
         let keys = vec![b"exists".to_vec(), b"no_such_key".to_vec()];
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         assert_eq!(batch[0], Some(b"val".to_vec()));
         assert_eq!(batch[1], None);
@@ -2273,7 +2269,7 @@ mod tests {
         store.flush_and_compact_all().unwrap();
 
         let keys: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i]).collect();
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         for (i, result) in batch.iter().enumerate() {
             assert_eq!(result.as_deref(), Some(vec![i as u8; 32].as_slice()), "missing key {i}");
@@ -3100,7 +3096,7 @@ mod tests {
                     }
 
                     // get_multiple has its own read loop — strong oracle.
-                    let got = store.get_multiple(&all_live);
+                    let got = store.get_multiple(&all_live).unwrap();
                     for (i, v) in got.iter().enumerate() {
                         if v.as_deref() != Some(expected(i as u32).as_slice()) {
                             record(format!(
@@ -3260,7 +3256,7 @@ mod tests {
                     // Exercise the batch value paths under churn, but do not assert
                     // a non-linearizable active-churn snapshot here. The quiescent
                     // assertions below are the completeness/exactness oracle.
-                    let _ = store.get_multiple(&all_live);
+                    let _ = store.get_multiple(&all_live).unwrap();
                     let _ = store.scan_prefix_batch(b"live:").unwrap();
                 }
                 stop.store(true, Ordering::Release);
@@ -3273,7 +3269,7 @@ mod tests {
 
         // Once the churn threads have joined, the batch get path must be complete:
         // all never-deleted live keys should resolve to their exact value.
-        let got = store.get_multiple(&all_live);
+        let got = store.get_multiple(&all_live).unwrap();
         for (i, v) in got.iter().enumerate() {
             assert_eq!(
                 v.as_deref(),

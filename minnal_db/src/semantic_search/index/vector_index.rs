@@ -3,10 +3,15 @@ use rkyv::rancor::Error as RkyvError;
 use rkyv::vec::ArchivedVec;
 use serde::{Deserialize, Serialize};
 
+/// One cluster's sparse entries: `(document_id_bytes, raw_rkyv_bytes)` pairs.
+///
+/// Returned by [`VectorKvStore::scan_sparse_cluster`].
+pub type ClusterEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Map from cluster ID to `(doc_id_bytes, raw_rkyv_bytes)` pairs.
 ///
 /// Returned by [`VectorKvStore::scan_sparse_clusters_batch`].
-pub type ClusterBatchResult = std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>;
+pub type ClusterBatchResult = std::collections::HashMap<u32, ClusterEntries>;
 
 // ── QuantisationStyle ─────────────────────────────────────────────────────────
 
@@ -52,6 +57,8 @@ impl Default for QuantisationStyle {
 /// and is scanned cluster-by-cluster in the first pass.
 /// The dense namespace holds MultiBit entries keyed by `doc_id` and is queried
 /// directly by document ID in the re-ranking pass.
+/// Every method reports a storage failure as `Err` rather than as "no entries":
+/// an empty result would make search silently return fewer (or no) matches.
 pub trait VectorKvStore {
     /// Return all SingleBit entries for the given `cluster_id` from the sparse namespace.
     ///
@@ -60,12 +67,12 @@ pub trait VectorKvStore {
     /// of the document that was assigned to this cluster).  Pass it to
     /// [`score_rkyv_bytes`] to obtain the per-query-token max, or deserialize
     /// with [`VectorIndex::list_from_bytes`] to score each chunk directly.
-    fn scan_sparse_cluster(&self, cluster_id: u32) -> impl std::future::Future<Output = Vec<(Vec<u8>, Vec<u8>)>> + Send;
+    fn scan_sparse_cluster(&self, cluster_id: u32) -> impl std::future::Future<Output = Result<ClusterEntries, crate::KVError>> + Send;
 
     /// Fetch the raw rkyv bytes for a document's MultiBit entry from the dense namespace.
     ///
     /// Returns `None` when the entry does not exist (document was never indexed).
-    fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send;
+    fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, crate::KVError>> + Send;
 
     /// Fetch dense entries for multiple documents in a single operation.
     ///
@@ -73,7 +80,7 @@ pub trait VectorKvStore {
     /// Prefer this over repeated `get_dense_entry` calls when fetching many candidates;
     /// implementations backed by a real KV store resolve all keys in one blocking task
     /// instead of one task per document.
-    fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> impl std::future::Future<Output = Vec<Option<Vec<u8>>>> + Send;
+    fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> impl std::future::Future<Output = Result<Vec<Option<Vec<u8>>>, crate::KVError>> + Send;
 
     /// Scan multiple IVF cluster prefixes in a single operation.
     ///
@@ -82,7 +89,8 @@ pub trait VectorKvStore {
     /// implementations backed by a real KV store do one blocking task with `num_buckets`
     /// value-log reader threads instead of one blocking task × `num_buckets` threads
     /// per cluster.
-    fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> impl std::future::Future<Output = ClusterBatchResult> + Send;
+    fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32])
+    -> impl std::future::Future<Output = Result<ClusterBatchResult, crate::KVError>> + Send;
 }
 
 /// Deserialize a list of `VectorIndex` entries from raw rkyv bytes and return

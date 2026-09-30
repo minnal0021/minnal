@@ -863,16 +863,16 @@ impl<'db> Namespace<'db> {
         self.db.delete_ns_no_wal(self.ns_id, key)
     }
 
-    /// Fetch several keys in one pass, one `Option` per key in input order.
+    /// Fetch several keys in one pass, one `Option` per key in input order
+    /// (`None` = absent or deleted). A storage error fails the whole call.
     /// Mirrors [`AsyncNamespace::get_multiple`].
-    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         self.store.get_multiple(keys)
     }
 
     /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning each
     /// prefix id's `(key, value)` pairs. Mirrors
-    /// [`AsyncNamespace::scan_prefixes_batch`], but reports a storage error
-    /// instead of returning an empty map.
+    /// [`AsyncNamespace::scan_prefixes_batch`].
     pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<KeyValue>>> {
         self.store.scan_prefixes_batch(prefix_ids)
     }
@@ -1905,25 +1905,25 @@ impl AsyncNamespace {
     /// dramatically cheaper than one `spawn_blocking` per prefix.
     ///
     /// Returns a map from `prefix_id` to `(raw_key_bytes, value_bytes)` pairs.
-    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>> {
+    /// A storage error is returned as such — it used to become an empty map,
+    /// indistinguishable from "no entries under these prefixes".
+    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
             .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
     /// Fetch multiple keys in a single blocking task.
     ///
-    /// Returns one `Option<Vec<u8>>` per input key in the same order.
-    /// Missing keys produce `None`; storage errors are silently mapped to `None`.
-    pub async fn get_multiple(&self, keys: Vec<Vec<u8>>) -> Vec<Option<Vec<u8>>> {
+    /// Returns one `Option<Vec<u8>>` per input key in the same order; `None` means
+    /// absent or deleted. A storage error fails the whole call — it used to be
+    /// mapped to `None`, indistinguishable from a missing key.
+    pub async fn get_multiple(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
         let store = self.store.clone();
-        let n = keys.len();
         tokio::task::spawn_blocking(move || store.get_multiple(&keys))
             .await
-            .unwrap_or_else(|_| vec![None; n])
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
     /// Delete a key.

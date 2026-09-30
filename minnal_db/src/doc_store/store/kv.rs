@@ -227,7 +227,7 @@ impl DocStore {
             None::<fn(&[u8]) -> bool>,
             top_k,
         )
-        .await;
+        .await?;
 
         Ok(crate::doc_store::pagination::Page::from_vec(all, pagination))
     }

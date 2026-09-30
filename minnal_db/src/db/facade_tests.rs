@@ -362,7 +362,7 @@ mod tests {
         ns.put(&key(7, 2), b"b")?;
         ns.put(&key(9, 1), b"c")?;
         assert_eq!(
-            ns.get_multiple(&[key(7, 1), key(8, 1), key(7, 1)]),
+            ns.get_multiple(&[key(7, 1), key(8, 1), key(7, 1)])?,
             vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
         );
         let by_prefix = ns.scan_prefixes_batch(&[7, 8])?;
