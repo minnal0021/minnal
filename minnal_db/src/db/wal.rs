@@ -537,12 +537,22 @@ impl Wal {
 
     fn open_segment_file(&self, segment_id: u64, create: bool) -> Result<File> {
         let path = self.segment_path_for(segment_id);
+        let is_new = create && !path.exists();
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         if create {
             options.create(true);
         }
-        Ok(options.open(path)?)
+        let file = options.open(&path)?;
+        // A new segment's *name* must be durable before any write into it is
+        // acknowledged. Every append fsyncs the file's contents, but a file's
+        // directory entry is only durable once the directory is fsynced — until
+        // then a power loss can drop the whole segment, and every write
+        // acknowledged into it since the rotation with it. One fsync per segment.
+        if is_new && let Some(dir) = path.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(file)
     }
 
     fn rotate_to_segment(&self, segment_id: u64) -> Result<()> {
@@ -598,7 +608,13 @@ impl Wal {
 
     pub fn open_with_options_and_segment_size<P: AsRef<Path>>(path: P, _use_mmap: bool, segment_size: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let is_new = !path.exists();
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        // As in `open_segment_file`: a newly created WAL file's name must be
+        // durable before the first write into it is acknowledged.
+        if is_new && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
 
         let handle = WalHandle::new(Arc::new(file));
 

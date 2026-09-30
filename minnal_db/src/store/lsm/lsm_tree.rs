@@ -1456,6 +1456,7 @@ impl LSMTree {
         let mut offset = SSTABLE_DATA_START;
 
         let level0_dir = Self::level0_bucket_dir_from(&self.base_path, bucket);
+        let dir_is_new = !level0_dir.exists();
         std::fs::create_dir_all(&level0_dir)?;
 
         // Level 0 files are named by timestamp/version, not by a global sequence.
@@ -1481,6 +1482,17 @@ impl LSMTree {
             offset += 4 + payload.len() as u64;
         }
         file.sync_all()?;
+        // Make the new file's directory entry durable too. `sync_all` on the file
+        // covers its contents, not its name: until the directory is fsynced a power
+        // loss can drop the file entirely — after the flush observer has already
+        // let its WAL entries be marked persisted, leaving nothing to replay. A
+        // directory this call created needs its own entry made durable as well.
+        File::open(&level0_dir)?.sync_all()?;
+        if dir_is_new {
+            let level0_root = Self::level0_dir_from(&self.base_path);
+            File::open(&level0_root)?.sync_all()?;
+            File::open(&self.base_path)?.sync_all()?;
+        }
         if let Some(summary) = summary.as_mut() {
             summary.index = (!index.is_empty()).then_some(index);
         }
