@@ -136,6 +136,8 @@ pub struct LsmLookupMetrics {
     l0_probes: u64,
     l1_probes: u64,
     bloom_rejects: u64,
+    l0_bloom_rejects: u64,
+    seq_prunes: u64,
 }
 
 #[derive(Serialize)]
@@ -227,6 +229,8 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             l0_probes: m.l0_probes,
             l1_probes: m.l1_probes,
             bloom_rejects: m.bloom_rejects,
+            l0_bloom_rejects: m.l0_bloom_rejects,
+            seq_prunes: m.seq_prunes,
         },
         writes: WriteMetrics {
             puts: m.puts,
