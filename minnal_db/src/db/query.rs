@@ -671,12 +671,12 @@ mod differential_tests {
                 }
                 // Pagination: pages concatenate to the full result; total is exact.
                 let full = db.query_keys(ns, &q).unwrap();
-                assert_eq!(full.total as usize, want.len(), "round {round} `{q}`: total");
+                assert_eq!(full.total, want.len(), "round {round} `{q}`: total");
                 let mut paged = Vec::new();
                 let mut off = 0;
                 loop {
                     let p = db.query_keys_paginated(ns, &q, off, 7).unwrap();
-                    assert_eq!(p.total as usize, want.len(), "round {round} `{q}`: paginated total");
+                    assert_eq!(p.total, want.len(), "round {round} `{q}`: paginated total");
                     if p.keys.is_empty() {
                         break;
                     }
