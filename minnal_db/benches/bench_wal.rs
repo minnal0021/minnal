@@ -17,38 +17,58 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use minnal_db::db::wal::{Wal, WalEntry};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Bytes of appends one WAL receives before the next is opened. Half the
+/// default 64 MiB segment, so no case rotates mid-run and times a segment
+/// creation it did not ask for.
+const WAL_BYTES_PER_RUN: usize = 32 * 1024 * 1024;
+
+/// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`.
+///
+/// Appends go into an already-open WAL, so the number is the append alone.
+/// Every `per_wal` appends the WAL is dropped and a fresh one opened, outside
+/// the timer, which bounds disk use on long runs. Opening a WAL per
+/// *iteration* instead (`iter_batched_ref` with one WAL per input) makes the
+/// untimed setup create thousands of files per batch; since creating a WAL
+/// fsyncs its directory, that leaves journal work in flight that slows the
+/// timed appends, and the unsynced case measured file creation, not appends.
+fn time_appends(iters: u64, per_wal: u64, sync: bool, make_entry: impl Fn() -> WalEntry) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    let mut done = 0;
+    while done < iters {
+        let n = per_wal.min(iters - done);
+        let temp = bench_tempdir();
+        let wal = Wal::open(temp.path().join("wal.log")).unwrap();
+        let mut tail = 0u64;
+        let start = Instant::now();
+        for _ in 0..n {
+            let entry = make_entry();
+            black_box(wal.append_entry(&entry, &mut tail, sync)).unwrap();
+        }
+        elapsed += start.elapsed();
+        done += n;
+    }
+    elapsed
+}
+
+/// Appends per WAL for `value_size`-byte values, capped at `max`.
+fn appends_per_wal(value_size: usize, max: usize) -> u64 {
+    (WAL_BYTES_PER_RUN / value_size).clamp(1, max) as u64
+}
 
 /// WAL append with fsync (the default crash-safe path).
-///
-/// Uses `iter_batched_ref` to create a fresh WAL every `BATCH` iterations,
-/// preventing disk exhaustion during long measurement runs. The batch size
-/// is chosen so that setup cost is amortised while disk usage stays bounded
-/// (worst case: BATCH * 65 KB ≈ 64 MB per batch).
 fn bench_wal_append_fsync(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/append_fsync");
     group.measurement_time(Duration::from_secs(10));
 
-    const BATCH: usize = 1_000;
-
     for value_size in [128usize, 4_096, 65_536] {
         let value = vec![0xABu8; value_size];
+        let per_wal = appends_per_wal(value_size, 1_000);
 
         group.throughput(Throughput::Bytes(value_size as u64));
         group.bench_with_input(BenchmarkId::new("value_size", format!("{value_size}B")), &value_size, |b, _| {
-            b.iter_batched_ref(
-                || {
-                    let temp = bench_tempdir();
-                    let wal_path = temp.path().join("wal.log");
-                    let wal = Wal::open(&wal_path).unwrap();
-                    (wal, 0u64, temp)
-                },
-                |(wal, tail, _temp)| {
-                    let entry = WalEntry::new_upsert(b"bench_key_00001".to_vec(), value.clone());
-                    black_box(wal.append_entry(&entry, tail, true)).unwrap();
-                },
-                criterion::BatchSize::NumIterations(BATCH as u64),
-            );
+            b.iter_custom(|iters| time_appends(iters, per_wal, true, || WalEntry::new_upsert(b"bench_key_00001".to_vec(), value.clone())));
         });
     }
     group.finish();
@@ -60,26 +80,13 @@ fn bench_wal_append_no_fsync(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/append_no_fsync");
     group.measurement_time(Duration::from_secs(10));
 
-    const BATCH: usize = 5_000;
-
     for value_size in [128usize, 4_096, 65_536] {
         let value = vec![0xABu8; value_size];
+        let per_wal = appends_per_wal(value_size, 5_000);
 
         group.throughput(Throughput::Bytes(value_size as u64));
         group.bench_with_input(BenchmarkId::new("value_size", format!("{value_size}B")), &value_size, |b, _| {
-            b.iter_batched_ref(
-                || {
-                    let temp = bench_tempdir();
-                    let wal_path = temp.path().join("wal.log");
-                    let wal = Wal::open(&wal_path).unwrap();
-                    (wal, 0u64, temp)
-                },
-                |(wal, tail, _temp)| {
-                    let entry = WalEntry::new_upsert(b"bench_key_00001".to_vec(), value.clone());
-                    black_box(wal.append_entry(&entry, tail, false)).unwrap();
-                },
-                criterion::BatchSize::NumIterations(BATCH as u64),
-            );
+            b.iter_custom(|iters| time_appends(iters, per_wal, false, || WalEntry::new_upsert(b"bench_key_00001".to_vec(), value.clone())));
         });
     }
     group.finish();
@@ -180,25 +187,14 @@ fn bench_wal_namespace_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/namespace_overhead");
     group.measurement_time(Duration::from_secs(10));
 
-    const BATCH: usize = 1_000;
+    const BATCH: u64 = 1_000;
     let value = vec![0xABu8; 512];
 
     // Append with default namespace (id=0)
     {
         let value = value.clone();
         group.bench_function("ns_id_0", |b| {
-            b.iter_batched_ref(
-                || {
-                    let temp = bench_tempdir();
-                    let wal = Wal::open(temp.path().join("wal.log")).unwrap();
-                    (wal, 0u64, temp)
-                },
-                |(wal, tail, _temp)| {
-                    let entry = WalEntry::new_upsert_ns(0, b"key_00001".to_vec(), value.clone());
-                    black_box(wal.append_entry(&entry, tail, true)).unwrap();
-                },
-                criterion::BatchSize::NumIterations(BATCH as u64),
-            );
+            b.iter_custom(|iters| time_appends(iters, BATCH, true, || WalEntry::new_upsert_ns(0, b"key_00001".to_vec(), value.clone())));
         });
     }
 
@@ -206,18 +202,7 @@ fn bench_wal_namespace_overhead(c: &mut Criterion) {
     {
         let value = value.clone();
         group.bench_function("ns_id_42", |b| {
-            b.iter_batched_ref(
-                || {
-                    let temp = bench_tempdir();
-                    let wal = Wal::open(temp.path().join("wal.log")).unwrap();
-                    (wal, 0u64, temp)
-                },
-                |(wal, tail, _temp)| {
-                    let entry = WalEntry::new_upsert_ns(42, b"key_00001".to_vec(), value.clone());
-                    black_box(wal.append_entry(&entry, tail, true)).unwrap();
-                },
-                criterion::BatchSize::NumIterations(BATCH as u64),
-            );
+            b.iter_custom(|iters| time_appends(iters, BATCH, true, || WalEntry::new_upsert_ns(42, b"key_00001".to_vec(), value.clone())));
         });
     }
 

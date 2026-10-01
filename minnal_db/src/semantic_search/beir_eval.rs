@@ -273,7 +273,8 @@ async fn beir_eval() {
                     None::<fn(&[u8]) -> bool>,
                     Some(first_pass),
                 )
-                .await;
+                .await
+                .expect("in-memory eval store cannot fail");
                 latencies.push(t.elapsed().as_secs_f64() * 1e3);
                 let ranked: Vec<&str> = results.iter().map(|r| corpus_ids[doc_u64(&r.document_id) as usize].as_str()).collect();
                 per_query.push(score(&ranked, &qrels[qid]));

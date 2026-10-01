@@ -74,8 +74,9 @@ impl DocStore {
     ///
     /// Returns an [`IndexBuildHandle`] immediately.  The index is activated
     /// before the handle is returned, so new writes are indexed straight away.
-    /// The background task then scans all existing documents and re-puts each
-    /// one so the extractor is called for historical data too.
+    /// The background task then walks every existing document and indexes its
+    /// current value in this field (`Db::reindex_field`, under the key's stripe),
+    /// without rewriting the document.
     ///
     /// Returns [`DocStoreError::IndexAlreadyExists`] if the field is already
     /// indexed.
@@ -84,6 +85,9 @@ impl DocStore {
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
+
+        // `schema.save()` below does not run `validate`, so check the name here.
+        crate::doc_store::schema::validate_index_field_name(&spec.field)?;
 
         if schema.indices.iter().any(|s| s.field == spec.field) {
             return Err(DocStoreError::IndexAlreadyExists {
@@ -163,7 +167,7 @@ impl DocStore {
         let key_type = schema.key_type;
 
         let task = tokio::spawn(async move {
-            let result = rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
+            let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone).await;
             if let Err(ref e) = result {
                 // Notify the whole chain (in-memory *and* disk), so the failure
                 // is persisted, not just visible to live pollers.
@@ -234,7 +238,7 @@ impl DocStore {
                 let key_type = schema.key_type;
 
                 let task = tokio::spawn(async move {
-                    let result = rebuild_index_for_namespace(db_clone, ns_name, key_type, field_id, resume_after, observer_clone).await;
+                    let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone).await;
                     if let Err(ref e) = result {
                         // Notify the whole chain (in-memory *and* disk), so the
                         // failure is persisted, not just visible to live pollers.
@@ -300,6 +304,7 @@ fn successor_key(key: &[u8]) -> Vec<u8> {
 async fn rebuild_index_for_namespace(
     db: Arc<AsyncDb>,
     ns_name: String,
+    ns_id: u32,
     key_type: KeyType,
     field_id: FieldId,
     resume_after: Option<Vec<u8>>,
@@ -352,9 +357,21 @@ async fn rebuild_index_for_namespace(
         if pairs.is_empty() {
             break;
         }
-        for (key, value) in pairs {
-            // Re-put triggers the active extractors, populating the new index.
-            ns.put(key.clone(), value).await?;
+        for (key, _value) in pairs {
+            // Index the key's CURRENT value in this one field, under its key
+            // stripe (`Db::reindex_field`). This used to re-put the scanned bytes,
+            // which was wrong twice over: re-putting unchanged bytes is a no-op for
+            // the index (`DynFieldIndex::update` skips old == new), so only the
+            // documents WAL replay happened to cover at activation got indexed —
+            // on a store whose WAL had been reclaimed, 28 of 300; and writing back
+            // the bytes read a page earlier overwrote any newer write to that key.
+            let outcome = db.reindex_field(ns_id, field_id, key.clone()).await?;
+            if outcome == crate::db::namespace::FieldReindexOutcome::FieldNotActive {
+                return Err(crate::db::error::KVError::Serialization(format!(
+                    "index build for namespace '{ns_name}' field_id={field_id}: the field was deactivated mid-build"
+                ))
+                .into());
+            }
             indexed += 1;
             // The observer persists to disk on its own cadence (every `every_n`).
             observer.on_progress(indexed, total, false, Some(&key));
@@ -501,6 +518,36 @@ mod tests {
         );
     }
 
+    /// `add_index` saves the schema without running `validate`, so it must check
+    /// the new field's name itself.
+    #[tokio::test]
+    async fn test_add_index_rejects_a_field_name_no_query_can_reference() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+
+        for bad in ["address.city", "created-at", "in"] {
+            let result = store
+                .add_index(
+                    "ns",
+                    IndexSpec {
+                        field: bad.to_owned(),
+                        index_type: IndexType::Str,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(DocStoreError::Schema(SchemaError::InvalidFieldName { .. }))),
+                "'{bad}' must be rejected"
+            );
+        }
+        assert!(
+            DocStoreSchema::load(schema_dir.path(), "ns").unwrap().indices.is_empty(),
+            "nothing was added"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_index_and_wait() {
         let db_dir = TempDir::new().unwrap();
@@ -579,5 +626,52 @@ mod tests {
         assert_eq!(active.total + inactive.total, n, "all docs indexed");
         assert_eq!(active.total, n.div_ceil(2), "even ids are active");
         assert_eq!(inactive.total, n / 2, "odd ids are inactive");
+    }
+
+    /// A new index must cover every existing document, not just the ones whose
+    /// WAL entries are still around for activation to replay. The rebuild used to
+    /// re-put each document's bytes, which the index ignores when nothing changed
+    /// (`DynFieldIndex::update` skips old == new), so on a store whose WAL had
+    /// been reclaimed it indexed 28 of these 300 documents and reported success.
+    #[tokio::test]
+    async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        // Small WAL segments, so the documents' segments are reclaimable.
+        let config = || {
+            let mut c = crate::doc_store::test_db_config();
+            c.wal_segment_size = 4096;
+            c
+        };
+        let n = 300u64;
+        {
+            let store = DocStore::open_with_config(db_dir.path(), schema_dir.path(), config()).await.unwrap();
+            store.create(make_schema("ns", vec![])).await.unwrap();
+            for i in 0..n {
+                store
+                    .put("ns", DocId::U64(i), serde_json::json!({"status": "active", "pad": "x".repeat(40)}))
+                    .await
+                    .unwrap();
+            }
+            store.db.shutdown().await.unwrap(); // flush, so the WAL is persisted
+        }
+        let store = DocStore::open_with_config(db_dir.path(), schema_dir.path(), config()).await.unwrap();
+        let (reclaimed_bytes, _) = store.db.garbage_collect_wal().await.unwrap();
+        assert!(reclaimed_bytes > 0, "setup: the documents' WAL must be reclaimed");
+
+        let handle = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                },
+            )
+            .await
+            .unwrap();
+        handle.wait().await.unwrap();
+
+        let found = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap();
+        assert_eq!(found.total, n as usize, "every existing document must be indexed");
     }
 }

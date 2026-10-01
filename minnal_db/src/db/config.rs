@@ -3,18 +3,18 @@ use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// How many insert/update/delete operations to batch before syncing the
-/// value log and marking WAL entries as persisted.
+/// How many insert/update/delete operations to batch between fsyncs of the
+/// value log.
 ///
-/// * `records_per_sync = 0` — only sync on close or GC (maximum throughput,
-///   least durability between explicit syncs).
-/// * `records_per_sync = 1` — sync after every single write (maximum
-///   durability, lowest throughput).
-/// * Any other value N — sync every N writes (tunable trade-off).
+/// * `records_per_sync = 0` — sync only when it is required (see below).
+/// * `records_per_sync = 1` — sync after every single write.
+/// * Any other value N — sync every N writes.
 ///
-/// The WAL is always fsynced after every append regardless of this setting,
-/// so crash recovery is always possible.  This setting controls how quickly
-/// value-log data and WAL-persisted status are flushed to disk.
+/// This is a throughput knob, not a durability one. The WAL is fsynced after
+/// every write regardless, and holds each value until it is marked persisted;
+/// before that happens — whenever a memtable reaches L0, at GC, on shutdown, and
+/// whenever a value-log segment is sealed — the value log is fsynced
+/// unconditionally. So no setting here can lose an acknowledged write.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub records_per_sync: usize,

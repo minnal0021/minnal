@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// Reject a write whose ID is not of the store's [`KeyType`].
+///
+/// Every read decodes stored keys by the schema's key type, so one key of the
+/// wrong shape — a `U64` (8 bytes) in a `u128` store — made every scan page and
+/// query result containing it fail to decode, and a `Str` of exactly 8 bytes in
+/// a `u64` store would silently alias a numeric ID. The REST layer always
+/// builds IDs from the schema, so only library callers could reach this. Checked
+/// on writes only: a mismatched `get`/`delete` just finds nothing.
+fn check_id_type(namespace: &str, id: DocId, schema: &DocStoreSchema) -> Result<(), DocStoreError> {
+    if id.key_type() == schema.key_type {
+        return Ok(());
+    }
+    Err(DocStoreError::InvalidId(format!(
+        "store '{namespace}' has {:?} keys, but the id is {:?}",
+        schema.key_type,
+        id.key_type()
+    )))
+}
+
 impl DocStore {
     // ── CRUD ──────────────────────────────────────────────────────────────
     //
@@ -26,6 +45,7 @@ impl DocStore {
     pub async fn put(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         debug!("put namespace='{}' id={:?}", namespace, id);
         let schema = self.load_schema(namespace)?;
+        check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
 
         let key = id.to_bytes();
@@ -64,6 +84,7 @@ impl DocStore {
     /// index any documents that survived the no-WAL write.
     pub async fn put_no_wal(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         let schema = self.load_schema(namespace)?;
+        check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
 
         let key = id.to_bytes();
@@ -162,6 +183,30 @@ mod tests {
 
         let found = store.get("docs", DocId::U64(99)).await.unwrap();
         assert_eq!(found, None);
+    }
+
+    /// A write whose ID does not match the store's key type must be refused:
+    /// stored, its key would fail to decode in every scan page that holds it.
+    #[tokio::test]
+    async fn test_put_rejects_an_id_of_the_wrong_key_type() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        store.create(make_schema("docs", vec![])).await.unwrap(); // u64 keys
+
+        for wrong in [DocId::U128(1), DocId::Uuid(1)] {
+            assert!(matches!(
+                store.put("docs", wrong, serde_json::json!({})).await,
+                Err(DocStoreError::InvalidId(_))
+            ));
+            assert!(matches!(
+                store.put_no_wal("docs", wrong, serde_json::json!({})).await,
+                Err(DocStoreError::InvalidId(_))
+            ));
+        }
+        store.put("docs", DocId::U64(1), serde_json::json!({"x": 1})).await.unwrap();
+        let page = store.scan_range("docs", DocId::U64(0), None, None, 10).await.unwrap();
+        assert_eq!(page.results.len(), 1, "only the correctly typed document was stored");
     }
 
     #[tokio::test]

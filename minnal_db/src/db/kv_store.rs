@@ -164,6 +164,10 @@ struct BucketGCResult {
     pending_unlink: Vec<u32>,
 }
 
+/// A batch read's values (one per key) and the positions to re-resolve through
+/// the single-key path because their segment vanished mid-batch.
+type BatchReadWithRetries = (Vec<Option<Vec<u8>>>, Vec<usize>);
+
 impl KVStore {
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
     /// See `DbConfig::verify_checksums_on_read`.
@@ -382,6 +386,15 @@ impl KVStore {
     }
 
     /// Resolve a row ID back to its key via the dense map, if loaded.
+    /// The key a field-index row ID stands for, from whichever source assigns
+    /// row IDs here: the registered `RowToKeyFn`, else the dense row map.
+    pub(crate) fn key_for_row(&self, row_id: u128) -> Option<Vec<u8>> {
+        if let Some(inv) = self.row_to_key_fn.read().as_ref() {
+            return Some(inv(row_id));
+        }
+        self.rowmap_key_for(row_id)
+    }
+
     pub(crate) fn rowmap_key_for(&self, row_id: u128) -> Option<Vec<u8>> {
         self.rowmap.read().as_ref().and_then(|rm| rm.key_for(row_id))
     }
@@ -430,6 +443,12 @@ impl KVStore {
 
     /// Set the LSM flush observer (used to wire up WAL persistence callbacks)
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
+        let observer = observer.map(|inner| {
+            Arc::new(SyncValueLogBeforePersist {
+                inner,
+                logs: self.value_log.bucket_logs(),
+            }) as Arc<dyn LsmFlushObserver>
+        });
         self.lsm.set_flush_observer(observer);
     }
 
@@ -750,22 +769,30 @@ impl KVStore {
         // resurrecting the key. Taking the lock serialises us with GC so the
         // delete is either fully visible to GC's scan or applied after GC ends.
         let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        self.delete_with_bucket_locked(key, seq, bucket_guard)
+    }
 
+    /// The body of a delete, entered with `key`'s value-log bucket write lock
+    /// already held (`bucket_guard`, released before the field indices are
+    /// touched).
+    ///
+    /// Like the put path, it asks whether this delete actually **wins**: a delete
+    /// older than the key's current copy is dropped by the LSM, so it must not
+    /// strip that live document's rows from the field indices or charge its record
+    /// as garbage. It used to do both unconditionally, so a delete that lost its
+    /// race left a live document missing from every query on the field.
+    fn delete_with_bucket_locked(&self, key: &[u8], seq: u64, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning
         // every bucket. Only when the namespace has indexes to update.
         let want_old_for_index = !self.namespace_index.read().is_empty();
-        let mut old_value: Option<Vec<u8>> = None;
-        let mut displaced: Option<ShardedValuePointer> = None;
-        if let Some(existing) = self.lsm.get(key)?
-            && let Some(existing_ptr) = decode_sharded_pointer(existing)
-        {
-            displaced = Some(existing_ptr);
-            if want_old_for_index {
-                old_value = self.value_log.read_value(existing_ptr).ok();
-            }
-        }
+        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+        let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
+        let old_value = match displaced {
+            Some(existing_ptr) if want_old_for_index => self.value_log.read_value(existing_ptr).ok(),
+            _ => None,
+        };
         self.lsm.delete_with_seq(key, seq)?;
 
         // The deleted key's record is garbage now. Accounting only — the record itself
@@ -774,10 +801,12 @@ impl KVStore {
         if let Some(old) = displaced {
             self.value_log.note_displaced(old, key.len());
         }
-        drop(_bucket_guard);
+        drop(bucket_guard);
 
-        // Remove row from all field indices
-        self.update_indices_on_delete(key, old_value.as_deref());
+        // Remove row from all field indices — only if the key is now deleted.
+        if wins {
+            self.update_indices_on_delete(key, old_value.as_deref());
+        }
 
         Ok(())
     }
@@ -879,6 +908,15 @@ impl KVStore {
         Ok(entries)
     }
 
+    /// Delete records whose creation epoch is older than `ttl`, for a store with
+    /// no concurrent same-key writers to exclude (tests and standalone use). The
+    /// database's TTL worker uses [`expire_records_locked`](Self::expire_records_locked)
+    /// with its key stripe.
+    #[cfg(test)]
+    pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
+        self.expire_records_locked(ttl, max_deletes_per_run, |_| ())
+    }
+
     /// Delete records whose creation epoch is older than `ttl`.
     ///
     /// Scans live keys and reads each record's `epoch` straight from the value log
@@ -886,30 +924,62 @@ impl KVStore {
     /// records are removed per call so a single pass can't stall on a huge backlog;
     /// value-log GC reclaims the physical space afterwards. Returns the number
     /// deleted.
-    pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
+    ///
+    /// Each expired key is deleted by **compare-and-set**: only if it still points
+    /// at the exact record judged expired ([`delete_if_current`](Self::delete_if_current)).
+    /// A key rewritten after the check — its fresh value just acknowledged to a
+    /// writer — is left alone; the old code deleted whatever was current. And the
+    /// delete runs under `lock_key(key)`, which the database supplies as the key
+    /// stripe: a WAL-backed write holds that stripe from allocating its seq to
+    /// applying it, so no same-key write can sit between the two while TTL
+    /// allocates its own seq. Without it TTL deletes carried seqs out of order
+    /// with concurrent puts, the one source of "lower-seq copy in a newer layer"
+    /// that the read paths (and the L1 tombstone-drop contract) had to tolerate.
+    pub(crate) fn expire_records_locked<G>(&self, ttl: Duration, max_deletes_per_run: usize, lock_key: impl Fn(&[u8]) -> G) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
-        let keys = self.keys()?;
-        let entries = self.resolve_entries(keys)?;
-
         let mut deleted = 0usize;
-        for (key, pointer) in entries {
+        for key in self.keys()? {
             if deleted >= max_deletes_per_run {
                 break;
             }
-            // The LSM listed this key, so it is live by definition — there is no
-            // "already tombstoned" record state to skip any more.
+            // Resolved per key as the pass reaches it, not all up front: the
+            // compare-and-set below only holds off writes after this point.
+            let Some(pointer) = self.lsm.get(&key)?.and_then(decode_sharded_pointer) else {
+                continue; // deleted since the key list was taken
+            };
             let Ok(meta) = self.value_log.read_record_meta(pointer) else {
                 continue;
             };
             if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                self.delete_from_storage(&key)?;
-                deleted += 1;
+                let _key_guard = lock_key(&key);
+                if self.delete_if_current(&key, pointer)? {
+                    deleted += 1;
+                }
             }
         }
 
         Ok(deleted)
+    }
+
+    /// Delete `key` only if it still points at `expected` — the record a TTL pass
+    /// judged expired. Returns whether it deleted. A key rewritten (or relocated by
+    /// GC) since is left for the next pass to judge afresh; pointers are unique for
+    /// the life of the database, so pointer equality means "the same write".
+    ///
+    /// The seq is allocated only after the check, under the bucket lock and the
+    /// caller's key lock, so the delete is newer than anything already applied to
+    /// the key and — with the key stripe held — than anything about to be.
+    fn delete_if_current(&self, key: &[u8], expected: ShardedValuePointer) -> Result<bool> {
+        let bucket = self.value_log.bucket_for_key(key);
+        let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        if self.lsm.get(key)?.and_then(decode_sharded_pointer) != Some(expected) {
+            return Ok(false);
+        }
+        let seq = self.alloc_seq();
+        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        Ok(true)
     }
 
     /// Fetch multiple keys in parallel by grouping I/O across value-log buckets.
@@ -918,42 +988,33 @@ impl KVStore {
     /// per SSTable bucket (reads each level1 file once into memory), then reads
     /// values from the value-log with `num_buckets` parallel threads.
     ///
-    /// Returns one `Option<Vec<u8>>` per input key in the same order.
-    /// Missing keys and I/O errors both produce `None`.
-    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        let (mut results, retry) = self.get_multiple_inner(keys);
+    /// Returns one `Option<Vec<u8>>` per input key in the same order; `None` means
+    /// the key is absent or deleted. A storage error (an LSM read failure,
+    /// corruption, an IO fault) is an `Err` for the whole call — it used to become
+    /// `None` for the affected keys (or for *every* key, when the LSM lookup
+    /// failed), which a caller could not tell apart from a missing key.
+    pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let (mut results, retry) = self.get_multiple_inner(keys)?;
 
         // Keys that resolved to a pointer but whose value could not be read: usually GC
         // reclaimed the segment between the LSM lookup and the read, and the LSM now
         // holds the new pointer, so re-resolving through the single-key `get` succeeds.
-        // But `get` can also return a *hard* error (corruption, IO fault) — which the
-        // reclaimed-segment retry inside `get` no longer masks. This method's public
-        // signature is `Vec<Option>`, so it cannot surface a per-key error; log it so a
-        // genuine corruption is visible rather than silently indistinguishable from a
-        // missing key.
+        // A hard error from `get` (corruption, IO fault) is the caller's to see.
         for idx in retry {
-            match self.get(&keys[idx]) {
-                Ok(value) => results[idx] = value,
-                Err(e) => warn!(
-                    "[KVStore '{}'] get_multiple: value for a resolved key could not be read: {}",
-                    self.name, e
-                ),
-            }
+            results[idx] = self.get(&keys[idx])?;
         }
-        results
+        Ok(results)
     }
 
     /// Returns `(values, retry_indices)` where `retry_indices` are positions that
     /// `lsm.get_multiple` resolved to a pointer but whose value read returned `None`
     /// (a transient GC race the caller should re-resolve via [`get`](Self::get)).
-    fn get_multiple_inner(&self, keys: &[Vec<u8>]) -> (Vec<Option<Vec<u8>>>, Vec<usize>) {
+    fn get_multiple_inner(&self, keys: &[Vec<u8>]) -> Result<BatchReadWithRetries> {
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
 
         // ── Step 1: single-pass LSM lookup for all keys ───────────────────────
         // Reads each bucket's level1 file ONCE instead of once per key.
-        let Ok(pointers) = self.lsm.get_multiple(keys) else {
-            return (results, Vec::new());
-        };
+        let pointers = self.lsm.get_multiple(keys)?;
 
         // ── Step 2: group the pointers by value-log bucket ────────────────────
         let num_buckets = self.value_log.num_buckets();
@@ -969,7 +1030,7 @@ impl KVStore {
             }
         }
         if resolved.is_empty() {
-            return (results, Vec::new());
+            return Ok((results, Vec::new()));
         }
 
         // ── Step 3: read each bucket's values in parallel ─────────────────────
@@ -997,7 +1058,7 @@ impl KVStore {
         // the caller re-resolves them through the single-key `get`.
         let retry: Vec<usize> = resolved.into_iter().filter(|&idx| results[idx].is_none()).collect();
 
-        (results, retry)
+        Ok((results, retry))
     }
 
     /// Scan multiple 4-byte BE cluster prefixes and resolve their values.
@@ -1186,6 +1247,10 @@ impl KVStore {
     ///
     /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
+        // An empty page cannot carry a cursor that advances: with `limit = 0` the
+        // next cursor was the first key at or after this one — the cursor itself —
+        // so a caller following `next_cursor` looped forever. Treat 0 as 1.
+        let limit = limit.max(1);
         let start = cursor.unwrap_or(&[]);
         let key_pointers = self.lsm.range_pointers_bounded(start, end, limit + 1)?;
         let has_more = key_pointers.len() > limit;
@@ -1537,9 +1602,13 @@ impl KVStore {
             return Ok(self.gc_stats_now(0, start_time));
         }
 
-        // Step 3: make the re-points durable BEFORE unlinking anything. Load-bearing —
-        // `test_gc_crash_the_instant_segments_are_unlinked_loses_nothing` fails if these
-        // two steps are ever swapped.
+        // Step 3: make the relocated copies durable, then the re-points to them, BEFORE
+        // unlinking anything. Load-bearing — `test_gc_crash_the_instant_segments_are_
+        // unlinked_loses_nothing` fails if the flush and the unlink are ever swapped.
+        // The fsync matters for power loss rather than a process crash: survivors are
+        // appended without one, so without it the old copy could be unlinked (and the
+        // unlink made durable) while the new copy is still only in the page cache.
+        self.value_log.sync_all()?;
         self.lsm.flush_memtable_to_level0()?;
 
         // Step 4: the old segments are now unreferenced by anything durable.
@@ -1717,8 +1786,10 @@ impl KVStore {
     /// Flush and sync all data for this namespace.
     pub fn shutdown(&self) -> Result<()> {
         self.lsm.cleanup_pending_memtables_on_close();
-        self.lsm.flush_and_compact_all()?;
+        // Values before the LSM entries that point at them (see
+        // `SyncValueLogBeforePersist`).
         self.value_log.sync_all()?;
+        self.lsm.flush_and_compact_all()?;
         // Persist each bucket's segment inventory, its live/garbage counters and its
         // segment-id high-water mark. The high-water mark is what keeps ids unique
         // across restarts; the counters keep GC from under-triggering after a reopen.
@@ -1727,10 +1798,42 @@ impl KVStore {
     }
 }
 
+/// Makes a store's value log durable before any WAL entry is marked persisted.
+///
+/// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
+/// cadence), which is safe only while the WAL still holds the value. When a
+/// memtable reaches L0, `on_ro_memtable_flushed_to_level0` lets the WAL
+/// observer mark its entries persisted — recovery then skips them and WAL GC
+/// deletes them — so the value-log records those SSTable entries point at must
+/// be on stable storage first. Without this, a power loss after the flush lost
+/// up to `records_per_sync` acknowledged values (and any segment sealed since
+/// its last fsync) with nothing left to replay them from. If the fsync fails the
+/// event is withheld: the entries stay un-persisted and recovery replays them.
+struct SyncValueLogBeforePersist {
+    inner: Arc<dyn LsmFlushObserver>,
+    logs: Vec<Arc<crate::store::value_log::ValueLog>>,
+}
+
+impl LsmFlushObserver for SyncValueLogBeforePersist {
+    fn on_memtable_sealed(&self, version: u64) {
+        self.inner.on_memtable_sealed(version);
+    }
+
+    fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before marking memtable {version} persisted; its WAL entries stay replayable: {e:?}");
+                return;
+            }
+        }
+        self.inner.on_ro_memtable_flushed_to_level0(version);
+    }
+}
+
 impl Drop for KVStore {
     fn drop(&mut self) {
-        let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.sync_all();
+        let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.flush_all_metadata();
     }
 }
@@ -1987,8 +2090,8 @@ mod tests {
         // A value-log read error in the batch path used to be swallowed by
         // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
         // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
-        // and `get_multiple` still returns the readable keys — dropping (and logging) only
-        // the corrupt one rather than silently reporting it absent.
+        // and so does `get_multiple`: the batch fails rather than reporting the corrupt
+        // key absent.
         let dir = TempDir::new().unwrap();
         let store = KVStore::open(
             0,
@@ -2025,18 +2128,19 @@ mod tests {
             "corruption must surface as an error, not a missing key"
         );
 
-        // get_multiple returns every readable key and drops only the corrupt one.
-        let got = store.get_multiple(&keys);
-        for (i, k) in keys.iter().enumerate() {
-            if k.as_slice() == b"k2" {
-                assert!(got[i].is_none(), "the corrupt key must not be returned as a value");
-            } else {
-                assert_eq!(
-                    got[i].as_deref(),
-                    Some(format!("value-{i}-payload").as_bytes()),
-                    "readable key {i} must still be returned"
-                );
-            }
+        // get_multiple reports the corruption too: a corrupt key is not "absent",
+        // so the whole batch fails rather than returning `None` for it.
+        assert!(
+            matches!(store.get_multiple(&keys), Err(KVError::ShardedValueLogError(_))),
+            "a batch containing a corrupt key must fail, not report the key missing"
+        );
+
+        // The same batch without the corrupt key still returns every value.
+        let readable: Vec<Vec<u8>> = keys.iter().filter(|k| k.as_slice() != b"k2").cloned().collect();
+        let got = store.get_multiple(&readable).unwrap();
+        for (k, v) in readable.iter().zip(&got) {
+            let i = keys.iter().position(|x| x == k).unwrap();
+            assert_eq!(v.as_deref(), Some(format!("value-{i}-payload").as_bytes()));
         }
     }
 
@@ -2114,7 +2218,7 @@ mod tests {
         }
 
         let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         assert_eq!(batch.len(), keys.len());
         for (i, result) in batch.iter().enumerate() {
@@ -2139,7 +2243,7 @@ mod tests {
         store.put_to_storage(b"exists", b"val").unwrap();
 
         let keys = vec![b"exists".to_vec(), b"no_such_key".to_vec()];
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         assert_eq!(batch[0], Some(b"val".to_vec()));
         assert_eq!(batch[1], None);
@@ -2165,7 +2269,7 @@ mod tests {
         store.flush_and_compact_all().unwrap();
 
         let keys: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i]).collect();
-        let batch = store.get_multiple(&keys);
+        let batch = store.get_multiple(&keys).unwrap();
 
         for (i, result) in batch.iter().enumerate() {
             assert_eq!(result.as_deref(), Some(vec![i as u8; 32].as_slice()), "missing key {i}");
@@ -2212,6 +2316,41 @@ mod tests {
         assert!(vals_7.contains(&b"val_7_1".as_slice()));
         assert!(vals_7.contains(&b"val_7_2".as_slice()));
         assert!(vals_7.contains(&b"val_7_3".as_slice()));
+    }
+
+    /// Following `next_cursor` must always make progress. A `limit` of 0 returned
+    /// an empty page whose cursor was the one passed in, so a paging loop never
+    /// ended.
+    #[test]
+    fn test_scan_page_batch_limit_zero_still_advances() {
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(
+            0,
+            "t",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            DEFAULT_SEGMENT_SIZE_BYTES,
+        )
+        .unwrap();
+        for i in 0..3u8 {
+            store.put_to_storage(&[b'k', i], b"v").unwrap();
+        }
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let (page, next) = store.scan_page_batch(cursor.as_deref(), None, 0).unwrap();
+            seen.extend(page.into_iter().map(|(k, _)| k));
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![vec![b'k', 0], vec![b'k', 1], vec![b'k', 2]],
+            "the walk must advance and finish"
+        );
     }
 
     #[test]
@@ -2631,6 +2770,25 @@ mod tests {
         }
     }
 
+    /// GC appends its relocated copies without an fsync and then unlinks the
+    /// segments they came from. The copies must be durable before that, or a power
+    /// loss after the unlink loses both. A standalone store has no flush observer,
+    /// so this exercises GC's own fsync rather than the observer's.
+    #[test]
+    fn test_gc_makes_its_relocated_copies_durable() {
+        let dir = TempDir::new().unwrap();
+        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::new(0), 64 * 1024).unwrap();
+        for round in 0..4u8 {
+            for i in 0u32..200 {
+                store.put_to_storage(&format!("key:{i:04}").into_bytes(), &[round; 300]).unwrap();
+            }
+        }
+        store.value_log.sync_all().unwrap(); // start clean: only GC's own writes count
+        let stats = store.garbage_collect_with_threshold(0.0).unwrap();
+        assert!(stats.bytes_reclaimed > 0, "setup: GC must collect segments whose survivors it relocated");
+        assert_eq!(store.value_log.unsynced_bytes(), 0, "relocated copies were left unsynced");
+    }
+
     #[test]
     fn test_gc_concurrent_reads_never_error_or_return_stale() {
         // Item 6 regression: a reader must get a *generation-stable* snapshot.
@@ -2938,7 +3096,7 @@ mod tests {
                     }
 
                     // get_multiple has its own read loop — strong oracle.
-                    let got = store.get_multiple(&all_live);
+                    let got = store.get_multiple(&all_live).unwrap();
                     for (i, v) in got.iter().enumerate() {
                         if v.as_deref() != Some(expected(i as u32).as_slice()) {
                             record(format!(
@@ -3098,7 +3256,7 @@ mod tests {
                     // Exercise the batch value paths under churn, but do not assert
                     // a non-linearizable active-churn snapshot here. The quiescent
                     // assertions below are the completeness/exactness oracle.
-                    let _ = store.get_multiple(&all_live);
+                    let _ = store.get_multiple(&all_live).unwrap();
                     let _ = store.scan_prefix_batch(b"live:").unwrap();
                 }
                 stop.store(true, Ordering::Release);
@@ -3111,7 +3269,7 @@ mod tests {
 
         // Once the churn threads have joined, the batch get path must be complete:
         // all never-deleted live keys should resolve to their exact value.
-        let got = store.get_multiple(&all_live);
+        let got = store.get_multiple(&all_live).unwrap();
         for (i, v) in got.iter().enumerate() {
             assert_eq!(
                 v.as_deref(),

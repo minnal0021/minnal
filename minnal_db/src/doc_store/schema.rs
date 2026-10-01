@@ -265,6 +265,7 @@ impl DocStoreSchema {
             if spec.field.is_empty() {
                 return Err(SchemaError::EmptyFieldName { index: i });
             }
+            validate_index_field_name(&spec.field)?;
             if !seen.insert(spec.field.clone()) {
                 return Err(SchemaError::DuplicateFieldName { field: spec.field.clone() });
             }
@@ -298,6 +299,15 @@ impl DocStoreSchema {
             for f in &self.embedding_fields {
                 if f.is_empty() {
                     return Err(SchemaError::SemanticSearchMissingField);
+                }
+                // The embedding text reads top-level keys only (`doc.get(f)`),
+                // while type validation follows dotted paths — so a dotted
+                // embedding field passed validation and was never embedded.
+                if f.contains('.') {
+                    return Err(SchemaError::InvalidFieldName {
+                        field: f.clone(),
+                        reason: "an embedding field must be a top-level key (no '.')",
+                    });
                 }
                 if !seen_embedding.insert(f.as_str()) {
                     return Err(SchemaError::DuplicateFieldName { field: f.clone() });
@@ -538,6 +548,38 @@ impl AttributeType {
     }
 }
 
+/// Words the query lexer reads as keywords, whatever their case.
+const QUERY_KEYWORDS: [&str; 6] = ["and", "or", "not", "in", "true", "false"];
+
+/// Check that an index field name is one the query language can name and the
+/// index extractor can read: an identifier `[A-Za-z_][A-Za-z0-9_]*` that is not
+/// a query keyword in any case.
+///
+/// Without this, an index could be created that no query can ever reference
+/// (`created-at`, `in`, `NOT`), and a dotted name (`address.city`) was worse:
+/// `validate_doc` follows the dotted path, so nested documents were accepted,
+/// but the extractor reads a top-level key of that literal name, so the index
+/// stayed empty — silently.
+pub(crate) fn validate_index_field_name(field: &str) -> Result<(), SchemaError> {
+    let invalid = |reason| {
+        Err(SchemaError::InvalidFieldName {
+            field: field.to_owned(),
+            reason,
+        })
+    };
+    let mut chars = field.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        return invalid("an index field name must start with a letter or '_'");
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return invalid("an index field name may contain only letters, digits and '_' (no '.', '-' or spaces)");
+    }
+    if QUERY_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(field)) {
+        return invalid("an index field name cannot be a query keyword (AND, OR, NOT, IN, TRUE, FALSE)");
+    }
+    Ok(())
+}
+
 impl DocStoreSchema {
     /// Validate that a document conforms to this schema.
     ///
@@ -588,6 +630,27 @@ mod tests {
     use super::*;
     use crate::doc_store::kv_schema::valid_kv_schema;
     use std::collections::HashSet;
+
+    /// An index field name must be something a query can reference and the
+    /// extractor can read: dotted, hyphenated, digit-leading or keyword names
+    /// used to be accepted, giving an index no query could name — and, for a
+    /// dotted name, one the extractor never populated.
+    #[test]
+    fn index_field_names_must_be_query_identifiers() {
+        for bad in ["address.city", "created-at", "has space", "1st", "in", "NOT", "True", "false", "é"] {
+            let mut schema = valid_schema();
+            schema.indices[0].field = bad.to_owned();
+            assert!(
+                matches!(schema.validate(), Err(SchemaError::InvalidFieldName { .. })),
+                "'{bad}' must be rejected"
+            );
+        }
+        for good in ["status_2", "_private", "isTrue", "notes", "inbox", "Order"] {
+            let mut schema = valid_schema();
+            schema.indices[0].field = good.to_owned();
+            assert!(schema.validate().is_ok(), "'{good}' must be accepted");
+        }
+    }
 
     fn valid_schema() -> DocStoreSchema {
         DocStoreSchema {

@@ -43,6 +43,17 @@ pub struct Metrics {
     pub l1_probes: AtomicU64,
     /// L1 lookups short-circuited by the bloom filter ("definitely absent").
     pub bloom_rejects: AtomicU64,
+    /// L0 files a point lookup skipped unread: the key is outside the file's key
+    /// range or its bloom filter says "definitely absent".
+    pub l0_bloom_rejects: AtomicU64,
+    /// SSTables (L0 files or the L1 file) a point lookup skipped unread because a
+    /// newer layer already held a copy at least as new as anything in them.
+    pub seq_prunes: AtomicU64,
+    /// SSTable lookups whose sparse-index hint failed validation, so the scan
+    /// restarted from the head of the file. Correct but slow. Expected only
+    /// briefly for L1 while a compaction swaps the file; a steady rate means the
+    /// index offsets disagree with the files.
+    pub sparse_hint_rejects: AtomicU64,
 
     // ── Writes ──────────────────────────────────────────────────────────
     pub puts: AtomicU64,
@@ -125,6 +136,9 @@ impl Metrics {
             l0_probes: g(&self.l0_probes),
             l1_probes: g(&self.l1_probes),
             bloom_rejects: g(&self.bloom_rejects),
+            l0_bloom_rejects: g(&self.l0_bloom_rejects),
+            seq_prunes: g(&self.seq_prunes),
+            sparse_hint_rejects: g(&self.sparse_hint_rejects),
             puts: g(&self.puts),
             deletes: g(&self.deletes),
             merges: g(&self.merges),
@@ -166,6 +180,9 @@ impl Metrics {
         a(&self.l0_probes, o.l0_probes);
         a(&self.l1_probes, o.l1_probes);
         a(&self.bloom_rejects, o.bloom_rejects);
+        a(&self.l0_bloom_rejects, o.l0_bloom_rejects);
+        a(&self.seq_prunes, o.seq_prunes);
+        a(&self.sparse_hint_rejects, o.sparse_hint_rejects);
         a(&self.puts, o.puts);
         a(&self.deletes, o.deletes);
         a(&self.merges, o.merges);
@@ -199,6 +216,9 @@ pub struct MetricsSnapshot {
     pub l0_probes: u64,
     pub l1_probes: u64,
     pub bloom_rejects: u64,
+    pub l0_bloom_rejects: u64,
+    pub seq_prunes: u64,
+    pub sparse_hint_rejects: u64,
     pub puts: u64,
     pub deletes: u64,
     pub merges: u64,
@@ -234,6 +254,9 @@ impl MetricsSnapshot {
         self.l0_probes += o.l0_probes;
         self.l1_probes += o.l1_probes;
         self.bloom_rejects += o.bloom_rejects;
+        self.l0_bloom_rejects += o.l0_bloom_rejects;
+        self.seq_prunes += o.seq_prunes;
+        self.sparse_hint_rejects += o.sparse_hint_rejects;
         self.puts += o.puts;
         self.deletes += o.deletes;
         self.merges += o.merges;

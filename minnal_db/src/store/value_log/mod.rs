@@ -438,6 +438,11 @@ struct Inner {
     active_file: Arc<File>,
     /// Offset in the active segment where the next record goes.
     active_offset: u64,
+    /// How far into the active segment is known to be on stable storage. Every
+    /// sealed segment is fsynced as it is sealed, so `active_offset -
+    /// synced_offset` is everything this bucket holds that a power loss could
+    /// still take away.
+    synced_offset: u64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
 }
@@ -685,6 +690,9 @@ impl ValueLog {
                 active_id,
                 active_file,
                 active_offset,
+                // What a previous process wrote reached at least the page cache,
+                // which survives that process; nothing here is newly written.
+                synced_offset: active_offset,
                 total_gc_runs: persisted.total_gc_runs,
                 total_bytes_reclaimed: persisted.total_bytes_reclaimed,
             }),
@@ -731,7 +739,16 @@ impl ValueLog {
     }
 
     /// Seal the current tail and open a fresh segment as the new one.
+    ///
+    /// The tail is fsynced before it is sealed. [`sync`](Self::sync) only ever
+    /// fsyncs the *active* file, so a segment sealed with unsynced records would
+    /// never be made durable by anything — and once the LSM entries pointing into
+    /// it reach L0 their WAL entries are marked persisted (and later reclaimed),
+    /// so a power loss would lose those values for good.
     fn roll_active_segment(&self, inner: &mut Inner) -> Result<()> {
+        if inner.synced_offset < inner.active_offset {
+            inner.active_file.sync_data()?;
+        }
         if let Some(s) = inner.segments.get_mut(&inner.active_id) {
             s.sealed = true;
         }
@@ -757,6 +774,7 @@ impl ValueLog {
         inner.active_id = id;
         inner.active_file = file;
         inner.active_offset = SEGMENT_HEADER_SIZE;
+        inner.synced_offset = SEGMENT_HEADER_SIZE;
         Ok(())
     }
 
@@ -820,11 +838,12 @@ impl ValueLog {
         buf.extend_from_slice(value);
         buf.extend_from_slice(key);
         file.write_all_at(&buf, rec_offset)?;
+        inner.active_offset += record_len;
         if sync {
             file.sync_data()?;
+            inner.synced_offset = inner.active_offset;
         }
 
-        inner.active_offset += record_len;
         if let Some(s) = inner.segments.get_mut(&segment_id) {
             s.total_bytes += record_len;
             s.live_bytes += record_len;
@@ -851,10 +870,28 @@ impl ValueLog {
         }
     }
 
+    /// Make every record appended so far durable. Sealed segments were fsynced
+    /// when sealed, so only the active tail needs it.
     pub fn sync(&self) -> Result<()> {
-        let file = Arc::clone(&self.inner.read().active_file);
+        let (file, id, target) = {
+            let inner = self.inner.read();
+            (Arc::clone(&inner.active_file), inner.active_id, inner.active_offset)
+        };
         file.sync_data()?;
+        let mut inner = self.inner.write();
+        // A roll in between already synced (and replaced) that tail.
+        if inner.active_id == id && inner.synced_offset < target {
+            inner.synced_offset = target;
+        }
         Ok(())
+    }
+
+    /// Bytes appended to this bucket that are not yet known to be on stable
+    /// storage. Zero after [`sync`](Self::sync) with no appends since.
+    #[cfg(test)]
+    pub fn unsynced_bytes(&self) -> u64 {
+        let inner = self.inner.read();
+        inner.active_offset - inner.synced_offset
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────
@@ -1155,6 +1192,43 @@ mod tests {
             epoch: 1_700_000_000_000,
             seq,
         }
+    }
+
+    /// Unsynced appends are tracked until something makes them durable: `sync`,
+    /// an append with `sync = true`, or sealing the segment (which fsyncs it, so
+    /// only the fresh tail can hold unsynced bytes afterwards).
+    #[test]
+    fn unsynced_bytes_track_what_a_power_loss_could_take() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert_eq!(log.unsynced_bytes(), 0);
+
+        log.append(b"k1", &[1u8; 100], meta(1), false)?;
+        let one = ValueRecordHeader::record_len(2, 100);
+        assert_eq!(log.unsynced_bytes(), one);
+        log.sync()?;
+        assert_eq!(log.unsynced_bytes(), 0);
+
+        log.append(b"k2", &[2u8; 100], meta(2), false)?;
+        log.append(b"k3", &[3u8; 100], meta(3), true)?; // a synced append covers what came before
+        assert_eq!(log.unsynced_bytes(), 0);
+
+        // Fill past a segment boundary without syncing: after the roll only the new
+        // tail's records are unsynced — the sealed segment was fsynced as it sealed.
+        let first = log.inner.read().active_id;
+        let mut in_new_tail = 0;
+        for i in 0..1_000u64 {
+            log.append(b"kk", &[9u8; 1000], meta(10 + i), false)?;
+            if log.inner.read().active_id != first {
+                in_new_tail += ValueRecordHeader::record_len(2, 1000);
+                if in_new_tail >= 3 * ValueRecordHeader::record_len(2, 1000) {
+                    break;
+                }
+            }
+        }
+        assert_ne!(log.inner.read().active_id, first, "setup: the tail must have rolled");
+        assert_eq!(log.unsynced_bytes(), in_new_tail);
+        Ok(())
     }
 
     #[test]

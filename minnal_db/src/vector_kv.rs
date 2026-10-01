@@ -271,6 +271,7 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     if vector_indexes.is_empty() {
         return Ok(());
     }
+    let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
 
     // Never index into a store that no longer exists.
     //
@@ -338,11 +339,39 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     Ok(())
 }
 
+/// Number of stripes in [`lock_doc_vectors`]; a power of two.
+const DOC_VECTOR_LOCK_STRIPES: usize = 256;
+
+/// Serialise every write to one document's vectors: [`upsert_vectors`] and
+/// [`delete_vector`] each hold this across their whole body.
+///
+/// Both are multi-key read-modify-writes over the document's sparse cluster keys,
+/// its cluster list (`{ns}_sparse_vector_meta`) and its dense entry, and the list
+/// is the only way to find the cluster keys again. Interleaved, a delete could read
+/// the old list, then delete the list the upsert had just replaced — leaving the
+/// upsert's new cluster keys with nothing recording them. Every later clean-up
+/// (the worker's `process_clear`, the next delete) finds keys through the list, so
+/// those keys were orphaned for good: measured 260 orphans in 300 racing rounds.
+/// A document delete racing the vector worker is exactly this shape. The database
+/// has a single owning process (the directory lock), so an in-process lock
+/// suffices; the stripes are shared across namespaces and databases, which only
+/// costs an occasional false conflict.
+async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
+    static STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+        std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    doc_id_bytes.hash(&mut hasher);
+    STRIPES[(hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)].lock().await
+}
+
 /// Delete the quantised vector for a document from the vector KV store.
 ///
 /// No-op if no vector entry exists for `doc_id_bytes` (the document was never
 /// indexed, or was already cleaned up).
 pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+    let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
@@ -466,34 +495,36 @@ impl DbVectorStore {
 }
 
 impl VectorKvStore for DbVectorStore {
-    async fn scan_sparse_cluster(&self, cluster_id: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    async fn scan_sparse_cluster(&self, cluster_id: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KVError> {
         // Prefix = cluster_id (4B BE) — only entries for this cluster are returned.
         let prefix = cluster_id.to_be_bytes().to_vec();
-        let Ok(entries) = self.sparse_ns.scan_prefix(prefix).await else {
-            return vec![];
-        };
+        let entries = self.sparse_ns.scan_prefix(prefix).await?;
 
-        entries
+        Ok(entries
             .into_iter()
             .filter_map(|(key, value)| {
                 let (_, doc_id_bytes) = composite_key::decode(&key)?;
                 Some((doc_id_bytes.to_vec(), value))
             })
-            .collect()
+            .collect())
     }
 
-    async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Option<Vec<u8>> {
-        self.dense_ns.get(doc_id_bytes.to_vec()).await.ok()?
+    async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, crate::KVError> {
+        self.dense_ns.get(doc_id_bytes.to_vec()).await
     }
 
-    async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+    async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
         self.dense_ns.get_multiple(doc_ids.to_vec()).await
     }
 
-    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>> {
-        let raw = self.sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await;
+    async fn scan_sparse_clusters_batch(
+        &self,
+        cluster_ids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
+        let raw = self.sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await?;
         // Decode composite keys: strip the 4-byte cluster_id prefix, keep only doc_id.
-        raw.into_iter()
+        Ok(raw
+            .into_iter()
             .map(|(cluster_id, entries)| {
                 let decoded = entries
                     .into_iter()
@@ -504,7 +535,7 @@ impl VectorKvStore for DbVectorStore {
                     .collect();
                 (cluster_id, decoded)
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -708,6 +739,29 @@ pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], t
     Ok(())
 }
 
+/// Enqueue an embed for a document **only if it has no queue entry at all**;
+/// returns whether it enqueued. Atomic (a `merge` under the key's stripe).
+///
+/// For callers that decide from a snapshot — reconciliation — and so must never
+/// overwrite what a live write queued since: a newer text (the snapshot's would
+/// win and leave stale vectors) or a `Clear` tombstone (the deleted document
+/// would be embedded again).
+pub async fn enqueue_embed_if_absent(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let entry = encode_queue_value(QueueEntryKind::Embed, text, 0, None);
+    let result = queue_ns
+        .merge(queue_key(namespace, doc_id_bytes), Vec::new(), move |existing, _| match existing {
+            Some(_) => Err(crate::KVError::MergeAborted("a queue entry already exists".into())),
+            None => Ok(Some(entry)),
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(crate::KVError::MergeAborted(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Update an existing queue entry's retry count and last error (durable single-op write).
 ///
 /// The entry's text is preserved unchanged.
@@ -839,9 +893,27 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
 pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
     upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, vector_indexes).await?;
     match complete_entry(db, entry).await? {
-        Completion::Done | Completion::Superseded => Ok(()),
-        Completion::Cleared => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
+        Completion::Done | Completion::Superseded => {}
+        Completion::Cleared => return process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
     }
+    // The vectors just written must belong to a document that still exists. A
+    // delete normally leaves a `Clear` tombstone that the completion above sees,
+    // but an entry written from a snapshot (reconciliation) can land after that
+    // tombstone was already processed, and would otherwise index a deleted
+    // document for good. A delete landing after this check leaves a tombstone
+    // for the next pass, so the two together leave no orphan. (`list_namespaces`
+    // first: resolving a dropped namespace would recreate it.)
+    if db.list_namespaces().iter().any(|(name, _)| *name == entry.namespace)
+        && db
+            .namespace(entry.namespace.clone())
+            .await?
+            .get(entry.doc_id_bytes.clone())
+            .await?
+            .is_none()
+    {
+        delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
+    }
+    Ok(())
 }
 
 /// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
@@ -938,6 +1010,68 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
     }
 }
 
+#[cfg(test)]
+mod doc_vector_race_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A delete racing an upsert of the same document's vectors must never leave
+    /// a sparse cluster key that the document's cluster list does not record —
+    /// every clean-up finds keys through that list, so such a key is orphaned for
+    /// good. Unserialised, 260 of 300 rounds of this left one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_upsert_and_delete_leave_no_orphaned_cluster_keys() {
+        let dir = TempDir::new().unwrap();
+        let db = std::sync::Arc::new(
+            AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+                .await
+                .unwrap(),
+        );
+        db.namespace("docs".to_string()).await.unwrap();
+        let vectors = |clusters: &[u32]| -> Vec<VectorIndex> {
+            let mut out = vec![VectorIndex::new(
+                1,
+                QuantisationStyle::MultiBit { number_of_bits: 8 },
+                1.0,
+                0.0,
+                0.01,
+                vec![],
+            )];
+            out.extend(
+                clusters
+                    .iter()
+                    .map(|&c| VectorIndex::new(c, QuantisationStyle::SingleBit, 1.0, 0.0, 0.01, vec![])),
+            );
+            out
+        };
+        let meta_ns = db.namespace(sparse_vectors_meta_ns("docs")).await.unwrap();
+        let sparse_ns = db.namespace(sparse_vectors_ns("docs")).await.unwrap();
+        for round in 0..150 {
+            let doc = format!("d{round}").into_bytes();
+            upsert_vectors(&db, "docs", &doc, &vectors(&[3])).await.unwrap();
+            let (db_a, db_b, doc_a, doc_b) = (db.clone(), db.clone(), doc.clone(), doc.clone());
+            let upsert = tokio::spawn(async move { upsert_vectors(&db_a, "docs", &doc_a, &vectors(&[5, 7])).await.unwrap() });
+            let delete = tokio::spawn(async move { delete_vector(&db_b, "docs", &doc_b).await.unwrap() });
+            upsert.await.unwrap();
+            delete.await.unwrap();
+
+            let listed = meta_ns
+                .get(doc.clone())
+                .await
+                .unwrap()
+                .and_then(|b| decode_sparse_meta(&b))
+                .unwrap_or_default();
+            for cluster in [3u32, 5, 7] {
+                let present = sparse_ns.get(composite_key::encode(cluster, &doc)).await.unwrap().is_some();
+                assert!(
+                    !present || listed.contains(&cluster),
+                    "round {round}: cluster {cluster} key orphaned (list {listed:?})"
+                );
+            }
+        }
+    }
+}
+
 // ── Queue race tests (R1–R3) ──────────────────────────────────────────────────
 //
 // The worker snapshots the whole queue at the start of a pass, then embeds each
@@ -972,7 +1106,7 @@ mod queue_race_tests {
 
     async fn dense_tag(db: &AsyncDb, doc: &[u8]) -> Option<f32> {
         let store = DbVectorStore::new(db, "docs").await.unwrap();
-        let raw = store.get_dense_entry(doc).await?;
+        let raw = store.get_dense_entry(doc).await.unwrap()?;
         let list = VectorIndex::access_list(&raw).unwrap();
         Some(list.iter().next().unwrap().addition_factor())
     }
@@ -1224,11 +1358,51 @@ mod queue_race_tests {
     async fn uncontended_embed_indexes_and_completes() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
+        db.namespace("docs".to_string())
+            .await
+            .unwrap()
+            .put(b"x".to_vec(), b"{}".to_vec())
+            .await
+            .unwrap();
         enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
         let in_flight = snapshot(&db, b"x").await;
         finish_embed(&db, &in_flight, &vectors_for(2.0)).await.unwrap();
         assert_eq!(dense_tag(&db, b"x").await, Some(2.0));
         assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+    }
+
+    /// Vectors for a document that no longer exists must not survive. An entry
+    /// written from a snapshot (reconciliation) can land after the delete's
+    /// `Clear` tombstone was already processed, so nothing else would remove them.
+    #[tokio::test]
+    async fn embedding_a_deleted_document_leaves_no_vectors() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await; // "docs" exists, but no document "gone" in it
+        enqueue_embed(&db, "docs", b"gone", "stale text").await.unwrap();
+        let in_flight = snapshot(&db, b"gone").await;
+        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
+        assert_eq!(dense_tag(&db, b"gone").await, None, "vectors of a deleted document were kept");
+        assert!(!has_any_vector_state(&db, "docs", b"gone").await.unwrap(), "no vector state may remain");
+    }
+
+    /// Reconciliation enqueues from a snapshot, so it must never overwrite what a
+    /// live write queued since: newer text, or a delete's `Clear` tombstone (which
+    /// would re-index a deleted document).
+    #[tokio::test]
+    async fn enqueue_if_absent_never_overwrites_a_newer_entry_or_a_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+
+        enqueue_embed(&db, "docs", b"a", "newer text").await.unwrap();
+        assert!(!enqueue_embed_if_absent(&db, "docs", b"a", "snapshot text").await.unwrap());
+        assert_eq!(snapshot(&db, b"a").await.text, "newer text");
+
+        clear_vectors(&db, "docs", b"b").await.unwrap(); // a delete's tombstone
+        assert!(!enqueue_embed_if_absent(&db, "docs", b"b", "snapshot text").await.unwrap());
+        assert_eq!(snapshot(&db, b"b").await.kind, QueueEntryKind::Clear);
+
+        assert!(enqueue_embed_if_absent(&db, "docs", b"c", "text").await.unwrap(), "absent: enqueue");
+        assert_eq!(snapshot(&db, b"c").await.text, "text");
     }
 }
 
@@ -1277,7 +1451,7 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        let entries = store.scan_sparse_cluster(1).await;
+        let entries = store.scan_sparse_cluster(1).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, doc_id);
     }
@@ -1294,7 +1468,7 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        let bytes = store.get_dense_entry(doc_id).await.unwrap();
+        let bytes = store.get_dense_entry(doc_id).await.unwrap().unwrap();
         let vis = VectorIndex::list_from_bytes(&bytes).unwrap();
         assert_eq!(vis.len(), 1);
 
@@ -1320,7 +1494,7 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &chunks).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        let bytes = store.get_dense_entry(doc_id).await.unwrap();
+        let bytes = store.get_dense_entry(doc_id).await.unwrap().unwrap();
 
         let (score, error_bound) = score_rkyv_bytes(&bytes, &[], &zero_estimator()).unwrap();
         assert!((score - 0.9).abs() < 1e-6, "SimMax should pick 0.9, got {score}");
@@ -1337,7 +1511,7 @@ mod vector_upsert_tests {
 
         // An empty list must write nothing to either vector namespace.
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert!(store.get_dense_entry(b"doc4").await.is_none(), "empty list must write nothing");
+        assert!(store.get_dense_entry(b"doc4").await.unwrap().is_none(), "empty list must write nothing");
     }
 
     // Cluster reassignment for SingleBit deletes the stale sparse composite key.
@@ -1352,14 +1526,18 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi1]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 1);
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 0);
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1);
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 0);
 
         let vi2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.02, vec![]);
         upsert_vectors(&db, ns, doc_id, &[vi2]).await.unwrap();
 
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 0, "stale cluster-1 key must be deleted");
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 1, "new cluster-2 key must exist");
+        assert_eq!(
+            store.scan_sparse_cluster(1).await.unwrap().len(),
+            0,
+            "stale cluster-1 key must be deleted"
+        );
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 1, "new cluster-2 key must exist");
     }
 
     // ── Sparse-meta encoding round-trip ──────────────────────────────────────
@@ -1486,13 +1664,13 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi_sb, vi_mb]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert_eq!(store.scan_sparse_cluster(5).await.len(), 1, "sparse must exist before delete");
-        assert!(store.get_dense_entry(doc_id).await.is_some(), "dense must exist before delete");
+        assert_eq!(store.scan_sparse_cluster(5).await.unwrap().len(), 1, "sparse must exist before delete");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_some(), "dense must exist before delete");
 
         delete_vector(&db, ns, doc_id).await.unwrap();
 
-        assert_eq!(store.scan_sparse_cluster(5).await.len(), 0, "sparse must be gone after delete");
-        assert!(store.get_dense_entry(doc_id).await.is_none(), "dense must be gone after delete");
+        assert_eq!(store.scan_sparse_cluster(5).await.unwrap().len(), 0, "sparse must be gone after delete");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_none(), "dense must be gone after delete");
 
         // Second delete is a no-op (meta is gone).
         delete_vector(&db, ns, doc_id).await.unwrap();
@@ -1520,8 +1698,8 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert!(store.get_dense_entry(doc_id).await.is_some(), "dense entry must exist");
-        assert!(store.scan_sparse_cluster(3).await.is_empty(), "no sparse entry must be written");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_some(), "dense entry must exist");
+        assert!(store.scan_sparse_cluster(3).await.unwrap().is_empty(), "no sparse entry must be written");
 
         // Sparse meta must also be absent.
         let meta_ns = db.namespace(sparse_vectors_meta_ns(ns)).await.unwrap();
@@ -1540,8 +1718,8 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert_eq!(store.scan_sparse_cluster(7).await.len(), 1, "sparse entry must exist");
-        assert!(store.get_dense_entry(doc_id).await.is_none(), "no dense entry must be written");
+        assert_eq!(store.scan_sparse_cluster(7).await.unwrap().len(), 1, "sparse entry must exist");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_none(), "no dense entry must be written");
     }
 
     // ── delete_vector with multiple sparse clusters ───────────────────────────
@@ -1559,13 +1737,13 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, &[vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 1);
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 1);
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1);
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 1);
 
         delete_vector(&db, ns, doc_id).await.unwrap();
 
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 0, "cluster-1 must be deleted");
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 0, "cluster-2 must be deleted");
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 0, "cluster-1 must be deleted");
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 0, "cluster-2 must be deleted");
     }
 }
 
@@ -1919,17 +2097,17 @@ mod dual_style_tests {
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
 
-        let dense = store.get_dense_entry(doc_id).await;
+        let dense = store.get_dense_entry(doc_id).await.unwrap();
         assert!(dense.is_some(), "MultiBit entry must be in dense namespace");
         let vis = VectorIndex::list_from_bytes(&dense.unwrap()).unwrap();
         assert_eq!(vis.len(), 1);
         assert!((vis[0].addition_factor - 0.3).abs() < 1e-6);
 
-        let sb1 = store.scan_sparse_cluster(1).await;
+        let sb1 = store.scan_sparse_cluster(1).await.unwrap();
         assert_eq!(sb1.len(), 1, "SingleBit cluster 1: exactly 1 entry");
         assert_eq!(sb1[0].0, doc_id);
 
-        let sb2 = store.scan_sparse_cluster(2).await;
+        let sb2 = store.scan_sparse_cluster(2).await.unwrap();
         assert_eq!(sb2.len(), 1, "SingleBit cluster 2: exactly 1 entry");
         assert_eq!(sb2[0].0, doc_id);
     }
@@ -1949,15 +2127,15 @@ mod dual_style_tests {
         upsert_vectors(&db, ns, doc_id, &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert!(store.get_dense_entry(doc_id).await.is_some(), "MB entry exists before delete");
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 1, "SB cluster-1 exists before delete");
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 1, "SB cluster-2 exists before delete");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_some(), "MB entry exists before delete");
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1, "SB cluster-1 exists before delete");
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 1, "SB cluster-2 exists before delete");
 
         delete_vector(&db, ns, doc_id).await.unwrap();
 
-        assert!(store.get_dense_entry(doc_id).await.is_none(), "MB entry must be deleted");
-        assert!(store.scan_sparse_cluster(1).await.is_empty(), "SB cluster-1 must be deleted");
-        assert!(store.scan_sparse_cluster(2).await.is_empty(), "SB cluster-2 must be deleted");
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_none(), "MB entry must be deleted");
+        assert!(store.scan_sparse_cluster(1).await.unwrap().is_empty(), "SB cluster-1 must be deleted");
+        assert!(store.scan_sparse_cluster(2).await.unwrap().is_empty(), "SB cluster-2 must be deleted");
 
         // Second delete is a no-op (sparse meta is gone).
         delete_vector(&db, ns, doc_id).await.unwrap();
@@ -1979,8 +2157,8 @@ mod dual_style_tests {
         upsert_vectors(&db, ns, doc_id, &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert!(store.get_dense_entry(doc_id).await.is_some());
-        assert_eq!(store.scan_sparse_cluster(2).await.len(), 1);
+        assert!(store.get_dense_entry(doc_id).await.unwrap().is_some());
+        assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 1);
 
         // Second write: MB updated (overwrites dense), SB now in cluster 3 only (cluster 2 stale).
         let vi_mb2 = VectorIndex::new(1, MULTI8, 0.25, 0.0, 0.01, vec![]);
@@ -1988,13 +2166,13 @@ mod dual_style_tests {
 
         upsert_vectors(&db, ns, doc_id, &[vi_mb2, vi_sb3]).await.unwrap();
 
-        let dense = store.get_dense_entry(doc_id).await.unwrap();
+        let dense = store.get_dense_entry(doc_id).await.unwrap().unwrap();
         let vis = VectorIndex::list_from_bytes(&dense).unwrap();
         assert!((vis[0].addition_factor - 0.25).abs() < 1e-6, "dense must have updated addition_factor");
 
-        assert!(store.scan_sparse_cluster(2).await.is_empty(), "stale SB cluster 2 removed");
-        assert_eq!(store.scan_sparse_cluster(3).await.len(), 1, "new SB cluster 3 present");
-        assert!(store.scan_sparse_cluster(1).await.is_empty(), "stale SB cluster 1 removed");
+        assert!(store.scan_sparse_cluster(2).await.unwrap().is_empty(), "stale SB cluster 2 removed");
+        assert_eq!(store.scan_sparse_cluster(3).await.unwrap().len(), 1, "new SB cluster 3 present");
+        assert!(store.scan_sparse_cluster(1).await.unwrap().is_empty(), "stale SB cluster 1 removed");
     }
 
     /// Multiple documents can share the same sparse cluster without interfering.
@@ -2013,18 +2191,18 @@ mod dual_style_tests {
         }
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
-        assert!(store.get_dense_entry(doc_a).await.is_some(), "doc_a dense entry exists");
-        assert!(store.get_dense_entry(doc_b).await.is_some(), "doc_b dense entry exists");
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 2, "both docs in SB cluster 1");
+        assert!(store.get_dense_entry(doc_a).await.unwrap().is_some(), "doc_a dense entry exists");
+        assert!(store.get_dense_entry(doc_b).await.unwrap().is_some(), "doc_b dense entry exists");
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 2, "both docs in SB cluster 1");
 
         // Delete doc_a; doc_b must still be present.
         delete_vector(&db, ns, doc_a).await.unwrap();
 
-        assert!(store.get_dense_entry(doc_a).await.is_none(), "doc_a dense entry deleted");
-        assert!(store.get_dense_entry(doc_b).await.is_some(), "doc_b dense entry preserved");
-        assert_eq!(store.scan_sparse_cluster(1).await.len(), 1, "only doc_b remains in SB cluster 1");
+        assert!(store.get_dense_entry(doc_a).await.unwrap().is_none(), "doc_a dense entry deleted");
+        assert!(store.get_dense_entry(doc_b).await.unwrap().is_some(), "doc_b dense entry preserved");
+        assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1, "only doc_b remains in SB cluster 1");
 
-        let sb_remaining = store.scan_sparse_cluster(1).await;
+        let sb_remaining = store.scan_sparse_cluster(1).await.unwrap();
         assert_eq!(sb_remaining[0].0, doc_b, "remaining sparse entry belongs to doc_b");
     }
 }
@@ -2343,7 +2521,13 @@ mod real_kv_profile {
             // Refuse to profile an empty index: a silent no-op upsert once made this
             // harness report microsecond "searches" over nothing.
             let all_clusters: Vec<u32> = cluster_map.keys().copied().collect();
-            let stored: usize = store.scan_sparse_clusters_batch(&all_clusters).await.values().map(Vec::len).sum();
+            let stored: usize = store
+                .scan_sparse_clusters_batch(&all_clusters)
+                .await
+                .unwrap()
+                .values()
+                .map(Vec::len)
+                .sum();
             assert!(stored > 0, "profile store is empty — upsert_vectors wrote nothing");
 
             // Pass-2 fetch set is n_probes-independent: first_pass top_k doc ids (bounded by N_DOCS).
@@ -2376,9 +2560,11 @@ mod real_kv_profile {
 
                 // Warm the OS page cache / mmap so we measure steady-state, not first-touch.
                 for _ in 0..3 {
-                    let _ = store.scan_sparse_clusters_batch(&probe_clusters).await;
-                    let _ = store.get_dense_entries_batch(&dense_ids).await;
-                    let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                    let _ = store.scan_sparse_clusters_batch(&probe_clusters).await.unwrap();
+                    let _ = store.get_dense_entries_batch(&dense_ids).await.unwrap();
+                    let _ = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None)
+                        .await
+                        .unwrap();
                 }
 
                 let mut coarse = Vec::with_capacity(ITERS);
@@ -2402,16 +2588,18 @@ mod real_kv_profile {
                     coarse.push(t.elapsed().as_nanos() as f64 / 1e3);
 
                     let t = Instant::now();
-                    let scanned = store.scan_sparse_clusters_batch(&pc).await;
+                    let scanned = store.scan_sparse_clusters_batch(&pc).await.unwrap();
                     scan.push(t.elapsed().as_nanos() as f64 / 1e3);
                     scanned_entries = scanned.values().map(|v| v.len()).sum();
 
                     let t = Instant::now();
-                    let _ = store.get_dense_entries_batch(&dense_ids).await;
+                    let _ = store.get_dense_entries_batch(&dense_ids).await.unwrap();
                     dense.push(t.elapsed().as_nanos() as f64 / 1e3);
 
                     let t = Instant::now();
-                    let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None).await;
+                    let results = search(&config, ns, &index, &sparse_query, &dense_query, &store, no_filter, None)
+                        .await
+                        .unwrap();
                     total.push(t.elapsed().as_nanos() as f64 / 1e3);
                     result_len = results.len();
                 }
@@ -2661,7 +2849,9 @@ mod real_recall {
             let mut lat_us = Vec::with_capacity(q_embs.len());
             for qe in q_embs {
                 let t = Instant::now();
-                let r = search(config, NS, index, &qe.sparse, &qe.dense, store, no_filter, Some(SEARCH_TOPK)).await;
+                let r = search(config, NS, index, &qe.sparse, &qe.dense, store, no_filter, Some(SEARCH_TOPK))
+                    .await
+                    .unwrap();
                 lat_us.push(t.elapsed().as_nanos() as f64 / 1e3);
                 ranked.push(r.into_iter().map(|q| q.document_id).collect());
             }

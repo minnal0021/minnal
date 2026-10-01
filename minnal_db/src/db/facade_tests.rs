@@ -342,6 +342,82 @@ mod tests {
         Ok(())
     }
 
+    /// `get_typed` must validate what it reads: the bytes under a key need not
+    /// be an archive of the requested type. It used unchecked access, so reading
+    /// raw or differently-typed bytes followed archived pointers out of bounds —
+    /// undefined behaviour from a safe function. Now it is an error.
+    /// The sync `Namespace` offers the same operations as `AsyncNamespace`
+    /// (it lacked the no-WAL writes, `get_multiple` and `scan_prefixes_batch`).
+    #[test]
+    fn sync_namespace_mirrors_the_async_batch_and_no_wal_operations() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let ns = db.namespace("mirror")?;
+        let key = |prefix: u32, n: u8| {
+            let mut k = prefix.to_be_bytes().to_vec();
+            k.push(n);
+            k
+        };
+        ns.put_no_wal(&key(7, 1), b"a")?;
+        ns.put(&key(7, 2), b"b")?;
+        ns.put(&key(9, 1), b"c")?;
+        assert_eq!(
+            ns.get_multiple(&[key(7, 1), key(8, 1), key(7, 1)])?,
+            vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
+        );
+        let by_prefix = ns.scan_prefixes_batch(&[7, 8])?;
+        assert_eq!(by_prefix.get(&7).map(Vec::len), Some(2));
+        assert!(!by_prefix.contains_key(&9) && by_prefix.get(&8).is_none_or(Vec::is_empty));
+        ns.delete_no_wal(&key(7, 1))?;
+        assert_eq!(ns.get(&key(7, 1))?, None);
+        db.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_typed_rejects_bytes_that_are_not_an_archive_of_that_type() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+
+        // Too short to hold a `Tally`: unchecked access read past the buffer.
+        let short_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"short".to_string()).unwrap().to_vec();
+        db.put(&short_key, &[0x01, 0x02, 0x03])?;
+        assert!(matches!(
+            db.get_typed::<String, Tally>(&"short".to_string()),
+            Err(KVError::Serialization(_))
+        ));
+
+        // A real `Tally` archive whose out-of-line label bytes are corrupted into
+        // invalid UTF-8: unchecked access handed back an invalid `String`.
+        let long_label = Tally {
+            count: 1,
+            label: "a label long enough to be stored out of line".to_string(),
+        };
+        let mut bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&long_label).unwrap().to_vec();
+        let at = bytes.windows(7).position(|w| w == b"a label").expect("label bytes in the archive");
+        bytes[at] = 0xFF;
+        let corrupt_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"corrupt".to_string()).unwrap().to_vec();
+        db.put(&corrupt_key, &bytes)?;
+        assert!(matches!(
+            db.get_typed::<String, Tally>(&"corrupt".to_string()),
+            Err(KVError::Serialization(_))
+        ));
+
+        // A value stored as one type, read back as another.
+        db.put_typed(&"n".to_string(), &7u8)?;
+        assert!(matches!(db.get_typed::<String, Tally>(&"n".to_string()), Err(KVError::Serialization(_))));
+
+        // A correctly typed value still round-trips.
+        let tally = Tally {
+            count: 3,
+            label: "ok".to_string(),
+        };
+        db.put_typed(&"t".to_string(), &tally)?;
+        assert_eq!(db.get_typed::<String, Tally>(&"t".to_string())?, Some(tally));
+        db.shutdown()?;
+        Ok(())
+    }
+
     #[test]
     fn merge_typed_accumulates_a_typed_value() -> Result<()> {
         let temp_dir = TempDir::new()?;

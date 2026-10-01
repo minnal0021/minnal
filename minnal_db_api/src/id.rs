@@ -55,11 +55,9 @@ pub fn check_reserved_key(raw: &str, reserved: &[&str]) -> Result<(), AppError> 
 ///   `acme%20corp` arrives here as `acme corp`.
 pub fn parse_doc_id(s: &str, key_type: KeyType) -> Result<DocId, AppError> {
     match key_type {
-        KeyType::Uuid => {
-            let hex = s.replace('-', "");
-            let v = u128::from_str_radix(&hex, 16).map_err(|_| DocStoreError::InvalidId(format!("invalid UUID: '{s}'")))?;
-            Ok(DocId::Uuid(v))
-        }
+        KeyType::Uuid => Ok(DocId::Uuid(
+            parse_uuid(s).ok_or_else(|| DocStoreError::InvalidId(format!("invalid UUID: '{s}'")))?,
+        )),
         KeyType::U64 => {
             let v = s.parse::<u64>().map_err(|_| DocStoreError::InvalidId(format!("invalid u64 id: '{s}'")))?;
             Ok(DocId::U64(v))
@@ -77,6 +75,19 @@ pub fn parse_doc_id(s: &str, key_type: KeyType) -> Result<DocId, AppError> {
     }
 }
 
+/// Parse a UUID in its canonical form (`8-4-4-4-12` hex digits) or as 32 plain
+/// hex digits. Stripping every `-` and parsing the rest as a number accepted
+/// `1`, `1-2-3` and `+ff…`, and let non-canonical spellings alias one document.
+fn parse_uuid(s: &str) -> Option<u128> {
+    let hex: String = match s.len() {
+        32 => s.to_owned(),
+        36 if s.char_indices().all(|(i, c)| (c == '-') == matches!(i, 8 | 13 | 18 | 23)) => s.replace('-', ""),
+        _ => return None,
+    };
+    let bytes: [u8; 16] = minnal_db::doc_store::hex::hex_to_bytes(&hex)?.try_into().ok()?;
+    Some(u128::from_be_bytes(bytes))
+}
+
 fn format_uuid(v: u128) -> String {
     let b = v.to_be_bytes();
     format!(
@@ -89,6 +100,27 @@ fn format_uuid(v: u128) -> String {
 mod tests {
     use super::*;
     use minnal_db::{MAX_STR_KEY_LEN, SchemaError};
+
+    /// Canonical and plain 32-digit UUIDs parse to the same id; anything else is
+    /// rejected. Stripping all hyphens and parsing a number accepted `1`, `1-2-3`
+    /// and a leading `+`.
+    #[test]
+    fn uuid_ids_must_be_canonical_or_32_hex_digits() {
+        let want = DocId::Uuid(0x550e8400_e29b_41d4_a716_446655440000);
+        assert_eq!(parse_doc_id("550e8400-e29b-41d4-a716-446655440000", KeyType::Uuid).unwrap(), want);
+        assert_eq!(parse_doc_id("550e8400e29b41d4a716446655440000", KeyType::Uuid).unwrap(), want);
+        assert_eq!(parse_doc_id("550E8400-E29B-41D4-A716-446655440000", KeyType::Uuid).unwrap(), want);
+        for bad in [
+            "1",
+            "1-2-3",
+            "+50e8400e29b41d4a716446655440000",
+            "550e8400-e29b41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-44665544000é",
+            "",
+        ] {
+            assert!(parse_doc_id(bad, KeyType::Uuid).is_err(), "'{bad}' must be rejected");
+        }
+    }
 
     #[test]
     fn str_ids_round_trip_through_the_url_form() {

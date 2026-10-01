@@ -320,20 +320,20 @@ struct BenchKvStore {
 }
 
 impl VectorKvStore for BenchKvStore {
-    async fn scan_sparse_cluster(&self, cluster_id: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.sparse_data.get(&cluster_id).cloned().unwrap_or_default()
+    async fn scan_sparse_cluster(&self, cluster_id: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, minnal_db::KVError> {
+        Ok(self.sparse_data.get(&cluster_id).cloned().unwrap_or_default())
     }
-    async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Option<Vec<u8>> {
-        self.dense_data.get(doc_id_bytes).cloned()
+    async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, minnal_db::KVError> {
+        Ok(self.dense_data.get(doc_id_bytes).cloned())
     }
-    async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-        doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect()
+    async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, minnal_db::KVError> {
+        Ok(doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect())
     }
-    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> ClusterBatchResult {
-        cluster_ids
+    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<ClusterBatchResult, minnal_db::KVError> {
+        Ok(cluster_ids
             .iter()
             .filter_map(|id| self.sparse_data.get(id).map(|e| (*id, e.clone())))
-            .collect()
+            .collect())
     }
 }
 

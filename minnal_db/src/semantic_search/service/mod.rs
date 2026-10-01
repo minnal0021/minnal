@@ -329,13 +329,13 @@ pub async fn search<K, F>(
     kv_store: &K,
     doc_filter: Option<F>,
     top_k: Option<usize>,
-) -> Vec<QueryResult>
+) -> Result<Vec<QueryResult>, crate::KVError>
 where
     K: VectorKvStore,
     F: Fn(&[u8]) -> bool + Sync,
 {
     if query_sparse_embeddings.is_empty() || query_dense_embedding.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     // Validate the query dimension once at the search-setup boundary. Every query
@@ -346,7 +346,7 @@ where
     let expected_dim = cluster_index.dim();
     if query_dense_embedding.len() != expected_dim || query_sparse_embeddings.iter().any(|q| q.len() != expected_dim) {
         warn!("semantic search query embedding dimension does not match centroid dimension {expected_dim}; returning no results");
-        return vec![];
+        return Ok(vec![]);
     }
 
     let top_k_limit = top_k.unwrap_or(config.top_k_results);
@@ -374,7 +374,7 @@ where
 
     // Fetch all probed clusters in a single batch operation: one blocking task, which
     // spawns a scoped thread per overlapping L1 bucket and then one per value-log bucket.
-    let sparse_by_cluster = kv_store.scan_sparse_clusters_batch(&probe_clusters).await;
+    let sparse_by_cluster = kv_store.scan_sparse_clusters_batch(&probe_clusters).await?;
 
     // Everything from here to the dense fetch is CPU work, mostly on the rayon pool.
     // No `.await` happens while a permit is held.
@@ -519,7 +519,7 @@ where
     debug!("ANN search: {} sparse candidates after pass 1", sparse_ranked.len());
 
     if sparse_ranked.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     // ── Pass 2: dense multi-bit re-ranking ───────────────────────────────────
@@ -537,7 +537,7 @@ where
     drop(pass1_permit);
     tokio::task::spawn_blocking(move || drop(sparse_by_cluster));
 
-    let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await;
+    let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await?;
 
     debug!("ANN search: dense pass over {} candidates", dense_doc_ids.len());
 
@@ -638,14 +638,15 @@ where
 
     debug!("ANN search: returning top {} results", heap.len());
 
-    heap.into_sorted_vec()
+    Ok(heap
+        .into_sorted_vec()
         .into_iter()
         .map(|Reverse(e)| QueryResult {
             document_id: e.document_id,
             dot_product: e.dot_product,
             error_bound: e.error_bound,
         })
-        .collect()
+        .collect())
 }
 
 /// Fixed payload sent to both embedding endpoints at startup to validate the
@@ -724,7 +725,7 @@ pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::index::vector_index::ClusterBatchResult;
+    use crate::semantic_search::index::vector_index::{ClusterBatchResult, ClusterEntries};
 
     #[test]
     fn test_default_config() {
@@ -1160,17 +1161,20 @@ mod tests {
 
     struct EmptyKvStore;
     impl VectorKvStore for EmptyKvStore {
-        async fn scan_sparse_cluster(&self, _cluster_id: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-            vec![]
+        async fn scan_sparse_cluster(&self, _cluster_id: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KVError> {
+            Ok(vec![])
         }
-        async fn get_dense_entry(&self, _doc_id_bytes: &[u8]) -> Option<Vec<u8>> {
-            None
+        async fn get_dense_entry(&self, _doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, crate::KVError> {
+            Ok(None)
         }
-        async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-            vec![None; doc_ids.len()]
+        async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
+            Ok(vec![None; doc_ids.len()])
         }
-        async fn scan_sparse_clusters_batch(&self, _cluster_ids: &[u32]) -> std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>> {
-            std::collections::HashMap::new()
+        async fn scan_sparse_clusters_batch(
+            &self,
+            _cluster_ids: &[u32],
+        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
+            Ok(std::collections::HashMap::new())
         }
     }
 
@@ -1188,7 +1192,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1217,7 +1222,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(results.is_empty(), "mismatched query dimension must yield no results, not a panic");
     }
 
@@ -1239,7 +1245,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1333,20 +1340,23 @@ mod tests {
     }
 
     impl VectorKvStore for MockVectorKvStore {
-        async fn scan_sparse_cluster(&self, cluster_id: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-            self.sparse_data.get(&cluster_id).cloned().unwrap_or_default()
+        async fn scan_sparse_cluster(&self, cluster_id: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KVError> {
+            Ok(self.sparse_data.get(&cluster_id).cloned().unwrap_or_default())
         }
-        async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Option<Vec<u8>> {
-            self.dense_data.get(doc_id_bytes).cloned()
+        async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, crate::KVError> {
+            Ok(self.dense_data.get(doc_id_bytes).cloned())
         }
-        async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
-            doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect()
+        async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
+            Ok(doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect())
         }
-        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>> {
-            cluster_ids
+        async fn scan_sparse_clusters_batch(
+            &self,
+            cluster_ids: &[u32],
+        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
+            Ok(cluster_ids
                 .iter()
                 .filter_map(|id| self.sparse_data.get(id).map(|entries| (*id, entries.clone())))
-                .collect()
+                .collect())
         }
     }
 
@@ -1357,6 +1367,70 @@ mod tests {
             .map(|&(id, c)| (id, crate::semantic_search::cluster::Cluster::new(id, c.to_vec())))
             .collect();
         crate::semantic_search::cluster::ClusterIndex::from_clusters(clusters)
+    }
+
+    /// Wraps the mock and fails either its sparse cluster scan (pass 1) or its
+    /// dense fetch (pass 2).
+    struct FailingKvStore {
+        inner: MockVectorKvStore,
+        fail_sparse: bool,
+    }
+
+    impl VectorKvStore for FailingKvStore {
+        async fn scan_sparse_cluster(&self, cluster_id: u32) -> Result<ClusterEntries, crate::KVError> {
+            self.inner.scan_sparse_cluster(cluster_id).await
+        }
+        async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, crate::KVError> {
+            self.inner.get_dense_entry(doc_id_bytes).await
+        }
+        async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
+            if self.fail_sparse {
+                self.inner.get_dense_entries_batch(doc_ids).await
+            } else {
+                Err(crate::KVError::Io(std::io::Error::other("dense read failed")))
+            }
+        }
+        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<ClusterBatchResult, crate::KVError> {
+            if self.fail_sparse {
+                Err(crate::KVError::Io(std::io::Error::other("sparse scan failed")))
+            } else {
+                self.inner.scan_sparse_clusters_batch(cluster_ids).await
+            }
+        }
+    }
+
+    /// A storage failure in either pass must reach the caller. The store's batch
+    /// reads used to turn errors into an empty map or `None`s, so a failed search
+    /// returned fewer (or no) results as if nothing had matched.
+    #[tokio::test]
+    async fn test_search_surfaces_storage_errors_from_either_pass() {
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let config = SemanticSearchConfig {
+            n_probes: 1,
+            ..Default::default()
+        };
+        for fail_sparse in [true, false] {
+            let mut inner = MockVectorKvStore::new();
+            inner.add_sparse_entry(1, b"doc", 0.0);
+            inner.add_dense_entry(1, b"doc", 0.1);
+            let store = FailingKvStore { inner, fail_sparse };
+            let q = vec![1.0f32, 0.0, 0.0, 0.0];
+            let result = search(
+                &config,
+                "test_ns",
+                &cluster_index,
+                std::slice::from_ref(&q),
+                &q,
+                &store,
+                None::<fn(&[u8]) -> bool>,
+                None,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "fail_sparse={fail_sparse}: a storage error must not look like an empty result"
+            );
+        }
     }
 
     /// Documents excluded by the filter must not appear in results.
@@ -1383,7 +1457,8 @@ mod tests {
             Some(|_: &[u8]| false),
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(results.is_empty(), "filtered doc must not appear in results");
     }
 
@@ -1421,7 +1496,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         let after = crate::semantic_search::metrics::snapshot(ns);
 
         // The corrupt sparse and corrupt dense skips each bumped their counter.
@@ -1468,7 +1544,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
         assert!(ids.contains(&b"doc_ok".as_slice()), "valid SingleBit doc must be returned, got {ids:?}");
@@ -1510,7 +1587,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
         assert!(ids.contains(&b"doc_ok".as_slice()), "MultiBit{{8}} doc must be returned, got {ids:?}");
@@ -1551,7 +1629,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
         assert!(
@@ -1591,7 +1670,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].document_id, b"doc_high");
@@ -1627,7 +1707,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let ids: Vec<&Vec<u8>> = results.iter().map(|r| &r.document_id).collect();
         assert!(ids.contains(&&b"doc_a".to_vec()), "doc_a must be found via cluster 1 probe");
@@ -1659,7 +1740,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(results.is_empty(), "doc with no dense entry must be skipped");
     }
@@ -1696,7 +1778,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(
@@ -1735,7 +1818,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 2, "must return at most top_k_results items");
     }
@@ -1768,7 +1852,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             Some(1), // override: return only 1
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1, "top_k override of 1 must cap results at 1");
     }
@@ -1846,7 +1931,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1, "only the sparse winner should reach the dense pass");
         assert_eq!(
@@ -1907,7 +1993,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         // MaxSim(doc_a) = 2.0 > MaxSim(doc_b) = 1.0, so only doc_a passes.
         assert_eq!(results.len(), 1, "only the MaxSim winner should reach the dense pass");
@@ -1948,7 +2035,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].document_id, b"doc_high");
@@ -2018,7 +2106,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         // doc_multi: max(0.8, 0.2) = 0.8.  doc_solo: 0.5.  doc_multi wins.
         // (If inner aggregation were sum, doc_multi would score 0.8+0.2=1.0, but the
@@ -2083,7 +2172,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1, "one merged candidate per document, cut to top 1");
         assert_eq!(
@@ -2134,7 +2224,8 @@ mod tests {
             None::<fn(&[u8]) -> bool>,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         // Both pass sparse (top_k=2) and both have dense entries.
         // Final ordering is by dense score (equal), so both appear.
@@ -2156,6 +2247,7 @@ mod tests {
             None,
         )
         .await
+        .unwrap()
         .into_iter()
         .map(|r| (r.document_id, r.dot_product))
         .collect()

@@ -99,7 +99,7 @@ impl DocStore {
             None::<fn(&[u8]) -> bool>,
             top_k,
         )
-        .await;
+        .await?;
 
         debug!("semantic search namespace='{}' returned {} results", namespace, all.len());
         Ok(Page::from_vec(all, pagination))
@@ -168,7 +168,7 @@ impl DocStore {
             Some(move |id: &[u8]| allowed_ids.contains(id)),
             top_k,
         )
-        .await;
+        .await?;
 
         Ok(Page::from_vec(all, pagination).with_degraded_fields(degraded_fields))
     }
@@ -192,7 +192,7 @@ impl DocStore {
 
         let start_bytes = start.to_bytes();
         let end_bytes = end.map(|e| e.to_bytes());
-        let scan_start = cursor.unwrap_or(start_bytes);
+        let scan_start = clamp_cursor(cursor, start_bytes);
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
         let results = pairs
@@ -229,7 +229,7 @@ impl DocStore {
     ) -> Result<CursorPage<(DocId, serde_json::Value)>, DocStoreError> {
         let schema = self.load_schema(namespace)?;
         let end_bytes = prefix_upper_bound(&prefix);
-        let scan_start = cursor.unwrap_or(prefix);
+        let scan_start = clamp_cursor(cursor, prefix);
         let ns = self.db.namespace(namespace.to_owned()).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
@@ -297,7 +297,7 @@ impl DocStore {
 
         let page_keys = outcome.keys;
         let ns = self.db.namespace(namespace.to_owned()).await?;
-        let values = ns.get_multiple(page_keys.clone()).await;
+        let values = ns.get_multiple(page_keys.clone()).await?;
         let mut results = Vec::with_capacity(page_keys.len());
         for (key_bytes, value_opt) in page_keys.into_iter().zip(values) {
             if let Some(bytes) = value_opt {

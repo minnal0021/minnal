@@ -70,7 +70,7 @@ impl Database {
                 let mut reindexed = 0usize;
                 let mut absent = 0usize;
                 for key in &decoded {
-                    match store.reindex_field(field_id, key)? {
+                    match self.reindex_key(&store, namespace_id, field_id, key)? {
                         FieldReindexOutcome::Reindexed => reindexed += 1,
                         // The key has no current value. `reindex_field` has
                         // already cleared its row, which is the repair when it
@@ -90,16 +90,41 @@ impl Database {
                 }
             }
             RepairMode::FullRebuild => {
+                let deactivated = || KVError::Serialization(format!("Field {field_id} in namespace {namespace_id} was deactivated mid-repair"));
                 let keys = store.keys()?;
                 let scanned = keys.len();
                 for key in &keys {
-                    match store.reindex_field(field_id, key)? {
-                        FieldReindexOutcome::FieldNotActive => {
-                            return Err(KVError::Serialization(format!(
-                                "Field {field_id} in namespace {namespace_id} was deactivated mid-repair"
-                            )));
+                    if self.reindex_key(&store, namespace_id, field_id, key)? == FieldReindexOutcome::FieldNotActive {
+                        return Err(deactivated());
+                    }
+                }
+
+                // Walking live keys cannot clear a row whose key no longer
+                // exists — and a stale row of a deleted key is one of the ways an
+                // index diverges (a lost delete). So also visit every row the
+                // index holds that no live key accounts for: `reindex_key` clears
+                // it if its key is still absent, or re-sets it if the key was
+                // written since the snapshot above.
+                let live_rows: std::collections::HashSet<u128> = keys.iter().filter_map(|k| store.resolve_row_id_get(k)).collect();
+                let mut orphan_rows = Vec::new();
+                {
+                    let ns_index = store.namespace_index.read();
+                    let entry = ns_index.get(field_id).ok_or_else(deactivated)?;
+                    entry
+                        .index
+                        .read()
+                        .for_each_bitmap(|bm| orphan_rows.extend(bm.iter().filter(|row| !live_rows.contains(row))));
+                }
+                orphan_rows.sort_unstable();
+                orphan_rows.dedup();
+                for row in orphan_rows {
+                    match store.key_for_row(row) {
+                        Some(key) => {
+                            if self.reindex_key(&store, namespace_id, field_id, &key)? == FieldReindexOutcome::FieldNotActive {
+                                return Err(deactivated());
+                            }
                         }
-                        _ => continue,
+                        None => warn!("[REPAIR] ns={namespace_id} field={field_id}: row {row} has no key to check; left as is"),
                     }
                 }
                 FieldRepairOutcome::FullRebuild { scanned }
@@ -304,6 +329,33 @@ mod tests {
     use crate::db::test_support::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// A full rebuild must also clear rows whose key no longer exists. Walking
+    /// live keys alone can only fix rows of keys that exist, so a stale row of a
+    /// deleted key (a lost delete) survived "full rebuild" and kept inflating
+    /// query totals.
+    #[test]
+    fn test_full_rebuild_clears_the_row_of_a_key_that_no_longer_exists() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+        db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
+        db.put(b"doc:2", br#"{"status":"active"}"#).unwrap();
+
+        // A delete the index never saw: straight into the LSM, past the write path.
+        db.get_store(ns).unwrap().lsm.delete_with_seq(b"doc:2", 1_000_000).unwrap();
+        assert!(db.get(b"doc:2").unwrap().is_none(), "setup: doc:2 is gone");
+        assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().total, 2, "setup: its row is stale");
+
+        record_test_gap(&db, ns, field_id);
+        db.repair_field_index(ns, field_id).unwrap();
+
+        let outcome = db.query_keys(ns, "status = \"active\"").unwrap();
+        assert_eq!(outcome.keys, vec![b"doc:1".to_vec()]);
+        assert_eq!(outcome.total, 1, "the deleted key's row must be gone, not just skipped");
+        db.shutdown().unwrap();
+    }
 
     /// FR-001 step 1: dropping a field index deletes its on-disk directory.
     ///

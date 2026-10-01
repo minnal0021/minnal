@@ -21,8 +21,12 @@ impl Pagination {
         }
     }
 
+    /// Items to skip to reach this page. Saturates: `page_no` comes straight from
+    /// the caller, and an absurd one (2^62 pages of 1,000) overflowed — a wrapped,
+    /// meaningless offset in release builds, a panic in debug. A saturated offset
+    /// is simply past the end, so the page is empty.
     pub fn offset(self) -> usize {
-        (self.page_no - 1) * self.page_size
+        (self.page_no - 1).saturating_mul(self.page_size)
     }
 }
 
@@ -137,5 +141,34 @@ mod cursor_tests {
     #[test]
     fn upper_bound_empty_is_open_ended() {
         assert_eq!(prefix_upper_bound(b""), None);
+    }
+}
+
+/// Where a cursor-paginated scan over `[start, …)` resumes: the caller's cursor,
+/// but never before `start`.
+///
+/// A cursor is opaque client input. One from a different query (another
+/// prefix), a stale one, or a hand-edited one used to be taken as-is, so the
+/// scan began below `start` and returned keys outside the requested range — for
+/// a prefix scan, keys that do not even have the prefix. The end bound was
+/// already enforced; this enforces the start.
+pub fn clamp_cursor(cursor: Option<Vec<u8>>, start: Vec<u8>) -> Vec<u8> {
+    match cursor {
+        Some(c) if c > start => c,
+        _ => start,
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    /// `page_no` is caller-supplied; an absurd one must give an empty page, not
+    /// an overflow (a panic in debug builds, a wrapped offset in release).
+    #[test]
+    fn a_huge_page_number_is_past_the_end_not_an_overflow() {
+        let p = Pagination::new(usize::MAX / 2, 1_000);
+        assert_eq!(p.offset(), usize::MAX);
+        assert!(Page::from_vec(vec![1, 2, 3], p).results.is_empty());
     }
 }

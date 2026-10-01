@@ -228,6 +228,18 @@ impl ShardedValueLog {
 
     // ── Durability & stats ────────────────────────────────────────────────
 
+    /// Bytes appended across all buckets that are not yet on stable storage.
+    #[cfg(test)]
+    pub fn unsynced_bytes(&self) -> u64 {
+        self.logs.iter().map(|log| log.unsynced_bytes()).sum()
+    }
+
+    /// Handles to every bucket's log, for syncing from outside the store (the
+    /// flush observer does, before WAL entries are marked persisted).
+    pub(crate) fn bucket_logs(&self) -> Vec<Arc<ValueLog>> {
+        self.logs.clone()
+    }
+
     pub fn sync_all(&self) -> Result<()> {
         for log in &self.logs {
             log.sync()?;

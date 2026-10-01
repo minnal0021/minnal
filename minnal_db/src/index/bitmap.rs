@@ -1209,3 +1209,182 @@ mod tests {
         assert_eq!(dense.cardinality(), sparse.cardinality());
     }
 }
+
+#[cfg(test)]
+mod differential_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    struct R(u64);
+    impl R {
+        fn n(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn b(&mut self, k: u64) -> u64 {
+            self.n() % k
+        }
+    }
+    fn make_set(r: &mut R) -> BTreeSet<u128> {
+        let highs = [0u128, 1, 2, 7, (u128::MAX >> 16) - 1, u128::MAX >> 16];
+        let mut s = BTreeSet::new();
+        for &h in &highs {
+            let base = h << 16;
+            match r.b(5) {
+                0 => {}
+                1 => {
+                    for _ in 0..r.b(300) {
+                        s.insert(base + r.b(65536) as u128);
+                    }
+                }
+                2 => {
+                    for _ in 0..(4200 + r.b(1500)) {
+                        s.insert(base + r.b(65536) as u128);
+                    }
+                }
+                3 => {
+                    for _ in 0..r.b(6) {
+                        let st = r.b(65536);
+                        let len = r.b(6000);
+                        for v in st..(st + len).min(65536) {
+                            s.insert(base + v as u128);
+                        }
+                    }
+                }
+                _ => {
+                    s.insert(base);
+                    s.insert(base + 65535);
+                    s.insert(base + 4095);
+                    s.insert(base + 4096);
+                }
+            }
+        }
+        s
+    }
+    fn bm(s: &BTreeSet<u128>, r: &mut R) -> RoaringBitmap {
+        let mut b = match r.b(3) {
+            0 => RoaringBitmap::from_sorted_iter(s.iter().copied()),
+            1 => RoaringBitmap::from_unsorted_iter(s.iter().rev().copied()),
+            _ => {
+                let mut b = RoaringBitmap::new();
+                for &v in s {
+                    b.insert(v);
+                }
+                b
+            }
+        };
+        if r.b(2) == 0 {
+            b.optimize();
+        }
+        b
+    }
+    fn same(b: &RoaringBitmap, s: &BTreeSet<u128>, what: &str) {
+        assert_eq!(b.len(), s.len(), "{what}: len");
+        let got: Vec<u128> = b.iter().collect();
+        let want: Vec<u128> = s.iter().copied().collect();
+        if got != want {
+            let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+            panic!(
+                "{what}: iter differs at {i}: got {:?} want {:?} (lens {} {})",
+                got.get(i),
+                want.get(i),
+                got.len(),
+                want.len()
+            );
+        }
+        assert_eq!(b.min(), s.first().copied(), "{what}: min");
+        assert_eq!(b.max(), s.last().copied(), "{what}: max");
+    }
+
+    /// Every operation must agree with a `BTreeSet<u128>` model, over random
+    /// sets shaped to hit each container kind (sparse array, dense bitset, long
+    /// runs, container-edge values) in blocks near both ends of the u128 space,
+    /// built three ways (sorted, unsorted, one insert at a time) and sometimes
+    /// `optimize`d.
+    #[test]
+    fn test_bitmap_matches_btreeset() {
+        let mut r = R(12345);
+        for case in 0..12 {
+            let (sa, sb) = (make_set(&mut r), make_set(&mut r));
+            let (a, b) = (bm(&sa, &mut r), bm(&sb, &mut r));
+            let c = format!("case {case}");
+            same(&a, &sa, &format!("{c} a"));
+            same(&a.and(&b), &sa.intersection(&sb).copied().collect(), &format!("{c} and"));
+            same(&a.or(&b), &sa.union(&sb).copied().collect(), &format!("{c} or"));
+            same(&a.and_not(&b), &sa.difference(&sb).copied().collect(), &format!("{c} and_not"));
+            let mut x = a.clone();
+            x.and_inplace(&b);
+            same(&x, &sa.intersection(&sb).copied().collect(), &format!("{c} and_inplace"));
+            let mut x = a.clone();
+            x.or_inplace(&b);
+            same(&x, &sa.union(&sb).copied().collect(), &format!("{c} or_inplace"));
+            let mut x = a.clone();
+            x.and_not_inplace(&b);
+            same(&x, &sa.difference(&sb).copied().collect(), &format!("{c} and_not_inplace"));
+            let rt = crate::index::storage::deserialize(&crate::index::storage::serialize(&a).unwrap()).unwrap();
+            same(&rt, &sa, &format!("{c} serde"));
+            let v: Vec<u128> = sa.iter().copied().collect();
+            for _ in 0..50 {
+                let probe = if !v.is_empty() && r.b(2) == 0 {
+                    v[r.b(v.len() as u64) as usize]
+                } else {
+                    ((r.b(8) as u128) << 16) + r.b(65536) as u128
+                };
+                assert_eq!(a.contains(probe), sa.contains(&probe), "{c} contains {probe}");
+                assert_eq!(a.rank(probe), sa.range(..=probe).count(), "{c} rank {probe}");
+            }
+            for _ in 0..20 {
+                let i = r.b(v.len() as u64 + 3) as usize;
+                assert_eq!(a.select(i), v.get(i).copied(), "{c} select {i}");
+            }
+            for _ in 0..20 {
+                let off = r.b(v.len() as u64 + 10) as usize;
+                let lim = r.b(5000) as usize;
+                let got: Vec<u128> = a.iter_page(off, lim).collect();
+                assert_eq!(
+                    got,
+                    v.iter().skip(off).take(lim).copied().collect::<Vec<_>>(),
+                    "{c} iter_page({off},{lim})"
+                );
+            }
+            for _ in 0..5 {
+                let lo = ((r.b(3) as u128) << 16) + r.b(65536) as u128;
+                let hi = lo + r.b(80_000) as u128;
+                let inr = |x: &&u128| **x >= lo && **x < hi;
+                same(
+                    &a.range_and(&b, lo, hi),
+                    &sa.intersection(&sb).filter(inr).copied().collect(),
+                    &format!("{c} range_and[{lo},{hi})"),
+                );
+                same(
+                    &a.range_or(&b, lo, hi),
+                    &sa.union(&sb).filter(inr).copied().collect(),
+                    &format!("{c} range_or[{lo},{hi})"),
+                );
+            }
+            let mut f = a.clone();
+            let mut sf = sa.clone();
+            let lo = ((r.b(3) as u128) << 16) + r.b(65536) as u128;
+            let hi = lo + r.b(20_000) as u128;
+            f.flip(lo, hi);
+            for x in lo..hi {
+                if !sf.remove(&x) {
+                    sf.insert(x);
+                }
+            }
+            same(&f, &sf, &format!("{c} flip[{lo},{hi})"));
+            let mut m = a.clone();
+            let mut sm = sa.clone();
+            for _ in 0..(v.len() / 2 + 5) {
+                let x = if !v.is_empty() { v[r.b(v.len() as u64) as usize] } else { 5 };
+                assert_eq!(m.remove(x), sm.remove(&x), "{c} remove ret");
+            }
+            same(&m, &sm, &format!("{c} after removes"));
+            for _ in 0..100 {
+                let x = ((r.b(8) as u128) << 16) + r.b(65536) as u128;
+                assert_eq!(m.insert(x), sm.insert(x), "{c} insert ret");
+            }
+            same(&m, &sm, &format!("{c} after inserts"));
+        }
+    }
+}

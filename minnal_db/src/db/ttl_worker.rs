@@ -241,4 +241,32 @@ mod tests {
 
         assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     }
+
+    // A TTL pass decides a record has expired, then deletes it. A write that lands
+    // in between replaced the expired record with a fresh one that was just
+    // acknowledged to its writer; the pass must leave it alone. It used to delete
+    // whatever the key held by then. `lock_key` runs exactly in that window (after
+    // the verdict, before the delete), so it is where this test lands the write.
+    #[test]
+    fn test_expiry_spares_a_value_rewritten_after_it_was_judged_expired() {
+        let dir = TempDir::new().unwrap();
+        let store = create_test_store(&dir);
+        store.put_to_storage(b"key1", b"stale").unwrap();
+        store.put_to_storage(b"key2", b"stale").unwrap();
+
+        let locked = std::sync::atomic::AtomicUsize::new(0);
+        let deleted = store
+            .expire_records_locked(Duration::from_millis(0), 1000, |key| {
+                locked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if key == b"key1" {
+                    store.put_to_storage(key, b"fresh").unwrap();
+                }
+            })
+            .unwrap();
+
+        assert_eq!(store.get(b"key1").unwrap(), Some(b"fresh".to_vec()), "a fresh write was expired");
+        assert_eq!(store.get(b"key2").unwrap(), None, "the untouched expired key must still go");
+        assert_eq!(deleted, 1, "only the untouched key counts as deleted");
+        assert_eq!(locked.into_inner(), 2, "every delete must run under the caller's key lock");
+    }
 }

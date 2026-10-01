@@ -1301,9 +1301,9 @@ impl Database {
     /// are safe but pointless: a read of this key returns the same pre-merge
     /// value the closure was already handed.
     ///
-    /// TTL expiry is the one writer outside the stripe: it deletes straight
-    /// through `KVStore`, so a merge racing an expiry can resurrect a key that
-    /// was about to expire. The next TTL pass expires it again.
+    /// TTL expiry takes the same stripe and deletes by compare-and-set, so a
+    /// merge that rewrites a key about to expire keeps its result; the next TTL
+    /// pass judges the new value on its own epoch.
     pub fn merge_ns<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
@@ -1730,6 +1730,19 @@ impl Database {
         let Ok(store) = self.get_store(namespace_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
         };
+        self.reindex_key(&store, namespace_id, field_id, key)
+    }
+
+    /// [`KVStore::reindex_field`] under `key`'s stripe — the only way anything
+    /// outside the write path should rewrite an index row.
+    ///
+    /// Reindexing reads the key's current value and then sets its row. A put to
+    /// the same key updates the index after its own apply, under the stripe, so
+    /// without the stripe the two interleave: reindex reads v1, the put applies v2
+    /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
+    /// disagrees with the store until something rewrites the key.
+    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        let _stripe = self.key_locks.guard(namespace_id, key);
         store.reindex_field(field_id, key)
     }
 
@@ -2928,7 +2941,15 @@ impl IndexCheckpointTarget for Database {
     }
 
     fn run_index_checkpoint(&self) -> Result<usize> {
-        let wal_tail = self.wal_metadata.read().tail;
+        // The offset this checkpoint claims the indices reflect. NOT the raw tail:
+        // a write registers as in flight when it appends to the WAL and stays so
+        // until its store apply *and index update* are done, so the tail can hold
+        // an entry the index has not seen. Recording that tail let a crash skip
+        // the entry at replay — the document stayed out of every field index,
+        // with no gap recorded (caught by the SIGKILL stress harness: 1–2 docs per
+        // crash). `wal_cut_ceiling` stops below the oldest in-flight write, so
+        // everything under it is applied before the flushes below run.
+        let wal_tail = self.wal_flush_observer.wal_cut_ceiling();
         let fields = self.registry.read().all_indexed_fields();
 
         // Flush mmap bitmap data for each active field index, and collect only
@@ -3149,7 +3170,9 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            match store.expire_records(ttl, max_deletes) {
+            // The key stripe keeps expiry out of every same-key write's
+            // seq-to-apply window (see `KVStore::expire_records_locked`).
+            match store.expire_records_locked(ttl, max_deletes, |key| self.key_locks.guard(ns_id, key)) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);
