@@ -42,7 +42,7 @@ impl From<DocStoreError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self.inner {
-            DocStoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            DocStoreError::NotFound { .. } | DocStoreError::IndexNotFound { .. } => StatusCode::NOT_FOUND,
 
             DocStoreError::AlreadyExists { .. }
             | DocStoreError::IndexAlreadyExists { .. }
@@ -130,6 +130,19 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json["error"].as_str().unwrap().to_owned())
+    }
+
+    /// A missing index is the caller's mistake, not a server fault: 404 with the
+    /// reason, matching the routes that already mapped it by hand.
+    #[tokio::test]
+    async fn index_not_found_is_a_404() {
+        let (status, msg) = render(DocStoreError::IndexNotFound {
+            namespace: "users".into(),
+            field: "nope".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(msg.contains("nope"), "got: {msg}");
     }
 
     /// A bad predicate is the caller's fault. Reporting it as 500 with the text
