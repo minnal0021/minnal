@@ -53,20 +53,17 @@ pub struct SemanticSearchConfig {
     /// Base URL of the embedding HTTP service, e.g. `http://192.168.1.155:8001`.
     pub embedding_service_url: String,
 
-    /// Identifies the *family* of embedding model this instance is configured
-    /// for, e.g. `"qwen"`.
+    /// The embedding model to request, e.g. `"gemma"` or `"qwen"`.
     ///
-    /// This is only an indication of the model family — minnal does not use it
-    /// to select or version a model at request time, and it is not sent to the
-    /// embedding service. Which concrete model (and version) actually produces
-    /// the embeddings is entirely the embedding service's concern: the model is
-    /// fixed server-side, and requests simply go to
-    /// `{embedding_service_url}/embedding/document` and `.../query` with no model
-    /// segment in the URL.
-    ///
-    /// Within minnal the name serves a single purpose: it selects which cluster
-    /// file and embedding dimension this instance uses, validated at startup
-    /// against `[[semantic_search.supported_models]]`.
+    /// Sent on every request as the `{model}` path segment —
+    /// `{embedding_service_url}/embedding/{model_name}/document` and
+    /// `.../query` — so it picks which of the service's loaded models embeds
+    /// the text; a model the service does not serve fails with a 404. It must
+    /// match the model the cluster centroids (`cluster_path`) were fitted on
+    /// and the model every stored vector was embedded with: vectors from
+    /// different models live in different spaces, so switching models means
+    /// re-indexing the corpus. The startup probe
+    /// ([`check_embedding_service`]) checks the service loads it.
     pub model_name: String,
 
     /// Dimensionality of the embedding vectors (e.g. 768).
@@ -174,6 +171,7 @@ pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &Clust
 
     let embeddings = embedding_service::embed(
         &config.embedding_service_url,
+        &config.model_name,
         EmbeddingTarget::Document,
         &payloads,
         config.embedding_dim,
@@ -213,6 +211,7 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
     let payloads = [text.to_string()];
     let mut embeddings = embedding_service::embed(
         &config.embedding_service_url,
+        &config.model_name,
         EmbeddingTarget::Query,
         &payloads,
         config.embedding_dim,
@@ -662,26 +661,32 @@ const PROBE_NORM_TOLERANCE: f32 = 0.05;
 /// expected contract.
 ///
 /// Intended to run once at startup, after the cluster index loads. It:
-/// 1. GETs `{url}/healthcheck`.
-/// 2. Embeds a known payload through **both** the document and query endpoints —
+/// 1. GETs `{url}/healthcheck` and checks the service lists `model_name` among
+///    its loaded models with status `ok`.
+/// 2. Embeds a known payload through **both** of that model's document and
+///    query endpoints —
 ///    the embed call rejects any returned vector whose
 ///    dimension is not `config.embedding_dim`, so a service configured for a
 ///    different dimension fails here at startup instead of silently degrading
 ///    search later, and both endpoints are confirmed to agree.
 /// 3. Soft-checks that the probe embedding is unit-norm and warns otherwise.
 ///
-/// **Limitation:** this cannot catch a *wrong model with the same dimension* — the
-/// service exposes no model/version metadata, so model pinning stays operational,
-/// not enforced (see `semantic_search/CLAUDE.md`). A clean-dimension probe passing
-/// is necessary but not sufficient for "the right model is loaded".
+/// **Limitation:** this checks that the service serves the *named* model, not
+/// that the cluster centroids were fitted on it — `model_name` and
+/// `cluster_path` are configured separately, and centroids from another model
+/// with the same dimension load without error (see `semantic_search/CLAUDE.md`).
 ///
 /// A failure is non-fatal at the call site (the server starts anyway and semantic
 /// search surfaces the error at request time); returning `Err` just makes startup
 /// log it loudly.
 pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<(), EmbeddingError> {
-    info!("checking embedding service health at {}/healthcheck", config.embedding_service_url);
+    info!(
+        "checking embedding service health at {}/healthcheck (model '{}')",
+        config.embedding_service_url, config.model_name
+    );
     embedding_service::check_health(
         &config.embedding_service_url,
+        &config.model_name,
         config.embedding_request_timeout,
         config.embedding_connect_timeout,
     )
@@ -695,6 +700,7 @@ pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<()
     for target in probe_targets {
         let embeddings = embedding_service::embed(
             &config.embedding_service_url,
+            &config.model_name,
             target,
             &probe,
             config.embedding_dim,
@@ -718,7 +724,10 @@ pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<()
         }
     }
 
-    info!("embedding service reachable; probe embedding validated (dim={})", config.embedding_dim);
+    info!(
+        "embedding service reachable; model '{}' probe embedding validated (dim={})",
+        config.model_name, config.embedding_dim
+    );
     Ok(())
 }
 
@@ -738,16 +747,27 @@ mod tests {
     // ── Startup probe (check_embedding_service) ──────────────────────────────
     //
     // A minimal mock embedding service backed by std::net::TcpListener (no extra
-    // deps): it answers every request 200 with one embedding of `dim` values whose
-    // L2 norm is `norm`. `Connection: close` makes each of the probe's requests
+    // deps). `GET /healthcheck` answers with `health` (200 when its `status` is
+    // "healthy", else 503); a POST to `/embedding/{model}/...` answers 200 with
+    // one embedding of `dim` values whose L2 norm is `norm` when `{model}` is in
+    // `models`, and 404 otherwise, like the real service. Every request line is
+    // recorded. `Connection: close` makes each of the probe's requests
     // (healthcheck GET, document POST, query POST) a fresh connection.
 
-    fn spawn_probe_server(dim: usize, norm: f32) -> String {
+    struct MockService {
+        url: String,
+        requests: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    fn spawn_service(dim: usize, norm: f32, models: &[&str], health: serde_json::Value) -> MockService {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let models: Vec<String> = models.iter().map(|m| m.to_string()).collect();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = match stream {
@@ -755,12 +775,27 @@ mod tests {
                     Err(_) => break,
                 };
                 let mut tmp = [0u8; 2048];
-                let _ = stream.read(&mut tmp); // consume the request head (tiny, one segment on localhost)
-                let val = norm / (dim as f32).sqrt(); // L2 norm of `dim` equal values = norm
-                let emb: Vec<f32> = vec![val; dim];
-                let body = serde_json::json!({ "embeddings": [emb] }).to_string();
+                let n = stream.read(&mut tmp).unwrap_or(0); // the request head (tiny, one segment on localhost)
+                let head = String::from_utf8_lossy(&tmp[..n]);
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                seen.lock().push(request_line);
+                let (status, body) = if path == "/healthcheck" {
+                    let ok = health["status"] == "healthy";
+                    (if ok { "200 OK" } else { "503 Service Unavailable" }, health.to_string())
+                } else {
+                    let model = path.split('/').nth(2).unwrap_or_default();
+                    if models.iter().any(|m| m == model) {
+                        let val = norm / (dim as f32).sqrt(); // L2 norm of `dim` equal values = norm
+                        let emb: Vec<f32> = vec![val; dim];
+                        ("200 OK", serde_json::json!({ "embeddings": [emb] }).to_string())
+                    } else {
+                        let detail = format!("Unknown model '{model}'; available: {}", models.join(", "));
+                        ("404 Not Found", serde_json::json!({ "detail": detail }).to_string())
+                    }
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body,
                 );
@@ -769,7 +804,21 @@ mod tests {
                 let _ = stream.read(&mut tmp); // drain any trailing request bytes → avoids RST before the client reads the response
             }
         });
-        format!("http://{addr}")
+        MockService {
+            url: format!("http://{addr}"),
+            requests,
+        }
+    }
+
+    /// A healthy service loading `models`, all ready.
+    fn healthy(models: &[&str]) -> serde_json::Value {
+        let entries: serde_json::Map<String, serde_json::Value> =
+            models.iter().map(|m| (m.to_string(), serde_json::json!({ "status": "ok" }))).collect();
+        serde_json::json!({ "status": "healthy", "models": entries })
+    }
+
+    fn spawn_probe_server(dim: usize, norm: f32) -> String {
+        spawn_service(dim, norm, &["qwen"], healthy(&["qwen"])).url
     }
 
     fn probe_config(url: String, embedding_dim: usize) -> SemanticSearchConfig {
@@ -804,6 +853,72 @@ mod tests {
         let url = spawn_probe_server(8, 5.0);
         let result = check_embedding_service(&probe_config(url, 8)).await;
         assert!(result.is_ok(), "non-unit-norm must be a soft warning, not an error: {result:?}");
+    }
+
+    /// The configured model is the `{model}` path segment of every embed
+    /// request, for documents and queries alike.
+    #[tokio::test]
+    async fn embed_requests_name_the_configured_model_in_the_path() {
+        let service = spawn_service(8, 1.0, &["gemma", "qwen"], healthy(&["gemma", "qwen"]));
+        let config = SemanticSearchConfig {
+            model_name: "gemma".into(),
+            ..probe_config(service.url.clone(), 8)
+        };
+        embed_query(&config, "what is a bloom filter").await.expect("query embeds");
+        check_embedding_service(&config).await.expect("probe passes");
+        let requests = service.requests.lock().clone();
+        assert!(requests.contains(&"POST /embedding/gemma/query HTTP/1.1".to_string()), "{requests:?}");
+        assert!(requests.contains(&"POST /embedding/gemma/document HTTP/1.1".to_string()), "{requests:?}");
+        assert!(!requests.iter().any(|r| r.contains("/qwen/")), "{requests:?}");
+    }
+
+    /// A model the service does not load is caught at the healthcheck, naming
+    /// what it does load.
+    #[tokio::test]
+    async fn check_embedding_service_rejects_a_model_the_service_does_not_load() {
+        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
+        let result = check_embedding_service(&probe_config(service.url, 8)).await; // default model: qwen
+        assert!(
+            matches!(&result, Err(EmbeddingError::ModelNotServed { model, available }) if model == "qwen" && available == "gemma"),
+            "got {result:?}",
+        );
+    }
+
+    /// The service answers 503 while *any* model loads; the probe judges only
+    /// the configured one.
+    #[tokio::test]
+    async fn check_embedding_service_judges_only_the_configured_model() {
+        let health = serde_json::json!({
+            "status": "starting",
+            "models": { "gemma": { "status": "loading" }, "qwen": { "status": "ok" } },
+        });
+        let service = spawn_service(8, 1.0, &["gemma", "qwen"], health);
+        let qwen = probe_config(service.url.clone(), 8);
+        assert!(check_embedding_service(&qwen).await.is_ok(), "qwen is ready");
+
+        let gemma = SemanticSearchConfig {
+            model_name: "gemma".into(),
+            ..qwen
+        };
+        let result = check_embedding_service(&gemma).await;
+        assert!(
+            matches!(&result, Err(EmbeddingError::ModelNotReady { model, status }) if model == "gemma" && status == "loading"),
+            "got {result:?}",
+        );
+    }
+
+    /// An embed call for an unknown model surfaces the service's own message.
+    #[tokio::test]
+    async fn embed_for_an_unknown_model_reports_the_service_detail() {
+        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
+        let result = embed_query(&probe_config(service.url, 8), "hello").await;
+        match result {
+            Err(EmbeddingError::Status { status, detail, .. }) => {
+                assert_eq!(status, 404);
+                assert_eq!(detail, "Unknown model 'qwen'; available: gemma");
+            }
+            other => panic!("expected a 404 Status error, got {other:?}"),
+        }
     }
 
     /// Verifies that the quantised dot-product estimate is within 0.1% of the

@@ -19,6 +19,7 @@ echo "=== Setup: ensure '$NS' store exists ==="
 curl -s -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "users",
     "key_type":  "uuid",
     "attributes": [],

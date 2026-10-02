@@ -13,7 +13,8 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `index/composite_key.rs` | Composite key layout: `cluster_id (4B BE) ‖ doc_id` |
 | `index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
 | `quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode) |
-| `service/mod.rs` | HTTP client for the external embedding service; `embed_document` / `embed_query`; `search()` two-pass ANN and `SCORING_GATE` |
+| `service/mod.rs` | Embedding orchestration: `embed_document` / `embed_query`, the startup probe `check_embedding_service`; `search()` two-pass ANN and `SCORING_GATE` |
+| `service/embedding_service.rs` | Raw HTTP client for the embedding service (`/embedding/{model}/…`, `/healthcheck`) |
 | `beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
 | `query-embedding-report.md` | BEIR evaluation behind whole-query Pass-1 embedding (vs chunked queries) |
 | `vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
@@ -45,7 +46,7 @@ The **query-embedding cache** (`system_qemb_cache`, below) follows the same spli
 
 ### Search (two-pass ANN)
 
-`embed_query` makes **one** embedding of the whole query (one payload, one service call) and uses it for **both** passes: as Pass 2's dense vector and as Pass 1's single MaxSim query vector (`QueryEmbeddings { sparse: vec![dense.clone()], dense }`). Queries used to be split into 4-word sliding windows; a BEIR evaluation (`query-embedding-report.md`) found the whole-query vector never worse and often better. With a tight first-pass cut it kept more relevant docs (ArguAna candidate recall 0.991 vs 0.870). It is also far cheaper: one embedding instead of 1+N, and `n_probes` clusters instead of the union over every fragment (up to 74% faster search). Document-style sentence windows for long queries gained nothing either, so there is **no query-chunking option**. `search()` still accepts several Pass-1 query vectors (general MaxSim) and returns empty if either input is empty. The embedding is cached in the `system_qemb_cache` TTL namespace, keyed by query text (`query_embedding_cache_ttl_secs`, default 1 day). Since queries are not chunked, chunking settings never invalidate it; clear it (`DELETE /admin/indices/vector/query-cache`) only after changing the embedding model or service.
+`embed_query` makes **one** embedding of the whole query (one payload, one service call) and uses it for **both** passes: as Pass 2's dense vector and as Pass 1's single MaxSim query vector (`QueryEmbeddings { sparse: vec![dense.clone()], dense }`). Queries used to be split into 4-word sliding windows; a BEIR evaluation (`query-embedding-report.md`) found the whole-query vector never worse and often better. With a tight first-pass cut it kept more relevant docs (ArguAna candidate recall 0.991 vs 0.870). It is also far cheaper: one embedding instead of 1+N, and `n_probes` clusters instead of the union over every fragment (up to 74% faster search). Document-style sentence windows for long queries gained nothing either, so there is **no query-chunking option**. `search()` still accepts several Pass-1 query vectors (general MaxSim) and returns empty if either input is empty. The embedding is cached in the `system_qemb_cache` TTL namespace, keyed by `model ‖ 0x00 ‖ query text` (`vector_kv::query_cache_key`; `query_embedding_cache_ttl_secs`, default 1 day). The model is in the key because minnal picks the model per request and one service serves several: keyed by text alone, switching `model_name` served the previous model's vectors for up to a day. Since queries are not chunked, chunking settings never invalidate it either; clear it (`DELETE /admin/indices/vector/query-cache`) only if the service changes what it serves under the same model name.
 
 **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
 1. Use the Pass-1 query vector (the whole-query embedding; fetched from the `system_qemb_cache` TTL namespace on a hit).
@@ -80,20 +81,22 @@ Three rules keep it working:
 
 **The embedding service must be running** for any vector insert or query to work. Without it, `semantic_search` calls will return an error. The service is not part of this workspace.
 
-Requests use a **batch interface** (chunking happens in minnal, not the service):
-- `POST {base_url}/embedding/document` — body `{"payloads": [str, ...], "dimensions": N}` → `{"embeddings": [[f32], ...]}` (one vector per payload)
-- `POST {base_url}/embedding/query` — same request/response shape
-- `GET {base_url}/healthcheck`
+Requests use a **batch interface** (chunking happens in minnal, not the service). The service loads several models (the companion one: `gemma`, `qwen`), so **every request names the model** — `{model}` is `SemanticSearchConfig::model_name` (`[semantic_search] model`, lower-cased by the API config's `resolve`):
+- `POST {base_url}/embedding/{model}/document` — body `{"payloads": [str, ...], "dimensions": N}` → `{"embeddings": [[f32], ...]}` (one vector per payload)
+- `POST {base_url}/embedding/{model}/query` — same request/response shape
+- `GET {base_url}/healthcheck` — `{"status", "models": {"<model>": {"status": "ok"|"loading"|"unreachable", ...}}}`; 503 while *any* model loads
 
-A whole-text ("single") embedding is just a one-element `payloads` array (every query is one); a document sends its whole text plus one payload per sentence-window chunk. The `{model}` path segment from the old API is gone (the model is fixed server-side). Default base URL: `http://localhost:8001`.
+A whole-text ("single") embedding is just a one-element `payloads` array (every query is one); a document sends its whole text plus one payload per sentence-window chunk. A model the service was not started with answers 404 `{"detail": "Unknown model ..."}`; non-2xx answers surface as `EmbeddingError::Status` with that detail. Default base URL: `http://localhost:8001`.
 
-### Startup probe & the model-pinning gap (operational, not enforced)
+The service's API was single-model for a while (`/embedding/document`, model fixed server-side, `model_name` inert). It is multi-model again, so `model_name` is load-bearing: it routes every embed request **and** keys the query cache. Don't drop either.
 
-`check_embedding_service` (called once at startup, non-fatal) does more than ping `/healthcheck`: it embeds a fixed probe payload through **both** the document and query endpoints and validates the returned **dimension** against `embedding_dim` (a service on a different dimension fails the probe instead of degrading search silently), then soft-warns if the probe vector is not unit-norm. **What it cannot validate is the model itself** — the service exposes no model family/version metadata, so a *wrong model with the same dimension* passes every check while the bundled cluster centroids are for a different embedding distribution (silently degraded recall). **Model pinning is therefore an operational guarantee, not an enforced one:** deployment must ensure `[[semantic_search.supported_models]]` / `cluster_path` match the model the service actually serves. If the service later exposes a model/version endpoint, enforce it here.
+### Startup probe & the centroid pairing (warned, not enforced)
+
+`check_embedding_service` (called once at startup, non-fatal) checks `/healthcheck` lists `model_name` with status `ok` (`ModelNotServed` / `ModelNotReady` otherwise — it reads the model's own entry, not the HTTP status, because the service is 503 while *another* model loads; a body without `models` falls back to "2xx"), then embeds a fixed probe payload through **both** of that model's endpoints and validates the returned **dimension** against `embedding_dim`, then soft-warns if the probe vector is not unit-norm. **The probe cannot validate the centroid file** — `model_name` and `cluster_path` are configured separately and both bundled sets are 768-dim, so centroids from the other model load fine and skew the IVF partition (slower, worse search, no error; `release.sh` once hard-coded qwen under a gemma config and a FiQA query read 92% of its index). The API server therefore compares them at startup: `ResolvedSemanticSearchConfig::centroid_mismatch` (`minnal_db_api/src/config.rs`) checks `cluster_path` against `service/embedding_support/{model}/clusters.json` (bytes first, then parsed centroids, so a reformatted copy passes) and `main.rs` logs a **warning** on a difference. It is deliberately a warning, not an error: centroids fitted on your own corpus for a bundled model legitimately differ. It skips silently when there is no readable bundled set (a custom model, CWD not the workspace root — e.g. the Docker runtime image, which copies only the selected file — or an LFS pointer stub). The library path (`SemanticSearchContext` built by hand) has no check.
 
 ## Cluster centroids
 
-Pre-built centroids ship per model at `service/embedding_support/{model}/clusters.json` — currently **gemma** (what the companion embedding service serves) and **qwen**, each 256 centroids × 768 dims. Set `semantic_search.cluster_path` to the one matching the model the service actually serves; both are 768-dim, so a mismatch passes `load_with_dim` and degrades recall silently. Each file is ~4.4 MB of JSONL — do not read it; it is data, not code.
+Pre-built centroids ship per model at `service/embedding_support/{model}/clusters.json` — currently **gemma** and **qwen** (the two models the companion embedding service serves), each 256 centroids × 768 dims. Set `semantic_search.cluster_path` to the one matching `semantic_search.model`; both are 768-dim, so a mismatch passes `load_with_dim` and degrades recall silently. Each file is ~4.4 MB of JSONL — do not read it; it is data, not code.
 
 **The gemma set was regenerated on 2026-09-25 for the PyTorch embedding service.** The earlier ONNX/FastEmbed service mean-pooled raw hidden states and skipped EmbeddingGemma's two Dense projections, so its vectors, and the old centroids fit on them, lived in a different space (cosine ≈ 0 vs the real embeddings). Any vector index built with the old service is incompatible with this file: re-index it (`POST /admin/indices/{ns}/vector/reindex-all`) and clear the query-embedding cache (`DELETE /admin/indices/vector/query-cache`). Provenance, reproducible with the embedding service's `generate_sample_embeddings.sh` + `generate_cluster_centroids.sh`: ELI5 QA pairs (first 25,024 records, `question + "\n" + answer`, document prompt), K-means k=256, seed 42. It is a **general-purpose example set**: well spread on general text (253/256 clusters used by held-out ELI5), but specialist text collapses (SciFact: 43% of docs in one cluster), so domain-specific deployments should fit centroids on their own data.
 
@@ -105,6 +108,8 @@ Pre-built centroids ship per model at `service/embedding_support/{model}/cluster
 # 4 = compact, 8 = better recall (default).
 number_of_bits_for_dense_quantisation = 8
 
+# Model requested from the service on every request; must match cluster_path.
+model = "gemma"
 cluster_path = "service/embedding_support/gemma/clusters.json"
 
 # embedding_service_url = "http://localhost:8001"

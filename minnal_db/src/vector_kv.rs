@@ -85,7 +85,8 @@ pub fn companion_base(name: &str) -> Option<&str> {
 /// namespaces with semantic search enabled write to and read from this cache
 /// regardless of which namespace the query originated from.
 ///
-/// Keys are raw UTF-8 query strings; values are big-endian `f32` vectors.
+/// Keys are `model ‖ 0x00 ‖ query` (see [`query_cache_key`]); values are
+/// big-endian `f32` vectors.
 /// The namespace is TTL-enabled; the expiry duration is supplied by the caller
 /// (configurable via `[semantic_search] query_embedding_cache_ttl_secs`), so
 /// stale embeddings are evicted automatically.
@@ -113,28 +114,43 @@ pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_4
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
 
+/// The cache key for `query_text` embedded by `model`: `model ‖ 0x00 ‖ query`.
+///
+/// The model is part of the key because one embedding service can serve
+/// several models, and the same text embeds to unrelated vectors in each.
+/// Without it, switching `model_name` would keep serving the previous model's
+/// cached query vectors until the TTL expired. The NUL separator keeps
+/// `("ab", "c")` and `("a", "bc")` apart.
+fn query_cache_key(model: &str, query_text: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(model.len() + 1 + query_text.len());
+    key.extend_from_slice(model.as_bytes());
+    key.push(0);
+    key.extend_from_slice(query_text.as_bytes());
+    key
+}
+
 /// Look up a cached query embedding in the system-wide TTL cache.
 ///
-/// Keyed by query text. Returns the whole-query embedding, which serves both
+/// Keyed by embedding model and query text. Returns the whole-query embedding, which serves both
 /// search passes (queries are not chunked; see
 /// [`embed_query`](crate::semantic_search::service::embed_query)).
 ///
 /// Returns `None` on cache miss, dimension mismatch, or any I/O error so that
 /// the caller always falls back to the embedding service transparently.
-pub async fn get_cached_query_embedding(db: &AsyncDb, query_text: &str, expected_dim: usize, ttl: Duration) -> Option<Vec<f32>> {
+pub async fn get_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &str, expected_dim: usize, ttl: Duration) -> Option<Vec<f32>> {
     let cache_ns = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await
         .ok()?;
 
-    let bytes = cache_ns.get(query_text.as_bytes().to_vec()).await.ok()??;
+    let bytes = cache_ns.get(query_cache_key(model, query_text)).await.ok()??;
     bytes_to_f32_vec_list(&bytes, expected_dim)?.into_iter().next()
 }
 
-/// Store a whole-query embedding in the system-wide TTL cache under `query_text` (see
-/// [`get_cached_query_embedding`]). Failures are silently ignored — the cache
+/// Store `model`'s whole-query embedding of `query_text` in the system-wide TTL
+/// cache (see [`get_cached_query_embedding`]). Failures are silently ignored — the cache
 /// is best-effort and must never block or fail a query.
-pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &[f32], ttl: Duration) {
+pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &str, dense: &[f32], ttl: Duration) {
     let Ok(cache_ns) = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await
@@ -147,17 +163,18 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, query_text: &str, dense: &
     // would be pure query-path latency with no durability benefit. A crash that
     // drops the entry simply turns into a future cache miss.
     let _ = cache_ns
-        .put_no_wal(query_text.as_bytes().to_vec(), f32_vec_list_to_bytes(&[dense.to_vec()]))
+        .put_no_wal(query_cache_key(model, query_text), f32_vec_list_to_bytes(&[dense.to_vec()]))
         .await;
 }
 
 /// Delete every entry from the system-wide query-embedding cache.
 ///
 /// Returns the number of cached entries removed. This is an explicit
-/// administrative operation. Chunking settings no longer affect cached entries
-/// (queries are not chunked), but the cache key does not capture the embedding
-/// *model*: clear it after switching models or embedding services, or stale
-/// vectors are served until the configured TTL expires.
+/// administrative operation. Entries are keyed by model and query text, so
+/// neither switching models nor changing chunking settings (queries are not
+/// chunked) needs a clear. Clear it when the service starts producing different
+/// vectors under the same model name (a different model build behind the name),
+/// or stale vectors are served until the configured TTL expires.
 pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Result<usize, crate::KVError> {
     let cache_ns = db
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
@@ -2223,6 +2240,7 @@ mod query_embedding_cache_tests {
 
     /// TTL used by the cache round-trip tests.
     const TEST_TTL: Duration = DEFAULT_QUERY_EMBEDDING_CACHE_TTL;
+    const MODEL: &str = "gemma";
 
     // ── Encoding helpers ──────────────────────────────────────────────────────
 
@@ -2277,7 +2295,7 @@ mod query_embedding_cache_tests {
     async fn test_cache_miss_returns_none() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        assert!(get_cached_query_embedding(&db, "unknown", 4, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "unknown", 4, TEST_TTL).await.is_none());
     }
 
     #[tokio::test]
@@ -2285,8 +2303,8 @@ mod query_embedding_cache_tests {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let dense = vec![0.1f32, 0.2, 0.3, 0.4];
-        put_cached_query_embedding(&db, "hello", &dense, TEST_TTL).await;
-        let cached = get_cached_query_embedding(&db, "hello", 4, TEST_TTL).await.unwrap();
+        put_cached_query_embedding(&db, MODEL, "hello", &dense, TEST_TTL).await;
+        let cached = get_cached_query_embedding(&db, MODEL, "hello", 4, TEST_TTL).await.unwrap();
         for (a, b) in cached.iter().zip(dense.iter()) {
             assert!((a - b).abs() < 1e-6, "f32 mismatch after cache round-trip");
         }
@@ -2297,9 +2315,9 @@ mod query_embedding_cache_tests {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let dense = vec![1.0f32, 2.0, 3.0, 4.0];
-        put_cached_query_embedding(&db, "query", &dense, TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "query", &dense, TEST_TTL).await;
         // stored as dim=4; ask for dim=3 — should be a cache miss
-        assert!(get_cached_query_embedding(&db, "query", 3, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "query", 3, TEST_TTL).await.is_none());
     }
 
     #[tokio::test]
@@ -2308,10 +2326,10 @@ mod query_embedding_cache_tests {
         let db = open_db(&dir).await;
         let dense_a = vec![1.0f32, 0.0];
         let dense_b = vec![0.0f32, 1.0];
-        put_cached_query_embedding(&db, "query-a", &dense_a, TEST_TTL).await;
-        put_cached_query_embedding(&db, "query-b", &dense_b, TEST_TTL).await;
-        let cached_a = get_cached_query_embedding(&db, "query-a", 2, TEST_TTL).await.unwrap();
-        let cached_b = get_cached_query_embedding(&db, "query-b", 2, TEST_TTL).await.unwrap();
+        put_cached_query_embedding(&db, MODEL, "query-a", &dense_a, TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "query-b", &dense_b, TEST_TTL).await;
+        let cached_a = get_cached_query_embedding(&db, MODEL, "query-a", 2, TEST_TTL).await.unwrap();
+        let cached_b = get_cached_query_embedding(&db, MODEL, "query-b", 2, TEST_TTL).await.unwrap();
         assert!((cached_a[0] - 1.0f32).abs() < 1e-6);
         assert!((cached_b[1] - 1.0f32).abs() < 1e-6);
     }
@@ -2320,13 +2338,13 @@ mod query_embedding_cache_tests {
     async fn test_clear_removes_all_entries() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        put_cached_query_embedding(&db, "query-a", &[1.0f32, 0.0], TEST_TTL).await;
-        put_cached_query_embedding(&db, "query-b", &[0.0f32, 1.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "query-a", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "query-b", &[0.0f32, 1.0], TEST_TTL).await;
 
         let cleared = clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap();
         assert_eq!(cleared, 2);
-        assert!(get_cached_query_embedding(&db, "query-a", 2, TEST_TTL).await.is_none());
-        assert!(get_cached_query_embedding(&db, "query-b", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "query-a", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "query-b", 2, TEST_TTL).await.is_none());
 
         // Clearing an already-empty cache is a no-op that reports zero.
         assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
@@ -2343,8 +2361,8 @@ mod query_embedding_cache_tests {
         // Baseline after namespace setup, so we only measure the cache writes.
         let before = db.ops_metrics();
 
-        put_cached_query_embedding(&db, "q1", &[1.0f32, 0.0], TEST_TTL).await;
-        put_cached_query_embedding(&db, "q2", &[0.0f32, 1.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "q1", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "q2", &[0.0f32, 1.0], TEST_TTL).await;
         let cleared = clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap();
         assert_eq!(cleared, 2);
 
@@ -2358,8 +2376,8 @@ mod query_embedding_cache_tests {
     /// Populate the cache and flush it to L0 — the state a long-running server
     /// is in once the periodic no-WAL flush tick has persisted cache entries.
     async fn populate_and_flush(db: &AsyncDb) {
-        put_cached_query_embedding(db, "q1", &[1.0f32, 0.0], TEST_TTL).await;
-        put_cached_query_embedding(db, "q2", &[0.0f32, 1.0], TEST_TTL).await;
+        put_cached_query_embedding(db, MODEL, "q1", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(db, MODEL, "q2", &[0.0f32, 1.0], TEST_TTL).await;
         assert!(db.coordinator_for_test().flush_no_wal_memtables() >= 1);
     }
 
@@ -2374,8 +2392,8 @@ mod query_embedding_cache_tests {
             db.shutdown().await.unwrap();
         }
         let db = open_db(&dir).await;
-        assert!(get_cached_query_embedding(&db, "q1", 2, TEST_TTL).await.is_none());
-        assert!(get_cached_query_embedding(&db, "q2", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "q1", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "q2", 2, TEST_TTL).await.is_none());
     }
 
     /// A clear must survive a crash that lands before the next no-WAL flush
@@ -2393,8 +2411,28 @@ mod query_embedding_cache_tests {
             std::mem::forget(db);
         }
         let db = open_db(&dir).await;
-        assert!(get_cached_query_embedding(&db, "q1", 2, TEST_TTL).await.is_none());
-        assert!(get_cached_query_embedding(&db, "q2", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "q1", 2, TEST_TTL).await.is_none());
+        assert!(get_cached_query_embedding(&db, MODEL, "q2", 2, TEST_TTL).await.is_none());
+    }
+
+    /// The same query text cached for two models keeps two entries: switching
+    /// models must not serve the other model's vector.
+    #[tokio::test]
+    async fn test_cache_is_keyed_by_model() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        put_cached_query_embedding(&db, "gemma", "q", &[1.0f32, 0.0], TEST_TTL).await;
+        assert!(get_cached_query_embedding(&db, "qwen", "q", 2, TEST_TTL).await.is_none());
+        put_cached_query_embedding(&db, "qwen", "q", &[0.0f32, 1.0], TEST_TTL).await;
+        assert_eq!(
+            get_cached_query_embedding(&db, "gemma", "q", 2, TEST_TTL).await.unwrap(),
+            vec![1.0f32, 0.0]
+        );
+        assert_eq!(
+            get_cached_query_embedding(&db, "qwen", "q", 2, TEST_TTL).await.unwrap(),
+            vec![0.0f32, 1.0]
+        );
+        assert_ne!(query_cache_key("ab", "c"), query_cache_key("a", "bc"));
     }
 
     /// Re-embedding the same query overwrites its entry.
@@ -2402,9 +2440,9 @@ mod query_embedding_cache_tests {
     async fn test_cache_reembed_overwrites() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        put_cached_query_embedding(&db, "q", &[1.0f32, 0.0], TEST_TTL).await;
-        put_cached_query_embedding(&db, "q", &[0.0f32, 1.0], TEST_TTL).await;
-        assert_eq!(get_cached_query_embedding(&db, "q", 2, TEST_TTL).await.unwrap(), vec![0.0f32, 1.0]);
+        put_cached_query_embedding(&db, MODEL, "q", &[1.0f32, 0.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "q", &[0.0f32, 1.0], TEST_TTL).await;
+        assert_eq!(get_cached_query_embedding(&db, MODEL, "q", 2, TEST_TTL).await.unwrap(), vec![0.0f32, 1.0]);
     }
 }
 

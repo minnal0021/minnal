@@ -59,10 +59,12 @@ cargo build --release -p minnal_tools     # minnal_tools (bulk_load, …)
 > indexed and when a query is run. If you plan to use semantic search, set up and
 > run one first. The companion
 > [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service)
-> serves the **gemma** model over HTTP — see its
+> serves the **gemma** and **qwen** models over HTTP — see its
 > [README](https://github.com/minnal0021/embedding_service#readme) to get started,
 > then point `semantic_search.embedding_service_url` at it (default
-> `http://localhost:8001`).
+> `http://localhost:8001`). minnal names the model on every request, from
+> `[semantic_search] model` (default `qwen`), so set that to a model the service
+> loads.
 
 ---
 
@@ -261,9 +263,11 @@ max_retries = 5
 concurrency = 4
 
 [semantic_search]
+# Embedding model to request from the service (sent on every request; default "qwen").
+model = "gemma"
 # Path to the JSONL cluster centroids file (one {"cluster_id":…,"centroid":[…]} per line).
 # One set per model ships under service/embedding_support/{gemma,qwen}/ — use the
-# one matching the model your embedding service serves.
+# one matching `model` above.
 cluster_path = "service/embedding_support/gemma/clusters.json"
 # Bits per dimension for the dense (multi-bit) Pass 2 quantisation. 4 = compact, 8 = high recall.
 number_of_bits_for_dense_quantisation = 8
@@ -602,7 +606,7 @@ holds **256 centroids for 768-dimensional embeddings** (~4.4 MB of JSONL on disk
 
 | Model | File |
 |---|---|
-| **gemma** (served by the companion embedding service) | [`service/embedding_support/gemma/clusters.json`](service/embedding_support/gemma/clusters.json) |
+| **gemma** | [`service/embedding_support/gemma/clusters.json`](service/embedding_support/gemma/clusters.json) |
 | **qwen** | [`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) |
 
 Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
@@ -611,10 +615,15 @@ Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
 `version https://git-lfs.github.com/spec/v1`. (The bulk-load sample data,
 `minnal_tools/sample_data/sample_data.jsonl`, is tracked the same way.)
 
-Point the server at the one matching the model your embedding service actually
-serves, via `[semantic_search] cluster_path`. The cluster index is loaded once at
-startup and never mutated. Both files are 768-dimensional, so pairing the wrong
-one with your service passes every startup check and degrades recall *silently*.
+Point the server at the one matching `[semantic_search] model` — the model minnal
+asks the embedding service for — via `[semantic_search] cluster_path`. The cluster
+index is loaded once at startup and never mutated. The two settings are separate,
+and both files are 768-dimensional, so the wrong file loads without error; search
+then runs slower and returns worse results. The server compares `cluster_path`
+with the bundled file for `model` at startup and logs a **warning** if their
+centroids differ. Expect that warning if you fitted your own centroids; otherwise
+it means the two settings disagree. It can only compare when it is started from
+the workspace root, where `service/embedding_support/` is.
 
 To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at that file instead. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
 

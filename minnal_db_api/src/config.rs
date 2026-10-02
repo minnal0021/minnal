@@ -57,10 +57,11 @@ const EMBEDDING_SUPPORT_DIR: &str = "service/embedding_support";
 /// centroids match the declared `dimension` — there is no hard-coded list of
 /// recognised models.
 ///
-/// The name is purely internal: minnal never sends it to the embedding service
-/// (requests always go to `{url}/embedding/document` and `.../query` with no
-/// model segment). It only selects which cluster file and embedding dimension
-/// this instance uses.
+/// The name is also the model key the embedding service is asked for: the
+/// active `semantic_search.model` is sent, lower-cased, as the `{model}` path
+/// segment of every request (`{url}/embedding/{model}/document` and
+/// `.../query`), so a declared name must be one the service serves (the
+/// companion service serves `gemma` and `qwen`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportedModelEntry {
     /// Model identifier. The corresponding cluster file is expected at
@@ -648,15 +649,22 @@ pub struct SemanticSearchSection {
 
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     ///
-    /// Requests are a batch POST to `{url}/embedding/document` and
-    /// `{url}/embedding/query` with body `{"payloads": [str, ...], "dimensions": N}`,
-    /// returning `{"embeddings": [[f32], ...]}`. Chunking happens in minnal.
+    /// Requests are a batch POST to `{url}/embedding/{model}/document` and
+    /// `{url}/embedding/{model}/query` with body
+    /// `{"payloads": [str, ...], "dimensions": N}`, returning
+    /// `{"embeddings": [[f32], ...]}`, where `{model}` is [`model`](Self::model).
+    /// Chunking happens in minnal.
     #[serde(default = "default_embedding_service_url")]
     pub embedding_service_url: String,
 
-    /// Embedding model to use.  Selects which cluster file and embedding
-    /// dimension this instance uses; should name one of the
-    /// [`supported_models`](Self::supported_models) entries.  Default: `"qwen"`.
+    /// Embedding model to use, e.g. `"gemma"` or `"qwen"`.  Sent (lower-cased)
+    /// to the embedding service as the `{model}` path segment of every request,
+    /// so it chooses which of the service's loaded models embeds the text; the
+    /// startup probe checks the service loads it.  When
+    /// [`supported_models`](Self::supported_models) is non-empty it must name
+    /// one of the entries.  It must match the model `cluster_path`'s centroids
+    /// were fitted on, and changing it requires a corpus re-index.
+    /// Default: `"qwen"`.
     #[serde(default = "default_model")]
     pub model: String,
 
@@ -786,7 +794,7 @@ pub struct ResolvedSemanticSearchConfig {
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     pub embedding_service_url: String,
 
-    /// Embedding model name, e.g. `"qwen"`.
+    /// Embedding model requested from the service, lower-cased, e.g. `"qwen"`.
     pub model_name: String,
 
     /// Maximum number of results returned by a semantic search query.
@@ -811,6 +819,44 @@ pub struct ResolvedSemanticSearchConfig {
     pub embedding_connect_timeout: std::time::Duration,
 }
 
+impl ResolvedSemanticSearchConfig {
+    /// If `cluster_path` holds different centroids from the bundled set for the
+    /// configured model (`service/embedding_support/{model}/clusters.json`),
+    /// return that bundled file's path, so startup can warn.
+    ///
+    /// Nothing else catches this pairing: both bundled sets are 768-dimensional,
+    /// so the other model's centroids load and pass the embedding probe, then
+    /// file vectors into the wrong clusters — search slows down and loses
+    /// recall without any error. It stays a warning rather than an error
+    /// because centroids fitted on your own corpus legitimately differ.
+    ///
+    /// Returns `None` when the files match (byte-identical, or the same
+    /// centroids formatted differently), or when there is no readable bundled
+    /// set to compare against: a model without one, a working directory other
+    /// than the workspace root, or a clone missing its Git LFS files.
+    pub fn centroid_mismatch(&self) -> Option<PathBuf> {
+        self.centroid_mismatch_in(Path::new(EMBEDDING_SUPPORT_DIR))
+    }
+
+    fn centroid_mismatch_in(&self, support_dir: &Path) -> Option<PathBuf> {
+        use minnal_db::semantic_search::cluster::read_clusters_from_file;
+
+        let bundled = support_dir.join(&self.model_name).join("clusters.json");
+        // Fast path: a copy of the bundled file (what release.sh stages).
+        match (std::fs::read(&bundled), std::fs::read(&self.cluster_path)) {
+            (Ok(a), Ok(b)) if a == b => return None,
+            (Ok(_), Ok(_)) => {}
+            _ => return None,
+        }
+        // Different bytes; compare what they parse to, so reformatting is not a
+        // mismatch. A bundled file that does not parse (an LFS pointer stub) is
+        // no reference at all.
+        let reference = read_clusters_from_file(bundled.to_str()?).ok()?;
+        let configured = read_clusters_from_file(self.cluster_path.to_str()?).ok()?;
+        (reference != configured).then_some(bundled)
+    }
+}
+
 impl SemanticSearchSection {
     /// Resolve this section into a [`ResolvedSemanticSearchConfig`], filling in
     /// the `cluster_path` default (`{db_path}/semantic_search/clusters.json`)
@@ -825,7 +871,9 @@ impl SemanticSearchSection {
             n_probes: self.n_probes,
             number_of_bits_for_dense_quantisation: self.number_of_bits_for_dense_quantisation,
             embedding_service_url: self.embedding_service_url.clone(),
-            model_name: self.model.clone(),
+            // The service's model keys are lower-case, and the supported-models
+            // check and cluster-file lookup already match case-insensitively.
+            model_name: self.model.to_lowercase(),
             top_k_results: self.top_k_results,
             window_size: self.window_size,
             sliding_size: self.sliding_size,
@@ -983,6 +1031,102 @@ mod tests {
         }];
         let err = cfg.validate_active_model_listed().unwrap_err();
         assert!(err.contains("qwen") && err.contains("supported_models"), "got: {err}");
+    }
+
+    /// A resolved config for `model` whose `cluster_path` is `cluster_path`.
+    fn resolved_with(model: &str, cluster_path: PathBuf) -> ResolvedSemanticSearchConfig {
+        let mut resolved = SemanticSearchSection {
+            model: model.to_string(),
+            ..SemanticSearchSection::default()
+        }
+        .resolve(Path::new("/tmp/db"));
+        resolved.cluster_path = cluster_path;
+        resolved
+    }
+
+    #[test]
+    fn centroid_check_accepts_a_copy_of_the_bundled_set() {
+        let support_dir = write_cluster_file("gemma", 4, 3);
+        let bundled = support_dir.join("gemma").join("clusters.json");
+        let copy = support_dir.join("staged.bin");
+        std::fs::copy(&bundled, &copy).unwrap();
+        assert_eq!(resolved_with("gemma", copy).centroid_mismatch_in(&support_dir), None);
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn centroid_check_ignores_formatting_differences() {
+        let support_dir = write_cluster_file("gemma", 4, 3);
+        let bundled = support_dir.join("gemma").join("clusters.json");
+        // Same centroids, different whitespace and line order.
+        let mut lines: Vec<String> = std::fs::read_to_string(&bundled)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(l).unwrap())
+                    .unwrap()
+                    .replace('\n', "")
+            })
+            .collect();
+        lines.reverse();
+        let reformatted = support_dir.join("reformatted.json");
+        std::fs::write(&reformatted, lines.join("\n")).unwrap();
+        assert_ne!(std::fs::read(&bundled).unwrap(), std::fs::read(&reformatted).unwrap());
+        assert_eq!(resolved_with("gemma", reformatted).centroid_mismatch_in(&support_dir), None);
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn centroid_check_flags_the_other_models_centroids() {
+        let support_dir = write_cluster_file("gemma", 4, 3);
+        // write_cluster_file derives values from the id, so shift qwen's.
+        let qwen_dir = support_dir.join("qwen");
+        std::fs::create_dir_all(&qwen_dir).unwrap();
+        let body: String = (0..3)
+            .map(|id| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({ "cluster_id": id, "centroid": [0.5f32, 0.25, 0.125, id as f32] })
+                )
+            })
+            .collect();
+        std::fs::write(qwen_dir.join("clusters.json"), body).unwrap();
+
+        let gemma = support_dir.join("gemma").join("clusters.json");
+        let qwen = qwen_dir.join("clusters.json");
+        assert_eq!(
+            resolved_with("gemma", qwen.clone()).centroid_mismatch_in(&support_dir),
+            Some(gemma.clone())
+        );
+        assert_eq!(resolved_with("qwen", gemma).centroid_mismatch_in(&support_dir), Some(qwen));
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn centroid_check_skips_when_there_is_nothing_to_compare_against() {
+        let support_dir = write_cluster_file("gemma", 4, 3);
+        let custom = support_dir.join("gemma").join("clusters.json");
+        // A model with no bundled set (custom model, or wrong working directory).
+        assert_eq!(resolved_with("e5", custom.clone()).centroid_mismatch_in(&support_dir), None);
+        // A clone without Git LFS: the bundled file is a pointer stub.
+        let stub_dir = support_dir.join("qwen");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::write(
+            stub_dir.join("clusters.json"),
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 4400000\n",
+        )
+        .unwrap();
+        assert_eq!(resolved_with("qwen", custom).centroid_mismatch_in(&support_dir), None);
+        std::fs::remove_dir_all(&support_dir).ok();
+    }
+
+    #[test]
+    fn resolve_lower_cases_the_model_name() {
+        let section = SemanticSearchSection {
+            model: "Gemma".to_string(),
+            ..SemanticSearchSection::default()
+        };
+        assert_eq!(section.resolve(Path::new("/tmp/db")).model_name, "gemma");
     }
 
     #[test]

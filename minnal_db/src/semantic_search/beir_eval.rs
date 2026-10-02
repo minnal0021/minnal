@@ -26,7 +26,8 @@
 //!
 //! Env knobs (all optional): `MINNAL_BEIR_DATASET` (default `scifact`),
 //! `MINNAL_BEIR_ROOT` (default `../work/beir`), `MINNAL_BEIR_SPLIT` (default
-//! `test`), `MINNAL_BEIR_MODEL` (cluster set, default `gemma`),
+//! `test`), `MINNAL_BEIR_MODEL` (the model requested from the service and its
+//! cluster set, default `gemma`),
 //! `MINNAL_EMBED_URL`, `MINNAL_BEIR_MAX_QUERIES`, and `MINNAL_BEIR_DB`, a
 //! directory to keep the built index in so later runs skip re-embedding the
 //! corpus. Results are also written to `{root}/{dataset}/beir_eval_{model}_{split}.{md,tsv}`.

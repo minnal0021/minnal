@@ -20,6 +20,7 @@ echo "=== Create a 'users' store (UUID keys, indexed on 'status' and 'age') ==="
 curl -sf -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "users",
     "key_type": "uuid",
     "attributes": [
@@ -38,6 +39,7 @@ echo "=== Create a 'products' store (u64 keys, indexed on 'in_stock') ==="
 curl -sf -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "products",
     "key_type": "u64",
     "attributes": [],
@@ -103,7 +105,7 @@ echo "=== Create duplicate store (expect 409 Conflict) ==="
 curl -s -o /dev/null -w "HTTP %{http_code}\n" \
   -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
-  -d '{"namespace":"users","key_type":"uuid","attributes":[],"indices":[]}'
+  -d '{"store_type":"doc","namespace":"users","key_type":"uuid","attributes":[],"indices":[]}'
 
 echo
 echo "=== Amend attribute that is an active index (expect 409 Conflict) ==="

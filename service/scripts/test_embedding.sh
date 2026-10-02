@@ -9,14 +9,15 @@
 #   Request body : {"payloads": ["text1", "text2", ...], "dimensions": 768}
 #   Response     : {"embeddings": [[<float>, ...], ...]}   # one vector per input
 #
-# The URL paths (the {model} segment from the old API is gone — the model is
-# fixed server-side):
-#   POST {base}/embedding/document
-#   POST {base}/embedding/query
+# The service can load several models, so the URL names the one to use
+# ({model} is the config's `model`, e.g. gemma or qwen; others answer 404):
+#   POST {base}/embedding/{model}/document
+#   POST {base}/embedding/{model}/query
 #
 # This script:
 #   1. Reads URL / model / dimension from the TOML config.
-#   2. GETs /healthcheck to confirm the service is reachable.
+#   2. GETs /healthcheck to confirm the service is reachable and reports the
+#      configured model's status.
 #   3. Sends a multi-payload document batch and a multi-payload query batch
 #      using the new request/response shape, then prints per-vector stats,
 #      an L2-normalisation check, and a query×doc cosine-similarity matrix.
@@ -115,6 +116,7 @@ fi
 
 EMBED_URL="${EMBED_URL:-$(toml_get "$CONFIG_FILE" embedding_service_url "http://localhost:8001")}"
 MODEL="${MODEL:-$(toml_get "$CONFIG_FILE" model "qwen")}"
+MODEL="${MODEL,,}"   # the service's model keys are lower-case; minnal lower-cases too
 DIM="${DIM:-$(toml_get "$CONFIG_FILE" dimension "768")}"
 
 # ---------------------------------------------------------------------------
@@ -199,12 +201,19 @@ field "query text:"  "${QUERY_TEXT:0:80}..."
 # ---------------------------------------------------------------------------
 
 header "Healthcheck  GET /healthcheck"
-HEALTH_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+HEALTH_BODY=$(mktemp)
+HEALTH_STATUS=$(curl -s -o "$HEALTH_BODY" -w '%{http_code}' --max-time 5 \
     "$EMBED_URL/healthcheck" || true)
-if [[ "$HEALTH_STATUS" == "200" ]]; then
-    field "status:" "OK (HTTP 200)"
+# The service is 503 while *any* model loads, so judge the configured model's entry.
+MODEL_STATUS=$(jq -r --arg m "$MODEL" '.models[$m].status // "not loaded"' "$HEALTH_BODY" 2>/dev/null || echo "unknown")
+AVAILABLE=$(jq -r '(.models // {}) | keys | join(", ")' "$HEALTH_BODY" 2>/dev/null || true)
+rm -f "$HEALTH_BODY"
+field "HTTP status:" "$HEALTH_STATUS"
+field "loaded:"      "${AVAILABLE:-?}"
+if [[ "$MODEL_STATUS" == "ok" ]]; then
+    field "model status:" "$MODEL ok"
 else
-    field "status:" "HTTP $HEALTH_STATUS  <-- service may be unavailable"
+    field "model status:" "$MODEL $MODEL_STATUS  <-- embedding calls may fail"
     printf '  \033[1;33mWARN\033[0m continuing anyway; embedding calls may fail.\n'
 fi
 
@@ -220,10 +229,10 @@ trap 'rm -f "$DOC_RESP" "$QUERY_RESP"' EXIT
 # Document embedding  (batch: one vector per sentence)
 # ---------------------------------------------------------------------------
 
-DOC_ENDPOINT="${EMBED_URL}/embedding/document"
+DOC_ENDPOINT="${EMBED_URL}/embedding/${MODEL}/document"
 DOC_BODY=$(build_body document "$DOC_TEXT")
 
-header "Document Embedding  POST .../embedding/document"
+header "Document Embedding  POST .../embedding/${MODEL}/document"
 printf '  payloads: %s\n' "$(echo "$DOC_BODY" | jq '.payloads | length')"
 post_batch "$DOC_ENDPOINT" "$DOC_BODY" "$DOC_RESP" "document embedding"
 printf '  HTTP status: %s\n' "$LAST_HTTP"
@@ -232,10 +241,10 @@ printf '  HTTP status: %s\n' "$LAST_HTTP"
 # Query embedding  (batch: one vector per word)
 # ---------------------------------------------------------------------------
 
-QUERY_ENDPOINT="${EMBED_URL}/embedding/query"
+QUERY_ENDPOINT="${EMBED_URL}/embedding/${MODEL}/query"
 QUERY_BODY=$(build_body query "$QUERY_TEXT")
 
-header "Query Embedding  POST .../embedding/query"
+header "Query Embedding  POST .../embedding/${MODEL}/query"
 printf '  payloads: %s\n' "$(echo "$QUERY_BODY" | jq '.payloads | length')"
 post_batch "$QUERY_ENDPOINT" "$QUERY_BODY" "$QUERY_RESP" "query embedding"
 printf '  HTTP status: %s\n' "$LAST_HTTP"

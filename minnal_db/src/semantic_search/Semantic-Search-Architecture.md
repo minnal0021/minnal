@@ -10,22 +10,24 @@ This document describes how semantic search works end to end: embedding generati
 
 Minnal does **not** generate embeddings itself. It relies on an **external embedding service** and treats it as the sole source of vectors: minnal prepares payloads, the service returns embeddings, and minnal quantises and indexes them as-is.
 
-> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) is a reference implementation that serves the **gemma** embedding model over HTTP — the external dependency described here. Run it, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) is a reference implementation that serves two embedding models over HTTP — **gemma** (EmbeddingGemma-300M) and **qwen** (Qwen3-Embedding-8B) — the external dependency described here. Run it, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
 
-The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`. Minnal does not negotiate or version models with the service — every request goes to fixed endpoints with no model identifier in the URL or body. Choosing the concrete model, and pinning its exact version, is entirely the embedding service's responsibility, decided server-side and applied uniformly to every request.
+The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`.
 
-The `model` name in the config (e.g. `gemma`) is therefore *not* used to select or version a model at request time. It is only an indication of which *family* of model the deployment is built around, and within minnal it serves a single purpose: selecting the matching cluster-centroid file and embedding dimension for this instance (validated at startup against `[[semantic_search.supported_models]]`). Keeping the config name aligned with whatever the embedding service actually serves is an operational convention, not something minnal enforces against the service.
+One service can load several models, so **minnal names the model on every request**. The `model` setting under `[semantic_search]` (e.g. `gemma` or `qwen`; default `qwen`; lower-cased before use) is sent as the `{model}` path segment of both embedding endpoints, so it decides which of the service's models embeds the text. The service answers 404 for a model it was not started with. Which build of a model sits behind a name (its quantisation, say) is still the service's choice.
+
+The model must be the one the cluster centroids (`cluster_path`) were fitted on, and the one every stored vector was embedded with: the same text embeds to unrelated vectors under different models. `model` and `cluster_path` are separate settings, and both bundled centroid sets are 768-dimensional, so the wrong file loads without error. The API server compares the centroids at `cluster_path` with the bundled set for `model` (`service/embedding_support/{model}/clusters.json`) at startup and logs a warning when they differ; it is a warning, not an error, because centroids fitted on your own corpus legitimately differ. When there is no bundled set to compare against (a custom model, a working directory other than the workspace root, or the library used directly), the pairing is on the operator. Changing `model` therefore means pointing `cluster_path` at that model's centroids and re-indexing every semantic-search store.
 
 ### Service interface
 
 Each request carries a **`payloads` array of strings and returns one embedding per string**, so a single HTTP call can embed many strings at once. Minnal decides how many strings to send: chunking/tokenisation happens in minnal (`chunking/mod.rs`), not in the service, so the service never splits a string — it embeds exactly the strings it is given. To embed a whole text, minnal sends a `payloads` array with a single string — every query is exactly that, since queries are not chunked; to embed a chunked (sliding-window) document, it sends one string per chunk — all in the same request.
 
-Two `POST` endpoints, identical in request/response shape, differing only in which side of the asymmetric model they target (documents are embedded differently from queries):
+Two `POST` endpoints per model, identical in request/response shape, differing only in which side of the asymmetric model they target (documents are embedded differently from queries). `{model}` is the configured `model`:
 
 | Method & path | Purpose |
 |---|---|
-| `POST {base_url}/embedding/document` | Embed document payloads (indexing). |
-| `POST {base_url}/embedding/query` | Embed query payloads (search). |
+| `POST {base_url}/embedding/{model}/document` | Embed document payloads (indexing). |
+| `POST {base_url}/embedding/{model}/query` | Embed query payloads (search). |
 
 **Request body** (`application/json`):
 
@@ -53,9 +55,15 @@ Two `POST` endpoints, identical in request/response shape, differing only in whi
 |---|---|---|
 | `embeddings` | array of `f32` arrays | One vector per input payload, in the **same order** as `payloads`. Each vector must be L2-normalised and of length `dimensions`. |
 
-Minnal validates the response and errors if the number of returned embeddings differs from the number of payloads sent (`CountMismatch`), or if any vector's length differs from the requested `dimensions` (`DimensionMismatch`). An empty `payloads` array short-circuits to an empty result with no HTTP request. Extra fields in the response JSON are ignored.
+Minnal validates the response and errors if the number of returned embeddings differs from the number of payloads sent (`CountMismatch`), or if any vector's length differs from the requested `dimensions` (`DimensionMismatch`). A non-2xx answer becomes a `Status` error carrying the service's `detail` message — for an unknown model, `Unknown model 'foo'; available: gemma, qwen`. An empty `payloads` array short-circuits to an empty result with no HTTP request. Extra fields in the response JSON are ignored.
 
-A health endpoint is also expected: `GET {base_url}/healthcheck` should return a 2xx status. Minnal probes this at startup and logs a warning if the service is unreachable (startup is non-fatal — failures surface at query time).
+A health endpoint is also expected: `GET {base_url}/healthcheck`, listing the loaded models and the state of each:
+
+```json
+{"status": "healthy", "models": {"gemma": {"status": "ok", ...}, "qwen": {"status": "ok", ...}}}
+```
+
+The service answers 503 while *any* of its models is still loading, so minnal judges only the configured model's entry: it must be present (`ModelNotServed` otherwise) with status `ok` (`ModelNotReady` otherwise). A response without a `models` map just has to be 2xx. Minnal probes this at startup, then embeds a probe text through both endpoints to check the dimension (see [Embedding service availability](#embedding-service-availability)).
 
 ### Embedding dimension
 
@@ -140,7 +148,7 @@ Lines are parsed independently (`read_clusters_from_file` in `cluster/mod.rs`): 
 ```
 Raw query text
   → embedding cache lookup (system_qemb_cache TTL namespace)
-  → on miss: embed_query — ONE POST to {base_url}/embedding/query
+  → on miss: embed_query — ONE POST to {base_url}/embedding/{model}/query
        · payload[0]: whole query → 1 embedding q
                      (Pass 2 dense vector AND Pass 1's single MaxSim vector;
                       queries are not chunked)
@@ -247,7 +255,7 @@ Three companion KVStore namespaces per semantic-search-enabled store (`vector_kv
 
 ## 6. Query Embedding Cache
 
-Query embeddings are cached in a system-wide TTL namespace `system_qemb_cache` shared across all doc-store namespaces. Keys are raw UTF-8 query strings; values are packed big-endian `f32` vectors. The TTL is **configurable** via `[semantic_search] query_embedding_cache_ttl_secs` and **defaults to 1 day** (86400 s) — once it elapses, stale entries are evicted automatically by the TTL worker. Cache misses fall back to the embedding service transparently.
+Query embeddings are cached in a system-wide TTL namespace `system_qemb_cache` shared across all doc-store namespaces. Keys are the model name, a NUL byte, then the UTF-8 query string, so switching `model` never serves the previous model's vectors; values are packed big-endian `f32` vectors. The TTL is **configurable** via `[semantic_search] query_embedding_cache_ttl_secs` and **defaults to 1 day** (86400 s) — once it elapses, stale entries are evicted automatically by the TTL worker. Cache misses fall back to the embedding service transparently.
 
 **Durability — no-WAL populate, WAL-backed clear.** Populating an entry on a cache miss is no-WAL (`put_no_wal`): the cache is TTL-bounded and fully regenerable, so a dropped populate just produces a future cache miss that re-fetches from the embedding service, and staying off the WAL removes a per-populate fsync from the query hot path (the latency motivation for caching in the first place). Clearing the cache (`DELETE /admin/indices/vector/query-cache`) uses WAL-backed deletes, like the vector-index cleanup deletes (see §7, *Durability guarantees*): the periodic no-WAL flush tick has usually already persisted the cached entries, so a clear tombstone lost to a crash before the next tick would resurrect entries the operator explicitly cleared.
 
@@ -266,7 +274,7 @@ Vector indexing is **asynchronous and decoupled from document writes**. A docume
 
 The embedding service being unreachable is **never fatal**:
 
-- **At startup**, the server probes `GET {base_url}/healthcheck`. On failure it logs an error and **starts anyway**; the failure surfaces later at call time. The background worker starts regardless of the probe result.
+- **At startup**, the server probes `GET {base_url}/healthcheck` (the configured model must be listed and ready), then embeds a probe text through both of the model's endpoints and checks the vectors have `embedding_dim` dimensions. On failure it logs an error and **starts anyway**; the failure surfaces later at call time. The background worker starts regardless of the probe result.
 - **At query time**, a search that cannot reach the service returns an error to the caller (`EmbeddingFailed`) — no crash, no partial index corruption.
 - **At index time**, the worker simply fails the affected queue entries and retries them on later passes (see [Retry & exhaustion](#retry--exhaustion)). Because the queue is durable, no indexing work is lost while the service is down — it drains once the service returns.
 
@@ -365,7 +373,7 @@ All parameters are under `[semantic_search]` in the TOML config:
 | `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
 | `window_size` | `4` | Sentences per sliding-window chunk for **document** SingleBit embeddings (queries are not chunked). Changing it requires a corpus re-index. |
 | `sliding_size` | `2` | Document window advance step, in sentences. Smaller than `window_size` → overlapping chunks. |
-| `model` | `qwen` | Name of the embedding model, used to pick and validate the cluster file (the sample config sets `gemma`). |
+| `model` | `qwen` | Embedding model requested from the service on every request (`/embedding/{model}/…`), lower-cased. Must be listed in `[[semantic_search.supported_models]]` when that list is non-empty, and must match the centroids at `cluster_path`. Changing it requires a re-index. The sample config sets `gemma`. |
 | `embedding_dim` | `768` | Dimension of the vectors the service returns; must match the cluster file. |
 | `cluster_path` | — | Path to the JSONL cluster centroids file. |
 | `embedding_service_url` | `http://localhost:8001` | Base URL of the external embedding service. |

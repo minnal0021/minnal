@@ -29,6 +29,7 @@ echo "=== Setup: create test stores ==="
 curl -s -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "users",
     "key_type":  "uuid",
     "attributes": [{"name": "email", "attr_type": "str"}],
@@ -41,6 +42,7 @@ curl -s -X POST "$BASE_URL/stores" \
 curl -s -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "products",
     "key_type":  "u64",
     "attributes": [],
@@ -53,6 +55,7 @@ curl -s -X POST "$BASE_URL/stores" \
 curl -s -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type": "doc",
     "namespace": "events",
     "key_type":  "u128",
     "attributes": [],
@@ -250,17 +253,22 @@ echo
 echo "=== Setup: create semantic-search-enabled store ==="
 # semantic_search_enabled: true tells the server to embed every document on
 # write and maintain the companion vector KV store.
-# embedding_field names the JSON field whose text is embedded.
+# embedding_fields names the JSON fields whose text is embedded; each must be
+# declared as a str attribute.
 # status and seniority are indexed so the filtered examples can use them.
 SS_CREATE_STATUS=$(curl -s -o /tmp/ss_create_resp.json -w "%{http_code}" \
   -X POST "$BASE_URL/stores" \
   -H "Content-Type: application/json" \
   -d '{
+    "store_type":              "doc",
     "namespace":               "profiles",
     "key_type":                "uuid",
     "semantic_search_enabled": true,
-    "embedding_field":         "bio",
-    "attributes":              [{"name": "name", "attr_type": "str"}],
+    "embedding_fields":        ["bio"],
+    "attributes":              [
+      {"name": "name", "attr_type": "str"},
+      {"name": "bio",  "attr_type": "str"}
+    ],
     "indices": [
       {"field": "status",    "index_type": "str"},
       {"field": "seniority", "index_type": "str"}
@@ -325,6 +333,19 @@ else
   echo "  -> HTTP 204 No Content"
 
   echo
+  # Embedding happens in the background after each PUT returns, so wait (up to
+  # 30 s) until all four profiles are searchable.
+  echo "=== Waiting for the four profiles to be embedded ==="
+  for _ in $(seq 1 30); do
+    if curl -s -X POST "$BASE_URL/stores/profiles/semantic-search" \
+         -H "Content-Type: application/json" -d '{"query": "engineer"}' \
+         | grep -qE '"total": *4'; then
+      echo "  -> indexed"
+      break
+    fi
+    sleep 1
+  done
+
   echo "=== Semantic search (no filter): find profiles similar to a query ==="
   # Returns all candidates ranked by dot-product similarity.
   # Expect Alice and Carol near the top; Dave near the bottom.

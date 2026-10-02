@@ -612,11 +612,13 @@ pub async fn vector_reindex_failed(
 /// `DELETE /admin/indices/vector/query-cache` — clear the system-wide query
 /// embedding cache.
 ///
-/// The cache is shared across all semantic-search namespaces and keyed only by
-/// query text. Clear it after changing the chunking parameters
-/// (`window_size` / `sliding_size`), in tandem with a corpus re-index — otherwise
-/// stale cached vectors silently degrade recall until the configured TTL
-/// (`query_embedding_cache_ttl_secs`, default 1 day) expires.
+/// The cache is shared across all semantic-search namespaces and keyed by
+/// embedding model and query text, so neither switching `semantic_search.model`
+/// nor changing the chunking parameters (queries are not chunked) needs a
+/// clear. Clear it when the service starts producing different vectors under
+/// the same model name — otherwise stale cached vectors silently degrade recall
+/// until the configured TTL (`query_embedding_cache_ttl_secs`, default 1 day)
+/// expires.
 pub async fn vector_query_cache_clear(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     info!("clearing system-wide query embedding cache");
     let cleared = state.store.clear_query_embedding_cache().await.map_err(|e| {

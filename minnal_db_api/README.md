@@ -301,7 +301,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
-Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup.
+Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup. The server asks the service for the model named in `semantic_search.model` (default `qwen`) on every embedding request, and its startup probe logs an error if the service does not load that model; `cluster_path` must hold the centroids fitted on that same model.
 
 ### KV store concept
 
@@ -1614,10 +1614,12 @@ indexed fields.
 #### `DELETE /admin/indices/vector/query-cache`
 
 Clears the cache of query embeddings. Semantic search caches each query's
-embedding for a day (`query_embedding_cache_ttl_secs`), keyed only by the query
-text and shared by every namespace. Clear it whenever the embedding service
-starts serving a different model; otherwise repeated queries keep using vectors
-from the old model until they expire.
+embedding for a day (`query_embedding_cache_ttl_secs`), keyed by the embedding
+model and the query text and shared by every namespace. Changing
+`semantic_search.model` needs no clear, since the new model's entries have
+different keys. Clear it when the service starts producing different vectors
+under the same model name (another build of the model behind that name);
+otherwise repeated queries keep using the old vectors until they expire.
 
 ```bash
 curl -X DELETE http://localhost:8080/admin/indices/vector/query-cache
