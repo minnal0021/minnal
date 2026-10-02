@@ -17,7 +17,7 @@ For a hands-on server walkthrough — build, bulk-load, and every endpoint — s
 
 > **Companion UI:** [minnal0021/minnal_ui](https://github.com/minnal0021/minnal_ui) is a lightweight web UI that can be used to drive the minnal doc store.
 
-> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) serves the **gemma** embedding model over HTTP — the external dependency semantic search needs. Run it to get started with the minnal doc store's semantic search, then point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`).
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) serves the **gemma** (EmbeddingGemma-300M) and **qwen** (Qwen3-Embedding-8B) embedding models over HTTP — the external dependency semantic search needs. Run it to get started with the minnal doc store's semantic search, point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`), and set `semantic_search.model` to the model to embed with (default `qwen`) and `cluster_path` to that model's centroids.
 
 ---
 
@@ -221,13 +221,15 @@ Accuracy is validated in the test suite: at 8 bits, the relative error against t
 
 #### Embedding Service
 
-The embedding service is an external HTTP endpoint. Chunking/tokenisation happens in minnal (`semantic_search::chunking`); the service receives a batch of pre-prepared payload strings (one per chunk) and returns a parallel array of embeddings — one embedding per payload, in the same order:
+The embedding service is an external HTTP endpoint. Chunking/tokenisation happens in minnal (`semantic_search::chunking`); the service receives a batch of pre-prepared payload strings (one per chunk) and returns a parallel array of embeddings — one embedding per payload, in the same order. One service can load several models, so every request names the model in its path; `{model}` is the configured `semantic_search.model` (e.g. `gemma` or `qwen`):
 
 ```
-POST {base_url}/embedding/document   {"payloads": [str, ...], "dimensions": N}  →  {"embeddings": [[f32], ...]}
-POST {base_url}/embedding/query      (same request/response shape)
-GET  {base_url}/healthcheck
+POST {base_url}/embedding/{model}/document   {"payloads": [str, ...], "dimensions": N}  →  {"embeddings": [[f32], ...]}
+POST {base_url}/embedding/{model}/query      (same request/response shape)
+GET  {base_url}/healthcheck                  → {"status": ..., "models": {"<model>": {"status": "ok", ...}, ...}}
 ```
+
+A model the service was not started with answers 404. At startup the server checks that the healthcheck lists the configured model as ready and that a probe embedding through both endpoints has `embedding_dim` dimensions; a failure is logged and semantic search reports the error at request time.
 
 #### Adding a New Embedding Model
 
@@ -254,7 +256,7 @@ The set of models is **data-driven** — no code change or recompile is required
 
    At startup the server validates that each declared model's cluster file exists and that its centroids match the declared `dimension`, and — when the list is non-empty — that the active `model` is one of the declared entries.
 
-5. **Point the embedding service at the model** so `/embedding/document` and `/embedding/query` return vectors of the matching dimension. The model name is *not* sent to the service (the URL has no model segment); which concrete model produces the embeddings is the service's own concern. minnal uses the name only to pick the cluster file and dimension.
+5. **Serve the model from the embedding service under the same name.** minnal sends the active `model` (lower-cased) as the `{model}` segment of every request — `/embedding/e5/document` and `/embedding/e5/query` here — so the service must load a model under that key and return vectors of `embedding_dim` dimensions for it. The companion service serves `gemma` and `qwen`; another model needs adding to the service first.
 
 6. **Re-index affected namespaces.** Existing vectors were quantised against the previous model's centroids/dimension and are not comparable. Since secondary indices are reconstructable, re-embed each namespace you want searchable under the new model with `POST /admin/indices/{ns}/vector/reindex-all` — it re-enqueues every document for embedding (a fresh full build) and returns `202 Accepted`. For a clean slate first (recommended when the dimension changes), clear the old vectors with `DELETE /admin/indices/{ns}/vector/drop-all` before re-indexing.
 

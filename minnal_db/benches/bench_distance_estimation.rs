@@ -7,7 +7,8 @@
 //! `benches/data/bench_embeddings.json` for reuse.
 //!
 //! To use embeddings from the live embedding service instead, populate that file yourself
-//! using the service's HTTP API (POST to /embedding/document) before running the
+//! using the service's HTTP API (POST to /embedding/{model}/document, e.g.
+//! /embedding/gemma/document) before running the
 //! bench.  The expected JSON format is:
 //!   { "query": [f32; 768], "docs": [[f32; 768]; N] }
 

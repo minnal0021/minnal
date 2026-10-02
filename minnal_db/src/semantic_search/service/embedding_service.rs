@@ -2,17 +2,20 @@
 //!
 //! The service no longer chunks text — chunking/tokenisation lives in
 //! [`crate::semantic_search::chunking`].  Each call posts a list of already-prepared payload
-//! strings and gets back one embedding per payload:
+//! strings to the endpoint for the configured model and gets back one embedding
+//! per payload:
 //!
 //! ```text
-//! POST {base}/embedding/document   {"payloads":[...],"dimensions":D}  ->  {"embeddings":[[f32], ...]}
-//! POST {base}/embedding/query      (same request/response shape)
+//! POST {base}/embedding/{model}/document   {"payloads":[...],"dimensions":D}  ->  {"embeddings":[[f32], ...]}
+//! POST {base}/embedding/{model}/query      (same request/response shape)
+//! GET  {base}/healthcheck                  -> {"status":..., "models":{"<model>":{"status":"ok"|..., ...}, ...}}
 //! ```
 //!
+//! A service can load several models, so the model is named on every request
+//! (`{model}` is e.g. `gemma` or `qwen`); one it does not serve answers 404.
 //! A "single" whole-text embedding is just a one-element `payloads` array (a
 //! query is always one payload: queries are not chunked); a document passes its
-//! whole text plus one payload per sentence-window chunk.  The old
-//! `{model}` path segment is gone (the model is fixed server-side).
+//! whole text plus one payload per sentence-window chunk.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -58,6 +61,22 @@ pub enum EmbeddingError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// The service answered with a non-2xx status. `detail` is the service's
+    /// error message when it sent one (e.g. `Unknown model 'foo'; available:
+    /// gemma, qwen` for a model it does not serve), otherwise the raw body.
+    #[error("Embedding service returned HTTP {status} for {url}: {detail}")]
+    Status { status: u16, url: String, detail: String },
+
+    /// `/healthcheck` lists the models the service loads, and the configured
+    /// model is not among them.
+    #[error("Embedding service does not serve model '{model}' (available: {available})")]
+    ModelNotServed { model: String, available: String },
+
+    /// The service loads the configured model but reports it is not ready
+    /// (`loading` while it starts, `unreachable` if its model server is down).
+    #[error("Embedding service model '{model}' is not ready (status: {status})")]
+    ModelNotReady { model: String, status: String },
+
     #[error("Embedding service returned an empty response")]
     EmptyResponse,
 
@@ -76,18 +95,18 @@ pub enum EmbeddingError {
 /// Which embedding endpoint a batch is destined for.
 ///
 /// The service exposes separate document and query endpoints because the model
-/// embeds the two asymmetrically; this selects the URL path segment under
-/// `{base_url}/embedding/`.
+/// embeds the two asymmetrically; this selects the last URL path segment,
+/// under `{base_url}/embedding/{model}/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingTarget {
-    /// Documents being indexed → `/embedding/document`.
+    /// Documents being indexed → `/embedding/{model}/document`.
     Document,
-    /// Search queries → `/embedding/query`.
+    /// Search queries → `/embedding/{model}/query`.
     Query,
 }
 
 impl EmbeddingTarget {
-    /// The path segment under `{base_url}/embedding/` for this target.
+    /// The path segment under `{base_url}/embedding/{model}/` for this target.
     fn path_segment(self) -> &'static str {
         match self {
             EmbeddingTarget::Document => "document",
@@ -109,9 +128,34 @@ struct BatchEmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+/// The parts of `/healthcheck` the client reads. `models` maps each model the
+/// service loads to its state; a service that omits it is judged by the HTTP
+/// status alone.
+#[derive(Deserialize)]
+struct HealthResponse {
+    #[serde(default)]
+    models: Option<std::collections::BTreeMap<String, ModelHealth>>,
+}
+
+#[derive(Deserialize)]
+struct ModelHealth {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// The service's error body (FastAPI's `{"detail": "..."}`).
+#[derive(Deserialize)]
+struct ErrorBody {
+    detail: serde_json::Value,
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// POST `payloads` to the embedding endpoint for `target` and return one vector per payload.
+/// POST `payloads` to `model`'s embedding endpoint for `target` and return one
+/// vector per payload.
+///
+/// A model the service does not serve fails with [`EmbeddingError::Status`]
+/// (404, carrying the service's list of available models).
 ///
 /// `request_timeout` caps the whole round trip (connect + send + receive) so a slow
 /// service cannot stall the caller; `connect_timeout` caps just the TCP connect phase
@@ -119,38 +163,55 @@ struct BatchEmbedResponse {
 /// without making a request when `payloads` is empty.
 pub async fn embed(
     base_url: &str,
+    model: &str,
     target: EmbeddingTarget,
     payloads: &[String],
     dimension: usize,
     request_timeout: Duration,
     connect_timeout: Duration,
 ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-    let url = format!("{}/embedding/{}", base_url, target.path_segment());
+    let url = format!("{}/embedding/{}/{}", base_url, model, target.path_segment());
     post_embed_batch(&url, payloads, dimension, request_timeout, connect_timeout).await
 }
 
-/// GET `{base_url}/healthcheck` and return `Ok(())` on a successful response.
+/// GET `{base_url}/healthcheck` and check that `model` is loaded and ready.
+///
+/// The service answers 503 while *any* of its models is still loading, so the
+/// verdict comes from `model`'s own entry in the `models` map rather than the
+/// HTTP status: [`EmbeddingError::ModelNotServed`] if it is absent,
+/// [`EmbeddingError::ModelNotReady`] if its status is not `ok`. A response
+/// without a `models` map must simply be 2xx.
 ///
 /// `request_timeout` caps the whole round trip so the startup probe cannot hang;
 /// `connect_timeout` caps the TCP connect phase (bound at first client build).
-pub async fn check_health(base_url: &str, request_timeout: Duration, connect_timeout: Duration) -> Result<(), EmbeddingError> {
+pub async fn check_health(base_url: &str, model: &str, request_timeout: Duration, connect_timeout: Duration) -> Result<(), EmbeddingError> {
     let url = format!("{}/healthcheck", base_url);
     debug!("embedding service health check url={}", url);
-    client(connect_timeout)
-        .get(&url)
-        .timeout(request_timeout)
-        .send()
-        .await
-        .map_err(|e| {
-            warn!("embedding service health check failed: {}", e);
-            e
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            warn!("embedding service returned non-2xx status: {}", e);
-            e
-        })?;
-    Ok(())
+    let response = client(connect_timeout).get(&url).timeout(request_timeout).send().await.map_err(|e| {
+        warn!("embedding service health check failed: {}", e);
+        e
+    })?;
+    let status = response.status();
+    let body = response.text().await?;
+    let models = serde_json::from_str::<HealthResponse>(&body).ok().and_then(|h| h.models);
+    let Some(models) = models else {
+        if status.is_success() {
+            return Ok(());
+        }
+        warn!("embedding service returned non-2xx status: {}", status);
+        return Err(status_error(status, url, &body));
+    };
+    match models.get(model) {
+        None => Err(EmbeddingError::ModelNotServed {
+            model: model.to_string(),
+            available: models.keys().cloned().collect::<Vec<_>>().join(", "),
+        }),
+        Some(m) if m.status.as_deref() == Some("ok") => Ok(()),
+        Some(m) => Err(EmbeddingError::ModelNotReady {
+            model: model.to_string(),
+            status: m.status.clone().unwrap_or_else(|| "unknown".to_string()),
+        }),
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -174,8 +235,12 @@ async fn post_embed_batch(
             dimensions: dimension,
         })
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(status_error(status, url.to_string(), &body));
+    }
     let BatchEmbedResponse { embeddings } = response.json().await?;
     if embeddings.is_empty() {
         return Err(EmbeddingError::EmptyResponse);
@@ -195,6 +260,23 @@ async fn post_embed_batch(
         }
     }
     Ok(embeddings)
+}
+
+/// Build [`EmbeddingError::Status`], preferring the service's `detail` message
+/// over the raw body.
+fn status_error(status: reqwest::StatusCode, url: String, body: &str) -> EmbeddingError {
+    let detail = match serde_json::from_str::<ErrorBody>(body) {
+        Ok(ErrorBody {
+            detail: serde_json::Value::String(msg),
+        }) => msg,
+        Ok(ErrorBody { detail }) => detail.to_string(),
+        Err(_) => body.chars().take(500).collect(),
+    };
+    EmbeddingError::Status {
+        status: status.as_u16(),
+        url,
+        detail,
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +309,7 @@ mod tests {
         let start = Instant::now();
         let result = embed(
             &base,
+            "gemma",
             EmbeddingTarget::Document,
             &["hello".to_string()],
             8,
@@ -249,6 +332,7 @@ mod tests {
     async fn embed_empty_payloads_makes_no_request() {
         let result = embed(
             "http://127.0.0.1:1", // unroutable; must never be contacted
+            "gemma",
             EmbeddingTarget::Document,
             &[],
             8,

@@ -57,10 +57,11 @@ const EMBEDDING_SUPPORT_DIR: &str = "service/embedding_support";
 /// centroids match the declared `dimension` — there is no hard-coded list of
 /// recognised models.
 ///
-/// The name is purely internal: minnal never sends it to the embedding service
-/// (requests always go to `{url}/embedding/document` and `.../query` with no
-/// model segment). It only selects which cluster file and embedding dimension
-/// this instance uses.
+/// The name is also the model key the embedding service is asked for: the
+/// active `semantic_search.model` is sent, lower-cased, as the `{model}` path
+/// segment of every request (`{url}/embedding/{model}/document` and
+/// `.../query`), so a declared name must be one the service serves (the
+/// companion service serves `gemma` and `qwen`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportedModelEntry {
     /// Model identifier. The corresponding cluster file is expected at
@@ -648,15 +649,22 @@ pub struct SemanticSearchSection {
 
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     ///
-    /// Requests are a batch POST to `{url}/embedding/document` and
-    /// `{url}/embedding/query` with body `{"payloads": [str, ...], "dimensions": N}`,
-    /// returning `{"embeddings": [[f32], ...]}`. Chunking happens in minnal.
+    /// Requests are a batch POST to `{url}/embedding/{model}/document` and
+    /// `{url}/embedding/{model}/query` with body
+    /// `{"payloads": [str, ...], "dimensions": N}`, returning
+    /// `{"embeddings": [[f32], ...]}`, where `{model}` is [`model`](Self::model).
+    /// Chunking happens in minnal.
     #[serde(default = "default_embedding_service_url")]
     pub embedding_service_url: String,
 
-    /// Embedding model to use.  Selects which cluster file and embedding
-    /// dimension this instance uses; should name one of the
-    /// [`supported_models`](Self::supported_models) entries.  Default: `"qwen"`.
+    /// Embedding model to use, e.g. `"gemma"` or `"qwen"`.  Sent (lower-cased)
+    /// to the embedding service as the `{model}` path segment of every request,
+    /// so it chooses which of the service's loaded models embeds the text; the
+    /// startup probe checks the service loads it.  When
+    /// [`supported_models`](Self::supported_models) is non-empty it must name
+    /// one of the entries.  It must match the model `cluster_path`'s centroids
+    /// were fitted on, and changing it requires a corpus re-index.
+    /// Default: `"qwen"`.
     #[serde(default = "default_model")]
     pub model: String,
 
@@ -786,7 +794,7 @@ pub struct ResolvedSemanticSearchConfig {
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     pub embedding_service_url: String,
 
-    /// Embedding model name, e.g. `"qwen"`.
+    /// Embedding model requested from the service, lower-cased, e.g. `"qwen"`.
     pub model_name: String,
 
     /// Maximum number of results returned by a semantic search query.
@@ -825,7 +833,9 @@ impl SemanticSearchSection {
             n_probes: self.n_probes,
             number_of_bits_for_dense_quantisation: self.number_of_bits_for_dense_quantisation,
             embedding_service_url: self.embedding_service_url.clone(),
-            model_name: self.model.clone(),
+            // The service's model keys are lower-case, and the supported-models
+            // check and cluster-file lookup already match case-insensitively.
+            model_name: self.model.to_lowercase(),
             top_k_results: self.top_k_results,
             window_size: self.window_size,
             sliding_size: self.sliding_size,
@@ -983,6 +993,15 @@ mod tests {
         }];
         let err = cfg.validate_active_model_listed().unwrap_err();
         assert!(err.contains("qwen") && err.contains("supported_models"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_lower_cases_the_model_name() {
+        let section = SemanticSearchSection {
+            model: "Gemma".to_string(),
+            ..SemanticSearchSection::default()
+        };
+        assert_eq!(section.resolve(Path::new("/tmp/db")).model_name, "gemma");
     }
 
     #[test]

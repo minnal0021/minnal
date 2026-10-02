@@ -31,9 +31,11 @@ For running minnal as a REST **service** instead, see
 >    `http://localhost:8001`), which minnal calls to turn text into vectors. To
 >    get started, run the companion reference service,
 >    [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
->    which serves the **gemma** embedding model, then point
+>    which serves the **gemma** and **qwen** embedding models, then point
 >    `SemanticSearchConfig::embedding_service_url` (embedded) or
->    `semantic_search.embedding_service_url` (REST server) at it. Without a
+>    `semantic_search.embedding_service_url` (REST server) at it, and name the
+>    model to embed with in `SemanticSearchConfig::model_name` /
+>    `semantic_search.model` (sent on every request). Without a
 >    service reachable, writes still succeed but vector indexing lags and
 >    semantic *queries* error.
 > 2. a **cluster-centroid file** — pre-computed IVF centroids, downloaded
@@ -41,7 +43,7 @@ For running minnal as a REST **service** instead, see
 >    crate). Two are available, one per supported model:
 >    [gemma](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json)
 >    and [qwen](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json).
->    Use the one matching the model your service serves.
+>    Use the one matching the model you configure.
 >
 > Both are set up in [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
 
@@ -431,7 +433,8 @@ a **document** store or a **KV store whose value type is `str`**
 
 1. an external **embedding service** (default `http://localhost:8001`) — run the
    companion [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
-   which serves the **gemma** model; and
+   which serves the **gemma** and **qwen** models (minnal names the one to use
+   on every request, from `SemanticSearchConfig::model_name`); and
 2. a **cluster-centroid file** — the pre-computed IVF centroids the coarse
    quantiser assigns chunks to. See below.
 
@@ -448,7 +451,7 @@ model:
 
 | Model | Download | View on GitHub | Centroids | Dim | Size |
 |---|---|---|:---:|:---:|:---:|
-| **gemma** (used by the reference embedding service) | [`gemma/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 | 4.4 MB |
+| **gemma** | [`gemma/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 | 4.4 MB |
 | **qwen** | [`qwen/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/qwen/clusters.json) | 256 | 768 | 4.4 MB |
 
 ```sh
@@ -457,15 +460,15 @@ curl -L --create-dirs -o clusters/clusters.json \
   https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json
 ```
 
-Pick the file that matches the model your embedding service serves. Both sets are
-768-dimensional, so minnal cannot tell them apart: `load_with_dim` checks the
-dimension and nothing more. Pair the wrong file with your service and startup
-succeeds, queries return results, and recall is quietly worse — you get no error
-at any point. Matching the two is on you.
+Pick the file that matches the model you set in `model_name` — the model minnal
+asks the service for. Both sets are 768-dimensional, so minnal cannot tell them
+apart: `load_with_dim` checks the dimension and nothing more. Pair the wrong file
+with your model and startup succeeds, queries return results, and recall is
+quietly worse — you get no error at any point. Matching the two is on you.
 
 Neither file is privileged: they are ordinary JSONL, one
 `{"cluster_id": <u32>, "centroid": [f32; dim]}` object per line, and the only
-thing special about them is the model they were fitted on. If you serve a
+thing special about them is the model they were fitted on. If you use a
 different model, run k-means over a sample of your own corpus's embeddings and
 load the result exactly the same way. Whichever file you use, it is read into
 memory once at startup and never mutated afterwards — around 750 KB resident for
@@ -495,7 +498,7 @@ use minnal_db::semantic_search::ClusterIndex;
 use minnal_db::semantic_search::service::SemanticSearchConfig;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let embedding_dim = 768; // must match the model the embedding service serves
+let embedding_dim = 768; // must match the vectors the service returns for `model_name`
 // Path to the centroid file you downloaded above — gemma and qwen centroids are
 // both published in the minnal repo under service/embedding_support/{model}/.
 let cluster_index = Arc::new(ClusterIndex::load_with_dim(
@@ -503,10 +506,11 @@ let cluster_index = Arc::new(ClusterIndex::load_with_dim(
     embedding_dim,
 )?);
 // `embedding_dim` (768) is already the default; it is spelled out here because it
-// must agree with both the centroid file and the model the service serves.
-// `model_name` is inert when embedded — nothing is sent to the service, and it is
-// not used to pick the cluster file (that is the `ClusterIndex` above) — but set it
-// to match, since it defaults to "qwen".
+// must agree with both the centroid file and the vectors the service returns.
+// `model_name` is sent on every request (`/embedding/gemma/document`, `.../query`)
+// and picks which of the service's models embeds the text; it defaults to "qwen".
+// It does not pick the cluster file (that is the `ClusterIndex` above), so keep the
+// two in step.
 let config = SemanticSearchConfig {
     embedding_dim,
     model_name: "gemma".into(),
