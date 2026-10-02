@@ -65,7 +65,8 @@ pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Js
 /// `DELETE /stores/{ns}/indices/{field}` — drop a field index.
 ///
 /// The bitmap files are deleted in a background task.  Returns `202 Accepted`.
-/// Returns `409` when an attribute index operation is already active for this namespace.
+/// Returns `404` when the store does not exist or `field` is not indexed, and
+/// `409` when an attribute index operation is already active for this namespace.
 pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(String, String)>) -> Result<impl IntoResponse, AppError> {
     {
         let ops = state.attr_index_ops.lock();
@@ -74,8 +75,13 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
         }
     }
 
-    // Verify the index exists (fail fast before spawning).
-    state.store.get_schema(&ns).map_err(AppError::from)?;
+    // Verify the store and the index exist (fail fast before spawning). The
+    // background `drop_index` checks again, but by then the caller already has
+    // its 202, so a missing index would only surface as a logged error.
+    let schema = state.store.get_schema(&ns).map_err(AppError::from)?;
+    if !schema.indices.iter().any(|s| s.field == field) {
+        return Err(DocStoreError::IndexNotFound { namespace: ns, field }.into());
+    }
 
     info!(namespace = %ns, field = %field, "dropping index — background cleanup");
     state.attr_index_ops.lock().insert(ns.clone());

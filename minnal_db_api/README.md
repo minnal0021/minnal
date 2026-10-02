@@ -608,7 +608,7 @@ curl -X DELETE http://localhost:8080/stores/users/indices/country
 # → 202 Accepted
 ```
 
-Returns `409 Conflict` if an attribute index operation is already active for this namespace.
+Returns `404 Not Found` if the store does not exist or `{field}` is not an indexed field, and `409 Conflict` if an attribute index operation is already active for this namespace.
 
 ---
 
