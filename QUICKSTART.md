@@ -618,8 +618,12 @@ Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
 Point the server at the one matching `[semantic_search] model` — the model minnal
 asks the embedding service for — via `[semantic_search] cluster_path`. The cluster
 index is loaded once at startup and never mutated. The two settings are separate,
-and both files are 768-dimensional, so pairing the wrong file with the configured
-model passes every startup check and degrades recall *silently*.
+and both files are 768-dimensional, so the wrong file loads without error; search
+then runs slower and returns worse results. The server compares `cluster_path`
+with the bundled file for `model` at startup and logs a **warning** if their
+centroids differ. Expect that warning if you fitted your own centroids; otherwise
+it means the two settings disagree. It can only compare when it is started from
+the workspace root, where `service/embedding_support/` is.
 
 To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at that file instead. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
 

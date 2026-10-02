@@ -16,8 +16,8 @@ COPY . .
 RUN cargo build --release -p minnal_db_api
 
 # Pick the cluster centroids for the model the config names — never a hard-coded
-# model: both bundled sets are 768-dim, so a mismatch passes every load-time
-# check and silently skews the IVF partition.
+# model: both bundled sets are 768-dim, so a mismatch loads without error and
+# silently skews the IVF partition.
 RUN model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' config/sample.toml | head -n 1 | tr '[:upper:]' '[:lower:]')" \
     && test -n "$model" && test -f "service/embedding_support/$model/clusters.json" \
     && cp "service/embedding_support/$model/clusters.json" /build/clusters.json \

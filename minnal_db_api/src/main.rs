@@ -145,6 +145,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     n_probes = semantic_cfg.n_probes,
                     "loaded cluster index for semantic search"
                 );
+                if let Some(bundled) = semantic_cfg.centroid_mismatch() {
+                    warn!(
+                        cluster_path = %path,
+                        model = %semantic_cfg.model_name,
+                        bundled = %bundled.display(),
+                        "cluster_path holds different centroids from the bundled set for the configured model; \
+                         unless they were fitted on that model, vectors are filed into the wrong clusters and \
+                         search is slower and less accurate, with no error",
+                    );
+                }
                 Some(Arc::new(idx))
             }
             Err(e) => {

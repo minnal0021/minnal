@@ -45,10 +45,11 @@ CONFIG_SRC="${WORKSPACE_ROOT}/config/sample.toml"
 STOP_TIMEOUT=30
 
 # ── 0. Resolve and check the cluster centroids (before building or stopping) ─
-# The centroids must be the ones fitted for the model the embedding service
-# serves: both bundled sets are 768-dim, so a mismatch passes every load-time
-# check and silently skews the IVF partition (this script used to hard-code
-# qwen while the config said gemma, so a FiQA query read 92% of its index).
+# The centroids must be the ones fitted for the configured `model` — the model
+# minnal asks the embedding service for: both bundled sets are 768-dim, so a
+# mismatch loads without error and silently skews the IVF partition (this
+# script used to hard-code qwen while the config said gemma, so a FiQA query
+# read 92% of its index).
 MODEL="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${CONFIG_SRC}" | head -n 1 | tr '[:upper:]' '[:lower:]')"
 if [[ -z "${MODEL}" ]]; then
     echo "ERROR: no [semantic_search] model = \"…\" line in ${CONFIG_SRC}" >&2
