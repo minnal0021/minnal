@@ -942,6 +942,20 @@ pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::
     Ok(result)
 }
 
+/// The namespaces that have entries in the embedding queue, read from the keys
+/// alone. The queue key carries the namespace and the value carries the text, so
+/// this never reads a value: after a crash mid bulk-load the queue can hold every
+/// document's text, and the startup drop sweep needs only the namespaces.
+pub async fn queued_namespaces(db: &AsyncDb) -> Result<std::collections::BTreeSet<String>, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    Ok(queue_ns
+        .keys()
+        .await?
+        .iter()
+        .filter_map(|key| decode_queue_key(key).map(|(namespace, _)| namespace.to_owned()))
+        .collect())
+}
+
 /// Look up a single pending embedding queue entry by namespace and document ID.
 ///
 /// Returns `None` when no entry exists for the given `(namespace, doc_id_bytes)` pair.

@@ -292,7 +292,7 @@ impl DocStore {
             .into_iter()
             .filter_map(|(name, _)| vector_kv::companion_base(&name).map(str::to_owned))
             .collect();
-        leftover.extend(vector_kv::list_queue_entries(&self.db).await?.into_iter().map(|e| e.namespace));
+        leftover.extend(vector_kv::queued_namespaces(&self.db).await?);
         leftover.retain(|ns| !semantic.contains(ns));
         for namespace in &leftover {
             warn!("finishing an interrupted vector-index drop for namespace='{namespace}'");
