@@ -167,12 +167,18 @@ pub struct VecReindexProgress {
     pub exhausted_cleared: usize,
     /// Error message when `status == "failed"`.
     pub error: Option<String>,
+    /// Whether every document was enqueued. A `"running"` record without it, and
+    /// with no reindex enqueueing in this process, was cut short by a crash.
+    #[serde(default)]
+    pub enqueue_done: bool,
 }
 
+#[cfg(feature = "semantic-search")]
 pub(super) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
     crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join("vector_reindex.json")
 }
 
+#[cfg(feature = "semantic-search")]
 pub(super) fn read_vec_reindex(path: &Path) -> Option<VecReindexProgress> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()

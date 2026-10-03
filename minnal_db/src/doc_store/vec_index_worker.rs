@@ -130,9 +130,22 @@ pub struct VecIndexWorkerHandle {
     shutdown: Arc<AtomicBool>,
     notify: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
+    startup_pass: tokio::sync::watch::Receiver<bool>,
 }
 
 impl VecIndexWorkerHandle {
+    /// Becomes `true` once the worker has made one pass over the queue it found
+    /// at startup (the work a crash left behind), or found it empty.
+    ///
+    /// Startup reconciliation waits for this. A delete interrupted by a crash
+    /// leaves the document, no vectors and a `Clear` tombstone; reconciliation
+    /// never overwrites a tombstone, so run before the tombstone is processed it
+    /// skipped the document, and the tombstone's removal then left it unindexed
+    /// until the next restart (crash-audit test `delete_survives_a_crash_anywhere`).
+    pub fn startup_pass(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.startup_pass.clone()
+    }
+
     /// Signal the worker to stop and await its exit.
     pub async fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -161,6 +174,7 @@ pub(crate) struct VecIndexWorker {
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     config: Arc<VectorIndexConfig>,
+    startup_pass: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl VecIndexWorker {
@@ -172,24 +186,28 @@ impl VecIndexWorker {
     /// fallback poll as a safety net.
     pub fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, notify: Arc<Notify>, config: VectorIndexConfig) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (pass_tx, pass_rx) = tokio::sync::watch::channel(false);
         let worker = VecIndexWorker {
             db,
             ctx,
             notify: Arc::clone(&notify),
             shutdown: Arc::clone(&shutdown),
             config: Arc::new(config),
+            startup_pass: Arc::new(pass_tx),
         };
         let task = tokio::spawn(async move { worker.run().await });
         VecIndexWorkerHandle {
             shutdown,
             notify,
             task: Some(task),
+            startup_pass: pass_rx,
         }
     }
 
     async fn run(self) {
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
+        self.startup_pass.send_replace(true); // also covers an empty queue
         info!("vec index worker ready");
 
         loop {
@@ -408,6 +426,9 @@ impl VecIndexWorker {
                 any_failed |= failed > 0;
             }
 
+            // The first pass over the startup queue is done (see `startup_pass`).
+            self.startup_pass.send_replace(true);
+
             // Per-pass completion summary visible at INFO level.
             info!(
                 "vec index worker: pass complete — indexed={indexed_count} failed={failed_count} \
@@ -443,7 +464,7 @@ impl VecIndexWorker {
                 let vector_indexes = crate::semantic_search::service::embed_document(&self.ctx.config, &self.ctx.cluster_index, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-                vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &vector_indexes).await?;
+                vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {
