@@ -7,14 +7,15 @@ at the end) · branch `dynamic-rabitq-index` · 2026-10-03
 maintain its own IVF partition as documents arrive. Search quality (nDCG, recall)
 and query latency must not regress at any step.
 
-**Approach.** Five milestones (M0–M4), plus a correctness fix (M0-1) found
-while designing M3. Each changes one thing and ends at a
+**Approach.** Five milestones (M0–M4), plus two correctness steps (M0-1, M0-2)
+found while designing M3. Each changes one thing and ends at a
 benchmark gate, so a regression shows up in the milestone that caused it.
 
 | Milestone | What changes | Changes partitioning? | Gate (summary) |
 |---|---|:---:|---|
 | **M0** Benchmark | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
 | **M0-1** Durable re-embed | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; indexing throughput within 5% |
+| **M0-2** Write-path crash audit | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
@@ -316,6 +317,62 @@ readable as soon as they are written.
   completion they cover is unchanged, only deferred.
 - **Gate:** the tests above, and M0's indexing throughput (documents per second,
   embedding excluded) within 5% of the M0 baseline.
+
+---
+
+## M0-2 — Crash audit of the vector-index write paths
+
+M0-1 came from tracing one write path. The same class of bug (a WAL-backed
+write made durable before the no-WAL data it depends on) may exist in others.
+M0-2 traces every multi-step vector-index write, records what a crash at each
+step can lose and what redoes it, and adds a crash test per path. Any gap found
+is fixed inside M0-2, with a regression test that fails before the fix.
+
+It is an audit, not new infrastructure. The redo-only journal stays in M3a,
+where its first real user (split, merge, reassign) defines what it must record.
+Today's paths already have redo sources: the vector queue, the `Clear`
+tombstone, and the reindex progress record.
+
+### Paths to audit
+
+| Path | Redo source today | What to check |
+|---|---|---|
+| Re-embed (`finish_embed` → `upsert_vectors`) | Vector queue | Fixed by M0-1; its tests join this suite |
+| Delete / clear (`clear_vectors` → `process_clear`) | `Clear` tombstone, written first | All writes WAL-backed; confirm a crash at each step leaves the tombstone or no vectors |
+| Vanished-document cleanup in `finish_embed` | Next worker pass? | A crash after the vector write and before its `delete_vector`: is anything left that re-checks the document? |
+| Startup reconciliation (`enqueue_embed_if_absent`) | Itself, at the next start | Its cheap completeness check passes stale vectors (M0-1's case); confirm that after M0-1 nothing reaches that state |
+| `reindex-all` | `vector_reindex.json` progress record | Resume after a crash mid-enqueue; old and new codes mixed while it runs |
+| Drop vector index / drop store | Registry-first ordering | No sidecar data or queue entries left behind after a crash at each step |
+| Query-cache clear | WAL-backed deletes | Already reasoned in `semantic_search/CLAUDE.md`; one test to pin it |
+
+For each path the audit records the write sequence, which writes are WAL-backed
+and which no-WAL, the crash points between them, and what restores consistency.
+The table goes into `semantic_search/CLAUDE.md` next to the existing durability
+notes.
+
+### Shared crash-test helper
+
+One helper, reused later by the M3a split tests:
+
+1. run a scripted sequence of steps up to step N;
+2. crash with `std::mem::forget(db)`, which loses every unflushed no-WAL write,
+   as a real process crash does;
+3. reopen, then run what production runs after a restart: startup
+   reconciliation and the worker's next pass;
+4. check the invariants:
+   - every sparse key a document has is listed in its meta;
+   - no vectors remain for a deleted document;
+   - an indexed document's vectors match its current text (the dense entry's
+     tag, as the existing R1–R3 tests check);
+   - no queue entry is lost while its work is undone.
+
+Each path's test runs the helper for every N.
+
+### Gate
+
+One crash test per path, each covering every crash point, all passing; any gap
+found fixed with a test that failed before the fix. No change to indexing
+throughput beyond M0-1's.
 
 ---
 
