@@ -7,6 +7,8 @@ pub mod metrics;
 pub mod quantisation;
 pub mod service;
 pub(crate) mod simd;
+#[cfg(test)]
+mod vector_bench;
 pub mod vector_math;
 
 pub use self::chunking::chunk_document;
