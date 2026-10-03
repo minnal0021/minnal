@@ -531,33 +531,121 @@ the wrong variant.
   posting-size events. It runs off the request path, on `spawn_blocking` plus its
   own small thread budget, not the rayon pool searches share (the
   `SCORING_GATE` rules).
-- **Split protocol** (copy, then delete; never a hole):
-  1. Read posting P's entries. Reconstruct `x̂ = c + scaling_factor ·
-     P(2b − 1)` (unrotated), and run balanced 2-means.
-  2. WAL: append two centres; write postings P1 and P2 (`Active`); mark P
-     `Draining`; write a split record `{P → P1, P2, state: Planned}`.
-  3. **Routing epoch.** Inserts route and write while holding a per-namespace
-     tokio `RwLock` read guard, inside the existing `lock_doc_vectors`. The split
-     takes the write guard just long enough to publish a snapshot where P is
-     `Draining`: still probed by search, never chosen by inserts. After that
-     point, no insert that routed with the old snapshot is still writing.
-     Split record → `Published`.
-  4. Move each P entry to P1 or P2 (nearest routing centroid by code estimate).
-     Under the doc lock: put the new key, update `{ns}_sparse_vector_meta`,
-     delete the old key. Then rescan P once; it must be empty. P → `Retired`;
-     split record → `Done`.
-- **Duplicates are harmless** in the window (MaxSim takes each document's
-  max), and holes cannot happen (copy before delete).
-- **Recovery:** on open, finish any `Published` split (step 4 is idempotent)
-  and abandon any `Planned` one. Orphan centres are harmless. A startup check
-  moves any entry found under a `Retired` prefix.
+- **Every maintenance operation goes through a journal** (next section),
+  so a crash at any point is finished by recovery, never left half done.
+
+#### Maintenance journal
+
+The store has no transactions, and the design does not need them: no step has to
+change several keys at once. It needs single-key atomic state changes (a
+WAL-backed `put`), steps that are safe to repeat, and a guaranteed order in
+which writes become durable. The journal provides the first two; the barrier
+rule below provides the third.
+
+**Format.** One WAL-backed companion namespace, `{ns}_ivf_journal`:
+
+| Key | Value |
+|---|---|
+| `op_id` (u64 BE, increasing) | `{ kind: Split \| Merge \| Reassign \| Rebuild, plan, state }` |
+
+- **The plan is a rule, not a list of entries.** For a split: "entries of P go
+  to whichever of R1 or R2 is nearer, measured from their codes", with P, the
+  child posting ids, their routing centroids and their new centre ids stored in
+  the record. Re-running the plan gives the same assignment every time, and the
+  record stays small however large P is. A rebuild covers the whole namespace,
+  so it is written as one record per batch of postings.
+- **Redo only, no undo log.** Every step is copy-then-delete, so the old state
+  stays intact until the plan commits, and recovery always rolls forward. The
+  only "undo" is abandoning a plan that never published, which just deletes its
+  empty child postings. An undo log would have to capture the previous values of
+  no-WAL entries, which are themselves not durable.
+- **One writer per namespace** (the maintenance task), so operations never
+  interleave and replaying open records in `op_id` order is correct.
+
+**Split, step by step.** Each state change is one WAL-backed put of the journal
+record.
+
+| Step | Writes | Durable how | Record state after |
+|---|---|---|---|
+| 1. Plan | Read P, reconstruct `x̂ = c + scaling_factor · P(2b − 1)` (unrotated), run balanced 2-means. Write the record | WAL | `Planned` |
+| 2. Prepare | Append the two centres; write postings P1, P2 (`Active`); mark P `Draining` | WAL | `Planned` |
+| 3. Publish | Take the routing-epoch write guard (below), publish a snapshot where inserts never choose P but search still probes it | WAL | `Published` |
+| 4. Copy | Per doc, under `lock_doc_vectors`: add P1/P2 to the doc's meta, then write its chunks under `P1‖doc` / `P2‖doc` | **no-WAL** | `Published` |
+| 5. Barrier | Flush the sparse and meta namespaces to L0 (the flush fsyncs the value log first) | flush | `Copied` |
+| 6. Delete | Per doc, under the lock: delete `P‖doc`, then remove P from the doc's meta. Rescan P; it must be empty | WAL (deletes), no-WAL (meta) | `Copied` |
+| 7. Retire | Mark P `Retired`; publish the snapshot | WAL | `Done` |
+
+**Recovery** runs at open, before the vector worker and reconciliation start.
+It finishes every record that is not `Done`, in `op_id` order:
+
+| Last durable state | Recovery |
+|---|---|
+| No record | Nothing happened. Any centres appended are unreferenced and harmless. |
+| `Planned` | Abandon: delete the child postings (they are empty, since inserts only route to them after `Published`), restore P to `Active`, mark the record `Done`. |
+| `Published` | Redo steps 4–7. Step 4 is safe to repeat; it may re-copy entries that did survive. |
+| `Copied` | Redo steps 6–7. |
+| `Done` | Nothing. `Done` records are deleted, or the last N kept for diagnostics. |
+
+A merge or a reassignment follows the same table with its own plan. A merge
+moves all of P's entries to their nearest remaining postings; a reassignment
+moves the entries the plan selects from neighbouring postings.
+
+**Rules the steps depend on.**
+
+1. **Barrier before delete.** Copies are no-WAL, deletes are WAL-backed, and a
+   WAL-backed write is durable the moment it returns while a no-WAL one is
+   durable only after the next memtable flush. Without step 5, a crash after a
+   delete but before the flush loses the copy and the chunk is gone for good.
+   Copy order alone does not help; durability order does. One flush per
+   operation, not per entry. (Making the copies WAL-backed would also work, at
+   roughly one extra fsync per insert at the measured 0.5–0.9 moves per insert.)
+2. **The meta is always a superset.** `{ns}_sparse_vector_meta` is the only
+   record of which postings hold a doc's chunks, and `delete_vector` deletes
+   exactly what it lists. A posting missing from the meta becomes an orphan: the
+   chunk of a deleted doc keeps appearing in search. So a posting is added to
+   the meta before the copy and removed only after the delete. An extra posting
+   is harmless (deleting an absent key does nothing). The barrier makes this
+   hold across the two no-WAL meta writes.
+3. **Values are lists.** The key `posting ‖ doc_id` holds all of that doc's
+   chunks in that posting, so a move splits or merges lists. Every move runs
+   under `lock_doc_vectors`, which serialises all writers of a doc's vector keys,
+   so a plain get and put is enough. The move re-reads its source under the
+   lock and skips it if an upsert or delete already changed it. A repeated move
+   must not append a chunk that is already there: chunk codes carry no id, so
+   de-duplicate by comparing bytes.
+4. **Routing epoch.** Inserts route and write while holding a per-namespace
+   tokio `RwLock` read guard, inside `lock_doc_vectors`. Step 3 takes the write
+   guard only to publish, so once it returns no insert that routed with the old
+   snapshot is still writing to P.
+5. **Recovery comes first.** Reconciliation treats `Draining` and `Retired`
+   postings as part of the journal's work: an entry under a retired prefix is
+   moved, not reported as an orphan.
+
+Search tolerates the intermediate states: duplicates during a move score the
+same (MaxSim takes each document's maximum), and holes cannot occur.
+
+**Related finding in today's code.** `upsert_vectors` has the rule 1 problem
+already. Re-embedding an indexed document whose chunks change clusters deletes
+the stale keys (WAL, durable at once), then writes the new keys and meta
+(no-WAL). A crash before the next flush loses the new keys and meta, while the
+old meta and dense entry, flushed earlier, still make `has_complete_vector_index`
+report the document as complete, so startup reconciliation skips it. Only the
+validating reconcile (`check_bytes = true`) notices. The same rule fixes it: the
+vector queue is already a redo log for embedding, so complete a batch's queue
+entries only after a flush of the namespaces holding its no-WAL writes. Not
+reproduced yet; it needs the discard hook below.
 
 **Gate (SciFact and FiQA, empty namespace, no file, all three orders):**
 recall within 2 pts of (iv) at equal entries scanned; largest posting < 1%
 (today 43% on SciFact); nDCG@10 ≥ M2d − 0.005. Plus these tests:
 
-- a **kill-during-split** test at each step boundary (fault injection), next to
-  `racing_upsert_and_delete_leave_no_orphaned_cluster_keys`
+- a **crash at every step boundary** of the table above, next to
+  `racing_upsert_and_delete_leave_no_orphaned_cluster_keys`. The existing
+  SIGKILL tests cannot see rule 1, because a killed process keeps the page
+  cache. These need a test hook that **discards unflushed no-WAL memtables**
+  (simulating power loss) at a chosen step. After reopen and recovery, check
+  that every posting key a doc has is listed in its meta, that no chunk is
+  missing, and that no chunk of a deleted doc remains
 - racing inserts and deletes against a split: no lost or orphaned keys, and the
   meta stays consistent
 - search results during a split: a superset of before or after, never missing a
@@ -601,7 +689,8 @@ the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
 | Mixed old/new codes in one namespace | M1, M2 | `index_format` check refuses search; rebuild by drop + re-enable, not `reindex-all` |
 | Rotated/unrotated mix-up (`q` vs `q'`, `c` vs `Pᵀc`) | M1 | Consistency test against explicitly rotated inputs; estimator-RMSE gate |
 | Hot-path cost of per-entry centre lookup | M2b | Dense `Vec` index; latency gate on this sub-step alone |
-| Split races with inserts and deletes; crash mid-split | M3a | Routing epoch + doc lock; WAL split record; fault-injection tests |
+| Split races with inserts and deletes; crash mid-split | M3a | Maintenance journal (redo only); barrier before delete; meta kept a superset; routing epoch + doc lock; crash tests that discard unflushed no-WAL writes |
+| No-WAL write lost while a WAL-backed delete survives | M3a, today's `upsert_vectors` | Barrier before delete; queue completion after flush |
 | Write amplification from reassignment | M3b | Measured in M3-pre; `k` is a knob (0 = off) |
 | Early-life quality before the first splits | M3 | M3-pre decides float seeding; flat scan while small |
 | Two models in one process | M2a | Per-namespace probe and cache key; test with gemma + qwen |
