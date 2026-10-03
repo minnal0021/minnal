@@ -15,7 +15,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 |---|---|:---:|---|
 | **M0** Benchmark ✓ | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
 | **M0-1** Durable re-embed ✓ | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; end-to-end indexing throughput within 5% |
-| **M0-2** Write-path crash audit | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
+| **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
@@ -430,6 +430,40 @@ Each path's test runs the helper for every N.
 One crash test per path, each covering every crash point, all passing; any gap
 found fixed with a test that failed before the fix. No change to indexing
 throughput beyond M0-1's.
+
+### Findings and fixes (2026-10-03)
+
+Five gaps, each fixed with a test that fails without the fix (checked by undoing
+the fix and rerunning). Search results are byte-identical to the M0 baseline on
+both datasets; the codes themselves did not change.
+
+| # | Gap | Consequence | Fix | Test |
+|---|---|---|---|---|
+| 1 | The meta and the chunk keys are no-WAL writes to different namespaces, which flush independently | A key durable while its meta is lost: a later delete misses it for good, a reused id inherits it | Meta written WAL-backed, after the stale deletes and before the new keys | `delete_racing_a_reembed_survives_a_crash_anywhere` |
+| 2 | A crash between a document write and its embed enqueue | New text saved, old vectors kept, nothing queued; they looked complete forever | The meta records a hash of the embedded text; reconciliation compares it with the current text (no count short-circuit) | `reembed_survives_a_crash_anywhere`, `test_reconcile_reembeds_vectors_of_stale_text` |
+| 3 | The vanished-document cleanup ran after the queue completion | Vectors of a deleted document kept, with nothing left to remove them | Cleanup runs before the completion | `embedding_a_vanished_document_survives_a_crash_anywhere` |
+| 4 | Startup reconciliation ran concurrently with the worker's crash-recovery pass | A delete cut short left a document unindexed until the next restart | Reconciliation waits for the worker's first pass | `startup_reconciliation_runs_after_the_crash_queue_is_processed` |
+| 5 | An interrupted vector-index drop was never finished | Vector data and queue entries of a dropped index kept; the worker recreated its namespaces | Finished at open, before any worker starts | `an_interrupted_vector_index_drop_is_finished_at_open` |
+
+One more, not crash-related, found on the same path: a reindex record never left
+`"running"` (nothing wrote `"complete"`), so every second `reindex-all` on a store
+was refused with 409. Concurrency is now an in-memory claim held while the
+reindex enqueues, and the record is brought up to date when read (`"complete"`
+once the queue drains, `"failed"` if a crash cut the enqueue short). Tests:
+`a_finished_reindex_does_not_block_the_next`,
+`a_reindex_interrupted_by_a_crash_does_not_block_the_next`.
+
+Paths checked and already safe: the delete path (`clear_vectors` →
+`process_clear`, all WAL-backed, covered by `delete_survives_a_crash_anywhere`)
+and the query-cache clear (pinned by `test_cache_clear_survives_crash_before_flush_tick`).
+
+**Cost.** One WAL fsync per document upsert (the meta): indexing throughput,
+embedding excluded, is within run-to-run noise on this NVMe host (FiQA 15,287 →
+15,415 docs/s). Startup reconciliation now reads every document: 1.44 s for
+57,600 entries, once per start, in the background (it was 0.08 s with the count
+short-circuit, which could not see stale vectors).
+
+**Status: passed.**
 
 ---
 
