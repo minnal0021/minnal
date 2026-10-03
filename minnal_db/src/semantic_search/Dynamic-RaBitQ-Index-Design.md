@@ -18,7 +18,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-2** Write-path crash audit | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
-| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
+| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 
 The research behind this design (production systems, papers, the 109k-passage
@@ -803,6 +803,69 @@ float-seeded k-means with exact re-encode, or none if (i) is enough. **Gate:**
 the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
 
 ---
+
+### Re-encode strategies (per-namespace policy)
+
+After a split, merge or rebuild, a moved code keeps its original centre (the
+code-only design above). That code is still **correct**: it scores against the
+centre it names, just with a wider error than a fresh encode against the new,
+nearer centre would have. Re-encoding moved codes is therefore an optional
+**precision** improvement, never a correctness requirement, and it can wait.
+
+Each namespace chooses where re-encoding gets its vectors, as
+`reencode_source` in its schema next to `embedding_model`:
+
+| Policy | Source of vectors for re-encoding | Extra storage | Load on the embedding service | Moved codes |
+|---|---|---|---|---|
+| `none` (default) | None: only keys move | none | none | keep their original centre; slightly less precise |
+| `stored` | The raw embeddings, kept in `{ns}_raw_vector` | about 3 KB per chunk as f32 at 768 dims (FiQA: ~530 MB, against ~19 MB of 1-bit codes); half as f16 | none | re-encoded exactly against the new centre |
+| `service` | The embedding service, called again | none | heavy: re-embedding FiQA takes ~95 min at today's ~10 docs/s, competing with new documents | re-encoded exactly against the new centre |
+
+Users pick the trade-off per namespace: disk for local, fast, service-free
+maintenance (`stored`), or no extra disk at the cost of embedding-service
+capacity (`service`), or neither (`none`).
+
+**Rules shared by all three.**
+
+- **Code-only is the floor.** Split, merge and rebuild ask a *vector source*
+  for a document's vectors. When it has none (policy `none`, a stored vector
+  lost in a crash, the service unavailable), the operation proceeds code-only.
+  So M3 never depends on either optional source.
+- **New documents always come first.** Re-encoding runs from a separate
+  low-priority queue, never ahead of the embed queue. For `service` it is capped
+  at a configured share of embedding requests; for `stored` it is local CPU only.
+  A pending re-encode costs precision, not correctness, so delaying it is
+  always safe.
+- **Re-encodes are journalled** like any other maintenance operation (see
+  *Maintenance journal*): the new code and its `centre_id` replace the old one
+  under the doc lock, and a crash mid-way leaves the old, still-valid code.
+- **One model per store.** The model is fixed per store (M2a), so stored vectors
+  can never come from a different model than the service would use.
+
+**`stored` in more detail.** The raw vectors are written no-WAL alongside the
+codes, at index time, and deleted with them (the meta superset rule covers the
+key). Losing one to a crash only drops that document back to `none` until it is
+next embedded. Beyond re-encoding, stored vectors give exact k-means for
+rebuilds (M4), changing the rotation or the dense bit width without the service,
+and a per-namespace exact ground truth for checking recall on live data.
+
+**`service` in more detail.** A re-encode re-embeds the document's text (from the
+store itself), so it needs no extra storage, but each one costs a full embedding
+call. Its queue entries are a separate kind from new-document embeds so the
+worker can always prefer the latter.
+
+**Sequencing.** M3a–M3c ship `none`, which every namespace needs. M3-pre's
+simulation also measures what an exact re-encode is worth on gemma. On the 109k
+WordLlama test it lifted recall@10 before reranking from 0.918 to 0.955; after
+the Pass-2 rerank the gain will be smaller. Both optional strategies are planned:
+
+- **M3d — `stored`:** the raw-vector namespace, the vector-source interface,
+  the low-priority re-encode queue. Gate: after a FiQA split-heavy ingest and a
+  full re-encode, recall within 0.5 pt of a fresh index fitted on the same
+  postings; no change to new-document indexing throughput.
+- **M3e — `service`:** the same interface backed by the embedding service, with
+  the request cap. Gate: under continuous new-document load, new-document
+  indexing throughput stays within 5% while re-encodes drain.
 
 ## M4 — Rebuild from codes, then remove the files
 
