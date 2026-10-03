@@ -251,6 +251,47 @@ impl DocStore {
         Ok(specs)
     }
 
+    /// Finish every vector-index drop a crash interrupted; returns how many.
+    ///
+    /// Dropping a vector index saves the schema with semantic search off first
+    /// (so new writes stop enqueueing), then clears the queue and removes the
+    /// vector namespaces in the background ([`drop_vector_index_data`]). A crash
+    /// in between left the vectors and the queue entries for good, and the worker
+    /// would even process those entries, recreating the vector namespaces of a
+    /// store without semantic search. Dropping a whole store has the same shape.
+    /// So at open, before any worker starts, every namespace that has vector data
+    /// or queue entries but no semantic-search schema gets the cleanup finished.
+    ///
+    /// [`drop_vector_index_data`]: DocStore::drop_vector_index_data
+    #[cfg(feature = "semantic-search")]
+    pub(super) async fn finish_interrupted_vector_index_drops(&self) -> Result<usize, DocStoreError> {
+        let mut semantic: std::collections::HashSet<String> = self
+            .load_all_schemas()?
+            .into_iter()
+            .filter(|s| s.is_semantic_search_enabled())
+            .map(|s| s.namespace)
+            .collect();
+        semantic.extend(
+            self.load_all_kv_schemas()?
+                .into_iter()
+                .filter(|s| s.is_semantic_search_enabled())
+                .map(|s| s.namespace),
+        );
+        let mut leftover: std::collections::BTreeSet<String> = self
+            .db
+            .list_namespaces()
+            .into_iter()
+            .filter_map(|(name, _)| vector_kv::companion_base(&name).map(str::to_owned))
+            .collect();
+        leftover.extend(vector_kv::list_queue_entries(&self.db).await?.into_iter().map(|e| e.namespace));
+        leftover.retain(|ns| !semantic.contains(ns));
+        for namespace in &leftover {
+            warn!("finishing an interrupted vector-index drop for namespace='{namespace}'");
+            self.drop_vector_index_data(namespace).await?;
+        }
+        Ok(leftover.len())
+    }
+
     /// Delete all vector-index backing data for a namespace.
     ///
     /// Clears:

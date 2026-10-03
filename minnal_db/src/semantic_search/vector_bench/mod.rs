@@ -358,7 +358,7 @@ async fn vector_bench() {
             set.spawn(async move {
                 let _permit = permit;
                 let vis = index_embeddings(&config, &index, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
-                upsert_vectors(&db, NS, &(d as u64).to_be_bytes(), &vis).await.unwrap();
+                upsert_vectors(&db, NS, &(d as u64).to_be_bytes(), "", &vis).await.unwrap();
             });
         }
         while let Some(r) = set.join_next().await {
@@ -672,7 +672,7 @@ async fn vector_bench_worker_completion() {
             let id = (d as u64).to_be_bytes();
             let entry = get_queue_entry(&db, NS, &id).await.unwrap().unwrap();
             let vis = index_embeddings(&config, &index, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
-            upsert_vectors(&db, NS, &id, &vis).await.unwrap();
+            upsert_vectors(&db, NS, &id, "text", &vis).await.unwrap();
             if flush_first {
                 pending.push(entry);
                 if pending.len() >= BATCH || d + 1 == frozen.n_docs() {
