@@ -234,6 +234,42 @@ the in-process harness can't: the query cache, the REST path, and the
 - **M0 exit:** baseline numbers for `main` (`4397d16`) on both datasets, and two
   back-to-back runs giving identical quality numbers.
 
+### Baseline (measured 2026-10-03, commit `54bea36`)
+
+gemma served by llama.cpp (`embeddinggemma-300M-Q8_0`), bundled gemma
+centroids, default `DbConfig`, corpus insertion order. Results and per-query
+data: `work/bench/results/m0-baseline/`.
+
+| | SciFact | FiQA |
+|---|---:|---:|
+| Docs indexed / chunks | 5,183 / 22,787 | 57,579 / 172,202 |
+| Docs left out (empty / refused by the service) | 0 / 0 | 38 / 21 |
+| nDCG@10 at 64 probes | 0.7908 | 0.4722 |
+| ANN recall@10 at 64 probes | 0.9813 | 0.9927 |
+| Pass-1 recall at 64 probes / all clusters | 0.797 / 0.836 | 0.804 / 0.808 |
+| Entries scanned at 64 probes / all clusters | 5,587 / 8,197 | 69,360 / 89,547 |
+| Latency p50 / p95 at 64 probes | 3.08 / 3.39 ms | 14.47 / 16.84 ms |
+| Largest cluster (share of chunks) | 36.2% | 14.7% |
+| Pass-1 / Pass-2 estimator RMSE | 0.0267 / 0.00030 | 0.0232 / 0.00024 |
+| Footprint (sparse + meta + dense) | 7.0 MiB | 67.7 MiB |
+
+What it shows:
+
+- **Partition skew.** At 64 of 256 probes a FiQA query already scans 77% of the
+  index, and SciFact's largest cluster holds over a third of its chunks. This is
+  the problem M3 targets.
+- **Pass 1 loses candidates even when it scans everything.** With every
+  cluster probed, the 1-bit Pass 1 keeps only 84% (SciFact) and 81% (FiQA) of
+  the exact top-1000 candidates. Final ANN recall stays above 0.98 because Pass 2
+  recovers most of it, but this is the error M1's rotation should reduce.
+- **Reproducible.** A second run (`m0-repro`) gave identical quality numbers for
+  every query on both datasets; p50 latency moved by at most 2%.
+- **Embedding service.** gemma on llama.cpp scores the same as the earlier
+  PyTorch service through the server pipeline on `main` at 64 probes (SciFact
+  0.7851 → 0.7849, FiQA 0.4714 → 0.4718; paired CIs include 0). It refuses
+  payloads over 2,048 tokens, so 21 FiQA documents cannot be indexed at all;
+  production's worker exhausts them the same way.
+
 ---
 
 ## M0-1 — Make a re-embed durable before its queue entry is completed
@@ -325,6 +361,14 @@ readable as soon as they are written.
   completion path, so the cost is measured by `vector_bench_worker_completion`:
   the same frozen documents through write-then-complete, once completing each
   entry at once (the old behaviour) and once flushing every 256 entries first.
+
+**Measured (2026-10-03).** With embedding excluded, so that only the flushes
+differ: SciFact 2,455 → 2,444 docs/s (−0.4%), FiQA 2,541 → 2,085 docs/s (−18%,
+about 225 flushes of ~22 ms each). **This fails the 5% gate as written.** In the
+real worker the embedding call dominates: the service embeds about 10 docs/s, so
+a batch of 256 takes ~25 s against one ~22 ms flush (about 0.1%). Open decision:
+judge the gate end to end (passes), or keep it embedding-excluded and raise
+`COMPLETION_BATCH` (fewer flushes, later completion).
 
 ---
 
