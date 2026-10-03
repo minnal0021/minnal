@@ -464,6 +464,13 @@ impl Db {
         self.inner.compact_lsm()
     }
 
+    /// Make every write already applied to the named namespaces durable, no-WAL
+    /// writes included. See `Database::flush_namespaces`.
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
+        self.inner.flush_namespaces(names)
+    }
+
     /// The current value-log waste ratio for the default namespace.
     pub fn waste_ratio(&self) -> f64 {
         self.inner.get_waste_ratio()
@@ -1503,6 +1510,15 @@ impl AsyncDb {
     pub async fn compact(&self) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.compact())
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Async [`Db::flush_namespaces`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn flush_namespaces(&self, names: Vec<String>) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.flush_namespaces(&names))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }

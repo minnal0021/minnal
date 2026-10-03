@@ -6,10 +6,19 @@
 //! service inline.  This worker picks those entries up, calls the embedding
 //! service, quantises the result, and writes the [`VectorIndex`] to the
 //! companion `{ns}_sparse_vector`, `{ns}_dense_vector`, and
-//! `{ns}_sparse_vector_meta` namespaces, then removes the queue entry.  The
-//! vector writes and the queue delete are independent single-op writes; the
-//! worker is idempotent, so a crash between them simply re-processes the entry
-//! on the next pass.
+//! `{ns}_sparse_vector_meta` namespaces, then removes the queue entry.
+//!
+//! # Completion waits for durability
+//!
+//! The vector writes are no-WAL (durable only after a memtable flush) while the
+//! queue removal is WAL-backed (durable at once), so an entry is completed only
+//! after its vectors are flushed. Written entries collect in a batch of up to
+//! [`COMPLETION_BATCH`]; each batch, and whatever is pending at the end of a pass,
+//! is made durable with one flush of the affected vector namespaces
+//! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
+//! that flush leaves the entries queued, and the next pass re-embeds them; writing
+//! the same text's vectors again is harmless. See
+//! `vector_kv::make_vector_writes_durable` for what completing first used to lose.
 //!
 //! # Lifecycle
 //!
@@ -57,6 +66,22 @@ use tokio::task::JoinSet;
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::store::SemanticSearchContext;
 use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
+
+/// Written embed entries completed per flush of the vector namespaces. Larger
+/// batches mean fewer flushes (each makes level-0 files for compaction to merge);
+/// smaller ones complete entries sooner. Search is unaffected either way: vectors
+/// are readable as soon as they are written.
+const COMPLETION_BATCH: usize = 256;
+
+/// What processing one queue entry left to do.
+enum Processed {
+    /// An embed entry's vectors are written but not yet durable; it is completed
+    /// with its batch.
+    Written,
+    /// Nothing left: a `Clear` entry, whose writes are all WAL-backed, completes
+    /// itself.
+    Done,
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -302,11 +327,13 @@ impl VecIndexWorker {
 
             // Process work_queue with bounded concurrency.
             let concurrency = self.config.concurrency.max(1);
-            let mut set: JoinSet<(QueueEntry, Result<(), DocStoreError>)> = JoinSet::new();
+            let mut set: JoinSet<(QueueEntry, Result<Processed, DocStoreError>)> = JoinSet::new();
             let mut work_iter = work_queue.into_iter();
             let mut any_failed = false;
             let mut indexed_count = 0usize;
             let mut failed_count = 0usize;
+            // Embed entries whose vectors are written but not yet durable.
+            let mut written: Vec<QueueEntry> = Vec::new();
 
             // Seed the JoinSet with the first batch of tasks.
             for entry in (&mut work_iter).take(concurrency) {
@@ -333,10 +360,19 @@ impl VecIndexWorker {
                 }
 
                 match join_result {
-                    Ok((entry, Ok(()))) => {
+                    Ok((entry, Ok(Processed::Written))) => {
+                        written.push(entry);
+                        if written.len() >= COMPLETION_BATCH {
+                            let (done, failed) = self.complete_written(std::mem::take(&mut written)).await;
+                            indexed_count += done;
+                            failed_count += failed;
+                            any_failed |= failed > 0;
+                        }
+                    }
+                    Ok((entry, Ok(Processed::Done))) => {
                         indexed_count += 1;
                         debug!(
-                            "vec index worker: indexed ns='{}' doc='{}'",
+                            "vec index worker: cleared ns='{}' doc='{}'",
                             entry.namespace,
                             doc_id_display(&entry.doc_id_bytes),
                         );
@@ -365,6 +401,13 @@ impl VecIndexWorker {
                 }
             }
 
+            if !written.is_empty() {
+                let (done, failed) = self.complete_written(std::mem::take(&mut written)).await;
+                indexed_count += done;
+                failed_count += failed;
+                any_failed |= failed > 0;
+            }
+
             // Per-pass completion summary visible at INFO level.
             info!(
                 "vec index worker: pass complete — indexed={indexed_count} failed={failed_count} \
@@ -388,25 +431,70 @@ impl VecIndexWorker {
     /// Carry out one queue entry.
     ///
     /// **Embed:** embed `text`, quantise it with both multi-bit (single embedding)
-    /// and single-bit (chunked embeddings), then [`vector_kv::finish_embed`] writes
-    /// the vectors and completes the entry. The vector writes happen before the
-    /// completion: a crash in between leaves the entry queued and the next pass
-    /// re-processes it idempotently. The completion is conditional — `entry` comes
-    /// from this pass's snapshot, and the document may have been upserted or
-    /// deleted since (see `vector_kv`'s conditional queue updates).
+    /// and single-bit (chunked embeddings), and write the vectors. The entry is
+    /// **not** completed here: it joins the pass's batch, which
+    /// [`complete_written`](Self::complete_written) makes durable and then completes
+    /// (see the module docs).
     ///
     /// **Clear:** delete the document's vectors and remove the tombstone.
-    async fn process_one(&self, entry: &QueueEntry) -> Result<(), DocStoreError> {
+    async fn process_one(&self, entry: &QueueEntry) -> Result<Processed, DocStoreError> {
         match entry.kind {
             QueueEntryKind::Embed => {
                 let vector_indexes = crate::semantic_search::service::embed_document(&self.ctx.config, &self.ctx.cluster_index, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-                vector_kv::finish_embed(&self.db, entry, &vector_indexes).await?;
+                vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &vector_indexes).await?;
+                Ok(Processed::Written)
             }
-            QueueEntryKind::Clear => vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?,
+            QueueEntryKind::Clear => {
+                vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
+                Ok(Processed::Done)
+            }
         }
-        Ok(())
+    }
+
+    /// Make a batch of written embed entries durable, then complete each one.
+    /// Returns `(completed, failed)`.
+    ///
+    /// If the flush fails, nothing is completed: every entry stays queued and the
+    /// next pass redoes it. Each completion is conditional — the entry comes from
+    /// this pass's snapshot, and the document may have been upserted or deleted
+    /// since (see `vector_kv`'s conditional queue updates).
+    async fn complete_written(&self, written: Vec<QueueEntry>) -> (usize, usize) {
+        let mut namespaces: Vec<String> = written.iter().map(|e| e.namespace.clone()).collect();
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        if let Err(e) = vector_kv::make_vector_writes_durable(&self.db, &namespaces).await {
+            warn!(
+                "vec index worker: could not flush the vectors of {} written entr(y/ies); \
+                 leaving them queued for the next pass: {e}",
+                written.len(),
+            );
+            return (0, written.len());
+        }
+        let (mut done, mut failed) = (0usize, 0usize);
+        for entry in written {
+            match vector_kv::complete_embed(&self.db, &entry).await {
+                Ok(()) => {
+                    done += 1;
+                    debug!(
+                        "vec index worker: indexed ns='{}' doc='{}'",
+                        entry.namespace,
+                        doc_id_display(&entry.doc_id_bytes),
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        "vec index worker: completing ns='{}' doc='{}' failed: {e}",
+                        entry.namespace,
+                        doc_id_display(&entry.doc_id_bytes),
+                    );
+                    self.increment_retry(&entry, &e.to_string()).await;
+                }
+            }
+        }
+        (done, failed)
     }
 
     /// Increment the retry count and record the last error for a failed queue
