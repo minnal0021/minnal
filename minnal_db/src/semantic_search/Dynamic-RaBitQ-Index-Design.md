@@ -58,14 +58,20 @@ interest rates.
 centroid (0.5, 0.5) and encodes new inserts against C7. Every entry stores
 `centre_id 7`:
 
-| Chunk | Topic | Vector | Key | Stored residual `x − c` | `centre_id` |
-|---|---|---|---|---|---|
-| a | cricket | (0.9, 0.2) | `P7‖a` | (0.4, −0.3) | 7 |
-| b | cricket | (1.0, 0.1) | `P7‖b` | (0.5, −0.4) | 7 |
-| c | cricket | (0.8, 0.0) | `P7‖c` | (0.3, −0.5) | 7 |
-| d | rates | (0.1, 0.9) | `P7‖d` | (−0.4, 0.4) | 7 |
-| e | rates | (0.2, 1.0) | `P7‖e` | (−0.3, 0.5) | 7 |
-| f | rates | (0.0, 0.8) | `P7‖f` | (−0.5, 0.3) | 7 |
+| Chunk | Topic | Vector `x` | Key | Residual `x − c` (not stored) | Stored code: signs of `x − c` | `centre_id` |
+|---|---|---|---|---|---|---|
+| a | cricket | (0.9, 0.2) | `P7‖a` | (0.4, −0.3) | `+ −` | 7 |
+| b | cricket | (1.0, 0.1) | `P7‖b` | (0.5, −0.4) | `+ −` | 7 |
+| c | cricket | (0.8, 0.0) | `P7‖c` | (0.3, −0.5) | `+ −` | 7 |
+| d | rates | (0.1, 0.9) | `P7‖d` | (−0.4, 0.4) | `− +` | 7 |
+| e | rates | (0.2, 1.0) | `P7‖e` | (−0.3, 0.5) | `− +` | 7 |
+| f | rates | (0.0, 0.8) | `P7‖f` | (−0.5, 0.3) | `− +` | 7 |
+
+An entry stores what it stores today: the sign of each residual coordinate (96
+bytes at 768 dimensions, after rotation) plus three scalar factors. The float
+residual is shown only to make the arithmetic visible. The only new per-entry
+field is the 4-byte `centre_id`; the centre vectors themselves (3 KB each at 768
+dimensions) live once per namespace in the centre table.
 
 A cricket query scans all six entries, half of them about rates.
 
@@ -84,13 +90,14 @@ codes still point at it.
 | P8 | (0.9, 0.1) | C8 | Active |
 | P9 | (0.1, 0.9) | C9 | Active |
 
-| Chunk | Key | Stored residual | `centre_id` |
+| Chunk | Key | Stored code | `centre_id` |
 |---|---|---|---|
 | a, b, c | `P7‖…` → `P8‖…` | unchanged | 7 |
 | d, e, f | `P7‖…` → `P9‖…` | unchanged | 7 |
 
 A new cricket chunk `g = (0.95, 0.15)` arriving later routes to P8 and is
-encoded against C8: residual (0.05, 0.05), `centre_id 8`, key `P8‖g`. So P8
+encoded against C8: residual (0.05, 0.05), stored as `+ +`, `centre_id 8`,
+key `P8‖g`. So P8
 holds codes with two different centres, and each entry names its own.
 
 A cricket query now routes to P8 and scans four entries (a, b, c, g) instead of
