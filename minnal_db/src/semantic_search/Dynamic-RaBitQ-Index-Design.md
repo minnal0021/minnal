@@ -173,7 +173,7 @@ dims, model, chunking params, service commit).
 ### Harness
 
 The harness is `semantic_search/vector_bench/` (`#[cfg(test)]`, `#[ignore]`d
-tests). It reuses `beir_eval.rs`'s readers and scoring, and its module docs give
+tests). It reuses `metrics/beir_eval.rs`'s readers and scoring, and its module docs give
 the commands.
 
 1. **`embed_document` is split** into the service call and
@@ -646,7 +646,7 @@ namespace instead:**
 | Vector worker (`vec_index_worker.rs`) | context config | the queue entry's namespace → schema → model |
 | `check_embedding_service` (startup, `main.rs`) | probes one model at one dimension | probes each **distinct** (model, dim) pair used by an existing semantic namespace; also probe at create/enable time (a 404 `Unknown model` or a dimension mismatch fails the request; an unreachable service only warns, since the queue tolerates outages) |
 | `centroid_mismatch` (`minnal_db_api/src/config.rs`) | compares `cluster_path` with the model's bundled file | **removed**: in M2b the seed file is chosen by the model, so there is nothing to mismatch |
-| `beir_eval.rs`, `config_report.rs`, `routes/stores.rs`, tests | config | schema |
+| `metrics/beir_eval.rs`, `config_report.rs`, `routes/stores.rs`, tests | config | schema |
 | `QUICKSTART.md`, `minnal_db/QUICKSTART.md`, READMEs, `config/sample.toml`, `service/scripts/examples/docs.sh` | `[semantic_search] model` / `embedding_dim` | `embedding_model` / `embedding_dim` in the store body (examples rerun per the docs rules) |
 
 Stores created before M2a are recreated (greenfield).

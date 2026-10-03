@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use super::super::beir_eval::{env_or, read_qrels, score};
+use super::super::metrics::beir_eval::{env_or, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen::{self, Frozen};
 use super::splitmix;

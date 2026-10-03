@@ -2993,7 +2993,7 @@ mod real_kv_profile {
 
 // ── Shared corpus indexing for the real-embedding harnesses ───────────────────
 //
-// Used by `real_recall` below and `semantic_search::beir_eval`: embeds each text
+// Used by `real_recall` below and `semantic_search::metrics::beir_eval`: embeds each text
 // through the real embedding service and upserts its vectors under a `u64` BE doc id.
 #[cfg(test)]
 pub(crate) mod eval_indexing {

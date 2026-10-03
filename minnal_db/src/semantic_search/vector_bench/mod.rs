@@ -40,7 +40,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use super::beir_eval::{env_or, read_qrels, score};
+use super::metrics::beir_eval::{env_or, read_qrels, score};
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
 use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};

@@ -16,7 +16,8 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `quantisation/rotation.rs` | `FhtKacRotator`: the seeded random rotation codes are computed in (format pinned by `output_is_pinned_for_a_fixed_seed`) |
 | `service/mod.rs` | Embedding orchestration: `embed_document` / `embed_query`, the startup probe `check_embedding_service`; `search()` two-pass ANN and `SCORING_GATE` |
 | `service/embedding_service.rs` | Raw HTTP client for the embedding service (`/embedding/{model}/…`, `/healthcheck`) |
-| `beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
+| `metrics/corruption.rs` | Per-namespace counters of corrupt index entries search skipped (`GET /admin/indices/vector/corruption-metrics`); re-exported as `semantic_search::metrics` |
+| `metrics/beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
 | `query-embedding-report.md` | BEIR evaluation behind whole-query Pass-1 embedding (vs chunked queries) |
 | `vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
 
