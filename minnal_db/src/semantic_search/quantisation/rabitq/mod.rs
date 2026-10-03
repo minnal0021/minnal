@@ -186,14 +186,16 @@ pub fn index_embedding_to_cluster(
 }
 
 #[inline]
-fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_factor_start: f32) -> (Vec<i32>, f32, f32) {
+fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_factor_start: f32, max_code: i32) -> (Vec<i32>, f32, f32) {
     let dimension = normalised_residual_vector.len();
     let mut normalised_residual_vector_bar: Vec<i32> = Vec::with_capacity(dimension);
     let mut denominator: f32 = dimension as f32 * 0.25;
     let mut numerator: f32 = 0.0;
 
     for (index, &value) in normalised_residual_vector.iter().enumerate() {
-        let current_rescale_factor = ((rescale_factor_start * value) + EPS) as i32;
+        // Clamped like the final quantisation: for 1 and 3 magnitude bits the start
+        // scale can put the largest coordinate above the top code.
+        let current_rescale_factor = (((rescale_factor_start * value) + EPS) as i32).min(max_code);
         normalised_residual_vector_bar.insert(index, current_rescale_factor);
         denominator += (current_rescale_factor * current_rescale_factor + current_rescale_factor) as f32;
         numerator += (current_rescale_factor as f32 + 0.5) * value;
@@ -214,19 +216,27 @@ fn best_rescale_factor(normalised_residual_vector: &[f32], number_of_bits_for_qu
     let rescale_factor_end = ((1 << number_of_bits_for_quantisation) - 1 + NO_ENUMERATIONS) as f32 / max_value;
     let rescale_factor_start = rescale_factor_end * START[number_of_bits_for_quantisation];
 
+    let max_normalised_residual_vector_bar = (1 << number_of_bits_for_quantisation) - 1;
     let (mut normalised_residual_vector_bar, mut sqr_of_denominator, mut numerator) =
-        setup_initial_computation_values(normalised_residual_vector, rescale_factor_start);
+        setup_initial_computation_values(normalised_residual_vector, rescale_factor_start, max_normalised_residual_vector_bar);
 
     let mut rescaling_factor_binary_heap = BinaryHeap::with_capacity(dimension);
 
+    // Same guards as the push inside the loop: never step a coordinate past the
+    // top code, and never past the end of the search range.
     for (index, &value) in normalised_residual_vector.iter().enumerate() {
+        if normalised_residual_vector_bar[index] >= max_normalised_residual_vector_bar {
+            continue;
+        }
         let next_value = (normalised_residual_vector_bar[index] + 1) as f32 / value;
-        rescaling_factor_binary_heap.push(QueueItem { value: next_value, index });
+        if next_value < rescale_factor_end {
+            rescaling_factor_binary_heap.push(QueueItem { value: next_value, index });
+        }
     }
 
-    let mut max_inner_product = 0.0;
-    let mut best_rescaling_factor = 0.0;
-    let max_normalised_residual_vector_bar = (1 << number_of_bits_for_quantisation) - 1;
+    // The starting scale is a candidate too.
+    let mut max_inner_product = numerator / sqr_of_denominator.sqrt();
+    let mut best_rescaling_factor = rescale_factor_start;
 
     while let Some(item) = rescaling_factor_binary_heap.pop() {
         let current_t = item.value;
@@ -580,7 +590,57 @@ mod tests {
         let number_of_bits = 6;
 
         let best_rescale_factor = best_rescale_factor(&residual_vector_data_to_centroid, number_of_bits);
-        assert_relative_eq!(best_rescale_factor, 47.632656, epsilon = 0.0001);
+        // The starting scale (0.75 · 73 / max) is itself the best candidate here.
+        assert_relative_eq!(best_rescale_factor, 51.814213, epsilon = 0.0001);
+    }
+
+    /// The rescale factor the search picks must be as good as an exhaustive sweep
+    /// over every critical scale in its range, scored on the codes the quantiser can
+    /// actually emit (clamped to `2^bits − 1`). For 2 and 4 total bits (1 and 3
+    /// magnitude bits) the search's starting codes can exceed that maximum, so it
+    /// scored states the quantiser can never produce and could pick a worse scale.
+    #[test]
+    fn best_rescale_factor_matches_an_exhaustive_sweep_on_clamped_codes() {
+        fn objective(o: &[f32], t: f32, bits: usize) -> f32 {
+            let max = (1i32 << bits) - 1;
+            let (mut num, mut den) = (0f32, 0f32);
+            for &v in o {
+                let k = (((t * v) + EPS) as i32).min(max) as f32 + 0.5;
+                num += k * v;
+                den += k * k;
+            }
+            num / den.sqrt()
+        }
+        let mut state = 0x1234_5678_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (1u64 << 31) as f32
+        };
+        for (bits, &start) in START.iter().enumerate().take(8).skip(1) {
+            let mut worst = 0f32;
+            for _ in 0..50 {
+                // A normalised residual's magnitudes, as `quantise_multi_bits` passes them.
+                let raw: Vec<f32> = (0..64).map(|_| next() - 0.5).collect();
+                let n = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let o: Vec<f32> = raw.iter().map(|v| (v / n).abs()).collect();
+                let max_o = o.iter().copied().fold(0f32, f32::max);
+                let t_end = ((1 << bits) - 1 + NO_ENUMERATIONS) as f32 / max_o;
+                let t_start = t_end * start;
+                let mut ts = vec![t_start];
+                for &v in &o {
+                    for k in 0..(1 << bits) {
+                        let t = (k + 1) as f32 / v;
+                        if t > t_start && t < t_end {
+                            ts.push(t);
+                        }
+                    }
+                }
+                let best = ts.iter().map(|&t| objective(&o, t, bits)).fold(0f32, f32::max);
+                let got = objective(&o, best_rescale_factor(&o, bits), bits);
+                worst = worst.max(best - got);
+            }
+            assert!(worst <= 1e-4, "{bits} magnitude bits: search is {worst} below the best clamped scale");
+        }
     }
 
     #[test]
@@ -591,8 +651,8 @@ mod tests {
         let number_of_bits = 6;
 
         let extra_bits_quantisation = quantise_extra_bits(&residual_vector_data_to_centroid, number_of_bits);
-        assert_relative_eq!(extra_bits_quantisation.inverse_of_inner_product, 0.009810816, epsilon = 0.0001);
-        assert_eq!(extra_bits_quantisation.extra_bits_quantised_embedding, [50, -18, 0, -19, -26, 14, 26, 5]);
+        assert_relative_eq!(extra_bits_quantisation.inverse_of_inner_product, 0.009065732, epsilon = 0.0001);
+        assert_eq!(extra_bits_quantisation.extra_bits_quantised_embedding, [54, -20, 0, -21, -28, 15, 28, 5]);
     }
 
     #[test]
