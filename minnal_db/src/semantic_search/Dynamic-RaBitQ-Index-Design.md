@@ -515,7 +515,7 @@ dependencies) unchanged, on this host (AVX-512, rustc 1.96):
   sign** between the dispatched and portable paths. That matters because a
   1-bit code is the sign pattern.
 
-Gaps to close when it moves into `semantic_search/rotation.rs`:
+Gaps to close when it moves into `semantic_search/quantisation/rotation.rs`:
 
 1. **The format is unpinned.** A change to `splitmix64`, `ROUNDS`, the mask
    layout or the block order would silently change every code. Add a golden test:
@@ -565,7 +565,7 @@ similar vectors are correlated.
 
 ### Result (2026-10-03)
 
-**Passed.** Rotation is in (`semantic_search/rotation.rs`, wired through
+**Passed.** Rotation is in (`semantic_search/quantisation/rotation.rs`, wired through
 `ClusterIndex::rotate` / `rotated_centroid`, `index_embedding_rotated` and
 `search()`), and on gemma it changes almost nothing:
 
@@ -599,7 +599,7 @@ only.
 
 Also in M1: the API rejects an `embedding_dim` the rotation cannot handle (odd,
 or under 8) at startup, and the rotator's format is pinned by a fixed-seed test
-(`test_data/rotation_golden_768.json`).
+(`quantisation/test_data/rotation_golden_768.json`).
 
 ---
 

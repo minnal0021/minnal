@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use crate::semantic_search::rotation::FhtKacRotator;
+use crate::semantic_search::quantisation::rotation::FhtKacRotator;
 
 #[derive(Debug, Clone)]
 pub struct Cluster {
@@ -127,7 +127,7 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 /// drift.
 ///
 /// **Rotation.** RaBitQ codes are computed in a randomly rotated space (see
-/// [`crate::semantic_search::rotation`]), which its error bound assumes: a code
+/// [`crate::semantic_search::quantisation::rotation`]), which its error bound assumes: a code
 /// stores `Pᵀ(x − c)`, and a query is rotated once per search (`q' = Pᵀq`) before it
 /// meets the codes. Every quantity the quantiser and the estimators compute is an
 /// inner product, and rotation preserves inner products, so the formulas stay as

@@ -768,7 +768,7 @@ async fn vector_bench_pass1_study() {
 #[test]
 #[ignore]
 fn vector_bench_rotation_spread() {
-    use crate::semantic_search::rotation::FhtKacRotator;
+    use crate::semantic_search::quantisation::rotation::FhtKacRotator;
     let dim = 768;
     let one = FhtKacRotator::new(dim, crate::semantic_search::cluster::ROTATION_SEED);
     let two = FhtKacRotator::new(dim, 0x5eed_0002);

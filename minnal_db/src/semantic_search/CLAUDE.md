@@ -13,7 +13,7 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `index/composite_key.rs` | Composite key layout: `cluster_id (4B BE) ‖ doc_id` |
 | `index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
 | `quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode); `index_embedding_rotated` is the production indexing path |
-| `rotation.rs` | `FhtKacRotator`: the seeded random rotation codes are computed in (format pinned by `output_is_pinned_for_a_fixed_seed`) |
+| `quantisation/rotation.rs` | `FhtKacRotator`: the seeded random rotation codes are computed in (format pinned by `output_is_pinned_for_a_fixed_seed`) |
 | `service/mod.rs` | Embedding orchestration: `embed_document` / `embed_query`, the startup probe `check_embedding_service`; `search()` two-pass ANN and `SCORING_GATE` |
 | `service/embedding_service.rs` | Raw HTTP client for the embedding service (`/embedding/{model}/…`, `/healthcheck`) |
 | `beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |

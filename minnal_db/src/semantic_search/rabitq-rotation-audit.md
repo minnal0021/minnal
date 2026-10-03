@@ -45,7 +45,7 @@ embeddings of BEIR SciFact and FiQA, with the bundled gemma centroids, at commit
   `Pᵀc`, and queries are rotated once, `q' = Pᵀq`.
 - **FhtKac**: the fast rotation the library uses in place of a dense random
   matrix. Four rounds of random sign flips, a Walsh–Hadamard transform and one
-  Kac butterfly (`rotation.rs`).
+  Kac butterfly (`quantisation/rotation.rs`).
 - **Haar rotation**: a rotation drawn uniformly from all rotations. The papers'
   theorems assume one.
 - **`error_bound`**: the per-vector half-width the paper gives for the
