@@ -1446,6 +1446,44 @@ mod tests {
         );
     }
 
+    /// Cost of the open-time drop sweep's queue scan when a crash mid bulk-load
+    /// left the whole corpus queued (57,600 entries of ~1.2 KB text): reading
+    /// every entry against reading only the keys, and a full `DocStore` open.
+    /// `MINNAL_QUEUE_DOCS` overrides the size. Run with `--ignored --nocapture`.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn open_cost_with_a_full_vector_queue() {
+        let n: usize = std::env::var("MINNAL_QUEUE_DOCS").ok().and_then(|v| v.parse().ok()).unwrap_or(57_600);
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        {
+            let store = open_kv_semantic(&db_dir, &schema_dir).await;
+            let body = "Interest rates, bond yields and portfolio risk over the market cycle. ".repeat(17);
+            for i in 0..n {
+                vector_kv::enqueue_embed(&store.db, "sem_kv", format!("{i:08}").as_bytes(), &format!("{i} {body}"))
+                    .await
+                    .unwrap();
+            }
+            store.db.shutdown().await.unwrap();
+        }
+        let t = std::time::Instant::now();
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let open = t.elapsed();
+        let t = std::time::Instant::now();
+        let entries = vector_kv::list_queue_entries(&store.db).await.unwrap();
+        let full = t.elapsed();
+        let t = std::time::Instant::now();
+        let namespaces = vector_kv::queued_namespaces(&store.db).await.unwrap();
+        let keys = t.elapsed();
+        assert_eq!((entries.len(), namespaces.len()), (n, 1));
+        eprintln!(
+            "\n=== open with {n} queued entries ===\n  DocStore open (keys-only sweep included): {:.3} s\n  queue scan reading every entry (old sweep): {:.3} s\n  queue scan reading keys only (new sweep):   {:.3} s",
+            open.as_secs_f64(),
+            full.as_secs_f64(),
+            keys.as_secs_f64()
+        );
+    }
+
     /// A vector-index drop cut short by a crash (schema saved with semantic
     /// search off, data and queue not yet cleared) is finished at the next open,
     /// before a worker could process the leftover queue entries.
