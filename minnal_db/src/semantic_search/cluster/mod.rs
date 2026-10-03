@@ -410,6 +410,15 @@ pub fn find_top_n_cluster_ids(clusters: &HashMap<u32, Cluster>, embedding: &[f32
 mod tests {
     use super::*;
 
+    /// No index records which rotation its codes were built with yet (the
+    /// per-namespace seed record comes with M2b), so a changed seed would make
+    /// every stored index score wrongly with no error. Changing it means
+    /// re-indexing every semantic-search store; update this test only then.
+    #[test]
+    fn rotation_seed_is_pinned() {
+        assert_eq!(ROTATION_SEED, 0x6d69_6e6e_616c_0001);
+    }
+
     #[test]
     fn test_find_closest_cluster_id() {
         let cluster1 = Cluster::new(1, vec![0.243, 0.453, 0.7644]);
