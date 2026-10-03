@@ -13,7 +13,7 @@
 //!   median search latency, at `n_probes` 64 (production) and 256 (exhaustive).
 //!
 //! It was used to choose whole-query Pass-1 embedding over chunked queries
-//! (`semantic_search/query-embedding-report.md`); rerun it to evaluate any
+//! (`semantic_search/report/query-embedding-report.md`); rerun it to evaluate any
 //! change to indexing, centroids or search.
 //!
 //! Setup, then run from the crate root (`minnal_db/`):

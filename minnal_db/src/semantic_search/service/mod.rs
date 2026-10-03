@@ -214,7 +214,7 @@ pub fn index_embeddings(
 ///
 /// Queries used to be split into 4-word sliding windows, each embedded on its
 /// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
-/// `semantic_search/query-embedding-report.md`) found the whole-query vector
+/// `semantic_search/report/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
 /// It is also much cheaper: one embedding instead of 1 + N, and `n_probes`

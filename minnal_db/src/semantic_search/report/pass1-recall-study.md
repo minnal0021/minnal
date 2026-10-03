@@ -8,7 +8,7 @@ they cost in final ranking quality. It also checks Pass 2 on its own.
 *Measured on gemma (`embeddinggemma-300m`, Q8, llama.cpp) frozen embeddings of
 BEIR SciFact (5,183 docs, 300 queries) and FiQA (57,600 docs, 648 queries),
 bundled gemma centroids (256), 64 probes and a cut of 1,000 unless stated. Commit
-`f163050`. Harness: [`vector_bench/study.rs`](vector_bench/study.rs)
+`f163050`. Harness: [`vector_bench/study.rs`](../vector_bench/study.rs)
 (`vector_bench_pass1_study`).*
 
 ## Answer

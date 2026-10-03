@@ -237,7 +237,7 @@ The set of models is **data-driven** — no code change or recompile is required
 
 1. **Generate the cluster centroids offline.** Run k-means (or any IVF clustering) over a representative corpus *embedded with the new model*. The number of centroids is the IVF cluster count (more clusters → finer partitioning, the trade-off knob against `n_probes`). Every centroid vector must have the model's embedding dimension.
 
-2. **Write them as a JSONL file** — one `{cluster_id, centroid}` object per line, each centroid dimensioned to match the model. For the exact file format and the validation rules enforced at startup, see [`Semantic-Search-Architecture.md` §3 — IVF Index Structure](minnal_db/src/semantic_search/Semantic-Search-Architecture.md#3-ivf-index-structure).
+2. **Write them as a JSONL file** — one `{cluster_id, centroid}` object per line, each centroid dimensioned to match the model. For the exact file format and the validation rules enforced at startup, see [`Semantic-Search-Architecture.md` §3 — IVF Index Structure](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#3-ivf-index-structure).
 
 3. **Place the file** at `service/embedding_support/{model}/clusters.json`, where `{model}` is the lower-cased model name (e.g. `service/embedding_support/e5/clusters.json`).
 
@@ -260,7 +260,7 @@ The set of models is **data-driven** — no code change or recompile is required
 
 6. **Re-index affected namespaces.** Existing vectors were quantised against the previous model's centroids/dimension and are not comparable. Since secondary indices are reconstructable, re-embed each namespace you want searchable under the new model with `POST /admin/indices/{ns}/vector/reindex-all` — it re-enqueues every document for embedding (a fresh full build) and returns `202 Accepted`. For a clean slate first (recommended when the dimension changes), clear the old vectors with `DELETE /admin/indices/{ns}/vector/drop-all` before re-indexing.
 
-For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/Semantic-Search-Architecture.md).
+For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md).
 
 ### Layer 4 — Document Store + KV Store (`doc-store`)
 
@@ -298,7 +298,7 @@ When `semantic_search_enabled` is `true` and an embedding field is declared, eve
 
 Document writes return immediately without blocking on the embedding service. Vector index entries may lag slightly behind the most recent writes. If the embedding service is temporarily unavailable, entries are retried with configurable back-off (see `[vector_index]` below).
 
-**Reconciliation.** Because the document write and its embed enqueue are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any document that's missing its vector index, self-healing the gap automatically — it runs on every startup, and can also be triggered on demand via `POST /admin/indices/vector/reconcile`. For the exact crash windows it closes, see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
+**Reconciliation.** Because the document write and its embed enqueue are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any document that's missing its vector index, self-healing the gap automatically — it runs on every startup, and can also be triggered on demand via `POST /admin/indices/vector/reconcile`. For the exact crash windows it closes, see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
 ### Layer 5 — REST API (`minnal_db_api`)
 
