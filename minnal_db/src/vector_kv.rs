@@ -903,12 +903,42 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
     }
 }
 
-/// The worker's step after embedding an [`QueueEntryKind::Embed`] entry: write the
-/// document's vectors, then complete the entry — conditionally (see the section
-/// comment). If the document was cleared while it was being embedded, the vectors
-/// just written are removed again.
+/// The worker's step after embedding an [`QueueEntryKind::Embed`] entry, for one
+/// entry: write the document's vectors, make them durable, then complete the
+/// entry. The worker does the same over a batch, with one
+/// [`make_vector_writes_durable`] for the whole batch.
 pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
     upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, vector_indexes).await?;
+    make_vector_writes_durable(db, std::slice::from_ref(&entry.namespace)).await?;
+    complete_embed(db, entry).await
+}
+
+/// Make every vector write already done for the given (parent) namespaces durable,
+/// by flushing their three vector namespaces. A barrier: see below.
+///
+/// **Why completion waits for this.** [`upsert_vectors`] deletes stale cluster keys
+/// WAL-backed (durable at once) and writes the new keys, meta and dense entry
+/// no-WAL (durable only after a memtable flush), and [`complete_embed`] removes the
+/// queue entry WAL-backed. Completing before the flush let a crash keep the
+/// completion and the deletes but lose the new vectors. A re-embedded document then
+/// kept its *old* meta and dense entry, which `has_complete_vector_index` accepts,
+/// so nothing re-enqueued it: it stayed indexed under its old text, minus the
+/// chunks whose clusters changed. With completion after this barrier, a crash
+/// before it leaves the queue entry in place and the restarted worker redoes it.
+/// Regression test: `crash_before_reembed_is_flushed_keeps_new_vectors`.
+pub async fn make_vector_writes_durable(db: &AsyncDb, namespaces: &[String]) -> Result<(), crate::KVError> {
+    let names = namespaces
+        .iter()
+        .flat_map(|ns| [sparse_vectors_ns(ns), sparse_vectors_meta_ns(ns), dense_vectors_ns(ns)])
+        .collect();
+    db.flush_namespaces(names).await
+}
+
+/// Complete an embed entry whose vectors are written **and durable** (see
+/// [`make_vector_writes_durable`]) — conditionally (see the section comment). If
+/// the document was cleared while it was being embedded, the vectors just written
+/// are removed again.
+pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<(), crate::KVError> {
     match complete_entry(db, entry).await? {
         Completion::Done | Completion::Superseded => {}
         Completion::Cleared => return process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
@@ -1420,6 +1450,143 @@ mod queue_race_tests {
 
         assert!(enqueue_embed_if_absent(&db, "docs", b"c", "text").await.unwrap(), "absent: enqueue");
         assert_eq!(snapshot(&db, b"c").await.text, "text");
+    }
+
+    // ── Completion waits for durability (design doc M0-1) ──
+
+    /// Like [`vectors_for`], but the sparse chunk lands in cluster 4 instead of 3,
+    /// as a re-embedded document's chunks can.
+    fn moved_vectors_for(tag: f32) -> Vec<VectorIndex> {
+        vec![
+            VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, tag, 0.0, 0.01, vec![]),
+            VectorIndex::new(4, QuantisationStyle::SingleBit, tag, 0.0, 0.01, vec![]),
+        ]
+    }
+
+    async fn put_doc(db: &AsyncDb, doc: &[u8]) {
+        db.namespace("docs".to_string())
+            .await
+            .unwrap()
+            .put(doc.to_vec(), b"{}".to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// The doc's sparse cluster keys actually present, and the clusters its meta lists.
+    async fn sparse_state(db: &AsyncDb, doc: &[u8]) -> (Vec<u32>, Option<Vec<u32>>) {
+        let sparse = db.namespace(sparse_vectors_ns("docs")).await.unwrap();
+        let mut present = Vec::new();
+        for cluster in [3u32, 4] {
+            if sparse.get(composite_key::encode(cluster, doc)).await.unwrap().is_some() {
+                present.push(cluster);
+            }
+        }
+        let meta = db
+            .namespace(sparse_vectors_meta_ns("docs"))
+            .await
+            .unwrap()
+            .get(doc.to_vec())
+            .await
+            .unwrap();
+        (present, meta.as_deref().and_then(decode_sparse_meta))
+    }
+
+    /// A re-embed must be durable before its queue entry is completed. The worker
+    /// used to complete it (WAL-backed, durable at once) while the new vectors were
+    /// still no-WAL in memory, so a crash kept the completion and the stale-key
+    /// deletes but lost the new vectors: the document kept its old dense entry,
+    /// lost its moved chunk, and looked complete to reconciliation.
+    #[tokio::test]
+    async fn crash_before_reembed_is_flushed_keeps_new_vectors() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            put_doc(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+            let first = snapshot(&db, b"x").await;
+            finish_embed(&db, &first, &vectors_for(1.0)).await.unwrap();
+            make_vector_writes_durable(&db, &["docs".to_string()]).await.unwrap(); // old index on disk
+            enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+            let second = snapshot(&db, b"x").await;
+            finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
+            std::mem::forget(db); // crash: nothing flushed after finish_embed returned
+        }
+        let db = open_db(&dir).await;
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(), "the re-embed was completed");
+        assert_eq!(dense_tag(&db, b"x").await, Some(2.0), "the completed re-embed's dense vector was lost");
+        assert_eq!(
+            sparse_state(&db, b"x").await,
+            (vec![4], Some(vec![4])),
+            "the moved chunk must be present and listed"
+        );
+    }
+
+    /// The worker writes a batch, flushes, then completes. A crash after the flush
+    /// but before the completions leaves the entry queued; redoing it writes the
+    /// same vectors and completes it.
+    #[tokio::test]
+    async fn crash_after_flush_before_completion_redoes_the_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            put_doc(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+            upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap(); // the worker's write
+            make_vector_writes_durable(&db, &["docs".to_string()]).await.unwrap(); // the batch flush
+            std::mem::forget(db); // crash before the completions
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("entry still queued");
+        assert_eq!(dense_tag(&db, b"x").await, Some(1.0), "flushed vectors survive");
+        finish_embed(&db, &pending, &vectors_for(1.0)).await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+        assert_eq!(dense_tag(&db, b"x").await, Some(1.0));
+        assert_eq!(sparse_state(&db, b"x").await, (vec![3], Some(vec![3])));
+    }
+
+    /// If the vectors cannot be made durable, the entry is not completed.
+    #[tokio::test]
+    async fn a_failed_flush_completes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        put_doc(&db, b"x").await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let entry = snapshot(&db, b"x").await;
+        upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap();
+
+        // A level-0 file cannot be created in a read-only namespace directory.
+        let dense_dir = crate::db::layout::namespace_data_dir(dir.path(), &dense_vectors_ns("docs"));
+        let set_mode = |mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in walk_dirs(&dense_dir) {
+                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        set_mode(0o555);
+        let result = finish_embed(&db, &entry, &vectors_for(1.0)).await;
+        set_mode(0o755);
+        assert!(result.is_err(), "the flush should have failed");
+        assert!(
+            get_queue_entry(&db, "docs", b"x").await.unwrap().is_some(),
+            "an entry whose vectors are not durable was completed"
+        );
+    }
+
+    /// Every directory under `root`, `root` included.
+    fn walk_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![root.to_path_buf()];
+        let mut i = 0;
+        while i < out.len() {
+            if let Ok(rd) = std::fs::read_dir(&out[i]) {
+                for e in rd.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        out.push(e.path());
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
     }
 }
 
