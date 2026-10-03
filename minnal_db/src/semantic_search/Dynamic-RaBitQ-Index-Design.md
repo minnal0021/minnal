@@ -16,7 +16,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0** Benchmark ✓ | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
 | **M0-1** Durable re-embed ✓ | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; end-to-end indexing throughput within 5% |
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
-| **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
+| **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
@@ -545,10 +545,11 @@ Gaps to close when it moves into `semantic_search/rotation.rs`:
 
 ### Rotation seed
 
-Each namespace's rotation seed is stored in a per-namespace vector-index
-metadata record, `{ns}_vector_meta` (a new companion namespace, WAL-backed),
-which grows in M2. It defaults to a fixed constant: a per-namespace seed gives no
-quality gain over one fixed seed, but recording it makes the seed explicit.
+M1 uses one fixed seed (`ROTATION_SEED`), held by the process-wide `ClusterIndex`
+together with a rotated copy of every centroid. A per-namespace seed needs
+per-namespace rotated centres, which arrive with M2b's per-namespace index, so
+the seed record (`{ns}_vector_meta`) moves there. The choice of seed does not
+affect quality.
 
 The new code format is simply the format from M1 on. There is no migration and
 no format-version check: stores indexed before M1 are recreated (greenfield).
@@ -561,6 +562,36 @@ gemma has a stronger common direction, so a larger gain is plausible but
 unproven. **If M1 shows no gain and no loss, keep it anyway.** M3's
 reconstruction-based maintenance depends on it: without rotation, sign bits of
 similar vectors are correlated.
+
+### Result (2026-10-03)
+
+**Passed.** Rotation is in (`semantic_search/rotation.rs`, wired through
+`ClusterIndex::rotate` / `rotated_centroid`, `index_embedding_rotated` and
+`search()`), and on gemma it changes almost nothing:
+
+| At 64 probes, vs M0 | SciFact | FiQA |
+|---|---|---|
+| nDCG@10 | −0.0002 [−0.0006, 0.0000]; 0 better, 2 worse, 298 same | −0.0008 [−0.0024, +0.0003]; 12 / 9 / 627 |
+| ANN recall@10 | +0.0033 [+0.0003, +0.0063] | +0.0005 [−0.0014, +0.0022] |
+| Pass-1 estimator RMSE | 0.02671 → 0.02655 (−0.6%) | 0.02328 → 0.02276 (−2.2%) |
+| Pass-1 recall, all clusters probed | 0.836 → 0.835 | 0.808 → 0.809 |
+| p50 / p95 latency, alternated runs | 3.06, 3.05 → 3.10, 3.04 / 3.35, 3.37 → 3.40, 3.32 ms | 14.91, 14.85 → 14.84, 14.67 / 17.40, 17.24 → 17.21, 17.00 ms |
+
+Latency was measured by running the pre-rotation and rotation binaries
+alternately, twice; a first comparison against the M0 baseline from hours
+earlier showed +2–6%, which alternated runs show to be machine drift. Rotating a
+query costs microseconds.
+
+What it means: gemma's sign bits are already close to independent, so the 1-bit
+estimator's error barely moves, and Pass-1's candidate losses (16–19% of the
+exact top-1000 with every cluster probed) are not caused by a missing rotation.
+They are the 1-bit estimator's own variance, which a finer chunk code (2-bit,
+listed as optional after M4) or a larger first-pass cut addresses. Rotation stays,
+as planned: M3's maintenance reconstructs vectors from codes and relies on it.
+
+Also in M1: the API rejects an `embedding_dim` the rotation cannot handle (odd,
+or under 8) at startup, and the rotator's format is pinned by a fixed-seed test
+(`test_data/rotation_golden_768.json`).
 
 ---
 
