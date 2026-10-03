@@ -45,6 +45,73 @@ per-namespace model selection, and how a namespace bootstraps from nothing.
   floats with no partitioning (exact MaxSim over all chunks, then exact dense
   rerank). It is the ground truth for ANN recall.
 
+Postings and centres are numbered separately, written `P…` and `C…` below.
+Today they share one number (the `cluster_id`), which is why they are easy to
+confuse.
+
+### Worked example: a split
+
+Toy 2-D vectors. Six chunks share one posting: three about cricket, three about
+interest rates.
+
+**Before.** The centre table holds `C7 = (0.5, 0.5)`. Posting P7 has routing
+centroid (0.5, 0.5) and encodes new inserts against C7. Every entry stores
+`centre_id 7`:
+
+| Chunk | Topic | Vector | Key | Stored residual `x − c` | `centre_id` |
+|---|---|---|---|---|---|
+| a | cricket | (0.9, 0.2) | `P7‖a` | (0.4, −0.3) | 7 |
+| b | cricket | (1.0, 0.1) | `P7‖b` | (0.5, −0.4) | 7 |
+| c | cricket | (0.8, 0.0) | `P7‖c` | (0.3, −0.5) | 7 |
+| d | rates | (0.1, 0.9) | `P7‖d` | (−0.4, 0.4) | 7 |
+| e | rates | (0.2, 1.0) | `P7‖e` | (−0.3, 0.5) | 7 |
+| f | rates | (0.0, 0.8) | `P7‖f` | (−0.5, 0.3) | 7 |
+
+A cricket query scans all six entries, half of them about rates.
+
+**The split.** 2-means over P7's entries (computed from their codes) finds a
+cricket group around (0.9, 0.1) and a rates group around (0.1, 0.9). Two
+centres are appended, `C8 = (0.9, 0.1)` and `C9 = (0.1, 0.9)`. Postings P8 and
+P9 are created and P7 is retired. Each entry's **key** moves; its value is
+copied byte for byte.
+
+**After.** The centre table holds C7, C8 and C9; **C7 stays**, because six
+codes still point at it.
+
+| Posting | Routing centroid | Centre for new inserts | State |
+|---|---|---|---|
+| P7 | — | — | Retired |
+| P8 | (0.9, 0.1) | C8 | Active |
+| P9 | (0.1, 0.9) | C9 | Active |
+
+| Chunk | Key | Stored residual | `centre_id` |
+|---|---|---|---|
+| a, b, c | `P7‖…` → `P8‖…` | unchanged | 7 |
+| d, e, f | `P7‖…` → `P9‖…` | unchanged | 7 |
+
+A new cricket chunk `g = (0.95, 0.15)` arriving later routes to P8 and is
+encoded against C8: residual (0.05, 0.05), `centre_id 8`, key `P8‖g`. So P8
+holds codes with two different centres, and each entry names its own.
+
+A cricket query now routes to P8 and scans four entries (a, b, c, g) instead of
+six, none of them about rates. It scores a, b and c with `⟨q, C7⟩ + estimate
+from bits`, exactly as before the split, and g with `⟨q, C8⟩ + …`.
+
+What each part buys:
+
+- **The split makes search cheaper:** fewer entries scanned, all on topic. No
+  code is rewritten.
+- **New centres make new codes more precise:** g's residual is about 0.07 long
+  against about 0.5 for a, and the 1-bit estimate's error grows with that
+  length.
+- **Old codes stay valid but slightly less precise.** Rewriting them would need
+  the original vector (an embedding call) or re-centring from the 1-bit code,
+  which measured worse than leaving them alone (0.861 vs 0.918).
+
+A centre can be removed only when no entry points at it any more: after its
+chunks are deleted or re-embedded. At 768 dimensions it costs 3 KB, so removing
+unreferenced centres is a small clean-up job for M4.
+
 ---
 
 ## What today's code ties together
