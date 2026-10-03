@@ -25,7 +25,7 @@
 //! [`embed_query`](crate::semantic_search::service::embed_query)). Earlier
 //! versions split queries into 4-word windows; a BEIR evaluation found the
 //! whole-query vector never worse, often better, and much cheaper
-//! (`semantic_search/query-embedding-report.md`).
+//! (`semantic_search/report/query-embedding-report.md`).
 //!
 //! `window_size` and `sliding_size` are the knobs of
 //! [`crate::semantic_search::service::SemanticSearchConfig`] / the TOML

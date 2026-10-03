@@ -10,7 +10,7 @@ Extended RaBitQ, Gao et al., SIGMOD 2025 ([arXiv 2409.09913](https://arxiv.org/a
 [RaBitQ-Library](https://github.com/VectorDB-NTU/RaBitQ-Library) at commit
 `d929e30`. Measurements on gemma (`embeddinggemma-300m`, Q8, llama.cpp) frozen
 embeddings of BEIR SciFact and FiQA, with the bundled gemma centroids, at commit
-`f163050`. Harness: [`vector_bench/study.rs`](vector_bench/study.rs).*
+`f163050`. Harness: [`vector_bench/study.rs`](../vector_bench/study.rs).*
 
 ## Verdict
 

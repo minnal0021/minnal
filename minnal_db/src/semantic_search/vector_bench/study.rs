@@ -1,6 +1,6 @@
 //! Pass-1 / Pass-2 study: where the exact Pass-1 candidates that the index misses
 //! sit, why they are missed, what that costs, and what the rotation and the
-//! estimator's form contribute (`pass1-recall-study.md`, `rabitq-rotation-audit.md`).
+//! estimator's form contribute (`report/pass1-recall-study.md`, `report/rabitq-rotation-audit.md`).
 //!
 //! Works on the frozen embeddings only. Every 1-bit code is rebuilt in memory with
 //! the production quantiser (`quantise`), and Pass 1 is scored with the production

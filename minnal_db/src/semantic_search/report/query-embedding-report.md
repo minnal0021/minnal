@@ -6,7 +6,7 @@ splits documents.
 
 *Run 2026-09-25. Embedding model `google/embeddinggemma-300m` through the PyTorch
 embedding service (full pipeline, bfloat16); gemma centroids regenerated for that
-service (ELI5, k = 256). Harness: [`metrics/beir_eval.rs`](metrics/beir_eval.rs).*
+service (ELI5, k = 256). Harness: [`metrics/beir_eval.rs`](../metrics/beir_eval.rs).*
 
 ## Decision
 
