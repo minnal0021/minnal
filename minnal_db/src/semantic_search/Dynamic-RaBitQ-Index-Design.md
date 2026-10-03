@@ -7,12 +7,14 @@ at the end) · branch `dynamic-rabitq-index` · 2026-10-03
 maintain its own IVF partition as documents arrive. Search quality (nDCG, recall)
 and query latency must not regress at any step.
 
-**Approach.** Five milestones (M0–M4). Each changes one thing and ends at a
+**Approach.** Five milestones (M0–M4), plus a correctness fix (M0-1) found
+while designing M3. Each changes one thing and ends at a
 benchmark gate, so a regression shows up in the milestone that caused it.
 
 | Milestone | What changes | Changes partitioning? | Gate (summary) |
 |---|---|:---:|---|
 | **M0** Benchmark | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
+| **M0-1** Durable re-embed | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; indexing throughput within 5% |
 | **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
@@ -225,6 +227,95 @@ the in-process harness can't: the query cache, the REST path, and the
 - **Footprint:** within +5% unless the milestone states otherwise.
 - **M0 exit:** baseline numbers for `main` (`4397d16`) on both datasets, and two
   back-to-back runs giving identical quality numbers.
+
+---
+
+## M0-1 — Make a re-embed durable before its queue entry is completed
+
+A correctness fix in today's vector pipeline, found while designing the M3
+journal. It comes before M1 because every later milestone re-embeds documents,
+and the M3 journal relies on the same rule.
+
+### The problem
+
+The vector worker handles a queue entry in `vector_kv::finish_embed`:
+
+1. `upsert_vectors` deletes the document's stale cluster keys (**WAL-backed**,
+   durable when the call returns), then writes the new sparse keys, the new
+   sparse meta and the new dense entry (**no-WAL**, durable only after the next
+   memtable flush).
+2. `complete_entry` removes the queue entry with a `merge` (**WAL-backed**,
+   durable at once).
+
+So the queue entry can be gone for good while the vectors it vouches for are
+still only in memory. A crash then (a process kill is enough: unflushed no-WAL
+writes live only in the memtable) leaves an already-indexed document like this:
+
+| What | After the crash |
+|---|---|
+| Queue entry | Gone (its removal was durable) |
+| New sparse keys, new meta, new dense entry | Lost |
+| Stale cluster keys | Deleted (the deletes were durable) |
+| Old meta and old dense entry | Still on disk, flushed at the original index |
+
+`has_complete_vector_index` finds the old meta and dense entry and reports the
+document complete, so startup reconciliation skips it. The document keeps the
+**old text's** vectors, minus the chunks whose clusters changed, until something
+re-embeds it. Only the on-demand validating reconcile (`check_bytes = true`)
+notices the missing keys, and nothing at all notices the stale vectors.
+
+A first-time index is not affected: with no old meta the document reads as
+incomplete and reconciliation re-enqueues it.
+
+### The fix: complete only after a flush, in batches
+
+The queue is already a redo log for embedding; it just must not be truncated
+before the work it records is durable.
+
+- The worker splits `finish_embed` into **write** (`upsert_vectors`) and
+  **complete** (`complete_entry`, plus the existing `Cleared` and
+  vanished-document checks, unchanged).
+- After writing, an entry joins a pending list. When the list reaches a batch
+  size (a constant, e.g. 256) or the pass ends, the worker:
+  1. flushes the vector namespaces those entries wrote to (`{ns}_sparse_vector`,
+     `{ns}_sparse_vector_meta`, `{ns}_dense_vector`) that hold unflushed no-WAL
+     writes, once each;
+  2. only if the flush succeeded, completes every entry in the list.
+- A flush failure completes nothing: the entries stay queued and the next pass
+  redoes them, which is safe because re-embedding the same text writes the same
+  vectors.
+- A crash before the flush leaves the queue entries in place, so the restarted
+  worker re-embeds them. The stale-key deletes that did survive are harmless:
+  the re-run writes the full new set.
+- `Clear` entries need no barrier: `process_clear` and its tombstone removal are
+  all WAL-backed.
+
+**New internal API.** `AsyncDb::flush_no_wal_writes(namespaces)` (crate-internal):
+on a blocking thread, for each named namespace that `has_unflushed_no_wal_writes`,
+call `KVStore::flush_memtable_to_level0`. That flush already fsyncs the value log
+before the L0 file counts as durable (`SyncValueLogBeforePersist`, installed on
+every store); a test confirms it for these namespaces.
+
+**Cost.** One memtable flush per vector namespace per batch, rather than per
+document, so more L0 files during bulk indexing (FiQA: ~57.6k documents ÷ 256 ≈
+225 flushes per namespace) for the compaction worker to merge. Completion is
+delayed by up to one batch; search is not affected, since the vectors are
+readable as soon as they are written.
+
+### Tests and gate
+
+- **Regression test (fails today):** index doc x and flush; re-embed x with
+  vectors whose sparse chunk lands in a different cluster; crash with
+  `std::mem::forget(db)` before any flush; reopen. Expect the queue entry for x
+  to still be there, and processing it to leave exactly the new vectors. Today
+  the entry is gone and x keeps its old dense entry.
+- A crash **after** the barrier but before completion: on reopen the entry is
+  re-processed and the result is the same vectors.
+- A flush failure (injected) completes nothing.
+- The existing R1–R3 race and crash tests keep passing; the conditional
+  completion they cover is unchanged, only deferred.
+- **Gate:** the tests above, and M0's indexing throughput (documents per second,
+  embedding excluded) within 5% of the M0 baseline.
 
 ---
 
@@ -624,26 +715,19 @@ moves the entries the plan selects from neighbouring postings.
 Search tolerates the intermediate states: duplicates during a move score the
 same (MaxSim takes each document's maximum), and holes cannot occur.
 
-**Related finding in today's code.** `upsert_vectors` has the rule 1 problem
-already. Re-embedding an indexed document whose chunks change clusters deletes
-the stale keys (WAL, durable at once), then writes the new keys and meta
-(no-WAL). A crash before the next flush loses the new keys and meta, while the
-old meta and dense entry, flushed earlier, still make `has_complete_vector_index`
-report the document as complete, so startup reconciliation skips it. Only the
-validating reconcile (`check_bytes = true`) notices. The same rule fixes it: the
-vector queue is already a redo log for embedding, so complete a batch's queue
-entries only after a flush of the namespaces holding its no-WAL writes. Not
-reproduced yet; it needs the discard hook below.
+**Same rule in today's code.** `upsert_vectors` and the vector queue have the
+rule 1 problem already: the queue entry's removal is durable before the
+vectors it vouches for. M0-1 fixes that first, with the same barrier.
 
 **Gate (SciFact and FiQA, empty namespace, no file, all three orders):**
 recall within 2 pts of (iv) at equal entries scanned; largest posting < 1%
 (today 43% on SciFact); nDCG@10 ≥ M2d − 0.005. Plus these tests:
 
 - a **crash at every step boundary** of the table above, next to
-  `racing_upsert_and_delete_leave_no_orphaned_cluster_keys`. The existing
-  SIGKILL tests cannot see rule 1, because a killed process keeps the page
-  cache. These need a test hook that **discards unflushed no-WAL memtables**
-  (simulating power loss) at a chosen step. After reopen and recovery, check
+  `racing_upsert_and_delete_leave_no_orphaned_cluster_keys`. A crash here is
+  `std::mem::forget(db)` at the chosen step, as the existing vector crash tests
+  do: unflushed no-WAL writes live only in the memtable, so a process crash
+  loses them. That needs a hook to stop at each step boundary. After reopen and recovery, check
   that every posting key a doc has is listed in its meta, that no chunk is
   missing, and that no chunk of a deleted doc remains
 - racing inserts and deletes against a split: no lost or orphaned keys, and the
@@ -690,7 +774,7 @@ the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
 | Rotated/unrotated mix-up (`q` vs `q'`, `c` vs `Pᵀc`) | M1 | Consistency test against explicitly rotated inputs; estimator-RMSE gate |
 | Hot-path cost of per-entry centre lookup | M2b | Dense `Vec` index; latency gate on this sub-step alone |
 | Split races with inserts and deletes; crash mid-split | M3a | Maintenance journal (redo only); barrier before delete; meta kept a superset; routing epoch + doc lock; crash tests that discard unflushed no-WAL writes |
-| No-WAL write lost while a WAL-backed delete survives | M3a, today's `upsert_vectors` | Barrier before delete; queue completion after flush |
+| No-WAL write lost while a WAL-backed delete or queue completion survives | M0-1, M3a | Queue completion after flush (M0-1); barrier before delete (M3a) |
 | Write amplification from reassignment | M3b | Measured in M3-pre; `k` is a knob (0 = off) |
 | Early-life quality before the first splits | M3 | M3-pre decides float seeding; flat scan while small |
 | Two models in one process | M2a | Per-namespace probe and cache key; test with gemma + qwen |
