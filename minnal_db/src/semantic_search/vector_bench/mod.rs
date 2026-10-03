@@ -29,6 +29,7 @@
 
 mod exact;
 mod frozen;
+mod study;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
