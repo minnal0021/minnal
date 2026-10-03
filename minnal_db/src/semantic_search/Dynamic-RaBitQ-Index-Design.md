@@ -585,9 +585,17 @@ query costs microseconds.
 What it means: gemma's sign bits are already close to independent, so the 1-bit
 estimator's error barely moves, and Pass-1's candidate losses (16–19% of the
 exact top-1000 with every cluster probed) are not caused by a missing rotation.
-They are the 1-bit estimator's own variance, which a finer chunk code (2-bit,
-listed as optional after M4) or a larger first-pass cut addresses. Rotation stays,
-as planned: M3's maintenance reconstructs vectors from codes and relies on it.
+They are the 1-bit estimator's own variance reordering near-equal scores at
+the bottom of the list: the index keeps 99.6% of FiQA's exact top 100, and a
+first-pass cut of 4,000 instead of 1,000 gives the same nDCG@10. The only
+quality lever is probing (`pass1-recall-study.md`). Rotation stays, as planned:
+M3's maintenance reconstructs vectors from codes and relies on it.
+
+An audit against the RaBitQ papers and RaBitQ-Library (`rabitq-rotation-audit.md`)
+found the rotation and both passes' similarity formulas correct. It also found
+that a dense Haar rotation and no rotation at all score the same as FhtKac on
+gemma, and fixed a multi-bit rescale-search bug that affects 2- and 4-bit codes
+only.
 
 Also in M1: the API rejects an `embedding_dim` the rotation cannot handle (odd,
 or under 8) at startup, and the rotator's format is pinned by a fixed-seed test
