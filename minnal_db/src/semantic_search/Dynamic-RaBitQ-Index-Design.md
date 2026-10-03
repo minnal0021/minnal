@@ -13,8 +13,8 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 
 | Milestone | What changes | Changes partitioning? | Gate (summary) |
 |---|---|:---:|---|
-| **M0** Benchmark | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
-| **M0-1** Durable re-embed | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; indexing throughput within 5% |
+| **M0** Benchmark ✓ | Frozen-embedding harness plus a baseline on `main` | — | Reproducible: two runs give identical quality numbers |
+| **M0-1** Durable re-embed ✓ | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; end-to-end indexing throughput within 5% |
 | **M0-2** Write-path crash audit | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
@@ -356,19 +356,21 @@ readable as soon as they are written.
 - A flush failure (injected) completes nothing.
 - The existing R1–R3 race and crash tests keep passing; the conditional
   completion they cover is unchanged, only deferred.
-- **Gate:** the tests above, and indexing throughput within 5%. The main
-  benchmark writes vectors directly and never goes through the worker's
-  completion path, so the cost is measured by `vector_bench_worker_completion`:
-  the same frozen documents through write-then-complete, once completing each
-  entry at once (the old behaviour) and once flushing every 256 entries first.
+- **Gate:** the tests above, and end-to-end indexing throughput (embedding
+  call included, as in production) within 5%. The flush cost itself is
+  measured by `vector_bench_worker_completion`: the same frozen documents
+  through write-then-complete, once completing each entry at once (the old
+  behaviour) and once flushing every 256 entries first.
 
 **Measured (2026-10-03).** With embedding excluded, so that only the flushes
 differ: SciFact 2,455 → 2,444 docs/s (−0.4%), FiQA 2,541 → 2,085 docs/s (−18%,
-about 225 flushes of ~22 ms each). **This fails the 5% gate as written.** In the
-real worker the embedding call dominates: the service embeds about 10 docs/s, so
-a batch of 256 takes ~25 s against one ~22 ms flush (about 0.1%). Open decision:
-judge the gate end to end (passes), or keep it embedding-excluded and raise
-`COMPLETION_BATCH` (fewer flushes, later completion).
+about 225 flushes of ~22 ms each). End to end the embedding call
+dominates: the service embeds about 10 docs/s, so a batch of 256 takes ~25 s
+against one ~22 ms flush, about 0.1%. Vectors are searchable as soon as they are
+written, so the later completion does not delay search.
+
+**Status: passed (2026-10-03).** Regression tests pass and fail without the fix;
+end-to-end throughput cost about 0.1%.
 
 ---
 
