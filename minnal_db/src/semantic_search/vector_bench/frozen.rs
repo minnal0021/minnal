@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use super::super::beir_eval::{read_jsonl, read_qrels, str_field};
+use super::super::metrics::beir_eval::{read_jsonl, read_qrels, str_field};
 use crate::semantic_search::chunking::chunk_document;
 use crate::semantic_search::service::embedding_service::{EmbeddingTarget, embed};
 
