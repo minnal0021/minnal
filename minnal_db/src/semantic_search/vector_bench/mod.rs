@@ -699,6 +699,130 @@ async fn vector_bench_worker_completion() {
     eprintln!("\n=== worker completion cost: {dataset}, {} docs ===\n{report}", frozen.n_docs());
 }
 
+// ── How much rotation can help (design doc M1 follow-up) ─────────────────────
+
+/// Whether a dataset's residuals (chunk − nearest centroid) are evenly spread over
+/// dimensions, measured before and after rotation on a sample of chunks:
+///
+/// - share of total variance in the top 10% of dimensions (10% = perfectly even),
+///   and the largest dimension's variance against the mean;
+/// - mean `⟨ō, o⟩` of the 1-bit code (`ō = sign(o)/√D`): how much of each residual
+///   one bit per dimension captures (≈0.80 for evenly spread vectors; RaBitQ's
+///   error grows as it falls);
+/// - mean |correlation| between the sign bits of random dimension pairs (0 =
+///   every bit carries new information).
+///
+/// Read-only over the frozen embeddings; `MINNAL_BENCH_DATASET` picks the dataset.
+#[test]
+#[ignore]
+fn vector_bench_residual_spread() {
+    const SAMPLE: usize = 5000;
+    const PAIRS: usize = 2000;
+    let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
+    let model = env_or("MINNAL_BENCH_MODEL", "gemma");
+    let bench_root = PathBuf::from(env_or("MINNAL_BENCH_ROOT", "../work/bench"));
+    let frozen_dir = bench_root.join(&dataset).join(&model);
+    assert!(frozen_dir.join("manifest.json").exists(), "run vector_bench for {dataset} first");
+    let config = SemanticSearchConfig::default();
+    let dataset_dir = PathBuf::from(env_or("MINNAL_BEIR_ROOT", "../work/beir")).join(&dataset);
+    let frozen = tokio::runtime::Runtime::new().unwrap().block_on(frozen::load_or_dump(
+        &frozen_dir,
+        &frozen::DumpSpec {
+            dataset: &dataset,
+            dataset_dir: &dataset_dir,
+            split: &env_or("MINNAL_BEIR_SPLIT", "test"),
+            model: &model,
+            dim: config.embedding_dim,
+            window_size: config.window_size,
+            sliding_size: config.sliding_size,
+            embed_url: &config.embedding_service_url,
+        },
+    ));
+    let raw = read_clusters_from_file(&format!("../service/embedding_support/{model}/clusters.json")).unwrap();
+    let index = ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
+    let dim = frozen.dim();
+    let mut rng = SEED;
+    let rows: Vec<usize> = (0..SAMPLE).map(|_| (splitmix(&mut rng) % frozen.n_chunks() as u64) as usize).collect();
+    let pairs: Vec<(usize, usize)> = (0..PAIRS)
+        .map(|_| {
+            let a = (splitmix(&mut rng) % dim as u64) as usize;
+            let b = (a + 1 + (splitmix(&mut rng) % (dim as u64 - 1)) as usize) % dim;
+            (a, b)
+        })
+        .collect();
+
+    let mut report = String::new();
+    for rotated in [false, true] {
+        // Unit residuals o, one row per sampled chunk.
+        let units: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|&c| {
+                let x = frozen.chunk(c);
+                let id = find_closest_cluster_id(&index.clusters, x);
+                let mut r: Vec<f32> = x.iter().zip(&index.clusters[&id].centroid).map(|(a, b)| a - b).collect();
+                if rotated {
+                    r = index.rotate(&r);
+                }
+                let n = r.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                r.iter().map(|v| v / n).collect()
+            })
+            .collect();
+        let mut var = vec![0f64; dim];
+        for o in &units {
+            for (v, &x) in var.iter_mut().zip(o) {
+                *v += (x as f64).powi(2);
+            }
+        }
+        let total: f64 = var.iter().sum();
+        let mean = total / dim as f64;
+        let mut sorted = var.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let top10 = sorted.iter().take(dim / 10).sum::<f64>() / total;
+        let max_over_mean = sorted[0] / mean;
+        let alignment = units
+            .iter()
+            .map(|o| o.iter().map(|v| v.abs() as f64).sum::<f64>() / (dim as f64).sqrt())
+            .sum::<f64>()
+            / units.len() as f64;
+        // Sign-bit correlation over random dimension pairs (bits as ±1).
+        let corr = pairs
+            .iter()
+            .map(|&(a, b)| {
+                let n = units.len() as f64;
+                let (mut sa, mut sb, mut sab) = (0f64, 0f64, 0f64);
+                for o in &units {
+                    let (x, y) = (o[a].signum() as f64, o[b].signum() as f64);
+                    sa += x;
+                    sb += y;
+                    sab += x * y;
+                }
+                let (ma, mb) = (sa / n, sb / n);
+                let cov = sab / n - ma * mb;
+                let denom = ((1.0 - ma * ma) * (1.0 - mb * mb)).sqrt();
+                if denom > 0.0 { (cov / denom).abs() } else { 0.0 }
+            })
+            .sum::<f64>()
+            / pairs.len() as f64;
+        let _ = writeln!(
+            report,
+            "  {:>10}: top 10% of dims hold {:.1}% of variance; max dim {:.1}x the mean; mean <ō,o> {:.4}; mean |sign-bit corr| {:.4}",
+            if rotated { "rotated" } else { "unrotated" },
+            top10 * 100.0,
+            max_over_mean,
+            alignment,
+            corr
+        );
+    }
+    // Reference: what perfectly evenly spread (random) unit vectors give.
+    let _ = writeln!(
+        report,
+        "  reference (random unit vectors): 10.0% (plus sampling noise); <ō,o> ≈ {:.4}; |corr| ≈ {:.4} at {SAMPLE} samples",
+        (2.0f64 / std::f64::consts::PI).sqrt(),
+        (2.0 / (std::f64::consts::PI * SAMPLE as f64)).sqrt()
+    );
+    eprintln!("\n=== residual spread: {dataset} ({model}), {SAMPLE} chunks, {PAIRS} dimension pairs ===\n{report}");
+}
+
 // ── Comparison ───────────────────────────────────────────────────────────────
 
 /// Mean of `new − base` over queries, with a paired bootstrap 95% interval.
