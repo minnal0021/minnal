@@ -135,6 +135,33 @@ pub fn index_embedding(
     Ok(index_embedding_to_cluster(embeddings, cluster, style))
 }
 
+/// Quantise `embedding` for `cluster_index`: assign it to its nearest cluster (in
+/// the original space) and encode it against that cluster's centroid in the
+/// index's rotated space (`quantise(Pᵀx, Pᵀc)`; see
+/// [`ClusterIndex`](crate::semantic_search::ClusterIndex)). The production indexing
+/// path; its codes are scored by `search()`, which rotates the query to match.
+pub fn index_embedding_rotated(
+    cluster_index: &crate::semantic_search::ClusterIndex,
+    embedding: &[f32],
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> Result<VectorIndex, ClusterIndexError> {
+    let cluster_id = find_closest_cluster_id(&cluster_index.clusters, embedding);
+    index_embedding_in_cluster(cluster_index, embedding, cluster_id, style).ok_or(ClusterIndexError::EmptyClusterMap)
+}
+
+/// Like [`index_embedding_rotated`], but against a given cluster; `None` for an
+/// unknown cluster id.
+pub fn index_embedding_in_cluster(
+    cluster_index: &crate::semantic_search::ClusterIndex,
+    embedding: &[f32],
+    cluster_id: u32,
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> Option<VectorIndex> {
+    let centroid = cluster_index.rotated_centroid(cluster_id)?;
+    let rotated = Cluster::new(cluster_id, centroid.to_vec());
+    Some(index_embedding_to_cluster(&cluster_index.rotate(embedding), &rotated, style))
+}
+
 pub fn index_embedding_to_cluster(
     embedding: &[f32],
     cluster: &Cluster,

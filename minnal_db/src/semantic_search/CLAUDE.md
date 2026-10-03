@@ -12,7 +12,8 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `index/vector_index.rs` | `VectorIndex` struct, `VectorKvStore` trait (`scan_sparse_clusters_batch` / `get_dense_entries_batch`, which `search()` uses, and their single-item forms) |
 | `index/composite_key.rs` | Composite key layout: `cluster_id (4B BE) ‖ doc_id` |
 | `index/distance_estimator.rs` | `SingleBitQuanDotProductEstimator` (Pass 1) and `MultiBitQuanDotProductEstimator` (Pass 2) |
-| `quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode) |
+| `quantisation/rabitq/` | RaBitQ multi-bit and single-bit quantisation (encode + decode); `index_embedding_rotated` is the production indexing path |
+| `rotation.rs` | `FhtKacRotator`: the seeded random rotation codes are computed in (format pinned by `output_is_pinned_for_a_fixed_seed`) |
 | `service/mod.rs` | Embedding orchestration: `embed_document` / `embed_query`, the startup probe `check_embedding_service`; `search()` two-pass ANN and `SCORING_GATE` |
 | `service/embedding_service.rs` | Raw HTTP client for the embedding service (`/embedding/{model}/…`, `/healthcheck`) |
 | `beir_eval.rs` | `#[ignore]`d BEIR relevance eval of the production pipeline (nDCG@10, candidate recall, probes, latency) |
@@ -59,6 +60,10 @@ A third namespace, `{ns}_sparse_vector_meta`, is each document's index record: `
 **Crash audit (design doc M0-2).** `vector_kv::crash_audit_tests` runs each write path with a simulated crash before every write (`crash_point!()`, a test-only countdown before each vector-index write in `vector_kv`), under five flush patterns (no namespace, each one alone, all), then restarts in production's order (worker pass, reconciliation, worker pass) and checks that the vector index matches what the store holds. Add a `crash_point!()` before any new vector-index write, and a scenario for any new multi-step path.
 
 The **query-embedding cache** (`system_qemb_cache`, below) follows the same split. Populates are no-WAL (`put_no_wal`): the cache is TTL-bounded and fully regenerable from the embedding service, so a dropped populate is just a future miss, and staying off the WAL removes a per-populate fsync from the query hot path. The admin clear (`DELETE /admin/indices/vector/query-cache`) deletes **WAL-backed**: the periodic no-WAL flush tick has usually already persisted the entries being cleared, so a no-WAL tombstone lost to a crash before the next tick would resurrect them — serving entries the operator explicitly cleared until the TTL expires. The clear is a rare admin operation, so the per-delete fsync is off the query path.
+
+### Rotation (codes live in a rotated space)
+
+`ClusterIndex` holds one `FhtKacRotator` (`ROTATION_SEED`) and a rotated copy of every centroid. Indexing (`index_embedding_rotated`) picks the nearest cluster on the **original** vector, then quantises `Pᵀx` against `Pᵀc`; `search()` rotates each query once and uses the rotated query for every term that meets a code (the query sum, `scaled_query_sum`, and the packed dot products), while cluster probing and `⟨q, c⟩` use the original (rotation preserves both). **Mixing the two spaces is the bug to watch for**: a rotated code scored with an unrotated query sum, or the reverse. `rotated_scoring_matches_scoring_fully_rotated_inputs` checks the formula wiring, and `rotated_index_finds_the_source_document_end_to_end` (with a first-pass cut of 3, so Pass 1 must rank correctly too) fails if either pass's query is left unrotated. Dimensions that are odd or below 8 get no rotation (only tiny test indexes); the API rejects such an `embedding_dim`. Measured on gemma: estimator RMSE −0.6% / −2.2% (SciFact / FiQA), quality and latency unchanged (design doc M1).
 
 ### Search (two-pass ANN)
 

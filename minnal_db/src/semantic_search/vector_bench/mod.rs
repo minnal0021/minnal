@@ -44,7 +44,7 @@ use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
 use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
-use crate::semantic_search::quantisation::rabitq::index_embedding;
+use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
 use crate::semantic_search::service::{SemanticSearchConfig, index_embeddings, search};
 use crate::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_meta_ns, sparse_vectors_ns, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
@@ -215,8 +215,9 @@ fn error_stats(errors: &[(f32, f32)]) -> ErrorStats {
 /// Estimator error on sampled (query, chunk) and (query, doc) pairs: each query's
 /// exact top [`ESTIMATOR_TOP`] plus [`ESTIMATOR_RANDOM`] random picks.
 ///
-/// Builds codes and estimators the way indexing and `search()` do today; a
-/// milestone that changes that wiring (rotation, centres) must change it here too.
+/// Builds codes and estimators the way indexing and `search()` do (rotated codes and
+/// query terms, ⟨q, c⟩ unrotated); a milestone that changes that wiring (centres)
+/// must change it here too.
 fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, dense_bits: usize) -> (ErrorStats, ErrorStats) {
     let nq = frozen.n_queries();
     let step = (nq / ESTIMATOR_QUERIES).max(1);
@@ -233,11 +234,15 @@ fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, den
             })
             .collect();
         chunks.extend((0..ESTIMATOR_RANDOM).map(|_| (splitmix(&mut rng) % frozen.n_chunks() as u64) as usize));
+        // Wired as indexing and `search()` are: codes and the query's code-facing
+        // terms in rotated space, ⟨q, c⟩ in the original space.
+        let rq = index.rotate(q);
         for c in chunks {
             let x = frozen.chunk(c);
-            let vi = index_embedding(&index.clusters, x, QuantisationStyle::SingleBit).unwrap();
+            let vi = index_embedding_rotated(index, x, QuantisationStyle::SingleBit).unwrap();
             let centroid = &index.clusters[&vi.cluster_id].centroid;
-            let est = SingleBitQuanDotProductEstimator::new(vi.cluster_id, q, centroid).estimate_distance(q, &vi);
+            let sum = SingleBitQuanDotProductEstimator::query_sum(&rq);
+            let est = SingleBitQuanDotProductEstimator::with_query_sum(vi.cluster_id, q, centroid, sum).estimate_distance(&rq, &vi);
             sparse_err.push((est - dot(q, x), vi.error_bound));
         }
         let mut docs: Vec<usize> = gt.final_ranking[qi].iter().take(ESTIMATOR_TOP).map(|&d| d as usize).collect();
@@ -245,9 +250,10 @@ fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, den
         for d in docs {
             let x = frozen.dense(d);
             let style = QuantisationStyle::MultiBit { number_of_bits: dense_bits };
-            let vi = index_embedding(&index.clusters, x, style).unwrap();
+            let vi = index_embedding_rotated(index, x, style).unwrap();
             let centroid = &index.clusters[&vi.cluster_id].centroid;
-            let est = MultiBitQuanDotProductEstimator::new(vi.cluster_id, q, centroid, dense_bits).estimate_distance(q, &vi);
+            let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, dense_bits);
+            let est = MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.cluster_id, q, centroid, sum).estimate_distance(&rq, &vi);
             dense_err.push((est - dot(q, x), vi.error_bound));
         }
     }

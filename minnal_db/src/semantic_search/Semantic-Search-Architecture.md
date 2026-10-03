@@ -112,7 +112,7 @@ All quantised entries share the same `VectorIndex` struct:
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
-> **Limitation: no random rotation.** The RaBitQ paper applies a random orthogonal rotation to both the stored embeddings and the query before quantising. minnal quantises them directly. The rotation decorrelates dimensions and tightens the error bound, so minnal's estimated dot products are noisier than the paper's guarantee. Adding it means applying one shared rotation matrix at index time and at query time.
+**Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one fixed orthogonal transform `P` (`semantic_search/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
 
 ---
 
