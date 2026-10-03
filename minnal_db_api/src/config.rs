@@ -175,6 +175,13 @@ impl DocStoreApiConfig {
                  {MIN_MULTI_BIT_QUANTISATION_BITS}..={MAX_MULTI_BIT_QUANTISATION_BITS}, got {bits}"
             ));
         }
+        // Codes are computed in a randomly rotated space, and the rotation needs an
+        // even dimension of at least 8; any other would run unrotated, which the
+        // RaBitQ error bound does not cover.
+        let dim = self.semantic_search.embedding_dim;
+        if dim < 8 || !dim.is_multiple_of(2) {
+            return Err(format!("semantic_search.embedding_dim must be even and at least 8, got {dim}"));
+        }
         Ok(())
     }
 
@@ -913,6 +920,19 @@ mod tests {
         let mut cfg = DocStoreApiConfig::default();
         cfg.semantic_search.number_of_bits_for_dense_quantisation = bits;
         cfg
+    }
+
+    #[test]
+    fn validate_semantic_search_rejects_a_dimension_the_rotation_cannot_handle() {
+        for dim in [0usize, 4, 7, 767] {
+            let mut cfg = config_with_bits(8);
+            cfg.semantic_search.embedding_dim = dim;
+            let err = cfg.validate_semantic_search().unwrap_err();
+            assert!(err.contains("embedding_dim"), "dim={dim} should be rejected, got: {err}");
+        }
+        let mut cfg = config_with_bits(8);
+        cfg.semantic_search.embedding_dim = 768;
+        assert!(cfg.validate_semantic_search().is_ok());
     }
 
     #[test]

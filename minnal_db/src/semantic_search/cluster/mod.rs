@@ -6,6 +6,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use crate::semantic_search::rotation::FhtKacRotator;
+
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub cluster_id: u32,
@@ -123,6 +125,19 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 /// matrix is one contiguous allocation the scan streams sequentially (a measured ~12%
 /// win). The two are built together and never mutated after construction, so they cannot
 /// drift.
+///
+/// **Rotation.** RaBitQ codes are computed in a randomly rotated space (see
+/// [`crate::semantic_search::rotation`]), which its error bound assumes: a code
+/// stores `Pᵀ(x − c)`, and a query is rotated once per search (`q' = Pᵀq`) before it
+/// meets the codes. Every quantity the quantiser and the estimators compute is an
+/// inner product, and rotation preserves inner products, so the formulas stay as
+/// they are and only their inputs are rotated consistently: the embedding and the
+/// centroid at index time ([`rotated_centroid`](Self::rotated_centroid)), and the
+/// query's code-facing terms at search time ([`rotate`](Self::rotate)). Probing
+/// and `⟨q, c⟩` stay in the original space. The index holds one rotation, fixed by
+/// [`ROTATION_SEED`]; it is part of the stored format, so changing the seed means
+/// re-indexing. It exists for every even dimension of at least 8 (production uses
+/// 768); smaller test dimensions are left unrotated.
 #[derive(Debug)]
 pub struct ClusterIndex {
     /// All clusters keyed by their ID.
@@ -136,6 +151,20 @@ pub struct ClusterIndex {
     /// The uniform centroid dimension, validated at load time. Every query and
     /// document embedding compared against these centroids must share it.
     dim: usize,
+    /// The rotation codes are computed in, with each centroid rotated by it.
+    /// `None` only for dimensions it cannot handle (odd, or below 8).
+    rotation: Option<Rotation>,
+}
+
+/// Seed of the rotation every index uses. Part of the stored format: changing it
+/// means re-indexing every semantic-search store.
+pub const ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
+
+#[derive(Debug)]
+struct Rotation {
+    rotator: FhtKacRotator,
+    /// `Pᵀc` for every centroid, keyed by cluster id.
+    centroids: HashMap<u32, Vec<f32>>,
 }
 
 impl ClusterIndex {
@@ -183,12 +212,49 @@ impl ClusterIndex {
             centroids.extend_from_slice(&cluster.centroid);
             centroid_ids.push(cluster.cluster_id);
         }
+        let rotation = (dim >= 8 && dim.is_multiple_of(2)).then(|| {
+            let rotator = FhtKacRotator::new(dim, ROTATION_SEED);
+            let centroids = clusters
+                .values()
+                .map(|c| {
+                    let mut r = c.centroid.clone();
+                    rotator.rotate_inplace(&mut r);
+                    (c.cluster_id, r)
+                })
+                .collect();
+            Rotation { rotator, centroids }
+        });
         Self {
             clusters,
             centroids,
             centroid_ids,
             dim,
+            rotation,
         }
+    }
+
+    /// `v` in the space codes are computed in (`Pᵀv`); a copy of `v` when the index
+    /// has no rotation.
+    pub fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut out = v.to_vec();
+        if let Some(rotation) = &self.rotation {
+            rotation.rotator.rotate_inplace(&mut out);
+        }
+        out
+    }
+
+    /// Cluster `cluster_id`'s centroid in the space codes are computed in (`Pᵀc`),
+    /// or `None` for an unknown id.
+    pub fn rotated_centroid(&self, cluster_id: u32) -> Option<&[f32]> {
+        match &self.rotation {
+            Some(rotation) => rotation.centroids.get(&cluster_id).map(Vec::as_slice),
+            None => self.clusters.get(&cluster_id).map(|c| c.centroid.as_slice()),
+        }
+    }
+
+    /// Whether codes are computed in a rotated space.
+    pub fn is_rotated(&self) -> bool {
+        self.rotation.is_some()
     }
 
     /// Build an index directly from in-memory clusters, inferring the dimension

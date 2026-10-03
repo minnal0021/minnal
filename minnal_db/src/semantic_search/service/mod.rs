@@ -199,9 +199,9 @@ pub fn index_embeddings(
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
     let mut indexes = Vec::with_capacity(1 + chunks.len());
-    indexes.push(rabitq::index_embedding(&cluster_index.clusters, dense, multi_bit_style)?);
+    indexes.push(rabitq::index_embedding_rotated(cluster_index, dense, multi_bit_style)?);
     for e in chunks {
-        indexes.push(rabitq::index_embedding(&cluster_index.clusters, e, QuantisationStyle::SingleBit)?);
+        indexes.push(rabitq::index_embedding_rotated(cluster_index, e, QuantisationStyle::SingleBit)?);
     }
     Ok(indexes)
 }
@@ -364,6 +364,13 @@ where
 
     let top_k_limit = top_k.unwrap_or(config.top_k_results);
 
+    // The codes live in the index's rotated space, so every term a query meets them
+    // in (its sum and its dot product with the code bits) uses the rotated query;
+    // probing and ⟨q, c⟩ keep the original (rotation preserves both). Rotated once
+    // here, not per cluster or per entry. See `ClusterIndex`.
+    let rotated_sparse: Vec<Vec<f32>> = query_sparse_embeddings.iter().map(|q| cluster_index.rotate(q)).collect();
+    let rotated_dense = cluster_index.rotate(query_dense_embedding);
+
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
     // Union of top-n_probes clusters across all Pass-1 query vectors (in production
@@ -407,10 +414,7 @@ where
     // One estimator per (probed cluster, query vector): query_to_centroid_dot_product
     // and scaled_query_sum are constant across a cluster's entries. A probed id with
     // no centroid in the index contributes no candidates.
-    let query_sums: Vec<f32> = query_sparse_embeddings
-        .iter()
-        .map(|q| SingleBitQuanDotProductEstimator::query_sum(q))
-        .collect();
+    let query_sums: Vec<f32> = rotated_sparse.iter().map(|q| SingleBitQuanDotProductEstimator::query_sum(q)).collect();
     let cluster_estimators: HashMap<u32, Vec<SingleBitQuanDotProductEstimator>> = sparse_by_cluster
         .keys()
         .filter_map(|&cluster_id| {
@@ -487,7 +491,7 @@ where
             for vi in vi_list.iter() {
                 vi.copy_packed_into(words_buf);
                 let scaling_factor = vi.scaling_factor();
-                for ((q, estimator), row_max) in query_sparse_embeddings.iter().zip(estimators).zip(row.iter_mut()) {
+                for ((q, estimator), row_max) in rotated_sparse.iter().zip(estimators).zip(row.iter_mut()) {
                     let score = estimator.estimate_from_parts(q, words_buf, scaling_factor);
                     if score > *row_max {
                         *row_max = score;
@@ -556,7 +560,7 @@ where
 
     // scaled_query_sum is constant for the whole-query dense embedding + bit-width
     // across all clusters, so compute it once.
-    let scaled_query_sum = MultiBitQuanDotProductEstimator::scaled_query_sum(query_dense_embedding, config.number_of_bits_for_dense_quantisation);
+    let scaled_query_sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rotated_dense, config.number_of_bits_for_dense_quantisation);
 
     // The dense namespace must hold MultiBit entries at exactly the configured
     // bit-width — the estimator and scaled_query_sum are built for that width, so a
@@ -627,7 +631,7 @@ where
                     MultiBitQuanDotProductEstimator::with_scaled_query_sum(cluster_id, query_dense_embedding, &cluster.centroid, scaled_query_sum)
                 });
                 vi.copy_packed_into(words_buf);
-                let dot_product = estimator.estimate_from_parts(query_dense_embedding, words_buf, vi.addition_factor(), vi.scaling_factor());
+                let dot_product = estimator.estimate_from_parts(&rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
                 Some(HeapEntry {
                     dot_product,
                     error_bound: vi.error_bound(),
@@ -1035,6 +1039,121 @@ mod tests {
     }
 
     // ── QuantisationStyle ─────────────────────────────────────────────────────
+
+    // ── Rotation (design doc M1) ──────────────────────────────────────────────
+
+    fn unit_vec(dim: usize, seed: u64) -> Vec<f32> {
+        let mut st = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut v: Vec<f32> = (0..dim)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    fn rotated_cluster_index(dim: usize, clusters: u32) -> crate::semantic_search::ClusterIndex {
+        use crate::semantic_search::cluster::{Cluster, ClusterIndex};
+        let index = ClusterIndex::from_clusters((0..clusters).map(|id| (id, Cluster::new(id, unit_vec(dim, 1000 + id as u64)))).collect());
+        assert!(index.is_rotated(), "a {dim}-d index must be rotated");
+        index
+    }
+
+    /// `search()` scores a code with ⟨q, c⟩ on the original query and centroid and
+    /// everything else on the rotated query. That must equal the estimator applied
+    /// to explicitly rotated inputs throughout (rotation preserves ⟨q, c⟩); a query
+    /// term left unrotated breaks the equality.
+    #[test]
+    fn rotated_scoring_matches_scoring_fully_rotated_inputs() {
+        use crate::semantic_search::index::distance_estimator::{
+            DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator,
+        };
+        let index = rotated_cluster_index(768, 8);
+        for seed in 0..20 {
+            let (x, q) = (unit_vec(768, seed), unit_vec(768, 500 + seed));
+            let rq = index.rotate(&q);
+
+            let vi = rabitq::index_embedding_rotated(&index, &x, QuantisationStyle::SingleBit).unwrap();
+            let c = &index.clusters[&vi.cluster_id].centroid;
+            let rc = index.rotated_centroid(vi.cluster_id).unwrap();
+            let as_search = SingleBitQuanDotProductEstimator::with_query_sum(vi.cluster_id, &q, c, SingleBitQuanDotProductEstimator::query_sum(&rq))
+                .estimate_distance(&rq, &vi);
+            let all_rotated = SingleBitQuanDotProductEstimator::new(vi.cluster_id, &rq, rc).estimate_distance(&rq, &vi);
+            assert!((as_search - all_rotated).abs() < 1e-4, "1-bit, seed {seed}: {as_search} vs {all_rotated}");
+
+            let style = QuantisationStyle::MultiBit { number_of_bits: 8 };
+            let vi = rabitq::index_embedding_rotated(&index, &x, style).unwrap();
+            let c = &index.clusters[&vi.cluster_id].centroid;
+            let rc = index.rotated_centroid(vi.cluster_id).unwrap();
+            let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, 8);
+            let as_search = MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.cluster_id, &q, c, sum).estimate_distance(&rq, &vi);
+            let all_rotated = MultiBitQuanDotProductEstimator::new(vi.cluster_id, &rq, rc, 8).estimate_distance(&rq, &vi);
+            assert!((as_search - all_rotated).abs() < 1e-4, "8-bit, seed {seed}: {as_search} vs {all_rotated}");
+            let exact: f32 = x.iter().zip(&q).map(|(a, b)| a * b).sum();
+            assert!(
+                (as_search - exact).abs() < 0.01,
+                "8-bit, seed {seed}: estimate {as_search} vs exact {exact}"
+            );
+        }
+    }
+
+    /// Through the production write path (`index_embeddings`, `upsert_vectors`) and
+    /// the real `search()`, a rotated 768-d index finds the document a query was
+    /// drawn from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotated_index_finds_the_source_document_end_to_end() {
+        let index = rotated_cluster_index(768, 16);
+        // A tight first-pass cut, so Pass 1's own ranking must be right too (with
+        // the default 1,000 candidates Pass 2 would rescue any Pass-1 mistake).
+        let config = SemanticSearchConfig {
+            n_probes: 16,
+            first_pass_sparse_search_top_k: 3,
+            ..SemanticSearchConfig::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        db.namespace("docs".to_string()).await.unwrap();
+        let docs: Vec<Vec<f32>> = (0..300).map(|d| unit_vec(768, d)).collect();
+        for (d, v) in docs.iter().enumerate() {
+            let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
+            crate::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
+                .await
+                .unwrap();
+        }
+        let store = crate::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
+        for d in (0..300u64).step_by(15) {
+            // The source document plus a little noise.
+            let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
+            let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            q.iter_mut().for_each(|x| *x /= n);
+            let results = search(
+                &config,
+                "docs",
+                &index,
+                std::slice::from_ref(&q),
+                &q,
+                &store,
+                None::<fn(&[u8]) -> bool>,
+                Some(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                results[0].document_id,
+                d.to_be_bytes().to_vec(),
+                "query from doc {d} ranked {:?} first",
+                results[0].document_id
+            );
+        }
+        db.shutdown().await.unwrap();
+    }
 
     #[test]
     fn test_quantisation_style_default_is_multi_bit_8() {
