@@ -460,24 +460,15 @@ Gaps to close when it moves into `semantic_search/rotation.rs`:
   final top-10 equal to `exact_final` on ≥ 97% of positions (the threshold gets
   set from the M0 baseline value, not guessed).
 
-### Index format and rollout
+### Rotation seed
 
-M1 changes what every stored code means. Add `index_format: u16` to a
-per-namespace vector-index metadata record (`{ns}_vector_meta`, a new
-companion namespace, WAL-backed). It holds `index_format` and `rotation_seed`
-and grows in M2. A namespace whose format doesn't match the binary's is refused
-for search with a clear "re-index required" error. Silently mis-scoring it is the
-alternative, and it's worse. Greenfield rules apply: existing indexes are
-not migrated, they are rebuilt.
+Each namespace's rotation seed is stored in a per-namespace vector-index
+metadata record, `{ns}_vector_meta` (a new companion namespace, WAL-backed),
+which grows in M2. It defaults to a fixed constant: a per-namespace seed gives no
+quality gain over one fixed seed, but recording it makes the seed explicit.
 
-`reindex-all` re-enqueues documents **without clearing** old vectors, so a
-namespace would serve a mix of old and new codes while it runs. Rebuilding
-after a format change is therefore *drop vector index → re-enable*, which clears
-it first.
-
-Seed: stored per namespace, defaulting to a fixed constant. A per-namespace seed
-gives no quality gain over one fixed seed, but recording it makes the format
-explicit.
+The new code format is simply the format from M1 on. There is no migration and
+no format-version check: stores indexed before M1 are recreated (greenfield).
 
 ### Gate
 
@@ -536,8 +527,7 @@ namespace instead:**
 | `beir_eval.rs`, `config_report.rs`, `routes/stores.rs`, tests | config | schema |
 | `QUICKSTART.md`, `minnal_db/QUICKSTART.md`, READMEs, `config/sample.toml`, `service/scripts/examples/docs.sh` | `[semantic_search] model` / `embedding_dim` | `embedding_model` / `embedding_dim` in the store body (examples rerun per the docs rules) |
 
-**Existing stores.** Schemas on disk without these fields fail validation.
-Existing data is not a concern (greenfield): such stores are recreated.
+Stores created before M2a are recreated (greenfield).
 
 **Gate.** Pure refactor: harness results byte-identical to M1. Add tests for
 schema validation (missing, empty, mixed-case model; odd, small or zero
@@ -564,8 +554,7 @@ cannot be rebuilt by re-embedding):
 table is empty, seed it from `{centroid_dir}/{model}/clusters.json`: posting id
 = centre id = cluster id, and routing centroid = centre. `centroid_dir` is
 engine-wide (default `service/embedding_support`) and replaces `cluster_path`.
-After seeding, the namespace never reads the file again, so the bundled file can
-later change without corrupting existing namespaces. A model with no bundled
+After seeding, the namespace never reads the file again. A model with no bundled
 file, or a file whose dimension differs from the namespace's, fails the enable
 request during M2; from M3 on, such a namespace simply starts with no file.
 
@@ -835,7 +824,6 @@ the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
 
 | Risk | Where | Mitigation |
 |---|---|---|
-| Mixed old/new codes in one namespace | M1, M2 | `index_format` check refuses search; rebuild by drop + re-enable, not `reindex-all` |
 | Rotated/unrotated mix-up (`q` vs `q'`, `c` vs `Pᵀc`) | M1 | Consistency test against explicitly rotated inputs; estimator-RMSE gate |
 | Hot-path cost of per-entry centre lookup | M2b | Dense `Vec` index; latency gate on this sub-step alone |
 | Split races with inserts and deletes; crash mid-split | M3a | Maintenance journal (redo only); barrier before delete; meta kept a superset; routing epoch + doc lock; crash tests that discard unflushed no-WAL writes |
