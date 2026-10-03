@@ -172,15 +172,20 @@ dims, model, chunking params, service commit).
 
 ### Harness
 
-Extend `semantic_search/beir_eval.rs` rather than writing a new tool:
+The harness is `semantic_search/vector_bench/` (`#[cfg(test)]`, `#[ignore]`d
+tests). It reuses `beir_eval.rs`'s readers and scoring, and its module docs give
+the commands.
 
-1. **Split `embed_document`** into *fetch embeddings* and
-   `index_embeddings(config, ns_index, dense, chunks) -> Vec<VectorIndex>`. This
-   is a pure refactor and the harness's only hook into production code. Later
+1. **`embed_document` is split** into the service call and
+   `index_embeddings(config, cluster_index, dense, chunks) -> Vec<VectorIndex>`.
+   This pure refactor is the harness's only hook into production code. Later
    milestones change `index_embeddings` and the harness follows automatically.
-2. Add a `MINNAL_BEIR_EMBEDDINGS=dir` mode: load frozen vectors, index them
-   through `index_embeddings` + `upsert_vectors`, and run queries through the
-   real `search()`.
+2. **`vector_bench`** loads the frozen vectors (dumping them through the service
+   on the first run), indexes them through `index_embeddings` +
+   `upsert_vectors` into a fresh database (default `DbConfig`, 8 docs in flight),
+   reopens and compacts it, and runs queries through the real `search()`.
+   Documents the service refuses are left out of the dump and listed in its
+   manifest (see *Finding* below).
 3. **Ground truth from floats**, computed once and cached next to the vectors:
    - `exact_pass1[q]`: exact MaxSim (`max_j ⟨q, d_j⟩`) over all chunks, top 1000.
    - `exact_final[q]`: `exact_pass1` reranked by exact dense `⟨q, d⟩`, top 100.
@@ -195,7 +200,7 @@ Extend `semantic_search/beir_eval.rs` rather than writing a new tool:
 | Relevance (qrels) | nDCG@10, MRR@10, Recall@100 | What users see; already in `beir_eval` |
 | ANN fidelity | Pass-1 recall@{100,1000} vs `exact_pass1`; final recall@10 vs `exact_final` | Isolates index damage from model quality; more sensitive than nDCG |
 | Estimator | RMSE and bias of Pass-1 and Pass-2 estimates vs exact inner products, on a fixed sample of (query, entry) pairs; share of errors inside `error_bound` | What rotation (M1) and centring (M2b) change directly |
-| Cost | entries scanned, postings probed, Pass-1/Pass-2 ms, total ms p50/p95/p99 (warm, sequential) | Latency gate |
+| Cost | entries and chunks scanned, total ms p50/p95/p99 (warm, sequential, 3 repeats), queries whose results differ between repeats | Latency gate. Pass 1 and Pass 2 are not timed separately: `search()` has no timing hook, and adding one is not worth a production change |
 | Partition shape | postings, largest posting share, p99 posting size, coefficient of variation | Catches skew (today: 43% of SciFact in one cluster) |
 | Footprint | bytes in `_sparse_vector`, `_dense_vector`, `_meta`, centre tables; indexing throughput (docs/s, embedding excluded) | Space goal; M2 adds 4 bytes per entry |
 
@@ -315,8 +320,11 @@ readable as soon as they are written.
 - A flush failure (injected) completes nothing.
 - The existing R1–R3 race and crash tests keep passing; the conditional
   completion they cover is unchanged, only deferred.
-- **Gate:** the tests above, and M0's indexing throughput (documents per second,
-  embedding excluded) within 5% of the M0 baseline.
+- **Gate:** the tests above, and indexing throughput within 5%. The main
+  benchmark writes vectors directly and never goes through the worker's
+  completion path, so the cost is measured by `vector_bench_worker_completion`:
+  the same frozen documents through write-then-complete, once completing each
+  entry at once (the old behaviour) and once flushing every 256 entries first.
 
 ---
 
