@@ -5,7 +5,6 @@ pub mod cluster;
 pub mod index;
 pub mod metrics;
 pub mod quantisation;
-pub mod rotation;
 pub mod service;
 pub(crate) mod simd;
 #[cfg(test)]

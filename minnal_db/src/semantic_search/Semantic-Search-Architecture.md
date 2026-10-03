@@ -112,7 +112,7 @@ All quantised entries share the same `VectorIndex` struct:
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
-**Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one fixed orthogonal transform `P` (`semantic_search/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
+**Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one fixed orthogonal transform `P` (`semantic_search/quantisation/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
 
 ---
 
