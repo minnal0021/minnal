@@ -4,7 +4,7 @@
 //! This module contains only higher-level logic: quantisation, cluster
 //! probing, and result ranking.  Raw text is forwarded to the service as-is.
 
-mod embedding_service;
+pub(crate) mod embedding_service;
 
 pub use crate::semantic_search::index::vector_index::QuantisationStyle;
 
@@ -159,10 +159,6 @@ pub struct QueryEmbeddings {
 /// combined list can be passed directly to `upsert_vectors`; the storage
 /// layer groups by `(style, cluster_id)`.
 pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &ClusterIndex, text: &str) -> Result<Vec<VectorIndex>, EmbeddingError> {
-    let multi_bit_style = QuantisationStyle::MultiBit {
-        number_of_bits: config.number_of_bits_for_dense_quantisation,
-    };
-
     // payload[0] = whole document (dense); payload[1..] = sliding-window chunks (sparse).
     let mut payloads = Vec::with_capacity(1);
     payloads.push(text.to_string());
@@ -181,14 +177,32 @@ pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &Clust
     .await?;
 
     // Split the ordered response: first = dense (MultiBit), rest = sparse chunks (SingleBit).
-    let mut it = embeddings.iter();
-    let dense = it.next().ok_or(EmbeddingError::EmptyResponse)?;
-    let mut indexes = Vec::with_capacity(embeddings.len());
+    let (dense, chunks) = embeddings.split_first().ok_or(EmbeddingError::EmptyResponse)?;
+    index_embeddings(config, cluster_index, dense, chunks)
+}
+
+/// Quantise a document's already-fetched embeddings into its vector-index entries:
+/// `dense` (the whole-text embedding) as one `MultiBit` entry, then each of `chunks`
+/// (the sliding-window embeddings) as a `SingleBit` entry assigned to its nearest
+/// IVF cluster.
+///
+/// This is everything [`embed_document`] does after the embedding-service call.
+/// It is separate so the vector benchmark can index saved embeddings through the
+/// exact production path without calling the service.
+pub fn index_embeddings(
+    config: &SemanticSearchConfig,
+    cluster_index: &ClusterIndex,
+    dense: &[f32],
+    chunks: &[Vec<f32>],
+) -> Result<Vec<VectorIndex>, EmbeddingError> {
+    let multi_bit_style = QuantisationStyle::MultiBit {
+        number_of_bits: config.number_of_bits_for_dense_quantisation,
+    };
+    let mut indexes = Vec::with_capacity(1 + chunks.len());
     indexes.push(rabitq::index_embedding(&cluster_index.clusters, dense, multi_bit_style)?);
-    for e in it {
+    for e in chunks {
         indexes.push(rabitq::index_embedding(&cluster_index.clusters, e, QuantisationStyle::SingleBit)?);
     }
-
     Ok(indexes)
 }
 

@@ -53,11 +53,11 @@ const RECALL_K: usize = 100;
 const NPROBES: [usize; 2] = [64, 256];
 const FIRST_PASS: [usize; 2] = [1000, 100];
 
-fn env_or(key: &str, default: &str) -> String {
+pub(super) fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
+pub(super) fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     std::io::BufReader::new(f)
         .lines()
@@ -67,12 +67,12 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+pub(super) fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim()
 }
 
 /// `query-id → (corpus-id → graded relevance)`, keeping only positive judgements.
-fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
+pub(super) fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut qrels: HashMap<String, HashMap<String, u32>> = HashMap::new();
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok).skip(1) {
@@ -89,15 +89,15 @@ fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Metrics {
-    ndcg: f64,
-    mrr: f64,
-    recall: f64,
-    cand_recall: f64,
+pub(super) struct Metrics {
+    pub(super) ndcg: f64,
+    pub(super) mrr: f64,
+    pub(super) recall: f64,
+    pub(super) cand_recall: f64,
 }
 
 /// Score one query: `ranked` is the dense-ordered candidate list (corpus ids).
-fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
+pub(super) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
     let dcg: f64 = ranked
         .iter()
         .take(NDCG_K)
