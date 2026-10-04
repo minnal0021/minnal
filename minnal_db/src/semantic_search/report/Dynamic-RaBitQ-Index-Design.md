@@ -591,11 +591,28 @@ first-pass cut of 4,000 instead of 1,000 gives the same nDCG@10. The only
 quality lever is probing (`pass1-recall-study.md`). Rotation stays, as planned:
 M3's maintenance reconstructs vectors from codes and relies on it.
 
+**On qwen** (`Qwen3-Embedding-8B`, Q4_K_M, 768 dimensions, centroids refitted
+with the gemma recipe), rotation does measurably more, because qwen's residuals
+are concentrated in fewer dimensions (top 10% of dimensions hold 21–24% of the
+variance, against 15–20% for gemma). Same alternated A/B procedure, 64 probes:
+
+| qwen, at 64 probes | SciFact | FiQA |
+|---|---|---|
+| nDCG@10 | +0.0012 [−0.0002, +0.0037]; 1 better, 1 worse, 298 same | +0.0001 [−0.0010, +0.0016]; 6 / 8 / 634 |
+| ANN recall@10 | +0.0010 | +0.0011 |
+| Pass-1 estimator RMSE | 0.0278 → 0.0235 (−15%) | 0.0239 → 0.0213 (−11%) |
+| Pass-1 estimator bias | −0.0105 → −0.0001 | −0.0035 → −0.0001 |
+| Pass-1 recall | 0.7966 → 0.8084 | 0.8085 → 0.8225 |
+| p50 / p95 latency, alternated runs | 3.15, 3.15 → 3.07, 3.13 / 3.50, 3.46 → 3.41, 3.49 ms | 15.48, 15.43 → 15.45, 15.51 / 17.83, 17.69 → 17.72, 17.80 ms |
+
+Without rotation qwen's 1-bit estimate is biased; rotation removes the bias and
+keeps more of the exact candidates, at no cost. The final ranking does not move,
+for the reason the study gives: the extra candidates sit near rank 1,000.
+
 An audit against the RaBitQ papers and RaBitQ-Library (`rabitq-rotation-audit.md`)
-found the rotation and both passes' similarity formulas correct. It also found
-that a dense Haar rotation and no rotation at all score the same as FhtKac on
-gemma, and fixed a multi-bit rescale-search bug that affects 2- and 4-bit codes
-only.
+found the rotation and both passes' similarity formulas correct. FhtKac scores
+the same as a dense Haar rotation on both models. The audit also fixed a
+multi-bit rescale-search bug that affects 2- and 4-bit codes only.
 
 Also in M1: the API rejects an `embedding_dim` the rotation cannot handle (odd,
 or under 8) at startup, and the rotator's format is pinned by a fixed-seed test
