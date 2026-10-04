@@ -96,6 +96,21 @@ pub(in crate::semantic_search) struct Metrics {
     pub(in crate::semantic_search) cand_recall: f64,
 }
 
+/// nDCG at cutoff `k` (gain = graded relevance, `log2(rank + 1)` discount, ideal
+/// over every judged-relevant document), as [`score`] computes it for k = 10.
+pub(in crate::semantic_search) fn ndcg_at(ranked: &[&str], rels: &HashMap<String, u32>, k: usize) -> f64 {
+    let dcg: f64 = ranked
+        .iter()
+        .take(k)
+        .enumerate()
+        .map(|(i, id)| rels.get(*id).copied().unwrap_or(0) as f64 / ((i + 2) as f64).log2())
+        .sum();
+    let mut ideal: Vec<u32> = rels.values().copied().collect();
+    ideal.sort_unstable_by(|a, b| b.cmp(a));
+    let idcg: f64 = ideal.iter().take(k).enumerate().map(|(i, &r)| r as f64 / ((i + 2) as f64).log2()).sum();
+    if idcg > 0.0 { dcg / idcg } else { 0.0 }
+}
+
 /// Score one query: `ranked` is the dense-ordered candidate list (corpus ids).
 pub(in crate::semantic_search) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
     let dcg: f64 = ranked
@@ -342,6 +357,15 @@ async fn beir_eval() {
 #[cfg(test)]
 mod metric_tests {
     use super::*;
+
+    #[test]
+    fn ndcg_at_ten_matches_score() {
+        let r = rels(&[("a", 2), ("c", 1), ("z", 1)]);
+        let ranked = ["b", "a", "d", "c", "e", "f", "g", "h", "i", "j", "z"];
+        assert_eq!(ndcg_at(&ranked, &r, 10), score(&ranked, &r).ndcg);
+        assert!(ndcg_at(&ranked, &r, 20) > ndcg_at(&ranked, &r, 10), "z enters at rank 11");
+        assert_eq!(ndcg_at(&[], &r, 10), 0.0);
+    }
 
     fn rels(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
         pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()

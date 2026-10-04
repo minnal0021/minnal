@@ -909,6 +909,25 @@ ArguAna. The 8-bit nearest-centre rows reproduce production exactly.
   it for ranking; whether it is worth it for rebuilding vectors from codes is a
   question for M3-pre.
 
+**Deeper cutoffs (2026-10-04).** nDCG@10 only checks the top of the ranking, so
+the same comparison was repeated at nDCG@{10, 20, 30, 40, 50, 100}, Pass 2 ranking
+the top 100 of production Pass-1 candidates, paired per query (zero minus
+nearest, 95% bootstrap interval), on all eight model-dataset pairs:
+
+| Pass-2 bits | Largest drop at any cutoff, any pair | Largest gain | Queries that change |
+|---|---|---|---|
+| 8 | −0.0006 (qwen FiQA @20, [−0.0013, −0.0000]) | +0.0010 (qwen SciFact @10) | up to 55% (gemma NFCorpus @100: 83 better, 95 worse) |
+| 4 | −0.0021 (gemma NFCorpus @10, [−0.0054, +0.0008]) | +0.0036 (qwen SciFact @10) | up to 77% (qwen NFCorpus @100: 115 better, 134 worse) |
+
+At 8 bits the zero centre is within ±0.001 of the nearest centre at every
+cutoff on every pair, and at 4 bits every interval but one includes zero (that
+one, qwen SciFact @10, is a gain). Many queries change at deep cutoffs on
+NFCorpus, which judges dozens of documents per query, so almost any reordering
+near rank 100 touches one; the changes are small and split evenly between better
+and worse, which is why the means stay at zero. The choice holds below the top 10. (ArguAna
+here includes each query's own document, which both centres see alike; the
+paired difference is unaffected.)
+
 **Decision (2026-10-04): zero centre, Pass-2 widths 4–8.** M2c proceeds as
 designed below. The schema records `quantisation.pass2_centre = "zero"`
 (read-only) next to `pass2_bits`, and when widths become choosable, Pass 2

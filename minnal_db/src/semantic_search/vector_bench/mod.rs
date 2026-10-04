@@ -41,7 +41,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use super::metrics::beir_eval::{env_or, read_qrels, score};
+use super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
 use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
@@ -69,6 +69,8 @@ const ESTIMATOR_QUERIES: usize = 100;
 const ESTIMATOR_TOP: usize = 25;
 const ESTIMATOR_RANDOM: usize = 25;
 const SEED: u64 = 42;
+/// nDCG cutoffs reported beside nDCG@10 (and gated on by `vector_bench_compare`).
+const NDCG_CUTOFFS: [usize; 6] = [10, 20, 30, 40, 50, 100];
 
 // ── Result types (serialised; `vector_bench_compare` reads them back) ──────────
 
@@ -115,6 +117,9 @@ struct QueryResultRow {
     entries_scanned: usize,
     chunks_scanned: usize,
     latency_ms: f64,
+    /// nDCG at each of [`NDCG_CUTOFFS`] (absent from results written before it existed).
+    #[serde(default)]
+    ndcg_at: [f64; NDCG_CUTOFFS.len()],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,6 +296,7 @@ fn mean_row(rows: &[QueryResultRow]) -> QueryResultRow {
         entries_scanned: (rows.iter().map(|r| r.entries_scanned).sum::<usize>() as f64 / n).round() as usize,
         chunks_scanned: (rows.iter().map(|r| r.chunks_scanned).sum::<usize>() as f64 / n).round() as usize,
         latency_ms: f(|r| r.latency_ms),
+        ndcg_at: std::array::from_fn(|i| rows.iter().map(|r| r.ndcg_at[i]).sum::<f64>() / n),
     }
 }
 
@@ -476,9 +482,11 @@ async fn vector_bench() {
                     let q = frozen.query(qi);
                     let probed: Vec<u32> = index.find_top_n_cluster_ids_batch(&[q.to_vec()], n_probes).remove(0);
                     let ids: Vec<&str> = ranked.iter().map(|&d| doc_ids[d as usize].as_str()).collect();
-                    let m = score(&ids, &qrels[&frozen.manifest.query_ids[qi]]);
+                    let rels = &qrels[&frozen.manifest.query_ids[qi]];
+                    let m = score(&ids, rels);
                     let pass1: HashSet<u32> = gt.pass1[qi].iter().copied().collect();
                     rows.push(QueryResultRow {
+                        ndcg_at: NDCG_CUTOFFS.map(|k| ndcg_at(&ids, rels, k)),
                         ndcg10: m.ndcg,
                         mrr10: m.mrr,
                         recall100: m.recall,
@@ -622,6 +630,15 @@ fn render(r: &BenchResult) -> String {
             s.latency_p99_ms,
             s.nondeterministic_queries
         );
+    }
+    let _ = writeln!(
+        md,
+        "\n| n_probes | {} |\n|---:|{}",
+        NDCG_CUTOFFS.map(|k| format!("nDCG@{k}")).join(" | "),
+        "---:|".repeat(NDCG_CUTOFFS.len())
+    );
+    for s in &r.settings {
+        let _ = writeln!(md, "| {} | {} |", s.n_probes, s.mean.ndcg_at.map(|v| format!("{v:.4}")).join(" | "));
     }
     md
 }
@@ -904,6 +921,33 @@ fn vector_bench_compare() {
             gate.push(("p50 latency within +5% (or +0.3 ms)", within(b.latency_p50_ms, n.latency_p50_ms)));
             gate.push(("p95 latency within +5% (or +0.3 ms)", within(b.latency_p95_ms, n.latency_p95_ms)));
         }
+    }
+    // Deeper cutoffs at the production setting: the ranking below the top 10.
+    if let (Some(b), Some(n)) = (
+        base.settings.iter().find(|s| s.n_probes == PRODUCTION_NPROBES),
+        new.settings.iter().find(|s| s.n_probes == PRODUCTION_NPROBES),
+    ) {
+        let _ = writeln!(md, "\nnDCG by cutoff at n_probes {PRODUCTION_NPROBES}, paired per query:\n");
+        let _ = writeln!(md, "| Cutoff | Base | New | Δ [95% CI] | W / L / T |\n|---:|---:|---:|---|---|");
+        let mut worst = f64::INFINITY;
+        for (i, k) in NDCG_CUTOFFS.iter().enumerate() {
+            let (x, y): (Vec<f64>, Vec<f64>) = b.per_query.iter().zip(&n.per_query).map(|(x, y)| (x.ndcg_at[i], y.ndcg_at[i])).unzip();
+            let (d, lo, hi) = paired_delta(&x, &y);
+            let (w, l) = x.iter().zip(&y).fold((0, 0), |(w, l), (a, b)| match b - a {
+                v if v > 1e-9 => (w + 1, l),
+                v if v < -1e-9 => (w, l + 1),
+                _ => (w, l),
+            });
+            let _ = writeln!(
+                md,
+                "| @{k} | {:.4} | {:.4} | {d:+.4} [{lo:+.4}, {hi:+.4}] | {w} / {l} / {} |",
+                b.mean.ndcg_at[i],
+                n.mean.ndcg_at[i],
+                x.len() - w - l
+            );
+            worst = worst.min(d);
+        }
+        gate.push(("nDCG@{10..100} Δ ≥ −0.002 at every cutoff", worst >= -0.002));
     }
     let footprint = |r: &BenchResult| (r.footprint.sparse_bytes + r.footprint.sparse_meta_bytes + r.footprint.dense_bytes) as f64;
     gate.push(("footprint within +5%", footprint(&new) <= footprint(&base) * 1.05));

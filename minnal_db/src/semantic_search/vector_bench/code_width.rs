@@ -26,9 +26,10 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use super::super::metrics::beir_eval::{env_or, read_qrels, score};
+use super::super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen;
+use super::paired_delta;
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
@@ -40,6 +41,8 @@ const N_PROBES: usize = 64;
 const CUT: usize = 1000;
 const PASS2_BITS: [usize; 3] = [2, 4, 8];
 const PASS1_BITS: [usize; 2] = [1, 2];
+/// nDCG cutoffs Pass 2 is judged at.
+const CUTOFFS: [usize; 6] = [10, 20, 30, 40, 50, 100];
 /// Every this-many queries contribute every probed chunk to Pass-1 error.
 const ERROR_QUERY_STEP: usize = 8;
 
@@ -74,6 +77,8 @@ impl Err {
 struct Pass2Row {
     err: Err,
     ndcg: f64,
+    /// nDCG at each of [`CUTOFFS`].
+    ndcg_k: [f64; CUTOFFS.len()],
     top10_overlap: f64,
     top10_identical: bool,
 }
@@ -247,8 +252,13 @@ async fn vector_bench_code_width() {
                         row.err.add(est - dense_exact[d as usize]);
                         s[d as usize] = est;
                     }
-                    let top10 = exact::top_k(&s, 10);
+                    let top = exact::top_k(&s, 100);
+                    let top10: Vec<u32> = top.iter().take(10).copied().collect();
                     row.ndcg = score(&ids(&top10), rels).ndcg;
+                    let ranked = ids(&top);
+                    for (slot, &k) in row.ndcg_k.iter_mut().zip(&CUTOFFS) {
+                        *slot = ndcg_at(&ranked, rels, k);
+                    }
                     row.top10_overlap = top10.iter().filter(|d| exact10_set.contains(d)).count() as f64 / exact10_set.len().max(1) as f64;
                     row.top10_identical = top10 == exact10;
                     row
@@ -303,6 +313,47 @@ async fn vector_bench_code_width() {
             per_query.iter().map(|(_, p2)| p2[i].top10_overlap).sum::<f64>() / n,
             per_query.iter().filter(|(_, p2)| p2[i].top10_identical).count(),
         );
+    }
+    let _ = writeln!(md, "\n### Pass 2 nDCG by cutoff\n");
+    let _ = writeln!(
+        md,
+        "| Bits | Centre | {} |",
+        CUTOFFS.iter().map(|k| format!("@{k}")).collect::<Vec<_>>().join(" | ")
+    );
+    let _ = writeln!(md, "|---:|---|{}", "---:|".repeat(CUTOFFS.len()));
+    for (i, ((bits, zeroed), _)) in dense_codes.iter().enumerate() {
+        let means: Vec<String> = (0..CUTOFFS.len())
+            .map(|c| format!("{:.4}", per_query.iter().map(|(_, p2)| p2[i].ndcg_k[c]).sum::<f64>() / n))
+            .collect();
+        let _ = writeln!(md, "| {bits} | {} | {} |", if *zeroed { "zero" } else { "nearest" }, means.join(" | "));
+    }
+    let _ = writeln!(
+        md,
+        "\n### Zero minus nearest centre, paired per query (mean [95% interval], better / worse / same)\n"
+    );
+    let _ = writeln!(md, "| Bits | Cutoff | Δ nDCG | Better / worse / same |\n|---:|---:|---|---|");
+    for &bits in &PASS2_BITS {
+        let idx = |zeroed: bool| dense_codes.iter().position(|((b, z), _)| *b == bits && *z == zeroed).unwrap();
+        let (near, zero) = (idx(false), idx(true));
+        for (c, k) in CUTOFFS.iter().enumerate() {
+            let base: Vec<f64> = per_query.iter().map(|(_, p2)| p2[near].ndcg_k[c]).collect();
+            let new: Vec<f64> = per_query.iter().map(|(_, p2)| p2[zero].ndcg_k[c]).collect();
+            let (mean, lo, hi) = paired_delta(&base, &new);
+            let (better, worse) = base.iter().zip(&new).fold((0, 0), |(b, w), (x, y)| {
+                if y > x {
+                    (b + 1, w)
+                } else if y < x {
+                    (b, w + 1)
+                } else {
+                    (b, w)
+                }
+            });
+            let _ = writeln!(
+                md,
+                "| {bits} | @{k} | {mean:+.4} [{lo:+.4}, {hi:+.4}] | {better} / {worse} / {} |",
+                nq - better - worse
+            );
+        }
     }
     let _ = writeln!(md, "\n## Pass 1 (chunk codes, nearest centre), exact dense rerank\n");
     let _ = writeln!(md, "| Bits | RMSE | Bias | Pass-1 recall | Exact top 100 kept | nDCG@10 |");
