@@ -18,8 +18,9 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
-| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) and caller-supplied embeddings | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
+| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
+| *Optional, future:* **BYO embeddings** | A write may bring its own vectors; dense-only namespaces (see *Caller-supplied embeddings*) | No | Not on the critical path; built on demand after M3d |
 
 The research behind this design (production systems, papers, the 109k-passage
 experiment, worked examples) is in the *Dynamic Clustering for minnal's IVF +
@@ -1181,7 +1182,14 @@ store itself), so it needs no extra storage, but each one costs a full embedding
 call. Its queue entries are a separate kind from new-document embeds so the
 worker can always prefer the latter.
 
-### Caller-supplied embeddings
+### Caller-supplied embeddings (BYO embeddings) — optional extra, future
+
+**Status: a future option, not part of the M0–M4 plan.** Nothing in M3 or M4
+depends on it, and none of its fields exist until it is built. It is designed
+here so the milestones it builds on (M2a's `vector_index`, M3d's raw-vector
+store and vector-source interface) leave room for it. Build it when a user
+needs it, any time after M3d.
+
 
 **The idea.** A write may carry the document's embedding instead of leaving it
 to the service. minnal validates it, stores it in `{ns}_raw_vector` (the store
@@ -1292,10 +1300,10 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 - **M3e — `service`:** the same interface backed by the embedding service, with
   the request cap. Gate: under continuous new-document load, new-document
   indexing throughput stays within 5% while re-encodes drain.
-- **M3f — caller-supplied embeddings:** `embedding_source`, `pass1`, the
-  payload fields, validation, the `Encode` queue kind, WAL-backed raw vectors,
+- **M3f — BYO embeddings (optional extra, future; not on the critical path):**
+  `embedding_source`, `pass1`, the payload fields, validation, the `Encode` queue kind, WAL-backed raw vectors,
   and the dense-only search path. It needs only M3d's raw-vector store, not
-  dynamic partitions, so it can move ahead of M3a–M3c if wanted. Gate: a
+  dynamic partitions, so it can be built any time after M3d, on demand. Gate: a
   namespace indexed from supplied vectors equal to the service's gives
   byte-identical results to one the service indexed; a dense-only namespace
   is within 1 pt nDCG@10 of exact dense scoring at the default probes, with its
@@ -1344,4 +1352,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 6 | Bundled centroid files | Deleted in M4 |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
-| 9 | Caller-supplied embeddings (2026-10-04) | A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |
+| 9 | BYO embeddings (2026-10-04) | An optional, future extra (M3f), designed but not scheduled. A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |
