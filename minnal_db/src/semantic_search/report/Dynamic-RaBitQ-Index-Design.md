@@ -549,7 +549,7 @@ Gaps to close when it moves into `semantic_search/quantisation/rotation.rs`:
 M1 uses one fixed seed (`ROTATION_SEED`), held by the process-wide `ClusterIndex`
 together with a rotated copy of every centroid. A per-namespace seed needs
 per-namespace rotated centres, which arrive with M2b's per-namespace index, so
-the seed record (`{ns}_vector_meta`) moves there. The choice of seed does not
+the seed record moves there (a schema field, see *M2b result*). The choice of seed does not
 affect quality.
 
 The new code format is simply the format from M1 on. There is no migration and
@@ -784,7 +784,7 @@ cannot be rebuilt by re-embedding):
 - `{ns}_ivf_postings`: `posting_id (u32 BE) → { routing_centroid [f32; D],
   centre_id, state: Active | Draining | Retired }`. Entry counts are kept in
   memory and recomputed at load from the key prefixes; they feed M2c and M3.
-- `{ns}_vector_meta` (from M1): plus `seeded_from` (the file and its hash).
+- ~~`{ns}_vector_meta`~~: replaced by read-only schema fields (`quantisation.rotation_seed`, `seeded_from`); see *M2b result*.
 
 **Bootstrap.** When a namespace's vector index is created and the postings
 table is empty, seed it from `{centroid_dir}/{model}/clusters.json`: posting id
@@ -813,6 +813,39 @@ indexed load per entry. **This sub-step's latency gate is the one to watch.**
 **Gate.** Search results byte-identical to M1 (same seeds, same ids, same
 centres). Hot-path latency within noise. Footprint +4 bytes per entry (measured,
 not assumed; rkyv padding may round it).
+
+### M2b result (2026-10-04)
+
+**Passed.** The harness now seeds a namespace's partition into its stores and
+indexes and searches against the loaded `NamespaceIvf`, as a store does. Against
+M2a it is identical on every query at every probe setting (SciFact 300/300, FiQA
+648/648, `n_probes` 4 to 256). Latency, alternated runs at 64 probes: SciFact
+3.12, 3.10 → 3.16, 3.15 ms p50; FiQA 14.82, 14.78 → 14.62, 14.50 ms, within noise.
+Footprint: exactly 4 bytes per entry, no padding (FiQA sparse 22.3 → 23.0 MiB
+for 172,998 chunks, dense 44.7 → 44.9 MiB).
+
+Built as designed, with these differences:
+
+- **No `{ns}_vector_meta`.** By user decision the rotation seed
+  (`quantisation.rotation_seed`, a hex string so JSON clients keep all 64 bits)
+  and the provenance (`seeded_from: {file, murmur3_128, centres}`) live in the
+  schema's `vector_index`, read-only. The seed defaults to the previous fixed
+  seed, so results stay reproducible; `seeded_from` is written by the server and
+  rejected in requests, and schema import drops it (the new namespace seeds its
+  own).
+- **Seeding is durable without a WAL write per row:** centres and postings are
+  written no-WAL and both stores flushed before the schema is saved. A seed cut
+  short (postings ≠ centres) is wiped and redone at the next enable.
+- **Pass 1 builds estimators for every centre**, not only those of the probed
+  postings, so a code is decoded correctly whichever posting holds it (one dot
+  product per centre, microseconds). Each chunk looks up its `centre_id`, with
+  the last lookup per entry cached.
+- **`IvfLayout`** (`cluster/layout.rs`) is the interface indexing and search run
+  against: `NamespaceIvf` in production, `ClusterIndex` as the identity layout
+  for tests, benches and raw `vector_kv` users.
+- **The partition outlives a vector-index drop** (`VECTOR_DATA_SUFFIXES` vs
+  `COMPANION_SUFFIXES`); re-enabling reuses it. Dropping the store removes it.
+- No detection of namespaces built before M2b (user decision; greenfield).
 
 ### M2c-pre — Measure code width against centre choice
 
