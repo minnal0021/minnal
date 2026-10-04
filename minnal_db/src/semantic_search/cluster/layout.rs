@@ -20,6 +20,12 @@ use std::error::Error;
 
 use super::{Cluster, ClusterIndex, DEFAULT_ROTATION_SEED, find_closest_cluster_id};
 
+/// The centre whole-document (Pass-2) codes are encoded against: the origin.
+/// Reserved: no stored centre may use this id. A zero centre makes Pass 2
+/// independent of the partition, so postings and centres can change under it
+/// (design doc M2c).
+pub const ZERO_CENTRE: u32 = u32::MAX;
+
 /// What indexing and search need to know about a partition.
 pub trait IvfLayout: Sync {
     /// The embedding dimension.
@@ -125,6 +131,9 @@ impl NamespaceIvf {
             return Err("a namespace index needs at least one posting and one centre".into());
         }
         let dim = centres.values().next().map(Vec::len).unwrap_or(0);
+        if centres.contains_key(&ZERO_CENTRE) {
+            return Err(format!("centre id {ZERO_CENTRE} is reserved for the zero centre"));
+        }
         if let Some((id, c)) = centres.iter().find(|(_, c)| c.len() != dim) {
             return Err(format!("centre {id} has {} dimensions, expected {dim}", c.len()));
         }
@@ -286,6 +295,14 @@ mod tests {
             centre_id: 99,
         }];
         assert!(NamespaceIvf::new(bad, c.clone(), 1).unwrap_err().contains("centre 99"));
-        assert!(NamespaceIvf::new(vec![], c, 1).is_err());
+        assert!(NamespaceIvf::new(vec![], c.clone(), 1).is_err());
+        let mut reserved = c.clone();
+        reserved.insert(ZERO_CENTRE, vec![0.0; 16]);
+        let posting = vec![Posting {
+            posting_id: 1,
+            routing_centroid: c[&0].clone(),
+            centre_id: 0,
+        }];
+        assert!(NamespaceIvf::new(posting, reserved, 1).unwrap_err().contains("reserved"));
     }
 }

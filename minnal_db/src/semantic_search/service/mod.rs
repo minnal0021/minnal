@@ -10,14 +10,14 @@ pub use crate::semantic_search::index::vector_index::QuantisationStyle;
 
 use crate::semantic_search::chunking;
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use rayon::prelude::*;
 
-use crate::semantic_search::cluster::IvfLayout;
+use crate::semantic_search::cluster::{IvfLayout, ZERO_CENTRE};
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::semantic_search::quantisation::rabitq;
@@ -204,7 +204,9 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
     let mut indexes = Vec::with_capacity(1 + chunks.len());
-    indexes.push(rabitq::index_embedding_rotated(layout, dense, multi_bit_style)?);
+    // Whole-document codes against the zero centre (design doc M2c); chunks against
+    // their posting's centre.
+    indexes.push(rabitq::index_embedding_zero_centred(layout, dense, multi_bit_style));
     for e in chunks {
         indexes.push(rabitq::index_embedding_rotated(layout, e, QuantisationStyle::SingleBit)?);
     }
@@ -595,77 +597,76 @@ where
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
 
-    // Each VectorIndex carries its own cluster_id for centroid lookup, so we
-    // score each document directly against the single whole-query embedding.
+    // Whole-document codes are encoded against the zero centre (design doc M2c), so
+    // `⟨q, c⟩ = 0` and one estimator serves every candidate. A code encoded
+    // against anything else is a write-path bug or corruption: skipped, counted
+    // and logged, never silently scored against the wrong centre.
     //
     // Entries are read zero-copy from their rkyv archive (packed words copied into a
-    // reused buffer). The dense estimator's per-cluster scalar (query·centroid) is
-    // constant for every candidate in the same cluster, so it is cached per cluster in
-    // the per-worker `est_cache` — with ~1000 candidates over ~n_probes clusters this
-    // builds ~n_probes estimators instead of one per candidate. Both pieces of reused
-    // state are per rayon worker via `map_init`; doc_ids are moved (not cloned) into the
+    // per-worker buffer via `map_init`); doc_ids are moved (not cloned) into the
     // heap entries.
     let _pass2_permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
+    let origin = vec![0.0f32; query_dense_embedding.len()];
+    let estimator = MultiBitQuanDotProductEstimator::with_scaled_query_sum(ZERO_CENTRE, query_dense_embedding, &origin, scaled_query_sum);
     let scored: Vec<HeapEntry> = dense_doc_ids
         .into_par_iter()
         .zip(dense_raw.into_par_iter())
-        .map_init(
-            || (HashMap::<u32, MultiBitQuanDotProductEstimator>::new(), Vec::<u64>::new()),
-            |(est_cache, words_buf), (doc_id, opt_bytes)| {
-                let raw_bytes = opt_bytes?;
-                let list = match VectorIndex::access_list(&raw_bytes) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        // Corrupt dense entry: skip it, but log it so index corruption is
-                        // not mistaken for a candidate simply scoring poorly in pass 2.
-                        crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
-                        warn!(
-                            "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
-                            doc_id_hex(&doc_id),
-                            raw_bytes.len(),
-                        );
-                        return None;
-                    }
-                };
-                // The dense namespace stores exactly one MultiBit entry per document
-                // (embed_document emits a single whole-doc dense vector; upsert only
-                // writes a dense value when at least one MultiBit entry is present). A
-                // count other than 1 means a write-path bug, a duplicate, or corruption —
-                // skip rather than silently scoring an arbitrary `first()` and letting a
-                // stale entry shadow the correct one.
-                if list.len() != 1 {
+        .map_init(Vec::<u64>::new, |words_buf, (doc_id, opt_bytes)| {
+            let raw_bytes = opt_bytes?;
+            let list = match VectorIndex::access_list(&raw_bytes) {
+                Ok(list) => list,
+                Err(e) => {
+                    // Corrupt dense entry: skip it, but log it so index corruption is
+                    // not mistaken for a candidate simply scoring poorly in pass 2.
+                    crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
                     warn!(
-                        "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
-                        list.len(),
+                        "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
                         doc_id_hex(&doc_id),
+                        raw_bytes.len(),
                     );
                     return None;
                 }
-                let vi = &list[0];
-                let style = vi.style();
-                if style != expected_dense_style {
-                    warn!(
-                        "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
-                        doc_id_hex(&doc_id),
-                    );
-                    return None;
-                }
-                // Decoded through the code's own centre, like Pass 1.
-                let centre_id = vi.centre_id();
-                let centre = layout.centre(centre_id)?;
-
-                let estimator = est_cache.entry(centre_id).or_insert_with(|| {
-                    MultiBitQuanDotProductEstimator::with_scaled_query_sum(centre_id, query_dense_embedding, centre, scaled_query_sum)
-                });
-                vi.copy_packed_into(words_buf);
-                let dot_product = estimator.estimate_from_parts(&rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
-                Some(HeapEntry {
-                    dot_product,
-                    error_bound: vi.error_bound(),
-                    document_id: doc_id,
-                })
-            },
-        )
+            };
+            // The dense namespace stores exactly one MultiBit entry per document
+            // (embed_document emits a single whole-doc dense vector; upsert only
+            // writes a dense value when at least one MultiBit entry is present). A
+            // count other than 1 means a write-path bug, a duplicate, or corruption —
+            // skip rather than silently scoring an arbitrary `first()` and letting a
+            // stale entry shadow the correct one.
+            if list.len() != 1 {
+                warn!(
+                    "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
+                    list.len(),
+                    doc_id_hex(&doc_id),
+                );
+                return None;
+            }
+            let vi = &list[0];
+            let style = vi.style();
+            if style != expected_dense_style {
+                warn!(
+                    "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
+                    doc_id_hex(&doc_id),
+                );
+                return None;
+            }
+            if vi.centre_id() != ZERO_CENTRE {
+                crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
+                error!(
+                    "skipping dense vector entry not encoded against the zero centre: doc_id={} centre_id={}",
+                    doc_id_hex(&doc_id),
+                    vi.centre_id(),
+                );
+                return None;
+            }
+            vi.copy_packed_into(words_buf);
+            let dot_product = estimator.estimate_from_parts(&rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
+            Some(HeapEntry {
+                dot_product,
+                error_bound: vi.error_bound(),
+                document_id: doc_id,
+            })
+        })
         .flatten()
         .collect();
 
@@ -1559,9 +1560,11 @@ mod tests {
             self.sparse_data.entry(cluster_id).or_default().push((doc_id.to_vec(), raw));
         }
 
-        fn add_dense_entry(&mut self, cluster_id: u32, doc_id: &[u8], addition_factor: f32) {
+        /// A whole-document entry as production writes it: encoded against the
+        /// zero centre (`cluster_id` is kept only so callers read as before).
+        fn add_dense_entry(&mut self, _cluster_id: u32, doc_id: &[u8], addition_factor: f32) {
             let vi = VectorIndex::new(
-                cluster_id,
+                ZERO_CENTRE,
                 QuantisationStyle::MultiBit { number_of_bits: 8 },
                 addition_factor,
                 0.0,
@@ -1597,7 +1600,7 @@ mod tests {
         /// Store a dense entry for `doc_id` with an explicit quantisation `style`,
         /// to exercise the dense-pass style check.
         fn add_dense_entry_with_style(&mut self, doc_id: &[u8], style: QuantisationStyle) {
-            let vi = VectorIndex::new(1, style, 0.0, 0.0, 0.01, vec![]);
+            let vi = VectorIndex::new(ZERO_CENTRE, style, 0.0, 0.0, 0.01, vec![]);
             let raw = VectorIndex::list_to_bytes(&[vi]);
             self.dense_data.insert(doc_id.to_vec(), raw);
         }
@@ -1606,7 +1609,7 @@ mod tests {
         /// "exactly one dense entry per doc" invariant.
         fn add_dense_entry_multi(&mut self, doc_id: &[u8], count: usize) {
             let vis: Vec<VectorIndex> = (0..count)
-                .map(|_| VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.0, 0.0, 0.01, vec![]))
+                .map(|_| VectorIndex::new(ZERO_CENTRE, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.0, 0.0, 0.01, vec![]))
                 .collect();
             self.dense_data.insert(doc_id.to_vec(), VectorIndex::list_to_bytes(&vis));
         }
@@ -2238,16 +2241,15 @@ mod tests {
     ///
     /// Therefore only the MaxSim aggregation guarantees that doc_a outranks doc_b.
     /// Setting first_pass_sparse_search_top_k=1 lets us verify the correct winner.
-    /// Codes are decoded through their own `centre_id`, never through the posting
-    /// they are filed under: a code encoded against centre 2 but sitting in posting
-    /// 1 (what a split leaves behind) scores with centre 2's `⟨q, c⟩`, in both passes.
+    /// Chunk codes are decoded through their own `centre_id`, never through the
+    /// posting they are filed under: a code encoded against centre 2 but sitting in
+    /// posting 1 (what a split leaves behind) scores with centre 2's `⟨q, c⟩`.
     #[tokio::test]
     async fn codes_are_scored_against_their_own_centre_not_their_posting() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
         let mut store = MockVectorKvStore::new();
+        // Both filed under posting 1; "home" encoded against centre 1, "moved" against 2.
         store.add_sparse_entry(1, b"home", 0.0);
-        store.add_dense_entry(1, b"home", 0.1);
-        // Filed under posting 1, encoded against centre 2.
         let mut moved = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.0, 0.0, 0.01, vec![]);
         moved.centre_id = 2;
         store
@@ -2255,15 +2257,18 @@ mod tests {
             .entry(1)
             .or_default()
             .push((b"moved".to_vec(), VectorIndex::list_to_bytes(&[moved])));
-        let mut moved_dense = VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.1, 0.0, 0.01, vec![]);
-        moved_dense.centre_id = 2;
-        store.dense_data.insert(b"moved".to_vec(), VectorIndex::list_to_bytes(&[moved_dense]));
+        store.add_dense_entry(1, b"home", 0.1);
+        store.add_dense_entry(1, b"moved", 0.1);
 
+        // With empty codes the Pass-1 score is ⟨q, c⟩: for q = e₂, centre 2 gives 1
+        // and centre 1 gives 0, so only "moved" survives a cut of one. Decoded
+        // through the posting, both would score 0 and tie.
         let config = SemanticSearchConfig {
-            n_probes: 1, // posting 1 only
+            n_probes: 2,
+            first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
-        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let q = vec![0.0f32, 1.0, 0.0, 0.0];
         let results = search(
             &config,
             "test_ns",
@@ -2276,10 +2281,85 @@ mod tests {
         )
         .await
         .unwrap();
-        let score = |id: &[u8]| results.iter().find(|r| r.document_id == id).map(|r| r.dot_product);
-        // Pass 2 with empty codes scores 1 + ⟨q, c⟩ − addition_factor: ⟨q, c1⟩ = 1, ⟨q, c2⟩ = 0.
-        assert!((score(b"home").unwrap() - 1.9).abs() < 1e-5, "{results:?}");
-        assert!((score(b"moved").unwrap() - 0.9).abs() < 1e-5, "scored against centre 2: {results:?}");
+        let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
+        assert_eq!(ids, vec![b"moved".as_slice()], "{results:?}");
+    }
+
+    /// Whole-document codes must be encoded against the zero centre: one encoded
+    /// against anything else is skipped and counted, never scored against the
+    /// wrong centre.
+    #[tokio::test]
+    async fn a_dense_code_not_encoded_against_the_zero_centre_is_skipped_and_counted() {
+        let ns = "dense_centre_ns";
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        store.add_sparse_entry(1, b"good", 0.0);
+        store.add_dense_entry(1, b"good", 0.1);
+        store.add_sparse_entry(1, b"stale", 0.0);
+        let stale = VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.1, 0.0, 0.01, vec![]);
+        store.dense_data.insert(b"stale".to_vec(), VectorIndex::list_to_bytes(&[stale]));
+
+        let before = crate::semantic_search::metrics::snapshot(ns).dense_corrupt_skipped;
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let results = search(
+            &SemanticSearchConfig::default(),
+            ns,
+            &cluster_index,
+            std::slice::from_ref(&q),
+            &q,
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
+        assert_eq!(ids, vec![b"good".as_slice()]);
+        // Zero centre: the Pass-2 score is 1 − addition_factor, with no ⟨q, c⟩ term.
+        assert!((results[0].dot_product - 0.9).abs() < 1e-5, "{results:?}");
+        assert_eq!(crate::semantic_search::metrics::snapshot(ns).dense_corrupt_skipped, before + 1);
+    }
+
+    /// `index_embeddings` encodes the whole-document vector against the zero
+    /// centre and the chunks against their posting's centre, all in the layout's
+    /// rotated space, and the zero-centred estimate tracks the exact inner product.
+    #[test]
+    fn index_embeddings_encodes_the_dense_vector_against_the_zero_centre() {
+        let dim = 16;
+        let centroids: HashMap<u32, Vec<f32>> = (0..4u32)
+            .map(|id| {
+                let mut v = vec![0.0f32; dim];
+                v[id as usize] = 1.0;
+                (id, v)
+            })
+            .collect();
+        let ivf = crate::semantic_search::NamespaceIvf::seeded(&centroids, 99).unwrap();
+        let unit = |v: Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let dense = unit((0..dim).map(|i| ((i * 7) % 5) as f32 + 0.5).collect());
+        let chunk = unit((0..dim).map(|i| if i == 2 { 3.0 } else { 0.2 }).collect());
+        let vis = index_embeddings(&SemanticSearchConfig::default(), &ivf, &dense, std::slice::from_ref(&chunk)).unwrap();
+        assert_eq!((vis[0].cluster_id, vis[0].centre_id), (ZERO_CENTRE, ZERO_CENTRE));
+        assert_eq!((vis[1].cluster_id, vis[1].centre_id), (2, 2), "chunk: its posting's centre");
+
+        let q = unit((0..dim).map(|i| (i % 3) as f32 + 0.1).collect());
+        let rq = IvfLayout::rotate(&ivf, &q);
+        let origin = vec![0.0f32; dim];
+        let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, 8);
+        let est = MultiBitQuanDotProductEstimator::with_scaled_query_sum(ZERO_CENTRE, &q, &origin, sum).estimate_from_parts(
+            &rq,
+            &vis[0].packed_vector,
+            vis[0].addition_factor,
+            vis[0].scaling_factor,
+        );
+        let exact: f32 = q.iter().zip(&dense).map(|(a, b)| a * b).sum();
+        assert!(
+            (est - exact).abs() <= vis[0].error_bound.max(1e-3),
+            "est {est} exact {exact} bound {}",
+            vis[0].error_bound
+        );
     }
 
     #[tokio::test]

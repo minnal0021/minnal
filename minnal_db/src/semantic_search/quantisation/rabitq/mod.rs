@@ -167,6 +167,21 @@ pub fn index_embedding_in_cluster<L: IvfLayout + ?Sized>(
     Some(vi)
 }
 
+/// Quantise `embedding` against the zero centre (the origin), in `layout`'s
+/// rotated space: the production encoding of whole-document (Pass-2) codes. The
+/// entry's `cluster_id` and `centre_id` are both
+/// [`ZERO_CENTRE`](crate::semantic_search::ZERO_CENTRE); it is fetched by document
+/// id and never routed, so it depends on no centre of the partition.
+pub fn index_embedding_zero_centred<L: IvfLayout + ?Sized>(
+    layout: &L,
+    embedding: &[f32],
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> VectorIndex {
+    use crate::semantic_search::ZERO_CENTRE;
+    let origin = Cluster::new(ZERO_CENTRE, vec![0.0; embedding.len()]);
+    index_embedding_to_cluster(&layout.rotate(embedding), &origin, style)
+}
+
 pub fn index_embedding_to_cluster(
     embedding: &[f32],
     cluster: &Cluster,

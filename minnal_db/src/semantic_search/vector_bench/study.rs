@@ -310,7 +310,13 @@ async fn vector_bench_pass1_study() {
     let dense_bits = config.number_of_bits_for_dense_quantisation;
     let dense_codes: Vec<_> = (0..nd)
         .into_par_iter()
-        .map(|d| index_embedding_rotated(&index, frozen.dense(d), QuantisationStyle::MultiBit { number_of_bits: dense_bits }).unwrap())
+        .map(|d| {
+            crate::semantic_search::index_embedding_zero_centred(
+                index.as_ref(),
+                frozen.dense(d),
+                QuantisationStyle::MultiBit { number_of_bits: dense_bits },
+            )
+        })
         .collect();
     let mut cluster_chunks: HashMap<u32, Vec<usize>> = HashMap::new();
     for (c, code) in codes[0].1.iter().enumerate() {
@@ -471,11 +477,11 @@ async fn vector_bench_pass1_study() {
                 if vi == prod_variant {
                     // Pass 2 as production runs it: 8-bit codes, rotated query.
                     let dsum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, dense_bits);
+                    let origin = vec![0.0f32; dim];
                     let mut s = vec![f32::NEG_INFINITY; nd];
                     for &d in &cut {
                         let dc = &dense_codes[d as usize];
-                        let centroid = &index.clusters[&dc.cluster_id].centroid;
-                        let e = MultiBitQuanDotProductEstimator::with_scaled_query_sum(dc.cluster_id, q, centroid, dsum);
+                        let e = MultiBitQuanDotProductEstimator::with_scaled_query_sum(dc.centre_id, q, &origin, dsum);
                         s[d as usize] = e.estimate_from_parts(&rq, &dc.packed_vector, dc.addition_factor, dc.scaling_factor);
                     }
                     let quant10 = exact::top_k(&s, 10);

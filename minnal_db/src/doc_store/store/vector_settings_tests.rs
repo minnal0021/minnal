@@ -49,7 +49,7 @@ async fn create_writes_every_default_into_the_saved_schema() {
     let expected = serde_json::json!({
         "embedding_model": "gemma", "embedding_dim": 768,
         "chunking": {"window_size": 4, "sliding_size": 2},
-        "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001"},
+        "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001", "pass2_centre": "zero"},
         "search": {"n_probes": 64, "first_pass_top_k": 1000, "top_k": 100}
     });
     assert_eq!(saved_vector_index(schema_dir.path(), "docs"), expected);

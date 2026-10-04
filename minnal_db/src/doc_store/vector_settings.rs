@@ -53,6 +53,9 @@ pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
 pub const PASS1_BITS: u8 = 1;
 /// Code width of Pass-2 (whole-document) codes. Read-only.
 pub const PASS2_BITS: u8 = 8;
+/// What Pass-2 codes are encoded against. Read-only: only the zero centre
+/// (design doc M2c).
+pub const PASS2_CENTRE: &str = "zero";
 /// Default number of clusters probed by Pass 1.
 pub const DEFAULT_N_PROBES: u32 = 64;
 /// Largest accepted `n_probes`. A search probes at most the namespace's
@@ -136,6 +139,9 @@ pub struct QuantisationSpec {
     /// Fixed once set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_seed: Option<String>,
+    /// What Pass-2 (whole-document) codes are encoded against: `"zero"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass2_centre: Option<String>,
 }
 
 /// Search settings: the namespace's defaults, or one request's overrides.
@@ -172,6 +178,8 @@ pub struct VectorIndexSettings {
     pub pass2_bits: u8,
     /// Seed of the rotation codes are computed in.
     pub rotation_seed: u64,
+    /// What Pass-2 codes are encoded against (always [`PASS2_CENTRE`]).
+    pub pass2_centre: String,
     /// Where the centres came from, once seeded.
     pub seeded_from: Option<SeededFrom>,
     /// Search defaults.
@@ -362,6 +370,7 @@ impl VectorIndexSpec {
                 None => DEFAULT_ROTATION_SEED,
             },
             seeded_from: self.seeded_from.clone(),
+            pass2_centre: quantisation.pass2_centre.clone().unwrap_or_else(|| PASS2_CENTRE.to_string()),
             search: SearchSettings {
                 n_probes: search.n_probes.unwrap_or(DEFAULT_N_PROBES),
                 first_pass_top_k,
@@ -396,6 +405,11 @@ impl VectorIndexSpec {
         let quantisation = self.quantisation.clone().unwrap_or_default();
         fixed("quantisation.pass1_bits", quantisation.pass1_bits, current.pass1_bits)?;
         fixed("quantisation.pass2_bits", quantisation.pass2_bits, current.pass2_bits)?;
+        fixed(
+            "quantisation.pass2_centre",
+            quantisation.pass2_centre.clone(),
+            current.pass2_centre.clone(),
+        )?;
         if let Some(seed) = &quantisation.rotation_seed {
             let seed = parse_seed(seed)?;
             if seed != current.rotation_seed {
@@ -421,6 +435,12 @@ impl VectorIndexSettings {
         check_dim(self.embedding_dim)?;
         check_chunking(self.window_size, self.sliding_size)?;
         check_bits(self.pass1_bits, self.pass2_bits)?;
+        if self.pass2_centre != PASS2_CENTRE {
+            return Err(invalid(
+                "quantisation.pass2_centre",
+                format!("is read-only and must be \"{PASS2_CENTRE}\", got {:?}", self.pass2_centre),
+            ));
+        }
         self.search.validate()
     }
 
@@ -437,6 +457,7 @@ impl VectorIndexSettings {
                 pass1_bits: Some(self.pass1_bits),
                 pass2_bits: Some(self.pass2_bits),
                 rotation_seed: Some(format_seed(self.rotation_seed)),
+                pass2_centre: Some(self.pass2_centre.clone()),
             }),
             search: Some(SearchSpec {
                 n_probes: Some(self.search.n_probes),
@@ -526,6 +547,23 @@ mod tests {
     #[test]
     fn default_rotation_seed_matches_the_cluster_index() {
         assert_eq!(DEFAULT_ROTATION_SEED, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED);
+    }
+
+    #[test]
+    fn pass2_centre_is_read_only_zero() {
+        let s = VectorIndexSpec::default().resolve().unwrap();
+        assert_eq!(s.pass2_centre, "zero");
+        assert_eq!(s.to_spec().quantisation.unwrap().pass2_centre.as_deref(), Some("zero"));
+        assert!(spec(r#"{"quantisation":{"pass2_centre":"zero"}}"#).resolve().is_ok());
+        assert_eq!(
+            err_field(spec(r#"{"quantisation":{"pass2_centre":"nearest"}}"#).resolve()),
+            "quantisation.pass2_centre"
+        );
+        assert_eq!(
+            err_field(spec(r#"{"quantisation":{"pass2_centre":"nearest"}}"#).merge_onto(&s)),
+            "quantisation.pass2_centre"
+        );
+        assert!(spec(r#"{"quantisation":{"pass2_centre":"zero"}}"#).merge_onto(&s).is_ok());
     }
 
     #[test]

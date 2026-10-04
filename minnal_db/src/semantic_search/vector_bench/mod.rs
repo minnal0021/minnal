@@ -257,10 +257,11 @@ fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, den
         for d in docs {
             let x = frozen.dense(d);
             let style = QuantisationStyle::MultiBit { number_of_bits: dense_bits };
-            let vi = index_embedding_rotated(index, x, style).unwrap();
-            let centroid = &index.clusters[&vi.cluster_id].centroid;
+            // Production encodes whole-document codes against the zero centre.
+            let vi = crate::semantic_search::index_embedding_zero_centred(index, x, style);
+            let origin = vec![0.0f32; x.len()];
             let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, dense_bits);
-            let est = MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.cluster_id, q, centroid, sum).estimate_distance(&rq, &vi);
+            let est = MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.centre_id, q, &origin, sum).estimate_distance(&rq, &vi);
             dense_err.push((est - dot(q, x), vi.error_bound));
         }
     }
