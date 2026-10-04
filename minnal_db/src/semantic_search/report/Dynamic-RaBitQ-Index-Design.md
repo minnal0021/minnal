@@ -949,6 +949,32 @@ not a silent `?` drop.
 **Gate:** Pass-2 estimator RMSE within 1.3× of M2b, nDCG@10 ≥ M2b − 0.002,
 latency ≤ M2b.
 
+### M2c result (2026-10-04)
+
+**Passed.** Whole-document codes are encoded against the zero centre
+(`index_embedding_zero_centred`, `centre_id = ZERO_CENTRE = u32::MAX`, reserved:
+a stored centre with that id is rejected). Pass 2 builds one estimator per query;
+a dense code with any other `centre_id` is skipped, counted in
+`dense_corrupt_skipped` and logged at error level. The schema records it as
+`quantisation.pass2_centre = "zero"`, read-only.
+
+Gate, M2b against M2c at 64 probes, two alternated rounds (identical in both),
+paired per query:
+
+| Model, dataset | nDCG@10 Δ | Worst Δ at @10–@100 | Pass-2 RMSE | p50 ms (r1; r2) |
+|---|---|---|---|---|
+| gemma SciFact | +0.0000 (0 / 0 / 300) | −0.0000 (@100, 3 of 300 queries worse) | 0.00028 → 0.00026 | 3.20 → 3.18; 3.08 → 3.08 |
+| gemma FiQA | +0.0005 [−0.0008, +0.0021] | +0.0000 (@40) | 0.00024 → 0.00025 | 14.20 → 14.55; 14.20 → 14.12 |
+| qwen SciFact | +0.0010 [−0.0001, +0.0030] | +0.0001 (@20–@100) | 0.00023 → 0.00025 | 3.13 → 3.16; 3.13 → 3.13 |
+| qwen FiQA | −0.0003 [−0.0007, +0.0001] | −0.0006 [−0.0013, −0.0000] (@20) | 0.00021 → 0.00024 | 15.15 → 15.16; 15.31 → 15.29 |
+
+Every cutoff on every pair is within the −0.002 limit; RMSE is at most 1.14× M2b
+(limit 1.3×); latency is unchanged within run-to-run noise, and the p95 checks
+pass too. Footprint and Pass 1 are untouched (entries scanned and Pass-1 recall
+identical). Indexing is 1–10% faster (no nearest-centre search for the dense
+vector). The numbers match the M2c-pre simulation exactly, so the production
+path encodes and scores as the harness did.
+
 ### M2d — Probe by entry budget
 
 Replace the fixed `n_probes` with `probe_budget_entries`: probe the nearest
@@ -1405,3 +1431,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
 | 9 | BYO embeddings (2026-10-04) | An optional, future extra (M3f), designed but not scheduled. A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |
+| 10 | M2c done (2026-10-04) | Whole-document codes against the zero centre, one Pass-2 estimator per query; gated at nDCG@{10..100} on gemma and qwen, SciFact and FiQA |
