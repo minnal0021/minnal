@@ -212,7 +212,9 @@ impl DocStore {
                 namespace: namespace.to_string(),
             });
         }
-        let ns = self.namespace_semantics(&schema.vector_settings()?, overrides)?;
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
 
         let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
 
@@ -222,7 +224,7 @@ impl DocStore {
         let all = crate::semantic_search::service::search(
             &ns.config,
             namespace,
-            &ns.cluster_index,
+            &*ns.ivf,
             &query_sparse,
             &query_dense,
             &db_store,

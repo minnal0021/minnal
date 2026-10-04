@@ -12,6 +12,7 @@ pub mod vector_math;
 pub use self::chunking::chunk_document;
 pub use self::cluster::Cluster;
 pub use self::cluster::ClusterIndex;
+pub use self::cluster::{IvfLayout, NamespaceIvf, Posting};
 pub use self::index::composite_key;
 pub use self::index::vector_index::{QuantisationStyle, VectorIndex};
 pub use self::quantisation::rabitq::{index_embedding_in_cluster, index_embedding_rotated, index_embedding_to_cluster};

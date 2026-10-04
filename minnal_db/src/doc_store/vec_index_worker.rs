@@ -357,21 +357,19 @@ impl VecIndexWorker {
             // Each namespace's settings, read once per pass: not cached across
             // passes, because a dropped namespace can be recreated under the same
             // name with another model.
-            let semantics: Arc<HashMap<String, Result<Arc<NamespaceSemantics>, String>>> = Arc::new(
-                by_namespace
-                    .keys()
-                    .map(|ns| {
-                        let resolved = load_vector_settings(&self.schema_dir, ns)
-                            .and_then(|s| self.ctx.for_namespace(&s))
-                            .map(Arc::new)
-                            .map_err(|e| e.to_string());
-                        if let Err(e) = &resolved {
-                            warn!("vec index worker: cannot embed for namespace '{ns}': {e}");
-                        }
-                        (ns.clone(), resolved)
-                    })
-                    .collect(),
-            );
+            let mut resolved_all: HashMap<String, Result<Arc<NamespaceSemantics>, String>> = HashMap::new();
+            for ns in by_namespace.keys() {
+                let resolved = match load_vector_settings(&self.schema_dir, ns) {
+                    Ok((settings, ns_id)) => self.ctx.for_namespace(&self.db, ns, ns_id, &settings).await.map(Arc::new),
+                    Err(e) => Err(e),
+                }
+                .map_err(|e| e.to_string());
+                if let Err(e) = &resolved {
+                    warn!("vec index worker: cannot embed for namespace '{ns}': {e}");
+                }
+                resolved_all.insert(ns.clone(), resolved);
+            }
+            let semantics = Arc::new(resolved_all);
 
             // Process work_queue with bounded concurrency.
             let concurrency = self.config.concurrency.max(1);
@@ -498,7 +496,7 @@ impl VecIndexWorker {
                     Some(Err(e)) => return Err(DocStoreError::EmbeddingFailed(e.clone())),
                     None => return Err(DocStoreError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
                 };
-                let vector_indexes = crate::semantic_search::service::embed_document(&ns.config, &ns.cluster_index, &entry.text)
+                let vector_indexes = crate::semantic_search::service::embed_document(&ns.config, &*ns.ivf, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;

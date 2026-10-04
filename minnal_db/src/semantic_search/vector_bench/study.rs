@@ -770,7 +770,7 @@ async fn vector_bench_pass1_study() {
 fn vector_bench_rotation_spread() {
     use crate::semantic_search::quantisation::rotation::FhtKacRotator;
     let dim = 768;
-    let one = FhtKacRotator::new(dim, crate::semantic_search::cluster::ROTATION_SEED);
+    let one = FhtKacRotator::new(dim, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED);
     let two = FhtKacRotator::new(dim, 0x5eed_0002);
     let haar_p = haar(dim, 0x5eed_4a11);
     let stats = |vs: &[Vec<f32>]| {

@@ -1,4 +1,7 @@
 use log::info;
+pub mod layout;
+pub use layout::{IvfLayout, NamespaceIvf, Posting};
+
 use simsimd::SpatialSimilarity;
 use std::collections::HashMap;
 use std::error::Error;
@@ -134,9 +137,10 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 /// they are and only their inputs are rotated consistently: the embedding and the
 /// centroid at index time ([`rotated_centroid`](Self::rotated_centroid)), and the
 /// query's code-facing terms at search time ([`rotate`](Self::rotate)). Probing
-/// and `⟨q, c⟩` stay in the original space. The index holds one rotation, fixed by
-/// [`ROTATION_SEED`]; it is part of the stored format, so changing the seed means
-/// re-indexing. It exists for every even dimension of at least 8 (production uses
+/// and `⟨q, c⟩` stay in the original space. The index holds one rotation, from a
+/// seed ([`DEFAULT_ROTATION_SEED`] unless built with
+/// [`from_clusters_with_seed`](Self::from_clusters_with_seed)); a namespace records
+/// its seed, because changing it means re-encoding. It exists for every even dimension of at least 8 (production uses
 /// 768); smaller test dimensions are left unrotated.
 #[derive(Debug)]
 pub struct ClusterIndex {
@@ -156,9 +160,10 @@ pub struct ClusterIndex {
     rotation: Option<Rotation>,
 }
 
-/// Seed of the rotation every index uses. Part of the stored format: changing it
-/// means re-indexing every semantic-search store.
-pub const ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
+/// Seed a new namespace's rotation gets, recorded in its schema
+/// (`vector_index.quantisation.rotation_seed`). Changing it affects only
+/// namespaces created afterwards.
+pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
 
 #[derive(Debug)]
 struct Rotation {
@@ -195,7 +200,7 @@ impl ClusterIndex {
         let centroid_map = read_clusters_from_file(cluster_file_path)?;
         let dim = validate_centroids(&centroid_map, expected_dim)?;
         let clusters: HashMap<u32, Cluster> = centroid_map.into_iter().map(|(id, centroid)| (id, Cluster::new(id, centroid))).collect();
-        Ok(Self::from_parts(clusters, dim))
+        Ok(Self::from_parts(clusters, dim, DEFAULT_ROTATION_SEED))
     }
 
     /// Build the index from a validated cluster map of known dimension, deriving the
@@ -205,7 +210,7 @@ impl ClusterIndex {
     /// they are consistent by construction. Row order follows the map's iteration
     /// order — arbitrary but irrelevant, since every row carries its own id in
     /// `centroid_ids` and results are ranked by distance.
-    fn from_parts(clusters: HashMap<u32, Cluster>, dim: usize) -> Self {
+    fn from_parts(clusters: HashMap<u32, Cluster>, dim: usize, seed: u64) -> Self {
         let mut centroids = Vec::with_capacity(clusters.len() * dim);
         let mut centroid_ids = Vec::with_capacity(clusters.len());
         for cluster in clusters.values() {
@@ -213,7 +218,7 @@ impl ClusterIndex {
             centroid_ids.push(cluster.cluster_id);
         }
         let rotation = (dim >= 8 && dim.is_multiple_of(2)).then(|| {
-            let rotator = FhtKacRotator::new(dim, ROTATION_SEED);
+            let rotator = FhtKacRotator::new(dim, seed);
             let centroids = clusters
                 .values()
                 .map(|c| {
@@ -264,8 +269,19 @@ impl ClusterIndex {
     /// per-centroid validation done by [`load`](Self::load) is the file path's
     /// concern; in-memory callers are trusted to pass uniform centroids.
     pub fn from_clusters(clusters: HashMap<u32, Cluster>) -> Self {
+        Self::from_clusters_with_seed(clusters, DEFAULT_ROTATION_SEED)
+    }
+
+    /// Like [`from_clusters`](Self::from_clusters), with the rotation drawn from
+    /// `seed` (a namespace's recorded seed).
+    pub fn from_clusters_with_seed(clusters: HashMap<u32, Cluster>, seed: u64) -> Self {
         let dim = clusters.values().next().map(|c| c.centroid.len()).unwrap_or(0);
-        Self::from_parts(clusters, dim)
+        Self::from_parts(clusters, dim, seed)
+    }
+
+    /// The rotation's seed, or `None` when the index is unrotated.
+    pub fn rotation_seed(&self) -> Option<u64> {
+        self.rotation.as_ref().map(|r| r.rotator.seed())
     }
 
     /// The uniform centroid dimension every embedding must match.
@@ -410,13 +426,12 @@ pub fn find_top_n_cluster_ids(clusters: &HashMap<u32, Cluster>, embedding: &[f32
 mod tests {
     use super::*;
 
-    /// No index records which rotation its codes were built with yet (the
-    /// per-namespace seed record comes with M2b), so a changed seed would make
-    /// every stored index score wrongly with no error. Changing it means
-    /// re-indexing every semantic-search store; update this test only then.
+    /// Each namespace records its own seed, so changing the default only affects
+    /// namespaces created afterwards; but every milestone's byte-identical
+    /// benchmark gate assumes it. Update this test only on purpose.
     #[test]
-    fn rotation_seed_is_pinned() {
-        assert_eq!(ROTATION_SEED, 0x6d69_6e6e_616c_0001);
+    fn default_rotation_seed_is_pinned() {
+        assert_eq!(DEFAULT_ROTATION_SEED, 0x6d69_6e6e_616c_0001);
     }
 
     #[test]

@@ -130,6 +130,10 @@ pub enum DocStoreError {
     #[error("the embedding service cannot serve model '{model}' at dimension {dim}: {reason}")]
     EmbeddingModelUnavailable { model: String, dim: u32, reason: String },
 
+    /// A semantic namespace has no centres and postings to search or index with.
+    #[error("namespace '{namespace}' has no seeded centres; re-enable its vector index")]
+    VectorIndexNotSeeded { namespace: String },
+
     /// A namespace's embedding dimension does not match its model's centroids.
     #[error("embedding_dim {dim} does not match the {centroid_dim}-dimensional centroids of model '{model}'")]
     EmbeddingDimMismatch { model: String, dim: u32, centroid_dim: usize },

@@ -28,6 +28,7 @@ use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use crate::semantic_search::cluster::IvfLayout;
 use crate::semantic_search::index::vector_index::VectorIndex;
 use crate::semantic_search::quantisation::rabitq::quantisation_support::{IndexCalculationData, Quantisation, calculate_error_bound};
 use crate::semantic_search::vector_math::binary_quantize;
@@ -135,31 +136,35 @@ pub fn index_embedding(
     Ok(index_embedding_to_cluster(embeddings, cluster, style))
 }
 
-/// Quantise `embedding` for `cluster_index`: assign it to its nearest cluster (in
-/// the original space) and encode it against that cluster's centroid in the
-/// index's rotated space (`quantise(Pᵀx, Pᵀc)`; see
-/// [`ClusterIndex`](crate::semantic_search::ClusterIndex)). The production indexing
-/// path; its codes are scored by `search()`, which rotates the query to match.
-pub fn index_embedding_rotated(
-    cluster_index: &crate::semantic_search::ClusterIndex,
+/// Quantise `embedding` for `layout`: file it under its nearest posting (routing,
+/// in the original space) and encode it against that posting's centre in the
+/// layout's rotated space (`quantise(Pᵀx, Pᵀc)`; see
+/// [`ClusterIndex`](crate::semantic_search::ClusterIndex)). The returned entry's
+/// `cluster_id` is the posting and its `centre_id` the centre. The production
+/// indexing path; its codes are scored by `search()`, which rotates the query to
+/// match.
+pub fn index_embedding_rotated<L: IvfLayout + ?Sized>(
+    layout: &L,
     embedding: &[f32],
     style: crate::semantic_search::index::vector_index::QuantisationStyle,
 ) -> Result<VectorIndex, ClusterIndexError> {
-    let cluster_id = find_closest_cluster_id(&cluster_index.clusters, embedding);
-    index_embedding_in_cluster(cluster_index, embedding, cluster_id, style).ok_or(ClusterIndexError::EmptyClusterMap)
+    let posting = layout.route(embedding).ok_or(ClusterIndexError::EmptyClusterMap)?;
+    index_embedding_in_cluster(layout, embedding, posting, style).ok_or(ClusterIndexError::EmptyClusterMap)
 }
 
-/// Like [`index_embedding_rotated`], but against a given cluster; `None` for an
-/// unknown cluster id.
-pub fn index_embedding_in_cluster(
-    cluster_index: &crate::semantic_search::ClusterIndex,
+/// Like [`index_embedding_rotated`], but filed under a given posting; `None` for
+/// an unknown posting.
+pub fn index_embedding_in_cluster<L: IvfLayout + ?Sized>(
+    layout: &L,
     embedding: &[f32],
-    cluster_id: u32,
+    posting: u32,
     style: crate::semantic_search::index::vector_index::QuantisationStyle,
 ) -> Option<VectorIndex> {
-    let centroid = cluster_index.rotated_centroid(cluster_id)?;
-    let rotated = Cluster::new(cluster_id, centroid.to_vec());
-    Some(index_embedding_to_cluster(&cluster_index.rotate(embedding), &rotated, style))
+    let centre_id = layout.centre_of(posting)?;
+    let centre = Cluster::new(centre_id, layout.rotated_centre(centre_id)?.to_vec());
+    let mut vi = index_embedding_to_cluster(&layout.rotate(embedding), &centre, style);
+    vi.cluster_id = posting;
+    Some(vi)
 }
 
 pub fn index_embedding_to_cluster(

@@ -46,6 +46,9 @@ pub const DEFAULT_WINDOW_SIZE: u32 = 4;
 pub const MAX_WINDOW_SIZE: u32 = 64;
 /// Default step between document chunks, in sentences.
 pub const DEFAULT_SLIDING_SIZE: u32 = 2;
+/// Rotation seed a new namespace gets (the same value as
+/// `semantic_search::cluster::DEFAULT_ROTATION_SEED`, pinned together by a test).
+pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
 /// Code width of Pass-1 (chunk) codes. Read-only.
 pub const PASS1_BITS: u8 = 1;
 /// Code width of Pass-2 (whole-document) codes. Read-only.
@@ -86,6 +89,23 @@ pub struct VectorIndexSpec {
     /// Search defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchSpec>,
+    /// Where the namespace's centres came from. Written by the server when it
+    /// seeds them; a request may not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded_from: Option<SeededFrom>,
+}
+
+/// The centroid file a namespace's centres were seeded from. After seeding the
+/// namespace never reads the file again; this records which one it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeededFrom {
+    /// Path of the centroid file, as the server found it.
+    pub file: String,
+    /// MurmurHash3 (x64, 128-bit) of the file's bytes, hex.
+    pub murmur3_128: String,
+    /// Number of centres seeded.
+    pub centres: u32,
 }
 
 /// Document chunking: sentence windows of `window_size`, advancing by
@@ -102,7 +122,7 @@ pub struct ChunkingSpec {
 }
 
 /// Code widths of the two passes. Read-only today.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuantisationSpec {
     /// Bits per dimension of Pass-1 (chunk) codes.
@@ -111,6 +131,11 @@ pub struct QuantisationSpec {
     /// Bits per dimension of Pass-2 (whole-document) codes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass2_bits: Option<u8>,
+    /// Seed of the rotation codes are computed in, as a hex string
+    /// (`"0x6d696e6e616c0001"`; a JSON number would lose precision above 2^53).
+    /// Fixed once set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_seed: Option<String>,
 }
 
 /// Search settings: the namespace's defaults, or one request's overrides.
@@ -145,6 +170,10 @@ pub struct VectorIndexSettings {
     pub pass1_bits: u8,
     /// Pass-2 code width (always [`PASS2_BITS`]).
     pub pass2_bits: u8,
+    /// Seed of the rotation codes are computed in.
+    pub rotation_seed: u64,
+    /// Where the centres came from, once seeded.
+    pub seeded_from: Option<SeededFrom>,
     /// Search defaults.
     pub search: SearchSettings,
 }
@@ -227,6 +256,25 @@ fn check_chunking(window: u32, sliding: u32) -> Result<(), SchemaError> {
     Ok(())
 }
 
+/// Parse a `"0x…"` hex seed (1 to 16 hex digits).
+fn parse_seed(s: &str) -> Result<u64, SchemaError> {
+    let digits = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).ok_or_else(|| {
+        invalid(
+            "quantisation.rotation_seed",
+            format!("must be a hex string like \"0x6d696e6e616c0001\", got {s:?}"),
+        )
+    })?;
+    if digits.is_empty() || digits.len() > 16 {
+        return Err(invalid("quantisation.rotation_seed", format!("must have 1 to 16 hex digits, got {s:?}")));
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| invalid("quantisation.rotation_seed", format!("is not hex: {s:?}")))
+}
+
+/// A seed as the schema writes it.
+pub fn format_seed(seed: u64) -> String {
+    format!("0x{seed:016x}")
+}
+
 fn check_bits(pass1: u8, pass2: u8) -> Result<(), SchemaError> {
     if pass1 != PASS1_BITS {
         return Err(invalid(
@@ -282,10 +330,19 @@ impl SearchSpec {
 }
 
 impl VectorIndexSpec {
+    /// Reject `seeded_from` in a request: only the server writes it, when it
+    /// seeds the namespace's centres.
+    pub fn reject_seeded_from(&self) -> Result<(), SchemaError> {
+        if self.seeded_from.is_some() {
+            return Err(invalid("seeded_from", "is written by the server when it seeds the centres; omit it"));
+        }
+        Ok(())
+    }
+
     /// Fill omitted fields with the built-in defaults and validate.
     pub fn resolve(&self) -> Result<VectorIndexSettings, SchemaError> {
         let chunking = self.chunking.unwrap_or_default();
-        let quantisation = self.quantisation.unwrap_or_default();
+        let quantisation = self.quantisation.clone().unwrap_or_default();
         let search = self.search.unwrap_or_default();
         // A default never makes a valid request invalid: an omitted slide or
         // result count is capped at its partner field (window 1 alone is
@@ -300,6 +357,11 @@ impl VectorIndexSpec {
             sliding_size: chunking.sliding_size.unwrap_or(DEFAULT_SLIDING_SIZE.min(window_size)),
             pass1_bits: quantisation.pass1_bits.unwrap_or(PASS1_BITS),
             pass2_bits: quantisation.pass2_bits.unwrap_or(PASS2_BITS),
+            rotation_seed: match &quantisation.rotation_seed {
+                Some(s) => parse_seed(s)?,
+                None => DEFAULT_ROTATION_SEED,
+            },
+            seeded_from: self.seeded_from.clone(),
             search: SearchSettings {
                 n_probes: search.n_probes.unwrap_or(DEFAULT_N_PROBES),
                 first_pass_top_k,
@@ -331,9 +393,20 @@ impl VectorIndexSpec {
         let chunking = self.chunking.unwrap_or_default();
         fixed("chunking.window_size", chunking.window_size, current.window_size)?;
         fixed("chunking.sliding_size", chunking.sliding_size, current.sliding_size)?;
-        let quantisation = self.quantisation.unwrap_or_default();
+        let quantisation = self.quantisation.clone().unwrap_or_default();
         fixed("quantisation.pass1_bits", quantisation.pass1_bits, current.pass1_bits)?;
         fixed("quantisation.pass2_bits", quantisation.pass2_bits, current.pass2_bits)?;
+        if let Some(seed) = &quantisation.rotation_seed {
+            let seed = parse_seed(seed)?;
+            if seed != current.rotation_seed {
+                return Err(SchemaError::VectorSettingFixed {
+                    field: "quantisation.rotation_seed",
+                    current: format_seed(current.rotation_seed),
+                    requested: format_seed(seed),
+                });
+            }
+        }
+        self.reject_seeded_from()?;
         Ok(VectorIndexSettings {
             search: self.search.unwrap_or_default().apply(current.search)?,
             ..current.clone()
@@ -363,12 +436,14 @@ impl VectorIndexSettings {
             quantisation: Some(QuantisationSpec {
                 pass1_bits: Some(self.pass1_bits),
                 pass2_bits: Some(self.pass2_bits),
+                rotation_seed: Some(format_seed(self.rotation_seed)),
             }),
             search: Some(SearchSpec {
                 n_probes: Some(self.search.n_probes),
                 first_pass_top_k: Some(self.search.first_pass_top_k),
                 top_k: Some(self.search.top_k),
             }),
+            seeded_from: self.seeded_from.clone(),
         }
     }
 }
@@ -384,6 +459,7 @@ pub(crate) fn resolve_or_default(spec: Option<&VectorIndexSpec>) -> Result<Vecto
 /// the defaults when it holds nothing yet.
 pub(crate) fn settle(existing: Option<&VectorIndexSpec>, requested: Option<&VectorIndexSpec>) -> Result<VectorIndexSpec, SchemaError> {
     let requested = requested.cloned().unwrap_or_default();
+    requested.reject_seeded_from()?;
     let settings = match existing {
         Some(e) => requested.merge_onto(&e.resolve()?)?,
         None => requested.resolve()?,
@@ -422,6 +498,47 @@ mod tests {
             SchemaError::InvalidVectorSetting { field, .. } | SchemaError::VectorSettingFixed { field, .. } => field,
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn rotation_seed_is_hex_fixed_and_defaults_to_the_pinned_value() {
+        let s = VectorIndexSpec::default().resolve().unwrap();
+        assert_eq!(s.rotation_seed, DEFAULT_ROTATION_SEED);
+        let filled = s.to_spec();
+        assert_eq!(filled.quantisation.as_ref().unwrap().rotation_seed.as_deref(), Some("0x6d696e6e616c0001"));
+        assert_eq!(filled.resolve().unwrap().rotation_seed, DEFAULT_ROTATION_SEED);
+        assert_eq!(spec(r#"{"quantisation":{"rotation_seed":"0X1F"}}"#).resolve().unwrap().rotation_seed, 31);
+        for bad in [r#""31""#, r#""0x""#, r#""0xZZ""#, r#""0x11112222333344445""#] {
+            assert_eq!(
+                err_field(spec(&format!(r#"{{"quantisation":{{"rotation_seed":{bad}}}}}"#)).resolve()),
+                "quantisation.rotation_seed",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            err_field(spec(r#"{"quantisation":{"rotation_seed":"0x2"}}"#).merge_onto(&s)),
+            "quantisation.rotation_seed"
+        );
+        assert!(spec(r#"{"quantisation":{"rotation_seed":"0x6D696E6E616C0001"}}"#).merge_onto(&s).is_ok());
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[test]
+    fn default_rotation_seed_matches_the_cluster_index() {
+        assert_eq!(DEFAULT_ROTATION_SEED, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED);
+    }
+
+    #[test]
+    fn seeded_from_is_server_written() {
+        let seeded = spec(r#"{"seeded_from":{"file":"f","murmur3_128":"ab","centres":2}}"#);
+        assert!(seeded.resolve().is_ok(), "a stored schema with it loads");
+        assert_eq!(
+            err_field(seeded.merge_onto(&VectorIndexSpec::default().resolve().unwrap())),
+            "seeded_from"
+        );
+        assert!(settle(None, Some(&seeded)).is_err());
+        let kept = settle(Some(&seeded), None).unwrap();
+        assert_eq!(kept.seeded_from, seeded.seeded_from, "kept across a re-enable");
     }
 
     #[test]

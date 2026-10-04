@@ -199,7 +199,7 @@ pub async fn amend_schema(
 
     // Search defaults apply to doc and KV stores alike.
     if let AmendRequest::UpdateVectorSearch { search } = &req {
-        state.store.update_vector_search(&ns, search)?;
+        state.store.update_vector_search(&ns, search).await?;
         match state.store.store_type(&ns)? {
             StoreType::Doc => reload_schema(&state, &ns).await,
             StoreType::Kv => reload_kv_schema(&state, &ns).await,
@@ -265,7 +265,7 @@ pub async fn amend_schema(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    state.store.amend(&ns, req.into())?;
+    state.store.amend(&ns, req.into()).await?;
     reload_schema(&state, &ns).await;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -368,28 +368,33 @@ impl DocStore {
 }
 
 /// Load every persisted document-store schema from `schema_dir`.
-/// The resolved vector-index settings of `namespace`, whichever kind of store it
-/// is, read from its schema file.
+/// The resolved vector-index settings and `ns_id` of `namespace`, whichever kind
+/// of store it is, read from its schema file.
 #[cfg(feature = "semantic-search")]
 pub(crate) fn load_vector_settings(
     schema_dir: &Path,
     namespace: &str,
-) -> Result<crate::doc_store::vector_settings::VectorIndexSettings, DocStoreError> {
+) -> Result<(crate::doc_store::vector_settings::VectorIndexSettings, u32), DocStoreError> {
     let path = schema_dir.join(format!("{namespace}.json"));
     let json = std::fs::read_to_string(&path).map_err(|_| {
         DocStoreError::Schema(SchemaError::NotFound {
             namespace: namespace.to_owned(),
         })
     })?;
-    let settings = match crate::doc_store::schema::peek_store_type(&json) {
-        Some(StoreType::Kv) => serde_json::from_str::<KvStoreSchema>(&json)
-            .map_err(SchemaError::Serialize)?
-            .vector_settings()?,
-        _ => serde_json::from_str::<DocStoreSchema>(&json)
-            .map_err(SchemaError::Serialize)?
-            .vector_settings()?,
+    let (settings, ns_id) = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => {
+            let s = serde_json::from_str::<KvStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
+        _ => {
+            let s = serde_json::from_str::<DocStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
     };
-    Ok(settings)
+    let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+        namespace: namespace.to_owned(),
+    })?;
+    Ok((settings, ns_id))
 }
 
 fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocStoreError> {

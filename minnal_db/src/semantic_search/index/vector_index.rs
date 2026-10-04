@@ -136,7 +136,13 @@ pub struct QueryResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VectorIndex {
+    /// The posting this entry is filed under (the `cluster_id` key prefix of a
+    /// chunk entry).
     pub cluster_id: u32,
+    /// The centre the code was encoded against (`x − c`). Scoring decodes through
+    /// this, never through the key prefix: a posting may move or split while its
+    /// codes keep the centre they were written against.
+    pub centre_id: u32,
     /// Quantisation strategy used to produce this index entry.
     pub quantisation_style: QuantisationStyle,
     pub addition_factor: f32,
@@ -174,6 +180,7 @@ impl VectorIndex {
     ) -> VectorIndex {
         VectorIndex {
             cluster_id,
+            centre_id: cluster_id,
             quantisation_style,
             addition_factor,
             scaling_factor,
@@ -224,9 +231,14 @@ impl VectorIndex {
 }
 
 impl ArchivedVectorIndex {
-    /// The cluster this entry was quantised against (native value).
+    /// The posting this entry is filed under (native value).
     pub fn cluster_id(&self) -> u32 {
         self.cluster_id.to_native()
+    }
+
+    /// The centre the code was encoded against (native value).
+    pub fn centre_id(&self) -> u32 {
+        self.centre_id.to_native()
     }
 
     /// The quantisation style, converted to the owned enum (no allocation).

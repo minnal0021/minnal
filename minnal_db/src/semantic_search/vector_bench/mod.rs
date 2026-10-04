@@ -348,13 +348,22 @@ async fn vector_bench() {
     let cluster_path = format!("../service/embedding_support/{model}/clusters.json");
     let raw = read_clusters_from_file(&cluster_path).unwrap_or_else(|e| panic!("load {cluster_path}: {e}"));
     let index = Arc::new(ClusterIndex::from_clusters(
-        raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(),
+        raw.iter().map(|(&id, c)| (id, Cluster::new(id, c.clone()))).collect(),
     ));
 
     // ── Index through the production write path ──
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
     db.namespace(NS.to_string()).await.unwrap();
+    // The namespace's own partition, seeded and loaded back as a store does it:
+    // indexing and search run against it, not the file.
+    crate::vector_kv::seed_ivf(&db, NS, &raw).await.unwrap();
+    let ivf = Arc::new(
+        crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+            .await
+            .unwrap()
+            .expect("just seeded"),
+    );
     let rows = insertion_order(&order, &frozen, &index);
     let t = Instant::now();
     {
@@ -362,10 +371,10 @@ async fn vector_bench() {
         let mut set = tokio::task::JoinSet::new();
         for d in rows {
             let permit = sem.clone().acquire_owned().await.unwrap();
-            let (frozen, config, index, db) = (frozen.clone(), config.clone(), index.clone(), db.clone());
+            let (frozen, config, ivf, db) = (frozen.clone(), config.clone(), ivf.clone(), db.clone());
             set.spawn(async move {
                 let _permit = permit;
-                let vis = index_embeddings(&config, &index, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
+                let vis = index_embeddings(&config, &ivf, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
                 upsert_vectors(&db, NS, &(d as u64).to_be_bytes(), "", &vis).await.unwrap();
             });
         }
@@ -424,14 +433,14 @@ async fn vector_bench() {
             first_pass_sparse_search_top_k: FIRST_PASS,
             ..(*config).clone()
         };
-        let (store, index, frozen) = (&store, &index, &frozen);
+        let (store, ivf, frozen) = (&store, &ivf, &frozen);
         async move {
             let q = frozen.query(qi).to_vec();
             let t = Instant::now();
             let results = search(
                 &cfg,
                 NS,
-                index,
+                ivf,
                 std::slice::from_ref(&q),
                 &q,
                 store,

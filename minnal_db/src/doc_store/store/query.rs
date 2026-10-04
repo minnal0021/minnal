@@ -36,11 +36,14 @@ impl DocStore {
         Ok((q.dense, q.sparse))
     }
 
-    /// The per-call config and centroids for a semantic namespace with
-    /// `settings`, with one request's search `overrides` applied.
+    /// The per-call config and partition for semantic namespace `namespace`
+    /// (`ns_id`, from its schema) with `settings`, with one request's search
+    /// `overrides` applied.
     #[cfg(feature = "semantic-search")]
-    pub(super) fn namespace_semantics(
+    pub(super) async fn namespace_semantics(
         &self,
+        namespace: &str,
+        ns_id: Option<u32>,
         settings: &crate::doc_store::vector_settings::VectorIndexSettings,
         overrides: &SearchSpec,
     ) -> Result<NamespaceSemantics, DocStoreError> {
@@ -48,7 +51,12 @@ impl DocStore {
             .semantic_ctx
             .as_ref()
             .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
-        ctx.for_namespace(settings)?.with_overrides(overrides)
+        // Validate the overrides before touching storage.
+        overrides.apply(settings.search)?;
+        let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        ctx.for_namespace(&self.db, namespace, ns_id, settings).await?.with_overrides(overrides)
     }
 
     /// Clear the system-wide query-embedding cache, returning the number of
@@ -100,7 +108,9 @@ impl DocStore {
                 namespace: namespace.to_string(),
             });
         }
-        let ns = self.namespace_semantics(&schema.vector_settings()?, overrides)?;
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
 
         debug!("semantic search namespace='{}' top_k={}", namespace, ns.config.top_k_results);
         let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
@@ -112,7 +122,7 @@ impl DocStore {
         let all = crate::semantic_search::service::search(
             &ns.config,
             namespace,
-            &ns.cluster_index,
+            &*ns.ivf,
             &query_sparse,
             &query_dense,
             &db_store,
@@ -161,7 +171,9 @@ impl DocStore {
             });
         }
         // Validate overrides before evaluating the predicate, too.
-        let ns = self.namespace_semantics(&schema.vector_settings()?, overrides)?;
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
 
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
         // here — the full set is needed as an ANN filter before scoring).
@@ -181,7 +193,7 @@ impl DocStore {
         let all = crate::semantic_search::service::search(
             &ns.config,
             namespace,
-            &ns.cluster_index,
+            &*ns.ivf,
             &query_sparse,
             &query_dense,
             &db_store,

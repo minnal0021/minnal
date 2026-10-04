@@ -48,6 +48,12 @@ impl DocStore {
         // Register + activate field indices
         activate_indices(&self.db, ns_id, &schema).await?;
 
+        // Seed the namespace's centres before the schema says it is semantic.
+        if schema.semantic_search_enabled {
+            let settings = schema.vector_settings()?;
+            self.seed_vector_index(&ns_name, &settings, &mut schema.vector_index).await?;
+        }
+
         // Persist schema
         schema.save(&self.schema_dir)?;
         info!("namespace '{}' created (ns_id={})", ns_name, ns_id);
@@ -80,6 +86,10 @@ impl DocStore {
         })?;
         let schema_path = self.schema_path(namespace);
         cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path).await?;
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.evict(namespace);
+        }
         info!("namespace '{}' dropped", namespace);
         Ok(())
     }
@@ -116,6 +126,10 @@ impl DocStore {
 
         let ns_handle = self.db.namespace(ns_name.clone()).await?;
         schema.ns_id = Some(ns_handle.id());
+        if schema.is_semantic_search_enabled() {
+            let settings = schema.vector_settings()?;
+            self.seed_vector_index(&ns_name, &settings, &mut schema.vector_index).await?;
+        }
         schema.save(&self.schema_dir)?;
         info!("KV namespace '{}' created (ns_id={})", ns_name, schema.ns_id.unwrap());
         Ok(())
@@ -138,6 +152,10 @@ impl DocStore {
         })?;
         let schema_path = self.schema_path(namespace);
         cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path).await?;
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.evict(namespace);
+        }
         info!("KV namespace '{}' dropped", namespace);
         Ok(())
     }
@@ -150,7 +168,7 @@ impl DocStore {
     /// and [`SchemaAmendment::UpdateAttribute`] are supported.  Attempting to
     /// remove or update an attribute that is used by an active index returns
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
-    pub fn amend(&self, namespace: &str, amendment: SchemaAmendment) -> Result<(), DocStoreError> {
+    pub async fn amend(&self, namespace: &str, amendment: SchemaAmendment) -> Result<(), DocStoreError> {
         let mut schema = self.load_schema(namespace)?;
         let was_enabled = schema.semantic_search_enabled;
 
@@ -172,7 +190,9 @@ impl DocStore {
         // Only the amendment that turns semantic search on picks a model; others
         // must keep working even if this server no longer serves it.
         if schema.semantic_search_enabled && !was_enabled {
-            self.check_vector_model(&schema.vector_settings()?)?;
+            let settings = schema.vector_settings()?;
+            self.check_vector_model(&settings)?;
+            self.seed_vector_index(namespace, &settings, &mut schema.vector_index).await?;
         }
 
         schema.save(&self.schema_dir)?;
@@ -185,9 +205,9 @@ impl DocStore {
     /// [`SchemaError::VectorIndexNotConfigured`] if the store has never had
     /// semantic search enabled, and with [`SchemaError::InvalidVectorSetting`]
     /// for a value out of range.
-    pub fn update_vector_search(&self, namespace: &str, search: &crate::doc_store::vector_settings::SearchSpec) -> Result<(), DocStoreError> {
+    pub async fn update_vector_search(&self, namespace: &str, search: &crate::doc_store::vector_settings::SearchSpec) -> Result<(), DocStoreError> {
         match self.store_type(namespace)? {
-            StoreType::Doc => self.amend(namespace, SchemaAmendment::UpdateVectorSearch { search: *search }),
+            StoreType::Doc => self.amend(namespace, SchemaAmendment::UpdateVectorSearch { search: *search }).await,
             StoreType::Kv => {
                 let mut schema = self.load_kv_schema(namespace)?;
                 schema.update_vector_search(search)?;
@@ -195,6 +215,26 @@ impl DocStore {
                 Ok(())
             }
         }
+    }
+
+    /// Seed `namespace`'s centres and postings from its model's centroid set (or
+    /// keep a complete earlier seed) and record it in `vector_index`. Without an
+    /// attached semantic context there is nothing to seed from; the namespace is
+    /// seeded when it is next enabled with one.
+    async fn seed_vector_index(
+        &self,
+        _namespace: &str,
+        _settings: &crate::doc_store::vector_settings::VectorIndexSettings,
+        _vector_index: &mut Option<crate::doc_store::vector_settings::VectorIndexSpec>,
+    ) -> Result<(), DocStoreError> {
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            let seeded = ctx.seed_namespace(&self.db, _namespace, _settings).await?;
+            if let Some(vi) = _vector_index {
+                vi.seeded_from = Some(seeded);
+            }
+        }
+        Ok(())
     }
 
     /// Check that this server can embed and search with `settings` (its model
@@ -333,7 +373,8 @@ impl DocStore {
             .db
             .list_namespaces()
             .into_iter()
-            .filter_map(|(name, _)| vector_kv::companion_base(&name).map(str::to_owned))
+            // Vector data only: the partition (`_ivf_*`) outlives a vector-index drop.
+            .filter_map(|(name, _)| vector_kv::vector_data_base(&name).map(str::to_owned))
             .collect();
         leftover.extend(vector_kv::queued_namespaces(&self.db).await?);
         leftover.retain(|ns| !semantic.contains(ns));
@@ -438,10 +479,14 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
         let _ = db.remove_namespace(vector_kv::sparse_vectors_ns(namespace)).await;
         let _ = db.remove_namespace(vector_kv::sparse_vectors_meta_ns(namespace)).await;
         let _ = db.remove_namespace(vector_kv::dense_vectors_ns(namespace)).await;
+        let _ = db.remove_namespace(vector_kv::ivf_centres_ns(namespace)).await;
+        let _ = db.remove_namespace(vector_kv::ivf_postings_ns(namespace)).await;
         ns_names.extend([
             vector_kv::sparse_vectors_ns(namespace),
             vector_kv::sparse_vectors_meta_ns(namespace),
             vector_kv::dense_vectors_ns(namespace),
+            vector_kv::ivf_centres_ns(namespace),
+            vector_kv::ivf_postings_ns(namespace),
         ]);
     }
 
@@ -591,13 +636,17 @@ mod tests {
                     description: None,
                 },
             )
+            .await
             .unwrap();
 
         let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
         assert_eq!(loaded.attributes.len(), 1);
         assert_eq!(loaded.attributes[0].name, "email");
 
-        store.amend("ns", SchemaAmendment::RemoveAttribute { name: "email".to_owned() }).unwrap();
+        store
+            .amend("ns", SchemaAmendment::RemoveAttribute { name: "email".to_owned() })
+            .await
+            .unwrap();
         let loaded2 = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
         assert!(loaded2.attributes.is_empty());
     }
@@ -620,6 +669,7 @@ mod tests {
 
         let err = store
             .amend("ns", SchemaAmendment::RemoveAttribute { name: "status".to_owned() })
+            .await
             .unwrap_err();
         assert!(
             matches!(err, DocStoreError::AttributeIsIndexed { .. }),

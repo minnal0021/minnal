@@ -13,9 +13,11 @@ use crate::doc_store::index_observer::InMemoryProgress;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
-use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
+use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, SeededFrom, VectorIndexSettings};
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::ClusterIndex;
+#[cfg(feature = "semantic-search")]
+use crate::semantic_search::NamespaceIvf;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::service::SemanticSearchConfig;
 
@@ -256,11 +258,14 @@ impl IndexBuildHandle {
 /// Construct once at startup and attach via [`DocStore::with_semantic_search`].
 ///
 /// It holds what is engine-wide: the embedding service settings and one set of
-/// IVF cluster centroids per supported model. Everything that shapes a
-/// namespace's index (model, dimension, chunking, code widths, search
-/// defaults) comes from that namespace's schema; [`for_namespace`] combines the
-/// two into the per-call [`SemanticSearchConfig`] and picks the model's
-/// centroids.
+/// IVF cluster centroids per supported model, used only to **seed** a namespace
+/// when it first enables semantic search ([`seed_namespace`]). After that a
+/// namespace runs on its own stored centres and postings, loaded once into a
+/// registry. Everything that shapes a namespace's index comes from its schema;
+/// [`for_namespace`] combines the two into the per-call [`SemanticSearchConfig`]
+/// and the namespace's [`NamespaceIvf`].
+///
+/// [`seed_namespace`]: SemanticSearchContext::seed_namespace
 ///
 /// [`for_namespace`]: SemanticSearchContext::for_namespace
 #[cfg(feature = "semantic-search")]
@@ -269,9 +274,15 @@ pub struct SemanticSearchContext {
     /// per-namespace fields are ignored; [`for_namespace`](Self::for_namespace)
     /// overwrites them from the namespace's settings.
     pub config: SemanticSearchConfig,
-    /// IVF cluster centroids per supported model (lower-cased name), probed by
-    /// exact nearest-centroid distance.
+    /// Seed sources: IVF cluster centroids per supported model (lower-cased name).
     pub cluster_indexes: std::collections::HashMap<String, Arc<ClusterIndex>>,
+    /// The file each seed source was loaded from, when known (recorded in a
+    /// namespace's `seeded_from`).
+    seed_files: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Each namespace's partition, loaded once from its stores. Keyed by name and
+    /// `ns_id`, so a namespace dropped and recreated under the same name never
+    /// reuses the old one.
+    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, u32), Arc<NamespaceIvf>>>,
 }
 
 /// What one namespace's semantic operations run with: the per-call config built
@@ -281,8 +292,8 @@ pub struct NamespaceSemantics {
     /// Service settings plus the namespace's model, dimension, chunking, code
     /// widths and search defaults.
     pub config: SemanticSearchConfig,
-    /// The namespace's model's centroids.
-    pub cluster_index: Arc<ClusterIndex>,
+    /// The namespace's own partition (its centres, postings and rotation).
+    pub ivf: Arc<NamespaceIvf>,
 }
 
 #[cfg(feature = "semantic-search")]
@@ -293,7 +304,56 @@ impl SemanticSearchContext {
         Self {
             config,
             cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
+            seed_files: std::collections::HashMap::new(),
+            ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record the file `model`'s seed source was loaded from.
+    pub fn with_seed_file(mut self, model: &str, path: impl Into<std::path::PathBuf>) -> Self {
+        self.seed_files.insert(model.to_lowercase(), path.into());
+        self
+    }
+
+    /// Seed `namespace`'s centres and postings from its model's centroid set,
+    /// unless it already holds a complete partition (a re-enable after a
+    /// vector-index drop), and return the record for its schema. Durable on
+    /// return.
+    pub async fn seed_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<SeededFrom, DocStoreError> {
+        let source = self.cluster_index_for(settings)?;
+        let centroids: std::collections::HashMap<u32, Vec<f32>> = source.clusters.iter().map(|(&id, c)| (id, c.centroid.clone())).collect();
+        if let Some(existing) = &settings.seeded_from
+            && crate::vector_kv::ivf_is_seeded(db, namespace).await?
+        {
+            return Ok(existing.clone());
+        }
+        crate::vector_kv::seed_ivf(db, namespace, &centroids).await?;
+        self.ivfs.write().retain(|(name, _), _| name != namespace);
+        let (file, digest) = match self.seed_files.get(&settings.embedding_model) {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(DocStoreError::Io)?;
+                (path.display().to_string(), mm3h::murmurhash3_128(&bytes))
+            }
+            None => {
+                let mut ids: Vec<&u32> = centroids.keys().collect();
+                ids.sort_unstable();
+                let bytes: Vec<u8> = ids
+                    .into_iter()
+                    .flat_map(|id| id.to_be_bytes().into_iter().chain(centroids[id].iter().flat_map(|x| x.to_le_bytes())))
+                    .collect();
+                ("<in-memory>".to_string(), mm3h::murmurhash3_128(&bytes))
+            }
+        };
+        Ok(SeededFrom {
+            file,
+            murmur3_128: format!("{digest:032x}"),
+            centres: centroids.len() as u32,
+        })
+    }
+
+    /// Forget every loaded partition of `namespace` (it was dropped).
+    pub fn evict(&self, namespace: &str) {
+        self.ivfs.write().retain(|(name, _), _| name != namespace);
     }
 
     /// Check that `settings` can run here: its model has centroids, and they
@@ -324,9 +384,38 @@ impl SemanticSearchContext {
         Ok(index)
     }
 
-    /// The per-call config and centroids for a namespace with `settings`.
-    pub fn for_namespace(&self, settings: &VectorIndexSettings) -> Result<NamespaceSemantics, DocStoreError> {
-        let cluster_index = Arc::clone(self.cluster_index_for(settings)?);
+    /// The per-call config and partition for `namespace` (`ns_id`) with `settings`,
+    /// loading the partition from its stores on first use.
+    pub async fn for_namespace(
+        &self,
+        db: &crate::AsyncDb,
+        namespace: &str,
+        ns_id: u32,
+        settings: &VectorIndexSettings,
+    ) -> Result<NamespaceSemantics, DocStoreError> {
+        let key = (namespace.to_owned(), ns_id);
+        let cached = self.ivfs.read().get(&key).cloned();
+        let ivf = match cached {
+            Some(ivf) => ivf,
+            None => {
+                let ivf =
+                    crate::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
+                        .await?
+                        .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
+                            namespace: namespace.to_owned(),
+                        })?;
+                let ivf = Arc::new(ivf);
+                self.ivfs.write().insert(key, Arc::clone(&ivf));
+                ivf
+            }
+        };
+        if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
+            return Err(DocStoreError::EmbeddingDimMismatch {
+                model: settings.embedding_model.clone(),
+                dim: settings.embedding_dim,
+                centroid_dim: crate::semantic_search::IvfLayout::dim(ivf.as_ref()),
+            });
+        }
         let config = SemanticSearchConfig {
             model_name: settings.embedding_model.clone(),
             embedding_dim: settings.embedding_dim as usize,
@@ -338,7 +427,7 @@ impl SemanticSearchContext {
             top_k_results: settings.search.top_k as usize,
             ..self.config.clone()
         };
-        Ok(NamespaceSemantics { config, cluster_index })
+        Ok(NamespaceSemantics { config, ivf })
     }
 }
 

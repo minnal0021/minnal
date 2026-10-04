@@ -54,6 +54,10 @@ pub async fn import_schema(State(state): State<AppState>, Json(body): Json<serde
             // ns_id is an internal assignment made at creation time — strip any value
             // carried in the exported file so the store assigns a fresh one.
             schema.ns_id = None;
+            // A new namespace gets its own seed; the exported record describes the old one.
+            if let Some(vi) = schema.vector_index.as_mut() {
+                vi.seeded_from = None;
+            }
             // A field that has been indexed must not also appear in attributes
             // (attributes is the non-indexed list). Schemas written before this
             // invariant was enforced may carry the field in both; drop it so
@@ -67,6 +71,10 @@ pub async fn import_schema(State(state): State<AppState>, Json(body): Json<serde
                 serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::Schema(SchemaError::Malformed(e))))?;
             info!(namespace = %schema.namespace, "importing KV schema");
             schema.ns_id = None;
+            // A new namespace gets its own seed; the exported record describes the old one.
+            if let Some(vi) = schema.vector_index.as_mut() {
+                vi.seeded_from = None;
+            }
             create_kv_schema(&state, schema).await?
         }
     };
