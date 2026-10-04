@@ -18,7 +18,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
-| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
+| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) and caller-supplied embeddings | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 
 The research behind this design (production systems, papers, the 109k-passage
@@ -1146,6 +1146,12 @@ Users pick the trade-off per namespace: disk for local, fast, service-free
 maintenance (`stored`), or no extra disk at the cost of embedding-service
 capacity (`service`), or neither (`none`).
 
+A document's vectors can also come from the caller instead of the service (see
+*Caller-supplied embeddings* below). Those are always kept in `{ns}_raw_vector`,
+WAL-backed, whatever the policy: nothing else can produce them again, so for
+those documents the source is always the stored copy and `reencode_source` only
+governs documents the service embedded.
+
 **Rules shared by all three.**
 
 - **Code-only is the floor.** Split, merge and rebuild ask a *vector source*
@@ -1175,6 +1181,89 @@ store itself), so it needs no extra storage, but each one costs a full embedding
 call. Its queue entries are a separate kind from new-document embeds so the
 worker can always prefer the latter.
 
+### Caller-supplied embeddings
+
+**The idea.** A write may carry the document's embedding instead of leaving it
+to the service. minnal validates it, stores it in `{ns}_raw_vector` (the store
+`stored` introduces), and encodes it exactly as it would a service embedding.
+This generalises `stored`: there the first embedding comes from the service and
+is kept for later; here it comes from the caller and is kept for the same
+reasons (re-encoding, rebuilds, exact k-means for M3c's bootstrap and M4's
+rebuild, and exact ground truth on live data). It lets a namespace use a model
+minnal's service does not run, or embeddings the caller already paid for.
+
+**Where vectors come from: `embedding_source`** in `vector_index`, fixed for
+the namespace's life like the model:
+
+| Value | A write without an embedding | A write with one | Queries |
+|---|---|---|---|
+| `service` (default) | embedded by the service | rejected (400) | query text, embedded by the service |
+| `supplied` | rejected (400) | stored and encoded; the service is never called for documents | a query vector; or query text if the service serves the model |
+| `either` | embedded by the service | stored and encoded | either |
+
+`embedding_model` still names the space the vectors live in, and supplied
+vectors must come from that model: minnal compares them with query vectors and
+with centroids fitted for that model, and cannot check where a vector came from.
+A `supplied` namespace whose model the service does not serve can only be
+searched with query vectors.
+
+**Payload.**
+
+- *Document stores:* a reserved top-level key in the document,
+  `"_embedding": {"dense": [f32; D], "chunks": [[f32; D], ...], "model": "gemma"}`.
+  `dense` is the whole-document vector (Pass 2). `chunks` are the Pass-1
+  vectors; when omitted, the dense vector also serves as the document's only
+  chunk (MaxSim over one chunk is the dense score). `model` is optional and, when
+  given, must equal the namespace's model, a cheap guard against mixing spaces.
+  The shorthand `"_embedding": [f32; D]` means `dense` only. The key is removed
+  before the document is stored, so the document body never holds vectors;
+  `GET` returns the document without it. `_embedding` cannot be declared as an
+  attribute or index.
+- *KV stores:* the value is the text itself, so the embedding travels in an
+  envelope, `{"value": ..., "embedding": {...}}`, sent with
+  `?embedding=inline` so a value that happens to look like an envelope is never
+  misread.
+- *Bulk loader:* an embedding column per row, same shape.
+- *Search:* a request may give `query_embedding` (same validation) instead of,
+  or as well as, query text; a given vector is used as is and bypasses the
+  query cache.
+
+**Validation**, on every write and query vector, each failure a 400 that names
+the field and index (`_embedding.chunks[3] has 767 values, expected 768`):
+
+- length equals the namespace's `embedding_dim`;
+- every value finite (no NaN or infinity);
+- unit length within a tolerance (default 0.01). minnal ranks by inner product
+  and its centroids and error bounds assume unit vectors, so a vector that is not
+  normalised is rejected with a message saying so, rather than silently
+  rescaled, which would change what the caller's model meant;
+- `chunks`, when present, non-empty and at most `MAX_SUPPLIED_CHUNKS`
+  (default 128); the API's 2 MB request limit holds roughly 250 768-dimension
+  vectors as JSON text, so larger documents go through the bulk loader;
+- `model`, when present, equal to the namespace's model;
+- the payload is rejected outright by a `service` namespace, and required by a
+  `supplied` one.
+
+The namespace's `chunking` settings apply only to documents the service embeds;
+a caller chunks its own documents however it likes.
+
+**Durability and the write path.** A supplied vector is the only copy, so it is
+written **WAL-backed** (unlike codes and the service-sourced vectors of
+`stored`, which can be regenerated). The order mirrors today's: the document,
+then its raw vectors, then a queue entry of a new kind, `Encode`, which tells
+the worker to quantise from `{ns}_raw_vector` instead of calling the service.
+The worker writes codes, flushes and completes exactly as for `Embed` (M0-1).
+The meta's hash covers the supplied vectors instead of the text, so
+reconciliation detects stale codes the same way, and re-encodes from the stored
+vectors instead of re-embedding. A later write without an embedding (in an
+`either` namespace) replaces the stored vectors with the service's.
+
+**Deletion** removes the raw vectors with the codes (the meta superset rule
+covers the key), WAL-backed like every other vector-index delete.
+
+**Cost.** About 3 KB per vector at 768 dimensions in f32 (half as f16), the
+same as `stored`, and paid only by documents that supply vectors.
+
 **Sequencing.** M3a–M3c ship `none`, which every namespace needs. M3-pre's
 simulation also measures what an exact re-encode is worth on gemma. On the 109k
 WordLlama test it lifted recall@10 before reranking from 0.918 to 0.955; after
@@ -1187,6 +1276,15 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 - **M3e — `service`:** the same interface backed by the embedding service, with
   the request cap. Gate: under continuous new-document load, new-document
   indexing throughput stays within 5% while re-encodes drain.
+- **M3f — caller-supplied embeddings:** `embedding_source`, the payload and
+  query fields, validation, the `Encode` queue kind and WAL-backed raw vectors.
+  It needs only M3d's raw-vector store, not dynamic partitions, so it can move
+  ahead of M3a–M3c if wanted. Gate: a namespace indexed from supplied vectors
+  equal to the service's gives byte-identical results to one the service
+  indexed; every validation rule has a test at its edge; a crash at every step of
+  the write path (the M0-2 audit) leaves no document without its vectors and no
+  orphaned raw vector; reconciliation re-encodes stale codes without calling the
+  service.
 
 ## M4 — Rebuild from codes, then remove the files
 
@@ -1228,3 +1326,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 6 | Bundled centroid files | Deleted in M4 |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
+| 9 | Caller-supplied embeddings (2026-10-04) | A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`); validated, stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind; queries may carry a vector (M3f) |
