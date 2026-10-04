@@ -8,7 +8,8 @@ whether the difference matters, and the measurements behind that judgement.
 *Sources: RaBitQ, Gao & Long, SIGMOD 2024 ([arXiv 2405.12497](https://arxiv.org/abs/2405.12497));
 Extended RaBitQ, Gao et al., SIGMOD 2025 ([arXiv 2409.09913](https://arxiv.org/abs/2409.09913));
 [RaBitQ-Library](https://github.com/VectorDB-NTU/RaBitQ-Library) at commit
-`d929e30`. Measurements on frozen embeddings of BEIR SciFact and FiQA from two
+`d929e30`. Measurements on frozen embeddings of BEIR SciFact and FiQA (and, for
+the `q − c` comparison, NFCorpus and ArguAna) from two
 models served by llama.cpp: gemma (`embeddinggemma-300m`, Q8) and qwen
 (`Qwen3-Embedding-8B`, Q4_K_M, truncated to 768 dimensions), each with its
 bundled centroids (ELI5, k = 256), at commit `946814b`. Harness:
@@ -21,13 +22,14 @@ bundled centroids (ELI5, k = 256), at commit `946814b`. Harness:
 - **Both similarity formulas are right.** The Pass-1 estimate is the paper's
   unbiased estimator (measured bias at most 0.0016 in size on every model and dataset, against an RMSE of 0.022–0.027). The Pass-2 score is
   algebraically the library's inner-product estimate.
-- **One deliberate difference, kept for now:** Pass 1 estimates the residual's
-  inner product against the raw query `q`. The paper and library use the query
+- **One deliberate difference, kept:** Pass 1 estimates the residual's inner
+  product against the raw query `q`. The paper and library use the query
   residual `q − c`, which is more accurate only when the query sits close to the
-  centroid. Which form wins depends on the model: on gemma (`‖q − c‖` 1.10–1.15
-  against `‖q‖ = 1`) the paper's form is slightly worse; on qwen (`‖q − c‖`
-  1.01–1.04) it keeps 0.4–1.1 points more of the exact Pass-1 candidates. Neither
-  changes nDCG@10 (see row 9).
+  centroid. With the bundled centroids it does not: `‖q − c‖` is 1.10–1.15 for
+  gemma and 0.99–1.04 for qwen, against `‖q‖ = 1`. Over eight model–dataset pairs
+  the paper's form changes Pass-1 recall by −1.0 to +1.1 points and nDCG@10 by at
+  most 0.0004 (see row 9). It is to be re-measured after dynamic partitions
+  (design doc M3), which bring centres closer to the data.
 - **One bug, fixed (`9fb62a9`):** the multi-bit rescale-factor search could
   score codes above the top level for 2 and 4 total bits. The default (8 bits)
   was never affected.
@@ -81,7 +83,7 @@ bundled centroids (ELI5, k = 256), at commit `946814b`. Harness:
 |---|---|---|
 | 7 | 1-bit code | ✅ `ō = sign/√D`; `scaling_factor = ‖r‖/(⟨ō,o⟩√D)`; `error_bound` equals the library's `tmp_error` (same 1.9, same `D − 1`). |
 | 8 | Pass-1 estimate | ✅ `⟨x,q⟩ ≈ ⟨q,c⟩ + scaling·(2·Σ_{bit=1} q'ᵢ − Σq')`, which is `⟨q,c⟩ + ‖r‖·⟨ō,q'⟩/⟨ō,o⟩`: the paper's unbiased estimator (Theorem 3.2) applied to `⟨r, q⟩`. Measured over every probed (query, chunk) pair of every 8th query, 11.1 M pairs on FiQA: RMSE 0.0239 (gemma) / 0.0222 (qwen), bias −0.00003 / −0.0004. Scores from different clusters share one scale (each includes its own `⟨q,c⟩`), which the cross-cluster MaxSim needs. |
-| 9 | Raw `q` vs `q − c` | ⚠️ Kept. See *The one deliberate difference* below. |
+| 9 | Raw `q` vs `q − c` | ⚠️ Kept; re-measure after M3. See *The one deliberate difference* below. |
 | 10 | Pass-2 estimate | ✅ `score = 1 − (−⟨q,c⟩ + addition_factor + scaling·(⟨code,q'⟩ + c_b·Σq'))`, with `c_b = −(2^{B−1} − ½)`. Expanding minnal's own factors gives `⟨q,c⟩ + ⟨r,c⟩ + ‖r‖²⟨s, q−c⟩/⟨r,s⟩`, where `s` is the centred code: the library's `METRIC_IP` estimate, term for term, and `1 − estimate` is `⟨x,q⟩` with the right sign. Pass 2 already uses `q − c`. Measured RMSE 0.00024, bias 0.00000. |
 | 11 | Multi-bit codes | ✅ Sign-magnitude grid `sign(rᵢ)·(kᵢ + ½)` built as in the library; factors identical to `rabitq_impl.hpp` `METRIC_IP`. |
 | 12 | Rescale-factor search | ❌ → fixed in `9fb62a9`. See *The bug* below. |
@@ -100,32 +102,35 @@ Pass 1 needs `⟨r, q⟩` for each chunk. There are two ways to get it:
 
 The paper's form is better exactly when `‖q − c‖ < ‖q‖`, that is, when the query
 is close to the cluster's centroid. Both models embed queries and documents with
-different prompts, so queries need not sit inside document clusters. Over the
-probed clusters, `‖q − c‖` averages:
+different prompts, so queries need not sit inside document clusters. Measured
+with both forms on the same codes, 64 probes, on four BEIR datasets
+(`‖q − c‖` is the mean over the probed clusters, against `‖q‖ = 1`):
 
-| | SciFact | FiQA |
-|---|---:|---:|
-| gemma | 1.15 | 1.10 |
-| qwen | 1.04 | 1.01 |
+| Model | Dataset | `‖q − c‖` | Estimator RMSE, raw `q` → `q − c` | Pass-1 recall, raw `q` → `q − c` | nDCG@10 change |
+|---|---|---:|---|---|---:|
+| gemma | SciFact | 1.15 | 0.0274 → 0.0298 | 0.7959 → 0.7858 | 0.0000 |
+| gemma | FiQA | 1.10 | 0.0239 → 0.0255 | 0.8063 → 0.8056 | 0.0000 |
+| gemma | NFCorpus | 1.11 | 0.0269 → 0.0289 | 0.7300 → 0.7242 | 0.0000 |
+| gemma | ArguAna | 1.10 | 0.0254 → 0.0275 | 0.7867 → 0.7791 | 0.0000 |
+| qwen | SciFact | 1.04 | 0.0245 → 0.0242 | 0.8084 → 0.8122 | 0.0000 |
+| qwen | FiQA | 1.01 | 0.0222 → 0.0219 | 0.8225 → 0.8338 | 0.0000 |
+| qwen | NFCorpus | 1.04 | 0.0242 → 0.0245 | 0.7997 → 0.7997 | +0.0004 |
+| qwen | ArguAna | 0.99 | 0.0223 → 0.0217 | 0.8191 → 0.8252 | 0.0000 |
 
-against `‖q‖ = 1`. Measured with both forms on the same codes, 64 probes:
+(nDCG@10 is after an exact dense rerank of each form's 1,000 candidates.)
 
-| Model | Dataset | Form | RMSE | Within `error_bound` × query norm | Pass-1 recall | nDCG@10 (exact rerank) |
-|---|---|---|---:|---:|---:|---:|
-| gemma | SciFact | raw `q` (minnal) | 0.0274 | 93.8% | 0.7959 | 0.7900 |
-| gemma | SciFact | `q − c` (paper) | 0.0298 | 94.7% | 0.7858 | 0.7900 |
-| gemma | FiQA | raw `q` (minnal) | 0.0239 | 94.3% | 0.8063 | 0.4737 |
-| gemma | FiQA | `q − c` (paper) | 0.0255 | 94.6% | 0.8056 | 0.4737 |
-| qwen | SciFact | raw `q` (minnal) | 0.0245 | 94.3% | 0.8084 | 0.7817 |
-| qwen | SciFact | `q − c` (paper) | 0.0242 | 94.8% | 0.8122 | 0.7817 |
-| qwen | FiQA | raw `q` (minnal) | 0.0222 | 94.4% | 0.8225 | 0.5920 |
-| qwen | FiQA | `q − c` (paper) | 0.0219 | 94.4% | 0.8338 | 0.5920 |
+`‖q − c‖` predicts the direction: on gemma (1.10–1.15) the paper's form is worse
+everywhere; on qwen (0.99–1.04) it is equal or slightly better at Pass 1. It
+never moves the final ranking, because the candidates it gains or loses are
+near-ties around rank 1,000 (`pass1-recall-study.md`). Adopting it would cost
+one stored float per chunk (`⟨r,c⟩`, with `⟨ō,c⟩` folded in as the library does,
+so search needs no extra per-cluster work) and a re-encode of every namespace.
 
-On gemma the paper's form is worse; on qwen it is slightly better at Pass 1, and
-on neither does it move nDCG@10. It needs one more stored float per chunk and a
-per-cluster query residual at search time. Minnal keeps the raw form until a
-model shows a ranking gain; once the model is part of a namespace's schema
-(design doc M2a) the form could be chosen per model. The study prints both.
+**Decision: keep the raw form, and re-measure after dynamic partitions** (design
+doc M3, *After M3: re-check the Pass-1 estimator form*). Smaller, namespace-specific
+postings bring centres closer to the data. If `‖q − c‖` then falls well below 1
+the paper's form may start to pay. The study prints `‖q − c‖` and both forms side
+by side, so the check is one run.
 
 The same table checks the error bound. Under the paper's analysis the error
 is close to Gaussian with standard deviation `error_bound/1.9`, so the bound

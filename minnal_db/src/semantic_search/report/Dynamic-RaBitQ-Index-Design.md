@@ -941,6 +941,25 @@ Whichever bootstrap M3-pre's review chooses: for example a flat phase, or a
 float-seeded k-means with exact re-encode, or none if (i) is enough. **Gate:**
 the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
 
+### After M3: re-check the Pass-1 estimator form
+
+Pass 1 estimates a chunk's residual inner product against the raw query `q`
+(`⟨q,c⟩ + est⟨r, q⟩`). The RaBitQ paper and library estimate it against the query
+residual instead (`⟨q,c⟩ + ⟨r,c⟩ + est⟨r, q − c⟩`, with `⟨r,c⟩` exact and stored).
+That form's error scales with `‖q − c‖` rather than `‖q‖ = 1`. With the bundled
+256 centroids, queries sit about as far from the probed centroids as from the
+origin (`‖q − c‖` 1.10–1.15 for gemma, 0.99–1.04 for qwen), so it gains nothing:
+nDCG@10 moves by at most 0.0004 across eight model–dataset pairs
+(`rabitq-rotation-audit.md`, row 9).
+
+M3's smaller, namespace-specific postings bring centres closer to the data, and
+possibly to the queries that probe them. Once M3 is in, rerun
+`vector_bench_pass1_study`, which prints `‖q − c‖` and both forms side by side.
+Adopt the paper's form only if `‖q − c‖` falls well below 1 and nDCG@10 improves.
+It costs one stored float per chunk (`⟨r,c⟩`, with `⟨ō,c⟩` folded in as the
+library does, so search needs no extra per-cluster work) and a re-encode, which
+the per-namespace format from M2b can carry.
+
 ---
 
 ### Re-encode strategies (per-namespace policy)
