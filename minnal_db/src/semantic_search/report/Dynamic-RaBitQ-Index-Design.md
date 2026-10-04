@@ -875,7 +875,11 @@ ArguAna. The 8-bit nearest-centre rows reproduce production exactly.
   it for ranking; whether it is worth it for rebuilding vectors from codes is a
   question for M3-pre.
 
-**Decision:** pending.
+**Decision (2026-10-04): zero centre, Pass-2 widths 4–8.** M2c proceeds as
+designed below. The schema records `quantisation.pass2_centre = "zero"`
+(read-only) next to `pass2_bits`, and when widths become choosable, Pass 2
+accepts only 4 to 8 bits: the zero centre passes the gate there, and a 2-bit
+Pass 2 would cost about 1 nDCG point whatever its centre.
 
 ### M2c — Dense (Pass-2) codes against a zero centre
 
@@ -1223,3 +1227,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 5 | When to start clustering and when to split | Open; M3-pre's simulation comes first and its results are reviewed before M3a |
 | 6 | Bundled centroid files | Deleted in M4 |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
+| 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
