@@ -1189,47 +1189,65 @@ to the service. minnal validates it, stores it in `{ns}_raw_vector` (the store
 This generalises `stored`: there the first embedding comes from the service and
 is kept for later; here it comes from the caller and is kept for the same
 reasons (re-encoding, rebuilds, exact k-means for M3c's bootstrap and M4's
-rebuild, and exact ground truth on live data). It lets a namespace use a model
-minnal's service does not run, or embeddings the caller already paid for.
+rebuild, and exact ground truth on live data). It lets a caller reuse
+embeddings it already computed, or chunk its documents its own way.
 
-**Where vectors come from: `embedding_source`** in `vector_index`, fixed for
-the namespace's life like the model:
+**Where document vectors come from: `embedding_source`** in `vector_index`,
+fixed for the namespace's life like the model:
 
-| Value | A write without an embedding | A write with one | Queries |
-|---|---|---|---|
-| `service` (default) | embedded by the service | rejected (400) | query text, embedded by the service |
-| `supplied` | rejected (400) | stored and encoded; the service is never called for documents | a query vector; or query text if the service serves the model |
-| `either` | embedded by the service | stored and encoded | either |
+| Value | A write without an embedding | A write with one |
+|---|---|---|
+| `service` (default) | embedded by the service | rejected (400) |
+| `supplied` | rejected (400) | stored and encoded; the service is never called for documents |
+| `either` | embedded by the service | stored and encoded |
 
-`embedding_model` still names the space the vectors live in, and supplied
-vectors must come from that model: minnal compares them with query vectors and
-with centroids fitted for that model, and cannot check where a vector came from.
-A `supplied` namespace whose model the service does not serve can only be
-searched with query vectors.
+**Queries are always embedded by the service**, with the namespace's model,
+whatever the documents' source. So supplied vectors must come from that model,
+and that model must be one the service can embed queries for: creating or
+enabling a `supplied` or `either` namespace probes the model's query endpoint
+and fails (422) if the service does not serve it. An unreachable service only
+warns, as for any namespace, since the queue tolerates outages; a search for a
+model the service has stopped serving fails with a clear error. minnal cannot
+check where a document vector came from; the optional `model` field in the
+payload is a cheap guard against mixing spaces.
+
+**Pass 1 needs chunks: `pass1`** in `vector_index`, fixed for the namespace's
+life:
+
+- `chunks` (default): two passes as today. Service-embedded documents are
+  chunked by the namespace's `chunking` settings; a supplied document must
+  carry its chunk vectors (a caller chunks its own documents however it likes).
+- `none`: the namespace is **dense-only**, single-pass. Supplied documents carry
+  only the whole-document vector, and Pass 1 is skipped: the dense codes are
+  filed under the routing postings (key `posting_id ‖ doc_id`, still encoded
+  against the zero centre, so routing never touches the code) and a search
+  probes them directly and ranks by the dense estimate. Only valid with
+  `embedding_source = supplied`. The Pass-2 study found dense scoring of every
+  document ranks as well as the two passes on all eight model-dataset pairs
+  (`pass2-vs-maxsim-study.md`), so the loss is only what probing loses. The cost
+  is in bytes scanned: one 8-bit code per document instead of about three 1-bit
+  codes, roughly 2.7× the bytes per document probed. Mixing chunked and
+  unchunked documents in one namespace is not allowed.
 
 **Payload.**
 
 - *Document stores:* a reserved top-level key in the document,
   `"_embedding": {"dense": [f32; D], "chunks": [[f32; D], ...], "model": "gemma"}`.
-  `dense` is the whole-document vector (Pass 2). `chunks` are the Pass-1
-  vectors; when omitted, the dense vector also serves as the document's only
-  chunk (MaxSim over one chunk is the dense score). `model` is optional and, when
-  given, must equal the namespace's model, a cheap guard against mixing spaces.
-  The shorthand `"_embedding": [f32; D]` means `dense` only. The key is removed
-  before the document is stored, so the document body never holds vectors;
-  `GET` returns the document without it. `_embedding` cannot be declared as an
-  attribute or index.
+  `dense` is the whole-document vector. `chunks` are the Pass-1 vectors:
+  required when `pass1 = chunks`, rejected when `pass1 = none`. `model` is
+  optional and, when given, must equal the namespace's model. In a dense-only
+  namespace the shorthand `"_embedding": [f32; D]` means `dense`. The key is
+  removed before the document is stored, so the document body never holds
+  vectors; `GET` returns the document without it. `_embedding` cannot be
+  declared as an attribute or index.
 - *KV stores:* the value is the text itself, so the embedding travels in an
   envelope, `{"value": ..., "embedding": {...}}`, sent with
   `?embedding=inline` so a value that happens to look like an envelope is never
   misread.
 - *Bulk loader:* an embedding column per row, same shape.
-- *Search:* a request may give `query_embedding` (same validation) instead of,
-  or as well as, query text; a given vector is used as is and bypasses the
-  query cache.
 
-**Validation**, on every write and query vector, each failure a 400 that names
-the field and index (`_embedding.chunks[3] has 767 values, expected 768`):
+**Validation**, on every write, each failure a 400 that names the field and
+index (`_embedding.chunks[3] has 767 values, expected 768`):
 
 - length equals the namespace's `embedding_dim`;
 - every value finite (no NaN or infinity);
@@ -1237,15 +1255,13 @@ the field and index (`_embedding.chunks[3] has 767 values, expected 768`):
   and its centroids and error bounds assume unit vectors, so a vector that is not
   normalised is rejected with a message saying so, rather than silently
   rescaled, which would change what the caller's model meant;
-- `chunks`, when present, non-empty and at most `MAX_SUPPLIED_CHUNKS`
-  (default 128); the API's 2 MB request limit holds roughly 250 768-dimension
-  vectors as JSON text, so larger documents go through the bulk loader;
+- `chunks` present and non-empty exactly when `pass1 = chunks`, and at most
+  `MAX_SUPPLIED_CHUNKS` (default 128); the API's 2 MB request limit holds
+  roughly 250 768-dimension vectors as JSON text, so larger documents go through
+  the bulk loader;
 - `model`, when present, equal to the namespace's model;
-- the payload is rejected outright by a `service` namespace, and required by a
+- the payload rejected outright by a `service` namespace, and required by a
   `supplied` one.
-
-The namespace's `chunking` settings apply only to documents the service embeds;
-a caller chunks its own documents however it likes.
 
 **Durability and the write path.** A supplied vector is the only copy, so it is
 written **WAL-backed** (unlike codes and the service-sourced vectors of
@@ -1276,15 +1292,17 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 - **M3e — `service`:** the same interface backed by the embedding service, with
   the request cap. Gate: under continuous new-document load, new-document
   indexing throughput stays within 5% while re-encodes drain.
-- **M3f — caller-supplied embeddings:** `embedding_source`, the payload and
-  query fields, validation, the `Encode` queue kind and WAL-backed raw vectors.
-  It needs only M3d's raw-vector store, not dynamic partitions, so it can move
-  ahead of M3a–M3c if wanted. Gate: a namespace indexed from supplied vectors
-  equal to the service's gives byte-identical results to one the service
-  indexed; every validation rule has a test at its edge; a crash at every step of
-  the write path (the M0-2 audit) leaves no document without its vectors and no
-  orphaned raw vector; reconciliation re-encodes stale codes without calling the
-  service.
+- **M3f — caller-supplied embeddings:** `embedding_source`, `pass1`, the
+  payload fields, validation, the `Encode` queue kind, WAL-backed raw vectors,
+  and the dense-only search path. It needs only M3d's raw-vector store, not
+  dynamic partitions, so it can move ahead of M3a–M3c if wanted. Gate: a
+  namespace indexed from supplied vectors equal to the service's gives
+  byte-identical results to one the service indexed; a dense-only namespace
+  is within 1 pt nDCG@10 of exact dense scoring at the default probes, with its
+  latency measured against two-pass; every validation rule has a test at its
+  edge; a crash at every step of the write path (the M0-2 audit) leaves no
+  document without its vectors and no orphaned raw vector; reconciliation
+  re-encodes stale codes without calling the service.
 
 ## M4 — Rebuild from codes, then remove the files
 
@@ -1326,4 +1344,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 6 | Bundled centroid files | Deleted in M4 |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
-| 9 | Caller-supplied embeddings (2026-10-04) | A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`); validated, stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind; queries may carry a vector (M3f) |
+| 9 | Caller-supplied embeddings (2026-10-04) | A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |
