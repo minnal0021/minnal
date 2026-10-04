@@ -741,6 +741,36 @@ byte-identical to M1. New tests:
   settings in one process: each embeds with its own model and chunking, probes
   its own model's centroids, and keeps its own query-cache entries.
 
+### M2a result (2026-10-04)
+
+**Passed.** With every setting at its default, the gemma harness is identical
+to M1 on every query (SciFact 300/300, FiQA 648/648 unchanged; estimator RMSE
+equal to the last digit; latency within noise).
+
+Built as designed, plus these details settled during implementation:
+
+- **A default never makes a valid request invalid.** An omitted
+  `sliding_size` defaults to `min(2, window_size)`, and an omitted `top_k` to
+  `min(100, first_pass_top_k)`, so `{"window_size": 1}` or
+  `{"first_pass_top_k": 50}` alone are accepted. Values the caller gives are
+  checked as given, and so are changes to existing settings.
+- **Unknown keys are rejected** inside `vector_index` (a misspelt
+  `windowsize` is a 400 naming the valid keys) and in the server's
+  `[semantic_search]` section (a leftover `model` or `n_probes` fails startup).
+- **The model check runs on the transition that enables semantic search**,
+  not on every amendment, so a namespace keeps working for unrelated
+  amendments if the server later drops its model.
+- **Per-request `top_k`** keeps the API's existing clamp to 1,000 before it is
+  validated; `n_probes` and `first_pass_top_k` are validated as given.
+- **HTTP status:** invalid value 400; fixed or read-only field changed 409;
+  model without centroids, wrong dimension, model the service rejects, or a
+  search update on a store without settings 422.
+- **Deployment:** `release.sh` and the Docker image stage the whole centroid
+  directory. `release.sh` refuses to run over an existing database staged with
+  a single `clusters.bin` (or a different centroid directory) unless `-c` is
+  given, because the stored vectors were quantised against the old file; with
+  `-c`, every semantic store must then be re-indexed.
+
 ### M2b — Per-namespace centres and postings, seeded from the model's file
 
 **New per-namespace data** (companion namespaces, added to `COMPANION_SUFFIXES`
