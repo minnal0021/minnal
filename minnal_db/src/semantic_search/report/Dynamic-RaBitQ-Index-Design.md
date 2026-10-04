@@ -813,15 +813,78 @@ indexed load per entry. **This sub-step's latency gate is the one to watch.**
 centres). Hot-path latency within noise. Footprint +4 bytes per entry (measured,
 not assumed; rkyv padding may round it).
 
+### M2c-pre — Measure code width against centre choice
+
+The code widths are read-only today (M2a), but are meant to become choosable,
+for example 2-bit chunk codes (which would also help M3 rebuild vectors from
+codes) or 4-bit whole-document codes. Changing a width never needs new
+centroids: the centroids decide where a vector is filed and what it is encoded
+against, the width only how finely the residual is quantised. It does need
+every code of that pass re-encoded (re-embed or stored floats, see *Re-encode
+strategies*), so a width change will behave like a chunking change.
+
+What does depend on the width is whether a zero centre is good enough for
+Pass 2. A zero centre makes the residual the whole vector (‖r‖ = 1 instead of
+0.82–0.99 with the bundled centroids), and the estimator's error roughly
+doubles per bit removed, so a choice that is harmless at 8 bits may not be at
+4 or 2. M2b makes centres append-only, so a whole-document code can instead
+keep an immutable `centre_id` like a chunk code does, which holds at any width.
+
+**Measure before building M2c**, offline on the frozen embeddings (gemma and
+qwen, SciFact and FiQA, production Pass 1 at 64 probes):
+
+- Pass 2: widths {2, 4, 8} × centre {nearest, zero}: estimator RMSE and bias
+  over every Pass-1 candidate, nDCG@10, and top-10 agreement with an exact dense
+  rerank of the same candidates.
+- Pass 1: widths {1, 2} against the nearest centre: estimator RMSE, Pass-1
+  recall, and nDCG@10 after an exact dense rerank.
+
+**Decision rule.** If the zero centre passes M2c's gate at every width we might
+allow, M2c proceeds as below. If not, M2c becomes "whole-document codes record
+an immutable `centre_id`". Either way the schema records the scheme next to the
+widths (`quantisation.pass2_centre`, read-only), so a later width change cannot
+pair a width with a centre scheme it was never measured for.
+
+**Result (2026-10-04).** Harness `vector_bench_code_width`
+(`vector_bench/code_width.rs`); gemma and qwen on SciFact, FiQA, NFCorpus and
+ArguAna. The 8-bit nearest-centre rows reproduce production exactly.
+
+- **The zero centre's error penalty does not grow as bits drop.** Its RMSE over
+  the nearest centre's is a constant ratio per model and dataset at every width:
+  0.93–1.12× for gemma, 1.08–1.24× for qwen (the ratio of their residual
+  norms), within M2c's 1.3× gate everywhere. What grows is the absolute error
+  (8 bits ≈ 0.00025, 4 bits ≈ 0.0035, 2 bits ≈ 0.012), and with it the ranking
+  noise. nDCG@10, zero minus nearest:
+
+  | Pass-2 bits | gemma: SciFact, FiQA, NFCorpus, ArguAna | qwen: same | Gate (≥ −0.002) |
+  |---|---|---|---|
+  | 8 | 0.0000, +0.0006, +0.0003, 0.0000 | +0.0010, −0.0003, +0.0001, +0.0005 | passes |
+  | 4 | +0.0002, +0.0007, −0.0021, +0.0013 | +0.0036, +0.0002, +0.0032, −0.0001 | passes, one borderline |
+  | 2 | +0.0047, +0.0043, −0.0031, +0.0036 | −0.0079, −0.0062, −0.0027, −0.0007 | fails 4 of 8 |
+
+  The earlier estimate that a real centre is worth about 1.5 points at 4 bits
+  does not hold on these models and centroids.
+- **The width matters more than the centre.** Pass 2 at 4 bits instead of 8
+  costs 0.1–0.3 nDCG@10 points (FiQA: gemma 0.4729 → 0.4710, qwen 0.5925 →
+  0.5897); at 2 bits about 1 point (gemma 0.4606, qwen 0.5875).
+- **Pass 1 at 2 bits** halves the chunk estimator's error (FiQA gemma 0.0239 →
+  0.0124) and raises Pass-1 recall by 5–9 points (0.806 → 0.900), but keeps the
+  same exact top 100 and the same nDCG@10 in all eight pairs (within 0.0004):
+  it fixes the near-tie churn at the cut, which does not reach the ranking
+  (`pass1-recall-study.md`). It doubles chunk-code storage, so it is not worth
+  it for ranking; whether it is worth it for rebuilding vectors from codes is a
+  question for M3-pre.
+
+**Decision:** pending.
+
 ### M2c — Dense (Pass-2) codes against a zero centre
 
 Dense entries are fetched by `doc_id` and never routed. At 8 bits the choice of
 centre changed recall@10 by 0.2 pt at most (0.992–0.994 across five choices),
 and a zero centre removes the routing-id hazard entirely. With `c = 0` the
 `⟨q, c⟩` term vanishes, so Pass 2 needs **one** estimator per query and loses its
-`est_cache` HashMap. Dense entries get `centre_id = ZERO_CENTRE` (reserved). If
-the dense codes ever drop to 4 bits, switch back to a real centre (worth ≈1.5 pt
-there).
+`est_cache` HashMap. Dense entries get `centre_id = ZERO_CENTRE` (reserved). See
+*M2c-pre* for how the choice holds up at narrower widths.
 
 Also: a dense entry whose `centre_id` is unknown is a **counted, logged error**,
 not a silent `?` drop.

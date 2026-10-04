@@ -27,6 +27,7 @@
 //! `MINNAL_BEIR_SPLIT` (`test`), `MINNAL_BENCH_MODEL` (`gemma`),
 //! `MINNAL_EMBED_URL` (only for the dump).
 
+mod code_width;
 mod exact;
 mod frozen;
 mod study;
