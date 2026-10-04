@@ -299,7 +299,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 - **Automatically on startup** — a fast, presence-only check that skips namespaces already fully covered, so a clean boot is cheap.
 - **On demand**, via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) — a slower but more thorough pass that also catches corrupted (not just missing) vector-index entries.
 
-To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
+To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
 Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup. The server asks the service for the model named in `semantic_search.model` (default `qwen`) on every embedding request, and its startup probe logs an error if the service does not load that model; `cluster_path` must hold the centroids fitted on that same model.
 

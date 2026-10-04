@@ -13,7 +13,7 @@
 //!   median search latency, at `n_probes` 64 (production) and 256 (exhaustive).
 //!
 //! It was used to choose whole-query Pass-1 embedding over chunked queries
-//! (`semantic_search/query-embedding-report.md`); rerun it to evaluate any
+//! (`semantic_search/report/query-embedding-report.md`); rerun it to evaluate any
 //! change to indexing, centroids or search.
 //!
 //! Setup, then run from the crate root (`minnal_db/`):
@@ -53,11 +53,11 @@ const RECALL_K: usize = 100;
 const NPROBES: [usize; 2] = [64, 256];
 const FIRST_PASS: [usize; 2] = [1000, 100];
 
-fn env_or(key: &str, default: &str) -> String {
+pub(in crate::semantic_search) fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
+pub(in crate::semantic_search) fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     std::io::BufReader::new(f)
         .lines()
@@ -67,12 +67,12 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+pub(in crate::semantic_search) fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim()
 }
 
 /// `query-id → (corpus-id → graded relevance)`, keeping only positive judgements.
-fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
+pub(in crate::semantic_search) fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut qrels: HashMap<String, HashMap<String, u32>> = HashMap::new();
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok).skip(1) {
@@ -89,15 +89,15 @@ fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Metrics {
-    ndcg: f64,
-    mrr: f64,
-    recall: f64,
-    cand_recall: f64,
+pub(in crate::semantic_search) struct Metrics {
+    pub(in crate::semantic_search) ndcg: f64,
+    pub(in crate::semantic_search) mrr: f64,
+    pub(in crate::semantic_search) recall: f64,
+    pub(in crate::semantic_search) cand_recall: f64,
 }
 
 /// Score one query: `ranked` is the dense-ordered candidate list (corpus ids).
-fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
+pub(in crate::semantic_search) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
     let dcg: f64 = ranked
         .iter()
         .take(NDCG_K)
