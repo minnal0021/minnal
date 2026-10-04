@@ -17,7 +17,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-1** Durable re-embed ✓ | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; end-to-end indexing throughput within 5% |
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
-| **M2** Namespace-owned index | Model and dimension move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
+| **M2** Namespace-owned index | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 
@@ -626,54 +626,120 @@ M2 moves everything a namespace's index depends on into that namespace. No
 partition moves yet: postings are seeded from the model's centroid file, so
 M2a's results can be checked byte-for-byte against M1.
 
-### M2a — Model and dimension in the namespace schema
+### M2a — The namespace owns its vector-index settings
 
-**Change.** Add `embedding_model: Option<String>` and
-`embedding_dim: Option<u32>` to `DocStoreSchema` and `KvStoreSchema`.
+**Change.** Every setting that shapes a namespace's vector index, or how it is
+searched, moves out of the engine config into one `vector_index` object in
+`DocStoreSchema` and `KvStoreSchema`. The engine config keeps only what is about
+the embedding service itself (URL, timeouts, query-cache TTL) and the set of
+models the server supports.
 
-- **Validation:** both are required when semantic search is enabled (on a doc
-  store, when any field is an embedding field). The model must be non-empty and
-  is lower-cased on save. The dimension must be even and ≥ 8, which is what the
-  rotator needs. Both are ignored when semantic search is off, the same way
-  `embedding_fields` is ignored.
-- **Fixed once selected.** A store's model and dimension are set the first time
-  semantic search is enabled (at create, or by the first `EnableVectorIndex` /
-  `AddEmbeddingAttribute`) and can never change afterwards, including across a
-  drop and re-enable of the vector index. A later amendment may omit them, or
-  repeat the same values; a different value is rejected. Vectors from different
-  models live in unrelated spaces, so there is no in-place switch. A
-  "drop and re-index with another model" operation can be added later as a
-  separate feature.
-- **REST:** the create-store and enable-vector-index bodies carry
-  `embedding_model` and `embedding_dim`.
-- **Engine config:** remove `SemanticSearchConfig::model_name` and
-  `embedding_dim`, and the `[semantic_search] model` and `embedding_dim` keys.
-  What stays engine-wide is service-level: URL, timeouts, chunking, bits,
-  `top_k`, probing.
+```json
+"vector_index": {
+  "embedding_model": "gemma",
+  "embedding_dim": 768,
+  "chunking":     { "window_size": 4, "sliding_size": 2 },
+  "quantisation": { "pass1_bits": 1, "pass2_bits": 8 },
+  "search":       { "n_probes": 64, "first_pass_top_k": 1000, "top_k": 100 }
+}
+```
 
-**Where the model and dimension are read today and must come from the
-namespace instead:**
+| Field | Default | Valid values | After it is set |
+|---|---|---|---|
+| `embedding_model` | `gemma` | non-empty, at most 64 characters of `[a-z0-9._-]`; lower-cased on save; must be a declared supported model | fixed |
+| `embedding_dim` | 768 | even, 8 to 4096; must equal the supported model's declared dimension | fixed |
+| `chunking.window_size` | 4 | 1 to 64 sentences | fixed |
+| `chunking.sliding_size` | 2 | 1 to `window_size` (a larger step would skip sentences) | fixed |
+| `quantisation.pass1_bits` | 1 | 1 only | read-only |
+| `quantisation.pass2_bits` | 8 | 8 only | read-only |
+| `search.n_probes` | 64 | 1 to 4096; a search probes at most the namespace's posting count | changeable |
+| `search.first_pass_top_k` | 1,000 | `top_k` to 10,000 | changeable |
+| `search.top_k` | 100 | 1 to 1,000 (`MAX_RESULT_LIMIT`) | changeable |
+
+- **Defaults are written into the schema.** Any field the caller omits is
+  filled with its built-in default the first time semantic search is enabled
+  (at create, or by `EnableVectorIndex` / `AddEmbeddingAttribute`), and the
+  filled-in object is what is saved. A schema read back always shows the values
+  in force, and a later change of a built-in default never changes an existing
+  namespace.
+- **Only used while semantic search is on.** A store without semantic search
+  may omit the object; if it is given, it is validated but unused, like
+  `embedding_fields`.
+- **Fixed means fixed for the namespace's life.** The model, dimension and
+  chunking decide what the stored vectors are, so they cannot change once set,
+  including across a drop and re-enable of the vector index (the object is kept
+  when the vector index is dropped). Repeating the same value is accepted; a
+  different value is rejected with an error that names the field. Changing them
+  means a new namespace, or a later "drop and re-index" feature.
+- **Read-only bits.** `pass1_bits` and `pass2_bits` record the code widths the
+  index uses. A request may omit them or repeat the current value; any other
+  value is rejected. They are fields rather than constants so a future version
+  can make them choosable without a format change.
+- **Search settings change at any time** through a new amendment,
+  `UpdateVectorSearch { n_probes?, first_pass_top_k?, top_k? }`, on doc and KV
+  stores alike. No re-index: they only affect later searches.
+- **Per-request overrides.** A search request may pass `n_probes`,
+  `first_pass_top_k` and `top_k` for that query only. They are checked against
+  the same ranges, and `top_k ≤ first_pass_top_k` is checked on the values in
+  effect for the query.
+- **Errors are specific.** Each failure names the field, the value and the rule,
+  for example `vector_index.chunking.sliding_size must be at most window_size
+  (4), got 6`. Cross-field rules (`sliding_size ≤ window_size`,
+  `top_k ≤ first_pass_top_k`) are checked together with the single-field ones,
+  on create, on every amendment, on schema import and on every override.
+
+**Centroids are chosen by the model.** Today one global `ClusterIndex` is loaded
+from `cluster_path`, which would probe a qwen namespace with gemma's centroids.
+In M2a the server keeps one `ClusterIndex` per supported model, loaded from
+`{centroid_dir}/{model}/clusters.json` (`centroid_dir` defaults to
+`service/embedding_support`) and checked against the declared dimension at
+startup. A namespace uses its model's index. `cluster_path` and the
+`centroid_mismatch` startup warning are removed: there is no longer a separate
+file choice to get wrong. Per-namespace copies of the centres come in M2b.
+
+**Embedding-service checks.** At startup the server probes each distinct
+(model, dimension) pair used by an existing semantic namespace. At create and
+enable time it probes the requested pair: a 404 `Unknown model` or a dimension
+mismatch fails the request; an unreachable service only warns, because the
+embed queue tolerates outages.
+
+**Library layering.** `semantic_search::service` keeps taking a
+`SemanticSearchConfig` per call, which raw `vector_kv` namespaces (no schema)
+build themselves. The doc store builds it per namespace from the engine-wide
+service settings and the namespace's `vector_index`, so `search()` and
+`index_embeddings` do not change.
+
+**Where the settings are read today and must come from the namespace:**
 
 | Site | Today | After |
 |---|---|---|
-| `embed_document`, `embed_query` (`service/mod.rs`) | `config.model_name`, `config.embedding_dim` | `model` and `dim` arguments from the namespace (`dim` is also the `dimensions` sent in the request) |
-| `search()` dimension check (`service/mod.rs`) | `cluster_index.dim()` | the namespace's `embedding_dim` |
-| Query-cache read (`get_cached_query_embedding`) | `ctx.config.embedding_dim` | the namespace's dimension; the cache key gains the dimension too, so the same model at two dimensions never shares an entry |
-| Query cache (`doc_store/store/query.rs`) | `ctx.config.model_name` | namespace's model; the key already includes the model, so namespaces with different models never share entries |
-| Vector worker (`vec_index_worker.rs`) | context config | the queue entry's namespace → schema → model |
-| `check_embedding_service` (startup, `main.rs`) | probes one model at one dimension | probes each **distinct** (model, dim) pair used by an existing semantic namespace; also probe at create/enable time (a 404 `Unknown model` or a dimension mismatch fails the request; an unreachable service only warns, since the queue tolerates outages) |
-| `centroid_mismatch` (`minnal_db_api/src/config.rs`) | compares `cluster_path` with the model's bundled file | **removed**: in M2b the seed file is chosen by the model, so there is nothing to mismatch |
-| `metrics/beir_eval.rs`, `config_report.rs`, `routes/stores.rs`, tests | config | schema |
-| `QUICKSTART.md`, `minnal_db/QUICKSTART.md`, READMEs, `config/sample.toml`, `service/scripts/examples/docs.sh` | `[semantic_search] model` / `embedding_dim` | `embedding_model` / `embedding_dim` in the store body (examples rerun per the docs rules) |
+| `embed_document`, `embed_query` (`service/mod.rs`) | `config.model_name`, `embedding_dim`, `window_size`, `sliding_size` | the namespace's `vector_index`, through the per-namespace config |
+| `index_embeddings`, Pass 2 (`service/mod.rs`) | `config.number_of_bits_for_dense_quantisation` | `quantisation.pass2_bits` |
+| `search()` (`service/mod.rs`) | `config.n_probes`, `first_pass_sparse_search_top_k`, `top_k_results` | `search.*`, or the request's override |
+| Query cache (`doc_store/store/query.rs`, `vector_kv`) | key `model ‖ text`, dimension from the engine config | key `model ‖ dim ‖ text`, both from the namespace, so the same model at two dimensions never shares an entry |
+| Vector worker (`vec_index_worker.rs`) | the context's config and its one `ClusterIndex` | the queue entry's namespace → schema → per-namespace config and its model's `ClusterIndex` |
+| `SemanticSearchContext` (`doc_store/store/types.rs`) | one config, one `ClusterIndex` | service settings and the per-model `ClusterIndex` set |
+| `check_embedding_service` (`main.rs`) | one model at one dimension | each distinct pair in use, plus a probe at create and enable |
+| API config (`minnal_db_api/src/config.rs`, `config_report.rs`) | `[semantic_search]` model, dimension, chunking, bits, probing, `cluster_path` | `embedding_service_url`, timeouts, cache TTL, `centroid_dir`, `supported_models` |
+| Search routes (`routes/semantic_search.rs`) | `top_k` only | `top_k`, `n_probes`, `first_pass_top_k` |
+| `config/sample.toml`, `service/scripts/examples/docs.sh`, Docker image | old `[semantic_search]` keys; the image copies one centroid file | new keys; the image copies the centroid directory |
 
-Stores created before M2a are recreated (greenfield).
+Reader-facing docs (READMEs, QUICKSTARTs) are updated in the final doc pass
+after all milestones. Stores created before M2a are recreated (greenfield).
 
-**Gate.** Pure refactor: harness results byte-identical to M1. Add tests for
-schema validation (missing, empty, mixed-case model; odd, small or zero
-dimension; set on a non-semantic store), for immutability (a different value is
-rejected on every amendment path, including after a vector-index drop), and for
-two namespaces with different models in one process (each embeds with its own
-model and keeps its own cache entries).
+**Gate.** Pure refactor: with every setting at its default, harness results are
+byte-identical to M1. New tests:
+
+- every validation range and both cross-field rules, at their edges, for
+  create, amendment, import and per-request overrides;
+- defaults written into the saved schema when fields are omitted;
+- fixed fields rejected on every amendment path, including after a
+  vector-index drop and re-enable; read-only bits rejected unless omitted or
+  equal;
+- `UpdateVectorSearch` changes later searches without re-embedding anything;
+- two namespaces with different models (gemma and qwen) and different
+  settings in one process: each embeds with its own model and chunking, probes
+  its own model's centroids, and keeps its own query-cache entries.
 
 ### M2b — Per-namespace centres and postings, seeded from the model's file
 
@@ -1063,3 +1129,4 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 4 | Existing data | Not a concern; stores are recreated after format changes |
 | 5 | When to start clustering and when to split | Open; M3-pre's simulation comes first and its results are reviewed before M3a |
 | 6 | Bundled centroid files | Deleted in M4 |
+| 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
