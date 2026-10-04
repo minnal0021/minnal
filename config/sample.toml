@@ -277,76 +277,35 @@ max_retries = 5
 concurrency = 4
 
 # ---------------------------------------------------------------------------
-# [semantic_search] — vector quantisation settings
+# [semantic_search] — the embedding service and the cluster centroids
+#
+# A store's embedding model, dimension, chunking, code widths and search
+# defaults are NOT set here: they live in the store's schema (`vector_index`),
+# with built-in defaults (gemma, 768 dimensions, 4-sentence windows sliding by
+# 2, n_probes 64, first-pass cut 1000, top_k 100). Leaving one of those keys
+# here is a startup error.
 # ---------------------------------------------------------------------------
 [semantic_search]
 
-# Number of bits used for the dense (multi-bit) quantisation of each embedding dimension.
-# Applies to the second-pass re-ranking after the sparse first pass.
-# Higher values improve recall at the cost of more memory and CPU.  Must be greater than 1.
-#
-#   4   → very compact, lower recall
-#   8   → good balance between size and accuracy (default)
-#
-number_of_bits_for_dense_quantisation = 8
-
-# Path to the IVF cluster centroids file.
-# In the Docker image the file is copied to the container root at build time.
-# One centroid set ships per supported model under
-# service/embedding_support/{model}/clusters.json (gemma, qwen) — use the one
-# matching `model` below. For local development: service/embedding_support/gemma/clusters.json
-cluster_path = "./clusters.json"
-
 # Base URL of the embedding service.
 # Requests are sent to {url}/embedding/{model}/document and {url}/embedding/{model}/query
-# (where {model} is `model` below) as a batch POST:
+# (where {model} is the store's embedding_model) as a batch POST:
 # body {"payloads": [str, ...], "dimensions": N} -> {"embeddings": [[f32], ...]}.
 # Chunking/tokenisation happens in minnal, not the service.
 # Default: http://localhost:8001
-# embedding_service_url = "http://192.168.10.155:8001"
-# embedding_service_url = "http://192.168.10.101:8001"
 embedding_service_url = "http://localhost:8001"
 
-# Embedding model to use.  Sent (lower-cased) to the embedding service on every
-# request, so it chooses which of the service's loaded models embeds the text —
-# the companion service serves "gemma" and "qwen", and answers 404 for a model it
-# was not started with (the startup probe reports this).  Must match a name in
-# [[semantic_search.supported_models]] and the model `cluster_path` was fitted on.
-# Vectors from different models are not comparable: changing this requires a
-# re-index (POST /admin/indices/{ns}/vector/reindex-all).
-# Default: qwen
-# model = "qwen"
-model = "gemma"
-
-# Number of IVF clusters to probe during the sparse first-pass search (single-bit vectors).
-# Higher = better recall, slower queries. Measured with the gemma centroids (2026-09-26,
-# BEIR nDCG@10, gap vs exhaustive 256-cluster probe; warm query latency):
-#   SciFact (5.2k docs):  32 → −0.010, 2.8 ms;  64 → −0.003, 3.1 ms;  128 → lossless, 3.5 ms
-#   FiQA   (57.6k docs):  32 → −0.002, 13.9 ms; 64 → −0.002, 17.3 ms; 128 → lossless, 21.0 ms
-# 64 keeps both corpora within 0.003 of exhaustive at ~20% less latency than 128; use 128
-# when results must match exhaustive search. Earlier "32 ≈ lossless" figures were measured
-# with mismatched (qwen) centroids and no longer apply.
-n_probes = 64
-
-# Number of candidates to retain after the first-pass sparse (single-bit) vector search
-# before re-scoring with the dense multi-bit index.  Default: 1000.
-first_pass_sparse_search_top_k = 1000
-
-# Document chunking for the sparse first pass: sentences per sliding-window chunk.
-# Each chunk is independently assigned to its nearest IVF cluster and quantised as 1-bit.
-# Queries are NOT chunked — a query is embedded once, whole, for both passes.
-# Changing window_size or sliding_size requires re-indexing the corpus
-# (POST /admin/indices/{ns}/vector/reindex-all).  Default: 4.
-window_size = 4
-
-# How far the document window advances between consecutive chunks, in sentences.
-# A sliding_size smaller than window_size produces overlapping chunks.  Default: 2.
-sliding_size = 2
+# Directory of IVF cluster centroids, one set per model at
+# {centroid_dir}/{model}/clusters.json. A store uses the set for its model.
+# Relative paths resolve against the working directory; release.sh and the
+# Docker image rewrite this line to where they stage the centroids.
+# Default: service/embedding_support
+centroid_dir = "service/embedding_support"
 
 # Time-to-live (seconds) for cached query embeddings in the system-wide
 # `system_qemb_cache` namespace. After this duration a cached entry is evicted by
-# the TTL worker. Entries are keyed by model and query text, so neither switching
-# `model` nor chunking settings invalidate them; clear the cache
+# the TTL worker. Entries are keyed by model, dimension and query text, so
+# neither a store's model nor its chunking settings invalidate them; clear the cache
 # (DELETE /admin/indices/vector/query-cache) if the service starts producing
 # different vectors under the same model name, rather than waiting for this to expire.
 # Default: 86400 (1 day).
@@ -368,9 +327,11 @@ sliding_size = 2
 # Each entry declares one embedding model this instance may serve.  The model
 # set is data-driven: any name is accepted.  At startup the server validates
 # that the cluster file for every listed model exists at
-#   service/embedding_support/{name}/clusters.json
-# and that its centroids match the declared dimension.  To add a model, drop its
-# clusters.json under that path and add an entry here — no code change needed.
+#   {centroid_dir}/{name}/clusters.json
+# and that its centroids match the declared dimension, and loads only these
+# models.  Without any entry, every {centroid_dir}/*/clusters.json is loaded.
+# To add a model, drop its clusters.json under centroid_dir and add an entry
+# here — no code change needed.
 #
 # Fields:
 #   name      — model identifier (case-insensitive; lower-cased to form the

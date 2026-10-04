@@ -13,6 +13,8 @@ use crate::doc_store::index_observer::InMemoryProgress;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
+use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
+#[cfg(feature = "semantic-search")]
 use crate::semantic_search::ClusterIndex;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::service::SemanticSearchConfig;
@@ -252,12 +254,110 @@ impl IndexBuildHandle {
 /// availability.
 ///
 /// Construct once at startup and attach via [`DocStore::with_semantic_search`].
+///
+/// It holds what is engine-wide: the embedding service settings and one set of
+/// IVF cluster centroids per supported model. Everything that shapes a
+/// namespace's index (model, dimension, chunking, code widths, search
+/// defaults) comes from that namespace's schema; [`for_namespace`] combines the
+/// two into the per-call [`SemanticSearchConfig`] and picks the model's
+/// centroids.
+///
+/// [`for_namespace`]: SemanticSearchContext::for_namespace
 #[cfg(feature = "semantic-search")]
 pub struct SemanticSearchContext {
-    /// Embedding service configuration (URL, model, dimensions).
+    /// Embedding service settings: URL, timeouts and the query-cache TTL. Its
+    /// per-namespace fields are ignored; [`for_namespace`](Self::for_namespace)
+    /// overwrites them from the namespace's settings.
     pub config: SemanticSearchConfig,
-    /// IVF cluster centroids, probed by exact nearest-centroid distance.
+    /// IVF cluster centroids per supported model (lower-cased name), probed by
+    /// exact nearest-centroid distance.
+    pub cluster_indexes: std::collections::HashMap<String, Arc<ClusterIndex>>,
+}
+
+/// What one namespace's semantic operations run with: the per-call config built
+/// from its settings, and its model's centroids.
+#[cfg(feature = "semantic-search")]
+pub struct NamespaceSemantics {
+    /// Service settings plus the namespace's model, dimension, chunking, code
+    /// widths and search defaults.
+    pub config: SemanticSearchConfig,
+    /// The namespace's model's centroids.
     pub cluster_index: Arc<ClusterIndex>,
+}
+
+#[cfg(feature = "semantic-search")]
+impl SemanticSearchContext {
+    /// A context with the given service settings and centroids per model
+    /// (names are lower-cased).
+    pub fn new(config: SemanticSearchConfig, cluster_indexes: impl IntoIterator<Item = (String, Arc<ClusterIndex>)>) -> Self {
+        Self {
+            config,
+            cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
+        }
+    }
+
+    /// Check that `settings` can run here: its model has centroids, and they
+    /// have its dimension.
+    pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
+        self.cluster_index_for(settings).map(|_| ())
+    }
+
+    fn cluster_index_for(&self, settings: &VectorIndexSettings) -> Result<&Arc<ClusterIndex>, DocStoreError> {
+        let index = self
+            .cluster_indexes
+            .get(&settings.embedding_model)
+            .ok_or_else(|| DocStoreError::UnsupportedEmbeddingModel {
+                model: settings.embedding_model.clone(),
+                supported: {
+                    let mut m: Vec<&str> = self.cluster_indexes.keys().map(String::as_str).collect();
+                    m.sort_unstable();
+                    m.join(", ")
+                },
+            })?;
+        if index.dim() != settings.embedding_dim as usize {
+            return Err(DocStoreError::EmbeddingDimMismatch {
+                model: settings.embedding_model.clone(),
+                dim: settings.embedding_dim,
+                centroid_dim: index.dim(),
+            });
+        }
+        Ok(index)
+    }
+
+    /// The per-call config and centroids for a namespace with `settings`.
+    pub fn for_namespace(&self, settings: &VectorIndexSettings) -> Result<NamespaceSemantics, DocStoreError> {
+        let cluster_index = Arc::clone(self.cluster_index_for(settings)?);
+        let config = SemanticSearchConfig {
+            model_name: settings.embedding_model.clone(),
+            embedding_dim: settings.embedding_dim as usize,
+            window_size: settings.window_size as usize,
+            sliding_size: settings.sliding_size as usize,
+            number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
+            n_probes: settings.search.n_probes as usize,
+            first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
+            top_k_results: settings.search.top_k as usize,
+            ..self.config.clone()
+        };
+        Ok(NamespaceSemantics { config, cluster_index })
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+impl NamespaceSemantics {
+    /// This namespace's config with one request's search overrides applied
+    /// (validated against the same ranges as the schema).
+    pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
+        let base = SearchSettings {
+            n_probes: self.config.n_probes as u32,
+            first_pass_top_k: self.config.first_pass_sparse_search_top_k as u32,
+            top_k: self.config.top_k_results as u32,
+        };
+        let s = overrides.apply(base)?;
+        self.config.n_probes = s.n_probes as usize;
+        self.config.first_pass_sparse_search_top_k = s.first_pass_top_k as usize;
+        self.config.top_k_results = s.top_k as usize;
+        Ok(self)
+    }
 }
 
 // ── ReindexStats ─────────────────────────────────────────────────────────────

@@ -678,7 +678,7 @@ const PROBE_NORM_TOLERANCE: f32 = 0.05;
 /// Probe the embedding service to verify it is reachable **and** speaks the
 /// expected contract.
 ///
-/// Intended to run once at startup, after the cluster index loads. It:
+/// It:
 /// 1. GETs `{url}/healthcheck` and checks the service lists `model_name` among
 ///    its loaded models with status `ok`.
 /// 2. Embeds a known payload through **both** of that model's document and
@@ -689,14 +689,12 @@ const PROBE_NORM_TOLERANCE: f32 = 0.05;
 ///    search later, and both endpoints are confirmed to agree.
 /// 3. Soft-checks that the probe embedding is unit-norm and warns otherwise.
 ///
-/// **Limitation:** this checks that the service serves the *named* model, not
-/// that the cluster centroids were fitted on it — `model_name` and
-/// `cluster_path` are configured separately, and centroids from another model
-/// with the same dimension load without error (see `semantic_search/CLAUDE.md`).
-///
-/// A failure is non-fatal at the call site (the server starts anyway and semantic
-/// search surfaces the error at request time); returning `Err` just makes startup
-/// log it loudly.
+/// The API server runs it at startup for each (model, dimension) an existing
+/// semantic namespace uses (non-fatal: semantic requests surface the error at
+/// call time), and when a store enables semantic search, where
+/// [`EmbeddingError::is_configuration_error`] decides whether a failure rejects
+/// the request or only warns. Centroids are not its concern: they are chosen
+/// by the namespace's model (`SemanticSearchContext::for_namespace`).
 pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<(), EmbeddingError> {
     info!(
         "checking embedding service health at {}/healthcheck (model '{}')",

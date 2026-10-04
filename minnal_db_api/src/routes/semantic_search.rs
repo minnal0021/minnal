@@ -68,12 +68,23 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use minnal_db::doc_store::vector_settings::SearchSpec;
 use minnal_db::{DocId, DocStoreError, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::{AppState, error::AppError, id::doc_id_to_value};
+
+/// One request's search overrides. Validated by the store against the same
+/// ranges as the namespace's settings (out of range is a 400).
+pub(crate) fn search_overrides(top_k: Option<Limit>, n_probes: Option<u32>, first_pass_top_k: Option<u32>) -> SearchSpec {
+    SearchSpec {
+        n_probes,
+        first_pass_top_k,
+        top_k: top_k.map(|l| l.get() as u32),
+    }
+}
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -96,9 +107,16 @@ pub struct PaginationParams {
 pub struct SemanticSearchRequest {
     /// Free-text query to embed and search against the document vectors.
     pub query: String,
-    /// Override the number of results returned for this request only.
-    /// When `None`, the value from the server-side TOML config is used.
+    /// Override the number of results returned for this request only
+    /// (clamped to 1,000). When `None`, the namespace's `search.top_k` is used.
     pub top_k: Option<Limit>,
+    /// Override the number of clusters Pass 1 probes, for this request only
+    /// (1 to 4096). When `None`, the namespace's `search.n_probes` is used.
+    pub n_probes: Option<u32>,
+    /// Override the number of candidates Pass 1 hands to Pass 2, for this
+    /// request only (`top_k` to 10,000). When `None`, the namespace's
+    /// `search.first_pass_top_k` is used.
+    pub first_pass_top_k: Option<u32>,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -114,9 +132,16 @@ pub struct SemanticSearchFilteredRequest {
     /// `POST /stores/{ns}/query`).  Only documents that pass the predicate
     /// *and* score in the top-k by dot-product are returned.
     pub predicate: String,
-    /// Override the number of results returned for this request only.
-    /// When `None`, the value from the server-side TOML config is used.
+    /// Override the number of results returned for this request only
+    /// (clamped to 1,000). When `None`, the namespace's `search.top_k` is used.
     pub top_k: Option<Limit>,
+    /// Override the number of clusters Pass 1 probes, for this request only
+    /// (1 to 4096). When `None`, the namespace's `search.n_probes` is used.
+    pub n_probes: Option<u32>,
+    /// Override the number of candidates Pass 1 hands to Pass 2, for this
+    /// request only (`top_k` to 10,000). When `None`, the namespace's
+    /// `search.first_pass_top_k` is used.
+    pub first_pass_top_k: Option<u32>,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -157,7 +182,12 @@ pub async fn query(
     );
     let page = state
         .store
-        .search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
+        .search_semantic(
+            &ns,
+            &req.query,
+            &search_overrides(req.top_k, req.n_probes, req.first_pass_top_k),
+            pagination,
+        )
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;
@@ -192,7 +222,13 @@ pub async fn query_filtered(
     );
     let page = state
         .store
-        .search_semantic_filtered(&ns, &req.query, &req.predicate, req.top_k.map(Limit::get), pagination)
+        .search_semantic_filtered(
+            &ns,
+            &req.query,
+            &req.predicate,
+            &search_overrides(req.top_k, req.n_probes, req.first_pass_top_k),
+            pagination,
+        )
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
     let total = page.total;

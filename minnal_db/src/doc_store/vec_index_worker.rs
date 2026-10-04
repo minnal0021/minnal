@@ -53,7 +53,8 @@
 //!
 //! [`PENDING_VEC_INDEX_NS`]: crate::vector_kv::PENDING_VEC_INDEX_NS
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -64,7 +65,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::store::SemanticSearchContext;
+use crate::doc_store::store::{NamespaceSemantics, SemanticSearchContext, load_vector_settings};
 use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
@@ -171,6 +172,9 @@ impl Drop for VecIndexWorkerHandle {
 pub(crate) struct VecIndexWorker {
     db: Arc<AsyncDb>,
     ctx: Arc<SemanticSearchContext>,
+    /// Where namespace schemas live: each entry is embedded with its
+    /// namespace's model, dimension and chunking, read from its schema.
+    schema_dir: Arc<PathBuf>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     config: Arc<VectorIndexConfig>,
@@ -184,12 +188,19 @@ impl VecIndexWorker {
     /// (crash recovery).  It then waits on `notify` signals from write
     /// operations and processes new entries as they arrive, with a 30 s
     /// fallback poll as a safety net.
-    pub fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, notify: Arc<Notify>, config: VectorIndexConfig) -> VecIndexWorkerHandle {
+    pub fn start(
+        db: Arc<AsyncDb>,
+        ctx: Arc<SemanticSearchContext>,
+        schema_dir: PathBuf,
+        notify: Arc<Notify>,
+        config: VectorIndexConfig,
+    ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (pass_tx, pass_rx) = tokio::sync::watch::channel(false);
         let worker = VecIndexWorker {
             db,
             ctx,
+            schema_dir: Arc::new(schema_dir),
             notify: Arc::clone(&notify),
             shutdown: Arc::clone(&shutdown),
             config: Arc::new(config),
@@ -343,6 +354,25 @@ impl VecIndexWorker {
                 }
             }
 
+            // Each namespace's settings, read once per pass: not cached across
+            // passes, because a dropped namespace can be recreated under the same
+            // name with another model.
+            let semantics: Arc<HashMap<String, Result<Arc<NamespaceSemantics>, String>>> = Arc::new(
+                by_namespace
+                    .keys()
+                    .map(|ns| {
+                        let resolved = load_vector_settings(&self.schema_dir, ns)
+                            .and_then(|s| self.ctx.for_namespace(&s))
+                            .map(Arc::new)
+                            .map_err(|e| e.to_string());
+                        if let Err(e) = &resolved {
+                            warn!("vec index worker: cannot embed for namespace '{ns}': {e}");
+                        }
+                        (ns.clone(), resolved)
+                    })
+                    .collect(),
+            );
+
             // Process work_queue with bounded concurrency.
             let concurrency = self.config.concurrency.max(1);
             let mut set: JoinSet<(QueueEntry, Result<Processed, DocStoreError>)> = JoinSet::new();
@@ -356,8 +386,9 @@ impl VecIndexWorker {
             // Seed the JoinSet with the first batch of tasks.
             for entry in (&mut work_iter).take(concurrency) {
                 let worker = self.clone();
+                let semantics = Arc::clone(&semantics);
                 set.spawn(async move {
-                    let result = worker.process_one(&entry).await;
+                    let result = worker.process_one(&entry, semantics.get(&entry.namespace)).await;
                     (entry, result)
                 });
             }
@@ -371,8 +402,9 @@ impl VecIndexWorker {
                 // Keep the concurrency slot filled.
                 if let Some(entry) = work_iter.next() {
                     let worker = self.clone();
+                    let semantics = Arc::clone(&semantics);
                     set.spawn(async move {
-                        let result = worker.process_one(&entry).await;
+                        let result = worker.process_one(&entry, semantics.get(&entry.namespace)).await;
                         (entry, result)
                     });
                 }
@@ -458,10 +490,15 @@ impl VecIndexWorker {
     /// (see the module docs).
     ///
     /// **Clear:** delete the document's vectors and remove the tombstone.
-    async fn process_one(&self, entry: &QueueEntry) -> Result<Processed, DocStoreError> {
+    async fn process_one(&self, entry: &QueueEntry, semantics: Option<&Result<Arc<NamespaceSemantics>, String>>) -> Result<Processed, DocStoreError> {
         match entry.kind {
             QueueEntryKind::Embed => {
-                let vector_indexes = crate::semantic_search::service::embed_document(&self.ctx.config, &self.ctx.cluster_index, &entry.text)
+                let ns = match semantics {
+                    Some(Ok(ns)) => ns,
+                    Some(Err(e)) => return Err(DocStoreError::EmbeddingFailed(e.clone())),
+                    None => return Err(DocStoreError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
+                };
+                let vector_indexes = crate::semantic_search::service::embed_document(&ns.config, &ns.cluster_index, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;

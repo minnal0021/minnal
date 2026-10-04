@@ -17,6 +17,10 @@ impl DocStore {
     /// is already registered.
     pub async fn create(&self, mut schema: DocStoreSchema) -> Result<(), DocStoreError> {
         schema.validate()?;
+        schema.settle_vector_index()?;
+        if schema.semantic_search_enabled {
+            self.check_vector_model(&schema.vector_settings()?)?;
+        }
 
         #[cfg(not(feature = "semantic-search"))]
         if schema.semantic_search_enabled {
@@ -90,6 +94,10 @@ impl DocStore {
     /// [`create`]: DocStore::create
     pub async fn create_kv(&self, mut schema: KvStoreSchema) -> Result<(), DocStoreError> {
         schema.validate()?;
+        schema.settle_vector_index()?;
+        if schema.is_semantic_search_enabled() {
+            self.check_vector_model(&schema.vector_settings()?)?;
+        }
 
         #[cfg(not(feature = "semantic-search"))]
         if schema.semantic_search_enabled {
@@ -144,6 +152,7 @@ impl DocStore {
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
     pub fn amend(&self, namespace: &str, amendment: SchemaAmendment) -> Result<(), DocStoreError> {
         let mut schema = self.load_schema(namespace)?;
+        let was_enabled = schema.semantic_search_enabled;
 
         // Re-map SchemaError::AttributeIsIndexed to DocStoreError with namespace context
         schema.apply_amendment(amendment).map_err(|e| match e {
@@ -160,8 +169,42 @@ impl DocStore {
         if schema.semantic_search_enabled {
             return Err(DocStoreError::SemanticSearchNotCompiled);
         }
+        // Only the amendment that turns semantic search on picks a model; others
+        // must keep working even if this server no longer serves it.
+        if schema.semantic_search_enabled && !was_enabled {
+            self.check_vector_model(&schema.vector_settings()?)?;
+        }
 
         schema.save(&self.schema_dir)?;
+        Ok(())
+    }
+
+    /// Change a store's search defaults (`n_probes`, `first_pass_top_k`,
+    /// `top_k`), for document and KV stores alike. Later searches use them;
+    /// nothing is re-embedded. Fails with
+    /// [`SchemaError::VectorIndexNotConfigured`] if the store has never had
+    /// semantic search enabled, and with [`SchemaError::InvalidVectorSetting`]
+    /// for a value out of range.
+    pub fn update_vector_search(&self, namespace: &str, search: &crate::doc_store::vector_settings::SearchSpec) -> Result<(), DocStoreError> {
+        match self.store_type(namespace)? {
+            StoreType::Doc => self.amend(namespace, SchemaAmendment::UpdateVectorSearch { search: *search }),
+            StoreType::Kv => {
+                let mut schema = self.load_kv_schema(namespace)?;
+                schema.update_vector_search(search)?;
+                schema.save(&self.schema_dir)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Check that this server can embed and search with `settings` (its model
+    /// has centroids of its dimension). Without an attached semantic context
+    /// there is nothing to check against, so it passes.
+    pub fn check_vector_model(&self, _settings: &crate::doc_store::vector_settings::VectorIndexSettings) -> Result<(), DocStoreError> {
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.check_model(_settings)?;
+        }
         Ok(())
     }
 
@@ -1250,6 +1293,7 @@ mod tests {
             }],
             semantic_search_enabled: false,
             embedding_fields: vec![],
+            vector_index: None,
         };
 
         // Direct create (without normalisation) must be rejected by validate().

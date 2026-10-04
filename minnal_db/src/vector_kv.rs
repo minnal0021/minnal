@@ -160,24 +160,27 @@ pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_4
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
 
-/// The cache key for `query_text` embedded by `model`: `model ‖ 0x00 ‖ query`.
+/// The cache key for `query_text` embedded by `model` at `dim` dimensions:
+/// `model ‖ 0x00 ‖ dim (u32 BE) ‖ query`.
 ///
 /// The model is part of the key because one embedding service can serve
-/// several models, and the same text embeds to unrelated vectors in each.
-/// Without it, switching `model_name` would keep serving the previous model's
-/// cached query vectors until the TTL expired. The NUL separator keeps
-/// `("ab", "c")` and `("a", "bc")` apart.
-fn query_cache_key(model: &str, query_text: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(model.len() + 1 + query_text.len());
+/// several models, and the same text embeds to unrelated vectors in each; the
+/// dimension because each namespace picks its own, and the same model at two
+/// dimensions returns different vectors. Without them, namespaces with
+/// different models or dimensions would share cached query vectors. The NUL
+/// separator keeps `("ab", "c")` and `("a", "bc")` apart.
+fn query_cache_key(model: &str, dim: usize, query_text: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(model.len() + 5 + query_text.len());
     key.extend_from_slice(model.as_bytes());
     key.push(0);
+    key.extend_from_slice(&(dim as u32).to_be_bytes());
     key.extend_from_slice(query_text.as_bytes());
     key
 }
 
 /// Look up a cached query embedding in the system-wide TTL cache.
 ///
-/// Keyed by embedding model and query text. Returns the whole-query embedding, which serves both
+/// Keyed by embedding model, dimension and query text. Returns the whole-query embedding, which serves both
 /// search passes (queries are not chunked; see
 /// [`embed_query`](crate::semantic_search::service::embed_query)).
 ///
@@ -189,7 +192,7 @@ pub async fn get_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
         .await
         .ok()?;
 
-    let bytes = cache_ns.get(query_cache_key(model, query_text)).await.ok()??;
+    let bytes = cache_ns.get(query_cache_key(model, expected_dim, query_text)).await.ok()??;
     bytes_to_f32_vec_list(&bytes, expected_dim)?.into_iter().next()
 }
 
@@ -209,7 +212,7 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
     // would be pure query-path latency with no durability benefit. A crash that
     // drops the entry simply turns into a future cache miss.
     let _ = cache_ns
-        .put_no_wal(query_cache_key(model, query_text), f32_vec_list_to_bytes(&[dense.to_vec()]))
+        .put_no_wal(query_cache_key(model, dense.len(), query_text), f32_vec_list_to_bytes(&[dense.to_vec()]))
         .await;
 }
 
@@ -2758,7 +2761,24 @@ mod query_embedding_cache_tests {
             get_cached_query_embedding(&db, "qwen", "q", 2, TEST_TTL).await.unwrap(),
             vec![0.0f32, 1.0]
         );
-        assert_ne!(query_cache_key("ab", "c"), query_cache_key("a", "bc"));
+        assert_ne!(query_cache_key("ab", 2, "c"), query_cache_key("a", 2, "bc"));
+    }
+
+    /// The same model at two dimensions never shares an entry: each namespace
+    /// picks its own dimension.
+    #[tokio::test]
+    async fn test_cache_is_keyed_by_dimension() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        put_cached_query_embedding(&db, MODEL, "q", &[1.0f32, 0.0], TEST_TTL).await;
+        assert!(get_cached_query_embedding(&db, MODEL, "q", 4, TEST_TTL).await.is_none());
+        put_cached_query_embedding(&db, MODEL, "q", &[0.0f32, 0.0, 1.0, 0.0], TEST_TTL).await;
+        assert_eq!(get_cached_query_embedding(&db, MODEL, "q", 2, TEST_TTL).await.unwrap(), vec![1.0f32, 0.0]);
+        assert_eq!(
+            get_cached_query_embedding(&db, MODEL, "q", 4, TEST_TTL).await.unwrap(),
+            vec![0.0f32, 0.0, 1.0, 0.0]
+        );
+        assert_ne!(query_cache_key(MODEL, 2, "q"), query_cache_key(MODEL, 4, "q"));
     }
 
     /// Re-embedding the same query overwrites its entry.

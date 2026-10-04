@@ -18,6 +18,7 @@ pub(super) fn make_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreS
         indices,
         semantic_search_enabled: false,
         embedding_fields: vec![],
+        vector_index: None,
     }
 }
 
@@ -36,6 +37,7 @@ pub(super) fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: K
         key_type,
         value_type,
         semantic_search_enabled: false,
+        vector_index: None,
     }
 }
 

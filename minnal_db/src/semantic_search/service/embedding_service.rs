@@ -90,6 +90,21 @@ pub enum EmbeddingError {
     Cluster(#[from] crate::semantic_search::cluster::ClusterIndexError),
 }
 
+impl EmbeddingError {
+    /// `true` when the service answered but rejects this model or dimension
+    /// (not served, wrong dimension, or a 4xx), as opposed to a transient
+    /// failure (unreachable, timed out, 5xx, model still loading). A request
+    /// that would create a namespace for a rejected model should fail; a
+    /// transient failure is only worth a warning, since the embed queue retries.
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            EmbeddingError::ModelNotServed { .. } | EmbeddingError::DimensionMismatch { .. } => true,
+            EmbeddingError::Status { status, .. } => (400..500).contains(status) && *status != 408 && *status != 429,
+            _ => false,
+        }
+    }
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 /// Which embedding endpoint a batch is destined for.

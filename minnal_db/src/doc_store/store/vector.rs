@@ -938,6 +938,7 @@ mod tests {
             indices: vec![],
             semantic_search_enabled: true,
             embedding_fields: vec!["title".to_owned()],
+            vector_index: None,
         };
         let err = store.create(schema).await.unwrap_err();
         assert!(matches!(err, DocStoreError::SemanticSearchNotCompiled), "got {err:?}");
@@ -959,6 +960,7 @@ mod tests {
             indices: vec![],
             semantic_search_enabled: true,
             embedding_fields: vec!["title".to_owned()],
+            vector_index: None,
         };
         store.create(schema).await.unwrap();
     }
@@ -1084,6 +1086,7 @@ mod tests {
                 indices: vec![],
                 semantic_search_enabled: false,
                 embedding_fields: vec![],
+                vector_index: None,
             })
             .await
             .unwrap();
@@ -1234,6 +1237,7 @@ mod tests {
             key_type: KvKeyType::Str,
             value_type: KvValueType::Str,
             semantic_search_enabled: true,
+            vector_index: None,
         };
         store.create_kv(schema).await.unwrap();
 
@@ -1603,14 +1607,17 @@ mod tests {
         vector_kv::remove_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
         vector_kv::clear_vectors(&store.db, "sem_kv", b"x").await.unwrap(); // the delete, cut short by a crash
 
-        let ctx = SemanticSearchContext {
-            config: SemanticSearchConfig {
+        let ctx = SemanticSearchContext::new(
+            SemanticSearchConfig {
                 embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
                 embedding_connect_timeout: std::time::Duration::from_millis(200),
                 ..SemanticSearchConfig::default()
             },
-            cluster_index: Arc::new(ClusterIndex::from_clusters([(1, Cluster::new(1, vec![0.0; 768]))].into_iter().collect())),
-        };
+            [(
+                "gemma".to_string(),
+                Arc::new(ClusterIndex::from_clusters([(1, Cluster::new(1, vec![0.0; 768]))].into_iter().collect())),
+            )],
+        );
         let store = store.with_semantic_search(ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {

@@ -52,10 +52,12 @@ impl IntoResponse for AppError {
             | DocStoreError::VecIndexCleanupInProgress { .. }
             | DocStoreError::AttrIndexOpInProgress { .. }
             | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. })
+            | DocStoreError::Schema(SchemaError::VectorSettingFixed { .. })
             | DocStoreError::Schema(SchemaError::WrongStoreType { .. }) => StatusCode::CONFLICT,
 
             DocStoreError::InvalidId(_)
             | DocStoreError::Schema(SchemaError::Serialize(_))
+            | DocStoreError::Schema(SchemaError::Malformed(_))
             | DocStoreError::Schema(SchemaError::InvalidNamespace)
             | DocStoreError::Schema(SchemaError::TooManyIndices { .. })
             | DocStoreError::Schema(SchemaError::EmptyFieldName { .. })
@@ -72,7 +74,8 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::KvSemanticSearchOnlyForStr)
             | DocStoreError::Schema(SchemaError::StrKeyTooLong { .. })
             | DocStoreError::Schema(SchemaError::EmptyStrKey)
-            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8) => StatusCode::BAD_REQUEST,
+            | DocStoreError::Schema(SchemaError::StrKeyNotUtf8)
+            | DocStoreError::Schema(SchemaError::InvalidVectorSetting { .. }) => StatusCode::BAD_REQUEST,
 
             // A key/value too large for the storage format's u32 length fields is
             // user-actionable: report 413 rather than a generic 500.
@@ -89,6 +92,14 @@ impl IntoResponse for AppError {
             // request the server understood but cannot apply to this store —
             // the same 422 the admin vector endpoints return for it.
             DocStoreError::SemanticSearchNotEnabled { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+
+            // The request is well-formed but names a model this server, or its
+            // embedding service, cannot serve; or updates settings a store
+            // without semantic search does not have.
+            DocStoreError::UnsupportedEmbeddingModel { .. }
+            | DocStoreError::EmbeddingDimMismatch { .. }
+            | DocStoreError::EmbeddingModelUnavailable { .. }
+            | DocStoreError::Schema(SchemaError::VectorIndexNotConfigured { .. }) => StatusCode::UNPROCESSABLE_ENTITY,
 
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

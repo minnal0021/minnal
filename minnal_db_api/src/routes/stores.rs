@@ -17,9 +17,10 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, StoreType};
+use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, SchemaError, StoreType};
 use serde::Deserialize;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{AppState, error::AppError};
 
@@ -49,11 +50,12 @@ pub async fn list(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
 pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Result<impl IntoResponse, AppError> {
     match store_type_from_value(&body)? {
         StoreType::Doc => {
-            let schema: DocStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            let schema: DocStoreSchema =
+                serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::Schema(SchemaError::Malformed(e))))?;
             create_doc_schema(&state, schema).await
         }
         StoreType::Kv => {
-            let schema: KvStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            let schema: KvStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::Schema(SchemaError::Malformed(e))))?;
             create_kv_schema(&state, schema).await
         }
     }
@@ -61,16 +63,15 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::
 
 /// Core doc-store creation, shared by `POST /stores` and schema import.
 pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<StatusCode, AppError> {
-    // Reject semantic-search-enabled stores when no cluster index is loaded.
-    // Without the index, writes would attempt (and fail) to quantise embeddings,
+    // Reject semantic-search-enabled stores when no centroids are loaded.
+    // Without them, writes would attempt (and fail) to quantise embeddings,
     // leaving the namespace in a permanently broken state.
-    if schema.semantic_search_enabled && state.cluster_index.is_none() {
-        return Err(DocStoreError::EmbeddingFailed(
-            "cannot create a semantic-search-enabled store: \
-             cluster index is not loaded (check semantic_search.cluster_path in config)"
-                .into(),
-        )
-        .into());
+    if schema.semantic_search_enabled {
+        require_semantic_search(state)?;
+        // An invalid `vector_index` is reported by `create` itself.
+        if let Ok(settings) = schema.vector_settings() {
+            probe_model(state, &settings).await?;
+        }
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
@@ -137,9 +138,18 @@ pub(crate) enum AmendRequest {
     AddEmbeddingAttribute {
         name: String,
         description: Option<String>,
+        #[serde(default)]
+        vector_index: Option<VectorIndexSpec>,
     },
     EnableVectorIndex {
         fields: Vec<String>,
+        #[serde(default)]
+        vector_index: Option<VectorIndexSpec>,
+    },
+    /// `{"op": "update_vector_search", "search": {"n_probes": 16}}`: change the
+    /// store's search defaults (doc and KV stores).
+    UpdateVectorSearch {
+        search: SearchSpec,
     },
 }
 
@@ -165,8 +175,17 @@ impl From<AmendRequest> for SchemaAmendment {
                 attr_type,
                 description,
             },
-            AmendRequest::AddEmbeddingAttribute { name, description } => SchemaAmendment::AddEmbeddingAttribute { name, description },
-            AmendRequest::EnableVectorIndex { fields } => SchemaAmendment::EnableVectorIndex { fields },
+            AmendRequest::AddEmbeddingAttribute {
+                name,
+                description,
+                vector_index,
+            } => SchemaAmendment::AddEmbeddingAttribute {
+                name,
+                description,
+                vector_index,
+            },
+            AmendRequest::EnableVectorIndex { fields, vector_index } => SchemaAmendment::EnableVectorIndex { fields, vector_index },
+            AmendRequest::UpdateVectorSearch { search } => SchemaAmendment::UpdateVectorSearch { search },
         }
     }
 }
@@ -178,15 +197,44 @@ pub async fn amend_schema(
 ) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "amending schema");
 
+    // Search defaults apply to doc and KV stores alike.
+    if let AmendRequest::UpdateVectorSearch { search } = &req {
+        state.store.update_vector_search(&ns, search)?;
+        match state.store.store_type(&ns)? {
+            StoreType::Doc => reload_schema(&state, &ns).await,
+            StoreType::Kv => reload_kv_schema(&state, &ns).await,
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     // Enabling the vector index (single- or multi-field) requires semantic
-    // search infrastructure.
-    if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) && state.cluster_index.is_none() {
-        return Err(DocStoreError::EmbeddingFailed(
-            "cannot enable the vector index: cluster index is not loaded \
-                 (check semantic_search.cluster_path in config)"
-                .into(),
-        )
-        .into());
+    // search infrastructure, and a model the embedding service serves.
+    if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) {
+        require_semantic_search(&state)?;
+        // Apply to a copy first: the probe needs the resulting settings, and a
+        // rejected model must leave the stored schema untouched.
+        let mut preview = state.store.get_schema(&ns)?;
+        let amendment: SchemaAmendment = match &req {
+            AmendRequest::AddEmbeddingAttribute {
+                name,
+                description,
+                vector_index,
+            } => SchemaAmendment::AddEmbeddingAttribute {
+                name: name.clone(),
+                description: description.clone(),
+                vector_index: vector_index.clone(),
+            },
+            AmendRequest::EnableVectorIndex { fields, vector_index } => SchemaAmendment::EnableVectorIndex {
+                fields: fields.clone(),
+                vector_index: vector_index.clone(),
+            },
+            _ => unreachable!("matched above"),
+        };
+        if preview.apply_amendment(amendment).is_ok()
+            && let Ok(settings) = preview.vector_settings()
+        {
+            probe_model(&state, &settings).await?;
+        }
     }
 
     // For RemoveAttribute we use the dedicated path that returns whether the
@@ -222,6 +270,53 @@ pub async fn amend_schema(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Refuse a semantic-search operation when the server loaded no centroids.
+fn require_semantic_search(state: &AppState) -> Result<(), AppError> {
+    if state.embedding_service.is_none() {
+        return Err(DocStoreError::EmbeddingFailed(
+            "semantic search is unavailable: no cluster centroids are loaded \
+             (check semantic_search.centroid_dir and supported_models in config)"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Ask the embedding service whether it serves `settings`' model at its
+/// dimension. A rejection (unknown model, another dimension) fails the request;
+/// an unreachable or still-loading service only warns, because the embed queue
+/// retries until it comes back.
+async fn probe_model(state: &AppState, settings: &VectorIndexSettings) -> Result<(), AppError> {
+    let Some(service) = &state.embedding_service else {
+        return Ok(());
+    };
+    // The local check first: it is free, and names the models this server has
+    // centroids for.
+    state.store.check_vector_model(settings)?;
+    let probe = minnal_db::semantic_search::service::SemanticSearchConfig {
+        model_name: settings.embedding_model.clone(),
+        embedding_dim: settings.embedding_dim as usize,
+        ..service.clone()
+    };
+    match minnal_db::semantic_search::service::check_embedding_service(&probe).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_configuration_error() => Err(DocStoreError::EmbeddingModelUnavailable {
+            model: settings.embedding_model.clone(),
+            dim: settings.embedding_dim,
+            reason: e.to_string(),
+        }
+        .into()),
+        Err(e) => {
+            warn!(
+                model = %settings.embedding_model, dim = settings.embedding_dim,
+                "embedding service check failed; accepting the store, embeds will retry: {e}"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Re-read one namespace's schema from the store and update the in-memory cache.
 pub(crate) async fn reload_schema(state: &AppState, ns: &str) {
     if let Ok(list) = state.store.list() {
@@ -240,13 +335,11 @@ pub(crate) async fn reload_schema(state: &AppState, ns: &str) {
 
 /// Core KV-store creation, shared by `POST /stores` and schema import.
 pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<StatusCode, AppError> {
-    if schema.semantic_search_enabled && state.cluster_index.is_none() {
-        return Err(DocStoreError::EmbeddingFailed(
-            "cannot create a semantic-search-enabled KV store: \
-             cluster index is not loaded (check semantic_search.cluster_path in config)"
-                .into(),
-        )
-        .into());
+    if schema.semantic_search_enabled {
+        require_semantic_search(state)?;
+        if let Ok(settings) = schema.vector_settings() {
+            probe_model(state, &settings).await?;
+        }
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");

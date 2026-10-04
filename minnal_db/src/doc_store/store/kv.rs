@@ -188,6 +188,9 @@ impl DocStore {
 
     /// Run an ANN semantic search against a KV namespace with `value_type = str`.
     ///
+    /// Search settings come from the namespace unless `overrides` sets them for
+    /// this query (see [`DocStore::search_semantic`]).
+    ///
     /// Returns [`DocStoreError::SemanticSearchNotEnabled`] when the namespace does
     /// not have `semantic_search_enabled`, and [`DocStoreError::EmbeddingFailed`]
     /// when no [`SemanticSearchContext`] is configured or the embedding service
@@ -197,35 +200,34 @@ impl DocStore {
         &self,
         namespace: &str,
         query_text: &str,
-        top_k: Option<usize>,
+        overrides: &SearchSpec,
         pagination: crate::doc_store::pagination::Pagination,
     ) -> Result<crate::doc_store::pagination::Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
-        let ctx = self
-            .semantic_ctx
-            .as_ref()
-            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
-
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {
                 namespace: namespace.to_string(),
             });
         }
+        let ns = self.namespace_semantics(&schema.vector_settings()?, overrides)?;
 
-        let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;
+        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
         let all = crate::semantic_search::service::search(
-            &ctx.config,
+            &ns.config,
             namespace,
-            &ctx.cluster_index,
+            &ns.cluster_index,
             &query_sparse,
             &query_dense,
             &db_store,
             None::<fn(&[u8]) -> bool>,
-            top_k,
+            None,
         )
         .await?;
 

@@ -36,6 +36,8 @@ use crate::doc_store::pagination::{CursorPage, Page, Pagination, clamp_cursor, p
 use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
+#[cfg(feature = "semantic-search")]
+use crate::doc_store::vector_settings::SearchSpec;
 use crate::support::file_lock::{DirLock, LockError};
 #[cfg(feature = "semantic-search")]
 use crate::vector_kv;
@@ -54,6 +56,8 @@ mod str_keys_tests;
 mod test_support;
 mod types;
 mod vector;
+#[cfg(test)]
+mod vector_settings_tests;
 
 pub use types::*;
 
@@ -238,6 +242,7 @@ impl DocStore {
         let handle = VecIndexWorker::start(
             Arc::clone(&self.db),
             Arc::clone(&ctx),
+            self.schema_dir.clone(),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
@@ -363,6 +368,30 @@ impl DocStore {
 }
 
 /// Load every persisted document-store schema from `schema_dir`.
+/// The resolved vector-index settings of `namespace`, whichever kind of store it
+/// is, read from its schema file.
+#[cfg(feature = "semantic-search")]
+pub(crate) fn load_vector_settings(
+    schema_dir: &Path,
+    namespace: &str,
+) -> Result<crate::doc_store::vector_settings::VectorIndexSettings, DocStoreError> {
+    let path = schema_dir.join(format!("{namespace}.json"));
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        DocStoreError::Schema(SchemaError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    })?;
+    let settings = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => serde_json::from_str::<KvStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .vector_settings()?,
+        _ => serde_json::from_str::<DocStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .vector_settings()?,
+    };
+    Ok(settings)
+}
+
 fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocStoreError> {
     let mut schemas = Vec::new();
     let entries = match std::fs::read_dir(schema_dir) {
