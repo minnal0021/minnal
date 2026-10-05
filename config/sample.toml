@@ -282,7 +282,8 @@ concurrency = 4
 # A store's embedding model, dimension, chunking, code widths and search
 # defaults are NOT set here: they live in the store's schema (`vector_index`),
 # with built-in defaults (gemma, 768 dimensions, 4-sentence windows sliding by
-# 2, n_probes 64, first-pass cut 1000, top_k 100). Leaving one of those keys
+# 2, a probe budget of 70,000 entries over 1 to 1,024 postings, first-pass
+# cut 1000, top_k 100). Leaving one of those keys
 # here is a startup error.
 # ---------------------------------------------------------------------------
 [semantic_search]

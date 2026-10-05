@@ -499,11 +499,13 @@ impl VecIndexWorker {
                 let vector_indexes = crate::semantic_search::service::embed_document(&ns.config, &*ns.ivf, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-                vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
+                let delta = vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
+                ns.ivf.apply_delta(&delta);
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {
-                vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
+                let delta = vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
+                self.ctx.apply_posting_delta(&entry.namespace, &delta);
                 Ok(Processed::Done)
             }
         }
@@ -531,7 +533,8 @@ impl VecIndexWorker {
         let (mut done, mut failed) = (0usize, 0usize);
         for entry in written {
             match vector_kv::complete_embed(&self.db, &entry).await {
-                Ok(()) => {
+                Ok(delta) => {
+                    self.ctx.apply_posting_delta(&entry.namespace, &delta);
                     done += 1;
                     debug!(
                         "vec index worker: indexed ns='{}' doc='{}'",

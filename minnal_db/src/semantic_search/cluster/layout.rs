@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Cluster, ClusterIndex, DEFAULT_ROTATION_SEED, find_closest_cluster_id};
 
@@ -45,6 +46,11 @@ pub trait IvfLayout: Sync {
     fn rotated_centre(&self, centre_id: u32) -> Option<&[f32]>;
     /// Every centre id.
     fn centre_ids(&self) -> Vec<u32>;
+    /// How many entries `posting` holds, when the layout knows. Probing by entry
+    /// budget ([`select_probes`]) counts an unknown size as 0.
+    fn posting_entries(&self, _posting: u32) -> Option<u64> {
+        None
+    }
 }
 
 impl IvfLayout for ClusterIndex {
@@ -99,6 +105,123 @@ impl<T: IvfLayout + Send + ?Sized> IvfLayout for std::sync::Arc<T> {
     fn centre_ids(&self) -> Vec<u32> {
         (**self).centre_ids()
     }
+    fn posting_entries(&self, posting: u32) -> Option<u64> {
+        (**self).posting_entries(posting)
+    }
+}
+
+/// How many postings a search probes (design doc M2d).
+///
+/// Each query vector walks its postings nearest first and stops once it has
+/// probed at least `min_probes` **and** their entries add up to
+/// `budget_entries`, and never goes past `max_probes`. The posting that crosses
+/// the budget is probed. The cost of Pass 1 is the entries it reads, so a budget
+/// keeps that cost fixed as postings are split and change size, where a fixed
+/// probe count would not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeSettings {
+    /// Entries to read per query vector before stopping.
+    pub budget_entries: u64,
+    /// Postings always probed per query vector, whatever the budget.
+    pub min_probes: usize,
+    /// Postings never exceeded per query vector, whatever the budget.
+    pub max_probes: usize,
+}
+
+impl ProbeSettings {
+    /// Exactly `n` postings per query vector, whatever their size.
+    pub const fn fixed(n: usize) -> Self {
+        Self {
+            budget_entries: 0,
+            min_probes: n,
+            max_probes: n,
+        }
+    }
+}
+
+/// The postings a search probes under `probe`: per query vector, the nearest
+/// postings within its limits ([`ProbeSettings`]); then their union, in
+/// first-seen order. Also returns the entries the union holds, as far as the
+/// layout knows.
+pub fn select_probes<L: IvfLayout + ?Sized>(layout: &L, queries: &[Vec<f32>], probe: &ProbeSettings) -> (Vec<u32>, u64) {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    let mut planned = 0u64;
+    for ranked in layout.probe(queries, probe.max_probes) {
+        let mut entries = 0u64;
+        for (taken, id) in ranked.into_iter().enumerate() {
+            if taken >= probe.min_probes && entries >= probe.budget_entries {
+                break;
+            }
+            let size = layout.posting_entries(id).unwrap_or(0);
+            entries += size;
+            if seen.insert(id) {
+                ids.push(id);
+                planned += size;
+            }
+        }
+    }
+    (ids, planned)
+}
+
+/// A layout with entry counts attached: for layouts that keep none
+/// ([`ClusterIndex`]), so they can be probed by budget. Benches and tests use it
+/// with counts taken from the store.
+pub struct WithEntryCounts<L> {
+    /// The layout.
+    pub layout: L,
+    /// Entries per posting id.
+    pub entries: HashMap<u32, u64>,
+}
+
+impl<L: IvfLayout> IvfLayout for WithEntryCounts<L> {
+    fn dim(&self) -> usize {
+        self.layout.dim()
+    }
+    fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        self.layout.rotate(v)
+    }
+    fn route(&self, embedding: &[f32]) -> Option<u32> {
+        self.layout.route(embedding)
+    }
+    fn probe(&self, queries: &[Vec<f32>], n: usize) -> Vec<Vec<u32>> {
+        self.layout.probe(queries, n)
+    }
+    fn centre_of(&self, posting: u32) -> Option<u32> {
+        self.layout.centre_of(posting)
+    }
+    fn centre(&self, centre_id: u32) -> Option<&[f32]> {
+        self.layout.centre(centre_id)
+    }
+    fn rotated_centre(&self, centre_id: u32) -> Option<&[f32]> {
+        self.layout.rotated_centre(centre_id)
+    }
+    fn centre_ids(&self) -> Vec<u32> {
+        self.layout.centre_ids()
+    }
+    fn posting_entries(&self, posting: u32) -> Option<u64> {
+        self.entries.get(&posting).copied()
+    }
+}
+
+/// How one document's write changed posting sizes: a posting gains an entry
+/// for each id in `added` and loses one for each id in `removed`. Returned by
+/// the vector writes in `vector_kv` and applied with
+/// [`NamespaceIvf::apply_delta`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostingDelta {
+    /// Postings that gained this document's entry.
+    pub added: Vec<u32>,
+    /// Postings that lost this document's entry.
+    pub removed: Vec<u32>,
+}
+
+impl PostingDelta {
+    /// Add `other`'s changes to these.
+    pub fn extend(&mut self, other: PostingDelta) {
+        self.added.extend(other.added);
+        self.removed.extend(other.removed);
+    }
 }
 
 /// One posting as a namespace stores it.
@@ -121,6 +244,12 @@ pub struct NamespaceIvf {
     posting_centre: HashMap<u32, u32>,
     /// Centres keyed by centre id, rotated with the namespace's seed.
     centres: ClusterIndex,
+    /// Entries per posting, for probing by budget. **An estimate:** counted
+    /// from the store when the partition is loaded, then kept up to date by the
+    /// vector worker's [`PostingDelta`]s. A write racing the load, or no-WAL
+    /// entries lost in a crash, can leave it slightly off until the next load
+    /// recounts. It steers how much a search reads, never what is correct.
+    entries: HashMap<u32, AtomicU64>,
 }
 
 impl NamespaceIvf {
@@ -153,8 +282,10 @@ impl NamespaceIvf {
             posting_centre.insert(p.posting_id, p.centre_id);
             routing.insert(p.posting_id, Cluster::new(p.posting_id, p.routing_centroid));
         }
+        let entries = posting_centre.keys().map(|&id| (id, AtomicU64::new(0))).collect();
         Ok(Self {
             routing: ClusterIndex::from_clusters_with_seed(routing, seed),
+            entries,
             posting_centre,
             centres: ClusterIndex::from_clusters_with_seed(centres.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(), seed),
         })
@@ -195,6 +326,33 @@ impl NamespaceIvf {
     pub fn centres(&self) -> usize {
         self.centres.len()
     }
+
+    /// Set the entry counts, typically from a count of the stored keys.
+    /// Postings not named are set to 0; ids that are not postings are ignored.
+    pub fn set_entry_counts(&self, counts: &HashMap<u32, u64>) {
+        for (id, n) in &self.entries {
+            n.store(counts.get(id).copied().unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+
+    /// Apply one document's [`PostingDelta`]. A count never goes below 0.
+    pub fn apply_delta(&self, delta: &PostingDelta) {
+        for id in &delta.added {
+            if let Some(n) = self.entries.get(id) {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for id in &delta.removed {
+            if let Some(n) = self.entries.get(id) {
+                let _ = n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            }
+        }
+    }
+
+    /// Entries across every posting (an estimate; see the field's notes).
+    pub fn total_entries(&self) -> u64 {
+        self.entries.values().map(|n| n.load(Ordering::Relaxed)).sum()
+    }
 }
 
 impl IvfLayout for NamespaceIvf {
@@ -221,6 +379,9 @@ impl IvfLayout for NamespaceIvf {
     }
     fn centre_ids(&self) -> Vec<u32> {
         self.centres.clusters.keys().copied().collect()
+    }
+    fn posting_entries(&self, posting: u32) -> Option<u64> {
+        self.entries.get(&posting).map(|n| n.load(Ordering::Relaxed))
     }
 }
 
@@ -304,5 +465,85 @@ mod tests {
             centre_id: 0,
         }];
         assert!(NamespaceIvf::new(posting, reserved, 1).unwrap_err().contains("reserved"));
+    }
+
+    /// Four postings on the axes; a query nearest posting 0, then 1, 2, 3.
+    fn ranked_layout(sizes: [u64; 4]) -> (WithEntryCounts<ClusterIndex>, Vec<f32>) {
+        let c = centroids(16);
+        let layout = ClusterIndex::from_clusters(c.iter().map(|(&id, v)| (id, Cluster::new(id, v.clone()))).collect());
+        let mut q = vec![0.0f32; 16];
+        q[..4].copy_from_slice(&[0.8, 0.4, 0.2, 0.1]);
+        let entries = (0..4u32).map(|id| (id, sizes[id as usize])).collect();
+        (WithEntryCounts { layout, entries }, q)
+    }
+
+    fn budget(budget_entries: u64, min_probes: usize, max_probes: usize) -> ProbeSettings {
+        ProbeSettings {
+            budget_entries,
+            min_probes,
+            max_probes,
+        }
+    }
+
+    #[test]
+    fn a_budget_stops_at_the_posting_that_reaches_it() {
+        let (layout, q) = ranked_layout([10, 20, 30, 40]);
+        let qs = [q];
+        assert_eq!(select_probes(&layout, &qs, &budget(25, 1, 4)), (vec![0, 1], 30));
+        assert_eq!(select_probes(&layout, &qs, &budget(30, 1, 4)), (vec![0, 1], 30));
+        assert_eq!(select_probes(&layout, &qs, &budget(31, 1, 4)), (vec![0, 1, 2], 60));
+        assert_eq!(select_probes(&layout, &qs, &budget(1, 1, 4)), (vec![0], 10));
+        assert_eq!(select_probes(&layout, &qs, &budget(1_000, 1, 4)), (vec![0, 1, 2, 3], 100));
+    }
+
+    #[test]
+    fn min_and_max_probes_bound_the_budget() {
+        let (layout, q) = ranked_layout([10, 20, 30, 40]);
+        let qs = [q];
+        assert_eq!(select_probes(&layout, &qs, &budget(1, 3, 4)).0, vec![0, 1, 2]);
+        assert_eq!(select_probes(&layout, &qs, &budget(1_000, 1, 2)).0, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_fixed_count_ignores_sizes_and_matches_the_plain_probe() {
+        let (layout, q) = ranked_layout([10, 20, 30, 40]);
+        let qs = [q];
+        for n in 1..=4 {
+            assert_eq!(select_probes(&layout, &qs, &ProbeSettings::fixed(n)).0, layout.probe(&qs, n)[0]);
+        }
+    }
+
+    #[test]
+    fn unknown_sizes_count_as_zero() {
+        let (mut layout, q) = ranked_layout([10, 20, 30, 40]);
+        layout.entries.clear();
+        assert_eq!(select_probes(&layout, &[q], &budget(5, 1, 3)), (vec![0, 1, 2], 0));
+    }
+
+    #[test]
+    fn each_query_vector_has_its_own_budget_and_the_union_is_probed() {
+        let (layout, q) = ranked_layout([10, 20, 30, 40]);
+        let mut q2 = vec![0.0f32; 16];
+        q2[..4].copy_from_slice(&[0.1, 0.2, 0.4, 0.8]); // nearest 3, then 2
+        // q: {0, 1}; q2: {3}; posting 1 is not counted twice.
+        assert_eq!(select_probes(&layout, &[q.clone(), q2.clone()], &budget(25, 1, 4)), (vec![0, 1, 3], 70));
+        assert_eq!(select_probes(&layout, &[q, q2], &budget(25, 2, 4)), (vec![0, 1, 3, 2], 100));
+    }
+
+    #[test]
+    fn deltas_keep_entry_counts_and_never_go_below_zero() {
+        let ivf = NamespaceIvf::seeded(&centroids(16), 1).unwrap();
+        assert_eq!(ivf.posting_entries(0), Some(0));
+        ivf.set_entry_counts(&HashMap::from([(0, 5), (1, 2), (99, 7)]));
+        assert_eq!(
+            (ivf.posting_entries(0), ivf.posting_entries(2), ivf.posting_entries(99)),
+            (Some(5), Some(0), None)
+        );
+        ivf.apply_delta(&PostingDelta {
+            added: vec![2, 99],
+            removed: vec![0, 3],
+        });
+        assert_eq!([0, 1, 2, 3].map(|id| ivf.posting_entries(id).unwrap()), [4, 2, 1, 0]);
+        assert_eq!(ivf.total_entries(), 7);
     }
 }

@@ -108,7 +108,8 @@ impl KvStoreSchema {
         Ok(())
     }
 
-    /// Change the search defaults (`n_probes`, `first_pass_top_k`, `top_k`);
+    /// Change the search defaults (probe budget and bounds, `first_pass_top_k`,
+    /// `top_k`);
     /// everything else is unchanged. Fails if the store has no vector-index
     /// settings.
     pub fn update_vector_search(&mut self, search: &SearchSpec) -> Result<(), SchemaError> {

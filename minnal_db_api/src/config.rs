@@ -590,7 +590,7 @@ fn default_concurrency() -> usize {
 /// Everything that shapes one namespace's index (model, dimension, chunking,
 /// code widths, search defaults) lives in that namespace's schema
 /// (`vector_index`), not here. Unknown keys are rejected, so a config still
-/// carrying one of those (`model`, `embedding_dim`, `n_probes`, ...) fails at
+/// carrying one of those (`model`, `embedding_dim`, `probe_budget_entries`, ...) fails at
 /// startup instead of being silently ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -864,6 +864,8 @@ mod tests {
             "model = \"qwen\"",
             "embedding_dim = 768",
             "n_probes = 64",
+            "probe_budget_entries = 70000",
+            "max_probes = 1024",
             "window_size = 4",
             "cluster_path = \"x\"",
         ] {

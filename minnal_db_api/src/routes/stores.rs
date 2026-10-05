@@ -146,7 +146,7 @@ pub(crate) enum AmendRequest {
         #[serde(default)]
         vector_index: Option<VectorIndexSpec>,
     },
-    /// `{"op": "update_vector_search", "search": {"n_probes": 16}}`: change the
+    /// `{"op": "update_vector_search", "search": {"probe_budget_entries": 20000}}`: change the
     /// store's search defaults (doc and KV stores).
     UpdateVectorSearch {
         search: SearchSpec,

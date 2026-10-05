@@ -4,7 +4,8 @@
 //! ([`index_embeddings`] + [`upsert_vectors`]), runs every judged query through
 //! the production [`search`], and measures relevance, recall against the exact
 //! (unquantised, unpartitioned) ranking, estimator error, partition shape,
-//! footprint, indexing throughput and latency over an `n_probes` sweep.
+//! footprint, indexing throughput and latency over a sweep of fixed `n_probes`
+//! and of entry budgets (design doc M2d).
 //! Results go to `{bench_root}/results/{label}/{dataset}-{order}.{json,md}`;
 //! `vector_bench_compare` compares two result files with paired per-query deltas.
 //!
@@ -47,7 +48,8 @@ use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clu
 use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
 use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
-use crate::semantic_search::service::{SemanticSearchConfig, index_embeddings, search};
+use crate::semantic_search::service::{DEFAULT_PROBE, SemanticSearchConfig, index_embeddings, search};
+use crate::semantic_search::{IvfLayout, ProbeSettings, select_probes};
 use crate::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_meta_ns, sparse_vectors_ns, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
 use exact::{FINAL_K, GroundTruth, dot};
@@ -58,8 +60,11 @@ const NS: &str = "bench";
 const INDEX_CONCURRENCY: usize = 8;
 /// `n_probes` values swept; values above the cluster count are skipped.
 const NPROBES: [usize; 7] = [4, 8, 16, 32, 64, 128, 256];
-/// The production setting the gates are judged at.
+/// The fixed probe count gates compare against (the production setting before M2d).
 const PRODUCTION_NPROBES: usize = 64;
+/// Entry budgets swept, as shares of the namespace's entries (plus the default
+/// budget, [`DEFAULT_PROBE`]), so a small corpus gets a curve too.
+const BUDGET_SHARES: [f64; 9] = [0.025, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
 /// Candidates kept after Pass 1 (production default), and returned per query so
 /// the whole candidate list can be scored.
 const FIRST_PASS: usize = 1000;
@@ -120,11 +125,18 @@ struct QueryResultRow {
     /// nDCG at each of [`NDCG_CUTOFFS`] (absent from results written before it existed).
     #[serde(default)]
     ndcg_at: [f64; NDCG_CUTOFFS.len()],
+    /// Postings probed (absent from results written before M2d).
+    #[serde(default)]
+    probes: f64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Setting {
+    /// Fixed probe count, or 0 for a budget row.
     n_probes: usize,
+    /// Entry budget (min 1, max [`DEFAULT_PROBE`]'s), or `None` for a fixed row.
+    #[serde(default)]
+    budget_entries: Option<u64>,
     mean: QueryResultRow,
     latency_p50_ms: f64,
     latency_p95_ms: f64,
@@ -298,6 +310,30 @@ fn mean_row(rows: &[QueryResultRow]) -> QueryResultRow {
         chunks_scanned: (rows.iter().map(|r| r.chunks_scanned).sum::<usize>() as f64 / n).round() as usize,
         latency_ms: f(|r| r.latency_ms),
         ndcg_at: std::array::from_fn(|i| rows.iter().map(|r| r.ndcg_at[i]).sum::<f64>() / n),
+        probes: f(|r| r.probes),
+    }
+}
+
+impl Setting {
+    fn probe(&self) -> ProbeSettings {
+        match self.budget_entries {
+            Some(budget_entries) => ProbeSettings {
+                budget_entries,
+                ..DEFAULT_PROBE
+            },
+            None => ProbeSettings::fixed(self.n_probes),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self.budget_entries {
+            Some(b) => format!("budget {b}"),
+            None => format!("n_probes {}", self.n_probes),
+        }
+    }
+
+    fn same_as(&self, other: &Setting) -> bool {
+        (self.n_probes, self.budget_entries) == (other.n_probes, other.budget_entries)
     }
 }
 
@@ -396,6 +432,14 @@ async fn vector_bench() {
     drop(db);
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
     db.compact().await.unwrap();
+    // Loaded again as a restarted store loads it: its entry counts come from the
+    // stored keys.
+    let ivf = Arc::new(
+        crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+            .await
+            .unwrap()
+            .expect("seeded"),
+    );
 
     // ── Footprint and partition shape ──
     let (sparse_bytes, sparse_rows) = namespace_bytes(&db, sparse_vectors_ns(NS)).await;
@@ -428,15 +472,18 @@ async fn vector_bench() {
         sparse_keys: sparse_rows.len(),
     };
     drop(sparse_rows);
+    for (&posting, &n) in &cluster_entries {
+        assert_eq!(ivf.posting_entries(posting), Some(n as u64), "entry count of posting {posting}");
+    }
 
     let (estimator_pass1, estimator_pass2) = estimator_errors(&frozen, &gt, &index, config.number_of_bits_for_dense_quantisation);
 
     // ── Search sweep ──
     let store = DbVectorStore::new(&db, NS).await.unwrap();
     let doc_ids = &frozen.manifest.doc_ids;
-    let run_query = |n_probes: usize, qi: usize| {
+    let run_query = |probe: ProbeSettings, qi: usize| {
         let cfg = SemanticSearchConfig {
-            n_probes,
+            probe,
             first_pass_sparse_search_top_k: FIRST_PASS,
             ..(*config).clone()
         };
@@ -465,10 +512,32 @@ async fn vector_bench() {
         }
     };
     for qi in 0..frozen.n_queries() {
-        run_query(PRODUCTION_NPROBES, qi).await; // warm-up
+        run_query(ProbeSettings::fixed(PRODUCTION_NPROBES), qi).await; // warm-up
     }
+    let total_entries = partition.entries as u64;
+    let mut budgets: Vec<u64> = BUDGET_SHARES.iter().map(|s| (s * total_entries as f64).round() as u64).collect();
+    budgets.push(DEFAULT_PROBE.budget_entries);
+    budgets.sort_unstable();
+    budgets.dedup();
+    let sweep = NPROBES
+        .iter()
+        .filter(|&&n| n <= index.len())
+        .map(|&n| (n, None))
+        .chain(budgets.into_iter().map(|b| (0, Some(b))));
     let mut settings = Vec::new();
-    for &n_probes in NPROBES.iter().filter(|&&n| n <= index.len()) {
+    for (n_probes, budget_entries) in sweep {
+        let mut s = Setting {
+            n_probes,
+            budget_entries,
+            mean: QueryResultRow::default(),
+            latency_p50_ms: 0.0,
+            latency_p95_ms: 0.0,
+            latency_p99_ms: 0.0,
+            repeat_p50_ms: Vec::new(),
+            nondeterministic_queries: 0,
+            per_query: Vec::new(),
+        };
+        let probe = s.probe();
         let mut rows: Vec<QueryResultRow> = Vec::with_capacity(frozen.n_queries());
         let mut first: Vec<Vec<u32>> = Vec::new();
         let mut latencies: Vec<f64> = Vec::new();
@@ -477,11 +546,11 @@ async fn vector_bench() {
         for rep in 0..repeats.max(1) {
             let mut lat = Vec::with_capacity(frozen.n_queries());
             for qi in 0..frozen.n_queries() {
-                let (ranked, ms) = run_query(n_probes, qi).await;
+                let (ranked, ms) = run_query(probe, qi).await;
                 lat.push(ms);
                 if rep == 0 {
                     let q = frozen.query(qi);
-                    let probed: Vec<u32> = index.find_top_n_cluster_ids_batch(&[q.to_vec()], n_probes).remove(0);
+                    let (probed, _) = select_probes(&*ivf, &[q.to_vec()], &probe);
                     let ids: Vec<&str> = ranked.iter().map(|&d| doc_ids[d as usize].as_str()).collect();
                     let rels = &qrels[&frozen.manifest.query_ids[qi]];
                     let m = score(&ids, rels);
@@ -498,6 +567,7 @@ async fn vector_bench() {
                         entries_scanned: probed.iter().map(|c| cluster_entries.get(c).copied().unwrap_or(0)).sum(),
                         chunks_scanned: probed.iter().map(|c| cluster_chunks.get(c).copied().unwrap_or(0)).sum(),
                         latency_ms: 0.0,
+                        probes: probed.len() as f64,
                     });
                     first.push(ranked);
                 } else if ranked != first[qi] {
@@ -515,19 +585,23 @@ async fn vector_bench() {
             latencies.extend(lat);
         }
         latencies.sort_by(f64::total_cmp);
-        let s = Setting {
-            n_probes,
-            mean: mean_row(&rows),
-            latency_p50_ms: percentile(&latencies, 0.5),
-            latency_p95_ms: percentile(&latencies, 0.95),
-            latency_p99_ms: percentile(&latencies, 0.99),
-            repeat_p50_ms: repeat_p50,
-            nondeterministic_queries: nondeterministic.len(),
-            per_query: rows,
-        };
+        s.mean = mean_row(&rows);
+        s.latency_p50_ms = percentile(&latencies, 0.5);
+        s.latency_p95_ms = percentile(&latencies, 0.95);
+        s.latency_p99_ms = percentile(&latencies, 0.99);
+        s.repeat_p50_ms = repeat_p50;
+        s.nondeterministic_queries = nondeterministic.len();
+        s.per_query = rows;
         eprintln!(
-            "  n_probes {:>3}: nDCG@10 {:.4}  ANN R@10 {:.4}  Pass-1 recall {:.4}  entries {:>6}  p50 {:.2} ms  p95 {:.2} ms",
-            n_probes, s.mean.ndcg10, s.mean.ann_r10, s.mean.pass1_recall, s.mean.entries_scanned, s.latency_p50_ms, s.latency_p95_ms
+            "  {:>16}: nDCG@10 {:.4}  ANN R@10 {:.4}  Pass-1 recall {:.4}  entries {:>6}  probes {:>6.1}  p50 {:.2} ms  p95 {:.2} ms",
+            s.name(),
+            s.mean.ndcg10,
+            s.mean.ann_r10,
+            s.mean.pass1_recall,
+            s.mean.entries_scanned,
+            s.mean.probes,
+            s.latency_p50_ms,
+            s.latency_p95_ms
         );
         settings.push(s);
     }
@@ -609,15 +683,15 @@ fn render(r: &BenchResult) -> String {
     }
     let _ = writeln!(
         md,
-        "\n| n_probes | nDCG@10 | MRR@10 | R@100 | Cand. recall | ANN R@10 | ANN R@100 | Pass-1 recall | Entries scanned | p50 ms | p95 ms | p99 ms | Nondet. |"
+        "\n| Probing | nDCG@10 | MRR@10 | R@100 | Cand. recall | ANN R@10 | ANN R@100 | Pass-1 recall | Entries scanned | Postings probed | p50 ms | p95 ms | p99 ms | Nondet. |"
     );
-    let _ = writeln!(md, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for s in &r.settings {
         let m = &s.mean;
         let _ = writeln!(
             md,
-            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {:.2} | {:.2} | {:.2} | {} |",
-            s.n_probes,
+            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {:.1} | {:.2} | {:.2} | {:.2} | {} |",
+            s.name(),
             m.ndcg10,
             m.mrr10,
             m.recall100,
@@ -626,6 +700,7 @@ fn render(r: &BenchResult) -> String {
             m.ann_r100,
             m.pass1_recall,
             m.entries_scanned,
+            m.probes,
             s.latency_p50_ms,
             s.latency_p95_ms,
             s.latency_p99_ms,
@@ -634,12 +709,12 @@ fn render(r: &BenchResult) -> String {
     }
     let _ = writeln!(
         md,
-        "\n| n_probes | {} |\n|---:|{}",
+        "\n| Probing | {} |\n|---|{}",
         NDCG_CUTOFFS.map(|k| format!("nDCG@{k}")).join(" | "),
         "---:|".repeat(NDCG_CUTOFFS.len())
     );
     for s in &r.settings {
-        let _ = writeln!(md, "| {} | {} |", s.n_probes, s.mean.ndcg_at.map(|v| format!("{v:.4}")).join(" | "));
+        let _ = writeln!(md, "| {} | {} |", s.name(), s.mean.ndcg_at.map(|v| format!("{v:.4}")).join(" | "));
     }
     md
 }
@@ -867,6 +942,106 @@ fn paired_delta(base: &[f64], new: &[f64]) -> (f64, f64, f64) {
     (mean, percentile(&means, 0.025), percentile(&means, 0.975))
 }
 
+/// Paired per-query deltas of `n` against `b`: nDCG@10 and ANN R@10 as
+/// (mean, CI low, CI high), and nDCG@10 wins / losses / ties.
+struct Paired {
+    ndcg: (f64, f64, f64),
+    ann: (f64, f64, f64),
+    wlt: (usize, usize, usize),
+}
+
+fn paired(b: &Setting, n: &Setting) -> Paired {
+    let col = |s: &Setting, f: fn(&QueryResultRow) -> f64| s.per_query.iter().map(f).collect::<Vec<f64>>();
+    let (mut w, mut l, mut t) = (0, 0, 0);
+    for (x, y) in b.per_query.iter().zip(&n.per_query) {
+        match y.ndcg10 - x.ndcg10 {
+            d if d > 1e-9 => w += 1,
+            d if d < -1e-9 => l += 1,
+            _ => t += 1,
+        }
+    }
+    Paired {
+        ndcg: paired_delta(&col(b, |r| r.ndcg10), &col(n, |r| r.ndcg10)),
+        ann: paired_delta(&col(b, |r| r.ann_r10), &col(n, |r| r.ann_r10)),
+        wlt: (w, l, t),
+    }
+}
+
+/// `f` of the curve (sorted by mean entries scanned) at `x` entries.
+fn interpolate(curve: &[&Setting], x: f64, f: fn(&Setting) -> f64) -> f64 {
+    let e = |s: &Setting| s.mean.entries_scanned as f64;
+    if x <= e(curve[0]) {
+        return f(curve[0]);
+    }
+    for w in curve.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if x <= e(b) {
+            let span = e(b) - e(a);
+            let t = if span > 0.0 { (x - e(a)) / span } else { 1.0 };
+            return f(a) + t * (f(b) - f(a));
+        }
+    }
+    f(curve[curve.len() - 1])
+}
+
+/// Gate `n` against the base row `b`, paired per query: write the nDCG table by
+/// cutoff and push the gate checks, named after `n`.
+fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &Setting) {
+    let who = n.name();
+    let p = paired(b, n);
+    let within = |old: f64, new: f64| new <= (old * 1.05).max(old + 0.3);
+    let _ = writeln!(md, "\nnDCG by cutoff, {who} against base {}, paired per query:\n", b.name());
+    let _ = writeln!(md, "| Cutoff | Base | New | Δ [95% CI] | W / L / T |\n|---:|---:|---:|---|---|");
+    let mut worst = f64::INFINITY;
+    for (i, k) in NDCG_CUTOFFS.iter().enumerate() {
+        let (x, y): (Vec<f64>, Vec<f64>) = b.per_query.iter().zip(&n.per_query).map(|(x, y)| (x.ndcg_at[i], y.ndcg_at[i])).unzip();
+        let (d, lo, hi) = paired_delta(&x, &y);
+        let (w, l) = x.iter().zip(&y).fold((0, 0), |(w, l), (a, b)| match b - a {
+            v if v > 1e-9 => (w + 1, l),
+            v if v < -1e-9 => (w, l + 1),
+            _ => (w, l),
+        });
+        let _ = writeln!(
+            md,
+            "| @{k} | {:.4} | {:.4} | {d:+.4} [{lo:+.4}, {hi:+.4}] | {w} / {l} / {} |",
+            b.mean.ndcg_at[i],
+            n.mean.ndcg_at[i],
+            x.len() - w - l
+        );
+        worst = worst.min(d);
+    }
+    let _ = writeln!(
+        md,
+        "\nEntries {} → {}, postings {:.1} → {:.1}, ANN R@10 {:.4} → {:.4}, Pass-1 recall {:.4} → {:.4}, p50 {:.2} → {:.2} ms, p95 {:.2} → {:.2} ms.",
+        b.mean.entries_scanned,
+        n.mean.entries_scanned,
+        b.mean.probes,
+        n.mean.probes,
+        b.mean.ann_r10,
+        n.mean.ann_r10,
+        b.mean.pass1_recall,
+        n.mean.pass1_recall,
+        b.latency_p50_ms,
+        n.latency_p50_ms,
+        b.latency_p95_ms,
+        n.latency_p95_ms
+    );
+    gate.push((
+        format!("{who}: nDCG@10 Δ ≥ −0.005 and CI upper bound ≥ 0"),
+        p.ndcg.0 >= -0.005 && p.ndcg.2 >= 0.0,
+    ));
+    gate.push((format!("{who}: ANN recall@10 Δ ≥ −0.005"), p.ann.0 >= -0.005));
+    gate.push((format!("{who}: nDCG@{{10..100}} Δ ≥ −0.002 at every cutoff"), worst >= -0.002));
+    gate.push((
+        format!("{who}: p50 latency within +5% (or +0.3 ms)"),
+        within(b.latency_p50_ms, n.latency_p50_ms),
+    ));
+    gate.push((
+        format!("{who}: p95 latency within +5% (or +0.3 ms)"),
+        within(b.latency_p95_ms, n.latency_p95_ms),
+    ));
+}
+
 #[test]
 #[ignore]
 fn vector_bench_compare() {
@@ -884,29 +1059,27 @@ fn vector_bench_compare() {
     );
     let _ = writeln!(
         md,
-        "| n_probes | Δ nDCG@10 [95% CI] | W / L / T | Δ ANN R@10 [95% CI] | Δ Pass-1 recall | Entries scanned | p50 ms | p95 ms |"
+        "| Probing | Δ nDCG@10 [95% CI] | W / L / T | Δ ANN R@10 [95% CI] | Δ Pass-1 recall | Entries scanned | p50 ms | p95 ms |"
     );
-    let _ = writeln!(md, "|---:|---|---|---|---:|---|---|---|");
-    let mut gate = Vec::new();
+    let _ = writeln!(md, "|---|---|---|---|---:|---|---|---|");
     for b in &base.settings {
-        let Some(n) = new.settings.iter().find(|s| s.n_probes == b.n_probes) else {
+        let Some(n) = new.settings.iter().find(|s| s.same_as(b)) else {
             continue;
         };
-        let col = |s: &Setting, f: fn(&QueryResultRow) -> f64| s.per_query.iter().map(f).collect::<Vec<f64>>();
-        let (dn, dn_lo, dn_hi) = paired_delta(&col(b, |r| r.ndcg10), &col(n, |r| r.ndcg10));
-        let (da, da_lo, da_hi) = paired_delta(&col(b, |r| r.ann_r10), &col(n, |r| r.ann_r10));
-        let (mut w, mut l, mut t) = (0, 0, 0);
-        for (x, y) in b.per_query.iter().zip(&n.per_query) {
-            match y.ndcg10 - x.ndcg10 {
-                d if d > 1e-9 => w += 1,
-                d if d < -1e-9 => l += 1,
-                _ => t += 1,
-            }
-        }
+        let p = paired(b, n);
         let _ = writeln!(
             md,
-            "| {} | {dn:+.4} [{dn_lo:+.4}, {dn_hi:+.4}] | {w} / {l} / {t} | {da:+.4} [{da_lo:+.4}, {da_hi:+.4}] | {:+.4} | {} → {} | {:.2} → {:.2} | {:.2} → {:.2} |",
-            b.n_probes,
+            "| {} | {:+.4} [{:+.4}, {:+.4}] | {} / {} / {} | {:+.4} [{:+.4}, {:+.4}] | {:+.4} | {} → {} | {:.2} → {:.2} | {:.2} → {:.2} |",
+            b.name(),
+            p.ndcg.0,
+            p.ndcg.1,
+            p.ndcg.2,
+            p.wlt.0,
+            p.wlt.1,
+            p.wlt.2,
+            p.ann.0,
+            p.ann.1,
+            p.ann.2,
             n.mean.pass1_recall - b.mean.pass1_recall,
             b.mean.entries_scanned,
             n.mean.entries_scanned,
@@ -915,43 +1088,61 @@ fn vector_bench_compare() {
             b.latency_p95_ms,
             n.latency_p95_ms
         );
-        if b.n_probes == PRODUCTION_NPROBES {
-            let within = |old: f64, new: f64| new <= (old * 1.05).max(old + 0.3);
-            gate.push(("nDCG@10 Δ ≥ −0.005 and CI upper bound ≥ 0", dn >= -0.005 && dn_hi >= 0.0));
-            gate.push(("ANN recall@10 Δ ≥ −0.005", da >= -0.005));
-            gate.push(("p50 latency within +5% (or +0.3 ms)", within(b.latency_p50_ms, n.latency_p50_ms)));
-            gate.push(("p95 latency within +5% (or +0.3 ms)", within(b.latency_p95_ms, n.latency_p95_ms)));
-        }
     }
-    // Deeper cutoffs at the production setting: the ranking below the top 10.
-    if let (Some(b), Some(n)) = (
-        base.settings.iter().find(|s| s.n_probes == PRODUCTION_NPROBES),
-        new.settings.iter().find(|s| s.n_probes == PRODUCTION_NPROBES),
-    ) {
-        let _ = writeln!(md, "\nnDCG by cutoff at n_probes {PRODUCTION_NPROBES}, paired per query:\n");
-        let _ = writeln!(md, "| Cutoff | Base | New | Δ [95% CI] | W / L / T |\n|---:|---:|---:|---|---|");
-        let mut worst = f64::INFINITY;
-        for (i, k) in NDCG_CUTOFFS.iter().enumerate() {
-            let (x, y): (Vec<f64>, Vec<f64>) = b.per_query.iter().zip(&n.per_query).map(|(x, y)| (x.ndcg_at[i], y.ndcg_at[i])).unzip();
-            let (d, lo, hi) = paired_delta(&x, &y);
-            let (w, l) = x.iter().zip(&y).fold((0, 0), |(w, l), (a, b)| match b - a {
-                v if v > 1e-9 => (w + 1, l),
-                v if v < -1e-9 => (w, l + 1),
-                _ => (w, l),
-            });
+
+    // Budget rows against the base's fixed-probe curve, interpolated at the
+    // same mean entries scanned (design doc M2d: the curves should overlay).
+    let curve: Vec<&Setting> = {
+        let mut c: Vec<&Setting> = base.settings.iter().filter(|s| s.budget_entries.is_none()).collect();
+        c.sort_by_key(|s| s.mean.entries_scanned);
+        c
+    };
+    let budget_rows: Vec<&Setting> = new.settings.iter().filter(|s| s.budget_entries.is_some()).collect();
+    if !budget_rows.is_empty() && curve.len() >= 2 {
+        let _ = writeln!(
+            md,
+            "\nBudget rows against the base's fixed-probe curve at equal mean entries (linear interpolation; outside the curve's range, its nearest end):\n"
+        );
+        let _ = writeln!(
+            md,
+            "| Budget | Entries scanned | Postings probed (mean) | nDCG@10 Δ | ANN R@10 Δ | Pass-1 recall Δ | p50 ms Δ | p95 ms Δ |\n|---:|---:|---:|---:|---:|---:|---:|---:|"
+        );
+        for n in &budget_rows {
+            let x = n.mean.entries_scanned as f64;
+            let at = |f: fn(&Setting) -> f64| interpolate(&curve, x, f);
             let _ = writeln!(
                 md,
-                "| @{k} | {:.4} | {:.4} | {d:+.4} [{lo:+.4}, {hi:+.4}] | {w} / {l} / {} |",
-                b.mean.ndcg_at[i],
-                n.mean.ndcg_at[i],
-                x.len() - w - l
+                "| {} | {} | {:.1} | {:+.4} | {:+.4} | {:+.4} | {:+.2} | {:+.2} |",
+                n.budget_entries.unwrap(),
+                n.mean.entries_scanned,
+                n.mean.probes,
+                n.mean.ndcg10 - at(|s| s.mean.ndcg10),
+                n.mean.ann_r10 - at(|s| s.mean.ann_r10),
+                n.mean.pass1_recall - at(|s| s.mean.pass1_recall),
+                n.latency_p50_ms - at(|s| s.latency_p50_ms),
+                n.latency_p95_ms - at(|s| s.latency_p95_ms)
             );
-            worst = worst.min(d);
         }
-        gate.push(("nDCG@{10..100} Δ ≥ −0.002 at every cutoff", worst >= -0.002));
+    }
+
+    // Gates against the base at the fixed production probe count: the new run
+    // at the same count, and (when it has one) at the default budget.
+    let mut gate = Vec::new();
+    if let Some(b) = base
+        .settings
+        .iter()
+        .find(|s| s.budget_entries.is_none() && s.n_probes == PRODUCTION_NPROBES)
+    {
+        let candidates = [
+            new.settings.iter().find(|s| s.same_as(b)),
+            new.settings.iter().find(|s| s.budget_entries == Some(DEFAULT_PROBE.budget_entries)),
+        ];
+        for n in candidates.into_iter().flatten() {
+            gate_pair(&mut md, &mut gate, b, n);
+        }
     }
     let footprint = |r: &BenchResult| (r.footprint.sparse_bytes + r.footprint.sparse_meta_bytes + r.footprint.dense_bytes) as f64;
-    gate.push(("footprint within +5%", footprint(&new) <= footprint(&base) * 1.05));
+    gate.push(("footprint within +5%".to_string(), footprint(&new) <= footprint(&base) * 1.05));
     let _ = writeln!(
         md,
         "\nIndexing: {:.0} → {:.0} docs/s. Estimator RMSE: Pass 1 {:.5} → {:.5}, Pass 2 {:.5} → {:.5}.\n",
@@ -962,7 +1153,7 @@ fn vector_bench_compare() {
         base.estimator_pass2.rmse,
         new.estimator_pass2.rmse
     );
-    let _ = writeln!(md, "Gate at n_probes {PRODUCTION_NPROBES}:\n");
+    let _ = writeln!(md, "Gate against the base at n_probes {PRODUCTION_NPROBES}:\n");
     for (name, ok) in &gate {
         let _ = writeln!(md, "- {} {name}", if *ok { "PASS" } else { "FAIL" });
     }

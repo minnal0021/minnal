@@ -536,7 +536,7 @@ async fn vector_bench_pass1_study() {
     }
     let store = DbVectorStore::new(&db, "study").await.unwrap();
     let cfg = SemanticSearchConfig {
-        n_probes: 64,
+        probe: crate::semantic_search::ProbeSettings::fixed(64),
         first_pass_sparse_search_top_k: CUT,
         ..config.clone()
     };

@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorKvStore};
-use crate::semantic_search::{VectorIndex, composite_key};
+use crate::semantic_search::{PostingDelta, VectorIndex, composite_key};
 use crate::{AsyncDb, AsyncNamespace};
 
 /// Test-only crash injection for the crash audit (design doc M0-2).
@@ -392,6 +392,9 @@ fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// WAL-backed — they are tiny key-only tombstones and do not fire during a fresh
 /// bulk load.
 ///
+/// Returns how the document's entries moved between postings, for the
+/// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
+///
 /// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
 pub async fn upsert_vectors(
     db: &AsyncDb,
@@ -399,9 +402,9 @@ pub async fn upsert_vectors(
     doc_id_bytes: &[u8],
     text: &str,
     vector_indexes: &[VectorIndex],
-) -> Result<(), crate::KVError> {
+) -> Result<PostingDelta, crate::KVError> {
     if vector_indexes.is_empty() {
-        return Ok(());
+        return Ok(PostingDelta::default());
     }
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
 
@@ -419,7 +422,7 @@ pub async fn upsert_vectors(
     // Dropping the work is right — the store it belongs to is gone.
     if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
         log::debug!("upsert_vectors: skipping '{namespace}' — the namespace no longer exists");
-        return Ok(());
+        return Ok(PostingDelta::default());
     }
 
     // ── Sparse (SingleBit) and the meta ──────────────────────────────────────
@@ -434,16 +437,22 @@ pub async fn upsert_vectors(
     let new_cluster_ids: Vec<u32> = new_cluster_groups.keys().copied().collect();
 
     // (1) Delete stale cluster keys no longer present (WAL).
+    let mut old_cluster_ids = Vec::new();
     if let Some(old_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
         && let Some(old) = decode_sparse_meta(&old_bytes)
     {
-        for old_id in old.cluster_ids {
+        old_cluster_ids = old.cluster_ids;
+        for &old_id in &old_cluster_ids {
             if !new_cluster_ids.contains(&old_id) {
                 crash_point!();
                 sparse_ns.delete(composite_key::encode(old_id, doc_id_bytes)).await?;
             }
         }
     }
+    let delta = PostingDelta {
+        added: new_cluster_ids.iter().copied().filter(|id| !old_cluster_ids.contains(id)).collect(),
+        removed: old_cluster_ids.iter().copied().filter(|id| !new_cluster_ids.contains(id)).collect(),
+    };
     // (2) The new meta, durable before any key it lists is written (WAL).
     crash_point!();
     sparse_meta_ns
@@ -468,7 +477,7 @@ pub async fn upsert_vectors(
         dense_ns.put_no_wal(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
     }
 
-    Ok(())
+    Ok(delta)
 }
 
 /// Number of stripes in [`lock_doc_vectors`]; a power of two.
@@ -501,18 +510,20 @@ async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::
 /// Delete the quantised vector for a document from the vector KV store.
 ///
 /// No-op if no vector entry exists for `doc_id_bytes` (the document was never
-/// indexed, or was already cleaned up).
-pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+/// indexed, or was already cleaned up). Returns the postings that lost an entry.
+pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
+    let mut delta = PostingDelta::default();
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
         if let Some(meta) = decode_sparse_meta(&meta_bytes) {
             let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-            for cluster_id in meta.cluster_ids {
+            for &cluster_id in &meta.cluster_ids {
                 crash_point!();
                 sparse_ns.delete(composite_key::encode(cluster_id, doc_id_bytes)).await?;
             }
+            delta.removed = meta.cluster_ids;
         }
         crash_point!();
         sparse_meta_ns.delete(doc_id_bytes.to_vec()).await?;
@@ -523,7 +534,7 @@ pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
     crash_point!();
     dense_ns.delete(doc_id_bytes.to_vec()).await?;
 
-    Ok(())
+    Ok(delta)
 }
 
 /// Return `true` only if a document has a **complete, current** committed vector
@@ -1059,11 +1070,12 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
 /// entry: write the document's vectors, make them durable, then complete the
 /// entry. The worker does the same over a batch, with one
 /// [`make_vector_writes_durable`] for the whole batch.
-pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
-    upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, &entry.text, vector_indexes).await?;
+pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<PostingDelta, crate::KVError> {
+    let mut delta = upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, &entry.text, vector_indexes).await?;
     crash_point!();
     make_vector_writes_durable(db, std::slice::from_ref(&entry.namespace)).await?;
-    complete_embed(db, entry).await
+    delta.extend(complete_embed(db, entry).await?);
+    Ok(delta)
 }
 
 /// Make every vector write already done for the given (parent) namespaces durable,
@@ -1091,7 +1103,7 @@ pub async fn make_vector_writes_durable(db: &AsyncDb, namespaces: &[String]) -> 
 /// [`make_vector_writes_durable`]) — conditionally (see the section comment). If
 /// the document was cleared while it was being embedded, the vectors just written
 /// are removed again.
-pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<(), crate::KVError> {
+pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<PostingDelta, crate::KVError> {
     // The vectors just written must belong to a document that still exists. A
     // delete normally leaves a `Clear` tombstone that the completion below sees,
     // but an entry written from a snapshot (reconciliation) can land after that
@@ -1113,12 +1125,13 @@ pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<(), crat
         }
     };
     let vanished = doc_exists(db).await? == Some(false);
+    let mut delta = PostingDelta::default();
     if vanished {
-        delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
+        delta = delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
     }
     match complete_entry(db, entry).await? {
         Completion::Superseded => {}
-        Completion::Cleared => return process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
+        Completion::Cleared => delta.extend(process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?),
         // Re-created with the same text between the check and the completion: its
         // vectors were just removed, so queue it again.
         Completion::Done => {
@@ -1127,14 +1140,14 @@ pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<(), crat
             }
         }
     }
-    Ok(())
+    Ok(delta)
 }
 
 /// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
 /// then remove the tombstone unless a newer upsert has replaced it (in which case
 /// the next pass embeds that).
-pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
-    delete_vector(db, namespace, doc_id_bytes).await?;
+pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
+    let delta = delete_vector(db, namespace, doc_id_bytes).await?;
     let tombstone = QueueEntry {
         namespace: namespace.to_owned(),
         doc_id_bytes: doc_id_bytes.to_vec(),
@@ -1143,7 +1156,7 @@ pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
         retry_count: 0,
         last_error: None,
     };
-    complete_entry(db, &tombstone).await.map(|_| ())
+    complete_entry(db, &tombstone).await.map(|_| delta)
 }
 
 /// Record a failed attempt at `entry`: bump its retry count and store `error` —
@@ -1184,7 +1197,7 @@ pub async fn record_queue_failure(db: &AsyncDb, entry: &QueueEntry, error: &str)
 /// vectors are also deleted here, synchronously, so they stop matching
 /// immediately; the worker's later [`process_clear`] is an idempotent repeat that
 /// also removes the tombstone. Both writes are WAL-backed (see [`delete_vector`]).
-pub async fn clear_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+pub async fn clear_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     crash_point!();
     queue_ns
@@ -1314,7 +1327,27 @@ pub async fn load_ivf(db: &AsyncDb, namespace: &str, seed: u64) -> Result<Option
             routing_centroid: bytes_to_f32s(&v[5..]).ok_or_else(|| bad(format!("malformed posting {id}")))?,
         });
     }
-    NamespaceIvf::new(postings, centres, seed).map(Some).map_err(bad)
+    let ivf = NamespaceIvf::new(postings, centres, seed).map_err(bad)?;
+    ivf.set_entry_counts(&count_posting_entries(db, namespace).await?);
+    Ok(Some(ivf))
+}
+
+/// Entries per posting in `namespace`'s Pass-1 store, counted from its keys
+/// (`posting_id ‖ doc_id`) alone: the value log is never read. About 90k keys
+/// for FiQA.
+pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
+    let mut counts = HashMap::new();
+    let sparse = sparse_vectors_ns(namespace);
+    // Resolving a namespace creates it: count nothing rather than create one.
+    if !db.list_namespaces().iter().any(|(name, _)| *name == sparse) {
+        return Ok(counts);
+    }
+    for key in db.namespace(sparse).await?.keys().await? {
+        if let Some((posting, _)) = composite_key::decode(&key) {
+            *counts.entry(posting).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -1376,6 +1409,69 @@ mod ivf_store_tests {
         seed_ivf(&db, "ns", &centroids()).await.unwrap();
         let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
         assert_eq!((ivf.postings(), ivf.centres()), (4, 4), "the stray centre was wiped");
+        db.shutdown().await.unwrap();
+    }
+
+    /// The entry counts a search budgets by: counted from the keys at load, and
+    /// kept equal to a fresh recount by the deltas every vector write returns.
+    #[tokio::test]
+    async fn entry_counts_follow_writes_and_are_recounted_at_load() {
+        use crate::semantic_search::IvfLayout;
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let chunks = |postings: &[u32]| -> Vec<VectorIndex> {
+            postings
+                .iter()
+                .map(|&p| VectorIndex::new(p, QuantisationStyle::SingleBit, 0.5, 0.0, 0.01, vec![]))
+                .chain([VectorIndex::new(
+                    u32::MAX,
+                    QuantisationStyle::MultiBit { number_of_bits: 8 },
+                    0.5,
+                    0.0,
+                    0.01,
+                    vec![],
+                )])
+                .collect()
+        };
+        let counts = |ivf: &crate::semantic_search::NamespaceIvf| (1..=4).map(|p| ivf.posting_entries(p).unwrap()).collect::<Vec<_>>();
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        db.namespace("ns".to_string()).await.unwrap();
+        seed_ivf(&db, "ns", &centroids()).await.unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        assert_eq!(counts(&ivf), [0, 0, 0, 0]);
+        let recount = |db: AsyncDb| async move {
+            let c = count_posting_entries(&db, "ns").await.unwrap();
+            (1..=4).map(|p| c.get(&p).copied().unwrap_or(0)).collect::<Vec<_>>()
+        };
+
+        // Two chunks in one posting are one entry.
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "t", &chunks(&[1, 1, 2])).await.unwrap());
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"b", "t", &chunks(&[2, 3])).await.unwrap());
+        assert_eq!(counts(&ivf), [1, 2, 1, 0]);
+        // A re-embed moves "a" out of 1 and into 4; posting 2 keeps it.
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "u", &chunks(&[2, 4])).await.unwrap());
+        assert_eq!(counts(&ivf), [0, 2, 1, 1]);
+        assert_eq!(counts(&ivf), recount(db.clone()).await);
+        // Deletes, including of a document that has no vectors.
+        ivf.apply_delta(&delete_vector(&db, "ns", b"b").await.unwrap());
+        ivf.apply_delta(&delete_vector(&db, "ns", b"ghost").await.unwrap());
+        ivf.apply_delta(&clear_vectors(&db, "ns", b"a").await.unwrap());
+        assert_eq!(counts(&ivf), [0, 0, 0, 0]);
+        assert_eq!(counts(&ivf), recount(db.clone()).await);
+
+        // Counted afresh at load, including after a reopen.
+        upsert_vectors(&db, "ns", b"c", "t", &chunks(&[3, 4])).await.unwrap();
+        upsert_vectors(&db, "ns", b"d", "t", &chunks(&[4])).await.unwrap();
+        db.shutdown().await.unwrap();
+        drop(db);
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        assert_eq!(counts(&ivf), [0, 0, 1, 2]);
+        assert_eq!(ivf.total_entries(), 3);
         db.shutdown().await.unwrap();
     }
 
@@ -3114,7 +3210,7 @@ mod real_kv_profile {
 
             for &n_probes in &N_PROBES_SWEEP {
                 let config = SemanticSearchConfig {
-                    n_probes,
+                    probe: crate::semantic_search::ProbeSettings::fixed(n_probes),
                     ..base_config.clone()
                 };
 
@@ -3123,7 +3219,7 @@ mod real_kv_profile {
                 let probe_clusters: Vec<u32> = {
                     let mut seen = std::collections::HashSet::new();
                     let mut ids = Vec::new();
-                    for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes) {
+                    for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, n_probes) {
                         for id in chunk_ids {
                             if seen.insert(id) {
                                 ids.push(id);
@@ -3150,7 +3246,7 @@ mod real_kv_profile {
                 let mut scanned_entries = 0usize;
                 for _ in 0..ITERS {
                     let t = Instant::now();
-                    let probes = index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes);
+                    let probes = index.find_top_n_cluster_ids_batch(&sparse_query, n_probes);
                     let mut seen = std::collections::HashSet::new();
                     let mut pc = Vec::new();
                     for chunk_ids in probes {
@@ -3249,7 +3345,7 @@ pub(crate) mod eval_indexing {
         let mut first_err: Option<String> = None;
         while let Some(res) = set.join_next().await {
             match res.unwrap() {
-                Ok(()) => ok += 1,
+                Ok(_) => ok += 1,
                 Err(e) => {
                     fail += 1;
                     first_err.get_or_insert(e);
@@ -3435,7 +3531,7 @@ mod real_recall {
 
         // ── Ground truth: exhaustive-probe top-k per query ──
         let gt_config = SemanticSearchConfig {
-            n_probes: NPROBES[0],
+            probe: crate::semantic_search::ProbeSettings::fixed(NPROBES[0]),
             ..(*base_config).clone()
         };
         let (ground_truth, _) = run_all(&gt_config, &index, &store, &q_embs, no_filter).await;
@@ -3450,7 +3546,7 @@ mod real_recall {
         eprintln!("  ---------+-----------+------------+-----------+---------------");
         for &np in &NPROBES {
             let config = SemanticSearchConfig {
-                n_probes: np,
+                probe: crate::semantic_search::ProbeSettings::fixed(np),
                 ..(*base_config).clone()
             };
             let (ranked, mut lat_us) = run_all(&config, &index, &store, &q_embs, no_filter).await;
@@ -3571,7 +3667,7 @@ mod crash_audit_tests {
             match entry.kind {
                 QueueEntryKind::Embed => finish_embed(db, &entry, &vectors_for_text(&entry.text)).await?,
                 QueueEntryKind::Clear => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?,
-            }
+            };
         }
         Ok(())
     }

@@ -356,6 +356,22 @@ impl SemanticSearchContext {
         self.ivfs.write().retain(|(name, _), _| name != namespace);
     }
 
+    /// Apply one document's [`PostingDelta`] to `namespace`'s entry counts, if
+    /// its partition is loaded. When it is not, there is nothing to update: the
+    /// load counts from the store.
+    ///
+    /// [`PostingDelta`]: crate::semantic_search::PostingDelta
+    pub fn apply_posting_delta(&self, namespace: &str, delta: &crate::semantic_search::PostingDelta) {
+        if delta.added.is_empty() && delta.removed.is_empty() {
+            return;
+        }
+        for ((name, _), ivf) in self.ivfs.read().iter() {
+            if name == namespace {
+                ivf.apply_delta(delta);
+            }
+        }
+    }
+
     /// Check that `settings` can run here: its model has centroids, and they
     /// have its dimension.
     pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
@@ -404,9 +420,9 @@ impl SemanticSearchContext {
                         .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
                             namespace: namespace.to_owned(),
                         })?;
-                let ivf = Arc::new(ivf);
-                self.ivfs.write().insert(key, Arc::clone(&ivf));
-                ivf
+                // Two first uses can race to load; keep whichever landed first,
+                // so every count update goes to the one partition in use.
+                Arc::clone(self.ivfs.write().entry(key).or_insert_with(|| Arc::new(ivf)))
             }
         };
         if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
@@ -422,7 +438,7 @@ impl SemanticSearchContext {
             window_size: settings.window_size as usize,
             sliding_size: settings.sliding_size as usize,
             number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
-            n_probes: settings.search.n_probes as usize,
+            probe: probe_settings(&settings.search),
             first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
             top_k_results: settings.search.top_k as usize,
             ..self.config.clone()
@@ -437,12 +453,14 @@ impl NamespaceSemantics {
     /// (validated against the same ranges as the schema).
     pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
         let base = SearchSettings {
-            n_probes: self.config.n_probes as u32,
+            probe_budget_entries: self.config.probe.budget_entries as u32,
+            min_probes: self.config.probe.min_probes as u32,
+            max_probes: self.config.probe.max_probes as u32,
             first_pass_top_k: self.config.first_pass_sparse_search_top_k as u32,
             top_k: self.config.top_k_results as u32,
         };
         let s = overrides.apply(base)?;
-        self.config.n_probes = s.n_probes as usize;
+        self.config.probe = probe_settings(&s);
         self.config.first_pass_sparse_search_top_k = s.first_pass_top_k as usize;
         self.config.top_k_results = s.top_k as usize;
         Ok(self)
@@ -472,6 +490,16 @@ pub struct ReindexStats {
     pub exhausted_cleared: usize,
     /// Number of documents enqueued for re-embedding.
     pub enqueued: usize,
+}
+
+/// The probe settings a namespace's search settings describe.
+#[cfg(feature = "semantic-search")]
+fn probe_settings(s: &SearchSettings) -> crate::semantic_search::ProbeSettings {
+    crate::semantic_search::ProbeSettings {
+        budget_entries: u64::from(s.probe_budget_entries),
+        min_probes: s.min_probes as usize,
+        max_probes: s.max_probes as usize,
+    }
 }
 
 #[cfg(test)]

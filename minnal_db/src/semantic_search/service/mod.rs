@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 
 use rayon::prelude::*;
 
-use crate::semantic_search::cluster::{IvfLayout, ZERO_CENTRE};
+use crate::semantic_search::cluster::{IvfLayout, ProbeSettings, ZERO_CENTRE, select_probes};
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::semantic_search::quantisation::rabitq;
@@ -47,6 +47,15 @@ static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 type SparseEntryRef<'a> = (u32, &'a [u8], &'a [u8]);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
+
+/// The default probe settings: read about 70,000 entries per query (what 64
+/// fixed probes read on FiQA, the largest corpus measured), probing 1 to 1,024
+/// postings.
+pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
+    budget_entries: 70_000,
+    min_probes: 1,
+    max_probes: 1024,
+};
 
 /// Configuration required to call the embedding service.
 #[derive(Debug, Clone)]
@@ -84,9 +93,10 @@ pub struct SemanticSearchConfig {
     /// How far the document chunk window advances, in sentences. Default: 2.
     pub sliding_size: usize,
 
-    /// Number of IVF clusters to probe in the first-pass sparse (single-bit) search.
-    /// Default: 32.
-    pub n_probes: usize,
+    /// How many postings the first-pass sparse (single-bit) search probes: an
+    /// entry budget bounded by a minimum and maximum posting count
+    /// ([`ProbeSettings`]). Default: 70,000 entries, 1 to 1,024 postings.
+    pub probe: ProbeSettings,
 
     /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
     /// Default: 1000.
@@ -118,7 +128,7 @@ impl Default for SemanticSearchConfig {
             embedding_dim: 768,
             top_k_results: 100,
             number_of_bits_for_dense_quantisation: 8,
-            n_probes: 64,
+            probe: DEFAULT_PROBE,
             window_size: 4,
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
@@ -224,8 +234,8 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
 /// `semantic_search/report/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
-/// It is also much cheaper: one embedding instead of 1 + N, and `n_probes`
-/// clusters probed instead of the union over every fragment (search up to 74%
+/// It is also much cheaper: one embedding instead of 1 + N, and one vector's
+/// postings probed instead of the union over every fragment (search up to 74%
 /// faster). Document-style sentence windows for long queries gained nothing
 /// either.
 pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<QueryEmbeddings, EmbeddingError> {
@@ -254,8 +264,10 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 /// # Algorithm
 ///
 /// **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
-/// 1. For each query vector `q_i` in `query_sparse_embeddings`, find the `n_probes`
-///    closest clusters by Euclidean distance.
+/// 1. For each query vector `q_i` in `query_sparse_embeddings`, walk the clusters
+///    nearest first (Euclidean distance) until their entries reach the probe
+///    budget, within the minimum and maximum probe counts (`config.probe`,
+///    [`ProbeSettings`]).
 /// 2. Scan all SingleBit (document-chunk) entries in the union of those clusters in parallel.
 /// 3. For each document `d` and each query vector `q_i`, estimate `max_j ⟨q_i, d_j⟩`
 ///    over all chunks `d_j` of `d` found in the probed clusters.
@@ -264,8 +276,8 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 /// 5. Retain the top `first_pass_sparse_search_top_k` candidates.
 ///
 /// In production the query is **not chunked**: [`embed_query`] passes a single
-/// vector (the whole-query embedding), so Pass 1 probes exactly `n_probes`
-/// clusters and `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
+/// vector (the whole-query embedding), so Pass 1 probes one vector's clusters
+/// and `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
 /// The multi-vector form is kept general.
 ///
 /// **Pass 2 — dense (MultiBit):**
@@ -381,24 +393,15 @@ where
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
-    // Union of top-n_probes clusters across all Pass-1 query vectors (in production
-    // there is one, so this is just its n_probes nearest). The per-vector top-n scans
-    // are batched over a contiguous centroid matrix; the union/dedup below preserves
-    // first-seen order over the batched results.
-    let probe_clusters: Vec<u32> = {
-        let mut seen = std::collections::HashSet::new();
-        let mut ids = Vec::new();
-        for chunk_ids in layout.probe(query_sparse_embeddings, config.n_probes) {
-            for id in chunk_ids {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
-            }
-        }
-        ids
-    };
+    // Each Pass-1 query vector's nearest clusters within the probe budget, then
+    // their union (in production there is one vector). The per-vector rankings
+    // are batched over a contiguous centroid matrix.
+    let (probe_clusters, planned_entries) = select_probes(layout, query_sparse_embeddings, &config.probe);
 
-    debug!("ANN search: probing {} cluster(s) (sparse pass)", probe_clusters.len());
+    debug!(
+        "ANN search: probing {} cluster(s), about {planned_entries} entries (sparse pass)",
+        probe_clusters.len()
+    );
 
     // Fetch all probed clusters in a single batch operation: one blocking task, which
     // spawns a scoped thread per overlapping L1 bucket and then one per value-log bucket.
@@ -1137,7 +1140,7 @@ mod tests {
         // A tight first-pass cut, so Pass 1's own ranking must be right too (with
         // the default 1,000 candidates Pass 2 would rescue any Pass-1 mistake).
         let config = SemanticSearchConfig {
-            n_probes: 16,
+            probe: ProbeSettings::fixed(16),
             first_pass_sparse_search_top_k: 3,
             ..SemanticSearchConfig::default()
         };
@@ -1481,7 +1484,7 @@ mod tests {
         store.add_sparse_entry(1, b"doc", 0.0);
         store.add_dense_entry(1, b"doc", 0.1);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1682,7 +1685,7 @@ mod tests {
     async fn test_search_surfaces_storage_errors_from_either_pass() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         for fail_sparse in [true, false] {
@@ -1718,7 +1721,7 @@ mod tests {
         store.add_sparse_entry(1, b"doc_a", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1754,7 +1757,7 @@ mod tests {
         store.add_corrupt_dense_entry(b"doc_dense_corrupt");
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1807,7 +1810,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_bad", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1850,7 +1853,7 @@ mod tests {
 
         // Default config dense bit-width is 8.
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1892,7 +1895,7 @@ mod tests {
         store.add_dense_entry_multi(b"doc_dup", 2); // two dense entries — invalid
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1931,7 +1934,7 @@ mod tests {
         // doc_low deliberately has no dense entry to prove it is not reached.
 
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
@@ -1968,7 +1971,7 @@ mod tests {
         store.add_dense_entry(2, b"doc_b", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1, // each query probes only 1 cluster → union = {1, 2}
+            probe: ProbeSettings::fixed(1), // each query probes only 1 cluster → union = {1, 2}
             first_pass_sparse_search_top_k: 10,
             ..Default::default()
         };
@@ -2002,7 +2005,7 @@ mod tests {
         // Deliberately no dense entry.
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -2039,7 +2042,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_high_score", 0.1); // score = C - 0.1 (higher)
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             ..Default::default()
         };
@@ -2078,7 +2081,7 @@ mod tests {
         }
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             top_k_results: 2,
             ..Default::default()
@@ -2112,7 +2115,7 @@ mod tests {
         }
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             top_k_results: 100, // would return all 3 without override
             ..Default::default()
@@ -2192,7 +2195,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_q", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the sparse winner reaches dense
             ..Default::default()
         };
@@ -2264,7 +2267,7 @@ mod tests {
         // and centre 1 gives 0, so only "moved" survives a cut of one. Decoded
         // through the posting, both would score 0 and tie.
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
@@ -2375,7 +2378,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_b", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,                       // q1 → cluster 1, q2 → cluster 2
+            probe: ProbeSettings::fixed(1),    // q1 → cluster 1, q2 → cluster 2
             first_pass_sparse_search_top_k: 1, // only the top-scored doc enters dense
             ..Default::default()
         };
@@ -2417,7 +2420,7 @@ mod tests {
         store.add_dense_entry(2, b"doc_low", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the better sparse candidate passes
             ..Default::default()
         };
@@ -2488,7 +2491,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_solo", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the top sparse score passes
             ..Default::default()
         };
@@ -2555,7 +2558,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_rival", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
@@ -2602,7 +2605,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_one_token", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 2, // let both through sparse
             ..Default::default()
         };
@@ -2662,7 +2665,7 @@ mod tests {
     async fn test_search_early_return_releases_the_scoring_gate() {
         let index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         // Every sparse entry is corrupt, so Pass 1 keeps no candidate and `search`
@@ -2698,7 +2701,7 @@ mod tests {
             store.add_dense_entry(cluster, &doc_id, (d % 89) as f32 * 0.01);
         }
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 500,
             ..Default::default()
         };

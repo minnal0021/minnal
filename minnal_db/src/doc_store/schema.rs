@@ -193,8 +193,8 @@ pub enum SchemaAmendment {
         fields: Vec<String>,
         vector_index: Option<VectorIndexSpec>,
     },
-    /// Change the namespace's search defaults (`n_probes`, `first_pass_top_k`,
-    /// `top_k`). Takes effect on later searches; nothing is re-embedded. Fails
+    /// Change the namespace's search defaults (`probe_budget_entries`,
+    /// `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`). Takes effect on later searches; nothing is re-embedded. Fails
     /// if the namespace has never had semantic search enabled.
     UpdateVectorSearch { search: SearchSpec },
 }

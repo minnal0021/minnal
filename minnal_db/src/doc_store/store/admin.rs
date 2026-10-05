@@ -199,8 +199,8 @@ impl DocStore {
         Ok(())
     }
 
-    /// Change a store's search defaults (`n_probes`, `first_pass_top_k`,
-    /// `top_k`), for document and KV stores alike. Later searches use them;
+    /// Change a store's search defaults (`probe_budget_entries`, `min_probes`,
+    /// `max_probes`, `first_pass_top_k`, `top_k`), for document and KV stores alike. Later searches use them;
     /// nothing is re-embedded. Fails with
     /// [`SchemaError::VectorIndexNotConfigured`] if the store has never had
     /// semantic search enabled, and with [`SchemaError::InvalidVectorSetting`]

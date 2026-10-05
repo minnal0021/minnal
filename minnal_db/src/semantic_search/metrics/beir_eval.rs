@@ -263,7 +263,7 @@ async fn beir_eval() {
     for &n_probes in &NPROBES {
         for &first_pass in &FIRST_PASS {
             let run_config = SemanticSearchConfig {
-                n_probes,
+                probe: crate::semantic_search::ProbeSettings::fixed(n_probes),
                 first_pass_sparse_search_top_k: first_pass,
                 ..(*base_config).clone()
             };

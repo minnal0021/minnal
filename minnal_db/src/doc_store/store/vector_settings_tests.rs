@@ -50,7 +50,7 @@ async fn create_writes_every_default_into_the_saved_schema() {
         "embedding_model": "gemma", "embedding_dim": 768,
         "chunking": {"window_size": 4, "sliding_size": 2},
         "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001", "pass2_centre": "zero"},
-        "search": {"n_probes": 64, "first_pass_top_k": 1000, "top_k": 100}
+        "search": {"probe_budget_entries": 70_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100}
     });
     assert_eq!(saved_vector_index(schema_dir.path(), "docs"), expected);
     let kv_saved = saved_vector_index(schema_dir.path(), "kvs");
@@ -137,14 +137,14 @@ async fn fixed_settings_survive_a_vector_index_drop_and_re_enable() {
             SchemaAmendment::AddEmbeddingAttribute {
                 name: "body".into(),
                 description: None,
-                vector_index: Some(spec(r#"{"embedding_model":"QWEN","search":{"n_probes":8}}"#)),
+                vector_index: Some(spec(r#"{"embedding_model":"QWEN","search":{"max_probes":8}}"#)),
             },
         )
         .await
         .unwrap();
     let s = store.get_schema("docs").unwrap().vector_settings().unwrap();
     assert_eq!(
-        (s.embedding_model.as_str(), s.window_size, s.sliding_size, s.search.n_probes),
+        (s.embedding_model.as_str(), s.window_size, s.sliding_size, s.search.max_probes),
         ("qwen", 6, 3, 8)
     );
     store.shutdown().await.unwrap();
@@ -166,7 +166,7 @@ async fn update_vector_search_changes_only_search_settings() {
         .unwrap();
 
     let update = SearchSpec {
-        n_probes: Some(16),
+        probe_budget_entries: Some(16_000),
         top_k: Some(10),
         ..Default::default()
     };
@@ -176,20 +176,26 @@ async fn update_vector_search_changes_only_search_settings() {
         let saved = saved_vector_index(schema_dir.path(), ns);
         assert_eq!(
             saved["search"],
-            serde_json::json!({"n_probes": 16, "first_pass_top_k": 1000, "top_k": 10}),
+            serde_json::json!({
+                "probe_budget_entries": 16_000,
+                "min_probes": 1,
+                "max_probes": 1024,
+                "first_pass_top_k": 1000,
+                "top_k": 10
+            }),
             "{ns}"
         );
         assert_eq!(saved["embedding_model"], "gemma", "{ns}");
     }
 
     let bad = SearchSpec {
-        n_probes: Some(0),
+        probe_budget_entries: Some(0),
         ..Default::default()
     };
     assert!(matches!(
         store.update_vector_search("docs", &bad).await.unwrap_err(),
         DocStoreError::Schema(SchemaError::InvalidVectorSetting {
-            field: "search.n_probes",
+            field: "search.probe_budget_entries",
             ..
         })
     ));
@@ -338,6 +344,55 @@ mod with_service {
 
     const TEXT: &str = "One sentence here. Two sentences now. Three of them. Four in a row. Five so far. Six at last.";
 
+    /// The loaded partition's entry counts track the worker's writes and the
+    /// doc store's deletes, matching a fresh count of the stored keys.
+    #[tokio::test]
+    async fn entry_counts_track_indexing_updates_and_deletes() {
+        use crate::semantic_search::IvfLayout;
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"chunking":{"window_size":1,"sliding_size":1}}"#)),
+            ))
+            .await
+            .unwrap();
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let check = || async {
+            let ivf = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().ivf;
+            let stored = vector_kv::count_posting_entries(&store.db, "g").await.unwrap();
+            let loaded: std::collections::HashMap<u32, u64> = (1..=2)
+                .filter_map(|p| ivf.posting_entries(p).filter(|&n| n > 0).map(|n| (p, n)))
+                .collect();
+            assert_eq!(loaded, stored);
+            ivf.total_entries()
+        };
+
+        for i in 0..6u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        assert!(check().await > 0, "the documents were indexed");
+        // Re-embed with other text, then delete some (doc-store path) and blank one.
+        for i in 0..3u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("Other words {i}. And more.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        check().await;
+        store.delete("g", DocId::U64(4)).await.unwrap();
+        store.delete("g", DocId::U64(5)).await.unwrap();
+        store.put("g", DocId::U64(3), serde_json::json!({"text": ""})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        check().await;
+        store.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn two_namespaces_with_different_models_each_use_their_own() {
         let (url, seen) = spawn_service();
@@ -453,10 +508,10 @@ mod with_service {
         for (bad, field) in [
             (
                 SearchSpec {
-                    n_probes: Some(0),
+                    min_probes: Some(0),
                     ..Default::default()
                 },
-                "search.n_probes",
+                "search.min_probes",
             ),
             (
                 SearchSpec {

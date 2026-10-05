@@ -186,7 +186,9 @@ pub struct KvSemanticSearchRequest {
     /// Per-request overrides of the store's search settings; see
     /// [`SemanticSearchRequest`](super::semantic_search::SemanticSearchRequest).
     pub top_k: Option<Limit>,
-    pub n_probes: Option<u32>,
+    pub probe_budget_entries: Option<u32>,
+    pub min_probes: Option<u32>,
+    pub max_probes: Option<u32>,
     pub first_pass_top_k: Option<u32>,
     #[serde(default)]
     pub page_size: Limit,
@@ -225,7 +227,7 @@ pub async fn search_kv_semantic(
         .kv_search_semantic(
             &ns,
             &req.query,
-            &super::semantic_search::search_overrides(req.top_k, req.n_probes, req.first_pass_top_k),
+            &super::semantic_search::search_overrides(req.top_k, req.probe(), req.first_pass_top_k),
             pagination,
         )
         .await

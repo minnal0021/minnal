@@ -14,15 +14,19 @@ impl DocStore {
     /// flight, so the queue entry and the vectors are removed directly.
     #[cfg(feature = "semantic-search")]
     pub(super) async fn clear_doc_vectors(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
-        match &self.notify {
+        let delta = match &self.notify {
             Some(notify) => {
-                vector_kv::clear_vectors(&self.db, namespace, key).await?;
+                let delta = vector_kv::clear_vectors(&self.db, namespace, key).await?;
                 notify.notify_one();
+                delta
             }
             None => {
                 vector_kv::remove_queue_entry(&self.db, namespace, key).await?;
-                vector_kv::delete_vector(&self.db, namespace, key).await?;
+                vector_kv::delete_vector(&self.db, namespace, key).await?
             }
+        };
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.apply_posting_delta(namespace, &delta);
         }
         Ok(())
     }

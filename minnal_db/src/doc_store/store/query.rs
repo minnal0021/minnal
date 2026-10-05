@@ -83,8 +83,8 @@ impl DocStore {
     /// every quantised vector in the namespace's companion KV store and returns
     /// the top results sorted by descending dot-product similarity.
     ///
-    /// The namespace's search settings (`n_probes`, `first_pass_top_k`,
-    /// `top_k`) apply unless `overrides` sets them for this query; overrides are
+    /// The namespace's search settings (`probe_budget_entries`, `min_probes`,
+    /// `max_probes`, `first_pass_top_k`, `top_k`) apply unless `overrides` sets them for this query; overrides are
     /// validated against the same ranges as the schema.
     ///
     /// Returns [`DocStoreError::SemanticSearchNotEnabled`] if the namespace does
