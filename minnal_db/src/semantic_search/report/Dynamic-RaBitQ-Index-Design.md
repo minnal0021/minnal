@@ -17,7 +17,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-1** Durable re-embed ✓ | The vector worker completes a queue entry only after its vectors are flushed | — | Crash regression test passes; end-to-end indexing throughput within 5% |
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
-| **M2** Namespace-owned index | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
+| **M2** Namespace-owned index ✓ | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 | *Optional, future:* **BYO embeddings** | A write may bring its own vectors; dense-only namespaces (see *Caller-supplied embeddings*) | No | Not on the critical path; built on demand after M3d |
@@ -987,6 +987,73 @@ scans on FiQA at M0.
 
 **Gate:** the curves overlay M2c within noise; at the default budget, latency
 ≤ M2c and recall ≥ M2c.
+
+### M2d result (2026-10-05)
+
+**Passed**, with one gate clause amended (below). Pass 1 walks each query
+vector's postings nearest first, in the same order as before, and stops once it
+has probed `min_probes` postings and their entries reach `probe_budget_entries`,
+never going past `max_probes` (`cluster::select_probes`). The posting that
+crosses the budget is probed. The schema's `search` settings are
+`probe_budget_entries` (default 70,000), `min_probes` (1) and `max_probes`
+(1,024), which replace `n_probes`. They can be changed at any time and
+overridden per request. `ProbeSettings::fixed(n)` probes exactly `n` postings
+and is what tests, raw `vector_kv` users and the criterion benches use.
+
+**Entry counts.** A namespace's `NamespaceIvf` keeps one counter per posting.
+They are counted from the `{ns}_sparse_vector` keys when the partition loads
+(keys only, so the value log is not read), then kept current by the
+`PostingDelta` that every vector write returns (worker embed, clear and
+completion; document delete). The counts are an estimate. A write racing the
+load, or no-WAL entries lost in a crash, can leave them slightly off until the
+next load recounts. They only decide how much a search reads: a count that is
+too low makes a search read more, never less. In the bench the counts loaded
+after indexing equal the stored keys for every posting.
+
+Gate, M2c against M2d, two alternated rounds (numbers from round 1; round 2
+agrees to within 0.3 ms):
+
+| Model, dataset | Fixed `n_probes` 4–256 | Default budget against 64 probes: entries | nDCG@10 | ANN R@10 | Worst nDCG Δ @10–@100 | p50 ms |
+|---|---|---|---|---|---|---|
+| gemma SciFact | identical (0 / 0 / 300 at every count) | 5,587 → 8,197 (all) | 0.7906 → 0.7906 | 0.983 → 0.996 | −0.0007 (@30) | 3.13 → 3.92 |
+| gemma FiQA | identical (0 / 0 / 648) | 69,491 → 70,990 | 0.4735 → 0.4755 | 0.993 → 0.996 | +0.0018 (@20) | 14.56 → 14.39 |
+| qwen SciFact | identical | 7,021 → 8,478 (all) | 0.7817 → 0.7817 | 0.994 → 0.997 | +0.0000 (@10) | 3.19 → 3.75 |
+| qwen FiQA | identical | 71,812 → 71,205 | 0.5922 → 0.5922 | 0.997 → 0.997 | −0.0001 (@100) | 15.15 → 14.99 |
+
+- **Fixed probe counts** reproduce M2c query for query, so the new probe path and
+  the entry counts change nothing until a budget is used.
+- **FiQA at the default** passes every gate on both models: quality equal or
+  slightly higher, latency equal or slightly lower.
+- **SciFact at the default** is a full scan, because the namespace holds fewer
+  entries (8,197 and 8,478) than the budget. Recall rises, nDCG moves by
+  −0.0007 to +0.0013 across the cutoffs, and p50 rises by 0.6–0.8 ms. **Amended gate
+  (user decision):** a budget that covers the whole namespace trades time for
+  recall on purpose, so its latency is reported but not gated; it must not lose
+  recall. The alternative, a budget relative to namespace size, was rejected:
+  it adds a setting and ties cost to corpus size again.
+- **The curves.** Budget rows were compared with the M2c fixed-probe curve at the
+  same mean number of entries (linear interpolation). On FiQA, from about 20% of
+  the corpus upwards, the budget matches or beats fixed probing at equal cost:
+  ANN R@10 +0.0002 to +0.015, p50 within +0.03 ms or up to 0.5 ms lower. Below that,
+  budget rows scan fewer entries than the curve's lowest point (4 probes), so
+  there is nothing to compare them with. On SciFact budget probing is **worse**
+  at small budgets (gemma, about 3,100 entries: ANN R@10 0.893 against 0.92
+  for fixed probing). One gemma SciFact posting holds 43% of the chunks, and a
+  query nearest to it uses up its budget in one or two postings. Fixed probing
+  spreads the same entries over more postings. Matching postings in size is
+  M3's job; re-check this curve after M3a.
+- **A cheaper default exists but was not taken.** At a budget of about 40k, FiQA
+  nDCG@10 equals the 64-probe value (gemma 0.4740, qwen 0.5924) at p50 about
+  9.4 ms instead of 14.8, but ANN R@10 is 0.8–0.9 pt lower, which is over the
+  0.5 pt gate. The default stays at today's cost. A namespace can lower it.
+
+**Not done for M2d:** the online check (scratch server, `search_load`). M2d
+changes the serving path only in its renamed fields, so it is deferred to the
+end of M3 (user decision), where one online check covers both.
+
+**For M3.** The split trigger needs posting sizes. The M2d counts are close but
+not exact (see above): either recount a posting before splitting it, or make
+the counts exact first.
 
 ---
 
