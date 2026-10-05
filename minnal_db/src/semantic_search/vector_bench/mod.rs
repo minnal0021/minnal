@@ -985,8 +985,10 @@ fn interpolate(curve: &[&Setting], x: f64, f: fn(&Setting) -> f64) -> f64 {
 }
 
 /// Gate `n` against the base row `b`, paired per query: write the nDCG table by
-/// cutoff and push the gate checks, named after `n`.
-fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &Setting) {
+/// cutoff and push the gate checks, named after `n`. A budget at least the
+/// namespace's `entries` scans it in full, buying recall with time on purpose,
+/// so its latency is reported but not gated.
+fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &Setting, entries: usize) {
     let who = n.name();
     let p = paired(b, n);
     let within = |old: f64, new: f64| new <= (old * 1.05).max(old + 0.3);
@@ -1032,6 +1034,11 @@ fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &S
     ));
     gate.push((format!("{who}: ANN recall@10 Δ ≥ −0.005"), p.ann.0 >= -0.005));
     gate.push((format!("{who}: nDCG@{{10..100}} Δ ≥ −0.002 at every cutoff"), worst >= -0.002));
+    if n.budget_entries.is_some_and(|budget| budget >= entries as u64) {
+        let _ = writeln!(md, "\nThe budget covers all {entries} entries: a full scan, so latency is not gated.");
+        gate.push((format!("{who}: ANN recall@10 not below the base (full scan)"), p.ann.0 >= 0.0));
+        return;
+    }
     gate.push((
         format!("{who}: p50 latency within +5% (or +0.3 ms)"),
         within(b.latency_p50_ms, n.latency_p50_ms),
@@ -1138,7 +1145,7 @@ fn vector_bench_compare() {
             new.settings.iter().find(|s| s.budget_entries == Some(DEFAULT_PROBE.budget_entries)),
         ];
         for n in candidates.into_iter().flatten() {
-            gate_pair(&mut md, &mut gate, b, n);
+            gate_pair(&mut md, &mut gate, b, n, new.partition.entries);
         }
     }
     let footprint = |r: &BenchResult| (r.footprint.sparse_bytes + r.footprint.sparse_meta_bytes + r.footprint.dense_bytes) as f64;
