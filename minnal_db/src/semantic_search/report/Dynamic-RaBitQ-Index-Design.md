@@ -1113,10 +1113,163 @@ and reassign-neighbours `k ∈ {0, 2, 8}`. Report recall vs entries scanned
 (including the early-life curve at 1k, 5k, 10k and 20k chunks), moves per insert
 (write amplification), and largest posting share.
 
+**Probe limits that scale with the partition.** Each variant above is also run
+with probe limits that grow with the number of postings `K`, up to a ceiling.
+They are compared against today's absolute default (70k entries, at most 1,024
+probes):
+
+- `max_probes = clamp(⌈p_probes · K⌉, min_probes, max_probes_ceiling)`
+- `probe_budget_entries = min(p_budget · E, budget_ceiling)`, where `E` is the
+  namespace's entry count. With a fixed target posting size, `E ≈ K · target`,
+  so in practice this scales with `K` too.
+
+The two fractions are independent settings (user decision), so each is swept on
+its own: `p_budget ∈ {5%, 10%, 20%, 30%}`, `p_probes ∈ {5%, 10%, 20%, 30%}`,
+`budget_ceiling ∈ {40k, 70k, 100k}` and `max_probes_ceiling ∈ {256, 1024}`.
+A search stops at whichever limit it reaches first, so the results should also
+say which limit bound each query. Report recall and entries scanned
+along the growth curve (1k, 5k, 10k and 20k chunks, then the full corpus),
+because that is where the scaled and absolute limits differ. Below about
+`70k / p_budget` entries, the scaled limit scans a fraction of the namespace where the
+absolute one does a full scan. This reopens the M2d decision against a
+size-relative budget, but the ceiling now bounds the cost.
+
+**Pass-1 code width for maintenance from codes.** Every M3 operation (split,
+reassign, merge, the code-only bootstrap (iii)) and the M4 rebuild fits
+centres on *reconstructions* of chunk vectors, because the floats are gone.
+At 1 bit a reconstruction is coarse. Wider chunk codes may be close enough
+that fitting from codes almost matches fitting from floats, and that moved
+codes can be re-encoded against their new centre from the code alone. Then a
+namespace would rarely need re-embedding or stored floats (`reencode_source =
+none` would be nearly as good as `stored`), and staging floats for the bootstrap
+(variant (ii)) would not be needed either. Simulate widths `B ∈ {1, 2, 4}` for
+chunk codes:
+
+1. **Reconstruction fidelity.** Over every chunk: cos(x̂, x), ‖x̂ − x‖, and
+   nearest-centre agreement (the share of chunks whose nearest centre from x̂
+   is the same as from x), against the bundled centres and against a
+   float-fitted k-means (iv).
+2. **Centres fitted from codes.** For a split (2-means on one posting), the
+   reassignment of its neighbours, and a full rebuild (k-means over the whole
+   namespace), fit once on x̂ and once on x. Compare the centres (distance,
+   cosine) and, more to the point, the resulting partitions: recall against
+   entries scanned, where the float-fitted partition is the target.
+3. **Re-encode from codes.** Move a code to a new centre by decoding it and
+   encoding x̂ again at the same width. Compare three things: (a) keeping the
+   original centre (today's plan), (b) re-encoding from x̂, (c) a fresh encode
+   of x (what `stored` or `service` gives). Measure estimator RMSE and Pass-1
+   recall after many moves, since each re-encode adds its own error. At 1 bit,
+   (b) was measured worse than (a) (0.861 against 0.918). Check where, if
+   anywhere, that reverses as `B` grows.
+4. **Search quality and cost at each width.** Pass-1 recall and nDCG@{10, 20,
+   30, 40, 50, 100}. M2c-pre measured 1 and 2 bits (2 bits: recall +5–9 pt,
+   nDCG unchanged); add 4. Report storage per chunk at 768 dims: codes of 96,
+   192 and 384 B, plus factors and key. That puts FiQA at about 17, 33 and
+   66 MB of codes, against about 530 MB of stored f32. Report bytes read per query at
+   the default budget too. The per-entry scoring cost at each width (multi-bit
+   estimators do more work per entry than the 1-bit popcount) needs a Rust
+   microbenchmark beside the Python simulation, so that a width that is better
+   for maintenance is not quietly much slower to search.
+5. **Split the roles if the widths disagree.** Search may want 1 bit (cheapest
+   scan) while maintenance wants 4. In the code, the multi-bit code's top bit
+   per dimension is the sign of the residual (`quantise_multi_bits`, `≥ 0.0`).
+   That is exactly the 1-bit code (`binary_quantize`, same test, same rotated
+   residual), so a B-bit code contains its 1-bit code. The scalar factors
+   differ: the 1-bit estimator uses `‖r‖ / ⟨ō, o⟩` for the sign-only `ō`.
+   So an entry could keep today's search part (1-bit code plus 1-bit factors,
+   unchanged) and add a refinement, B−1 extra bits per dimension plus the
+   B-bit factors. Only maintenance would read the refinement. Search keeps
+   its 1-bit scan, maintenance gets B-bit reconstructions, and nothing needs
+   re-encoding to switch between the two. Cost: the refinement's storage
+   (`(B−1) · D / 8` bytes plus factors), and keeping it in step on every
+   write, move and delete. Simulate both layouts: a single B-bit code that
+   search also scores, and a 1-bit code plus a refinement.
+
+**Decision rule for the width.** Choose the smallest `B` at which (2) lands
+within 1 pt of the float-fitted partition at equal entries scanned, and (3b)
+is no worse than (3a). If such a `B` exists, the bootstrap and rebuild work
+from codes, and `stored` becomes an option for exactness rather than a need.
+If 4 bits is still clearly short of floats, keep 1-bit search codes and keep
+`stored` as the route to exact maintenance.
+
 The results go to review before M3a starts; the bootstrap and split policy are
 chosen then. A natural rule is to prefer the simplest variant within 1 pt of the
 best at equal entries scanned. This step needs no Rust, and it stops us building
 the wrong variant.
+
+### M3-pre result (2026-10-06)
+
+Full report: [`m3-pre-simulation/gemma/m3-pre-simulation.md`](m3-pre-simulation/gemma/m3-pre-simulation.md) (method, every
+table, caveats). Gemma, SciFact and FiQA; growth, then deletes and turnover
+in §5. Recall is ANN
+recall@10 against the exact pipeline, compared at equal entries read. The
+charts below are FiQA (648 queries); SciFact (300 queries) agrees except where
+noted.
+
+**Lifecycle letters, as used in the charts:**
+
+- **C**: grow from one posting at the zero centre and split any posting past
+  twice the target.
+- **A+C**: keep the floats until N chunks, then run k-means on them and
+  continue as C.
+- **B+C**: keep one flat posting until N chunks, then run k-means on the 1-bit
+  codes and continue as C.
+- **k**: the number of neighbouring postings re-checked after each split.
+
+**1. Posting size matters most.** Smaller postings find more of the exact top 10
+per entry read. At 10k entries read: 0.975 at target 128, 0.942 at 1,024, 0.811
+with the bundled file. The cost not simulated is per-probe overhead: target 128
+probes about 360 postings at today's budget, against 65 with the bundled file.
+
+![FiQA: recall against entries read per target size](m3-pre-simulation/gemma/fiqa-target-size.svg)
+
+**2. The lifecycle hardly matters, so C is enough.** On FiQA every lifecycle is
+within 0.2–1.6 points of static k-means. The best seeded variant (A+C at 30k)
+is 0.2 points ahead of C, which is the whole return on about 90 MB of staged
+floats and a bootstrap job. SciFact is noisier; its one larger gap is C
+trailing a 10k float seed by 2.6 points under drifting topics.
+
+![FiQA: each lifecycle against static k-means](m3-pre-simulation/gemma/fiqa-lifecycles.svg)
+
+**3. 1-bit codes are enough for maintenance; never re-encode from a 1- or 2-bit
+code.** A full rebuild from 1-bit codes equals one from floats. Codes that keep
+their old centre lose nothing at any width. Re-encoding a moved code from
+itself compounds its error below 4 bits. At 4 bits that re-encode is lossless,
+as hoped, but buys nothing measurable: nDCG@10 and @100 are unchanged at every
+width with codes that keep their centre, because a wider code only fixes Pass 1's near-ties.
+
+![FiQA: rebuild from codes](m3-pre-simulation/gemma/fiqa-rebuild.svg)
+
+![FiQA: re-encode policy by width](m3-pre-simulation/gemma/fiqa-reencode.svg)
+
+**4. Scaled probe limits need a floor.** A plain share of the namespace makes
+small namespaces inexact. Today they are scanned completely. At full FiQA
+size 30% reads 33k entries instead of 70k for −0.0013 nDCG. 20% reads 22k but
+is just over the 0.002 gate. `p_probes` below `p_budget` cuts searches
+short, and no ceiling was reached at these sizes.
+
+![FiQA: recall as the namespace grows](m3-pre-simulation/gemma/fiqa-probe-recall.svg)
+
+**5. Deletes and turnover do not wear the partition down.** Deleting half the
+documents, deleting whole topics, or replacing every document (even topic by
+topic) leaves C within 0.5–1.0 points of a fresh k-means fit on what is left,
+with postings under a quarter of the target merged into their neighbours. A
+full replacement costs about 1.9 key moves per deleted chunk.
+
+![FiQA: churn against a fresh fit](m3-pre-simulation/gemma/fiqa-churn.svg)
+
+**Proposed for M3 (for review):**
+
+| Question | Proposal | Evidence |
+|---|---|---|
+| Lifecycle | C only; drop the staging namespace and M3c (bootstrap) | §2: seeding gains ≤ 0.2 pt on FiQA |
+| Reassign | k = 8 from code reconstructions (M3b) | +0–0.6 pt, ~0.1 extra moves per insert; under churn 0.5 vs 1.4 pt |
+| Merge | below target / 4, into the nearest of 8 neighbours, codes kept (M3b) | §5: within 0.5–1.0 pt of a fresh fit after any churn |
+| Target posting size | 128 or 256, chosen after M3a measures per-probe cost | §1 |
+| Chunk code width | stay at 1 bit; codes keep their centre | §3: width changes nothing in the ranking |
+| `reencode_source` | not needed for partition quality; keep as a future option for rotation or width changes | §3 |
+| Probe budget | `clamp(p · E, floor, ceiling)`, e.g. 30% / 20k / 70k; `max_probes` stays absolute | §4 |
+| M4 rebuild | from 1-bit codes, no floats | §3: 0.978 vs 0.976 |
 
 ### M3a — Grow and split (split only, no reassign)
 
@@ -1236,6 +1389,101 @@ recall within 2 pts of (iv) at equal entries scanned; largest posting < 1%
   meta stays consistent
 - search results during a split: a superset of before or after, never missing a
   document present in both
+
+#### Partition health: residual drift and error band (build with M3a)
+
+Codes keep the centre they were encoded against while their keys move (the
+M3-pre result). That costs nothing in ranking today, but each move leaves the
+code a little less precise than a fresh encode against its current posting's
+centre would be. M3 records how far that has gone, per posting, so operators
+can see it and a later re-encode can start with the worst postings.
+
+**Per code, from what is already stored.** A code holds its residual norm
+`‖r‖` against its encode centre (inside `scaling_factor`) and its
+`error_bound`, `ε · ‖r‖ · √((1/⟨ō,o⟩² − 1)/(D − 1))`: the width of the
+estimator's error band, which scales with `‖r‖`. What a fresh encode against
+the current posting's centre `c'` would have is estimated without the float:
+`‖x − c'‖² = ‖r‖² + ‖c − c'‖² + 2⟨r, c − c'⟩`, with `⟨r, c − c'⟩` from the
+same RaBitQ estimator search uses (unbiased). The ratio of the two is the
+code's **residual inflation**: 1 for a code encoded against its own posting's
+centre, above 1 for one that moved away from its centre. The error band
+inflates by the same ratio.
+
+A code encoded against the zero centre (written while the namespace had one
+posting) has `‖r‖ = 1`. Against a fitted centre the mean is lower (gemma
+FiQA: 0.75 with 304 k-means centres, 0.88 with the bundled file), so early
+codes start at an inflation of about 1.3.
+
+**Per posting**, kept as running sums next to the entry counts (updated on
+every encode, move and delete, recounted when a partition loads):
+
+| Metric | Meaning |
+|---|---|
+| entries, chunks | size against the target (the split and merge triggers) |
+| foreign share | chunks whose `centre_id` is not the posting's own centre |
+| residual inflation, mean and p90 | how much precision moves have cost |
+| error band, mean | the mean `error_bound` of its codes, in score units |
+| zero-centre share | chunks still coded against the zero centre |
+
+**Per namespace**: postings (K), entries, posting-size spread (p10 / p50 / p90
+/ max against the target), splits, merges and key moves since start, the
+entry-weighted means of the posting metrics, and the 20 postings with the
+highest mean inflation: the **re-encode candidates**.
+
+**Surfaced as** `GET /admin/indices/{ns}/vector/partition` (the namespace
+summary above), and in minnal_ui
+under Admin → Ops Metrics, per namespace: a "Vector partition" card with stat
+tiles (K, entries, foreign share, mean inflation, mean error band), a
+histogram of posting sizes with the target marked, and the candidate table.
+
+**Posting list for visualisation.** A second endpoint returns every live
+posting with its size, so minnal_ui can draw the whole distribution rather than
+a summary:
+
+`GET /admin/indices/{ns}/vector/postings?sort=entries|inflation|id&order=desc&cursor=&limit=`
+
+```json
+{
+  "namespace": "fiqa",
+  "target_posting_size": 128,
+  "postings": 627,
+  "entries": 110638,
+  "chunks": 172998,
+  "results": [
+    {"posting_id": 412, "entries": 251, "chunks": 388, "centre_id": 412,
+     "parent_id": 97, "created_by": "split",
+     "foreign_share": 0.34, "zero_centre_share": 0.0,
+     "inflation_mean": 1.08, "error_band_mean": 0.0061}
+  ],
+  "next_cursor": "…"
+}
+```
+
+- One row per live posting. `entries` and `chunks` are exact (the split
+  trigger needs exact counts anyway; see the M2d result). `parent_id` and
+  `created_by` (`root`, `split`, `seed`, `rebuild`) let the UI draw the split
+  history as a tree. A retired posting appears only as some row's parent.
+- Cursor-paginated like the other scan endpoints (`limit` default 1,000,
+  maximum 10,000), because K grows with the namespace: about 630 postings for
+  FiQA's 173k chunks at target 128, so a few tens of thousands for a
+  ten-million-chunk namespace.
+- It reads only the in-memory per-posting counters (`NamespaceIvf`), never the
+  sparse namespace, so it is cheap enough to poll.
+
+minnal_ui draws from it, in the same "Vector partition" card:
+
+- a histogram of posting sizes (entries), with the target and the split
+  (2 × target) and merge (target / 4) thresholds marked;
+- every posting sorted by size, as a ranked bar strip, which shows skew at a
+  glance (the bundled file put 43% of SciFact in one posting);
+- the same strip coloured by mean inflation, to see where drift sits;
+- optionally, the split tree from `parent_id`.
+
+**Used later by** the re-encode queue (`reencode_source` = `stored` /
+`service`, *Re-encode strategies*), which takes postings in candidate order,
+and by M4's drift indicators. No threshold is set yet: the M3-pre simulation
+found no ranking cost from moved codes, so the first job of these numbers is
+to show what real namespaces look like.
 
 ### M3b — Reassign (LIRE) and merge
 
