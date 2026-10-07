@@ -20,14 +20,14 @@ continue at the first unticked item.
 changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
 **mapped** (today's two files) for `RoaringBitmap::create` / `open`.
 
-- [ ] 1a. `ContainerStore` = enum of `Heap` / `Mapped`, same public methods;
+- [x] 1a. `ContainerStore` = enum of `Heap` / `Mapped`, same public methods;
       add `with_container` (read without clone) and `modify` (change in place)
-- [ ] 1b. `RoaringBitmap` mutators and readers use the in-place methods, so an
+- [x] 1b. `RoaringBitmap` mutators and readers use the in-place methods, so an
       insert into a heap bitmap allocates nothing beyond the container itself
-- [ ] 1c. Tests: 65,536 inserts into one bitmap stay within a small multiple of
+- [x] 1c. Tests: 65,536 inserts into one bitmap stay within a small multiple of
       8 KB of memory (measure the store's own size, not process RSS); every
       existing bitmap / container_store / index test passes
-- [ ] 1d. Re-measure (insert cost, query cost via `bench_predicate`), commit
+- [x] 1d. Re-measure (insert cost, query cost via `bench_predicate`), commit
 
 ## Step 2: dirty-container overlay with a memory budget
 
@@ -106,3 +106,11 @@ Before starting, re-run the search; the list below is what it found on
 ## Log
 
 (one line per finished step: date, commit, headline numbers)
+
+- **Step 1** (2026-10-07): transient bitmaps on the heap. 65,536 inserts into
+  one bitmap: 2.9 µs → 0.004 µs each, +384 MiB → no RSS growth. Index insert
+  (file-backed, 50k rows): bool 10.1 → 2.1 µs, 16 values 5.9 → 0.96 µs, 1,000
+  values 3.2 → 0.23 µs; bytes appended unchanged (step 2). `bench_predicate`
+  8–21× faster on every case (`str_eq` 11.5 µs → 0.55 µs, `int_range` 1.11 ms →
+  134 µs, `three_way_and` 799 → 88 µs). Measured against `0270020`, release,
+  separate target dirs.

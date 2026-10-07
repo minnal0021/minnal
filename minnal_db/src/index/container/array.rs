@@ -11,6 +11,11 @@ pub struct ArrayContainer {
 }
 
 impl ArrayContainer {
+    /// Heap bytes this container owns (its value buffer's capacity).
+    pub fn heap_bytes(&self) -> usize {
+        self.values.capacity() * std::mem::size_of::<u16>()
+    }
+
     pub fn new() -> Self {
         Self { values: Vec::new() }
     }

@@ -1,6 +1,22 @@
-//! Memory-mapped two-file container store.
+//! Container store: the `u128 → Container` map behind a [`RoaringBitmap`].
 //!
-//! Stores a `u128 → Container` map in two memory-mapped regions:
+//! Two backings, one API:
+//!
+//! - **Heap** ([`ContainerStore::new_anon`]): a sorted map of containers,
+//!   changed in place. Every transient bitmap uses it — loaded copies, query
+//!   results, replay batches. Its memory is the bitmap's real size.
+//! - **Mapped** ([`ContainerStore::create`] / [`ContainerStore::open`]): the
+//!   two-file layout below, for persistent bitmaps.
+//!
+//! The heap backing exists because the mapped layout is append-only: every
+//! change writes a new copy of the container and nothing is reclaimed until the
+//! store is dropped. Used for transient bitmaps (it once backed them all, as an
+//! anonymous map) that made 65,536 inserts into one container cost 514 MiB of
+//! memory for an 8 KB bitmap. Do not put transient bitmaps back on it.
+//!
+//! [`RoaringBitmap`]: crate::index::RoaringBitmap
+//!
+//! The mapped layout stores the map in two memory-mapped regions:
 //!
 //! **Key file** (`containers.keys`):
 //! - 64-byte header (magic, version, capacity, counts, cardinality, value write pos)
@@ -10,10 +26,9 @@
 //! - Append-only sequence of rkyv-serialized [`Container`] blobs
 //! - Each slot in the key file records the byte offset and length of its blob
 //!
-//! Both files can be either file-backed (persistent bitmaps) or anonymous
-//! (transient bitmaps produced by set operations). The public API is identical
-//! in both cases; growth is handled transparently by remapping.
+//! Growth is handled transparently by remapping.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
@@ -236,11 +251,6 @@ struct GrowableMmap {
 }
 
 impl GrowableMmap {
-    fn new_anon(initial_size: usize) -> io::Result<Self> {
-        let mmap = MmapMut::map_anon(initial_size)?;
-        Ok(Self { mmap, file: None })
-    }
-
     fn create_file(path: &Path, initial_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
         file.set_len(initial_size as u64)?;
@@ -304,23 +314,15 @@ impl GrowableMmap {
 
 // ── ContainerStore ─────────────────────────────────────────────────────────────────
 
-/// Open-addressing hash table mapping `u128` container keys to serialized
-/// [`Container`] blobs stored in a companion value region.
-pub(crate) struct ContainerStore {
+/// The mapped backing: an open-addressing hash table mapping `u128` container
+/// keys to serialized [`Container`] blobs stored in a companion value region.
+struct MappedStore {
     key: GrowableMmap,
     val: GrowableMmap,
 }
 
-impl ContainerStore {
+impl MappedStore {
     // ── Construction ─────────────────────────────────────────────────────────
-
-    /// Create a new anonymous (transient) store backed by anonymous mmaps.
-    pub fn new_anon() -> Self {
-        let mut key = GrowableMmap::new_anon(INITIAL_KEY_SIZE).expect("anon key mmap alloc failed");
-        init_header(key.as_mut_slice(), INITIAL_CAPACITY);
-        let val = GrowableMmap::new_anon(INITIAL_VAL_SIZE).expect("anon val mmap alloc failed");
-        Self { key, val }
-    }
 
     /// Create a new persistent store, creating both files under `dir`.
     pub fn create(dir: &Path) -> io::Result<Self> {
@@ -613,6 +615,260 @@ impl ContainerStore {
     }
 }
 
+// ── HeapStore ────────────────────────────────────────────────────────────────
+
+/// The heap backing: containers in a sorted map, changed in place.
+#[derive(Default)]
+struct HeapStore {
+    map: BTreeMap<u128, Container>,
+    /// Total bit count across all containers, kept current on every change.
+    cardinality: u64,
+}
+
+impl HeapStore {
+    fn upsert(&mut self, key: u128, container: &Container) -> bool {
+        let new_card = container.cardinality() as u64;
+        match self.map.insert(key, container.clone()) {
+            Some(old) => {
+                self.cardinality = self.cardinality - old.cardinality() as u64 + new_card;
+                false
+            }
+            None => {
+                self.cardinality += new_card;
+                true
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn remove_key(&mut self, key: u128) -> u32 {
+        match self.map.remove(&key) {
+            Some(old) => {
+                let card = old.cardinality() as u32;
+                self.cardinality -= card as u64;
+                card
+            }
+            None => 0,
+        }
+    }
+}
+
+// ── ContainerStore ───────────────────────────────────────────────────────────
+
+/// The `u128 → Container` map behind a [`RoaringBitmap`](crate::index::RoaringBitmap):
+/// heap-backed for transient bitmaps, file-backed (mapped) for persistent ones.
+/// See the module docs for why transient bitmaps must not use the mapped layout.
+pub(crate) struct ContainerStore {
+    backing: Backing,
+}
+
+enum Backing {
+    Heap(HeapStore),
+    Mapped(MappedStore),
+}
+
+impl ContainerStore {
+    // ── Construction ─────────────────────────────────────────────────────────
+
+    /// Create a new empty transient store on the heap.
+    pub fn new_anon() -> Self {
+        Self {
+            backing: Backing::Heap(HeapStore::default()),
+        }
+    }
+
+    /// Create a new persistent store, creating both files under `dir`.
+    pub fn create(dir: &Path) -> io::Result<Self> {
+        Ok(Self {
+            backing: Backing::Mapped(MappedStore::create(dir)?),
+        })
+    }
+
+    /// Open an existing persistent store from `dir`.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        Ok(Self {
+            backing: Backing::Mapped(MappedStore::open(dir)?),
+        })
+    }
+
+    // ── Metrics ──────────────────────────────────────────────────────────────
+
+    /// Cached total bit count across all containers.
+    pub fn cardinality(&self) -> usize {
+        match &self.backing {
+            Backing::Heap(h) => h.cardinality as usize,
+            Backing::Mapped(m) => m.cardinality(),
+        }
+    }
+
+    /// Number of live (occupied) entries.
+    pub fn count(&self) -> usize {
+        match &self.backing {
+            Backing::Heap(h) => h.map.len(),
+            Backing::Mapped(m) => m.count(),
+        }
+    }
+
+    // ── Mutation ─────────────────────────────────────────────────────────────
+
+    /// Insert or replace the container for `key`.
+    ///
+    /// Returns `true` if this was a new key (false if an existing one was updated).
+    pub fn upsert(&mut self, key: u128, container: &Container) -> bool {
+        match &mut self.backing {
+            Backing::Heap(h) => h.upsert(key, container),
+            Backing::Mapped(m) => m.upsert(key, container),
+        }
+    }
+
+    /// Remove the container for `key`. Returns the removed container's
+    /// cardinality, or 0 if the key was not present.
+    #[allow(dead_code)]
+    pub fn remove_key(&mut self, key: u128) -> u32 {
+        match &mut self.backing {
+            Backing::Heap(h) => h.remove_key(key),
+            Backing::Mapped(m) => m.remove_key(key),
+        }
+    }
+
+    /// Change the container for `key` in place.
+    ///
+    /// `f` gets the container (a new empty array container if `key` is absent
+    /// and `create` is true) and returns whether it changed anything. A changed
+    /// container that ends up empty is removed. Returns `f`'s result, or
+    /// `false` without calling `f` when `key` is absent and `create` is false.
+    ///
+    /// On the heap this touches only the one container; the mapped backing
+    /// still writes a new copy, as [`upsert`](Self::upsert) does.
+    pub fn modify(&mut self, key: u128, create: bool, f: impl FnOnce(&mut Container) -> bool) -> bool {
+        match &mut self.backing {
+            Backing::Heap(h) => {
+                let (changed, old_card, new_card, empty) = match h.map.get_mut(&key) {
+                    Some(c) => {
+                        let old = c.cardinality() as u64;
+                        let changed = f(c);
+                        (changed, old, c.cardinality() as u64, c.is_empty())
+                    }
+                    None if create => {
+                        let mut c = Container::new_array();
+                        let changed = f(&mut c);
+                        let (card, empty) = (c.cardinality() as u64, c.is_empty());
+                        if changed && !empty {
+                            h.map.insert(key, c);
+                        }
+                        (changed, 0, card, empty)
+                    }
+                    None => return false,
+                };
+                if changed {
+                    h.cardinality = h.cardinality - old_card + new_card;
+                    if empty {
+                        h.map.remove(&key);
+                    }
+                }
+                changed
+            }
+            Backing::Mapped(m) => {
+                let mut c = match m.get(key) {
+                    Some(c) => c,
+                    None if create => Container::new_array(),
+                    None => return false,
+                };
+                let changed = f(&mut c);
+                if changed {
+                    if c.is_empty() {
+                        m.remove_key(key);
+                    } else {
+                        m.upsert(key, &c);
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    /// Remove all entries.
+    pub fn clear(&mut self) {
+        match &mut self.backing {
+            Backing::Heap(h) => *h = HeapStore::default(),
+            Backing::Mapped(m) => m.clear(),
+        }
+    }
+
+    // ── Query ────────────────────────────────────────────────────────────────
+
+    /// Return a copy of the container for `key`, or `None`.
+    ///
+    /// Prefer [`with_container`](Self::with_container) for reads: on the heap
+    /// it borrows instead of copying.
+    pub fn get(&self, key: u128) -> Option<Container> {
+        match &self.backing {
+            Backing::Heap(h) => h.map.get(&key).cloned(),
+            Backing::Mapped(m) => m.get(key),
+        }
+    }
+
+    /// Run `f` on the container for `key` without copying it (heap) or after
+    /// deserialising it (mapped). `None` if `key` is absent.
+    pub fn with_container<R>(&self, key: u128, f: impl FnOnce(&Container) -> R) -> Option<R> {
+        match &self.backing {
+            Backing::Heap(h) => h.map.get(&key).map(f),
+            Backing::Mapped(m) => m.get(key).as_ref().map(f),
+        }
+    }
+
+    /// True if the key has an entry.
+    #[allow(dead_code)]
+    pub fn contains_key(&self, key: u128) -> bool {
+        match &self.backing {
+            Backing::Heap(h) => h.map.contains_key(&key),
+            Backing::Mapped(m) => m.contains_key(key),
+        }
+    }
+
+    /// Return `(key, card)` for every live entry, sorted by key.
+    pub fn sorted_key_cards(&self) -> Vec<(u128, u32)> {
+        match &self.backing {
+            Backing::Heap(h) => h.map.iter().map(|(&k, c)| (k, c.cardinality() as u32)).collect(),
+            Backing::Mapped(m) => m.sorted_key_cards(),
+        }
+    }
+
+    /// Return all live keys sorted.
+    pub fn sorted_keys(&self) -> Vec<u128> {
+        match &self.backing {
+            Backing::Heap(h) => h.map.keys().copied().collect(),
+            Backing::Mapped(m) => m.sorted_keys(),
+        }
+    }
+
+    /// Return all `(key, container)` pairs, sorted by key.
+    pub fn sorted_entries(&self) -> Vec<(u128, Container)> {
+        match &self.backing {
+            Backing::Heap(h) => h.map.iter().map(|(&k, c)| (k, c.clone())).collect(),
+            Backing::Mapped(m) => m.sorted_entries(),
+        }
+    }
+
+    /// Flush to disk (no-op for the heap backing).
+    pub fn flush(&self) -> io::Result<()> {
+        match &self.backing {
+            Backing::Heap(_) => Ok(()),
+            Backing::Mapped(m) => m.flush(),
+        }
+    }
+
+    /// Heap bytes held by a heap-backed store: each container's own size plus
+    /// its map entry. `None` for the mapped backing, whose data is file pages.
+    #[cfg(test)]
+    pub fn heap_bytes(&self) -> Option<usize> {
+        match &self.backing {
+            Backing::Heap(h) => Some(h.map.values().map(|c| c.heap_bytes() + std::mem::size_of::<(u128, Container)>()).sum()),
+            Backing::Mapped(_) => None,
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
@@ -711,6 +967,39 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, 100);
         assert_eq!(entries[1].0, 200);
+    }
+
+    #[test]
+    fn transient_store_memory_is_the_bitmaps_size_not_its_history() {
+        // 65,536 single-value changes to one container. The mapped layout
+        // appends a copy per change (this used to cost 514 MiB of memory for an
+        // 8 KB bitmap); the heap store changes the container in place.
+        let mut store = ContainerStore::new_anon();
+        for low in 0..=u16::MAX {
+            assert!(store.modify(0, true, |c| c.insert(low)));
+        }
+        assert_eq!(store.cardinality(), 65_536);
+        assert_eq!(store.count(), 1);
+        let bytes = store.heap_bytes().expect("transient store is heap-backed");
+        assert!(bytes <= 16 * 1024, "one full container should hold ~8 KB, holds {bytes} bytes");
+    }
+
+    #[test]
+    fn modify_keeps_cardinality_and_removes_emptied_containers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for mut store in [ContainerStore::new_anon(), ContainerStore::create(dir.path()).unwrap()] {
+            assert!(store.modify(7, true, |c| c.insert(1)));
+            assert!(store.modify(7, true, |c| c.insert(2)));
+            assert!(!store.modify(7, true, |c| c.insert(2)), "re-inserting is no change");
+            assert_eq!(store.cardinality(), 2);
+            assert!(!store.modify(8, false, |c| c.insert(1)), "absent key without create is untouched");
+            assert!(!store.contains_key(8));
+            assert!(store.modify(7, false, |c| c.remove(1)));
+            assert!(store.modify(7, false, |c| c.remove(2)));
+            assert_eq!(store.cardinality(), 0);
+            assert!(!store.contains_key(7), "an emptied container is removed");
+            assert_eq!(store.with_container(7, |c| c.cardinality()), None);
+        }
     }
 
     // ── Header / bounds validation on open ──────────────────────────────────

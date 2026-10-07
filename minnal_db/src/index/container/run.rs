@@ -34,6 +34,11 @@ pub struct RunContainer {
 }
 
 impl RunContainer {
+    /// Heap bytes this container owns (its run buffer's capacity).
+    pub fn heap_bytes(&self) -> usize {
+        self.runs.capacity() * std::mem::size_of::<Run>()
+    }
+
     pub fn new() -> Self {
         Self {
             runs: Vec::new(),
