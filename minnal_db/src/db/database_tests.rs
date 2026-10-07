@@ -1124,6 +1124,58 @@ fn field_index_write_buffers_share_one_budget_and_stay_bounded() {
     db.shutdown().unwrap();
 }
 
+/// A field-index slot torn by a crash (half old, half new after a power loss)
+/// fails its checksum at open. The slot is dropped, the field records a
+/// full-rebuild gap so the loss is visible, and repair restores every row.
+#[test]
+fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let field_id = {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let field_id = activate_status_index(&db, ns);
+        for i in 0..100u32 {
+            let v = if i % 2 == 0 { "active" } else { "inactive" };
+            db.put(format!("doc:{i:03}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                .unwrap();
+        }
+        db.run_index_checkpoint().unwrap();
+        db.shutdown().unwrap();
+        field_id
+    };
+
+    // Tear the first checksummed live slot of the field's bitmap key table.
+    let keys = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns)
+        .join(field_id.to_string())
+        .join("blobs.keys");
+    let mut bytes = std::fs::read(&keys).unwrap();
+    let slot = (0..)
+        .map(|i| 64 + i * 48)
+        .take_while(|&b| b + 48 <= bytes.len())
+        .find(|&b| bytes[b] == 3)
+        .expect("a checksummed live slot");
+    bytes[slot + 30] ^= 0x5A;
+    std::fs::write(&keys, &bytes).unwrap();
+
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+        let s = std::str::from_utf8(bytes).ok()?;
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+    });
+    db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+        .unwrap();
+    let gap = db.index_manager.read_gap(ns, field_id).expect("the damage must be recorded");
+    assert_eq!(gap.cause, crate::db::index_manager::GapCause::DamagedIndexFile);
+    assert_eq!(gap.repair, crate::db::index_manager::RepairMode::FullRebuild);
+
+    db.repair_field_index(ns, field_id).unwrap();
+    assert!(db.index_manager.read_gap(ns, field_id).is_none(), "repair clears the gap");
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 50);
+    assert_eq!(db.query_keys(ns, "status = \"inactive\"").unwrap().keys.len(), 50);
+    db.shutdown().unwrap();
+}
+
 /// Replaying a **low-cardinality** field must not balloon its blob store.
 ///
 /// The bitmap store is append-only and rewrites a whole bitmap per key, so a

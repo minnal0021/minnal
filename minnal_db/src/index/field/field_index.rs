@@ -73,6 +73,10 @@ pub struct FieldIndex<V: Ord + Clone> {
     /// Values whose bitmap emptied since the last spill, with the slot they
     /// keep until then (see the type docs).
     emptied: BTreeMap<V, u128>,
+    /// Version of each overlay entry, bumped on every change, so a spill commit
+    /// can tell whether the entry changed after it was staged.
+    overlay_ver: HashMap<u128, u64>,
+    next_ver: u64,
     /// Heap bytes the overlay holds, as charged to `budget`.
     overlay_bytes: u64,
     /// Shared budget the overlay is charged against.
@@ -81,6 +85,15 @@ pub struct FieldIndex<V: Ord + Clone> {
 
 /// Fixed cost charged per overlay entry beyond the bitmap's own heap bytes.
 const OVERLAY_ENTRY_OVERHEAD: u64 = 64;
+
+/// What [`FieldIndex::stage`] appended and [`FieldIndex::commit`] applies:
+/// `(slot, overlay version, offset, len)` for changed bitmaps, and
+/// `(slot, overlay version)` for emptied ones.
+#[derive(Debug, Default)]
+pub struct SpillStage {
+    sets: Vec<(u128, u64, u64, u32)>,
+    removals: Vec<(u128, u64)>,
+}
 
 impl<V: Ord + Clone> FieldIndex<V> {
     /// Create an empty index backed by an anonymous (transient) mmap.
@@ -100,6 +113,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
             next_slot,
             corrupted: AtomicBool::new(false),
             overlay: HashMap::new(),
+            overlay_ver: HashMap::new(),
+            next_ver: 0,
             emptied: BTreeMap::new(),
             overlay_bytes: 0,
             budget: Arc::new(IndexOverlayBudget::default()),
@@ -125,22 +140,124 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.overlay_bytes
     }
 
-    /// Write every bitmap in the overlay to the blob store and empty it.
-    ///
-    /// Changed bitmaps are serialised once each and appended; bitmaps that
-    /// emptied have their blobs removed. Returns the slots that were freed —
-    /// the owner removes their keymap entries. This copies into the store's
-    /// memory map but does not `msync`: [`flush`](Self::flush) does that.
+    /// Write every bitmap in the overlay to the blob store and empty it:
+    /// [`stage`](Self::stage), sync the values, [`commit`](Self::commit).
+    /// Returns the slots that were freed (the owner removes their keymap
+    /// entries). Syncs the value region; the key table is synced by
+    /// [`flush`](Self::flush).
     pub fn spill(&mut self) -> Vec<u128> {
-        for (slot_id, bm) in std::mem::take(&mut self.overlay) {
+        let stage = self.stage();
+        if let Err(e) = self.bitmaps.sync_values() {
+            log::error!("FieldIndex::spill: syncing the bitmap values failed: {e}");
+        }
+        self.commit(stage)
+    }
+
+    /// Phase 1 of a spill: append every changed bitmap to the value region,
+    /// pointing no slot at it yet. The overlay keeps serving reads.
+    ///
+    /// Slots must not point at a blob before the blob is on disk, and the
+    /// kernel writes a shared memory map back in any order, so the slots are
+    /// changed only by [`commit`](Self::commit), after the caller has synced
+    /// the values ([`sync_values`](Self::sync_values)).
+    pub fn stage(&mut self) -> SpillStage {
+        let mut stage = SpillStage::default();
+        for (&slot_id, bm) in &self.overlay {
+            let ver = self.overlay_ver[&slot_id];
             if bm.is_empty() {
-                self.bitmaps.remove_key(slot_id);
-            } else {
-                self.store_bitmap(slot_id, &bm);
+                stage.removals.push((slot_id, ver));
+                continue;
+            }
+            match storage::serialize(bm) {
+                Ok(bytes) => {
+                    let (offset, len) = self.bitmaps.append_value(&bytes);
+                    stage.sets.push((slot_id, ver, offset, len));
+                }
+                Err(e) => {
+                    // Same policy as `store_bitmap`: keep the stored copy, flag it.
+                    self.corrupted.store(true, Ordering::Relaxed);
+                    log::error!("FieldIndex::stage: bitmap failed to serialize; keeping the stored copy (slot={slot_id}, error={e})");
+                }
             }
         }
-        self.charge(-(self.overlay_bytes as i64));
-        std::mem::take(&mut self.emptied).into_values().collect()
+        stage
+    }
+
+    /// Phase 2 of a spill: point the slots at the staged blobs, remove the
+    /// blobs of emptied slots, and drop every overlay entry that has not
+    /// changed since it was staged (one that has stays for the next spill).
+    /// Returns the slots freed for good.
+    pub fn commit(&mut self, stage: SpillStage) -> Vec<u128> {
+        let mut freed = Vec::new();
+        for (slot_id, ver, offset, len) in stage.sets {
+            self.bitmaps.set_slot(slot_id, offset, len);
+            self.drop_overlay_entry_if_unchanged(slot_id, ver);
+        }
+        for (slot_id, ver) in stage.removals {
+            if self.drop_overlay_entry_if_unchanged(slot_id, ver) {
+                self.bitmaps.remove_key(slot_id);
+                if let Some(value) = self.emptied.iter().find(|(_, s)| **s == slot_id).map(|(v, _)| v.clone()) {
+                    self.emptied.remove(&value);
+                    freed.push(slot_id);
+                }
+            }
+        }
+        freed
+    }
+
+    /// Remove `slot_id` from the overlay if its version is still `ver`, and
+    /// return its bytes to the budget. Returns whether it was removed.
+    fn drop_overlay_entry_if_unchanged(&mut self, slot_id: u128, ver: u64) -> bool {
+        if self.overlay_ver.get(&slot_id) != Some(&ver) {
+            return false;
+        }
+        self.overlay_ver.remove(&slot_id);
+        if let Some(bm) = self.overlay.remove(&slot_id) {
+            self.charge(-(bm.heap_bytes() as i64 + OVERLAY_ENTRY_OVERHEAD as i64));
+        }
+        true
+    }
+
+    /// Sync the bitmap store's value region to disk (between
+    /// [`stage`](Self::stage) and [`commit`](Self::commit)).
+    pub fn sync_values(&self) -> std::io::Result<()> {
+        self.bitmaps.sync_values()
+    }
+
+    /// Sync the bitmap store's key table to disk (after [`commit`](Self::commit)).
+    pub fn sync_keys(&self) -> std::io::Result<()> {
+        self.bitmaps.sync_keys()
+    }
+
+    /// Slots dropped as damaged when the bitmap store was opened.
+    pub(crate) fn damaged_at_open(&self) -> usize {
+        self.bitmaps.damaged_at_open()
+    }
+
+    /// Mutable access to the bitmap store, for the owner's open-time
+    /// reconciliation with its keymap.
+    pub(crate) fn bitmaps_mut(&mut self) -> &mut BlobStore {
+        &mut self.bitmaps
+    }
+
+    /// Every slot a value maps to.
+    pub(crate) fn slots(&self) -> impl Iterator<Item = u128> + '_ {
+        self.ordering.values().copied()
+    }
+
+    /// Every `(value, slot)` pair, copied (for open-time reconciliation).
+    pub(crate) fn mapped_values(&self) -> Vec<(V, u128)> {
+        self.ordering.iter().map(|(v, &s)| (v.clone(), s)).collect()
+    }
+
+    /// Drop `value` from the ordering without touching any store.
+    pub(crate) fn forget_value(&mut self, value: &V) {
+        self.ordering.remove(value);
+    }
+
+    /// Make sure new slot ids start at `at` or above.
+    pub(crate) fn raise_next_slot(&mut self, at: u128) {
+        self.next_slot = self.next_slot.max(at);
     }
 
     fn charge(&mut self, delta: i64) {
@@ -157,6 +274,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
             self.charge(bm.heap_bytes() as i64 + OVERLAY_ENTRY_OVERHEAD as i64);
             self.overlay.insert(slot_id, bm);
         }
+        self.overlay_ver.insert(slot_id, self.next_ver);
+        self.next_ver += 1;
         let bm = self.overlay.get_mut(&slot_id).expect("just inserted");
         let before = bm.heap_bytes() as i64;
         let r = f(bm);
@@ -493,25 +612,6 @@ impl<V: Ord + Clone> FieldIndex<V> {
                     RoaringBitmap::new()
                 }
             },
-        }
-    }
-
-    fn store_bitmap(&mut self, slot_id: u128, bm: &RoaringBitmap) {
-        match storage::serialize(bm) {
-            Ok(bytes) => {
-                self.bitmaps.upsert(slot_id, &bytes);
-            }
-            Err(e) => {
-                // Serialising a valid bitmap is effectively infallible, so this is
-                // a genuine "should never happen". Do NOT write empty bytes (the
-                // old `unwrap_or_default()` behaviour) — that would silently drop
-                // every row under this value. Leave the prior blob intact and flag
-                // the corruption for the owner to repair from the WAL.
-                self.corrupted.store(true, Ordering::Relaxed);
-                log::error!(
-                    "store_bitmap: bitmap failed to serialize; keeping the prior blob and flagging the index corrupt (slot={slot_id}, error={e})"
-                );
-            }
         }
     }
 }

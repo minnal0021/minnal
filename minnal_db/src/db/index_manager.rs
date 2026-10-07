@@ -136,6 +136,10 @@ pub enum GapCause {
     /// A field index rejected an update on the write path. The key is known
     /// exactly, so this is always row-scoped.
     RejectedUpdate,
+    /// The field's files held entries damaged by a crash (a slot torn by a
+    /// power loss), which were dropped when the field was opened. Which rows
+    /// they held is unknown, so the repair is a full rebuild.
+    DamagedIndexFile,
 }
 
 /// A durable record that a field index is missing updates, and what it would

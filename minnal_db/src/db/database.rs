@@ -1823,6 +1823,27 @@ impl Database {
         let field_path = self.index_manager.field_path(namespace_id, field_id);
         let mut dyn_index = DynFieldIndex::open(value_type, &field_path).map_err(KVError::Io)?;
         dyn_index.set_overlay_budget(self.index_overlay_budget.clone());
+        if dyn_index.damaged_at_open() > 0 {
+            error!(
+                "[activate_field_index] ns={namespace_id} field={field_id}: {} damaged entr(y/ies) in the field's index files \
+                 were dropped at open (torn by a crash). Rows they held are missing from this field index until it is \
+                 rebuilt; recording a full-rebuild gap.",
+                dyn_index.damaged_at_open()
+            );
+            let gap = crate::db::index_manager::GapRecord {
+                namespace_id,
+                field_id,
+                cause: crate::db::index_manager::GapCause::DamagedIndexFile,
+                from: 0,
+                to: 0,
+                missing_segments: Vec::new(),
+                detected_at_ms: crate::db::kv_store::current_epoch_millis(),
+                repair: crate::db::index_manager::RepairMode::FullRebuild,
+            };
+            if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
+                warn!("[activate_field_index] ns={namespace_id} field={field_id}: failed to record the damage gap: {e:?}");
+            }
+        }
 
         // Replay the WAL tail into dyn_index *before* registering the entry.
         // Recovering on the unshared dyn_index (not yet wrapped in Arc<RwLock<>>)
@@ -2982,11 +3003,23 @@ impl IndexCheckpointTarget for Database {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
                     let field_path = self.index_manager.field_path(ns_id, field_id);
-                    // Write the field's buffered changes into its stores under
-                    // the write lock: a memory copy, no fsync. Every write below
-                    // `wal_tail` finished its index update before `wal_tail` was
-                    // taken (see above), so it is in this spill.
-                    entry.index.write().spill();
+                    // Write the field's buffered changes out, crash-ordered and
+                    // with no fsync under the write lock:
+                    //   1. stage  (write lock): append the changed blobs; no slot
+                    //      points at them yet, reads keep using the overlay;
+                    //   2. sync the value regions (read lock);
+                    //   3. commit (write lock): point the slots at the blobs;
+                    //   4. sync the key tables (read lock, below).
+                    // A slot must never reach disk before its blob, and the kernel
+                    // writes a shared map back in any order, hence the split.
+                    // Every write below `wal_tail` finished its index update
+                    // before `wal_tail` was taken (see above), so it is staged.
+                    let stage = entry.index.write().stage();
+                    if let Err(e) = entry.index.read().sync_values() {
+                        entry.index.write().abort(stage);
+                        return Err(KVError::Io(e));
+                    }
+                    entry.index.write().commit(stage);
                     // Sync under a read lock, then check waste cheaply. Only take
                     // the write lock (which serialises with index writers) when the
                     // bitmap store OR the keymap store has crossed the compaction
@@ -2994,7 +3027,7 @@ impl IndexCheckpointTarget for Database {
                     // distinct-value churn).
                     let (over_threshold, stats) = {
                         let idx = entry.index.read();
-                        idx.sync(&field_path).map_err(KVError::Io)?;
+                        idx.sync_keys().map_err(KVError::Io)?;
                         let stats = idx.blob_stats();
                         let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
                         (over, stats)

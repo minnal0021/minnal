@@ -12,7 +12,8 @@ layout and write order (step 3).
 ## Resume here
 
 To pick up: read this file, run `git log --oneline main..` on the branch, and
-continue at the first unticked item.
+continue at the first unticked item. **Next: step 4 (docs) for steps 1–3a**;
+3b–3d are deferred (see step 3).
 
 ## Step 1: heap-backed in-memory bitmap
 
@@ -61,17 +62,30 @@ In production that is a low-cardinality field whose bitmaps exceed 64 MiB
 together (a boolean over ~300M rows). Step 3's overlay holds only changed
 containers (≤ 8 KB each), which removes the case.
 
-- [ ] 3a. New on-disk format: `blobs.vals` holds container blobs and per-slot
-      directories; `blobs.keys` maps slot → directory. 64-byte checksummed
-      slots; write position recomputed at open; rehash into a new file + rename.
-      Format version bump (greenfield: old indexes rebuild)
-- [ ] 3b. Ordered write: append + `msync` values, then slot updates, then
-      `msync` keys, then the checkpoint marker; no fsync under the field lock
-- [ ] 3c. Torn-slot detection at open → `FullRebuild` gap record
-- [ ] 3d. Compaction rewritten for the new layout (same staged-swap protocol)
-- [ ] 3e. Crash tests: crash before each write step, with a random subset of
-      dirty pages "written back"; reopen + replay must equal a full rebuild.
-      Re-measure, commit
+- [x] 3a. **Crash-ordered writes in the current format** (done first, on its
+      own: it closes the power-loss gap without a format change).
+      Two-phase spill (`stage` appends blobs → sync values → `commit` points
+      slots → sync keys; the checkpoint runs the phases under write / read /
+      write / read locks, no fsync under the write lock); overlay entry
+      versions so a commit keeps changes made after the stage; keymap writes
+      buffered and spilled the same way; a freed slot's keymap entry removed one
+      spill later; checksummed slots (new state byte 3, old files still read);
+      write cursor and counts recomputed at open; persistent rehash through a
+      new file + rename; open-time reconciliation of bitmaps and keymap (drop
+      values with no bitmap, remove orphan bitmaps, new slot ids above both);
+      damaged entries → `GapCause::DamagedIndexFile` full-rebuild gap.
+      `BlobStore::upsert` is now test-only, so production code cannot skip the
+      ordering.
+
+**Deferred** (agreed 2026-10-07: steps 1–3a deliver most of the gain; resume
+here only if the large-bitmap case matters):
+
+- [ ] 3b. Container-granular files: `blobs.vals` holds container blobs and
+      per-slot directories; the overlay holds only changed containers (fixes
+      the whole-bitmap spill loop past the budget, see above)
+- [ ] 3c. Compaction rewritten for the new layout (same staged-swap protocol)
+- [ ] 3d. Crash tests: crash before each write step, with a random subset of
+      dirty pages "written back"; reopen + replay must equal a full rebuild
 
 ## Step 4: docs (every place that describes index storage)
 
@@ -134,4 +148,9 @@ Before starting, re-run the search; the list below is what it found on
   1,000 values 4.6 → 2.7 MiB (each spill rewrites most of the many small
   bitmaps). `bench_predicate` unchanged against step 1 within noise
   (`int_range` +4%, `str_eq` −25%).
+
+- **Step 3a** (2026-10-07): crash-ordered spill in the current format, slot
+  checksums, open-time repair and reconciliation, damaged-file gap. No
+  measurable change on the write path (writes touch only the overlay); a
+  checkpoint adds one value-region `msync` per store.
 
