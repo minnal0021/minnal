@@ -66,6 +66,17 @@ pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 /// [`ThresholdConfig::index_blob_backpressure_bytes`].
 pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default soft limit (bytes) on memory held by field-index write buffers,
+/// across all fields of a database: crossing it requests an early index
+/// checkpoint. 32 MiB. See [`ThresholdConfig::index_overlay_soft_bytes`].
+pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_SOFT_BYTES;
+
+/// Default hard limit (bytes) on memory held by field-index write buffers,
+/// across all fields of a database: a write that crosses it writes its field's
+/// buffer out before returning. 64 MiB. See
+/// [`ThresholdConfig::index_overlay_hard_bytes`].
+pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_HARD_BYTES;
+
 /// Default cap on how many fully-persisted WAL segments the index-replay
 /// watermark may hold back. See
 /// [`ThresholdConfig::max_pinned_wal_segments`].
@@ -144,7 +155,22 @@ pub struct ThresholdConfig {
     /// only fires after another `index_blob_backpressure_bytes` accumulate.
     /// The dead-byte count is O(1) to read, so the check is cheap on the hot
     /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
+    ///
+    /// Field-index writes are buffered in memory and written once per
+    /// checkpoint (see `index_overlay_*_bytes`), so dead bytes now accrue per
+    /// checkpoint rather than per write and this valve rarely fires.
     pub index_blob_backpressure_bytes: u64,
+    /// Soft limit (bytes) on the memory all of a database's field indexes hold
+    /// in their write buffers (changed bitmaps not yet written to their files).
+    /// Crossing it requests an early index checkpoint, which writes every
+    /// buffer out. Shared across fields, not per field.
+    pub index_overlay_soft_bytes: u64,
+    /// Hard limit (bytes) on the same memory. A write that leaves the total
+    /// over it writes its own field's buffer out before returning, so the bound
+    /// holds even if the checkpoint worker is slow or not running. Writing a
+    /// buffer out is a copy into the field's memory-mapped files, not an fsync.
+    /// A soft limit above this is clamped to it.
+    pub index_overlay_hard_bytes: u64,
     /// Cap on how many fully-persisted WAL segments the **index-replay
     /// watermark** may hold back from WAL GC.
     ///
@@ -173,6 +199,8 @@ impl ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
+            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
             max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
@@ -209,6 +237,15 @@ impl ThresholdConfig {
         self
     }
 
+    /// Override the field-index write-buffer limits (bytes). See
+    /// [`index_overlay_soft_bytes`](Self::index_overlay_soft_bytes) and
+    /// [`index_overlay_hard_bytes`](Self::index_overlay_hard_bytes).
+    pub fn with_index_overlay_bytes(mut self, soft: u64, hard: u64) -> Self {
+        self.index_overlay_soft_bytes = soft;
+        self.index_overlay_hard_bytes = hard;
+        self
+    }
+
     /// Override the cap on WAL segments pinned by the index-replay watermark.
     /// See [`max_pinned_wal_segments`](Self::max_pinned_wal_segments).
     pub fn with_max_pinned_wal_segments(mut self, segments: u32) -> Self {
@@ -225,6 +262,8 @@ impl Default for ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
+            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
             max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }

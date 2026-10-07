@@ -34,10 +34,7 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
 - [x] 2a. `FieldIndex` overlay: per slot, changed containers (`Some` or deleted).
       Writes go to the overlay, loading only the row's container; reads merge
       overlay over file
-- [ ] 2b. (budget type, per-field private budget and hard-limit spill in
-      `DynFieldIndex` are done; remaining: one shared budget per `Database`,
-      config keys, soft-limit checkpoint trigger in the write path)
-      Global budget (`IndexOverlayBudget`, atomic byte counter shared by all
+- [x] 2b. Global budget (`IndexOverlayBudget`, atomic byte counter shared by all
       fields of a `Database`): soft limit requests a checkpoint, hard limit makes
       the writer spill its field before returning. Config:
       `thresholds.index_overlay_soft_bytes` (32 MiB),
@@ -46,8 +43,10 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
       per changed slot) and clears it; checkpoint marker only after the flush
 - [x] 2d. `remove_all_for_row(s)` probes the row's container per slot instead of
       deserialising every bitmap
-- [ ] 2e. WAL replay uses the normal path; remove its group-by-value code and
-      inline compaction
+- [x] 2e. WAL replay: bounded by the shared budget (set before replay). Kept
+      its group-by-value batching (saves a lookup per key) and the inline
+      compaction guard (a window larger than the budget still spills
+      repeatedly); comments updated
 - [ ] 2f. Tests: budget never exceeded with the checkpoint worker paused;
       overlay reads equal file reads; replay equivalence; existing index and
       crash tests. Re-measure, commit

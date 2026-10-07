@@ -276,6 +276,8 @@ impl DocStoreApiConfig {
                 tail_gc_min_garbage_pct: self.thresholds.tail_gc_min_garbage_pct,
                 index_blob_waste_threshold: self.thresholds.index_blob_waste_threshold,
                 index_blob_backpressure_bytes: self.thresholds.index_blob_backpressure_bytes,
+                index_overlay_soft_bytes: self.thresholds.index_overlay_soft_bytes,
+                index_overlay_hard_bytes: self.thresholds.index_overlay_hard_bytes,
                 max_pinned_wal_segments: self.thresholds.max_pinned_wal_segments,
             },
             sync_config: SyncConfig {
@@ -456,6 +458,14 @@ pub struct ThresholdSection {
     pub index_blob_waste_threshold: f64,
     #[serde(default = "default_index_blob_backpressure_bytes")]
     pub index_blob_backpressure_bytes: u64,
+    /// Soft limit on memory held by all field indexes' write buffers (changes
+    /// not yet written to their files): request an early index checkpoint.
+    #[serde(default = "default_index_overlay_soft_bytes")]
+    pub index_overlay_soft_bytes: u64,
+    /// Hard limit on the same memory: the writer that crosses it writes its
+    /// field's buffer out before returning.
+    #[serde(default = "default_index_overlay_hard_bytes")]
+    pub index_overlay_hard_bytes: u64,
     /// Cap on WAL segments the index-replay watermark may hold back from WAL GC
     /// before the backstop reclaims the oldest anyway. `0` disables the backstop.
     #[serde(default = "default_max_pinned_wal_segments")]
@@ -470,6 +480,8 @@ impl Default for ThresholdSection {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
+            index_overlay_soft_bytes: default_index_overlay_soft_bytes(),
+            index_overlay_hard_bytes: default_index_overlay_hard_bytes(),
             max_pinned_wal_segments: default_max_pinned_wal_segments(),
         }
     }
@@ -489,6 +501,14 @@ fn default_index_blob_waste_threshold() -> f64 {
 
 fn default_index_blob_backpressure_bytes() -> u64 {
     minnal_db::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
+}
+
+fn default_index_overlay_soft_bytes() -> u64 {
+    minnal_db::DEFAULT_INDEX_OVERLAY_SOFT_BYTES
+}
+
+fn default_index_overlay_hard_bytes() -> u64 {
+    minnal_db::DEFAULT_INDEX_OVERLAY_HARD_BYTES
 }
 
 fn default_max_pinned_wal_segments() -> u32 {

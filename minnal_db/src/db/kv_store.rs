@@ -590,6 +590,7 @@ impl KVStore {
                 },
             };
             let dead_bytes = idx.reclaimable_dead_bytes();
+            let overlay_full = idx.overlay_budget().over_soft();
             drop(idx);
             if let Err(e) = result {
                 // A rejected update leaves this row absent from the field for
@@ -604,6 +605,19 @@ impl KVStore {
             // dead space, ask the checkpoint worker to compact early instead of
             // waiting for the next tick (debounced inside the trigger).
             self.request_checkpoint_if_over_cap(dead_bytes);
+            // Memory: past the write buffers' soft limit, ask for a checkpoint
+            // to write them out. (The hard limit is enforced by the index itself.)
+            if overlay_full {
+                self.request_checkpoint_now();
+            }
+        }
+    }
+
+    /// Request an index checkpoint now, if the checkpoint worker is running.
+    /// Debounced inside the trigger. O(1) and non-blocking.
+    fn request_checkpoint_now(&self) {
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            trigger.request();
         }
     }
 
@@ -839,11 +853,15 @@ impl KVStore {
                 // Prior bytes unavailable → scan to be safe.
                 None => idx.remove_all_for_row(row_id),
             }
-            // A removal also rewrites the value's bitmap append-only, so it adds
-            // to the field's dead space — signal backpressure like the put path.
+            // A removal changes the value's bitmap like a put does: signal both
+            // valves the same way.
             let dead_bytes = idx.reclaimable_dead_bytes();
+            let overlay_full = idx.overlay_budget().over_soft();
             drop(idx);
             self.request_checkpoint_if_over_cap(dead_bytes);
+            if overlay_full {
+                self.request_checkpoint_now();
+            }
         }
     }
 

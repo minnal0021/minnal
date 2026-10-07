@@ -1082,6 +1082,48 @@ fn replay_cost_vs_window() {
     }
 }
 
+/// Every field index of a database charges one write-buffer budget, and a
+/// write that leaves it over the hard limit writes its field's buffer out
+/// before returning. Two fields, a 32 KiB hard limit and 6,000 documents: the
+/// total must stay within the limit plus one changed bitmap per field (the
+/// documented bound), and every query must stay correct.
+#[test]
+fn field_index_write_buffers_share_one_budget_and_stay_bounded() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let (soft, hard) = (16 * 1024u64, 32 * 1024u64);
+    let mut config = create_db_config();
+    config.threshold_config = config.threshold_config.with_index_overlay_bytes(soft, hard);
+    let db = Database::open(dir.path(), config).unwrap();
+    activate_named_index(&db, ns, "status");
+    activate_named_index(&db, ns, "tier");
+
+    let budget = db.index_overlay_budget.clone();
+    assert_eq!(budget.hard_limit(), hard, "the configured limit reaches the shared budget");
+    // One changed bitmap per field: here at most one full bitset container
+    // (8 KiB) plus overhead.
+    let slack = 2 * 12 * 1024;
+    let mut peak = 0;
+    for i in 0..6_000u32 {
+        let status = ["active", "inactive", "banned"][i as usize % 3];
+        let tier = ["gold", "silver"][i as usize % 2];
+        db.put(
+            format!("doc:{i:06}").as_bytes(),
+            format!(r#"{{"status":"{status}","tier":"{tier}"}}"#).as_bytes(),
+        )
+        .unwrap();
+        peak = peak.max(budget.used());
+    }
+    assert!(peak >= soft, "both fields must charge the shared budget (peaked at only {peak} bytes)");
+    assert!(peak <= hard + slack, "write buffers peaked at {peak} bytes, limit {hard} + slack {slack}");
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 2_000);
+    assert_eq!(db.query_keys(ns, "tier = \"gold\"").unwrap().keys.len(), 3_000);
+
+    db.run_index_checkpoint().unwrap();
+    assert_eq!(budget.used(), 0, "a checkpoint writes every buffer out");
+    db.shutdown().unwrap();
+}
+
 /// Replaying a **low-cardinality** field must not balloon its blob store.
 ///
 /// The bitmap store is append-only and rewrites a whole bitmap per key, so a

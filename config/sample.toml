@@ -141,6 +141,20 @@ index_blob_waste_threshold = 50.0
 # Default: 67108864 (64 MiB).
 index_blob_backpressure_bytes = 67_108_864
 
+# Memory limits for field-index write buffers. A field-index update changes an
+# in-memory copy of the affected bitmap; the copies are written to the index
+# files once per index checkpoint. These limits cap the memory all field
+# indexes of the database hold in those copies together (they are not per
+# field).
+#   soft: crossing it requests an index checkpoint now, which writes every
+#         buffer out.
+#   hard: a write that leaves the total above it writes its own field's buffer
+#         out before returning, so memory stays bounded even if checkpoints
+#         fall behind. A soft limit above the hard one is clamped to it.
+# Defaults: 33554432 (32 MiB) soft, 67108864 (64 MiB) hard.
+index_overlay_soft_bytes = 33_554_432
+index_overlay_hard_bytes = 67_108_864
+
 # Cap on how many fully-persisted WAL segments the INDEX-REPLAY WATERMARK may
 # hold back from WAL GC.
 #
