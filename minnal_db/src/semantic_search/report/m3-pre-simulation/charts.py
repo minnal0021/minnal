@@ -32,6 +32,18 @@ KEY_STATIC = [("static k-means", "= fitted once on the whole corpus's floats: th
               ("bundled file", f"= today's 256 general-purpose {MODEL} centroids (fitted on ELI5).")]
 
 
+# Chart titles state a finding, so they are checked per model and dataset. A chart
+# not listed here uses the default title in its function (written for gemma).
+TITLES = {
+    ("qwen", "scifact", "lifecycles"): "SciFact (qwen, 300 queries, noisier): every lifecycle trails static k-means, by 0.7–4.5 points",
+    ("qwen", "scifact", "churn"): "SciFact (qwen): after churn C ends within 2.1 points of a fresh fit",
+}
+
+
+def title(ds, chart, default):
+    return TITLES.get((MODEL, ds, chart), default)
+
+
 def run(ds, **kw):
     return next(r for r in D[ds]["stage1"] if all(r[k] == v for k, v in kw.items()))
 
@@ -76,8 +88,8 @@ def chart_lifecycle(ds):
         groups.append(dict(name=label, bars=bars))
     lo = -3 if ds == "fiqa" else -5
     hbar_chart(HERE / f"{ds}-lifecycles.svg",
-               {"fiqa": "FiQA: every lifecycle is within 1.6 points of static k-means",
-                "scifact": "SciFact (300 queries, noisier): C trails by 3 points when topics arrive in turn"}[ds],
+               title(ds, "lifecycles", {"fiqa": "FiQA: every lifecycle is within 1.6 points of static k-means",
+                                        "scifact": "SciFact (300 queries, noisier): C trails by 3 points when topics arrive in turn"}[ds]),
                "Recall@10 at 10% of entries scanned, minus static k-means fitted on the whole corpus (points). Target 128, k = 8.",
                groups, "difference from static k-means (recall points; 0 = as good)", (lo, 1), fmt="{:+.1f}",
                legend=[(c, t) for _, c, t in ORDERS], refs=[dict(x=-1, label="−1 pt")],
@@ -232,7 +244,7 @@ def chart_churn(ds, target=128, k=8):
         cls = ["fr1", "fr2", "fr3"] if len(ph) == 3 else ["fr1", "fr3"]
         groups.append(dict(name=label, bars=[dict(v=100 * (p["dyn"] - p["static"]), cls=c) for p, c in zip(ph, cls)]))
     hbar_chart(HERE / f"{ds}-churn.svg",
-               f"{ds_name(ds)}: deletes and turnover leave C within about a point of a fresh fit",
+               title(ds, "churn", f"{ds_name(ds)}: deletes and turnover leave C within about a point of a fresh fit"),
                f"Recall@10 at 10% of entries read, minus static k-means fitted on the surviving chunks (points). C, target {target}, k = {k}.",
                groups, "difference from static k-means (recall points; 0 = as good)", (-5, 1), fmt="{:+.1f}", label_w=190,
                legend=[("fr1", "after growing (before churn)"), ("fr2", "half replaced"), ("fr3", "after the deletes / all replaced")],
@@ -250,14 +262,24 @@ def ds_name(ds):
 if __name__ == "__main__":
     for f in HERE.glob("*.svg"):
         f.unlink()
-    chart_target("fiqa")
-    chart_lifecycle("fiqa")
-    chart_lifecycle("scifact")
-    chart_fidelity("fiqa")
-    chart_rebuild("fiqa")
-    chart_reencode("fiqa")
-    chart_search_width("fiqa")
-    chart_probe("fiqa")
-    chart_probe("fiqa", metric="cost")
-    chart_probe("scifact")
-    chart_churn("fiqa")
+    if "fiqa" in D:
+        chart_target("fiqa")
+        chart_lifecycle("fiqa")
+        chart_fidelity("fiqa")
+        chart_rebuild("fiqa")
+        chart_reencode("fiqa")
+        chart_search_width("fiqa")
+        chart_probe("fiqa")
+        chart_probe("fiqa", metric="cost")
+        chart_churn("fiqa")
+    if "scifact" in D:
+        chart_lifecycle("scifact")
+        chart_probe("scifact")
+        if "fiqa" not in D:      # SciFact is the only dataset so far: draw the rest from it too
+            chart_target("scifact")
+            chart_fidelity("scifact")
+            chart_rebuild("scifact")
+            chart_reencode("scifact")
+            chart_search_width("scifact")
+            chart_probe("scifact", metric="cost")
+            chart_churn("scifact")

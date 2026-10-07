@@ -359,6 +359,29 @@ chunks and at full size.
 run: below its floor it reads the whole namespace, which is what today's budget
 does at those sizes.)
 
+**Ranking quality by budget.** The same budgets in nDCG, at full FiQA size
+(shuffled), as the change from a full scan (nDCG@10 / @20 / @40 / @100 =
+0.4760 / 0.5019 / 0.5215 / 0.5412). C is target 128, k = 8:
+
+| Budget (share of E) | C: entries read | C: ΔnDCG @10 / @20 / @40 / @100 | bundled file: entries read | bundled file: ΔnDCG @10 / @20 / @40 / @100 |
+|---|---|---|---|---|
+| 5% | 5.7k | −0.0160 / −0.0158 / −0.0172 / −0.0190 | 8.0k | −0.0718 / −0.0764 / −0.0823 / −0.0877 |
+| 10% | 11.2k | −0.0071 / −0.0067 / −0.0073 / −0.0078 | 12.0k | −0.0338 / −0.0364 / −0.0386 / −0.0420 |
+| 20% | 22.2k | −0.0026 / −0.0023 / −0.0029 / −0.0031 | 20.9k | −0.0099 / −0.0106 / −0.0115 / −0.0132 |
+| 30% | 33.3k | −0.0013 / −0.0011 / −0.0013 / −0.0013 | — | — |
+| 40% | 44.4k | 0.0000 / 0.0000 / 0.0000 / −0.0002 | 38.1k | −0.0043 / −0.0043 / −0.0047 / −0.0055 |
+| 70k entries (today) | 70.1k | 0.0000 at every cutoff | 71.0k | −0.0004 / −0.0003 / −0.0002 / −0.0003 |
+
+(The bundled file reads more than the share at small budgets: a query always
+reads at least one whole posting, and its postings are uneven, the largest
+holding 11% of the namespace. The 30% row comes from the stage-3 run; the
+bundled file was not run at 30%.)
+
+The namespace's own partition reaches full-scan quality at about 44k entries,
+where the bundled file is still 0.004–0.006 short; the bundled file needs
+today's 70k budget to come within 0.0004. The loss is usually larger at @100
+than at @10, so @10 alone understates it.
+
 - **A pure share makes small namespaces inexact.** Today a namespace under
   70,000 entries is scanned completely and gets the exact top 10. A share
   scans a fraction of it: SciFact at full size loses 3.9 points at 20% and 9.4
@@ -367,7 +390,7 @@ does at those sizes.)
   queries about topics not yet indexed are far from every posting.
 - **At full FiQA size a share is much cheaper, but not free.** 20% reads 22,200
   entries per query, under a third of today's 70,000, for recall@10 0.992
-  instead of 0.999; nDCG@10 drops by 0.0025 and nDCG@100 by 0.0030, just over
+  instead of 0.999; nDCG@10 drops by 0.0026 and nDCG@100 by 0.0031, just over
   the 0.002 gate the milestones use. 30% reads 33,300 entries (under half) and
   stays inside it (−0.0013 at both cutoffs; drifting order −0.0018 / −0.0023).
   This is the saving the smaller postings of section 1 make possible.

@@ -1271,6 +1271,22 @@ full replacement costs about 1.9 key moves per deleted chunk.
 | Probe budget | `clamp(p · E, floor, ceiling)`, e.g. 30% / 20k / 70k; `max_probes` stays absolute | §4 |
 | M4 rebuild | from 1-bit codes, no floats | §3: 0.978 vs 0.976 |
 
+**The same simulation on qwen (SciFact so far; FiQA next).** Report:
+[`m3-pre-simulation/qwen/m3-pre-simulation.md`](m3-pre-simulation/qwen/m3-pre-simulation.md),
+which sets each number beside gemma's. Every proposal above holds on qwen
+SciFact:
+
+- Posting size, rebuild from 1-bit codes, never re-encoding from a narrow code,
+  the probe-budget floor and merging with k = 8 all give the same answers.
+- Width still leaves the ranking unchanged when codes keep their centre.
+
+The one difference is how close C gets to the best partition. In absolute
+terms C matches gemma (recall@10 0.878 against 0.883 at 10% read). But qwen's
+static k-means is better (0.900 against 0.876), so C trails it by 2.2–4.5
+points, where gemma was level. Seeding narrows the gap unevenly (0.7–1.1 points
+for the best seed per order), within SciFact's noise. If FiQA shows a gap of
+that size, it reopens M3c (float-seeded bootstrap) or a periodic M4 rebuild.
+
 ### M3a — Grow and split (split only, no reassign)
 
 - **Background maintenance task**, one writer per namespace, woken by
