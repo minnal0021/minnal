@@ -47,7 +47,7 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
       its group-by-value batching (saves a lookup per key) and the inline
       compaction guard (a window larger than the budget still spills
       repeatedly); comments updated
-- [ ] 2f. Tests: budget never exceeded with the checkpoint worker paused;
+- [x] 2f. Tests: budget never exceeded with the checkpoint worker paused;
       overlay reads equal file reads; replay equivalence; existing index and
       crash tests. Re-measure, commit
 
@@ -124,3 +124,14 @@ Before starting, re-run the search; the list below is what it found on
   8–21× faster on every case (`str_eq` 11.5 µs → 0.55 µs, `int_range` 1.11 ms →
   134 µs, `three_way_and` 799 → 88 µs). Measured against `0270020`, release,
   separate target dirs.
+
+- **Step 2** (2026-10-07, `cb46a67` + `3ac93bd`): bitmap changes buffered
+  in memory, written once per spill; one budget per database
+  (`index_overlay_soft_bytes` / `index_overlay_hard_bytes`, 32 / 64 MiB).
+  File-backed field, spill every 1,750 writes (1,000 writes/s at the 1.75 s
+  checkpoint), against `0270020`: bool 200k rows 3,076 MiB → 3.6 MiB appended
+  and 14.5 → 0.03 µs/row; bool 50k 361 → 0.43 MiB; 16 values 151 → 1.5 MiB;
+  1,000 values 4.6 → 2.7 MiB (each spill rewrites most of the many small
+  bitmaps). `bench_predicate` unchanged against step 1 within noise
+  (`int_range` +4%, `str_eq` −25%).
+
