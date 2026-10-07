@@ -43,18 +43,10 @@ where
     Ok(out)
 }
 
-/// Deserialize a [`RoaringBitmap`] from bytes written by [`serialize`].
-///
-/// Each container blob is accessed with **checked** rkyv validation
-/// ([`rkyv::access`]) so a corrupt or malicious on-disk blob is reported as a
-/// [`StorageError`] rather than triggering a panic or undefined behaviour — see
-/// `FieldIndex::load_bitmap`, which treats this failure as recoverable.
-pub fn deserialize(bytes: &[u8]) -> Result<RoaringBitmap, StorageError>
-where
-    <Container as Archive>::Archived:
-        Deserialize<Container, HighDeserializer<rancor::Error>> + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
-{
-    let mut bm = RoaringBitmap::new();
+/// Walk the frames of a serialized bitmap, calling `f(key, rkyv_bytes)` for
+/// each container in order. Stops early when `f` returns `Ok(false)`. Checks
+/// every length against the buffer, so truncated input is a [`StorageError`].
+fn for_each_frame(bytes: &[u8], mut f: impl FnMut(u128, &[u8]) -> Result<bool, StorageError>) -> Result<(), StorageError> {
     let mut pos = 0usize;
 
     if pos + 4 > bytes.len() {
@@ -82,16 +74,64 @@ where
         let blob = &bytes[pos..pos + blob_len];
         pos += blob_len;
 
-        // Checked access: validate the archive's structure before reading it, so
-        // a corrupt blob yields a `StorageError` instead of UB. The `unaligned`
-        // rkyv feature makes archived primitives 1-byte aligned, so the raw
-        // `blob` slice is sufficiently aligned and no AlignedVec copy is needed.
-        let archived = rkyv::access::<rkyv::Archived<Container>, rancor::Error>(blob).map_err(StorageError::from)?;
-        let container: Container = rkyv::deserialize::<Container, rancor::Error>(archived).map_err(StorageError::from)?;
-
-        bm.store.upsert(key, &container);
+        if !f(key, blob)? {
+            break;
+        }
     }
+    Ok(())
+}
+
+/// Decode one container's rkyv bytes.
+///
+/// Checked access: validate the archive's structure before reading it, so a
+/// corrupt blob yields a `StorageError` instead of UB. The `unaligned` rkyv
+/// feature makes archived primitives 1-byte aligned, so the raw slice is
+/// sufficiently aligned and no AlignedVec copy is needed.
+fn decode_container(blob: &[u8]) -> Result<Container, StorageError>
+where
+    <Container as Archive>::Archived:
+        Deserialize<Container, HighDeserializer<rancor::Error>> + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
+    let archived = rkyv::access::<rkyv::Archived<Container>, rancor::Error>(blob).map_err(StorageError::from)?;
+    rkyv::deserialize::<Container, rancor::Error>(archived).map_err(StorageError::from)
+}
+
+/// Deserialize a [`RoaringBitmap`] from bytes written by [`serialize`].
+///
+/// Each container blob is accessed with **checked** rkyv validation
+/// ([`rkyv::access`]) so a corrupt or malicious on-disk blob is reported as a
+/// [`StorageError`] rather than triggering a panic or undefined behaviour — see
+/// `FieldIndex::load_bitmap`, which treats this failure as recoverable.
+pub fn deserialize(bytes: &[u8]) -> Result<RoaringBitmap, StorageError> {
+    let mut bm = RoaringBitmap::new();
+    for_each_frame(bytes, |key, blob| {
+        bm.store.upsert(key, &decode_container(blob)?);
+        Ok(true)
+    })?;
     Ok(bm)
+}
+
+/// True if a bitmap serialized by [`serialize`] contains any of `values`.
+///
+/// Decodes only the containers those values fall in, not the whole bitmap, so
+/// it is cheap to ask of every value bucket of a field (clearing a row whose
+/// old value is unknown).
+pub fn contains_any(bytes: &[u8], values: &[u128]) -> Result<bool, StorageError> {
+    let mut found = false;
+    for_each_frame(bytes, |key, blob| {
+        let wanted: Vec<u16> = values
+            .iter()
+            .filter(|&&v| crate::index::bitmap::decompose(v).0 == key)
+            .map(|&v| crate::index::bitmap::decompose(v).1)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(true);
+        }
+        let c = decode_container(blob)?;
+        found = wanted.iter().any(|&low| c.contains(low));
+        Ok(!found)
+    })?;
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -114,6 +154,19 @@ mod tests {
         let orig: Vec<u128> = bm.iter().collect();
         let rest: Vec<u128> = restored.iter().collect();
         assert_eq!(orig, rest);
+    }
+
+    #[test]
+    fn contains_any_matches_a_full_decode() {
+        let mut bm = RoaringBitmap::new();
+        for v in [3u128, 70_000, 70_001, 5 << 40] {
+            bm.insert(v);
+        }
+        let bytes = serialize(&bm).unwrap();
+        for probe in [&[3u128][..], &[70_001], &[4, 5 << 40], &[4], &[200_000, 1], &[]] {
+            let expected = probe.iter().any(|&v| bm.contains(v));
+            assert_eq!(contains_any(&bytes, probe).unwrap(), expected, "probe {probe:?}");
+        }
     }
 
     #[test]

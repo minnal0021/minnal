@@ -31,17 +31,20 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
 
 ## Step 2: dirty-container overlay with a memory budget
 
-- [ ] 2a. `FieldIndex` overlay: per slot, changed containers (`Some` or deleted).
+- [x] 2a. `FieldIndex` overlay: per slot, changed containers (`Some` or deleted).
       Writes go to the overlay, loading only the row's container; reads merge
       overlay over file
-- [ ] 2b. Global budget (`IndexOverlayBudget`, atomic byte counter shared by all
+- [ ] 2b. (budget type, per-field private budget and hard-limit spill in
+      `DynFieldIndex` are done; remaining: one shared budget per `Database`,
+      config keys, soft-limit checkpoint trigger in the write path)
+      Global budget (`IndexOverlayBudget`, atomic byte counter shared by all
       fields of a `Database`): soft limit requests a checkpoint, hard limit makes
       the writer spill its field before returning. Config:
       `thresholds.index_overlay_soft_bytes` (32 MiB),
       `thresholds.index_overlay_hard_bytes` (64 MiB)
-- [ ] 2c. Checkpoint / spill writes the overlay out in today's format (one blob
+- [x] 2c. Checkpoint / spill writes the overlay out in today's format (one blob
       per changed slot) and clears it; checkpoint marker only after the flush
-- [ ] 2d. `remove_all_for_row(s)` probes the row's container per slot instead of
+- [x] 2d. `remove_all_for_row(s)` probes the row's container per slot instead of
       deserialising every bitmap
 - [ ] 2e. WAL replay uses the normal path; remove its group-by-value code and
       inline compaction
@@ -50,6 +53,14 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
       crash tests. Re-measure, commit
 
 ## Step 3: container-granular files, ordered checkpoint write
+
+Why step 3 matters beyond write volume: in step 2 the overlay holds **whole**
+bitmaps. Once the bitmaps being written add up to more than the hard limit,
+every write spills a whole bitmap again — today's per-write behaviour (seen in
+a test with a deliberately tiny budget: 400k writes took 51 s, debug build).
+In production that is a low-cardinality field whose bitmaps exceed 64 MiB
+together (a boolean over ~300M rows). Step 3's overlay holds only changed
+containers (≤ 8 KB each), which removes the case.
 
 - [ ] 3a. New on-disk format: `blobs.vals` holds container blobs and per-slot
       directories; `blobs.keys` maps slot → directory. 64-byte checksummed

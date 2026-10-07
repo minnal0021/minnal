@@ -127,6 +127,12 @@ impl RoaringBitmap {
         self.store.count()
     }
 
+    /// Heap bytes a transient bitmap holds (container buffers plus a fixed
+    /// per-container cost). O(1). Zero for a file-backed bitmap.
+    pub fn heap_bytes(&self) -> usize {
+        self.store.heap_bytes()
+    }
+
     // ── Set operations (return new bitmap) ──────────────────────────
 
     /// AND: intersection of two bitmaps.

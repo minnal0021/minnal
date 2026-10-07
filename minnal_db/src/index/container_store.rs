@@ -617,20 +617,33 @@ impl MappedStore {
 
 // ── HeapStore ────────────────────────────────────────────────────────────────
 
+/// Fixed per-container cost of a heap-backed store beyond the container's own
+/// buffer: the map entry (key + `Container` enum) plus B-tree node overhead.
+const HEAP_ENTRY_OVERHEAD: usize = std::mem::size_of::<(u128, Container)>() + 16;
+
+/// Heap bytes one stored container accounts for.
+fn heap_cost(c: &Container) -> usize {
+    c.heap_bytes() + HEAP_ENTRY_OVERHEAD
+}
+
 /// The heap backing: containers in a sorted map, changed in place.
 #[derive(Default)]
 struct HeapStore {
     map: BTreeMap<u128, Container>,
     /// Total bit count across all containers, kept current on every change.
     cardinality: u64,
+    /// Heap bytes held, kept current on every change (see [`heap_cost`]).
+    heap_bytes: usize,
 }
 
 impl HeapStore {
     fn upsert(&mut self, key: u128, container: &Container) -> bool {
         let new_card = container.cardinality() as u64;
+        self.heap_bytes += heap_cost(container);
         match self.map.insert(key, container.clone()) {
             Some(old) => {
                 self.cardinality = self.cardinality - old.cardinality() as u64 + new_card;
+                self.heap_bytes -= heap_cost(&old);
                 false
             }
             None => {
@@ -646,6 +659,7 @@ impl HeapStore {
             Some(old) => {
                 let card = old.cardinality() as u32;
                 self.cardinality -= card as u64;
+                self.heap_bytes -= heap_cost(&old);
                 card
             }
             None => 0,
@@ -743,27 +757,29 @@ impl ContainerStore {
     pub fn modify(&mut self, key: u128, create: bool, f: impl FnOnce(&mut Container) -> bool) -> bool {
         match &mut self.backing {
             Backing::Heap(h) => {
-                let (changed, old_card, new_card, empty) = match h.map.get_mut(&key) {
+                // (changed, old card, new card, old cost, new cost, now empty)
+                let (changed, old_card, new_card, old_cost, new_cost, empty) = match h.map.get_mut(&key) {
                     Some(c) => {
-                        let old = c.cardinality() as u64;
+                        let (old_card, old_cost) = (c.cardinality() as u64, heap_cost(c));
                         let changed = f(c);
-                        (changed, old, c.cardinality() as u64, c.is_empty())
+                        (changed, old_card, c.cardinality() as u64, old_cost, heap_cost(c), c.is_empty())
                     }
                     None if create => {
                         let mut c = Container::new_array();
                         let changed = f(&mut c);
-                        let (card, empty) = (c.cardinality() as u64, c.is_empty());
+                        let (card, cost, empty) = (c.cardinality() as u64, heap_cost(&c), c.is_empty());
                         if changed && !empty {
                             h.map.insert(key, c);
                         }
-                        (changed, 0, card, empty)
+                        (changed, 0, card, 0, if changed && !empty { cost } else { 0 }, empty)
                     }
                     None => return false,
                 };
+                h.heap_bytes = h.heap_bytes - old_cost + new_cost;
                 if changed {
                     h.cardinality = h.cardinality - old_card + new_card;
-                    if empty {
-                        h.map.remove(&key);
+                    if empty && h.map.remove(&key).is_some() {
+                        h.heap_bytes -= new_cost;
                     }
                 }
                 changed
@@ -858,13 +874,13 @@ impl ContainerStore {
         }
     }
 
-    /// Heap bytes held by a heap-backed store: each container's own size plus
-    /// its map entry. `None` for the mapped backing, whose data is file pages.
-    #[cfg(test)]
-    pub fn heap_bytes(&self) -> Option<usize> {
+    /// Heap bytes held: each container's buffer plus a fixed per-entry cost,
+    /// kept current on every change, so this is O(1). Zero for the mapped
+    /// backing, whose data lives in file pages the kernel can evict.
+    pub fn heap_bytes(&self) -> usize {
         match &self.backing {
-            Backing::Heap(h) => Some(h.map.values().map(|c| c.heap_bytes() + std::mem::size_of::<(u128, Container)>()).sum()),
-            Backing::Mapped(_) => None,
+            Backing::Heap(h) => h.heap_bytes,
+            Backing::Mapped(_) => 0,
         }
     }
 }
@@ -980,7 +996,7 @@ mod tests {
         }
         assert_eq!(store.cardinality(), 65_536);
         assert_eq!(store.count(), 1);
-        let bytes = store.heap_bytes().expect("transient store is heap-backed");
+        let bytes = store.heap_bytes();
         assert!(bytes <= 16 * 1024, "one full container should hold ~8 KB, holds {bytes} bytes");
     }
 

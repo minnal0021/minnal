@@ -2977,14 +2977,19 @@ impl IndexCheckpointTarget for Database {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
                     let field_path = self.index_manager.field_path(ns_id, field_id);
-                    // Flush under a read lock, then check waste cheaply. Only take
+                    // Write the field's buffered changes into its stores under
+                    // the write lock: a memory copy, no fsync. Every write below
+                    // `wal_tail` finished its index update before `wal_tail` was
+                    // taken (see above), so it is in this spill.
+                    entry.index.write().spill();
+                    // Sync under a read lock, then check waste cheaply. Only take
                     // the write lock (which serialises with index writers) when the
                     // bitmap store OR the keymap store has crossed the compaction
                     // threshold (the keymap accumulates dead space under
                     // distinct-value churn).
                     let (over_threshold, stats) = {
                         let idx = entry.index.read();
-                        idx.flush(&field_path).map_err(KVError::Io)?;
+                        idx.sync(&field_path).map_err(KVError::Io)?;
                         let stats = idx.blob_stats();
                         let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
                         (over, stats)

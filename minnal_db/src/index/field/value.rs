@@ -13,8 +13,14 @@
 //!
 //! The value→slot-id mapping (the "keymap") is persisted in a second
 //! `BlobStore` under a `keymap/` subdirectory.  Each entry maps
-//! `slot_id (u128) → serialised value bytes`, so individual inserts and
-//! removes are immediately durable without rewriting the entire keymap.
+//! `slot_id (u128) → serialised value bytes`. A new value's entry is written
+//! when the value first appears; a freed slot's entry is removed by
+//! [`DynFieldIndex::spill`], together with its bitmap blob, so the keymap never
+//! frees a slot whose old bitmap is still on disk.
+//!
+//! Bitmap changes are buffered in memory and written by `spill` (see
+//! [`FieldIndex`]'s *Changes are buffered* section); [`DynFieldIndex::flush`]
+//! spills and then syncs both stores.
 //!
 //! # Crash atomicity — DynFieldIndex is NOT independently crash-atomic
 //!
@@ -199,17 +205,46 @@ impl DynFieldIndex {
         })
     }
 
-    /// Flush both the bitmap and keymap mmap stores to disk.
+    /// Write the in-memory overlay to the stores ([`spill`](Self::spill)), then
+    /// sync both stores to disk ([`sync`](Self::sync)).
+    ///
+    /// The `dir` parameter is retained for API compatibility but is no longer
+    /// used — all state is already in the mmap stores opened at construction.
+    pub fn flush(&mut self, dir: &Path) -> std::io::Result<()> {
+        self.spill();
+        self.sync(dir)
+    }
+
+    /// Write every buffered bitmap change to the bitmap store, and remove the
+    /// keymap entries of slots freed since the last spill. Copies into the
+    /// stores' memory maps only; [`sync`](Self::sync) makes it durable.
+    ///
+    /// Bitmap blobs are removed before their keymap entries, so a crash in
+    /// between leaves a value with no rows (harmless, cleared by replay), never
+    /// a free slot whose old bitmap is still on disk.
+    pub fn spill(&mut self) {
+        let freed = match &mut self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.spill(),
+            DynFieldIndexInner::Int(fi) => fi.spill(),
+            DynFieldIndexInner::Str(fi) => fi.spill(),
+        };
+        if let Some(ks) = &mut self.keymap_store {
+            for slot_id in freed {
+                ks.remove_key(slot_id);
+            }
+        }
+    }
+
+    /// Sync both stores' memory maps to disk: what has been spilled, not the
+    /// overlay. Takes `&self` so the index checkpoint can run it under a read
+    /// lock after spilling under the write lock.
     ///
     /// The bitmap store is flushed first, then the keymap store, as **two
     /// independent `msync`s with no marker between them** — so a crash in
     /// between leaves the two stores skewed. This call is *not* crash-atomic on
     /// its own; the owner heals skew by replaying its log from the last
     /// checkpoint offset. See the module-level *Crash atomicity* section.
-    ///
-    /// The `dir` parameter is retained for API compatibility but is no longer
-    /// used — all state is already in the mmap stores opened at construction.
-    pub fn flush(&self, dir: &Path) -> std::io::Result<()> {
+    pub fn sync(&self, dir: &Path) -> std::io::Result<()> {
         let _ = dir; // retained for backward compatibility
         // Flush bitmap mmap pages.
         match &self.inner {
@@ -223,6 +258,33 @@ impl DynFieldIndex {
             ks.flush()?;
         }
         Ok(())
+    }
+
+    /// Charge this field's overlay to a shared budget (normally the database's).
+    pub fn set_overlay_budget(&mut self, budget: std::sync::Arc<crate::index::IndexOverlayBudget>) {
+        match &mut self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.set_overlay_budget(budget),
+            DynFieldIndexInner::Int(fi) => fi.set_overlay_budget(budget),
+            DynFieldIndexInner::Str(fi) => fi.set_overlay_budget(budget),
+        }
+    }
+
+    /// The budget this field's overlay is charged against.
+    pub fn overlay_budget(&self) -> &std::sync::Arc<crate::index::IndexOverlayBudget> {
+        match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.overlay_budget(),
+            DynFieldIndexInner::Int(fi) => fi.overlay_budget(),
+            DynFieldIndexInner::Str(fi) => fi.overlay_budget(),
+        }
+    }
+
+    /// Heap bytes this field's overlay holds (changes not yet spilled).
+    pub fn overlay_bytes(&self) -> u64 {
+        match &self.inner {
+            DynFieldIndexInner::Bool(fi) => fi.overlay_bytes(),
+            DynFieldIndexInner::Int(fi) => fi.overlay_bytes(),
+            DynFieldIndexInner::Str(fi) => fi.overlay_bytes(),
+        }
     }
 
     /// Fraction (`0.0..1.0`) of the bitmap value region that is reclaimable
@@ -362,12 +424,8 @@ impl DynFieldIndex {
 
     /// Record that every row in `row_ids` has `value` for this field.
     ///
-    /// One bitmap load and **one re-serialisation for the whole batch**, rather
-    /// than one per row. The blob store is append-only, so the per-row form
-    /// leaves a dead copy of the entire bitmap behind for every row — the
-    /// dominant cost when many rows share a value, i.e. exactly a
-    /// low-cardinality field. WAL replay uses this because it knows its whole
-    /// key set before it writes anything.
+    /// Changes the value's in-memory bitmap once for the whole batch. WAL
+    /// replay uses this because it knows its whole key set before it writes.
     ///
     /// Same type-mismatch and size errors as [`insert`](Self::insert). An empty
     /// `row_ids` is a no-op.
@@ -415,7 +473,18 @@ impl DynFieldIndex {
                 ));
             }
         }
+        self.spill_if_over_budget();
         Ok(())
+    }
+
+    /// Enforce the overlay budget's hard limit: when the shared budget is over
+    /// it after this field's write, spill this field before returning. Every
+    /// write path (the store's write path, WAL replay, reindex) goes through
+    /// these methods, so the bound holds wherever the index is changed.
+    fn spill_if_over_budget(&mut self) {
+        if self.overlay_budget().over_hard() && self.overlay_bytes() > 0 {
+            self.spill();
+        }
     }
 
     /// Scalar update: make `value` the **only** value `row_id` holds for this
@@ -471,43 +540,28 @@ impl DynFieldIndex {
 
     /// Remove `row_id` from the bucket for `value`.
     ///
-    /// If the value's bitmap becomes empty, the keymap entry is also removed
-    /// from the mmap store.
+    /// If the value's bitmap becomes empty, its slot (and keymap entry) is
+    /// freed at the next [`spill`](Self::spill).
     ///
     /// Returns `false` on type mismatch.
     pub fn remove(&mut self, value: &IndexValue, row_id: u128) -> bool {
+        let removed = self.remove_inner(value, row_id);
+        self.spill_if_over_budget();
+        removed
+    }
+
+    fn remove_inner(&mut self, value: &IndexValue, row_id: u128) -> bool {
         match (&mut self.inner, value) {
             (DynFieldIndexInner::Bool(idx), IndexValue::Bool(v)) => {
-                let slot_id = idx.slot_id_for(v);
                 idx.remove(*v, row_id);
-                if let Some(sid) = slot_id
-                    && !idx.contains_value(v)
-                    && let Some(ks) = &mut self.keymap_store
-                {
-                    ks.remove_key(sid);
-                }
                 true
             }
             (DynFieldIndexInner::Int(idx), IndexValue::Int(v)) => {
-                let slot_id = idx.slot_id_for(v);
                 idx.remove(*v, row_id);
-                if let Some(sid) = slot_id
-                    && !idx.contains_value(v)
-                    && let Some(ks) = &mut self.keymap_store
-                {
-                    ks.remove_key(sid);
-                }
                 true
             }
             (DynFieldIndexInner::Str(idx), IndexValue::Str(v)) => {
-                let slot_id = idx.slot_id_for(v);
                 idx.remove(v.clone(), row_id);
-                if let Some(sid) = slot_id
-                    && !idx.contains_value(v.as_str())
-                    && let Some(ks) = &mut self.keymap_store
-                {
-                    ks.remove_key(sid);
-                }
                 true
             }
             _ => false,
@@ -516,8 +570,8 @@ impl DynFieldIndex {
 
     /// Remove `row_id` from every value bucket it appears in.
     ///
-    /// Any value entries whose bitmaps become empty are also purged from the
-    /// keymap mmap store.
+    /// Slots whose bitmaps become empty are freed at the next
+    /// [`spill`](Self::spill).
     pub fn remove_all_for_row(&mut self, row_id: u128) {
         self.remove_all_for_rows(std::slice::from_ref(&row_id));
     }
@@ -529,16 +583,12 @@ impl DynFieldIndex {
     /// quadratic that makes a per-key `insert` loop expensive. Used by WAL
     /// replay, which clears its whole affected row set in one go.
     pub fn remove_all_for_rows(&mut self, row_ids: &[u128]) {
-        let removed_slots = match &mut self.inner {
+        match &mut self.inner {
             DynFieldIndexInner::Bool(idx) => idx.remove_all_for_rows(row_ids),
             DynFieldIndexInner::Int(idx) => idx.remove_all_for_rows(row_ids),
             DynFieldIndexInner::Str(idx) => idx.remove_all_for_rows(row_ids),
         };
-        if let Some(ks) = &mut self.keymap_store {
-            for slot_id in removed_slots {
-                ks.remove_key(slot_id);
-            }
-        }
+        self.spill_if_over_budget();
     }
 
     /// Call `f` for every bitmap across all value buckets.
@@ -861,10 +911,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         // Worst case for append-only write amplification: a single value (true)
-        // over many rows. Every insert re-appends the whole (growing) bitmap, so
-        // logical bytes balloon while the live footprint stays one small bitmap.
+        // over many rows, spilled after every insert (a checkpoint per write).
+        // Each spill appends the whole (growing) bitmap, so logical bytes
+        // balloon while the live footprint stays one small bitmap.
         for row in 0..2_000u128 {
             idx.insert(&IndexValue::Bool(true), row).unwrap();
+            idx.spill();
         }
 
         let before = idx.blob_stats();
@@ -917,6 +969,104 @@ mod tests {
         assert_eq!(idx.distinct_count(), 1);
     }
 
+    // ── Overlay (changes buffered until a spill) ────────────────────────────
+
+    #[test]
+    fn writes_between_spills_leave_no_dead_space() {
+        // The case the overlay exists for: 2,000 writes to one value used to
+        // append 2,000 copies of its bitmap. Now they change one in-memory
+        // bitmap, and the spill appends it once.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
+        for row in 0..2_000u128 {
+            idx.insert(&IndexValue::Bool(row % 2 == 0), row).unwrap();
+        }
+        assert_eq!(idx.blob_stats().bitmap_logical_bytes, 0, "nothing reaches the store before a spill");
+        assert!(idx.overlay_bytes() > 0);
+        idx.spill();
+        let st = idx.blob_stats();
+        assert_eq!(idx.overlay_bytes(), 0);
+        assert_eq!(idx.reclaimable_dead_bytes(), 0, "one copy per bitmap, nothing dead: {st:?}");
+        assert!(st.bitmap_live_bytes > 0);
+    }
+
+    #[test]
+    fn overlay_is_charged_to_and_released_from_the_shared_budget() {
+        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(1 << 20, 2 << 20));
+        let mut a = DynFieldIndex::new(IndexValueType::Int);
+        let mut b = DynFieldIndex::new(IndexValueType::Int);
+        a.set_overlay_budget(budget.clone());
+        b.set_overlay_budget(budget.clone());
+        for row in 0..10_000u128 {
+            a.insert(&IndexValue::Int((row % 7) as i64), row).unwrap();
+            b.insert(&IndexValue::Int(1), row).unwrap();
+        }
+        assert_eq!(budget.used(), a.overlay_bytes() + b.overlay_bytes());
+        a.spill();
+        assert_eq!(budget.used(), b.overlay_bytes());
+        drop(b);
+        assert_eq!(budget.used(), 0, "a dropped index returns its bytes");
+    }
+
+    #[test]
+    fn a_write_past_the_hard_limit_spills_its_field() {
+        // Two values over 140,000 rows: each ends with three 8 KB bitset
+        // containers, ~48 KB together. A 40 KiB hard limit is crossed near the
+        // end; the write that crosses it must spill, so the overlay never stays
+        // above the limit after a write returns.
+        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(32 * 1024, 40 * 1024));
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        idx.set_overlay_budget(budget.clone());
+        let mut max_seen = 0;
+        for row in 0..140_000u128 {
+            idx.insert(&IndexValue::Int((row % 2) as i64), row).unwrap();
+            max_seen = max_seen.max(budget.used());
+        }
+        assert!(max_seen <= 40 * 1024, "overlay must stay within the hard limit, peaked at {max_seen}");
+        assert!(idx.blob_stats().bitmap_live_bytes > 0, "the crossing write spilled to the store");
+        assert_eq!(int_rows(&idx, 0).len(), 70_000);
+        assert_eq!(int_rows(&idx, 1).len(), 70_000);
+    }
+
+    #[test]
+    fn reads_see_unspilled_changes_and_reopen_sees_spilled_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(5), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(5), 2).unwrap();
+            assert_eq!(int_rows(&idx, 5), vec![1, 2], "overlay read includes the unspilled row");
+            idx.remove_all_for_row(1);
+            assert_eq!(int_rows(&idx, 5), vec![2], "clearing probes the overlay and the store");
+            idx.flush(dir.path()).unwrap();
+        }
+        let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(int_rows(&idx, 5), vec![2]);
+    }
+
+    #[test]
+    fn a_value_emptied_and_refilled_before_a_spill_keeps_its_slot() {
+        // The keymap entry of an emptied value is removed only at the spill, so
+        // refilling the value before then must reuse the slot: two keymap
+        // entries for one value would reopen ambiguously.
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+            idx.insert(&IndexValue::Int(9), 1).unwrap();
+            idx.flush(dir.path()).unwrap();
+            idx.remove(&IndexValue::Int(9), 1);
+            assert_eq!(idx.distinct_count(), 0);
+            idx.insert(&IndexValue::Int(9), 2).unwrap();
+            idx.flush(dir.path()).unwrap();
+            assert_eq!(idx.keymap_store.as_ref().unwrap().count(), 1, "one keymap entry for value 9");
+        }
+        let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
+        assert_eq!(int_rows(&idx, 9), vec![2]);
+        assert_eq!(idx.distinct_count(), 1);
+    }
+
     // ── Compaction (the checkpoint's actual entry point) ─────────────────────
 
     use crate::index::field::predicate::Predicate;
@@ -934,12 +1084,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
 
-        // Two distinct values over many rows: each insert re-serialises and
-        // appends the whole bitmap, so the append-only value region accumulates
-        // dead space (the bloat compaction exists to reclaim).
+        // Two distinct values over many rows, spilled after every insert: each
+        // spill appends the whole changed bitmap, so the append-only value
+        // region accumulates dead space (the bloat compaction exists to reclaim).
         for row in 0..2_000u128 {
             let v = if row % 2 == 0 { 1 } else { 2 };
             idx.insert(&IndexValue::Int(v), row).unwrap();
+            idx.spill();
         }
 
         let waste = idx.bitmap_waste_ratio();
@@ -967,6 +1118,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             for row in 0..1_500u128 {
                 idx.insert(&IndexValue::Int((row % 3) as i64), row).unwrap();
+                idx.spill(); // one spill per write, to accumulate waste
             }
             assert!(idx.bitmap_waste_ratio() > 0.0);
             assert!(idx.maybe_compact(0.0).unwrap());
@@ -995,9 +1147,11 @@ mod tests {
             for v in 0..500i64 {
                 idx.insert(&IndexValue::Int(v), v as u128).unwrap();
             }
+            idx.spill();
             for v in 0..500i64 {
                 idx.remove(&IndexValue::Int(v), v as u128);
             }
+            idx.spill(); // frees the 500 slots in both stores
             // A handful of survivors that must remain queryable after compaction.
             for v in 1_000..1_005i64 {
                 idx.insert(&IndexValue::Int(v), v as u128).unwrap();
@@ -1033,6 +1187,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Str, dir.path()).unwrap();
             for row in 0..1_500u128 {
                 idx.insert(&IndexValue::Str(labels[row as usize % labels.len()].into()), row).unwrap();
+                idx.spill(); // one spill per write, to accumulate waste
             }
             assert!(idx.bitmap_waste_ratio() > 0.0);
             assert!(idx.maybe_compact(0.0).unwrap());
