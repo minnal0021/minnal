@@ -154,3 +154,11 @@ Before starting, re-run the search; the list below is what it found on
   measurable change on the write path (writes touch only the overlay); a
   checkpoint adds one value-region `msync` per store.
 
+- **Benchmark** (2026-10-07): `bench_predicate` now builds file-backed indexes
+  and flushes them before querying, so it measures reads from the index files
+  (the steady state) rather than the in-memory write buffer. At `571c113`:
+  `str_eq` 0.55 µs, `int_range` 148 µs, `compound_and` 2.2 µs,
+  `three_way_and` 93 µs, `parse_and_eval` 88 µs, AND 25% / 12% / 6%
+  0.59 / 2.3 / 62 µs. Earlier rows in this log used anonymous in-memory
+  stores, which read 0–7% faster than file pages.
+

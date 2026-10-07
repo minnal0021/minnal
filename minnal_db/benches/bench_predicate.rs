@@ -13,7 +13,13 @@ use minnal_db::index::{DynFieldIndex, IndexValue, IndexValueType};
 
 const N_ROWS: u128 = 100_000;
 
+/// Three file-backed field indexes over `N_ROWS` rows, written to disk before
+/// any query runs, so every query reads the index files. That is the steady
+/// state: a field index buffers changes in memory only until the next index
+/// checkpoint (1.75 s by default), so almost all reads hit the files.
 struct Indices {
+    /// Keeps the index files alive for the benchmark's lifetime.
+    _dir: tempfile::TempDir,
     schema: HashMap<String, u32>,
     status: Arc<RwLock<DynFieldIndex>>,
     age: Arc<RwLock<DynFieldIndex>>,
@@ -22,9 +28,15 @@ struct Indices {
 
 impl Indices {
     fn build() -> Self {
-        let mut status_idx = DynFieldIndex::new(IndexValueType::Str);
-        let mut age_idx = DynFieldIndex::new(IndexValueType::Int);
-        let mut active_idx = DynFieldIndex::new(IndexValueType::Bool);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let open = |name: &str, ty| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(&path).expect("index dir");
+            DynFieldIndex::open(ty, &path).expect("open index")
+        };
+        let mut status_idx = open("status", IndexValueType::Str);
+        let mut age_idx = open("age", IndexValueType::Int);
+        let mut active_idx = open("active", IndexValueType::Bool);
 
         let statuses = ["active", "inactive", "trial", "banned"];
         for row in 0..N_ROWS {
@@ -37,9 +49,17 @@ impl Indices {
             active_idx.insert(&IndexValue::Bool(active), row).unwrap();
         }
 
+        // Write everything to the index files, as a checkpoint does, so the
+        // queries below read the files rather than the in-memory write buffer.
+        for (idx, name) in [(&mut status_idx, "status"), (&mut age_idx, "age"), (&mut active_idx, "active")] {
+            idx.flush(&dir.path().join(name)).expect("flush index");
+            assert_eq!(idx.overlay_bytes(), 0, "nothing may remain buffered");
+        }
+
         let schema: HashMap<String, u32> = [("status".into(), 0u32), ("age".into(), 1u32), ("active".into(), 2u32)].into();
 
         Self {
+            _dir: dir,
             schema,
             status: Arc::new(RwLock::new(status_idx)),
             age: Arc::new(RwLock::new(age_idx)),
