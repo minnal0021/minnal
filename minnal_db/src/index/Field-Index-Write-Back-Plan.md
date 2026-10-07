@@ -63,10 +63,45 @@ changed in place, with a cached cardinality) for `RoaringBitmap::new()`, and
       dirty pages "written back"; reopen + replay must equal a full rebuild.
       Re-measure, commit
 
-## Step 4: docs
+## Step 4: docs (every place that describes index storage)
 
-- [ ] 4a. `index/CLAUDE.md`, `Index-Architecture.md`, root `CLAUDE.md` key knobs,
-      `config/sample.toml`; evaluation doc gets a results section
+Each step also updates the doc comments of the code it changes. This step
+brings the reader-facing docs and agent notes in line once the design has
+landed, following the root `CLAUDE.md` *Writing docs* rules: newcomer-first,
+no history, every fact checked against the code, REST examples run against a
+scratch server, a cold read of the whole diff before committing.
+
+Before starting, re-run the search; the list below is what it found on
+2026-10-07:
+
+    grep -rlnI -i "blob store\|BlobStore\|index_blob_\|append-only\|ContainerStore\|anonymous mmap\|blobs.vals\|bitmap" \
+        --include=*.md --include=*.toml --include=*.rs . | grep -v "^./target\|^./work/"
+
+- [ ] 4a. **Agent notes** (may keep the "why it changed"):
+      `minnal_db/src/index/CLAUDE.md` (ingest/checkpoint/compaction diagram,
+      *Blob store is append-only*, backpressure, crash-safety sections),
+      `minnal_db/CLAUDE.md` (index checkpoint / replay batching notes),
+      root `CLAUDE.md` (key knobs: `index_blob_*` thresholds, new overlay limits)
+- [ ] 4b. **Architecture doc**: `minnal_db/src/index/Index-Architecture.md`
+- [ ] 4c. **Operator docs**: `minnal_db_api/README.md` — index checkpoint,
+      `GET /admin/storage/index-waste`, `GET /admin/indices/{ns}/{field}/blob-stats`,
+      `POST /admin/storage/index-checkpoint`, config/metrics tables (new overlay
+      fields and limits; changed meaning of the backpressure setting);
+      `minnal_db/README.md`, `QUICKSTART.md`s and `benchmark.md` if they mention
+      index storage or its knobs
+- [ ] 4d. **Config**: `config/sample.toml` comments; `minnal_db/src/db/config.rs`
+      and `toml_config.rs` doc comments; `minnal_db_api/src/config.rs` and
+      `config_report.rs` (reported knobs)
+- [ ] 4e. **Code doc comments not touched in steps 1–3**: `bitmap.rs` type docs,
+      `field/field_index.rs`, `field/value.rs` (crash-atomicity section),
+      `blob_store.rs`, `db/kv_store.rs` and `db/database.rs` (replay and
+      backpressure comments), `db/index_checkpoint_worker.rs`,
+      `db/index_manager.rs`, admin route docs in
+      `minnal_db_api/src/routes/admin_indices.rs` / `admin_storage.rs`,
+      `doc_store/store/diagnostics.rs`
+- [ ] 4f. **Feature requests**: `FEATURE-REQUEST.md` entries that describe
+      the blob store or backpressure (mark what this work closes)
+- [ ] 4g. Evaluation doc: add a *Results* section with before/after numbers
 
 ## Log
 
