@@ -197,6 +197,8 @@ ttl_cleanup_interval_secs    = 3600
 
 [thresholds]
 value_log_waste_threshold = 30.0   # GC when >30 % of value-log is stale
+index_overlay_soft_bytes  = 33554432  # field-index write buffers, all fields together: checkpoint early past 32 MiB
+index_overlay_hard_bytes  = 67108864  # … and the writer writes its field's buffer out past 64 MiB
 
 [memtable]
 max_capacity = 100000          # skip-list capacity (entries)
@@ -1430,7 +1432,7 @@ curl -X POST http://localhost:8080/admin/storage/compact
 
 #### `GET /admin/storage/index-waste`
 
-Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows with per-document churn; the **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
+Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows each time a field's buffered changes are written out: every changed bitmap is appended whole and its old copy becomes dead space. The **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
 
 This is the fleet-wide view of waste *ratios*; for the absolute on-disk byte *growth* of a single field (logical vs. live bytes) — which a ratio alone hides — use [`GET /admin/indices/{ns}/{field}/blob-stats`](#get-adminindicesnsfieldblob-stats).
 
@@ -1464,7 +1466,7 @@ curl http://localhost:8080/admin/storage/index-waste
 
 #### `POST /admin/storage/index-checkpoint`
 
-Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (every 1.75 s by default, `scheduled_tasks.index_checkpoint_interval_ms`) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
+Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (every 1.75 s by default, `scheduled_tasks.index_checkpoint_interval_ms`) and clean shutdown: it flushes each namespace's dense row map, writes every active field index's buffered changes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
 
 This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem.
 
@@ -1771,9 +1773,9 @@ Returns `404` when the namespace is unknown, `{field}` is not an indexed field o
 
 #### `GET /admin/indices/{ns}/{field}/blob-stats`
 
-On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole on every document write) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
+On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole each time the field's buffered changes are written out: at every index checkpoint, or sooner when the write buffers reach `thresholds.index_overlay_hard_bytes`) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
 
-Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of low-cardinality, high-churn fields (e.g. a boolean over many documents), whose bitmap blob can balloon to many times its live footprint. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
+Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of a field whose bitmaps are large and change often (e.g. a boolean over many documents), whose bitmap blob can grow to many times its live footprint. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
 
 ```bash
 curl http://localhost:8080/admin/indices/users/status/blob-stats

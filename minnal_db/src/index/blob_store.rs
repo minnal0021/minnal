@@ -15,6 +15,26 @@
 //! **Value file** (`blobs.vals`):
 //! - Append-only sequence of raw byte blobs
 //! - Each slot records the byte offset and length of its blob
+//!
+//! # Write order (crash safety)
+//!
+//! Replacing a blob never overwrites it: the new blob is appended
+//! (`BlobStore::append_value`) and the slot is then pointed at it
+//! (`BlobStore::set_slot`), leaving the old copy as dead space for
+//! `BlobStore::compact`. Both files are shared memory maps that the kernel
+//! writes back in any order, so a persistent owner sequences the two steps
+//! itself: append every blob, `BlobStore::sync_values`, set the slots,
+//! `BlobStore::sync_keys`. A slot then never reaches disk ahead of its blob.
+//!
+//! Slots are still rewritten in place, so a crash can tear one. Each live slot
+//! carries a CRC-32 of its other bytes (state byte 3; state 1 is a slot written
+//! without one, still read). `BlobStore::open` tombstones any torn slot or
+//! slot pointing past the value file, counts it in
+//! `BlobStore::damaged_at_open`, and recomputes the header (counts and the
+//! write cursor) from the slots, so a stale header cannot make a new append
+//! overwrite live data. Growing the key table (rehash) builds the new table in
+//! a separate file and renames it into place; compaction stages both files and
+//! commits with a marker (see `BlobStore::compact`).
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -325,7 +345,7 @@ pub(crate) struct BlobStore {
     /// the rewritten `blobs.keys` / `blobs.vals` files.
     dir: Option<PathBuf>,
     /// Running count of reclaimable dead value-region bytes (blobs orphaned by
-    /// `upsert`/`remove_key` since the last [`compact`](BlobStore::compact)).
+    /// `set_slot`/`remove_key` since the last [`compact`](BlobStore::compact)).
     /// Maintained incrementally so it is O(1) to read on the hot write path —
     /// `waste_ratio`/`live_bytes` are O(capacity) and too costly per write. It is
     /// an **in-memory hint** for the checkpoint-backpressure trigger, not

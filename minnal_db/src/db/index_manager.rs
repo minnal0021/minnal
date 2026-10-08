@@ -11,12 +11,13 @@
 //! {db_path}/index/
 //!   {namespace_id}/
 //!     {field_id}/
-//!       blobs.keys     ← BlobStore key file (mmap hash table, slot_id → offset)
-//!       blobs.vals     ← BlobStore value file (serialised RoaringBitmap blobs)
-//!       keymap/        ← mmap-backed keymap store (value → slot_id mapping)
+//!       blobs.keys     ← BlobStore key file (mmap hash table, slot_id → offset, len)
+//!       blobs.vals     ← BlobStore value file (append-only serialised RoaringBitmap blobs)
+//!       keymap/        ← mmap-backed keymap store (slot_id → serialised value)
 //!         blobs.keys
 //!         blobs.vals
-//!       checkpoint     ← WAL write-offset at last flush (8 bytes, LE u64)
+//!       checkpoint     ← WAL offset the index reflects as of its last checkpoint (8 bytes, LE u64)
+//!       gap.json       ← present only while the index is known to be missing updates
 //! ```
 
 use std::path::{Path, PathBuf};

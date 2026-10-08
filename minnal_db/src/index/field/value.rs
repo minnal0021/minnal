@@ -22,34 +22,35 @@
 //! [`FieldIndex`]'s *Changes are buffered* section); [`DynFieldIndex::flush`]
 //! spills and then syncs both stores.
 //!
-//! # Crash atomicity — DynFieldIndex is NOT independently crash-atomic
+//! # Crash safety — each store is crash-ordered, the pair is reconciled at open
 //!
-//! A [`DynFieldIndex`] spans **two** separate `BlobStore`s — the bitmap store
-//! (`slot_id → RoaringBitmap`) and the keymap store (`slot_id → value bytes`) —
-//! and there is **no index-level marker tying them to one logical point**.
-//! `flush` flushes the bitmap store and then the keymap store as two distinct
-//! `msync`s, so a crash *between* them leaves the two stores at different
-//! versions (a "skew"): e.g. a slot's bitmap is on disk but its keymap entry is
-//! not, or vice-versa. Each store on its own is still structurally valid (they
-//! pass `BlobStore::open`'s header/bounds checks) — they simply disagree.
+//! A [`DynFieldIndex`] spans **two** `BlobStore`s — the bitmap store
+//! (`slot_id → RoaringBitmap`) and the keymap store (`slot_id → value bytes`).
+//! Within each store a spill is crash-ordered: new blobs are appended and the
+//! value region synced *before* any slot points at them, and slots carry a
+//! checksum, so a crash never leaves a slot pointing at bytes that did not
+//! reach disk (see `BlobStore`'s *Write order* section).
 //!
-//! This is **by design**: the field index is a *derived, reconstructable*
-//! structure, so consistency is the **owner's** responsibility, not the index
-//! crate's. In `minnal_db`, `run_index_checkpoint` flushes both stores and only
-//! *then* records the WAL offset (`IndexManager::checkpoint_fields`) as the
-//! single atomic marker. A crash mid-flush leaves that offset at the previous
-//! checkpoint, so on open `minnal_db` replays every WAL entry since then on top
-//! of the loaded index, re-applying the affected inserts/removes in their
-//! original order and reconciling any skew. A skewed reopen never panics or
-//! reads out of bounds — at worst a torn value queries empty (or leaves an
-//! orphaned slot reclaimed by a later `compact`) until replay heals it.
+//! There is **no marker tying the two stores to one logical point**, so after
+//! a crash one can be ahead of the other: a value's keymap entry on disk with
+//! no bitmap, or a bitmap no value maps to. [`DynFieldIndex::open`] reconciles
+//! the pair before returning (drops values with no bitmap, removes bitmaps no
+//! value maps to, and starts new slot ids above both), so an opened index is
+//! always self-consistent. Entries a store dropped as damaged are counted in
+//! [`DynFieldIndex::damaged_at_open`].
 //!
-//! **Standalone users must provide their own reconciliation** (e.g. an external
-//! log to replay, or a wrapping checkpoint marker). Do not assume that opening a
-//! `DynFieldIndex` after a crash, with no replay, yields a self-consistent
-//! bitmap/keymap pair. An index-level marker is intentionally **not** provided
-//! here because it would duplicate the owner's WAL-offset checkpoint; add one
-//! only if a genuine standalone-crash-atomic use case appears.
+//! What open cannot restore is *content*: rows changed after the last durable
+//! spill, and rows of a value dropped by reconciliation. That is the
+//! **owner's** job — the field index is a derived, reconstructable structure.
+//! In `minnal_db`, `run_index_checkpoint` syncs both stores and only *then*
+//! records the WAL offset (`IndexManager::checkpoint_fields`); on open it
+//! replays every WAL entry since that offset on top of the loaded index, and a
+//! non-zero `damaged_at_open` makes it record a full-rebuild gap
+//! (`GapCause::DamagedIndexFile`).
+//!
+//! **Standalone users must provide their own replay** (e.g. an external log
+//! from their last flush). An index-level marker is intentionally **not**
+//! provided here because it would duplicate the owner's WAL-offset checkpoint.
 //!
 
 use std::collections::BTreeMap;
@@ -419,11 +420,10 @@ impl DynFieldIndex {
     /// overlay. Takes `&self` so the index checkpoint can run it under a read
     /// lock after spilling under the write lock.
     ///
-    /// The bitmap store is flushed first, then the keymap store, as **two
-    /// independent `msync`s with no marker between them** — so a crash in
-    /// between leaves the two stores skewed. This call is *not* crash-atomic on
-    /// its own; the owner heals skew by replaying its log from the last
-    /// checkpoint offset. See the module-level *Crash atomicity* section.
+    /// Both stores' value regions are synced before either key table. There
+    /// is no marker across the two stores, so a crash part-way can leave them
+    /// skewed; [`open`](Self::open) reconciles that, and the owner's replay
+    /// restores the rows. See the module-level *Crash safety* section.
     pub fn sync(&self, dir: &Path) -> std::io::Result<()> {
         let _ = dir; // retained for backward compatibility
         // Values of both stores before the key table of either.
@@ -459,7 +459,7 @@ impl DynFieldIndex {
     }
 
     /// Fraction (`0.0..1.0`) of the bitmap value region that is reclaimable
-    /// dead space accumulated by the append-only per-insert bitmap rewrites.
+    /// dead space: old copies left behind when a spill appends a changed bitmap.
     pub fn bitmap_waste_ratio(&self) -> f64 {
         match &self.inner {
             DynFieldIndexInner::Bool(fi) => fi.bitmap_waste_ratio(),
@@ -494,8 +494,8 @@ impl DynFieldIndex {
     }
 
     /// Snapshot of this field's on-disk blob growth and reclaimable waste, for
-    /// monitoring the append-only write amplification (worst for low-cardinality
-    /// fields — see `index/CLAUDE.md`). Cheap: reads cached header fields and
+    /// monitoring write amplification (each spill appends every changed bitmap
+    /// whole — see `index/CLAUDE.md`). Cheap: reads cached header fields and
     /// scans live slots, no blob deserialisation.
     pub fn blob_stats(&self) -> IndexBlobStats {
         let (bitmap_logical_bytes, bitmap_live_bytes) = match &self.inner {
@@ -578,8 +578,8 @@ impl DynFieldIndex {
 
     /// Record that `row_id` has `value` for this field.
     ///
-    /// If this is the first row for `value`, the new slot is also written to
-    /// the keymap mmap store for immediate durability.
+    /// If this is the first row for `value`, its new slot's keymap entry is
+    /// queued and written by the next [`spill`](Self::spill), with the bitmaps.
     ///
     /// # Errors
     /// Returns an error string on type mismatch (runtime type of `value` does
@@ -743,9 +743,8 @@ impl DynFieldIndex {
 
     /// Clear every row in `row_ids` from every bucket it occupies.
     ///
-    /// One load and at most one write-back per bucket for the whole batch. The
-    /// single-row form pays that per row, which is the same append-only
-    /// quadratic that makes a per-key `insert` loop expensive. Used by WAL
+    /// One membership probe and at most one change per bucket for the whole
+    /// batch; the single-row form probes every bucket once per row. Used by WAL
     /// replay, which clears its whole affected row set in one go.
     pub fn remove_all_for_rows(&mut self, row_ids: &[u128]) {
         match &mut self.inner {

@@ -17,6 +17,12 @@ growth**? Which design is best?
 *Measured on `roaring_bit_map_fixes` at `ec5fb43` (release build, one thread,
 file-backed `DynFieldIndex`, no checkpoint or compaction running).*
 
+**Outcome.** Steps 1, 2 and the crash-ordering part of step 3 (3a) are
+implemented; the container-granular file format (3b–3d) is deferred as FR-005.
+Measured results and how the implementation differs from this proposal are in
+[Results](#results) at the end. The rest of this document describes the code as
+it was at `ec5fb43`.
+
 ## Terms
 
 - **Field index**: one `DynFieldIndex` per indexed field. It maps each distinct
@@ -285,3 +291,70 @@ container per checkpoint, not per update:
 - The power-loss gap exists today. Should it be fixed in the current format
   ahead of step 3 (flush values before keys, and stop the per-update
   shared-map writes), or wait for step 3?
+
+## Results
+
+Implemented on `roaring_bit_map_fixes`: step 1 (`4e63447`), step 2 (`cb46a67`,
+`3ac93bd`), step 3a (`571c113`). Measured in release builds against `0270020`
+(the last commit before any code change), with separate target directories.
+
+### Write volume (step 2)
+
+File-backed field, one spill every 1,750 writes (1,000 writes/s at the 1.75 s
+checkpoint interval):
+
+| Field | Appended before | Appended after | Time per write before → after |
+|---|---:|---:|---|
+| bool, 200k rows | 3,076 MiB | 3.6 MiB | 14.5 → 0.03 µs |
+| bool, 50k rows | 361 MiB | 0.43 MiB | |
+| 16 values | 151 MiB | 1.5 MiB | |
+| 1,000 values | 4.6 MiB | 2.7 MiB | |
+
+The 1,000-value field gains least: each spill rewrites most of its many small
+bitmaps.
+
+### Memory and insert cost (step 1)
+
+- 65,536 inserts into one in-memory bitmap: 2.9 µs → 0.004 µs each, and
+  +384 MiB of RSS → no growth.
+- Index insert, file-backed, 50k rows: bool 10.1 → 2.1 µs, 16 values 5.9 →
+  0.96 µs, 1,000 values 3.2 → 0.23 µs.
+
+### Query cost
+
+`bench_predicate` became 8–21× faster with step 1, because a query no longer
+builds its working bitmaps in an anonymous memory map: `str_eq` 11.5 → 0.55 µs,
+`int_range` 1.11 ms → 134 µs, `three_way_and` 799 → 88 µs. Steps 2 and 3a left
+it unchanged within noise. With indexes written to and read from their files
+(at `571c113`): `str_eq` 0.55 µs, `int_range` 148 µs, `compound_and` 2.2 µs,
+`three_way_and` 93 µs, `parse_and_eval` 88 µs.
+
+### Crash safety (step 3a)
+
+The power-loss gap described above is closed in the current file format: a
+spill appends, syncs the values, then points the slots and syncs them; slots
+carry a checksum; open repairs torn slots and reconciles the bitmap and keymap
+stores; damaged files trigger a full rebuild of the field. A checkpoint adds one
+value-region `msync` per store and no measurable cost on the write path.
+
+### How the implementation differs from the proposal
+
+- **The overlay holds whole bitmaps, not containers.** Container granularity
+  needs the step-3 file format, which is deferred. Consequence: a field whose
+  changed bitmaps exceed the hard limit spills its whole bitmap on every write
+  (FR-005).
+- **`index_blob_backpressure_bytes` keeps its meaning** (dead disk bytes per
+  field). The overlay got two new settings instead, `index_overlay_soft_bytes`
+  and `index_overlay_hard_bytes`, shared by all fields of a database. The
+  backpressure valve now rarely fires.
+- **A hard-limit spill syncs on the writer's thread**, under the field's write
+  lock, so the write that crosses the limit pays two `msync`s. The checkpoint
+  path syncs under a read lock.
+
+### Open questions, as resolved
+
+- Budget defaults stay at 32 / 64 MiB; they have not been sized against a
+  production write rate.
+- Step 1 shipped together with steps 2 and 3a on one branch.
+- The power-loss gap was fixed in the current format (step 3a), ahead of and
+  independent of the deferred format change.

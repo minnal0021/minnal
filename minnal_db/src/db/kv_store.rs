@@ -103,8 +103,9 @@ pub struct KVStore {
     // LSM compaction trigger channel
     pub(crate) lsm_compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 
-    // Index-checkpoint backpressure valve: requests an early checkpoint when a
-    // field index accumulates too much reclaimable dead blob space. `None` until
+    // Index-checkpoint trigger: requests an early checkpoint when a field index
+    // accumulates too much reclaimable dead blob space, or when field-index write
+    // buffers pass the overlay budget's soft limit. `None` until
     // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
     pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
     // Where rejected field-index updates are reported so they become durable gap
@@ -601,9 +602,10 @@ impl KVStore {
                     sink.note_rejected_update(self.namespace_id, entry.field_id, key);
                 }
             }
-            // Backpressure: if this field's append-only blob has piled up enough
-            // dead space, ask the checkpoint worker to compact early instead of
-            // waiting for the next tick (debounced inside the trigger).
+            // Disk: if this field's blob store has piled up enough dead space
+            // (old bitmap copies left by spills), ask the checkpoint worker to
+            // compact early instead of waiting for the next tick (debounced
+            // inside the trigger).
             self.request_checkpoint_if_over_cap(dead_bytes);
             // Memory: past the write buffers' soft limit, ask for a checkpoint
             // to write them out. (The hard limit is enforced by the index itself.)

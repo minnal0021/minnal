@@ -10,9 +10,11 @@
 //!   overlay out before returning (a *spill*), so the bound holds even when the
 //!   checkpoint worker is slow or not running.
 //!
-//! A spill copies bitmaps into the field's memory-mapped files; it does not
-//! fsync. The memory moves to page cache, which the kernel can write back and
-//! evict, and the next checkpoint makes it durable.
+//! A spill appends the changed bitmaps to the field's memory-mapped files and
+//! syncs them in crash order (values, then slots), so the memory moves to page
+//! cache, which the kernel can evict. The writer that triggers a hard-limit
+//! spill pays those two syncs while holding its field's write lock; the
+//! checkpoint path instead syncs under a read lock.
 //!
 //! The bound: total overlay bytes stay below the hard limit plus, per field
 //! written since the limit was crossed, the size of one changed bitmap (each

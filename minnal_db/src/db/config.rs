@@ -138,27 +138,32 @@ pub struct ThresholdConfig {
     pub tail_gc_min_garbage_pct: Option<f64>,
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
-    /// append-only, so each per-document insert leaves a stale copy of that
-    /// field-value's bitmap behind; compaction reclaims it.
+    /// append-only: each time a field's buffered changes are written out (a
+    /// *spill*), every changed bitmap is appended whole and its previous copy
+    /// becomes dead space; compaction reclaims it.
     pub index_blob_waste_threshold: f64,
     /// Absolute cap (bytes) on a single field index's reclaimable dead blob
-    /// bytes before the write path proactively requests an index checkpoint,
-    /// instead of waiting for the next periodic tick.
+    /// bytes before the write path requests an index checkpoint early (which
+    /// compacts the field), instead of waiting for the next periodic tick.
     ///
-    /// This is **backpressure**, and it is an absolute byte cap on purpose — a
-    /// *ratio* trigger is useless here because a low-cardinality, high-churn
-    /// field (e.g. a boolean over many docs) crosses any ratio almost
-    /// immediately and stays pinned near 100%, so it would fire on nearly every
-    /// write. Capping absolute dead bytes bounds the transient on-disk
+    /// Dead bytes accrue per spill, not per write. Spills happen once per
+    /// checkpoint and, between checkpoints, whenever the write buffers pass
+    /// [`index_overlay_hard_bytes`](Self::index_overlay_hard_bytes), so this
+    /// valve matters for fields whose changed bitmaps are large enough to keep
+    /// the buffers over the hard limit and spill on most writes.
+    ///
+    /// It is an absolute byte cap on purpose — a *ratio* trigger is useless
+    /// here because a field with one large, often-rewritten bitmap crosses any
+    /// ratio after a few spills and stays near 100%, so it would fire on nearly
+    /// every write. Capping absolute dead bytes bounds the transient on-disk
     /// amplification to roughly this value per field, and it self-debounces:
-    /// compaction resets the field's dead-byte count to 0, so the next request
-    /// only fires after another `index_blob_backpressure_bytes` accumulate.
-    /// The dead-byte count is O(1) to read, so the check is cheap on the hot
-    /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
+    /// compaction resets the field's dead-byte count to 0. The count is O(1) to
+    /// read, so the check is cheap on the hot write path (unlike
+    /// `index_blob_waste_threshold`, which scans every slot).
     ///
-    /// Field-index writes are buffered in memory and written once per
-    /// checkpoint (see `index_overlay_*_bytes`), so dead bytes now accrue per
-    /// checkpoint rather than per write and this valve rarely fires.
+    /// `0` disables the write-path valve. WAL replay at open still compacts
+    /// inline on the default cap, since an unbounded replay could leave the
+    /// database unable to open.
     pub index_blob_backpressure_bytes: u64,
     /// Soft limit (bytes) on the memory all of a database's field indexes hold
     /// in their write buffers (changed bitmaps not yet written to their files).
@@ -168,7 +173,10 @@ pub struct ThresholdConfig {
     /// Hard limit (bytes) on the same memory. A write that leaves the total
     /// over it writes its own field's buffer out before returning, so the bound
     /// holds even if the checkpoint worker is slow or not running. Writing a
-    /// buffer out is a copy into the field's memory-mapped files, not an fsync.
+    /// buffer out appends it to the field's memory-mapped files and syncs them
+    /// (values, then slots), on that writer's thread under the field's write
+    /// lock — so a write that crosses this limit is slower than one that
+    /// does not.
     /// A soft limit above this is clamped to it.
     pub index_overlay_hard_bytes: u64,
     /// Cap on how many fully-persisted WAL segments the **index-replay

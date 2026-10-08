@@ -2,17 +2,17 @@
 //!
 //! Two backings, one API:
 //!
-//! - **Heap** ([`ContainerStore::new_anon`]): a sorted map of containers,
+//! - **Heap** (`ContainerStore::new_anon`): a sorted map of containers,
 //!   changed in place. Every transient bitmap uses it — loaded copies, query
 //!   results, replay batches. Its memory is the bitmap's real size.
-//! - **Mapped** ([`ContainerStore::create`] / [`ContainerStore::open`]): the
+//! - **Mapped** (`ContainerStore::create` / `ContainerStore::open`): the
 //!   two-file layout below, for persistent bitmaps.
 //!
 //! The heap backing exists because the mapped layout is append-only: every
 //! change writes a new copy of the container and nothing is reclaimed until the
-//! store is dropped. Used for transient bitmaps (it once backed them all, as an
-//! anonymous map) that made 65,536 inserts into one container cost 514 MiB of
-//! memory for an 8 KB bitmap. Do not put transient bitmaps back on it.
+//! store is dropped. Backing a transient bitmap with it (as an anonymous map)
+//! made 65,536 inserts into one container cost 514 MiB of memory for an 8 KB
+//! bitmap. Do not put transient bitmaps on the mapped backing.
 //!
 //! [`RoaringBitmap`]: crate::index::RoaringBitmap
 //!

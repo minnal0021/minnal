@@ -51,8 +51,8 @@ pub enum IndexCheckpointCommand {
 }
 
 /// Write-path handle that requests an early index checkpoint when a field index
-/// accumulates too much reclaimable dead blob space — the backpressure valve for
-/// the append-only bitmap store's per-document write amplification.
+/// accumulates too much reclaimable dead blob space (the backpressure valve), or
+/// when field-index write buffers pass their memory budget's soft limit.
 ///
 /// Mirrors the WAL/LSM observer pattern: the write path holds this cheap handle
 /// and signals the background [`IndexCheckpointWorker`] rather than knowing how a
@@ -78,7 +78,9 @@ impl IndexCheckpointTrigger {
 
     /// Request an early checkpoint **unconditionally**, ignoring `cap_bytes`.
     ///
-    /// Used by WAL GC when the index-replay watermark is holding segments back:
+    /// Used by the write path when field-index write buffers pass the overlay
+    /// budget's soft limit (a checkpoint writes them out), and by WAL GC when
+    /// the index-replay watermark is holding segments back:
     /// the pin can only drain when a checkpoint advances the fields' recorded
     /// offsets, so retention tracks checkpoint latency instead of the periodic
     /// timer. It must not be routed through

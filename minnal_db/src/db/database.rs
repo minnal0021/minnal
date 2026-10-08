@@ -3032,18 +3032,20 @@ impl IndexCheckpointTarget for Database {
                         let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
                         (over, stats)
                     };
-                    // Guardrail: low-cardinality fields suffer append-only write
-                    // amplification — a value rewritten per document leaves a stale
-                    // bitmap copy each time (see index/CLAUDE.md). The compaction
-                    // below reclaims it, but warn when a field's bitmap blob has
-                    // grown large with a small live footprint so operators can spot
+                    // Guardrail: every spill appends each changed bitmap whole and
+                    // leaves the old copy behind, so a field whose bitmaps are large
+                    // and spill often (hard-limit spills between checkpoints) piles
+                    // up dead space (see index/CLAUDE.md). The compaction below
+                    // reclaims it, but warn when a field's bitmap blob has grown
+                    // large with a small live footprint so operators can spot
                     // runaway growth between checkpoints.
                     const LARGE_BITMAP_LOGICAL_BYTES: u64 = 64 * 1024 * 1024;
                     if stats.bitmap_logical_bytes >= LARGE_BITMAP_LOGICAL_BYTES && stats.bitmap_waste_ratio >= 0.5 {
                         warn!(
                             "[IndexCheckpoint] ns={ns_id} field={field_id}: bitmap blob logical={} MiB live={} MiB \
-                             waste={:.0}% across {} distinct value(s) — append-only write amplification (likely a \
-                             low-cardinality, high-churn field); compaction will reclaim it now, but review the field's update rate",
+                             waste={:.0}% across {} distinct value(s) — old bitmap copies left by spills (likely \
+                             large bitmaps spilling often at the overlay hard limit); compaction will reclaim it now, but review \
+                             the field's update rate and the index_overlay_*_bytes limits",
                             stats.bitmap_logical_bytes / (1024 * 1024),
                             stats.bitmap_live_bytes / (1024 * 1024),
                             stats.bitmap_waste_ratio * 100.0,

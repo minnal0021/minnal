@@ -15,6 +15,7 @@ re-check them before starting work.
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
+| [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | Proposed |
 
 ---
 
@@ -835,3 +836,49 @@ by construction.
   operations (`count_docs`, the `field_index_*` helpers, `reindex_doc_*`), or
   disappears.
 - The removal is a single, clearly-labelled breaking commit.
+
+---
+
+## FR-005 — Container-granular field-index files
+
+**Filed:** 2026-10-08
+**Area:** `minnal_db` (`src/index/`)
+**Severity:** Low — affects only fields whose changed bitmaps together exceed
+`thresholds.index_overlay_hard_bytes` (64 MiB by default)
+**Source:** field-index write-back work on branch `roaring_bit_map_fixes`
+(steps 1–3a done; this is step 3b–3d of
+`minnal_db/src/index/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+
+### Summary
+
+A field index buffers changed bitmaps in memory (the *overlay*) and writes each
+changed bitmap **whole** at the next spill. The overlay is bounded by a shared
+byte budget. When one field's changed bitmaps alone exceed the hard limit — a
+boolean over roughly 300M rows — every write to it spills its whole bitmap
+again: write amplification and an fsync per write return for that field. In a
+test with a deliberately tiny budget, 400k writes took 51 s (debug build).
+
+### Why this is a feature, not a bug fix
+
+The fix changes the on-disk format of `blobs.vals`, which needs a decision on
+compatibility (greenfield policy allows recreating, but every existing index
+would have to be rebuilt).
+
+### Scope
+
+- Store a field's bitmap as per-container blobs plus a per-slot directory, so
+  the overlay holds only changed containers (≤ 8 KB each) and a spill appends
+  only those.
+- Rewrite compaction for the new layout, keeping the staged-swap protocol.
+- Crash tests: crash before each write step, with a random subset of dirty pages
+  written back; reopen + replay must equal a full rebuild.
+
+The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
+(option 4, step 3).
+
+### Acceptance criteria
+
+- A boolean field over 300M rows with the default budget appends O(changed
+  containers) per spill, not O(bitmap size) per write.
+- Query latency on file-backed indexes (`bench_predicate`) does not regress.
+- The crash tests above pass.

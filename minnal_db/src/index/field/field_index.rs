@@ -326,11 +326,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Record that every row in `row_ids` has `value` for this field.
     ///
     /// The point of this over a loop of [`insert`](Self::insert) is that the
-    /// bitmap is loaded and **re-serialised once for the whole batch** rather
-    /// than once per row. The blob store is append-only, so a per-row loop
-    /// leaves one dead copy of the entire bitmap behind per row — the dominant
-    /// cost when many rows share one value, which is exactly the shape of a
-    /// low-cardinality field.
+    /// value's slot is looked up and its overlay bitmap fetched (loaded from
+    /// the store on first touch) **once for the whole batch** rather than once
+    /// per row.
     ///
     /// Used by WAL replay, which knows its full key set up front and can group
     /// by value before writing. An empty `row_ids` is a no-op and does not
@@ -439,10 +437,10 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// and writes back **every** bucket that actually contained `row_id` (so a
     /// multi-valued row is removed from all of them). Buckets that did not
     /// contain it are left untouched — this is load-bearing for high-cardinality
-    /// fields, since re-serialising and appending *every* bucket on each
-    /// update/delete would be O(distinct) write amplification against the
-    /// append-only bitmap store. For a scalar field the common case touches a
-    /// single bucket, so the write-back cost is one bitmap.
+    /// fields: a bucket that is written back joins the overlay (memory charged
+    /// to the budget) and is re-appended to the append-only bitmap store at the
+    /// next spill, so touching *every* bucket would cost O(distinct) of both.
+    /// For a scalar field the common case touches a single bucket.
     ///
     /// The scan still *loads* each bucket to test membership — `O(distinct
     /// values)`. **When the caller knows the row's old value** (the document
@@ -451,8 +449,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// `DynFieldIndex::remove` — which touches only the affected bucket. This
     /// full scan is the fallback for when the old value is unknown. A persistent
     /// `row → slot` reverse index is **deliberately not kept** (it would double
-    /// the per-write index mutations and add its own append-only churn for a
-    /// structure already rebuilt from the WAL on recovery); supplying the old
+    /// the per-write index mutations and need its own storage for a structure
+    /// already rebuilt from the WAL on recovery); supplying the old
     /// value gives the same `O(1)` without that cost.
     pub fn remove_all_for_row(&mut self, row_id: u128) -> Vec<u128> {
         self.remove_all_for_rows(std::slice::from_ref(&row_id))
@@ -460,11 +458,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     /// Clear every row in `row_ids` from every bucket it occupies.
     ///
-    /// One load and at most one write-back **per bucket for the whole batch**,
-    /// rather than per row. The single-row form loads every bucket's bitmap and
-    /// rewrites the one that changed, so clearing N rows costs N loads of every
-    /// bucket and N appended copies — the same append-only quadratic that makes
-    /// a per-key `insert` loop expensive.
+    /// One membership probe and at most one change **per bucket for the whole
+    /// batch**, rather than per row: clearing N rows one at a time probes every
+    /// bucket N times.
     ///
     /// Used by WAL replay, which clears its whole affected row set before
     /// re-inserting. An empty `row_ids` is a no-op.
@@ -563,22 +559,23 @@ impl<V: Ord + Clone> FieldIndex<V> {
     }
 
     /// `(logical, live)` bytes of the bitmap value region: total bytes ever
-    /// appended vs. what survives compaction. The gap is reclaimable dead space
-    /// from the append-only whole-bitmap rewrites — large for low-cardinality
-    /// fields. See `BlobStore::logical_bytes` / `BlobStore::live_bytes`.
+    /// appended vs. what survives compaction. The gap is reclaimable dead space:
+    /// each spill appends a fresh copy of every bitmap that changed and leaves
+    /// the old copy behind. See `BlobStore::logical_bytes` /
+    /// `BlobStore::live_bytes`.
     pub fn bitmap_blob_bytes(&self) -> (u64, u64) {
         (self.bitmaps.logical_bytes(), self.bitmaps.live_bytes())
     }
 
     /// Reclaimable dead bytes in the bitmap value region — **O(1)** (see
-    /// `BlobStore::dead_bytes`). Used to drive checkpoint backpressure without a
-    /// per-write waste-ratio scan.
+    /// `BlobStore::dead_bytes`). Read on the write path by the backpressure
+    /// valve, which cannot afford a waste-ratio scan per write.
     pub fn bitmap_dead_bytes(&self) -> u64 {
         self.bitmaps.dead_bytes()
     }
 
-    /// Compact the bitmap value region, reclaiming dead space left by the
-    /// per-insert whole-bitmap rewrites. See `BlobStore::compact`.
+    /// Compact the bitmap value region, reclaiming the dead space left by
+    /// spills (old copies of changed bitmaps). See `BlobStore::compact`.
     pub fn compact_bitmaps(&mut self) -> std::io::Result<u64> {
         self.bitmaps.compact()
     }
