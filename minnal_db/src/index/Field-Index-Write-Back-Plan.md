@@ -167,3 +167,15 @@ Before starting, re-run the search; the list below is what it found on
   and config doc comments, stale code comments, FR-005 for the deferred format,
   *Results* in the evaluation. `benchmark.md` not touched: its numbers come
   from `run_report.sh` at a pinned commit and need a full re-run.
+
+- **Benchmark report** (2026-10-08, `28c174e`): full `run_report.sh` run at
+  `0aeca7c`; every figure and chart in `benchmark.md` refreshed (field-index
+  equality 0.54 µs, range 144 µs).
+
+- **Replay time** (2026-10-08): `replay_cost_vs_window` / `_vs_total`, release,
+  alternated against `0270020`. 750 keys: 5.9–6.1 → 2.8–2.9 ms; about 3.7 µs
+  per key, flat over 6k–24k documents; 2.3 ms of the 2.8 is reading current
+  values. At the 1.75 s interval (≤ ~770 fsync-bound writes per tick) restart
+  replay is about 3 ms per indexed field. Interval kept at 1750 ms. Gotcha: the
+  tests leak each crashed database, which slows the third case of a run by ~9 ms
+  whatever its size (confirmed by reversing the order).

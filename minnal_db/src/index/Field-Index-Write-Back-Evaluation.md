@@ -337,6 +337,39 @@ carry a checksum; open repairs torn slots and reconciles the bitmap and keymap
 stores; damaged files trigger a full rebuild of the field. A checkpoint adds one
 value-region `msync` per store and no measurable cost on the write path.
 
+### Restart time (WAL replay)
+
+After a crash, each field index replays the WAL written since its last
+checkpoint. It scans that stretch of the WAL, reads the current value of every
+key it touched, and updates the bitmaps. Measured with the ignored tests
+`replay_cost_vs_window` and `replay_cost_vs_total` in `db/database_tests.rs`:
+one string field with two values, 6,000 documents, baseline and new binaries
+alternated over two rounds:
+
+| Keys to replay | Before | After |
+|---:|---:|---:|
+| 750 | 5.9–6.1 ms | 2.8–2.9 ms |
+| 1,500 | 9.7–10.4 ms | 5.3–5.5 ms |
+| 3,000 | 18.6 ms | 10.4–10.5 ms |
+| 6,000 | 42–56 ms | 26–29 ms |
+
+Replay now costs about 3.7 µs per key. Of the 2.8 ms for 750 keys, reading the
+keys' current values takes 2.3 ms and the WAL scan 0.2 ms. The bitmap updates
+take under 0.1 ms. The per-key cost does not grow with the store: 750 keys
+replay in 2.9–3.5 ms over 6,000, 12,000 and 24,000 documents. These tests leak
+each crashed database, whose background threads keep running. That adds about
+9 ms, outside the replay itself, to whichever case runs third, so the raw test
+output shows a jump at the third size whatever its order.
+
+What that means at the default 1.75 s checkpoint interval: a durable write
+fsyncs under the one WAL lock, so a database takes at most about 440 single-op
+writes per second, and a checkpoint leaves at most about 770 writes to replay.
+That is about 3 ms of replay per indexed field, against about 6 ms before. If
+the checkpoint falls behind, each second of lag adds about 1.6 ms per field. A
+longer interval would scale restart time linearly (a 15-minute interval: up to
+about 400,000 keys, roughly 1.5 s per field, extrapolated rather than measured)
+and would also hold that much more WAL.
+
 ### How the implementation differs from the proposal
 
 - **The overlay holds whole bitmaps, not containers.** Container granularity
