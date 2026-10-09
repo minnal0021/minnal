@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use minnal_db::{DocStoreError, DocStoreSchema, KvStoreSchema, StoreType};
+use minnal_db::{DocStoreError, DocStoreSchema, KvStoreSchema, SchemaError, StoreType};
 use tracing::info;
 
 use crate::{AppState, error::AppError};
@@ -47,12 +47,17 @@ pub async fn export_schema(State(state): State<AppState>, Path(ns): Path<String>
 pub async fn import_schema(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Result<impl IntoResponse, AppError> {
     let result = match store_type_from_value(&body)? {
         StoreType::Doc => {
-            let mut schema: DocStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            let mut schema: DocStoreSchema =
+                serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::Schema(SchemaError::Malformed(e))))?;
             let ns = schema.namespace.clone();
             info!(namespace = %ns, "importing doc schema");
             // ns_id is an internal assignment made at creation time — strip any value
             // carried in the exported file so the store assigns a fresh one.
             schema.ns_id = None;
+            // A new namespace gets its own seed; the exported record describes the old one.
+            if let Some(vi) = schema.vector_index.as_mut() {
+                vi.seeded_from = None;
+            }
             // A field that has been indexed must not also appear in attributes
             // (attributes is the non-indexed list). Schemas written before this
             // invariant was enforced may carry the field in both; drop it so
@@ -62,9 +67,14 @@ pub async fn import_schema(State(state): State<AppState>, Json(body): Json<serde
             create_doc_schema(&state, schema).await?
         }
         StoreType::Kv => {
-            let mut schema: KvStoreSchema = serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::from(e)))?;
+            let mut schema: KvStoreSchema =
+                serde_json::from_value(body).map_err(|e| AppError::from(DocStoreError::Schema(SchemaError::Malformed(e))))?;
             info!(namespace = %schema.namespace, "importing KV schema");
             schema.ns_id = None;
+            // A new namespace gets its own seed; the exported record describes the old one.
+            if let Some(vi) = schema.vector_index.as_mut() {
+                vi.seeded_from = None;
+            }
             create_kv_schema(&state, schema).await?
         }
     };

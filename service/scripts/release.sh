@@ -7,11 +7,11 @@
 #      otherwise inline — waits up to 30 s before aborting).
 #   3. Creates ./work/bin/ (if needed) and copies both binaries into it.
 #   4. Copies minnal_tools/sample_data/ → ./work/sample_data/  (only with -s flag).
-#   5. Copies the centroids for the configured model —
-#      service/embedding_support/{model}/clusters.json, where {model} is
-#      config/sample.toml's [semantic_search] model — → ./work/bin/clusters.bin.
-#      Refuses to replace a different centroid file while a database exists
-#      under ./work/doc_store (stored vectors are quantised against the old set)
+#   5. Copies the per-model cluster centroids — service/embedding_support/,
+#      one {model}/clusters.json per model — → ./work/bin/embedding_support/.
+#      Each namespace uses the centroids of the model its schema names.
+#      Refuses to change the centroids while a database exists under
+#      ./work/doc_store (stored vectors are quantised against the old ones)
 #      unless -c is given.
 #   6. Generates ./work/bin/minnal.toml from config/sample.toml, rewriting
 #      all data paths to use ./work/doc_store as the base directory.
@@ -22,7 +22,7 @@
 # Run from the workspace root:
 #   ./service/scripts/release.sh          # skip sample data
 #   ./service/scripts/release.sh -s       # also copy sample data
-#   ./service/scripts/release.sh -c       # allow the centroid file to change
+#   ./service/scripts/release.sh -c       # allow the centroids to change
 #                                         # (then re-index every semantic store)
 
 set -euo pipefail
@@ -45,67 +45,38 @@ CONFIG_SRC="${WORKSPACE_ROOT}/config/sample.toml"
 STOP_TIMEOUT=30
 
 # ── 0. Resolve and check the cluster centroids (before building or stopping) ─
-# The centroids must be the ones fitted for the configured `model` — the model
-# minnal asks the embedding service for: both bundled sets are 768-dim, so a
-# mismatch loads without error and silently skews the IVF partition (this
-# script used to hard-code qwen while the config said gemma, so a FiQA query
-# read 92% of its index).
-MODEL="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${CONFIG_SRC}" | head -n 1 | tr '[:upper:]' '[:lower:]')"
-if [[ -z "${MODEL}" ]]; then
-    echo "ERROR: no [semantic_search] model = \"…\" line in ${CONFIG_SRC}" >&2
+# One centroid set per model; each namespace uses the set for the model its
+# schema names, so there is no single file to pick here.
+CENTROID_SRC="${WORKSPACE_ROOT}/service/embedding_support"
+CENTROID_DST="${BIN_DIR}/embedding_support"
+if ! compgen -G "${CENTROID_SRC}/*/clusters.json" > /dev/null; then
+    echo "ERROR: no {model}/clusters.json under ${CENTROID_SRC}" >&2
     exit 1
 fi
-CLUSTER_SRC="${WORKSPACE_ROOT}/service/embedding_support/${MODEL}/clusters.json"
-if [[ ! -f "${CLUSTER_SRC}" ]]; then
-    echo "ERROR: model '${MODEL}' has no centroids at ${CLUSTER_SRC}" >&2
-    exit 1
-fi
-# Replacing the centroids under an existing database invalidates every stored
+# Changing the centroids under an existing database invalidates every stored
 # vector (both passes are quantised relative to a centroid), and search then
-# returns wrong results without any error. Only do it on purpose.
-if [[ -f "${BIN_DIR}/clusters.bin" ]] && ! cmp -s "${CLUSTER_SRC}" "${BIN_DIR}/clusters.bin" \
-    && [[ -n "$(ls -A "${WORKSPACE_ROOT}/work/doc_store/db" 2>/dev/null)" ]] && [[ "${ALLOW_CENTROID_CHANGE}" != true ]]; then
-    echo "ERROR: ${BIN_DIR}/clusters.bin differs from the ${MODEL} centroids, and a database" >&2
-    echo "       exists under ./work/doc_store. Its vector indices were quantised against the" >&2
-    echo "       current file; replacing it would make semantic search silently wrong." >&2
-    echo "       Re-run with -c to replace it anyway, then re-index every semantic-search store" >&2
-    echo "       (POST /admin/indices/{ns}/vector/reindex-all)." >&2
-    exit 1
-fi
-
-cd "${WORKSPACE_ROOT}"
-
-# ── Helper: graceful stop ──────────────────────────────────────────────────────
-stop_server() {
-    local pid
-    # pgrep -x won't match: Linux truncates comm to 15 chars and the binary
-    # name is 20 chars long. Use -f to search the full command line instead.
-    pid=$(pgrep -f minnal_db_api 2>/dev/null || true)
-
-    if [[ -z "$pid" ]]; then
-        echo "  No running minnal_db_api found — nothing to stop."
-        return 0
+# returns wrong results without any error. Only do it on purpose. A database
+# staged with a single clusters.bin was indexed against that one file, whatever
+# each namespace's model now selects.
+DB_EXISTS=false
+[[ -n "$(ls -A "${WORKSPACE_ROOT}/work/doc_store/db" 2>/dev/null)" ]] && DB_EXISTS=true
+if [[ "${DB_EXISTS}" == true ]] && [[ "${ALLOW_CENTROID_CHANGE}" != true ]]; then
+    reason=""
+    if [[ -f "${BIN_DIR}/clusters.bin" ]]; then
+        reason="the database was indexed against ${BIN_DIR}/clusters.bin; this release selects centroids per namespace model from ${CENTROID_DST}"
+    elif [[ -d "${CENTROID_DST}" ]] && ! diff -rq "${CENTROID_SRC}" "${CENTROID_DST}" > /dev/null; then
+        reason="${CENTROID_DST} differs from ${CENTROID_SRC}"
     fi
-
-    echo "  Found minnal_db_api (PID $pid) — sending SIGTERM..."
-    kill -TERM "$pid"
-
-    local elapsed=0
-    while kill -0 "$pid" 2>/dev/null; do
-        if [[ $elapsed -ge $STOP_TIMEOUT ]]; then
-            echo ""
-            echo "  ERROR: Process $pid did not exit within ${STOP_TIMEOUT}s. Aborting." >&2
-            echo "  Run 'kill -9 $pid' manually if you want to force-quit it." >&2
-            exit 1
-        fi
-        printf "\r  Waiting for process to exit... %ds elapsed" "$elapsed"
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-
-    echo ""
-    echo "  Server stopped after ${elapsed}s."
-}
+    if [[ -n "${reason}" ]]; then
+        echo "ERROR: the cluster centroids would change under an existing database:" >&2
+        echo "       ${reason}." >&2
+        echo "       Its vector indices were quantised against the current centroids;" >&2
+        echo "       changing them would make semantic search silently wrong." >&2
+        echo "       Re-run with -c to change them anyway, then re-index every semantic-search store" >&2
+        echo "       (POST /admin/indices/{ns}/vector/reindex-all)." >&2
+        exit 1
+    fi
+fi
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 echo "==> [1/9] Building release binaries..."
@@ -145,9 +116,11 @@ fi
 
 # ── 5. Copy cluster centroids ─────────────────────────────────────────────────
 echo ""
-echo "==> [5/9] Copying ${MODEL} cluster centroids → ${BIN_DIR}/clusters.bin"
-cp "${CLUSTER_SRC}" "${BIN_DIR}/clusters.bin"
-echo "  Copied clusters.bin (${MODEL})"
+echo "==> [5/9] Copying cluster centroids → ${CENTROID_DST}"
+rm -rf "${CENTROID_DST}"
+cp -r "${CENTROID_SRC}" "${CENTROID_DST}"
+rm -f "${BIN_DIR}/clusters.bin"
+echo "  Copied centroids for: $(cd "${CENTROID_SRC}" && ls -d */ | tr -d / | tr '\n' ' ')"
 
 # ── 6. Generate config ────────────────────────────────────────────────────────
 echo ""
@@ -156,7 +129,7 @@ sed \
     -e 's|db_path = "./data/db"|db_path = "./work/doc_store/db"|' \
     -e 's|schema_dir = "./data/schemas"|schema_dir = "./work/doc_store/schemas"|' \
     -e 's|log_dir = "./data/log"|log_dir = "./work/doc_store/log"|' \
-    -e 's|cluster_path = "./clusters.json"|cluster_path = "./work/bin/clusters.bin"|' \
+    -e 's|centroid_dir = "service/embedding_support"|centroid_dir = "./work/bin/embedding_support"|' \
     "${CONFIG_SRC}" > "${BIN_DIR}/minnal.toml"
 echo "  Written minnal.toml"
 
@@ -261,7 +234,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Release ready in ${BIN_DIR}:"
 echo "  minnal_db_api      — server binary"
 echo "  minnal_tools              — tools binary"
-echo "  clusters.bin              — ANN cluster centroids"
+echo "  embedding_support/        — ANN cluster centroids, one set per model"
 echo "  minnal.toml               — server config"
 echo "  stop.sh                   — gracefully stop the server"
 echo "  start.sh                  — start the server"

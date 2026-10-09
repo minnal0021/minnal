@@ -18,30 +18,53 @@ impl DocStore {
     /// the same file before the split.
     pub(super) async fn cached_query_embeddings(
         &self,
-        ctx: &SemanticSearchContext,
+        ns: &NamespaceSemantics,
         query_text: &str,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>), DocStoreError> {
-        let ttl = ctx.config.query_embedding_cache_ttl;
+        let config = &ns.config;
+        let ttl = config.query_embedding_cache_ttl;
         // Queries are not chunked: one whole-query vector serves both passes.
-        if let Some(dense) = vector_kv::get_cached_query_embedding(&self.db, &ctx.config.model_name, query_text, ctx.config.embedding_dim, ttl).await
-        {
+        if let Some(dense) = vector_kv::get_cached_query_embedding(&self.db, &config.model_name, query_text, config.embedding_dim, ttl).await {
             debug!("query embedding cache hit");
             return Ok((dense.clone(), vec![dense]));
         }
         debug!("query embedding cache miss, calling embedding service");
-        let q = crate::semantic_search::service::embed_query(&ctx.config, query_text)
+        let q = crate::semantic_search::service::embed_query(config, query_text)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-        vector_kv::put_cached_query_embedding(&self.db, &ctx.config.model_name, query_text, &q.dense, ttl).await;
+        vector_kv::put_cached_query_embedding(&self.db, &config.model_name, query_text, &q.dense, ttl).await;
         Ok((q.dense, q.sparse))
+    }
+
+    /// The per-call config and partition for semantic namespace `namespace`
+    /// (`ns_id`, from its schema) with `settings`, with one request's search
+    /// `overrides` applied.
+    #[cfg(feature = "semantic-search")]
+    pub(super) async fn namespace_semantics(
+        &self,
+        namespace: &str,
+        ns_id: Option<u32>,
+        settings: &crate::doc_store::vector_settings::VectorIndexSettings,
+        overrides: &SearchSpec,
+    ) -> Result<NamespaceSemantics, DocStoreError> {
+        let ctx = self
+            .semantic_ctx
+            .as_ref()
+            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
+        // Validate the overrides before touching storage.
+        overrides.apply(settings.search)?;
+        let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        ctx.for_namespace(&self.db, namespace, ns_id, settings).await?.with_overrides(overrides)
     }
 
     /// Clear the system-wide query-embedding cache, returning the number of
     /// entries removed.
     ///
-    /// Entries are keyed by embedding model and query text and hold the
-    /// whole-query embedding, so neither switching models nor chunking settings
-    /// (which only affect documents) invalidate them. Clear it when the service
+    /// Entries are keyed by embedding model, dimension and query text and hold
+    /// the whole-query embedding, so neither a namespace's model nor its
+    /// chunking settings (which only affect documents) invalidate them. Clear it when the service
     /// produces different vectors under the same model name, or stale vectors
     /// are served until the TTL expires. Exposed via the admin API.
     #[cfg(feature = "semantic-search")]
@@ -60,6 +83,10 @@ impl DocStore {
     /// every quantised vector in the namespace's companion KV store and returns
     /// the top results sorted by descending dot-product similarity.
     ///
+    /// The namespace's search settings (`probe_budget_entries`, `min_probes`,
+    /// `max_probes`, `first_pass_top_k`, `top_k`) apply unless `overrides` sets them for this query; overrides are
+    /// validated against the same ranges as the schema.
+    ///
     /// Returns [`DocStoreError::SemanticSearchNotEnabled`] if the namespace does
     /// not have `semantic_search_enabled`, and [`DocStoreError::EmbeddingFailed`]
     /// if no [`SemanticSearchContext`] is attached or the embedding service call
@@ -69,37 +96,38 @@ impl DocStore {
         &self,
         namespace: &str,
         query_text: &str,
-        top_k: Option<usize>,
+        overrides: &SearchSpec,
         pagination: Pagination,
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
-        let ctx = self
-            .semantic_ctx
-            .as_ref()
-            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
-
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
         let schema = self.load_schema(namespace)?;
         if !schema.semantic_search_enabled {
             return Err(DocStoreError::SemanticSearchNotEnabled {
                 namespace: namespace.to_string(),
             });
         }
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
 
-        debug!("semantic search namespace='{}' top_k={:?}", namespace, top_k);
-        let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;
+        debug!("semantic search namespace='{}' top_k={}", namespace, ns.config.top_k_results);
+        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
 
         let all = crate::semantic_search::service::search(
-            &ctx.config,
+            &ns.config,
             namespace,
-            &ctx.cluster_index,
+            &*ns.ivf,
             &query_sparse,
             &query_dense,
             &db_store,
             None::<fn(&[u8]) -> bool>,
-            top_k,
+            None,
         )
         .await?;
 
@@ -128,22 +156,24 @@ impl DocStore {
         namespace: &str,
         query_text: &str,
         predicate: &str,
-        top_k: Option<usize>,
+        overrides: &SearchSpec,
         pagination: Pagination,
     ) -> Result<Page<crate::semantic_search::index::vector_index::QueryResult>, DocStoreError> {
         // Refuse before evaluating the predicate: a store without semantic
         // search cannot answer, however cheap or costly the predicate is.
-        let ctx = self
-            .semantic_ctx
-            .as_ref()
-            .ok_or_else(|| DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()))?;
-
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
         let schema = self.load_schema(namespace)?;
         if !schema.semantic_search_enabled {
             return Err(DocStoreError::SemanticSearchNotEnabled {
                 namespace: namespace.to_string(),
             });
         }
+        // Validate overrides before evaluating the predicate, too.
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
 
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
         // here — the full set is needed as an ANN filter before scoring).
@@ -154,21 +184,21 @@ impl DocStore {
         let allowed_ids: std::collections::HashSet<Vec<u8>> = all_keys.into_iter().collect();
 
         // Phase 2: ANN search with the filter closure.
-        let (query_dense, query_sparse) = self.cached_query_embeddings(ctx, query_text).await?;
+        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
 
         let all = crate::semantic_search::service::search(
-            &ctx.config,
+            &ns.config,
             namespace,
-            &ctx.cluster_index,
+            &*ns.ivf,
             &query_sparse,
             &query_dense,
             &db_store,
             Some(move |id: &[u8]| allowed_ids.contains(id)),
-            top_k,
+            None,
         )
         .await?;
 
@@ -436,6 +466,7 @@ mod tests {
             indices: vec![],
             semantic_search_enabled: true,
             embedding_fields: vec!["title".to_owned()],
+            vector_index: None,
         };
         store.create(schema).await.unwrap();
 
@@ -639,6 +670,7 @@ mod tests {
             indices: vec![],
             semantic_search_enabled: true,
             embedding_fields: vec!["title".to_owned()],
+            vector_index: None,
         };
         store.create(schema).await.unwrap();
 
@@ -726,21 +758,24 @@ mod tests {
         let schema_dir = TempDir::new().unwrap();
         let mut store = open_fresh(db_dir.path(), schema_dir.path()).await;
         let clusters = std::collections::HashMap::from([(0, Cluster::new(0, vec![1.0, 0.0]))]);
-        store.semantic_ctx = Some(Arc::new(SemanticSearchContext {
-            config: SemanticSearchConfig::default(),
-            cluster_index: Arc::new(ClusterIndex::from_clusters(clusters)),
-        }));
+        store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(
+            SemanticSearchConfig::default(),
+            [("gemma".to_string(), Arc::new(ClusterIndex::from_clusters(clusters)))],
+        )));
         store.create(make_schema("plain", vec![])).await.unwrap();
         store
             .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))
             .await
             .unwrap();
 
-        let err = store.search_semantic("plain", "q", None, Pagination::default()).await.unwrap_err();
+        let err = store
+            .search_semantic("plain", "q", &SearchSpec::default(), Pagination::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, DocStoreError::SemanticSearchNotEnabled { .. }), "search_semantic: {err:?}");
 
         let err = store
-            .search_semantic_filtered("plain", "q", "x = 1", None, Pagination::default())
+            .search_semantic_filtered("plain", "q", "x = 1", &SearchSpec::default(), Pagination::default())
             .await
             .unwrap_err();
         assert!(
@@ -748,7 +783,10 @@ mod tests {
             "search_semantic_filtered: {err:?}"
         );
 
-        let err = store.kv_search_semantic("plain_kv", "q", None, Pagination::default()).await.unwrap_err();
+        let err = store
+            .kv_search_semantic("plain_kv", "q", &SearchSpec::default(), Pagination::default())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, DocStoreError::SemanticSearchNotEnabled { .. }),
             "kv_search_semantic: {err:?}"

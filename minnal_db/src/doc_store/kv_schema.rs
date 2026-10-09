@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::doc_store::error::SchemaError;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::{StoreType, peek_store_type};
+use crate::doc_store::vector_settings::{self, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// Key type for a KV store namespace.
 ///
@@ -62,6 +63,12 @@ pub struct KvStoreSchema {
     /// `value_type = str`; the stored string is the text that gets embedded.
     #[serde(default)]
     pub semantic_search_enabled: bool,
+    /// The namespace's vector-index settings (see
+    /// [`super::vector_settings`]). Filled in with defaults when the store is
+    /// created with semantic search on; the model, dimension and chunking are
+    /// fixed for the namespace's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index: Option<VectorIndexSpec>,
 }
 
 impl KvStoreSchema {
@@ -80,6 +87,33 @@ impl KvStoreSchema {
         if self.semantic_search_enabled && self.value_type != KvValueType::Str {
             return Err(SchemaError::KvSemanticSearchOnlyForStr);
         }
+        if let Some(spec) = &self.vector_index {
+            spec.resolve()?;
+        }
+        Ok(())
+    }
+
+    /// The namespace's resolved vector-index settings (the defaults when the
+    /// schema has none yet).
+    pub fn vector_settings(&self) -> Result<VectorIndexSettings, SchemaError> {
+        vector_settings::resolve_or_default(self.vector_index.as_ref())
+    }
+
+    /// Fill `vector_index` with its defaults when semantic search is on (or the
+    /// schema gives settings). Called when a store is created or imported.
+    pub fn settle_vector_index(&mut self) -> Result<(), SchemaError> {
+        if self.semantic_search_enabled || self.vector_index.is_some() {
+            self.vector_index = Some(vector_settings::settle(None, self.vector_index.as_ref())?);
+        }
+        Ok(())
+    }
+
+    /// Change the search defaults (probe budget and bounds, `first_pass_top_k`,
+    /// `top_k`);
+    /// everything else is unchanged. Fails if the store has no vector-index
+    /// settings.
+    pub fn update_vector_search(&mut self, search: &SearchSpec) -> Result<(), SchemaError> {
+        self.vector_index = Some(vector_settings::update_search(self.vector_index.as_ref(), &self.namespace, search)?);
         Ok(())
     }
 
@@ -264,6 +298,7 @@ pub(crate) fn valid_kv_schema() -> KvStoreSchema {
         key_type: KvKeyType::Str,
         value_type: KvValueType::Str,
         semantic_search_enabled: false,
+        vector_index: None,
     }
 }
 
@@ -302,6 +337,7 @@ mod tests {
                 key_type: KvKeyType::Str,
                 value_type: vt,
                 semantic_search_enabled: true,
+                vector_index: None,
             };
             assert!(
                 matches!(s.validate(), Err(SchemaError::KvSemanticSearchOnlyForStr)),
@@ -319,6 +355,7 @@ mod tests {
             key_type: KvKeyType::Str,
             value_type: KvValueType::Str,
             semantic_search_enabled: true,
+            vector_index: None,
         };
         assert!(s.validate().is_ok());
         assert!(s.is_semantic_search_enabled());
@@ -339,6 +376,7 @@ mod tests {
             key_type: KvKeyType::Int,
             value_type: KvValueType::F32,
             semantic_search_enabled: false,
+            vector_index: None,
         };
         schema.save(dir.path()).unwrap();
         let loaded = KvStoreSchema::load(dir.path(), "tokens").unwrap();

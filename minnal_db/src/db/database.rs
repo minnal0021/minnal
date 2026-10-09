@@ -2312,6 +2312,34 @@ impl Database {
         flushed
     }
 
+    /// Make every write already applied to the named namespaces durable, no-WAL
+    /// writes included, by flushing each one's memtables to level 0. Names that
+    /// are not registered are skipped (a dropped namespace must not be recreated).
+    ///
+    /// This is a barrier for callers that must not acknowledge work until its
+    /// no-WAL writes are on disk: the vector worker completes a queue entry only
+    /// after this returns. Unlike [`flush_no_wal_memtables`] it flushes whether or
+    /// not the no-WAL flag is set, because the flag is cleared *before* a
+    /// concurrent flush runs: a clear flag does not mean that flush has finished.
+    /// Flushing again is cheap when there is nothing new, and a read-only memtable
+    /// another thread is already flushing is waited for, not skipped.
+    ///
+    /// [`flush_no_wal_memtables`]: Self::flush_no_wal_memtables
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
+        for name in names {
+            let Some(ns_id) = self.registry.read().get_id(name) else {
+                continue;
+            };
+            // Dropped between the lookup and here: nothing left to make durable.
+            let Ok(store) = self.get_store(ns_id) else {
+                continue;
+            };
+            store.flush_memtable_to_level0()?;
+        }
+        Ok(())
+    }
+
     /// Flush every namespace that is holding the WAL persisted watermark back.
     ///
     /// The watermark can only advance to the slowest namespace's flushed offset,

@@ -34,6 +34,11 @@ pub enum SchemaError {
     #[error("failed to serialize schema: {0}")]
     Serialize(#[from] serde_json::Error),
 
+    /// A schema in a request does not parse: a missing or misspelt key, or a
+    /// value of the wrong type.
+    #[error("invalid schema: {0}")]
+    Malformed(serde_json::Error),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -83,6 +88,24 @@ pub enum SchemaError {
     #[error("semantic search is only supported for KV stores with value_type = str")]
     KvSemanticSearchOnlyForStr,
 
+    /// A `vector_index` setting is out of range or malformed.
+    #[error("vector_index.{field} {reason}")]
+    InvalidVectorSetting { field: &'static str, reason: String },
+
+    /// A request tried to change a vector-index setting that is fixed for the
+    /// namespace's life (model, dimension, chunking) or read-only (code widths).
+    #[error("vector_index.{field} is {current} for this namespace and cannot be changed (requested {requested})")]
+    VectorSettingFixed {
+        field: &'static str,
+        current: String,
+        requested: String,
+    },
+
+    /// The namespace has never had semantic search enabled, so it has no
+    /// vector-index settings to update.
+    #[error("namespace '{namespace}' has no vector index settings; enable semantic search first")]
+    VectorIndexNotConfigured { namespace: String },
+
     #[error("wrong store type for namespace '{namespace}': expected {expected}, found {found}")]
     WrongStoreType {
         namespace: String,
@@ -98,6 +121,23 @@ pub enum SchemaError {
 /// [`DocStore`]: crate::doc_store::store::DocStore
 #[derive(Debug, Error)]
 pub enum DocStoreError {
+    /// A namespace names an embedding model this server has no centroids for.
+    #[error("embedding model '{model}' is not supported by this server (supported: {supported})")]
+    UnsupportedEmbeddingModel { model: String, supported: String },
+
+    /// The embedding service does not serve a namespace's model at its
+    /// dimension (it answered "unknown model", or returned another dimension).
+    #[error("the embedding service cannot serve model '{model}' at dimension {dim}: {reason}")]
+    EmbeddingModelUnavailable { model: String, dim: u32, reason: String },
+
+    /// A semantic namespace has no centres and postings to search or index with.
+    #[error("namespace '{namespace}' has no seeded centres; re-enable its vector index")]
+    VectorIndexNotSeeded { namespace: String },
+
+    /// A namespace's embedding dimension does not match its model's centroids.
+    #[error("embedding_dim {dim} does not match the {centroid_dim}-dimensional centroids of model '{model}'")]
+    EmbeddingDimMismatch { model: String, dim: u32, centroid_dim: usize },
+
     /// The underlying schema was invalid.
     #[error("schema error: {0}")]
     Schema(#[from] SchemaError),

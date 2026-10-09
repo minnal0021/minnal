@@ -13,7 +13,7 @@
 //!   median search latency, at `n_probes` 64 (production) and 256 (exhaustive).
 //!
 //! It was used to choose whole-query Pass-1 embedding over chunked queries
-//! (`semantic_search/query-embedding-report.md`); rerun it to evaluate any
+//! (`semantic_search/report/query-embedding-report.md`); rerun it to evaluate any
 //! change to indexing, centroids or search.
 //!
 //! Setup, then run from the crate root (`minnal_db/`):
@@ -53,11 +53,11 @@ const RECALL_K: usize = 100;
 const NPROBES: [usize; 2] = [64, 256];
 const FIRST_PASS: [usize; 2] = [1000, 100];
 
-fn env_or(key: &str, default: &str) -> String {
+pub(in crate::semantic_search) fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
+pub(in crate::semantic_search) fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     std::io::BufReader::new(f)
         .lines()
@@ -67,12 +67,12 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+pub(in crate::semantic_search) fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim()
 }
 
 /// `query-id → (corpus-id → graded relevance)`, keeping only positive judgements.
-fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
+pub(in crate::semantic_search) fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut qrels: HashMap<String, HashMap<String, u32>> = HashMap::new();
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok).skip(1) {
@@ -89,15 +89,30 @@ fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Metrics {
-    ndcg: f64,
-    mrr: f64,
-    recall: f64,
-    cand_recall: f64,
+pub(in crate::semantic_search) struct Metrics {
+    pub(in crate::semantic_search) ndcg: f64,
+    pub(in crate::semantic_search) mrr: f64,
+    pub(in crate::semantic_search) recall: f64,
+    pub(in crate::semantic_search) cand_recall: f64,
+}
+
+/// nDCG at cutoff `k` (gain = graded relevance, `log2(rank + 1)` discount, ideal
+/// over every judged-relevant document), as [`score`] computes it for k = 10.
+pub(in crate::semantic_search) fn ndcg_at(ranked: &[&str], rels: &HashMap<String, u32>, k: usize) -> f64 {
+    let dcg: f64 = ranked
+        .iter()
+        .take(k)
+        .enumerate()
+        .map(|(i, id)| rels.get(*id).copied().unwrap_or(0) as f64 / ((i + 2) as f64).log2())
+        .sum();
+    let mut ideal: Vec<u32> = rels.values().copied().collect();
+    ideal.sort_unstable_by(|a, b| b.cmp(a));
+    let idcg: f64 = ideal.iter().take(k).enumerate().map(|(i, &r)| r as f64 / ((i + 2) as f64).log2()).sum();
+    if idcg > 0.0 { dcg / idcg } else { 0.0 }
 }
 
 /// Score one query: `ranked` is the dense-ordered candidate list (corpus ids).
-fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
+pub(in crate::semantic_search) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
     let dcg: f64 = ranked
         .iter()
         .take(NDCG_K)
@@ -248,7 +263,7 @@ async fn beir_eval() {
     for &n_probes in &NPROBES {
         for &first_pass in &FIRST_PASS {
             let run_config = SemanticSearchConfig {
-                n_probes,
+                probe: crate::semantic_search::ProbeSettings::fixed(n_probes),
                 first_pass_sparse_search_top_k: first_pass,
                 ..(*base_config).clone()
             };
@@ -342,6 +357,15 @@ async fn beir_eval() {
 #[cfg(test)]
 mod metric_tests {
     use super::*;
+
+    #[test]
+    fn ndcg_at_ten_matches_score() {
+        let r = rels(&[("a", 2), ("c", 1), ("z", 1)]);
+        let ranked = ["b", "a", "d", "c", "e", "f", "g", "h", "i", "j", "z"];
+        assert_eq!(ndcg_at(&ranked, &r, 10), score(&ranked, &r).ndcg);
+        assert!(ndcg_at(&ranked, &r, 20) > ndcg_at(&ranked, &r, 10), "z enters at rank 11");
+        assert_eq!(ndcg_at(&[], &r, 10), 0.0);
+    }
 
     fn rels(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
         pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()

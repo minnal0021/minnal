@@ -183,7 +183,13 @@ pub struct SemanticSearchParams {
 #[derive(Deserialize)]
 pub struct KvSemanticSearchRequest {
     pub query: String,
+    /// Per-request overrides of the store's search settings; see
+    /// [`SemanticSearchRequest`](super::semantic_search::SemanticSearchRequest).
     pub top_k: Option<Limit>,
+    pub probe_budget_entries: Option<u32>,
+    pub min_probes: Option<u32>,
+    pub max_probes: Option<u32>,
+    pub first_pass_top_k: Option<u32>,
     #[serde(default)]
     pub page_size: Limit,
     #[serde(default = "default_page_no")]
@@ -218,7 +224,12 @@ pub async fn search_kv_semantic(
 
     let page = state
         .store
-        .kv_search_semantic(&ns, &req.query, req.top_k.map(Limit::get), pagination)
+        .kv_search_semantic(
+            &ns,
+            &req.query,
+            &super::semantic_search::search_overrides(req.top_k, req.probe(), req.first_pass_top_k),
+            pagination,
+        )
         .await
         .map_err(|e| AppError::from(e).with_ns(&ns))?;
 

@@ -36,6 +36,8 @@ use crate::doc_store::pagination::{CursorPage, Page, Pagination, clamp_cursor, p
 use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
+#[cfg(feature = "semantic-search")]
+use crate::doc_store::vector_settings::SearchSpec;
 use crate::support::file_lock::{DirLock, LockError};
 #[cfg(feature = "semantic-search")]
 use crate::vector_kv;
@@ -54,6 +56,8 @@ mod str_keys_tests;
 mod test_support;
 mod types;
 mod vector;
+#[cfg(test)]
+mod vector_settings_tests;
 
 pub use types::*;
 
@@ -97,6 +101,11 @@ pub struct DocStore {
     /// [`DocStore::with_semantic_search`]; defaults are used otherwise.
     #[cfg(feature = "semantic-search")]
     vector_index_config: VectorIndexConfig,
+    /// Namespaces whose `index_all` / `kv_index_all` is still enqueueing in this
+    /// process. A second reindex of one of them is refused; the on-disk record
+    /// only reports progress (see [`DocStore::vec_reindex_progress`]).
+    #[cfg(feature = "semantic-search")]
+    vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl DocStore {
@@ -143,6 +152,8 @@ impl DocStore {
             #[cfg(feature = "semantic-search")]
             worker_handle: std::sync::Mutex::new(None),
             #[cfg(feature = "semantic-search")]
+            vec_reindexing: Arc::default(),
+            #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
         };
 
@@ -163,6 +174,11 @@ impl DocStore {
                 store.db.namespace(schema.namespace.clone()).await?;
             }
         }
+
+        // Before any vector worker can start (`with_semantic_search` comes after
+        // this): finish vector-index drops a crash interrupted.
+        #[cfg(feature = "semantic-search")]
+        store.finish_interrupted_vector_index_drops().await?;
 
         // Start background workers after all indices are activated so the
         // index checkpoint worker's first immediate tick captures a complete
@@ -226,6 +242,7 @@ impl DocStore {
         let handle = VecIndexWorker::start(
             Arc::clone(&self.db),
             Arc::clone(&ctx),
+            self.schema_dir.clone(),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
@@ -239,7 +256,12 @@ impl DocStore {
             let db = Arc::clone(&self.db);
             let schema_dir = self.schema_dir.clone();
             let notify = Arc::clone(&notify);
+            let mut startup_pass = handle.startup_pass();
             tokio::spawn(async move {
+                // After the worker's first pass over what a crash left queued: see
+                // `VecIndexWorkerHandle::startup_pass`. (A worker gone before then
+                // drops the sender; reconcile anyway.)
+                let _ = startup_pass.wait_for(|done| *done).await;
                 info!("startup vector-index reconciliation: scanning for documents missing a vector index");
                 let outcome = reconcile_all_vector_indexes(&db, &schema_dir, false).await;
                 if outcome.failed > 0 {
@@ -346,6 +368,35 @@ impl DocStore {
 }
 
 /// Load every persisted document-store schema from `schema_dir`.
+/// The resolved vector-index settings and `ns_id` of `namespace`, whichever kind
+/// of store it is, read from its schema file.
+#[cfg(feature = "semantic-search")]
+pub(crate) fn load_vector_settings(
+    schema_dir: &Path,
+    namespace: &str,
+) -> Result<(crate::doc_store::vector_settings::VectorIndexSettings, u32), DocStoreError> {
+    let path = schema_dir.join(format!("{namespace}.json"));
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        DocStoreError::Schema(SchemaError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    })?;
+    let (settings, ns_id) = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => {
+            let s = serde_json::from_str::<KvStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
+        _ => {
+            let s = serde_json::from_str::<DocStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
+    };
+    let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+        namespace: namespace.to_owned(),
+    })?;
+    Ok((settings, ns_id))
+}
+
 fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocStoreError> {
     let mut schemas = Vec::new();
     let entries = match std::fs::read_dir(schema_dir) {

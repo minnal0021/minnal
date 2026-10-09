@@ -172,26 +172,18 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("value_log", "verify_checksums_on_read", cfg.value_log.verify_checksums_on_read);
 
     let ss = &cfg.semantic_search;
-    r.add(
-        "semantic_search",
-        "number_of_bits_for_dense_quantisation",
-        ss.number_of_bits_for_dense_quantisation,
-    );
-    r.add("semantic_search", "n_probes", ss.n_probes);
-    r.add("semantic_search", "embedding_dim", ss.embedding_dim);
-    r.add("semantic_search", "first_pass_sparse_search_top_k", ss.first_pass_sparse_search_top_k);
-    r.add("semantic_search", "window_size", ss.window_size);
-    r.add("semantic_search", "sliding_size", ss.sliding_size);
-    r.add("semantic_search", "top_k_results", ss.top_k_results);
     r.add("semantic_search", "embedding_service_url", &ss.embedding_service_url);
-    r.add("semantic_search", "model", &ss.model);
-    let cluster = ss
-        .cluster_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "none (bundled default)".to_string());
-    r.add("semantic_search", "cluster_path", cluster);
-    r.add("semantic_search", "supported_models", format!("{} entry(ies)", ss.supported_models.len()));
+    r.add("semantic_search", "centroid_dir", ss.centroid_dir().display().to_string());
+    let models = if ss.supported_models.is_empty() {
+        "every set in centroid_dir".to_string()
+    } else {
+        ss.supported_models
+            .iter()
+            .map(|m| format!("{} ({}-d)", m.name, m.dimension))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    r.add("semantic_search", "supported_models", models);
     r.add("semantic_search", "query_embedding_cache_ttl_secs", ss.query_embedding_cache_ttl_secs);
     r.add("semantic_search", "embedding_request_timeout_secs", ss.embedding_request_timeout_secs);
     r.add("semantic_search", "embedding_connect_timeout_secs", ss.embedding_connect_timeout_secs);

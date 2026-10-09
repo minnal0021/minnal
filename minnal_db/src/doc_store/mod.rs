@@ -10,6 +10,7 @@ pub mod schema;
 pub mod store;
 #[cfg(feature = "semantic-search")]
 pub(crate) mod vec_index_worker;
+pub mod vector_settings;
 
 // ── Error types ────────────────────────────────────────────────────────────
 pub use self::error::{DocStoreError, SchemaError};

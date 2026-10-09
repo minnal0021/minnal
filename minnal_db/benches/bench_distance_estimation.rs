@@ -14,7 +14,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use minnal_db::semantic_search::{
-    ClusterIndex,
+    ClusterIndex, ProbeSettings,
     cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids, read_clusters_from_file},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
     index::vector_index::{ClusterBatchResult, QuantisationStyle, VectorIndex, VectorKvStore},
@@ -404,7 +404,11 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let store = build_bench_store(&cluster_map, N_DOCS, 1);
     let dense_query = load_or_generate_embeddings().query;
-    let config = SemanticSearchConfig::default(); // n_probes 64, top_k 1000/100
+    // 64 fixed probes: the cluster file carries no entry counts to budget by.
+    let config = SemanticSearchConfig {
+        probe: ProbeSettings::fixed(64),
+        ..SemanticSearchConfig::default()
+    }; // top_k 1000/100
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -441,7 +445,7 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     eprintln!(
         "end_to_end_search: {N_DOCS} docs, {} clusters, n_probes {}",
         cluster_map.len(),
-        config.n_probes
+        config.probe.max_probes
     );
 }
 
@@ -462,7 +466,10 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let dense_query = load_or_generate_embeddings().query;
     let sparse_query = production_or_synthetic_query(T, &dense_query);
-    let config = SemanticSearchConfig::default();
+    let config = SemanticSearchConfig {
+        probe: ProbeSettings::fixed(64),
+        ..SemanticSearchConfig::default()
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -496,7 +503,7 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
     eprintln!(
         "end_to_end_multichunk: {N_DOCS} docs, T={T}, {} clusters, n_probes {}",
         cluster_map.len(),
-        config.n_probes
+        config.probe.max_probes
     );
 }
 
