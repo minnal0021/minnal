@@ -1033,7 +1033,7 @@ impl KVStore {
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
 
         // ── Step 1: single-pass LSM lookup for all keys ───────────────────────
-        // Reads each bucket's level1 file ONCE instead of once per key.
+        // One forward pass per bucket's SSTables, reading near the keys only.
         let pointers = self.lsm.get_multiple(keys)?;
 
         // ── Step 2: group the pointers by value-log bucket ────────────────────
