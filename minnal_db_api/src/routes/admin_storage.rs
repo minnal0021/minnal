@@ -197,6 +197,9 @@ pub struct OpsMetricsResponse {
     uptime_s: u64,
     #[serde(flatten)]
     body: OpsMetricsBody,
+    /// Field-index write buffers (engine-wide; absent on per-namespace views).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_overlay: Option<minnal_db::IndexOverlayStats>,
 }
 
 /// One namespace's operational metrics (engine `uptime_s` omitted; the WAL-GC
@@ -271,6 +274,7 @@ pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
     Json(OpsMetricsResponse {
         uptime_s: state.started_at.elapsed().as_secs(),
         body: ops_metrics_body(&m),
+        index_overlay: Some(state.store.index_overlay_stats()),
     })
 }
 
@@ -281,6 +285,7 @@ pub async fn ops_metrics_ns(State(state): State<AppState>, Path(ns): Path<String
     Ok(Json(OpsMetricsResponse {
         uptime_s: state.started_at.elapsed().as_secs(),
         body: ops_metrics_body(&m),
+        index_overlay: None,
     }))
 }
 

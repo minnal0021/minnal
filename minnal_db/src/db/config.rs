@@ -66,6 +66,17 @@ pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
 /// [`ThresholdConfig::index_blob_backpressure_bytes`].
 pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default soft limit (bytes) on memory held by field-index write buffers,
+/// across all fields of a database: crossing it requests an early index
+/// checkpoint. 32 MiB. See [`ThresholdConfig::index_overlay_soft_bytes`].
+pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_SOFT_BYTES;
+
+/// Default hard limit (bytes) on memory held by field-index write buffers,
+/// across all fields of a database: a write that crosses it writes its field's
+/// buffer out before returning. 64 MiB. See
+/// [`ThresholdConfig::index_overlay_hard_bytes`].
+pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_HARD_BYTES;
+
 /// Default cap on how many fully-persisted WAL segments the index-replay
 /// watermark may hold back. See
 /// [`ThresholdConfig::max_pinned_wal_segments`].
@@ -127,24 +138,48 @@ pub struct ThresholdConfig {
     pub tail_gc_min_garbage_pct: Option<f64>,
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
-    /// append-only, so each per-document insert leaves a stale copy of that
-    /// field-value's bitmap behind; compaction reclaims it.
+    /// append-only: each time a field's buffered changes are written out (a
+    /// *spill*), every changed container and a new directory for its bitmap are
+    /// appended, and their previous copies become dead space; compaction
+    /// reclaims it.
     pub index_blob_waste_threshold: f64,
     /// Absolute cap (bytes) on a single field index's reclaimable dead blob
-    /// bytes before the write path proactively requests an index checkpoint,
-    /// instead of waiting for the next periodic tick.
+    /// bytes before the write path requests an index checkpoint early (which
+    /// compacts the field), instead of waiting for the next periodic tick.
     ///
-    /// This is **backpressure**, and it is an absolute byte cap on purpose — a
-    /// *ratio* trigger is useless here because a low-cardinality, high-churn
-    /// field (e.g. a boolean over many docs) crosses any ratio almost
-    /// immediately and stays pinned near 100%, so it would fire on nearly every
-    /// write. Capping absolute dead bytes bounds the transient on-disk
+    /// Dead bytes accrue per spill, not per write. Spills happen once per
+    /// checkpoint and, between checkpoints, whenever the write buffers pass
+    /// [`index_overlay_hard_bytes`](Self::index_overlay_hard_bytes), so this
+    /// valve matters only when the buffers stay over the hard limit and spill
+    /// on most writes.
+    ///
+    /// It is an absolute byte cap on purpose — a *ratio* trigger is useless
+    /// here because a field with one large, often-rewritten bitmap crosses any
+    /// ratio after a few spills and stays near 100%, so it would fire on nearly
+    /// every write. Capping absolute dead bytes bounds the transient on-disk
     /// amplification to roughly this value per field, and it self-debounces:
-    /// compaction resets the field's dead-byte count to 0, so the next request
-    /// only fires after another `index_blob_backpressure_bytes` accumulate.
-    /// The dead-byte count is O(1) to read, so the check is cheap on the hot
-    /// write path (unlike `index_blob_waste_threshold`, which scans every slot).
+    /// compaction resets the field's dead-byte count to 0. The count is O(1) to
+    /// read, so the check is cheap on the hot write path (unlike
+    /// `index_blob_waste_threshold`, which scans every slot).
+    ///
+    /// `0` disables the write-path valve. WAL replay at open still compacts
+    /// inline on the default cap, since an unbounded replay could leave the
+    /// database unable to open.
     pub index_blob_backpressure_bytes: u64,
+    /// Soft limit (bytes) on the memory all of a database's field indexes hold
+    /// in their write buffers (changed containers not yet written to their files).
+    /// Crossing it requests an early index checkpoint, which writes every
+    /// buffer out. Shared across fields, not per field.
+    pub index_overlay_soft_bytes: u64,
+    /// Hard limit (bytes) on the same memory. A write that leaves the total
+    /// over it writes its own field's buffer out before returning, so the bound
+    /// holds even if the checkpoint worker is slow or not running. Writing a
+    /// buffer out appends it to the field's memory-mapped files and syncs them
+    /// (values, then slots), on that writer's thread under the field's write
+    /// lock — so a write that crosses this limit is slower than one that
+    /// does not.
+    /// A soft limit above this is clamped to it.
+    pub index_overlay_hard_bytes: u64,
     /// Cap on how many fully-persisted WAL segments the **index-replay
     /// watermark** may hold back from WAL GC.
     ///
@@ -173,6 +208,8 @@ impl ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
+            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
             max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }
@@ -209,6 +246,15 @@ impl ThresholdConfig {
         self
     }
 
+    /// Override the field-index write-buffer limits (bytes). See
+    /// [`index_overlay_soft_bytes`](Self::index_overlay_soft_bytes) and
+    /// [`index_overlay_hard_bytes`](Self::index_overlay_hard_bytes).
+    pub fn with_index_overlay_bytes(mut self, soft: u64, hard: u64) -> Self {
+        self.index_overlay_soft_bytes = soft;
+        self.index_overlay_hard_bytes = hard;
+        self
+    }
+
     /// Override the cap on WAL segments pinned by the index-replay watermark.
     /// See [`max_pinned_wal_segments`](Self::max_pinned_wal_segments).
     pub fn with_max_pinned_wal_segments(mut self, segments: u32) -> Self {
@@ -225,6 +271,8 @@ impl Default for ThresholdConfig {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
             index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
+            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
             max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
         }
     }

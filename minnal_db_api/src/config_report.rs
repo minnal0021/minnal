@@ -157,6 +157,8 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("thresholds", "tail_gc_min_garbage_pct", tail);
     r.add("thresholds", "index_blob_waste_threshold", t.index_blob_waste_threshold);
     r.add("thresholds", "index_blob_backpressure_bytes", bytes(t.index_blob_backpressure_bytes));
+    r.add("thresholds", "index_overlay_soft_bytes", bytes(t.index_overlay_soft_bytes));
+    r.add("thresholds", "index_overlay_hard_bytes", bytes(t.index_overlay_hard_bytes));
 
     let s = &cfg.scheduled_tasks;
     r.add("scheduled_tasks", "value_log_gc_interval_secs", s.value_log_gc_interval_secs);

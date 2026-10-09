@@ -8,6 +8,14 @@
 //! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
 //! index.
 //!
+//! A store has one of two layouts (`BlobLayout`). In the **flat** layout
+//! (the keymap) a slot's blob is the whole value. In the **directory** layout
+//! (bitmaps) a slot's blob is a directory listing container blobs elsewhere in
+//! the same value region (format in `index::storage`), so replacing one
+//! container appends that container and a new directory, not the whole bitmap.
+//! The store reads directories only to account for space: dead bytes, live
+//! bytes, compaction, and open-time repair.
+//!
 //! **Key file** (`blobs.keys`):
 //! - 64-byte header (magic, version, capacity, counts, value write pos)
 //! - Fixed-size 48-byte slots forming an open-addressing linear-probing hash table
@@ -15,6 +23,26 @@
 //! **Value file** (`blobs.vals`):
 //! - Append-only sequence of raw byte blobs
 //! - Each slot records the byte offset and length of its blob
+//!
+//! # Write order (crash safety)
+//!
+//! Replacing a blob never overwrites it: the new blob is appended
+//! (`BlobStore::append_value`) and the slot is then pointed at it
+//! (`BlobStore::set_slot`), leaving the old copy as dead space for
+//! `BlobStore::compact`. Both files are shared memory maps that the kernel
+//! writes back in any order, so a persistent owner sequences the two steps
+//! itself: append every blob, `BlobStore::sync_values`, set the slots,
+//! `BlobStore::sync_keys`. A slot then never reaches disk ahead of its blob.
+//!
+//! Slots are still rewritten in place, so a crash can tear one. Each live slot
+//! carries a CRC-32 of its other bytes (state byte 3; state 1 is a slot written
+//! without one, still read). `BlobStore::open` tombstones any torn slot or
+//! slot pointing past the value file, counts it in
+//! `BlobStore::damaged_at_open`, and recomputes the header (counts and the
+//! write cursor) from the slots, so a stale header cannot make a new append
+//! overwrite live data. Growing the key table (rehash) builds the new table in
+//! a separate file and renames it into place; compaction stages both files and
+//! commits with a marker (see `BlobStore::compact`).
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -23,10 +51,22 @@ use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
 
+use crate::index::storage::{self, DirEntry};
+
+/// What a slot's blob is (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobLayout {
+    /// The blob is the whole value.
+    Flat,
+    /// The blob is a directory of container blobs (`index::storage`).
+    Directory,
+}
+
 // ── Layout constants ──────────────────────────────────────────────────────────
 
 const MAGIC: u64 = 0x4D494E4E414C4253; // "MINNALBS"
-const VERSION: u32 = 1;
+/// On-disk format version. 2: bitmap stores use the directory layout.
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 64;
 const SLOT_SIZE: usize = 48;
 const INITIAL_CAPACITY: usize = 16;
@@ -35,8 +75,13 @@ const INITIAL_VAL_SIZE: usize = 4096;
 const VALUE_ALIGNMENT: usize = 16;
 
 const STATE_EMPTY: u8 = 0;
+/// A live slot without a checksum (written before checksums existed). Read as
+/// live; never written any more.
 const STATE_OCCUPIED: u8 = 1;
 const STATE_TOMBSTONE: u8 = 2;
+/// On-disk state byte of a live slot that carries a checksum. [`read_slot`]
+/// reports it as [`STATE_OCCUPIED`]; [`write_slot`] always writes it.
+const STATE_OCCUPIED_CHECKED: u8 = 3;
 
 // ── Header ────────────────────────────────────────────────────────────────────
 
@@ -89,7 +134,12 @@ fn init_header(data: &mut [u8], capacity: usize) {
 //   8..24   key: u128  (LE)
 //   24..32  offset: u64 (LE)
 //   32..36  len: u32   (LE)
-//   36..48  pad
+//   36..40  crc32 of bytes 0..36 (live slots written with STATE_OCCUPIED_CHECKED)
+//   40..48  pad
+//
+// The checksum catches a slot torn by a crash: slots are rewritten in place in
+// a shared memory map, and a 48-byte slot can straddle a disk-sector boundary,
+// so after a power loss half of it can be old and half new.
 
 #[derive(Debug, Clone, Copy)]
 struct Slot {
@@ -106,7 +156,7 @@ fn slot_byte_offset(i: usize) -> usize {
 fn read_slot(data: &[u8], i: usize) -> Slot {
     let b = slot_byte_offset(i);
     Slot {
-        state: data[b],
+        state: if data[b] == STATE_OCCUPIED_CHECKED { STATE_OCCUPIED } else { data[b] },
         key: u128::from_le_bytes(data[b + 8..b + 24].try_into().unwrap()),
         offset: u64::from_le_bytes(data[b + 24..b + 32].try_into().unwrap()),
         len: u32::from_le_bytes(data[b + 32..b + 36].try_into().unwrap()),
@@ -115,12 +165,25 @@ fn read_slot(data: &[u8], i: usize) -> Slot {
 
 fn write_slot(data: &mut [u8], i: usize, s: &Slot) {
     let b = slot_byte_offset(i);
-    data[b] = s.state;
+    data[b] = if s.state == STATE_OCCUPIED { STATE_OCCUPIED_CHECKED } else { s.state };
     data[b + 1..b + 8].fill(0);
     data[b + 8..b + 24].copy_from_slice(&s.key.to_le_bytes());
     data[b + 24..b + 32].copy_from_slice(&s.offset.to_le_bytes());
     data[b + 32..b + 36].copy_from_slice(&s.len.to_le_bytes());
-    data[b + 36..b + 48].fill(0);
+    let crc = crc32fast::hash(&data[b..b + 36]);
+    data[b + 36..b + 40].copy_from_slice(&crc.to_le_bytes());
+    data[b + 40..b + 48].fill(0);
+}
+
+/// False only for a checksummed live slot whose checksum does not match: a
+/// slot torn by a crash. Unchecked (older) slots and non-live slots pass.
+fn slot_checksum_ok(data: &[u8], i: usize) -> bool {
+    let b = slot_byte_offset(i);
+    if data[b] != STATE_OCCUPIED_CHECKED {
+        return true;
+    }
+    let stored = u32::from_le_bytes(data[b + 36..b + 40].try_into().unwrap());
+    stored == crc32fast::hash(&data[b..b + 36])
 }
 
 // ── Open-time validation ───────────────────────────────────────────────────────
@@ -165,25 +228,9 @@ fn validate_open(key: &[u8], val_len: usize) -> io::Result<()> {
             hdr.capacity
         )));
     }
-    // The write cursor and every live blob must lie within the value file.
-    if hdr.value_write_pos > val_len as u64 {
-        return Err(invalid(format!(
-            "value_write_pos {} beyond value file ({val_len} bytes)",
-            hdr.value_write_pos
-        )));
-    }
-    for i in 0..hdr.capacity as usize {
-        let s = read_slot(key, i);
-        if s.state == STATE_OCCUPIED {
-            let end = s.offset.checked_add(s.len as u64).ok_or_else(|| invalid("slot offset+len overflows"))?;
-            if end > hdr.value_write_pos {
-                return Err(invalid(format!(
-                    "slot {i} blob [{}, {end}) extends past value_write_pos {}",
-                    s.offset, hdr.value_write_pos
-                )));
-            }
-        }
-    }
+    // Slots and the write cursor are checked by `BlobStore::repair_at_open`,
+    // which drops a damaged slot instead of refusing the whole store.
+    let _ = val_len;
     Ok(())
 }
 
@@ -318,20 +365,31 @@ pub(crate) struct BlobStore {
     /// the rewritten `blobs.keys` / `blobs.vals` files.
     dir: Option<PathBuf>,
     /// Running count of reclaimable dead value-region bytes (blobs orphaned by
-    /// `upsert`/`remove_key` since the last [`compact`](BlobStore::compact)).
+    /// `set_slot`/`remove_key` since the last [`compact`](BlobStore::compact)).
     /// Maintained incrementally so it is O(1) to read on the hot write path —
     /// `waste_ratio`/`live_bytes` are O(capacity) and too costly per write. It is
     /// an **in-memory hint** for the checkpoint-backpressure trigger, not
     /// persisted: seeded from the on-disk state at [`open`](BlobStore::open) and
     /// reset to 0 by `compact`. Equals `logical_bytes() - live_bytes()`.
     dead_bytes: u64,
+    /// Slots dropped at open because they were damaged (torn by a crash, or
+    /// pointing outside the value file). The owner must rebuild from the source
+    /// of truth: the dropped entries are gone.
+    damaged_at_open: usize,
+    layout: BlobLayout,
 }
 
 impl BlobStore {
     // ── Construction ──────────────────────────────────────────────────────────
 
-    /// Create a new anonymous (transient) store.
+    /// Create a new anonymous (transient) store with the flat layout.
+    #[cfg(test)]
     pub fn new_anon() -> Self {
+        Self::new_anon_with(BlobLayout::Flat)
+    }
+
+    /// Create a new anonymous (transient) store with `layout`.
+    pub fn new_anon_with(layout: BlobLayout) -> Self {
         let mut key = GrowableMmap::new_anon(INITIAL_KEY_SIZE).expect("anon key mmap alloc failed");
         init_header(key.as_mut_slice(), INITIAL_CAPACITY);
         let val = GrowableMmap::new_anon(INITIAL_VAL_SIZE).expect("anon val mmap alloc failed");
@@ -340,12 +398,19 @@ impl BlobStore {
             val,
             dir: None,
             dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
         }
     }
 
-    /// Create a new persistent store in `dir`, creating `blobs.keys` and
-    /// `blobs.vals`.
+    /// Create a new persistent flat-layout store in `dir`, creating
+    /// `blobs.keys` and `blobs.vals`.
     pub fn create(dir: &Path) -> io::Result<Self> {
+        Self::create_with(dir, BlobLayout::Flat)
+    }
+
+    /// Create a new persistent store with `layout` in `dir`.
+    pub fn create_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
         let mut key = GrowableMmap::create_file(&dir.join("blobs.keys"), INITIAL_KEY_SIZE)?;
         init_header(key.as_mut_slice(), INITIAL_CAPACITY);
         key.flush()?;
@@ -355,11 +420,18 @@ impl BlobStore {
             val,
             dir: Some(dir.to_path_buf()),
             dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
         })
     }
 
-    /// Open an existing persistent store from `dir`.
+    /// Open an existing persistent flat-layout store from `dir`.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with(dir, BlobLayout::Flat)
+    }
+
+    /// Open an existing persistent store with `layout` from `dir`.
+    pub fn open_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
         // Complete or discard any compaction that was interrupted by a crash
         // before its file swap finished, so we always map a consistent pair.
         Self::recover_compaction(dir)?;
@@ -371,12 +443,83 @@ impl BlobStore {
             val,
             dir: Some(dir.to_path_buf()),
             dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
         };
+        store.repair_at_open();
         // Seed the dead-bytes hint from the loaded state (one O(capacity) scan at
         // open) so backpressure is accurate immediately, even for a store that
         // was already bloated when the process started.
         store.dead_bytes = store.logical_bytes().saturating_sub(store.live_bytes());
         Ok(store)
+    }
+
+    /// Make a just-opened store safe to use after any crash.
+    ///
+    /// Slots are rewritten in place in a shared memory map, and the kernel may
+    /// write those pages back at any time and in any order, so the files can
+    /// hold a mix of states. This drops (tombstones) every live slot that is
+    /// torn (checksum mismatch) or points outside the value file, counting them
+    /// in `damaged_at_open`, and recomputes the header from the slots: the
+    /// counts, and a write cursor past every live blob, so that a stale header
+    /// can never let a new append overwrite live data.
+    fn repair_at_open(&mut self) {
+        let val_len = self.val.as_slice().len() as u64;
+        let cap = self.header().capacity as usize;
+        let (mut live, mut tombs, mut damaged, mut max_end) = (0u64, 0u64, 0usize, 0u64);
+        for i in 0..cap {
+            let ok = slot_checksum_ok(self.key.as_slice(), i);
+            let s = read_slot(self.key.as_slice(), i);
+            match s.state {
+                STATE_OCCUPIED => {
+                    let end = s.offset.checked_add(s.len as u64).filter(|&e| ok && e <= val_len);
+                    // In the directory layout the slot's directory and every
+                    // container it lists must be intact and inside the file.
+                    let end = end.and_then(|end| match self.layout {
+                        BlobLayout::Flat => Some(end),
+                        BlobLayout::Directory => {
+                            let entries = storage::decode_dir(&self.val.as_slice()[s.offset as usize..end as usize]).ok()?;
+                            entries.iter().try_fold(end, |m, e| {
+                                let c_end = e.offset.checked_add(e.len as u64).filter(|&c| c <= val_len)?;
+                                Some(m.max(c_end))
+                            })
+                        }
+                    });
+                    match end {
+                        Some(end) => {
+                            live += 1;
+                            max_end = max_end.max(end);
+                        }
+                        _ => {
+                            self.key.as_mut_slice()[slot_byte_offset(i)] = STATE_TOMBSTONE;
+                            tombs += 1;
+                            damaged += 1;
+                        }
+                    }
+                }
+                STATE_TOMBSTONE => tombs += 1,
+                _ => {}
+            }
+        }
+        let mut h = self.header();
+        h.count = live;
+        h.tombstone_count = tombs;
+        h.value_write_pos = h.value_write_pos.min(val_len).max(max_end);
+        self.set_header(&h);
+        if damaged > 0 {
+            log::error!(
+                "blob store {:?}: dropped {damaged} damaged slot(s) at open (torn by a crash, or pointing outside the value file); \
+                 the owner must rebuild this store",
+                self.dir
+            );
+        }
+        self.damaged_at_open = damaged;
+    }
+
+    /// Number of slots dropped at open as damaged (see `repair_at_open`). Non-zero
+    /// means entries were lost and the owner must rebuild.
+    pub fn damaged_at_open(&self) -> usize {
+        self.damaged_at_open
     }
 
     /// Returns `true` if persistent store files exist in `dir`.
@@ -449,8 +592,27 @@ impl BlobStore {
         (0..cap)
             .map(|i| read_slot(kdata, i))
             .filter(|s| s.state == STATE_OCCUPIED)
-            .map(|s| align_up(s.len as usize, VALUE_ALIGNMENT) as u64)
+            .map(|s| self.owned_bytes(&s))
             .sum()
+    }
+
+    /// The directory a directory-layout slot points at (`None` for the flat
+    /// layout, or a directory that does not decode).
+    fn dir_entries(&self, offset: u64, len: u32) -> Option<Vec<DirEntry>> {
+        if self.layout != BlobLayout::Directory {
+            return None;
+        }
+        storage::decode_dir(self.value_slice(offset, len)?).ok()
+    }
+
+    /// Value-region bytes a live slot owns, each blob rounded up to
+    /// `VALUE_ALIGNMENT`: its blob, plus the containers its directory lists.
+    fn owned_bytes(&self, s: &Slot) -> u64 {
+        let own = align_up(s.len as usize, VALUE_ALIGNMENT) as u64;
+        let containers: u64 = self
+            .dir_entries(s.offset, s.len)
+            .map_or(0, |es| es.iter().map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64).sum());
+        own + containers
     }
 
     /// Fraction (`0.0..1.0`) of the value region that is reclaimable dead space
@@ -523,6 +685,24 @@ impl BlobStore {
             .filter(|s| s.state == STATE_OCCUPIED)
             .collect();
 
+        if let Some(dir) = self.dir.clone() {
+            // Persistent: never rewrite the live key table in place. A crash
+            // part-way through an in-place rehash leaves a scrambled table the
+            // owner cannot detect. Build the new table, write it to a new file,
+            // and rename it over the old one (atomic). The values every slot
+            // points at must be durable before the new table is, so sync them
+            // first.
+            self.val.flush().expect("rehash: value sync failed");
+            let buf = build_key_table(new_cap, hdr.value_write_pos, &entries);
+            let keys = dir.join("blobs.keys");
+            let keys_new = dir.join("blobs.keys.rehash");
+            write_file_sync(&keys_new, &buf).expect("rehash: staging the key table failed");
+            std::fs::rename(&keys_new, &keys).expect("rehash: swapping the key table failed");
+            fsync_dir(&dir).expect("rehash: directory sync failed");
+            self.key = GrowableMmap::open_file(&keys).expect("rehash: remapping the key table failed");
+            return;
+        }
+
         self.key.ensure_capacity(new_key_size).expect("rehash key mmap grow failed");
 
         let kdata = self.key.as_mut_slice();
@@ -559,22 +739,44 @@ impl BlobStore {
 
     // ── Mutation ──────────────────────────────────────────────────────────────
 
-    /// Insert or replace the blob for `key`.
+    /// Insert or replace the blob for `key`: [`append_value`](Self::append_value)
+    /// then [`set_slot`](Self::set_slot).
     ///
     /// Returns `true` if this was a new key (false if an existing one was updated).
+    ///
+    /// Not crash-ordered: the slot can reach disk before the blob. Persistent
+    /// owners that need the order append, [`sync_values`](Self::sync_values),
+    /// then set slots. Test-only for that reason: production code goes through
+    /// the two steps.
+    #[cfg(test)]
     pub fn upsert(&mut self, key: u128, blob: &[u8]) -> bool {
-        if self.needs_rehash() {
-            self.rehash();
-        }
+        let (offset, len) = self.append_value(blob);
+        self.set_slot(key, offset, len)
+    }
 
+    /// Append `blob` to the value region without pointing any slot at it.
+    /// Returns its `(offset, len)` for a later [`set_slot`](Self::set_slot).
+    pub fn append_value(&mut self, blob: &[u8]) -> (u64, u32) {
         let hdr = self.header();
         let raw_offset = hdr.value_write_pos as usize;
         let aligned_offset = align_up(raw_offset, VALUE_ALIGNMENT);
         let new_val_end = aligned_offset + blob.len();
 
         self.val.ensure_capacity(new_val_end).expect("val mmap grow failed");
-
         self.val.as_mut_slice()[aligned_offset..aligned_offset + blob.len()].copy_from_slice(blob);
+
+        let mut h = self.header();
+        h.value_write_pos = new_val_end as u64;
+        self.set_header(&h);
+        (aligned_offset as u64, u32_len(blob.len(), "blob"))
+    }
+
+    /// Point `key` at a blob already in the value region (from
+    /// [`append_value`](Self::append_value)). Returns `true` if `key` is new.
+    pub fn set_slot(&mut self, key: u128, offset: u64, len: u32) -> bool {
+        if self.needs_rehash() {
+            self.rehash();
+        }
 
         let (idx, found) = self.probe(key);
 
@@ -583,7 +785,18 @@ impl BlobStore {
         // overwritten). This keeps `dead_bytes` O(1) and exact-since-compaction.
         if found {
             let old = read_slot(self.key.as_slice(), idx);
-            self.dead_bytes = self.dead_bytes.saturating_add(align_up(old.len as usize, VALUE_ALIGNMENT) as u64);
+            let mut dead = align_up(old.len as usize, VALUE_ALIGNMENT) as u64;
+            // Directory layout: the old directory's containers that the new
+            // one no longer lists are dead too.
+            if let Some(old_entries) = self.dir_entries(old.offset, old.len) {
+                let kept: std::collections::HashSet<u64> = self.dir_entries(offset, len).unwrap_or_default().iter().map(|e| e.offset).collect();
+                dead += old_entries
+                    .iter()
+                    .filter(|e| !kept.contains(&e.offset))
+                    .map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64)
+                    .sum::<u64>();
+            }
+            self.dead_bytes = self.dead_bytes.saturating_add(dead);
         }
 
         write_slot(
@@ -592,19 +805,35 @@ impl BlobStore {
             &Slot {
                 state: STATE_OCCUPIED,
                 key,
-                offset: aligned_offset as u64,
-                len: u32_len(blob.len(), "blob"),
+                offset,
+                len,
             },
         );
 
-        let mut h = self.header();
-        h.value_write_pos = new_val_end as u64;
         if !found {
+            let mut h = self.header();
             h.count += 1;
+            self.set_header(&h);
         }
-        self.set_header(&h);
 
         !found
+    }
+
+    /// True if `key` has a live slot.
+    #[cfg(test)]
+    pub fn contains_key(&self, key: u128) -> bool {
+        self.probe(key).1
+    }
+
+    /// Every live key, from the key table only (no blob reads).
+    pub fn keys(&self) -> Vec<u128> {
+        let cap = self.header().capacity as usize;
+        let kdata = self.key.as_slice();
+        (0..cap)
+            .map(|i| read_slot(kdata, i))
+            .filter(|s| s.state == STATE_OCCUPIED)
+            .map(|s| s.key)
+            .collect()
     }
 
     /// Mark the entry for `key` as a tombstone.
@@ -614,7 +843,7 @@ impl BlobStore {
             return;
         }
         // The removed key's blob is now dead — account it (aligned) as reclaimable.
-        let dead = align_up(read_slot(self.key.as_slice(), idx).len as usize, VALUE_ALIGNMENT) as u64;
+        let dead = self.owned_bytes(&read_slot(self.key.as_slice(), idx));
         self.dead_bytes = self.dead_bytes.saturating_add(dead);
 
         let kdata = self.key.as_mut_slice();
@@ -629,6 +858,7 @@ impl BlobStore {
     // ── Query ─────────────────────────────────────────────────────────────────
 
     /// Return the blob for `key`, or `None` if the key is absent.
+    #[cfg(test)]
     pub fn get(&self, key: u128) -> Option<Vec<u8>> {
         let (idx, found) = self.probe(key);
         if !found {
@@ -637,6 +867,24 @@ impl BlobStore {
         let s = read_slot(self.key.as_slice(), idx);
         let bytes = &self.val.as_slice()[s.offset as usize..s.offset as usize + s.len as usize];
         Some(bytes.to_vec())
+    }
+
+    /// Borrow the blob for `key`, or `None` if the key is absent.
+    pub fn get_ref(&self, key: u128) -> Option<&[u8]> {
+        let (idx, found) = self.probe(key);
+        if !found {
+            return None;
+        }
+        let s = read_slot(self.key.as_slice(), idx);
+        self.value_slice(s.offset, s.len)
+    }
+
+    /// Borrow `len` bytes of the value region at `offset`, or `None` if that
+    /// range runs past the region.
+    pub fn value_slice(&self, offset: u64, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len as usize)?;
+        self.val.as_slice().get(start..end)
     }
 
     /// Return all live `(key, blob)` pairs.
@@ -694,7 +942,23 @@ impl BlobStore {
                 if s.state != STATE_OCCUPIED {
                     continue;
                 }
-                let blob = &vdata[s.offset as usize..s.offset as usize + s.len as usize];
+                let mut blob = &vdata[s.offset as usize..s.offset as usize + s.len as usize];
+                // Directory layout: copy the containers first, then a
+                // directory pointing at their new offsets.
+                let moved_dir;
+                if let Some(entries) = self.dir_entries(s.offset, s.len) {
+                    let mut moved = Vec::with_capacity(entries.len());
+                    for e in entries {
+                        let c = &vdata[e.offset as usize..e.offset as usize + e.len as usize];
+                        let aligned = align_up(write_pos, VALUE_ALIGNMENT);
+                        val_buf.resize(aligned, 0);
+                        val_buf.extend_from_slice(c);
+                        moved.push(DirEntry { offset: aligned as u64, ..e });
+                        write_pos = aligned + c.len();
+                    }
+                    moved_dir = storage::encode_dir(&moved);
+                    blob = &moved_dir;
+                }
                 let aligned = align_up(write_pos, VALUE_ALIGNMENT);
                 val_buf.resize(aligned, 0); // honour VALUE_ALIGNMENT padding
                 val_buf.extend_from_slice(blob);
@@ -702,7 +966,7 @@ impl BlobStore {
                     state: STATE_OCCUPIED,
                     key: s.key,
                     offset: aligned as u64,
-                    len: s.len,
+                    len: u32_len(blob.len(), "blob"),
                 });
                 write_pos = aligned + blob.len();
             }
@@ -816,10 +1080,24 @@ impl BlobStore {
 
     // ── Persistence ───────────────────────────────────────────────────────────
 
-    /// Flush both mmaps to disk (no-op for anonymous stores).
+    /// Flush both mmaps to disk (no-op for anonymous stores): the value region
+    /// first, then the key table, so a durable slot never points at a blob that
+    /// is not. (The kernel may still write key pages back earlier on its own;
+    /// owners that need the order hold slot updates until after
+    /// [`sync_values`](Self::sync_values).)
     pub fn flush(&self) -> io::Result<()> {
-        self.key.flush()?;
+        self.sync_values()?;
+        self.sync_keys()
+    }
+
+    /// Sync the value region to disk.
+    pub fn sync_values(&self) -> io::Result<()> {
         self.val.flush()
+    }
+
+    /// Sync the key table to disk.
+    pub fn sync_keys(&self) -> io::Result<()> {
+        self.key.flush()
     }
 }
 
@@ -1228,34 +1506,200 @@ mod tests {
         assert_invalid(dir.path());
     }
 
-    #[test]
-    fn open_rejects_slot_blob_past_value_region() {
-        let dir = tempfile::TempDir::new().unwrap();
-        seed(dir.path());
-        // Inflate value_write_pos to a sane bound first so the slot bound is the
-        // failing check, then point slot 0's blob past it.
-        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
-        // Find an occupied slot and corrupt its offset to exceed value_write_pos.
-        let vwp = u64::from_le_bytes(key[48..56].try_into().unwrap());
-        for i in 0..INITIAL_CAPACITY {
-            let b = slot_byte_offset(i);
-            if key[b] == STATE_OCCUPIED {
-                key[b + 24..b + 32].copy_from_slice(&(vwp + 1).to_le_bytes()); // offset past vwp
-                break;
-            }
-        }
-        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
-        assert_invalid(dir.path());
+    fn first_live_slot(key: &[u8]) -> usize {
+        (0..INITIAL_CAPACITY)
+            .find(|&i| matches!(key[slot_byte_offset(i)], STATE_OCCUPIED | STATE_OCCUPIED_CHECKED))
+            .expect("seeded store has a live slot")
     }
 
     #[test]
-    fn open_rejects_value_write_pos_past_value_file() {
+    fn open_clamps_a_write_cursor_past_the_value_file() {
         let dir = tempfile::TempDir::new().unwrap();
         seed(dir.path());
         let val_len = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
         let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
-        key[48..56].copy_from_slice(&(val_len + 1).to_le_bytes()); // vwp beyond value file
+        key[48..56].copy_from_slice(&(val_len + 1).to_le_bytes());
         std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
-        assert_invalid(dir.path());
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert!(store.header().value_write_pos <= val_len);
+        assert_eq!(store.damaged_at_open(), 0);
+        assert_eq!(store.count(), 2);
+    }
+
+    #[test]
+    fn open_moves_a_stale_write_cursor_past_every_live_blob() {
+        // A header written back before its slots can name a cursor behind live
+        // blobs; appending from there would overwrite them.
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[48..56].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let mut store = BlobStore::open(dir.path()).unwrap();
+        let before: Vec<(u128, Vec<u8>)> = store.iter_entries();
+        store.upsert(99, &[7u8; 64]);
+        for (k, v) in before {
+            assert_eq!(store.get(k).unwrap(), v, "key {k} was overwritten by the new append");
+        }
+    }
+
+    #[test]
+    fn open_drops_a_torn_slot_and_reports_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let b = slot_byte_offset(first_live_slot(&key));
+        key[b + 30] ^= 0x5A; // half-written offset: the checksum no longer matches
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 1);
+        assert_eq!(store.count(), 1, "the torn slot is dropped, the other survives");
+    }
+
+    #[test]
+    fn open_drops_a_slot_pointing_past_the_value_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let i = first_live_slot(&key);
+        let val_len = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
+        let mut s = read_slot(&key, i);
+        s.offset = val_len + 16;
+        write_slot(&mut key, i, &s); // a valid checksum, but out of range
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 1);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn a_persistent_rehash_goes_through_a_new_file_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create(dir.path()).unwrap();
+            for k in 0..100u128 {
+                store.upsert(k, &k.to_le_bytes());
+            }
+            store.flush().unwrap();
+        }
+        assert!(!dir.path().join("blobs.keys.rehash").exists(), "the staged table was renamed into place");
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 0);
+        for k in 0..100u128 {
+            assert_eq!(store.get(k).unwrap(), k.to_le_bytes(), "key {k} after rehash + reopen");
+        }
+    }
+
+    #[test]
+    fn append_then_set_slot_is_upsert_in_two_steps() {
+        let mut store = BlobStore::new_anon();
+        let (off, len) = store.append_value(b"hello");
+        assert!(!store.contains_key(1), "appending points no slot at the blob");
+        assert!(store.set_slot(1, off, len));
+        assert_eq!(store.get(1).unwrap(), b"hello");
+    }
+
+    // ── Directory layout ─────────────────────────────────────────────────────
+
+    /// Append `containers` (raw bytes) and a directory over them; return the
+    /// directory's `(offset, len)`.
+    fn append_dir(store: &mut BlobStore, containers: &[(u128, &[u8])]) -> (u64, u32) {
+        let entries: Vec<DirEntry> = containers
+            .iter()
+            .map(|&(key, bytes)| {
+                let (offset, len) = store.append_value(bytes);
+                DirEntry { key, offset, len }
+            })
+            .collect();
+        store.append_value(&storage::encode_dir(&entries))
+    }
+
+    #[test]
+    fn directory_layout_counts_containers_as_live_and_dead() {
+        let mut store = BlobStore::new_anon_with(BlobLayout::Directory);
+        let (d, l) = append_dir(&mut store, &[(0, &[1u8; 100]), (1, &[2u8; 100])]);
+        store.set_slot(7, d, l);
+        let dir_len = align_up(l as usize, VALUE_ALIGNMENT) as u64;
+        assert_eq!(store.live_bytes(), 2 * 112 + dir_len);
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Replace container 1 only: the old directory and the old container 1
+        // become dead; container 0 is shared and stays live.
+        let old = storage::decode_dir(store.get_ref(7).unwrap()).unwrap();
+        let (off1, len1) = store.append_value(&[3u8; 50]);
+        let new_dir = storage::encode_dir(&[
+            old[0],
+            DirEntry {
+                key: 1,
+                offset: off1,
+                len: len1,
+            },
+        ]);
+        let (d2, l2) = store.append_value(&new_dir);
+        store.set_slot(7, d2, l2);
+        assert_eq!(store.dead_bytes(), dir_len + 112);
+        assert_eq!(store.live_bytes(), 112 + 64 + align_up(l2 as usize, VALUE_ALIGNMENT) as u64);
+
+        store.remove_key(7);
+        assert_eq!(store.live_bytes(), 0);
+        assert_eq!(store.dead_bytes(), store.logical_bytes(), "everything is dead once the slot is gone");
+    }
+
+    #[test]
+    fn directory_layout_compaction_moves_containers_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            for round in 0..5u8 {
+                for slot in 0..3u128 {
+                    let (d, l) = append_dir(&mut store, &[(0, &[round; 40]), (9, &[slot as u8; 300])]);
+                    store.set_slot(slot, d, l);
+                }
+            }
+            let live = store.live_bytes();
+            assert!(store.compact().unwrap() > 0);
+            assert_eq!(store.logical_bytes(), live, "only the live containers and directories remain");
+            store.flush().unwrap();
+        }
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 0);
+        for slot in 0..3u128 {
+            let entries = storage::decode_dir(store.get_ref(slot).unwrap()).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(store.value_slice(entries[0].offset, entries[0].len).unwrap(), &[4u8; 40]);
+            assert_eq!(store.value_slice(entries[1].offset, entries[1].len).unwrap(), &[slot as u8; 300][..]);
+        }
+    }
+
+    #[test]
+    fn open_drops_a_directory_that_is_torn_or_points_past_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (torn_at, far) = {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            let (d, l) = append_dir(&mut store, &[(0, &[1u8; 64])]);
+            store.set_slot(1, d, l);
+            // Slot 2: a directory naming a container far past the file end.
+            let far = storage::encode_dir(&[DirEntry {
+                key: 0,
+                offset: 1 << 30,
+                len: 64,
+            }]);
+            let (d2, l2) = store.append_value(&far);
+            store.set_slot(2, d2, l2);
+            // Slot 3: fine.
+            let (d3, l3) = append_dir(&mut store, &[(5, &[3u8; 64])]);
+            store.set_slot(3, d3, l3);
+            store.flush().unwrap();
+            (d as usize + 4, 2u128)
+        };
+        // Tear slot 1's directory (its count field).
+        let mut vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+        vals[torn_at] ^= 0xFF;
+        std::fs::write(dir.path().join("blobs.vals"), &vals).unwrap();
+
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 2);
+        assert!(!store.contains_key(1) && !store.contains_key(far));
+        assert!(store.contains_key(3));
     }
 }

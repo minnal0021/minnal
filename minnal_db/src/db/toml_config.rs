@@ -122,6 +122,14 @@ pub struct ThresholdSection {
     pub index_blob_waste_threshold: f64,
     #[serde(default = "default_index_blob_backpressure_bytes")]
     pub index_blob_backpressure_bytes: u64,
+    /// Soft limit on memory held by all field indexes' write buffers: request
+    /// an early index checkpoint.
+    #[serde(default = "default_index_overlay_soft_bytes")]
+    pub index_overlay_soft_bytes: u64,
+    /// Hard limit on the same memory: the writer that crosses it writes its
+    /// field's buffer out before returning.
+    #[serde(default = "default_index_overlay_hard_bytes")]
+    pub index_overlay_hard_bytes: u64,
     /// Cap on WAL segments the index-replay watermark may hold back from WAL GC
     /// before the backstop reclaims the oldest anyway. `0` disables the backstop.
     #[serde(default = "default_max_pinned_wal_segments")]
@@ -136,6 +144,8 @@ impl Default for ThresholdSection {
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: default_index_blob_waste_threshold(),
             index_blob_backpressure_bytes: default_index_blob_backpressure_bytes(),
+            index_overlay_soft_bytes: default_index_overlay_soft_bytes(),
+            index_overlay_hard_bytes: default_index_overlay_hard_bytes(),
             max_pinned_wal_segments: default_max_pinned_wal_segments(),
         }
     }
@@ -155,6 +165,14 @@ fn default_index_blob_waste_threshold() -> f64 {
 
 fn default_index_blob_backpressure_bytes() -> u64 {
     crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
+}
+
+fn default_index_overlay_soft_bytes() -> u64 {
+    crate::db::config::DEFAULT_INDEX_OVERLAY_SOFT_BYTES
+}
+
+fn default_index_overlay_hard_bytes() -> u64 {
+    crate::db::config::DEFAULT_INDEX_OVERLAY_HARD_BYTES
 }
 
 fn default_index_checkpoint_interval_ms() -> u64 {
@@ -283,6 +301,7 @@ impl MinnalTomlConfig {
                 .with_tail_gc_min_garbage_pct(self.thresholds.tail_gc_min_garbage_pct)
                 .with_index_blob_waste_threshold(self.thresholds.index_blob_waste_threshold)
                 .with_index_blob_backpressure_bytes(self.thresholds.index_blob_backpressure_bytes)
+                .with_index_overlay_bytes(self.thresholds.index_overlay_soft_bytes, self.thresholds.index_overlay_hard_bytes)
                 .with_max_pinned_wal_segments(self.thresholds.max_pinned_wal_segments),
             sync_config: SyncConfig::new(self.sync.records_per_sync),
             scheduled_task_config: ScheduledTaskConfig {
@@ -303,5 +322,19 @@ impl MinnalTomlConfig {
             fail_log_dir: self.recovery.fail_log_dir.as_deref().map(PathBuf::from),
             verify_checksums_on_read: self.value_log.verify_checksums_on_read,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_overlay_limits_parse_and_default() {
+        let t: ThresholdSection = toml::from_str("index_overlay_soft_bytes = 1024\nindex_overlay_hard_bytes = 4096\n").unwrap();
+        assert_eq!((t.index_overlay_soft_bytes, t.index_overlay_hard_bytes), (1024, 4096));
+        let d: ThresholdSection = toml::from_str("").unwrap();
+        assert_eq!(d.index_overlay_soft_bytes, crate::db::config::DEFAULT_INDEX_OVERLAY_SOFT_BYTES);
+        assert_eq!(d.index_overlay_hard_bytes, crate::db::config::DEFAULT_INDEX_OVERLAY_HARD_BYTES);
     }
 }

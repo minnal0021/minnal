@@ -125,13 +125,14 @@ fn total_blob_value_bytes(root: &std::path::Path) -> u64 {
     total
 }
 
-/// The bitmap blob store is append-only: every per-document insert rewrites the
-/// whole bitmap for that field value and orphans the previous copy. A low-
-/// cardinality field over many documents therefore balloons the value region.
-/// The checkpoint must reclaim that dead space via compaction once it crosses
-/// the waste threshold — and the live index must stay correct afterward.
+/// Field-index writes are buffered in memory and written once per checkpoint.
+/// The bitmap store is append-only, so writing each document's change straight
+/// to it left one dead copy of the whole bitmap per document: 500 documents over
+/// two values bloated the value region past 256 KiB before any checkpoint. Now
+/// nothing reaches the store before the checkpoint, the checkpoint writes each
+/// changed container once, and the index stays correct throughout.
 #[test]
-fn checkpoint_compacts_bloated_field_index() -> Result<(), KVError> {
+fn field_index_writes_are_buffered_until_the_checkpoint() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_test_db(dir.path())?;
 
@@ -141,11 +142,9 @@ fn checkpoint_compacts_bloated_field_index() -> Result<(), KVError> {
         Some(IndexValue::Str(user.status.as_str().to_string()))
     });
     db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor)?;
+    db.checkpoint_index()?;
+    let empty = total_blob_value_bytes(dir.path());
 
-    // 500 docs over just two status values → each value's bitmap is rewritten
-    // ~250 times, leaving heavy dead space in the append-only value region. The
-    // bitmap store is a file-backed mmap that grows on disk during the inserts,
-    // so the bloat is already on disk before any checkpoint runs.
     let n = 500u64;
     for i in 0..n {
         let status = if i % 2 == 0 { "active" } else { "inactive" };
@@ -157,29 +156,33 @@ fn checkpoint_compacts_bloated_field_index() -> Result<(), KVError> {
             },
         )?;
     }
-    let bloated = total_blob_value_bytes(dir.path());
-    assert!(bloated > 256 * 1024, "expected a bloated value region, got {bloated} bytes");
-
-    // An in-place checkpoint compacts because the bitmap store's waste (~99%) is
-    // well over the 50% threshold — and the db stays open and queryable.
-    db.checkpoint_index()?;
-    let compacted = total_blob_value_bytes(dir.path());
+    // Queries see the buffered changes before any checkpoint.
+    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
+    assert_eq!(active.len() as u64, n / 2, "buffered writes must be visible to queries");
+    // Before the checkpoint the store has not grown (a background checkpoint
+    // tick may land here, which writes each bitmap once, still no bloat).
     assert!(
-        compacted * 4 < bloated,
-        "compaction must reclaim most of the value region: {compacted} not « {bloated}"
+        total_blob_value_bytes(dir.path()) < empty + 64 * 1024,
+        "writes must not bloat the bitmap store before the checkpoint"
     );
 
-    // The live index must be correct after compaction.
+    // The checkpoint writes each value's bitmap once: two small blobs, no bloat.
+    db.checkpoint_index()?;
+    let written = total_blob_value_bytes(dir.path());
+    assert!(
+        written < empty + 64 * 1024,
+        "one copy per value expected, value region grew by {} bytes",
+        written - empty
+    );
     let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#)?.keys;
-    assert_eq!(active.len() as u64, n / 2, "every even-keyed doc must still match after compaction");
+    assert_eq!(active.len() as u64, n / 2, "every even-keyed doc must still match after the checkpoint");
 
-    // A second checkpoint is now a cheap no-op (waste reads back ≈0).
-    let before_second = total_blob_value_bytes(dir.path());
+    // A checkpoint with nothing buffered writes nothing.
     db.checkpoint_index()?;
     assert_eq!(
         total_blob_value_bytes(dir.path()),
-        before_second,
-        "already-compacted store must not be rewritten"
+        written,
+        "an idle checkpoint must not rewrite the store"
     );
 
     db.shutdown()?;

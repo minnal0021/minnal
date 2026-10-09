@@ -131,7 +131,8 @@ pub use db::config::ThresholdConfig;
 
 /// Default field-index bitmap compaction threshold (percentage of dead space).
 pub use db::config::{
-    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
+    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_INDEX_OVERLAY_HARD_BYTES, DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
+    DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
 };
 
 pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
@@ -187,6 +188,8 @@ pub use crate::index::IndexValue;
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
 /// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
 pub use crate::index::IndexBlobStats;
+/// Field-index write-buffer use and limits ([`Db::index_overlay_stats`]).
+pub use crate::index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
 pub use db::namespace::FieldId;

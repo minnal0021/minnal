@@ -103,8 +103,9 @@ pub struct KVStore {
     // LSM compaction trigger channel
     pub(crate) lsm_compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 
-    // Index-checkpoint backpressure valve: requests an early checkpoint when a
-    // field index accumulates too much reclaimable dead blob space. `None` until
+    // Index-checkpoint trigger: requests an early checkpoint when a field index
+    // accumulates too much reclaimable dead blob space, or when field-index write
+    // buffers pass the overlay budget's soft limit. `None` until
     // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
     pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
     // Where rejected field-index updates are reported so they become durable gap
@@ -590,6 +591,7 @@ impl KVStore {
                 },
             };
             let dead_bytes = idx.reclaimable_dead_bytes();
+            let overlay_full = idx.overlay_budget().over_soft();
             drop(idx);
             if let Err(e) = result {
                 // A rejected update leaves this row absent from the field for
@@ -600,10 +602,24 @@ impl KVStore {
                     sink.note_rejected_update(self.namespace_id, entry.field_id, key);
                 }
             }
-            // Backpressure: if this field's append-only blob has piled up enough
-            // dead space, ask the checkpoint worker to compact early instead of
-            // waiting for the next tick (debounced inside the trigger).
+            // Disk: if this field's blob store has piled up enough dead space
+            // (old bitmap copies left by spills), ask the checkpoint worker to
+            // compact early instead of waiting for the next tick (debounced
+            // inside the trigger).
             self.request_checkpoint_if_over_cap(dead_bytes);
+            // Memory: past the write buffers' soft limit, ask for a checkpoint
+            // to write them out. (The hard limit is enforced by the index itself.)
+            if overlay_full {
+                self.request_checkpoint_now();
+            }
+        }
+    }
+
+    /// Request an index checkpoint now, if the checkpoint worker is running.
+    /// Debounced inside the trigger. O(1) and non-blocking.
+    fn request_checkpoint_now(&self) {
+        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
+            trigger.request();
         }
     }
 
@@ -839,11 +855,15 @@ impl KVStore {
                 // Prior bytes unavailable → scan to be safe.
                 None => idx.remove_all_for_row(row_id),
             }
-            // A removal also rewrites the value's bitmap append-only, so it adds
-            // to the field's dead space — signal backpressure like the put path.
+            // A removal changes the value's bitmap like a put does: signal both
+            // valves the same way.
             let dead_bytes = idx.reclaimable_dead_bytes();
+            let overlay_full = idx.overlay_budget().over_soft();
             drop(idx);
             self.request_checkpoint_if_over_cap(dead_bytes);
+            if overlay_full {
+                self.request_checkpoint_now();
+            }
         }
     }
 
@@ -1013,7 +1033,7 @@ impl KVStore {
         let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
 
         // ── Step 1: single-pass LSM lookup for all keys ───────────────────────
-        // Reads each bucket's level1 file ONCE instead of once per key.
+        // One forward pass per bucket's SSTables, reading near the keys only.
         let pointers = self.lsm.get_multiple(keys)?;
 
         // ── Step 2: group the pointers by value-log bucket ────────────────────

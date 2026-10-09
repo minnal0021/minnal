@@ -11,12 +11,13 @@
 //! {db_path}/index/
 //!   {namespace_id}/
 //!     {field_id}/
-//!       blobs.keys     ← BlobStore key file (mmap hash table, slot_id → offset)
-//!       blobs.vals     ← BlobStore value file (serialised RoaringBitmap blobs)
-//!       keymap/        ← mmap-backed keymap store (value → slot_id mapping)
+//!       blobs.keys     ← BlobStore key file (mmap hash table, slot_id → offset, len)
+//!       blobs.vals     ← BlobStore value file (append-only serialised RoaringBitmap blobs)
+//!       keymap/        ← mmap-backed keymap store (slot_id → serialised value)
 //!         blobs.keys
 //!         blobs.vals
-//!       checkpoint     ← WAL write-offset at last flush (8 bytes, LE u64)
+//!       checkpoint     ← WAL offset the index reflects as of its last checkpoint (8 bytes, LE u64)
+//!       gap.json       ← present only while the index is known to be missing updates
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -136,6 +137,10 @@ pub enum GapCause {
     /// A field index rejected an update on the write path. The key is known
     /// exactly, so this is always row-scoped.
     RejectedUpdate,
+    /// The field's files held entries damaged by a crash (a slot torn by a
+    /// power loss), which were dropped when the field was opened. Which rows
+    /// they held is unknown, so the repair is a full rebuild.
+    DamagedIndexFile,
 }
 
 /// A durable record that a field index is missing updates, and what it would

@@ -25,6 +25,16 @@ impl Container {
         Container::Array(ArrayContainer::new())
     }
 
+    /// Heap bytes this container owns, not counting the enum itself. Used to
+    /// account for in-memory bitmaps against a memory budget.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Container::Array(a) => a.heap_bytes(),
+            Container::Bitset(b) => b.heap_bytes(),
+            Container::Run(r) => r.heap_bytes(),
+        }
+    }
+
     pub fn insert(&mut self, value: u16) -> bool {
         match self {
             Container::Array(a) => {

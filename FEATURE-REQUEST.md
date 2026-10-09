@@ -15,6 +15,8 @@ re-check them before starting work.
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
+| [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
+| [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | Proposed |
 
 ---
 
@@ -367,8 +369,9 @@ failure this FR exists to eliminate.
 
 A single-field rebuild stays consistent with the namespace's other fields:
 
-- `doc_store` namespaces register a key-derived `RowIdFn`, a pure function of the
-  key, so IDs are stable by construction.
+- `doc_store` namespaces with `u64` keys register a key-derived `RowIdFn`, a
+  pure function of the key, so IDs are stable by construction. Other doc stores
+  (`uuid`, `u128`, `str`) use the dense `RowMap` below.
 - Dense-`RowMap` namespaces: `get_or_alloc` returns the existing ID for known
   keys, and `run_index_checkpoint` flushes the row map **before** any field
   marker. So any key the restored row map lacks was written after that marker and
@@ -835,3 +838,153 @@ by construction.
   operations (`count_docs`, the `field_index_*` helpers, `reindex_doc_*`), or
   disappears.
 - The removal is a single, clearly-labelled breaking commit.
+
+---
+
+## FR-005 — Container-granular field-index files
+
+**Filed:** 2026-10-08
+**Area:** `minnal_db` (`src/index/`)
+**Severity:** Low — affects only fields whose changed bitmaps together exceed
+`thresholds.index_overlay_hard_bytes` (64 MiB by default)
+**Source:** field-index write-back work on branch `roaring_bit_map_fixes`
+(steps 1–3a done; this is step 3b–3d of
+`minnal_db/src/index/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+**✅ Implemented:** 2026-10-09 (`0c04268`) — see *Implementation* below.
+
+### Summary
+
+A field index buffers changed bitmaps in memory (the *overlay*) and writes each
+changed bitmap **whole** at the next spill. The overlay is bounded by a shared
+byte budget. When one field's changed bitmaps alone exceed the hard limit — a
+boolean over roughly 300M rows — every write to it spills its whole bitmap
+again: write amplification and an fsync per write return for that field. In a
+test with a deliberately tiny budget, 400k writes took 51 s (debug build).
+
+### Why this is a feature, not a bug fix
+
+The fix changes the on-disk format of `blobs.vals`, which needs a decision on
+compatibility (greenfield policy allows recreating, but every existing index
+would have to be rebuilt).
+
+### Scope
+
+- Store a field's bitmap as per-container blobs plus a per-slot directory, so
+  the overlay holds only changed containers (≤ 8 KB each) and a spill appends
+  only those.
+- Rewrite compaction for the new layout, keeping the staged-swap protocol.
+- Crash tests: crash before each write step, with a random subset of dirty pages
+  written back; reopen + replay must equal a full rebuild.
+
+The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
+(option 4, step 3).
+
+### Acceptance criteria
+
+- A boolean field over 300M rows with the default budget appends O(changed
+  containers) per spill, not O(bitmap size) per write.
+- Query latency on file-backed indexes (`bench_predicate`) does not regress.
+- The crash tests above pass.
+
+### Implementation
+
+- **Format** (`index/storage.rs`): each container is its own rkyv blob; a value's
+  slot points at a checksummed directory (`MBD1`, container key → offset, len).
+  `BlobStore` gained `BlobLayout::{Flat, Directory}` (keymap / bitmaps); dead and
+  live bytes, open-time repair (a torn directory, or one listing a container past
+  the file, counts as damaged → full-rebuild gap) and compaction read
+  directories. On-disk version 1 → 2: older stores refuse to open (greenfield;
+  delete and rebuild).
+- **Overlay** (`index/field/field_index.rs`): `slot → container key →
+  Option<Container>`, with the slot's decoded directory cached; a spill appends
+  only the changed containers and a new directory.
+- **Tests:** `every_spill_phase_crash_recovers_to_the_ground_truth` (crash after
+  each of stage / sync values / commit / sync keys, unsynced 4 KiB pages taken at
+  random from the old or new image, 24 seeds, half compacted first; reopen +
+  replay must equal the ground truth), and
+  `past_the_hard_limit_each_spill_appends_containers_not_bitmaps` (bool, 32
+  containers per value, 8 KiB hard limit: each write appends 18.2 KB — two
+  containers and two directories — where spilling both whole bitmaps would
+  append about 527 KB).
+- **Queries:** `bench_predicate` equal or faster than `b29d1ae` on every case
+  (`str_eq` 635 → 345–366 ns, `int_range` 140–145 → 135–137 µs).
+
+---
+
+## FR-006 — `reindex-all` compacts the row map
+
+**Filed:** 2026-10-09
+**Area:** `minnal_db` (`src/index/rowmap.rs`, `src/db/`), `minnal_db_api`
+(`POST /admin/indices/{ns}/attribute/reindex-all`)
+**Severity:** Low — disk and page cache only; affects namespaces that write many
+short-lived keys
+**Source:** discussion during the FR-005 1M-document test, after `uuid` and
+`u128` doc stores moved to dense row IDs (`711b1a6`)
+
+### Summary
+
+A namespace's row map (`index/{ns}/rowmap/`) gives each key a dense row ID and
+never frees one: a deleted key keeps its ID, and a key that comes back gets the
+same ID again. The files (`rows.keybytes`, `rows.idarray`, `rows.slots`) are
+memory-mapped, not heap, but they grow with **every distinct key ever written**,
+about 60 bytes per uuid key, and the row IDs of deleted keys leave holes that
+make the field bitmaps sparser over time. A namespace with steady key churn — TTL
+expiry, or documents deleted and re-created under fresh uuids — grows without
+bound.
+
+### Why IDs are never freed today
+
+A row ID is the only link between a key and its bits in every field index of the
+namespace. Giving a freed ID to a new key is safe only if no durable bitmap in
+any field still holds it. A bit can survive a delete: a field whose delete was
+not yet on disk at a crash, a field with an unrepaired gap, or one field rebuilt
+before or after the row map. WAL replay only re-applies writes and never clears a
+bit it does not know about, so a reused ID would make the new key match queries
+for the old key's values, silently. See the module docs in `index/rowmap.rs`.
+
+### Why the existing rebuilds do not fix it
+
+`reindex-all` drops every field index of the namespace and rebuilds each with
+`add_index`; per-field `repair` walks the live keys. Both go through
+`reindex_key` → `resolve_row_id_alloc` → `RowMap::get_or_alloc`, which returns
+each key's existing ID. The bitmaps end up holding only live rows, but the row
+map keeps every dead key and the live keys keep their sparse IDs.
+
+### Proposal
+
+`reindex-all` is the one point where freeing IDs is provably safe: once it has
+dropped every field index of the namespace, no bitmap references any row ID. At
+that point:
+
+1. Drop every field index, as today (the `dropped` flags are persisted first).
+2. Reset the namespace's row map: empty the three files and set `next_id` to 0.
+3. Rebuild every field, as today. Each live key is allocated a fresh dense ID.
+
+Row IDs are used only by the field bitmaps and the row map, and transiently to
+turn query hits back into keys. The vector index and `vector_kv` key by
+document ID, so they are unaffected.
+
+### Open questions
+
+- **Crash safety of step 2.** A crash between the reset and the end of the
+  rebuild must never leave a bitmap built under old IDs beside a reset row map.
+  The reset needs its own marker (or must happen only while every field is
+  durably dropped), and recovery must treat a half-done compaction as "rebuild
+  every field".
+- **Queries during the rebuild.** They already report the fields as
+  `degraded_fields` while `reindex-all` runs; confirm that still holds while the
+  row map is empty.
+- **`u64` stores** take row IDs from the key and have no row map; this applies
+  only to row-map namespaces (`str`, `uuid`, `u128` doc stores, and engine
+  namespaces without a `RowIdFn`).
+- Whether to also expose a dry-run that reports live keys versus keys in the row
+  map, so an operator can see when compaction is worth it.
+
+### Acceptance criteria
+
+- After deleting 90% of a namespace's documents and running `reindex-all`, the
+  row map files shrink to the live keys' size and `next_id` equals the live
+  document count.
+- Every query returns the same documents before and after.
+- A crash injected at each step of the reset and rebuild leaves either the old
+  state or a recorded full-rebuild gap, never wrong query results.

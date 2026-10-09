@@ -239,6 +239,9 @@ struct FrameReader<'a> {
     next_offset: u64,
     /// Size of the next refill read.
     read_size: usize,
+    /// Bytes read from the file so far (tests use it to check that a batch
+    /// lookup reads near its keys, not the whole file).
+    bytes_read: u64,
 }
 
 impl<'a> FrameReader<'a> {
@@ -253,7 +256,29 @@ impl<'a> FrameReader<'a> {
             len: 0,
             next_offset: offset,
             read_size: Self::MIN_READ,
+            bytes_read: 0,
         }
+    }
+
+    /// File offset of the next frame.
+    fn offset(&self) -> u64 {
+        self.next_offset - (self.len - self.pos) as u64
+    }
+
+    /// Continue reading at `offset`, a frame boundary at or past
+    /// [`offset`](Self::offset). Skips within the buffer when the target is
+    /// already in it; otherwise drops the buffer and restarts small read-ahead.
+    fn seek(&mut self, offset: u64) {
+        let here = self.offset();
+        debug_assert!(offset >= here, "FrameReader only seeks forward");
+        if offset >= here && offset < self.next_offset {
+            self.pos += (offset - here) as usize;
+            return;
+        }
+        self.pos = 0;
+        self.len = 0;
+        self.next_offset = offset;
+        self.read_size = Self::MIN_READ;
     }
 
     /// Buffer at least `n` unconsumed bytes, reading more only if needed. Returns
@@ -276,6 +301,7 @@ impl<'a> FrameReader<'a> {
                 Ok(read) => {
                     self.len += read;
                     self.next_offset += read as u64;
+                    self.bytes_read += read as u64;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(LSMError::Io(err)),
@@ -476,6 +502,9 @@ type Candidate = Option<(Option<u128>, u64)>;
 /// One bucket's share of a `get_multiple` batch: each distinct pending key and
 /// its running [`Candidate`].
 type BatchSlots<'k> = std::collections::HashMap<&'k [u8], Candidate>;
+
+/// Per input key, its winning `(pointer, seq)` or `None` (absent or deleted).
+type BatchLookup = Vec<Option<(u128, u64)>>;
 
 /// A single entry in the SSTable
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -2961,8 +2990,14 @@ impl LSMTree {
     /// Fetch multiple keys in a **single pass per bucket**.
     ///
     /// Where `get` × N keys would scan every Level-0 file N times, this groups the
-    /// keys by hash bucket and reads each bucket's L0 files and L1 file **once**,
-    /// resolving all of that bucket's keys in the same pass.
+    /// keys by hash bucket and makes one forward pass over each of the bucket's
+    /// L0 files and its L1 file, resolving all of that bucket's keys together.
+    /// The pass reads only near the keys: it jumps between them with the
+    /// sparse indexes (`scan_sorted_candidates`), so a query page of a few keys
+    /// reads a few KiB per file and a large batch one sequential read. It used to
+    /// read the whole L1 file into memory for any batch, which made every
+    /// document-store query page cost 1-14 ms on a 1M-document store (0.3 ms
+    /// after the change).
     ///
     /// Resolution is identical to [`get_with_seq`](Self::get_with_seq): the
     /// highest-`seq` copy across **every** layer wins (a winning tombstone ⇒
@@ -2975,8 +3010,15 @@ impl LSMTree {
     /// Returns one `Option<(pointer, seq)>` per input key, in input order; a key
     /// given more than once resolves at every position. `None` means the key does
     /// not exist or was deleted.
-    pub(crate) fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<(u128, u64)>>> {
+    pub(crate) fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<BatchLookup> {
+        Ok(self.get_multiple_counted(keys)?.0)
+    }
+
+    /// [`get_multiple`](Self::get_multiple), also returning the SSTable bytes
+    /// read (for tests).
+    fn get_multiple_counted(&self, keys: &[Vec<u8>]) -> Result<(BatchLookup, u64)> {
         let n = keys.len();
+        let mut sstable_bytes = 0u64;
         // Running winner per input position, folded newest layer first through
         // `merge_candidate` so an exact sequence tie stays with the newer layer.
         let mut best: Vec<Candidate> = vec![None; n];
@@ -3038,10 +3080,10 @@ impl LSMTree {
                     let outcome = handle
                         .join()
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))));
-                    if let Err(e) = outcome
-                        && first_err.is_none()
-                    {
-                        first_err = Some(e);
+                    match outcome {
+                        Ok(read) => sstable_bytes += read,
+                        Err(e) if first_err.is_none() => first_err = Some(e),
+                        Err(_) => {}
                     }
                 }
             });
@@ -3050,7 +3092,7 @@ impl LSMTree {
             }
         }
 
-        Ok((0..n)
+        let results = (0..n)
             .map(|i| {
                 let winner = if settled[i] {
                     best[i]
@@ -3060,13 +3102,15 @@ impl LSMTree {
                 };
                 winner.and_then(|(value, seq)| value.map(|ptr| (ptr, seq)))
             })
-            .collect())
+            .collect();
+        Ok((results, sstable_bytes))
     }
 
     /// The SSTable half of [`get_multiple`](Self::get_multiple) for one bucket: fold
     /// every L0 file's and then the L1 file's copy of each pending key into its slot,
     /// highest `seq` winning. Each slot arrives holding the memtable winner (if any).
-    fn resolve_bucket_batch(&self, bucket: usize, pending: &mut BatchSlots<'_>) -> Result<()> {
+    fn resolve_bucket_batch(&self, bucket: usize, pending: &mut BatchSlots<'_>) -> Result<u64> {
+        let mut bytes_read = 0u64;
         let fold = |pending: &mut BatchSlots<'_>, archived: &ArchivedSStableEntry| {
             if let Some(slot) = pending.get_mut(archived.key.as_slice()) {
                 let value = (!archived.tombstone).then(|| archived.value.to_native());
@@ -3090,33 +3134,28 @@ impl LSMTree {
             // Read the file only if some pending key may be in it AND could still
             // be beaten by it — the same exact rejects as `search_level0_files`.
             let entry = &guard.entry;
-            let worth_reading = pending
+            let mut wanted: Vec<&[u8]> = pending
                 .iter()
-                .any(|(key, slot)| entry.may_contain(key) && !slot.is_some_and(|(_, seq)| entry.cannot_beat(seq)));
-            if !worth_reading {
+                .filter(|(key, slot)| entry.may_contain(key) && !slot.is_some_and(|(_, seq)| entry.cannot_beat(seq)))
+                .map(|(key, _)| *key)
+                .collect();
+            if wanted.is_empty() {
                 continue;
             }
-            let mut file = open_registered_l0_for_scan(&entry.path)?;
-            // Bound for `check_frame_len`: a frame can never be longer than its file.
+            wanted.sort_unstable();
+            let wanted: Vec<(&[u8], u64)> = wanted.into_iter().map(|k| (k, entry.scan_start(k))).collect();
+            let file = open_registered_l0_for_scan(&entry.path)?;
             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let mut entry_bytes: Vec<u8> = Vec::new();
-            loop {
-                let mut size_buf = [0u8; 4];
-                match file.read_exact(&mut size_buf) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(LSMError::Io(e)),
-                }
-                let size = u32::from_le_bytes(size_buf) as usize;
-                check_frame_len(size as u64, file_len)?;
-                entry_bytes.resize(size, 0);
-                file.read_exact(&mut entry_bytes[..size])?;
-                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                fold(pending, archived);
-            }
+            let (read, rejected) = self.scan_sorted_candidates(&file, file_len, &wanted, |a| fold(pending, a))?;
+            // An L0 file is never rewritten, so its hints cannot go stale.
+            debug_assert!(
+                !rejected,
+                "an L0 sparse-index hint was rejected: the index offsets disagree with the file"
+            );
+            bytes_read += read;
         }
 
-        // L1 pre-filter: skip the whole-file read when no pending key can be in it.
+        // L1 pre-filter: skip the file when no pending key can be in it.
         // Same exact fast-rejects as `lookup_level1` (min/max is exact, a bloom
         // negative is exact), and only applied when the metadata/bloom are present —
         // absent metadata reads the file rather than risk skipping a live key.
@@ -3145,43 +3184,83 @@ impl LSMTree {
                 .filter(|k| bloom.as_ref().is_none_or(|b| b.contains(k)))
                 .collect()
         };
-        let Some(&last_candidate) = may_be_in_l1.iter().max() else {
-            return Ok(());
-        };
+        let mut may_be_in_l1 = may_be_in_l1;
+        if may_be_in_l1.is_empty() {
+            return Ok(bytes_read);
+        }
+        may_be_in_l1.sort_unstable();
 
-        // Level 1: single large read, then an in-memory pass. Entries are
-        // key-sorted, so stop once past the largest candidate key.
+        // Level 1: hop between the candidates with the sparse index, reading only
+        // near them. The index may belong to a newer file than the handle (a
+        // compaction swapping it), so each hint is validated before use.
         let level1_file = self.sstable_files[bucket].read().clone();
-        let file_size = level1_file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        let file_size = level1_file.metadata().map(|m| m.len()).unwrap_or(0);
         if file_size == 0 {
-            return Ok(());
+            return Ok(bytes_read);
         }
-        let mut file_buf = vec![0u8; file_size];
-        let mut total_read = 0usize;
-        while total_read < file_size {
-            match level1_file.read_at(&mut file_buf[total_read..], total_read as u64) {
-                Ok(0) => break,
-                Ok(nr) => total_read += nr,
-                Err(e) => return Err(LSMError::Io(e)),
-            }
+        let wanted: Vec<(&[u8], u64)> = {
+            let index = self.sstable_indexes[bucket].read();
+            may_be_in_l1
+                .iter()
+                .map(|&k| (k, index.as_ref().map_or(0, |i| i.block_start(k))))
+                .collect()
+        };
+        let (read, rejected) = self.scan_sorted_candidates(&level1_file, file_size, &wanted, |a| fold(pending, a))?;
+        if rejected && let Some(m) = self.metrics() {
+            Metrics::bump(&m.sparse_hint_rejects);
         }
-        let file_content = &file_buf[..total_read];
-        let mut pos = SSTABLE_DATA_START as usize;
-        while pos + 4 <= file_content.len() {
-            let size = u32::from_le_bytes(file_content[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + size > file_content.len() {
-                break;
+        Ok(bytes_read + read)
+    }
+
+    /// Visit the entries of one sorted SSTable file near each of `candidates`
+    /// (`(key, sparse-index hint)`, sorted by key), passing every entry read to
+    /// `visit`.
+    ///
+    /// One forward cursor: for each candidate, jump to its hint when that lies
+    /// past the cursor, then read forward until the
+    /// cursor passes the candidate. A batch of a few keys therefore reads about
+    /// `SAMPLE_INTERVAL` entries per key, while a dense batch turns into one
+    /// sequential read, never more than the file. Entries are key-sorted, so any
+    /// valid frame boundary at or below a candidate finds it: a hint is used
+    /// only after [`valid_scan_start`](Self::valid_scan_start) accepts it, and a
+    /// rejected one just keeps scanning from the cursor, which is always below
+    /// the current candidate.
+    ///
+    /// Returns the bytes read and whether any hint was rejected.
+    fn scan_sorted_candidates(
+        &self,
+        file: &File,
+        file_len: u64,
+        candidates: &[(&[u8], u64)],
+        mut visit: impl FnMut(&ArchivedSStableEntry),
+    ) -> Result<(u64, bool)> {
+        debug_assert!(candidates.windows(2).all(|w| w[0].0 <= w[1].0), "candidates must be sorted");
+        let mut frames = FrameReader::new(file, SSTABLE_DATA_START);
+        let mut rejected = false;
+        let mut next = 0usize;
+        'candidates: while next < candidates.len() {
+            let (wanted, start) = candidates[next];
+            if start > frames.offset() {
+                if Self::valid_scan_start(file, start, file_len, wanted) {
+                    frames.seek(start);
+                } else {
+                    rejected = true;
+                }
             }
-            let entry_slice = &file_content[pos..pos + size];
-            pos += size;
-            let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(entry_slice)?) };
-            if archived.key.as_slice() > last_candidate {
-                break;
+            while let Some(body) = frames.next_frame(file_len)? {
+                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
+                visit(archived);
+                let key = archived.key.as_slice();
+                if key >= wanted {
+                    while next < candidates.len() && candidates[next].0 <= key {
+                        next += 1;
+                    }
+                    continue 'candidates;
+                }
             }
-            fold(pending, archived);
+            break;
         }
-        Ok(())
+        Ok((frames.bytes_read, rejected))
     }
 
     /// Get all keys in the LSM tree (for compatibility with existing API)
@@ -5429,6 +5508,104 @@ mod tests {
         assert!(m.l0_bloom_rejects > 0, "no L0 file was ever skipped by range/bloom");
         assert!(m.seq_prunes > 0, "no SSTable was ever skipped by max-seq");
         assert!(m.l0_probes > 0 && m.l1_probes > 0, "the slow path never read L0 and L1");
+        Ok(())
+    }
+
+    /// A batch read must read near its keys, not whole SSTables: a one-key batch
+    /// on a large L1 file reads a few KiB, and every batch size agrees with the
+    /// single-key `get` across L1, several overlapping L0 files and the memtable
+    /// (overwrites, tombstones, absent and duplicated keys).
+    #[test]
+    fn test_get_multiple_reads_near_its_keys_and_agrees_with_get() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 2,
+            ..LSMConfig::default()
+        };
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        let key = |i: u64| format!("doc:{i:08}").into_bytes();
+        let mut seq = 1u64;
+        for i in 0..20_000u64 {
+            lsm.insert_with_seq(&key(i), u128::from(i) + 1, seq)?;
+            seq += 1;
+        }
+        lsm.flush_and_compact_all()?;
+        // Two L0 files of overwrites and deletes, then unflushed memtable writes.
+        for round in 0..2u64 {
+            for i in (round..20_000).step_by(7) {
+                if i % 3 == 0 {
+                    lsm.delete_with_seq(&key(i), seq)?;
+                } else {
+                    lsm.insert_with_seq(&key(i), u128::from(i + 1_000_000 * (round + 1)), seq)?;
+                }
+                seq += 1;
+            }
+            lsm.flush_memtable_to_level0()?;
+        }
+        for i in (0..20_000u64).step_by(101) {
+            lsm.insert_with_seq(&key(i), 7, seq)?;
+            seq += 1;
+        }
+        let l1_bytes: u64 = (0..2).map(|b| lsm.sstable_files[b].read().metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        assert!(l1_bytes > 500_000, "setup: L1 should be large, is {l1_bytes} bytes");
+
+        let mut probes: Vec<Vec<u8>> = (0..20_000u64).step_by(13).map(key).collect();
+        probes.extend((0..50u64).map(|i| format!("doc:{i:08}x").into_bytes())); // absent, between keys
+        probes.push(key(4_000)); // duplicated
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut pick = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for size in [1usize, 2, 5, 20, 200, probes.len()] {
+            for _ in 0..10 {
+                let batch: Vec<Vec<u8>> = (0..size).map(|_| probes[pick(probes.len())].clone()).collect();
+                let (got, read) = lsm.get_multiple_counted(&batch)?;
+                for (k, g) in batch.iter().zip(&got) {
+                    assert_eq!(*g, lsm.get_with_seq(k)?, "batch of {size}: key {:?}", String::from_utf8_lossy(k));
+                }
+                if size == 1 {
+                    assert!(read < 64 * 1024, "a one-key batch read {read} bytes (L1 is {l1_bytes})");
+                }
+                assert!(read <= 2 * l1_bytes, "a batch of {size} read {read} bytes, more than the files");
+            }
+        }
+        Ok(())
+    }
+
+    /// A stale or bogus sparse-index hint (an L1 file swapped by a compaction
+    /// under the index) must never lose a candidate in a batch read: it is
+    /// rejected and the cursor keeps scanning from where it is.
+    #[test]
+    fn test_batch_scan_survives_bogus_hints() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        for i in 0..3_000u64 {
+            lsm.insert_with_seq(format!("k:{i:08}").as_bytes(), u128::from(i) + 1, i + 1)?;
+        }
+        lsm.flush_and_compact_all()?;
+        let file = lsm.sstable_files[0].read().clone();
+        let file_len = file.metadata()?.len();
+        let keys: Vec<Vec<u8>> = [5u64, 900, 901, 2_999].iter().map(|i| format!("k:{i:08}").into_bytes()).collect();
+        let late = lsm.sstable_indexes[0].read().as_ref().map(|x| x.block_start(b"k:99999999")).unwrap_or(0);
+        for bad in [u64::MAX, 1, 3, file_len / 2 + 1, file_len, late] {
+            let candidates: Vec<(&[u8], u64)> = keys.iter().map(|k| (k.as_slice(), bad)).collect();
+            let mut seen = Vec::new();
+            let (_, rejected) = lsm.scan_sorted_candidates(&file, file_len, &candidates, |a| {
+                if keys.iter().any(|k| k.as_slice() == a.key.as_slice()) {
+                    seen.push(a.key.to_vec());
+                }
+            })?;
+            assert_eq!(seen, keys, "bogus hint {bad} lost a candidate");
+            // A hint at or below the cursor's start is never needed, so never checked.
+            assert_eq!(rejected, bad > SSTABLE_DATA_START, "bogus hint {bad}: rejection not reported as expected");
+        }
         Ok(())
     }
 

@@ -820,6 +820,72 @@ mod tests {
         }
     }
 
+    /// Random uuid keys must not scatter the field-index rows: the store takes
+    /// dense row IDs from the row map, so a two-value field over 2,000
+    /// documents fits in one container per value. Deriving the row ID from
+    /// the uuid gave every document a container of its own in every bitmap.
+    /// Queries still resolve the uuid keys, across a restart.
+    #[tokio::test]
+    async fn uuid_keyed_store_packs_its_index_rows_densely() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+        let mut active_ids = Vec::new();
+        {
+            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let mut schema = make_schema(
+                "events",
+                vec![IndexSpec {
+                    field: "active".to_owned(),
+                    index_type: IndexType::Bool,
+                }],
+            );
+            schema.key_type = KeyType::Uuid;
+            store.create(schema).await.unwrap();
+            for i in 0..2_000u128 {
+                // Spread over the whole u128 range, like v4 uuids.
+                let id = i.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
+                let active = i % 3 == 0;
+                if active {
+                    active_ids.push(id);
+                }
+                store.put("events", DocId::Uuid(id), serde_json::json!({"active": active})).await.unwrap();
+            }
+            store.checkpoint_index().await.unwrap();
+            let stats = store.field_index_blob_stats("events", "active").unwrap();
+            assert!(
+                // Dense: two array containers (2 bytes per row) and two
+                // directories, ~4 KB. One container per row would be over 80 KB.
+                stats.bitmap_live_bytes < 8_192,
+                "two values over 2,000 rows should be two small containers, got {} bytes live",
+                stats.bitmap_live_bytes
+            );
+        }
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let page = store
+            .query(
+                "events",
+                "active = true",
+                Pagination {
+                    page_no: 1,
+                    page_size: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+        let mut got: Vec<u128> = page
+            .results
+            .iter()
+            .map(|(id, _)| match id {
+                DocId::Uuid(u) => *u,
+                other => panic!("expected a uuid id, got {other:?}"),
+            })
+            .collect();
+        got.sort();
+        active_ids.sort();
+        assert_eq!(page.total, active_ids.len());
+        assert_eq!(got, active_ids);
+    }
+
     // ── KV lifecycle ────────────────────────────────────────────────────────
 
     #[tokio::test]

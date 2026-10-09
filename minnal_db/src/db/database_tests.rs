@@ -1082,10 +1082,105 @@ fn replay_cost_vs_window() {
     }
 }
 
+/// Every field index of a database charges one write-buffer budget, and a
+/// write that leaves it over the hard limit writes its field's buffer out
+/// before returning. Two fields, a 32 KiB hard limit and 6,000 documents: the
+/// total must stay within the limit plus one changed bitmap per field (the
+/// documented bound), and every query must stay correct.
+#[test]
+fn field_index_write_buffers_share_one_budget_and_stay_bounded() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let (soft, hard) = (16 * 1024u64, 32 * 1024u64);
+    let mut config = create_db_config();
+    config.threshold_config = config.threshold_config.with_index_overlay_bytes(soft, hard);
+    let db = Database::open(dir.path(), config).unwrap();
+    activate_named_index(&db, ns, "status");
+    activate_named_index(&db, ns, "tier");
+
+    let budget = db.index_overlay_budget.clone();
+    assert_eq!(budget.hard_limit(), hard, "the configured limit reaches the shared budget");
+    // One changed bitmap per field: here at most one full bitset container
+    // (8 KiB) plus overhead.
+    let slack = 2 * 12 * 1024;
+    let mut peak = 0;
+    for i in 0..6_000u32 {
+        let status = ["active", "inactive", "banned"][i as usize % 3];
+        let tier = ["gold", "silver"][i as usize % 2];
+        db.put(
+            format!("doc:{i:06}").as_bytes(),
+            format!(r#"{{"status":"{status}","tier":"{tier}"}}"#).as_bytes(),
+        )
+        .unwrap();
+        peak = peak.max(budget.used());
+    }
+    assert!(peak >= soft, "both fields must charge the shared budget (peaked at only {peak} bytes)");
+    assert!(peak <= hard + slack, "write buffers peaked at {peak} bytes, limit {hard} + slack {slack}");
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 2_000);
+    assert_eq!(db.query_keys(ns, "tier = \"gold\"").unwrap().keys.len(), 3_000);
+
+    db.run_index_checkpoint().unwrap();
+    assert_eq!(budget.used(), 0, "a checkpoint writes every buffer out");
+    db.shutdown().unwrap();
+}
+
+/// A field-index slot torn by a crash (half old, half new after a power loss)
+/// fails its checksum at open. The slot is dropped, the field records a
+/// full-rebuild gap so the loss is visible, and repair restores every row.
+#[test]
+fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let field_id = {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let field_id = activate_status_index(&db, ns);
+        for i in 0..100u32 {
+            let v = if i % 2 == 0 { "active" } else { "inactive" };
+            db.put(format!("doc:{i:03}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
+                .unwrap();
+        }
+        db.run_index_checkpoint().unwrap();
+        db.shutdown().unwrap();
+        field_id
+    };
+
+    // Tear the first checksummed live slot of the field's bitmap key table.
+    let keys = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns)
+        .join(field_id.to_string())
+        .join("blobs.keys");
+    let mut bytes = std::fs::read(&keys).unwrap();
+    let slot = (0..)
+        .map(|i| 64 + i * 48)
+        .take_while(|&b| b + 48 <= bytes.len())
+        .find(|&b| bytes[b] == 3)
+        .expect("a checksummed live slot");
+    bytes[slot + 30] ^= 0x5A;
+    std::fs::write(&keys, &bytes).unwrap();
+
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+        let s = std::str::from_utf8(bytes).ok()?;
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+    });
+    db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+        .unwrap();
+    let gap = db.index_manager.read_gap(ns, field_id).expect("the damage must be recorded");
+    assert_eq!(gap.cause, crate::db::index_manager::GapCause::DamagedIndexFile);
+    assert_eq!(gap.repair, crate::db::index_manager::RepairMode::FullRebuild);
+
+    db.repair_field_index(ns, field_id).unwrap();
+    assert!(db.index_manager.read_gap(ns, field_id).is_none(), "repair clears the gap");
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 50);
+    assert_eq!(db.query_keys(ns, "status = \"inactive\"").unwrap().keys.len(), 50);
+    db.shutdown().unwrap();
+}
+
 /// Replaying a **low-cardinality** field must not balloon its blob store.
 ///
-/// The bitmap store is append-only and rewrites a whole bitmap per key, so a
-/// value shared by N keys leaves N-1 stale copies. On the write path the
+/// The bitmap store is append-only: each spill appends the changed containers
+/// and a new directory, leaving the old copies as dead space, and a replay
+/// window larger than the write-buffer budget spills repeatedly. On the write path the
 /// backpressure valve bounds that; during `activate_field_index`'s replay the
 /// valve is a no-op, because it signals the checkpoint *worker* and the workers
 /// are not started until every field has been activated.

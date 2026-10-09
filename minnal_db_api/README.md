@@ -197,6 +197,8 @@ ttl_cleanup_interval_secs    = 3600
 
 [thresholds]
 value_log_waste_threshold = 30.0   # GC when >30 % of value-log is stale
+index_overlay_soft_bytes  = 33554432  # field-index write buffers, all fields together: checkpoint early past 32 MiB
+index_overlay_hard_bytes  = 67108864  # … and the writer writes its field's buffer out past 64 MiB
 
 [memtable]
 max_capacity = 100000          # skip-list capacity (entries)
@@ -1181,8 +1183,8 @@ value. There are two distinct kinds:
 #### Operational metrics — `GET /admin/storage/ops-metrics`
 
 All counters below are **in-memory and reset to zero on restart**. They are grouped
-in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`, plus a
-top-level `uptime_s`.
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
+`index_overlay`, plus a top-level `uptime_s`.
 
 | Field | Group | Meaning | Survives restart? |
 |-------|-------|---------|-------------------|
@@ -1217,6 +1219,12 @@ top-level `uptime_s`.
 | `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
 | `wal_gc_runs` | gc | WAL GC passes run | **No** |
 | `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+| `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
+| `peak_bytes` | index_overlay | Highest `used_bytes` since startup | **No** |
+| `soft_limit_bytes` / `hard_limit_bytes` | index_overlay | `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` | n/a (config) |
+| `soft_crossings` | index_overlay | Times `used_bytes` rose past the soft limit, each asking for an early index checkpoint | **No** |
+| `hard_spills` | index_overlay | Writes that found `used_bytes` over the hard limit and wrote their field's buffer out before returning (two fsyncs each). A steady rate means the hard limit is too small for the write rate | **No** |
+| `hard_spill_micros` | index_overlay | Total time those writes spent writing their buffers out | **No** |
 
 > **Startup-repopulation note.** Although these counters start at zero, they are
 > wired in *before* recovery, so the work the engine does on the way up bumps some
@@ -1242,6 +1250,9 @@ returning the same grouped shape as the engine endpoint:
 - `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
   lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
   `uptime_s`).
+
+Neither per-namespace view has `index_overlay`: the write-buffer budget is shared
+by every field of every namespace.
 
 #### Storage metrics — field reference
 
@@ -1430,7 +1441,7 @@ curl -X POST http://localhost:8080/admin/storage/compact
 
 #### `GET /admin/storage/index-waste`
 
-Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows with per-document churn; the **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
+Report the reclaimable dead space in each field index's two append-only stores, alongside the compaction `threshold` (a fraction). The **bitmap** store grows each time a field's buffered changes are written out: each changed bitmap container is appended, with a new directory for its bitmap, and the old copies become dead space. The **keymap** store grows under distinct-value churn. `over_threshold` is `true` when either store has reached the threshold and will be compacted at the next index checkpoint. Use this to decide whether to force a `POST /admin/storage/index-checkpoint`. Fields still building report `null` waste.
 
 This is the fleet-wide view of waste *ratios*; for the absolute on-disk byte *growth* of a single field (logical vs. live bytes) — which a ratio alone hides — use [`GET /admin/indices/{ns}/{field}/blob-stats`](#get-adminindicesnsfieldblob-stats).
 
@@ -1464,7 +1475,7 @@ curl http://localhost:8080/admin/storage/index-waste
 
 #### `POST /admin/storage/index-checkpoint`
 
-Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (every 1.75 s by default, `scheduled_tasks.index_checkpoint_interval_ms`) and clean shutdown: it flushes each namespace's dense row map and all active field indexes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
+Force an index checkpoint immediately. This runs the **same pass** as the periodic index-checkpoint worker (every 1.75 s by default, `scheduled_tasks.index_checkpoint_interval_ms`) and clean shutdown: it flushes each namespace's dense row map, writes every active field index's buffered changes to disk, and compacts any field-index bitmap store whose waste exceeds `thresholds.index_blob_waste_threshold`. Use it to reclaim field-index dead space on demand rather than waiting for the next tick.
 
 This is the **only** way to trigger field-index compaction on demand — `/admin/storage/compact` is LSM/value-log compaction, a separate subsystem.
 
@@ -1771,9 +1782,9 @@ Returns `404` when the namespace is unknown, `{field}` is not an indexed field o
 
 #### `GET /admin/indices/{ns}/{field}/blob-stats`
 
-On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (one blob per distinct value, re-appended whole on every document write) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
+On-disk blob growth for a **single** field index. Each field keeps two append-only stores — the **bitmap** store (each distinct value's bitmap stored as one blob per container plus a directory listing them; the changed containers and a new directory are appended each time the field's buffered changes are written out: at every index checkpoint, or sooner when the write buffers reach `thresholds.index_overlay_hard_bytes`) and the **keymap** store (slot → value) — and this reports, per store, the **logical** bytes (everything ever appended = live + stale) versus the **live** bytes (what survives compaction), their waste ratios, and the field's `distinct_values` count. `over_threshold` is `true` when either store has reached the compaction `waste_threshold`.
 
-Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of low-cardinality, high-churn fields (e.g. a boolean over many documents), whose bitmap blob can balloon to many times its live footprint. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
+Unlike [`GET /admin/storage/index-waste`](#get-adminstorageindex-waste), which reports only waste *ratios* across all fields, this surfaces the absolute blob *growth* between compactions that a ratio hides — the failure mode of a field whose bitmaps change on every spill (e.g. a boolean over many documents under steady writes), whose bitmap blob can grow to many times its live footprint between compactions. A large, high-waste `bitmap_logical_bytes` is the signal to force a [`POST /admin/storage/index-checkpoint`](#post-adminstorageindex-checkpoint). The same condition is logged as a checkpoint warning when a field's bitmap blob exceeds 64 MiB logical with ≥50% waste.
 
 ```bash
 curl http://localhost:8080/admin/indices/users/status/blob-stats

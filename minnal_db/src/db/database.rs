@@ -674,6 +674,10 @@ pub struct Database {
     // Shared index-checkpoint backpressure valve — stored so newly-opened
     // namespaces inherit it. `None` until the checkpoint worker is enabled.
     pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+    /// Memory budget shared by every field index's write buffer (its overlay
+    /// of changed containers). Set on each index when it is activated, before WAL
+    /// replay, so replay is bounded by it too.
+    pub(crate) index_overlay_budget: Arc<crate::index::IndexOverlayBudget>,
     /// Rejected field-index updates awaiting the next checkpoint, which turns
     /// them into durable gap records. Shared with every `KVStore`.
     pub(crate) rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
@@ -900,6 +904,11 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // One write-buffer budget for every field index of this database.
+        let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
+            config.threshold_config.index_overlay_soft_bytes,
+            config.threshold_config.index_overlay_hard_bytes,
+        ));
         let db = Self {
             db_path: db_path.to_path_buf(),
             config,
@@ -921,6 +930,7 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            index_overlay_budget,
             rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
             no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1812,6 +1822,28 @@ impl Database {
         // Open (or create) the file-backed mmap index in the field directory.
         let field_path = self.index_manager.field_path(namespace_id, field_id);
         let mut dyn_index = DynFieldIndex::open(value_type, &field_path).map_err(KVError::Io)?;
+        dyn_index.set_overlay_budget(self.index_overlay_budget.clone());
+        if dyn_index.damaged_at_open() > 0 {
+            error!(
+                "[activate_field_index] ns={namespace_id} field={field_id}: {} damaged entr(y/ies) in the field's index files \
+                 were dropped at open (torn by a crash). Rows they held are missing from this field index until it is \
+                 rebuilt; recording a full-rebuild gap.",
+                dyn_index.damaged_at_open()
+            );
+            let gap = crate::db::index_manager::GapRecord {
+                namespace_id,
+                field_id,
+                cause: crate::db::index_manager::GapCause::DamagedIndexFile,
+                from: 0,
+                to: 0,
+                missing_segments: Vec::new(),
+                detected_at_ms: crate::db::kv_store::current_epoch_millis(),
+                repair: crate::db::index_manager::RepairMode::FullRebuild,
+            };
+            if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
+                warn!("[activate_field_index] ns={namespace_id} field={field_id}: failed to record the damage gap: {e:?}");
+            }
+        }
 
         // Replay the WAL tail into dyn_index *before* registering the entry.
         // Recovering on the unshared dyn_index (not yet wrapped in Arc<RwLock<>>)
@@ -1906,24 +1938,20 @@ impl Database {
 
                     // Bound the blob growth this replay produces.
                     //
-                    // The bitmap store is append-only and `insert` rewrites a
-                    // whole bitmap per key, so replaying a **low-cardinality**
-                    // field is quadratic: a value shared by N keys leaves N-1
-                    // stale copies. The write path bounds exactly this with the
-                    // backpressure valve — but the valve signals the checkpoint
-                    // *worker*, and the workers are not started until after every
-                    // field has been activated. During replay the trigger is
-                    // `None` and the valve is a no-op.
+                    // Replay changes the index's in-memory write buffer, which is
+                    // written to the append-only bitmap store only when it spills
+                    // (the hard limit of the shared budget, set on `dyn_index`
+                    // above) and once at the end. Each spill can leave dead
+                    // copies behind, and the write path's backpressure valve is a
+                    // no-op here: it signals the checkpoint *worker*, which is not
+                    // started until every field has been activated.
                     //
-                    // Measured before this compaction existed: replaying one
+                    // When every insert appended a whole bitmap, replaying one
                     // 5-distinct-value field over 16k documents reached 2.6 GB on
-                    // disk and had not finished after ~1.5 hours. It also
-                    // compounded — an interrupted replay leaves a bigger blob and
-                    // does not advance the checkpoint, so the next start was
-                    // worse. The database became unopenable.
-                    //
-                    // So compact inline, on the same `dead_bytes` cap the write
-                    // path uses. We hold `dyn_index` exclusively here (it is not
+                    // disk and left the database unopenable. Buffering removes
+                    // that shape, but a replay window larger than the budget still
+                    // spills repeatedly, so keep the guard: compact inline, on the
+                    // same `dead_bytes` cap the write path uses. We hold `dyn_index` exclusively here (it is not
                     // yet published behind the `RwLock`), so this needs no locks
                     // and cannot race a writer.
                     let waste_threshold = (self.config.threshold_config.index_blob_waste_threshold / 100.0).clamp(0.0, 1.0);
@@ -1937,19 +1965,12 @@ impl Database {
                     };
                     let mut compactions = 0usize;
 
-                    // Group the replay by VALUE before writing anything.
-                    //
-                    // `insert` re-serialises the whole bitmap for a value, and
-                    // the blob store is append-only, so inserting key-by-key
-                    // leaves one dead copy of the entire bitmap per key. For a
-                    // low-cardinality field (few values, many rows) that is the
-                    // dominant cost of replay — measured at ~0.1 ms per key and
-                    // rising with the store's size, because the cost tracks the
-                    // bitmap, not the window.
-                    //
-                    // Replay is the one caller that can avoid it: it knows its
-                    // complete key set up front, so it can resolve every row
-                    // first and then write each value's bitmap exactly once.
+                    // Group the replay by VALUE before writing anything. Replay
+                    // knows its complete key set up front, so it resolves every
+                    // row first and then changes each value's bitmap once
+                    // (`insert_many`), and clears all affected rows in one pass.
+                    // The write buffer would coalesce per-key writes anyway; the
+                    // grouping still saves a bitmap lookup per key.
                     let mut rows_by_value: HashMap<crate::index::IndexValue, Vec<u128>> = HashMap::new();
                     let mut rows_to_clear: Vec<u128> = Vec::new();
 
@@ -1979,9 +2000,8 @@ impl Database {
                     // each row used to live in. This must precede the inserts:
                     // clearing afterwards would undo them.
                     //
-                    // Batched for the same reason the inserts are: the per-row
-                    // form loads every bucket and rewrites the changed one *per
-                    // row*, so clearing N rows appends N copies of the bitmap.
+                    // Batched: one probe of every bucket for the whole row set,
+                    // rather than one per row.
                     dyn_index.remove_all_for_rows(&rows_to_clear);
 
                     for (value, row_ids) in rows_by_value {
@@ -2827,6 +2847,11 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // One write-buffer budget for every field index of this database.
+        let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
+            config.threshold_config.index_overlay_soft_bytes,
+            config.threshold_config.index_overlay_hard_bytes,
+        ));
         let db = Self {
             db_path: db_path.to_path_buf(),
             config,
@@ -2848,6 +2873,7 @@ impl Database {
             value_log_gc_worker: Arc::new(tokio::sync::RwLock::new(None)),
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
+            index_overlay_budget,
             rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
             no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
@@ -2977,30 +3003,49 @@ impl IndexCheckpointTarget for Database {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
                     let field_path = self.index_manager.field_path(ns_id, field_id);
-                    // Flush under a read lock, then check waste cheaply. Only take
+                    // Write the field's buffered changes out, crash-ordered and
+                    // with no fsync under the write lock:
+                    //   1. stage  (write lock): append the changed blobs; no slot
+                    //      points at them yet, reads keep using the overlay;
+                    //   2. sync the value regions (read lock);
+                    //   3. commit (write lock): point the slots at the blobs;
+                    //   4. sync the key tables (read lock, below).
+                    // A slot must never reach disk before its blob, and the kernel
+                    // writes a shared map back in any order, hence the split.
+                    // Every write below `wal_tail` finished its index update
+                    // before `wal_tail` was taken (see above), so it is staged.
+                    let stage = entry.index.write().stage();
+                    if let Err(e) = entry.index.read().sync_values() {
+                        entry.index.write().abort(stage);
+                        return Err(KVError::Io(e));
+                    }
+                    entry.index.write().commit(stage);
+                    // Sync under a read lock, then check waste cheaply. Only take
                     // the write lock (which serialises with index writers) when the
                     // bitmap store OR the keymap store has crossed the compaction
                     // threshold (the keymap accumulates dead space under
                     // distinct-value churn).
                     let (over_threshold, stats) = {
                         let idx = entry.index.read();
-                        idx.flush(&field_path).map_err(KVError::Io)?;
+                        idx.sync_keys().map_err(KVError::Io)?;
                         let stats = idx.blob_stats();
                         let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
                         (over, stats)
                     };
-                    // Guardrail: low-cardinality fields suffer append-only write
-                    // amplification — a value rewritten per document leaves a stale
-                    // bitmap copy each time (see index/CLAUDE.md). The compaction
-                    // below reclaims it, but warn when a field's bitmap blob has
-                    // grown large with a small live footprint so operators can spot
+                    // Guardrail: every spill appends each changed container and a
+                    // new directory and leaves the old copies behind, so a field
+                    // that spills often (hard-limit spills between checkpoints)
+                    // piles up dead space (see index/CLAUDE.md). The compaction below
+                    // reclaims it, but warn when a field's bitmap blob has grown
+                    // large with a small live footprint so operators can spot
                     // runaway growth between checkpoints.
                     const LARGE_BITMAP_LOGICAL_BYTES: u64 = 64 * 1024 * 1024;
                     if stats.bitmap_logical_bytes >= LARGE_BITMAP_LOGICAL_BYTES && stats.bitmap_waste_ratio >= 0.5 {
                         warn!(
                             "[IndexCheckpoint] ns={ns_id} field={field_id}: bitmap blob logical={} MiB live={} MiB \
-                             waste={:.0}% across {} distinct value(s) — append-only write amplification (likely a \
-                             low-cardinality, high-churn field); compaction will reclaim it now, but review the field's update rate",
+                             waste={:.0}% across {} distinct value(s) — old bitmap copies left by spills (likely \
+                             large bitmaps spilling often at the overlay hard limit); compaction will reclaim it now, but review \
+                             the field's update rate and the index_overlay_*_bytes limits",
                             stats.bitmap_logical_bytes / (1024 * 1024),
                             stats.bitmap_live_bytes / (1024 * 1024),
                             stats.bitmap_waste_ratio * 100.0,

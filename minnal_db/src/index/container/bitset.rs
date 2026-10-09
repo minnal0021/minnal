@@ -26,6 +26,11 @@ pub struct BitsetContainer {
 }
 
 impl BitsetContainer {
+    /// Heap bytes this container owns: always the full 8 KB bit array.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<AlignedBits>()
+    }
+
     pub fn new() -> Self {
         Self {
             bits: Box::new(AlignedBits([0u64; BITSET_WORDS])),
