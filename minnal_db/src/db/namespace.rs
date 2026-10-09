@@ -112,6 +112,10 @@ pub struct QueryOutcome {
     /// Only fields the predicate actually touched are listed — an unrelated
     /// degraded field elsewhere in the namespace does not taint this query.
     pub degraded_fields: Vec<FieldId>,
+    /// Every field the predicate referenced, sorted and deduplicated. Lets a
+    /// caller check other conditions per field — the document store flags a
+    /// field whose index build is still running.
+    pub touched_fields: Vec<FieldId>,
 }
 
 impl QueryOutcome {

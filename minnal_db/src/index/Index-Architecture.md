@@ -129,7 +129,13 @@ The `key → id` table keys on the **full key bytes** — FNV-1a picks only the 
 start, after which keys are compared byte for byte — so two keys can never
 collide onto the same ID. Entries are **never removed**: a key that is deleted and
 later recreated reuses its original ID. That gives the table a useful invariant —
-no tombstones, and `count == next_id` at all times.
+no tombstones, and `count == next_id` at all times. It also means the map grows
+with every key ever written. IDs are freed only by resetting the whole map
+(`Database::reset_rowmap`), which is allowed only when no field index of the
+namespace exists — a freed ID handed to another key would otherwise match
+whatever an old bitmap still says about the deleted one. The document store's
+`reindex-all` resets the map between dropping and rebuilding its indexes, so
+the rebuilt indexes number the live documents only.
 
 When it comes time to assign an ID for a key, `KVStore::resolve_row_id_alloc`
 (`kv_store.rs`) consults two sources in order:
@@ -621,7 +627,9 @@ those slots held may predate the replay window, so the field is rebuilt).
 A field with a gap stays queryable, but its answers may be missing rows:
 
 - Queries that use the field list it in `degraded_fields`, so a caller can tell
-  "nothing matched" from "the index is incomplete".
+  "nothing matched" from "the index is incomplete". The document store also
+  lists a field whose index build is still running or failed: such an index
+  holds only the documents the build reached.
 - `GET /admin/indices/{ns}/health` lists every degraded field.
 - `POST /admin/indices/{ns}/attribute/{field}/repair` re-indexes the keys the gap
   names, or rebuilds the field when the keys could not be captured, then

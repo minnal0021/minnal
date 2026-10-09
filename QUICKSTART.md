@@ -151,8 +151,8 @@ curl -s -X POST http://localhost:8080/stores/jobs/query \
 ```
 
 `degraded_fields` lists any index the query used that is known to be missing
-updates (after a crash, say). When it is non-empty, the results may be
-incomplete; the [admin index endpoints](minnal_db_api/README.md#admin-indices-api)
+updates (after a crash, say) or is still being built. When it is non-empty, the
+results may be incomplete; the [admin index endpoints](minnal_db_api/README.md#admin-indices-api)
 report and repair it.
 
 > **Semantic search needs an external embedding service.** The schema above sets

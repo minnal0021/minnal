@@ -47,6 +47,7 @@ mod helpers;
 mod index_build;
 mod kv;
 mod query;
+mod reindex_all;
 #[cfg(test)]
 mod str_keys_tests;
 #[cfg(test)]

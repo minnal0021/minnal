@@ -290,7 +290,7 @@ impl DocStore {
         // Resolve degraded field ids to names for the caller — the engine speaks
         // in `FieldId`, but every doc-store surface above here speaks in field
         // names, and an operator reading a response needs the name.
-        let degraded_fields = self.degraded_field_names(ns_id, &outcome.degraded_fields);
+        let degraded_fields = self.degraded_field_names(ns_id, &outcome);
         let total = outcome.total;
 
         if total == 0 {
@@ -312,15 +312,27 @@ impl DocStore {
         Ok(Page::from_slice(results, pagination, total).with_degraded_fields(degraded_fields))
     }
 
-    /// Map degraded `FieldId`s back to their field names for this namespace.
+    /// The fields a query's results may be incomplete for, by name: those with
+    /// an outstanding gap record (from the engine), and those whose index build
+    /// is still running or failed — a building index holds only the documents
+    /// it has reached so far. Only fields the predicate touched are considered.
     ///
     /// An id with no matching registered field falls back to its numeric form
     /// rather than being dropped — losing a degradation signal because a name
     /// could not be resolved would be exactly the wrong failure mode.
-    fn degraded_field_names(&self, ns_id: u32, degraded: &[crate::db::namespace::FieldId]) -> Vec<String> {
+    fn degraded_field_names(&self, ns_id: u32, outcome: &crate::QueryOutcome) -> Vec<String> {
+        let mut degraded = outcome.degraded_fields.clone();
+        for &fid in &outcome.touched_fields {
+            let building = read_disk_progress(&build_progress_path(&self.db_path, ns_id, fid))
+                .is_some_and(|p| p.status == "in_progress" || p.status == "failed");
+            if building && !degraded.contains(&fid) {
+                degraded.push(fid);
+            }
+        }
         if degraded.is_empty() {
             return Vec::new();
         }
+        degraded.sort_unstable();
         let fields = self.db.list_index_fields(ns_id);
         degraded
             .iter()
@@ -345,7 +357,7 @@ impl DocStore {
             namespace: namespace.to_owned(),
         })?;
         let outcome = self.db.query_index(ns_id, predicate.to_owned()).await?;
-        let degraded = self.degraded_field_names(ns_id, &outcome.degraded_fields);
+        let degraded = self.degraded_field_names(ns_id, &outcome);
         Ok((outcome.keys, degraded))
     }
 }

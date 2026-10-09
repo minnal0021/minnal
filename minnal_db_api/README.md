@@ -766,10 +766,13 @@ Response — `{id, doc}` pairs plus the pagination envelope:
 }
 ```
 
-`degraded_fields` names any index this predicate used that is known to be
-missing updates, for example after a crash that outran the index's WAL
-retention. When it is non-empty the results may be incomplete: check
-[`GET /admin/indices/{ns}/health`](#get-adminindicesnshealth) and repair the field.
+`degraded_fields` names any index this predicate used whose results may be
+incomplete: one known to be missing updates (for example after a crash that
+outran the index's WAL retention — check
+[`GET /admin/indices/{ns}/health`](#get-adminindicesnshealth) and repair the
+field), or one still being built (after adding it, or during
+[`reindex-all`](#post-adminindicesnsattributereindex-all) — it fills in as the
+build progresses; see `GET /admin/indices/{ns}/progress`).
 
 ---
 
@@ -1514,6 +1517,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
 | `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
+| `GET` | `/admin/indices/{ns}/rowmap` | `200` | Row IDs held by deleted documents (what `reindex-all` would free) |
 | `POST` | `/admin/indices/{ns}/attribute/{field}/reindex/{doc_id}` | `200` | Reindex one document in one field index (doc stores) |
 | `GET` | `/admin/indices/{ns}/{field}/blob-stats` | `200` | One field index's on-disk blob growth/waste (`404` if not active) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-all` | `202` | Re-enqueue all docs for embedding |
@@ -1741,6 +1745,8 @@ curl "http://localhost:8080/admin/indices/vector/queue/retried?page_no=1&page_si
 
 Drop every field index for `{ns}` and rebuild them all from scratch. Returns `202 Accepted`; progress is visible via `GET /admin/indices/{ns}/progress`.
 
+Between dropping and rebuilding, no index refers to any document, so the store's row map — the dense numbering of documents the indexes use — is reset: the rebuilt indexes number only the documents that exist now, and the IDs of deleted documents are freed (see [`GET /admin/indices/{ns}/rowmap`](#get-adminindicesnsrowmap)). The run is crash-safe: it records the indexes it is rebuilding before dropping any, and a run interrupted by a crash is finished when the server next starts. While the indexes rebuild, queries that use them list them in `degraded_fields`.
+
 ```bash
 curl -X POST http://localhost:8080/admin/indices/users/attribute/reindex-all
 # → 202 Accepted
@@ -1750,9 +1756,23 @@ Returns `409` when an attribute operation is already active for `{ns}`. Returns 
 
 ---
 
+#### `GET /admin/indices/{ns}/rowmap`
+
+How much of the store's row map is spent on deleted documents. Every document a field index has seen gets a dense row ID, and the row map never frees one on its own, so after many deletes it holds the IDs of documents that no longer exist. [`reindex-all`](#post-adminindicesnsattributereindex-all) frees them.
+
+```bash
+curl http://localhost:8080/admin/indices/users/rowmap
+# → {"namespace":"users","uses_row_map":true,"ids_allocated":100000,
+#    "live_docs":10000,"dead_ids":90000,"bytes_on_disk":10485800}
+```
+
+`uses_row_map` is `false` (with no counts) for a store keyed by `u64` — those take their row IDs from the key — and for a store whose indexes were never built. Counting `live_docs` lists every key, so this is an occasional admin check, not something to poll. Returns `404` for an unknown document store.
+
+---
+
 #### `DELETE /admin/indices/{ns}/attribute/drop-all`
 
-Drop every field index for `{ns}` without rebuilding. Returns `202 Accepted`.
+Drop every field index for `{ns}` without rebuilding, and reset the store's row map (no index is left to refer to it). Returns `202 Accepted`.
 
 ```bash
 curl -X DELETE http://localhost:8080/admin/indices/users/attribute/drop-all

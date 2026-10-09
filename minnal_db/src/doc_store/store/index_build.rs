@@ -81,6 +81,14 @@ impl DocStore {
     /// Returns [`DocStoreError::IndexAlreadyExists`] if the field is already
     /// indexed.
     pub async fn add_index(&self, namespace: &str, spec: IndexSpec) -> Result<IndexBuildHandle, DocStoreError> {
+        self.add_index_inner(namespace, spec, false).await
+    }
+
+    /// [`add_index`](Self::add_index). `resuming` skips the "a build is already
+    /// in progress" guard: a re-add that finishes an interrupted run (an
+    /// interrupted `reindex-all`) finds its own `in_progress` record from before
+    /// the crash, and must take it over rather than refuse.
+    pub(super) async fn add_index_inner(&self, namespace: &str, spec: IndexSpec, resuming: bool) -> Result<IndexBuildHandle, DocStoreError> {
         let mut schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
@@ -111,7 +119,7 @@ impl DocStore {
         // still running (e.g. after a drop_index + immediate re-add).
         // We detect this via the on-disk progress file rather than in-process
         // state so the check also works when called directly (not via the API).
-        {
+        if !resuming {
             let ivt = to_ivt(spec.index_type);
             if let Ok(fid) = self.db.register_index_field(ns_id, &spec.field, ivt) {
                 let progress_path = build_progress_path(&self.db_path, ns_id, fid);
@@ -133,6 +141,26 @@ impl DocStore {
         let extractor = json_extractor(spec.field.clone(), spec.index_type);
         self.db.activate_field_index(ns_id, field_id, ivt, extractor).await?;
 
+        // Record the build as in progress BEFORE the schema lists the index.
+        // The build task writes its own first record only after counting every
+        // document, so without this a crash in between left an index the
+        // schema lists, half built, with no record for `resume_pending_builds`
+        // to find: it was never resumed and silently stayed incomplete. A
+        // record already there (an interrupted build being taken over) is kept,
+        // so its resume point survives.
+        let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
+        if read_disk_progress(&progress_path).is_none_or(|p| p.status != "in_progress") {
+            let initial = DiskBuildProgress {
+                status: "in_progress".to_owned(),
+                total: 0,
+                indexed: 0,
+                last_key_hex: None,
+                error: None,
+            };
+            let bytes = serde_json::to_vec(&initial).map_err(|e| DocStoreError::Io(std::io::Error::other(e)))?;
+            crate::support::write_atomic_durable(&progress_path, &bytes)?;
+        }
+
         // Persist updated schema — if the field was previously declared as a
         // non-indexed attribute, move it to indices (remove from attributes).
         schema.attributes.retain(|a| a.name != spec.field);
@@ -141,7 +169,6 @@ impl DocStore {
 
         // ── Background rebuild ────────────────────────────────────────────
         // Check for a previously interrupted build and resume from where it left off.
-        let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
         let resume_after: Option<Vec<u8>> = read_disk_progress(&progress_path)
             .filter(|p| p.status == "in_progress")
             .and_then(|p| p.last_key_hex)
@@ -199,7 +226,10 @@ impl DocStore {
     /// [`open_with_config`]: DocStore::open_with_config
     /// [`add_index`]: DocStore::add_index
     pub async fn resume_pending_builds(&self) -> Result<Vec<IndexBuildHandle>, DocStoreError> {
-        let mut handles = Vec::new();
+        // Finish any `reindex-all` a crash interrupted first: it re-adds indexes
+        // and starts their builds, which the loop below must not start again.
+        let mut handles = self.resume_interrupted_reindex_all().await?;
+        let started: std::collections::HashSet<(String, String)> = handles.iter().map(|h| (h.namespace.clone(), h.field.clone())).collect();
 
         for schema in self.load_all_schemas()? {
             let ns_id = match schema.ns_id {
@@ -208,6 +238,9 @@ impl DocStore {
             };
 
             for spec in &schema.indices {
+                if started.contains(&(schema.namespace.clone(), spec.field.clone())) {
+                    continue;
+                }
                 let ivt = to_ivt(spec.index_type);
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
                 let progress_path = build_progress_path(&self.db_path, ns_id, field_id);

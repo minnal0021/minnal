@@ -31,7 +31,13 @@
 //! WAL replay, so a crash mid-flush never yields an inconsistent map.
 //!
 //! Entries are **never removed** (a deleted-then-recreated key reuses its ID), so
-//! the table has no tombstones and `count == next_id` always.
+//! the table has no tombstones and `count == next_id` always. A field bitmap may
+//! still hold the ID of a deleted key (a delete not yet on disk at a crash, a
+//! gap not yet repaired), so handing a freed ID to another key would make it
+//! match the old key's values. The only way IDs are freed is
+//! [`reset`](RowMap::reset), and only when no field index of the namespace
+//! exists (`Database::reset_rowmap`; the document store's `reindex-all` and
+//! `drop-all` do it).
 //!
 //! ### The slot table is write-only (do not "optimise" the rebuild away)
 //!
@@ -202,6 +208,31 @@ impl RowMap {
             next_id: 0,
             keybytes_pos: 0,
         })
+    }
+
+    /// Discard the row map in `dir` and start a fresh, empty one: every ID is
+    /// freed and the files shrink back to their initial size.
+    ///
+    /// **Only safe when nothing references a row ID** — no field index of the
+    /// namespace is active or has files on disk. The caller
+    /// (`Database::reset_rowmap`) checks that; this function does not.
+    ///
+    /// Crash-safe on its own: removing the checkpoint marker (made durable by a
+    /// directory fsync) is the commit point. [`open`](Self::open) treats a
+    /// missing marker as a fresh map and `create` truncates every data file, so
+    /// a crash before the removal leaves the old map and after it an empty one.
+    /// Any `RowMap` still mapping these files must be dropped first: the
+    /// truncation would leave its mappings past the end of the files.
+    pub fn reset(dir: &Path) -> io::Result<Self> {
+        if dir.exists() {
+            match std::fs::remove_file(dir.join(MARKER_FILE)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            crate::support::fsync_dir(dir)?;
+        }
+        Self::create(dir)
     }
 
     /// Open an existing row map, or create a fresh one if no marker exists.
@@ -555,6 +586,42 @@ fn write_marker(dir: &Path, next_id: u64, keybytes_pos: u64, wal_offset: u64) ->
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The marker removal is the reset's commit point: a crash right after it,
+    /// before the files are recreated, must open as an empty, usable map — never
+    /// as the old IDs.
+    #[test]
+    fn reset_frees_every_id_and_a_crash_after_the_marker_removal_opens_empty() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut rm = RowMap::create(dir.path()).unwrap();
+            for i in 0..1_000u32 {
+                rm.get_or_alloc(format!("key{i}").as_bytes());
+            }
+            rm.flush(0).unwrap();
+        }
+        let mut rm = RowMap::reset(dir.path()).unwrap();
+        assert_eq!(rm.next_id(), 0);
+        assert_eq!(rm.get_or_alloc(b"key999"), 0, "IDs restart at 0");
+        rm.flush(0).unwrap();
+        drop(rm);
+        assert_eq!(RowMap::open(dir.path()).unwrap().next_id(), 1);
+
+        // Crash between the marker removal and the recreation: stale data files,
+        // no marker.
+        {
+            let mut rm = RowMap::open(dir.path()).unwrap();
+            for i in 0..500u32 {
+                rm.get_or_alloc(format!("other{i}").as_bytes());
+            }
+            rm.flush(0).unwrap();
+        }
+        std::fs::remove_file(dir.path().join(MARKER_FILE)).unwrap();
+        let mut rm = RowMap::open(dir.path()).unwrap();
+        assert_eq!(rm.next_id(), 0, "no marker opens as an empty map");
+        assert_eq!(rm.get(b"other7"), None);
+        assert_eq!(rm.get_or_alloc(b"fresh"), 0);
+    }
 
     #[test]
     fn alloc_is_dense_and_stable() {

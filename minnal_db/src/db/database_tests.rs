@@ -2951,3 +2951,55 @@ fn index_checkpoint_stops_below_an_in_flight_write() {
     assert_eq!(db.index_manager.read_checkpoint_state(ns, field_id, tail), CheckpointState::At(tail));
     db.shutdown().unwrap();
 }
+
+/// FR-006: once every field index of a namespace is dropped, its row map can be
+/// reset, freeing every row ID; the rebuilt index then packs the live keys into
+/// IDs 0..live. While any field still exists the reset is refused.
+#[test]
+fn reset_rowmap_frees_every_row_id_once_no_field_exists() {
+    let dir = TempDir::new().unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let rowmap_dir = |db: &Database| db.index_manager.rowmap_path(ns);
+    let rowmap_bytes = |d: &std::path::Path| -> u64 { std::fs::read_dir(d).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum() };
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let field = activate_named_index(&db, ns, "status");
+        for i in 0..5_000u32 {
+            db.put(format!("doc:{i:06}").as_bytes(), br#"{"status":"active"}"#).unwrap();
+        }
+        for i in 0..5_000u32 {
+            if i % 10 != 0 {
+                db.delete(format!("doc:{i:06}").as_bytes()).unwrap();
+            }
+        }
+        db.run_index_checkpoint().unwrap();
+        assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(5_000));
+        let before = rowmap_bytes(&rowmap_dir(&db));
+
+        let err = db.reset_rowmap(ns).unwrap_err().to_string();
+        assert!(err.contains("status"), "refused while the field exists: {err}");
+        assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(5_000), "a refused reset changes nothing");
+
+        db.drop_field_index(ns, field).unwrap();
+        assert!(db.reset_rowmap(ns).unwrap());
+        assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(0));
+        assert!(rowmap_bytes(&rowmap_dir(&db)) < before, "the files shrink");
+
+        // Rebuild: re-register and re-index the 500 live documents.
+        activate_named_index(&db, ns, "status");
+        for i in (0..5_000u32).step_by(10) {
+            db.put(format!("doc:{i:06}").as_bytes(), br#"{"status":"active"}"#).unwrap();
+        }
+        assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(500));
+        let mut keys = db.query_keys(ns, "status = \"active\"").unwrap().keys;
+        keys.sort();
+        let want: Vec<Vec<u8>> = (0..5_000u32).step_by(10).map(|i| format!("doc:{i:06}").into_bytes()).collect();
+        assert_eq!(keys, want);
+        db.shutdown().unwrap();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    activate_named_index(&db, ns, "status");
+    assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(500), "the compacted map survives a restart");
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 500);
+    db.shutdown().unwrap();
+}

@@ -144,8 +144,11 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
 
 /// `POST /admin/indices/{ns}/attribute/reindex-all`
 ///
-/// Drops every field index for `{ns}` and rebuilds them all from scratch.
-/// Returns `202 Accepted`; progress is visible via `GET /admin/indices/{ns}/progress`.
+/// Drops every field index for `{ns}`, frees its row IDs (the row map is reset,
+/// so the rebuilt indexes number only the live documents), and rebuilds every
+/// index from scratch. Crash-safe: a run interrupted by a crash is finished at
+/// the next start. Returns `202 Accepted`; progress is visible via
+/// `GET /admin/indices/{ns}/progress`.
 /// Returns `409 Conflict` when any attribute or vector index operation is already active
 /// for this namespace.
 pub async fn attribute_reindex_all(
@@ -192,9 +195,8 @@ pub async fn attribute_reindex_all(
 
     tokio::spawn(async move {
         let result: Result<(), DocStoreError> = async {
-            let specs = store.drop_all_attribute_indices(&ns)?;
-            for spec in specs {
-                let handle = store.add_index(&ns, spec).await?;
+            // Crash-safe: an interrupted run is finished at the next start.
+            for handle in store.reindex_all_attribute_indices(&ns).await? {
                 index_manager.insert_field_build(handle);
             }
             Ok(())
@@ -1007,6 +1009,39 @@ pub async fn index_health(
         "degraded_fields": degraded,
         "fields": health,
     })))
+}
+
+/// `GET /admin/indices/{ns}/rowmap`
+///
+/// How much of the store's row map is spent on deleted documents. The row map
+/// gives every document a dense row ID for the field indexes and never frees
+/// one; `dead_ids` counts the IDs of documents that no longer exist, which
+/// [`reindex-all`](attribute_reindex_all) frees. Counts live documents with a
+/// key scan, so it is not free on a large store.
+///
+/// `uses_row_map: false` (and no counts) for a store without one: `u64` keys
+/// take their row IDs from the key, and a store whose indexes were never built
+/// has none yet. `404` for an unknown document store.
+pub async fn rowmap_stats(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+    let stats = state.store.rowmap_stats(&ns).await.map_err(|e| match e {
+        DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+    Ok(Json(match stats {
+        Some(s) => serde_json::json!({
+            "namespace": ns,
+            "uses_row_map": true,
+            "ids_allocated": s.ids_allocated,
+            "live_docs": s.live_docs,
+            "dead_ids": s.dead_ids,
+            "bytes_on_disk": s.bytes_on_disk,
+        }),
+        None => serde_json::json!({ "namespace": ns, "uses_row_map": false }),
+    }))
 }
 
 /// `POST /admin/indices/{ns}/attribute/{field}/repair`
