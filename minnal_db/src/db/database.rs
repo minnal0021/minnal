@@ -2091,6 +2091,53 @@ impl Database {
         self.index_manager.remove_field_path(namespace_id, field_id)
     }
 
+    /// Free every row ID of a namespace: replace its dense row map with an
+    /// empty one, so the next field build allocates fresh dense IDs for the
+    /// live keys only. Returns `false` (and does nothing) for a namespace whose
+    /// row IDs come from a key-derived `RowIdFn`.
+    ///
+    /// Row IDs are referenced only by field-index bitmaps (gap records and build
+    /// progress store keys), so this is safe exactly when no field index of the
+    /// namespace exists: every registered field must be dropped (its `dropped`
+    /// flag persisted and its directory removed by
+    /// [`drop_field_index`](Self::drop_field_index)) and none active. Writers
+    /// resolve a row ID only while the namespace has an active field, so none
+    /// can race this. Refuses with an error otherwise.
+    ///
+    /// Holds `index_activate_lock` for the whole reset, so no field can be
+    /// activated (and allocate an ID) in the middle of it. The reset itself is
+    /// crash-safe (`RowMap::reset`).
+    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+        let store = self.get_store(namespace_id)?;
+        if store.row_id_fn.read().is_some() {
+            return Ok(false);
+        }
+        let _activate = self.index_activate_lock.lock();
+        let live_fields: Vec<String> = self
+            .registry
+            .read()
+            .schema(namespace_id)
+            .map(|s| s.list_fields().into_iter().filter(|f| !f.dropped).map(|f| f.field_name).collect())
+            .unwrap_or_default();
+        let ns_index = store.namespace_index.read();
+        if !ns_index.is_empty() || !live_fields.is_empty() {
+            return Err(KVError::Serialization(format!(
+                "cannot reset the row map of namespace {namespace_id}: field indices still exist ({}); drop them first",
+                live_fields.join(", ")
+            )));
+        }
+        store.reset_rowmap(&self.index_manager.rowmap_path(namespace_id))?;
+        info!("[INDEX] reset the row map of namespace {namespace_id}: every row ID freed");
+        Ok(true)
+    }
+
+    /// Row IDs a namespace's dense row map has allocated (every key ever
+    /// indexed, live or not), or `None` when it uses a key-derived `RowIdFn`
+    /// or has no row map loaded (no field index was ever activated).
+    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+        Ok(self.get_store(namespace_id)?.rowmap_ids_allocated())
+    }
+
     /// Finish deleting the directories of field indices whose drop was
     /// interrupted by a crash, and reclaim any that were dropped before this
     /// cleanup existed.

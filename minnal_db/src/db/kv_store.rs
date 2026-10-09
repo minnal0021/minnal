@@ -337,6 +337,26 @@ impl KVStore {
         Ok(())
     }
 
+    /// Replace this namespace's row map with a fresh, empty one in `dir`
+    /// (`RowMap::reset`). The caller guarantees no field index references a
+    /// row ID (see `Database::reset_rowmap`). The old map is dropped before its
+    /// files are truncated, so no live mapping outlives them.
+    pub(crate) fn reset_rowmap(&self, dir: &Path) -> Result<()> {
+        let mut guard = self.rowmap.write();
+        *guard = None;
+        *guard = Some(crate::index::RowMap::reset(dir).map_err(KVError::Io)?);
+        Ok(())
+    }
+
+    /// Number of row IDs the dense row map has allocated, or `None` when the
+    /// namespace has no loaded row map (or uses a key-derived `RowIdFn`).
+    pub(crate) fn rowmap_ids_allocated(&self) -> Option<u64> {
+        if self.row_id_fn.read().is_some() {
+            return None;
+        }
+        self.rowmap.read().as_ref().map(|rm| rm.next_id())
+    }
+
     /// Resolve the row ID for `key`, **allocating** a new dense ID if the key is
     /// unseen. Used on the put and WAL-replay paths.
     ///

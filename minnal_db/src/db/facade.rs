@@ -663,6 +663,23 @@ impl Db {
         self.inner.drop_field_index(namespace_id, field_id)
     }
 
+    /// Free every row ID of a namespace by replacing its dense row map with an
+    /// empty one; the next field builds allocate fresh dense IDs for the live
+    /// keys only. Every field index of the namespace must already be dropped
+    /// ([`drop_field_index`](Self::drop_field_index)) — otherwise this returns
+    /// an error and changes nothing. Returns `false` for a namespace whose row
+    /// IDs come from a key-derived `RowIdFn` (nothing to reset).
+    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+        self.inner.reset_rowmap(namespace_id)
+    }
+
+    /// Row IDs a namespace's dense row map has allocated — every key ever
+    /// indexed, live or deleted — or `None` when the namespace uses a
+    /// key-derived `RowIdFn` or no field index was ever activated.
+    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+        self.inner.rowmap_ids_allocated(namespace_id)
+    }
+
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
@@ -1748,6 +1765,17 @@ impl AsyncDb {
     /// removal, not a scan.
     pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         self.inner.inner.drop_field_index(namespace_id, field_id)
+    }
+
+    /// See [`Db::reset_rowmap`]. Synchronous — a marker removal, a directory
+    /// fsync and three small file truncations.
+    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+        self.inner.inner.reset_rowmap(namespace_id)
+    }
+
+    /// See [`Db::rowmap_ids_allocated`].
+    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+        self.inner.inner.rowmap_ids_allocated(namespace_id)
     }
 
     /// Register a custom row-ID function (and optionally its inverse) for a namespace.
