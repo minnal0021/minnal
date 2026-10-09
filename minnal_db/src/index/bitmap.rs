@@ -1306,7 +1306,11 @@ mod differential_tests {
             let mut x = a.clone();
             x.and_not_inplace(&b);
             same(&x, &sa.difference(&sb).copied().collect(), &format!("{c} and_not_inplace"));
-            let rt = crate::index::storage::deserialize(&crate::index::storage::serialize(&a).unwrap()).unwrap();
+            let mut rt = RoaringBitmap::new();
+            for (k, cont) in a.store.sorted_entries() {
+                let bytes = crate::index::storage::encode_container(&cont).unwrap();
+                rt.store.upsert(k, &crate::index::storage::decode_container(&bytes).unwrap());
+            }
             same(&rt, &sa, &format!("{c} serde"));
             let v: Vec<u128> = sa.iter().copied().collect();
             for _ in 0..50 {

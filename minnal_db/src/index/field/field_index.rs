@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::index::RoaringBitmap;
-use crate::index::blob_store::BlobStore;
+use crate::index::bitmap::decompose;
+use crate::index::blob_store::{BlobLayout, BlobStore};
+use crate::index::container::Container;
 use crate::index::overlay_budget::IndexOverlayBudget;
-use crate::index::storage;
+use crate::index::storage::{self, DirEntry};
 
 use super::predicate::Predicate;
 
@@ -16,9 +18,11 @@ use super::predicate::Predicate;
 /// - `ordering`: an in-memory `BTreeMap<V, u128>` mapping each distinct field
 ///   value to a stable slot ID. This is small (keys only, no bitmap data) and
 ///   provides the sorted iteration needed for range predicates.
-/// - `bitmaps`: a `BlobStore` mapping slot IDs to serialised [`RoaringBitmap`]
-///   data. This can be backed by anonymous mmaps (for transient / test use) or
-///   by persistent files under the field's on-disk directory.
+/// - `bitmaps`: a `BlobStore` in the directory layout. Each slot points at a
+///   directory listing that value's [`RoaringBitmap`] containers, each stored
+///   as its own blob (see `index::storage`). This can be backed by anonymous
+///   mmaps (for transient / test use) or by persistent files under the field's
+///   on-disk directory.
 ///
 /// Because the bitmap data lives in the `BlobStore` (off-heap for file-backed
 /// stores), there is no inherent cardinality cap from a memory-pressure
@@ -26,12 +30,15 @@ use super::predicate::Predicate;
 ///
 /// # Changes are buffered in memory until the next spill
 ///
-/// A write never touches the blob store. The bitmaps a write changes are kept
-/// in an in-memory **overlay** (`slot → bitmap`), read in preference to the
-/// store, and written out once by [`spill`](Self::spill) — at the index
-/// checkpoint, or sooner when the shared [`IndexOverlayBudget`] runs out. The
-/// blob store is append-only, so this turns "one copy of the whole bitmap per
-/// write" into "one copy per changed bitmap per spill".
+/// A write never touches the blob store. The **containers** a write changes
+/// (a container holds the row ids sharing their upper 112 bits, at most 8 KB)
+/// are kept in an in-memory **overlay** (`slot → container key → container`),
+/// read in preference to the store, and written out once by
+/// [`spill`](Self::spill) — at the index checkpoint, or sooner when the shared
+/// [`IndexOverlayBudget`] runs out. A spill appends each changed container and
+/// a new directory for its slot; containers that did not change are not
+/// rewritten. So the cost of a spill follows what changed, not the size of the
+/// bitmaps.
 ///
 /// A slot whose bitmap empties stays reserved until the spill: its value goes
 /// from `ordering` to `emptied`, and the store blob (and the owner's keymap
@@ -59,17 +66,17 @@ pub struct FieldIndex<V: Ord + Clone> {
     ordering: BTreeMap<V, u128>,
     bitmaps: BlobStore,
     next_slot: u128,
-    /// Latches `true` the first time a bitmap blob fails to **deserialise** on
-    /// read or **serialise** on write. The query/mutation methods stay infallible
-    /// (a failed read serves an empty bitmap, a failed write leaves the prior
-    /// blob untouched), but this flag makes the corruption observable so the
-    /// owner can distinguish "no rows matched" from "index data failed to load"
-    /// and rebuild the field from the WAL. Never auto-cleared; reset only by
-    /// rebuilding the index. See [`corruption_detected`](Self::corruption_detected).
+    /// Latches `true` the first time a stored directory or container fails to
+    /// **decode** on read or a container fails to **encode** on write. The
+    /// query/mutation methods stay infallible (a failed read serves an empty
+    /// container, a failed write leaves the prior blob untouched), but this
+    /// flag makes the corruption observable so the owner can distinguish "no
+    /// rows matched" from "index data failed to load" and rebuild the field
+    /// from the WAL. Never auto-cleared; reset only by rebuilding the index.
+    /// See [`corruption_detected`](Self::corruption_detected).
     corrupted: AtomicBool,
-    /// Bitmaps changed since the last spill, by slot. An empty bitmap is a slot
-    /// that emptied; the spill removes its blob.
-    overlay: HashMap<u128, RoaringBitmap>,
+    /// Containers changed since the last spill, by slot.
+    overlay: HashMap<u128, SlotChanges>,
     /// Values whose bitmap emptied since the last spill, with the slot they
     /// keep until then (see the type docs).
     emptied: BTreeMap<V, u128>,
@@ -83,12 +90,45 @@ pub struct FieldIndex<V: Ord + Clone> {
     budget: Arc<IndexOverlayBudget>,
 }
 
-/// Fixed cost charged per overlay entry beyond the bitmap's own heap bytes.
-const OVERLAY_ENTRY_OVERHEAD: u64 = 64;
+/// One slot's changes since the last spill.
+#[derive(Debug, Default)]
+struct SlotChanges {
+    /// The slot's stored directory, decoded on first touch so later writes to
+    /// the slot need not decode it again. `None` until loaded, and reset when
+    /// the stored directory changes under it (a commit or a compaction).
+    base: Option<Vec<DirEntry>>,
+    /// Changed containers: the new contents, or `None` for a container that
+    /// emptied (the spill drops it from the directory).
+    containers: BTreeMap<u128, Option<Container>>,
+    /// Whether the slot's whole bitmap is now empty (the spill removes it).
+    empty: bool,
+    /// Bytes this entry has charged to the budget.
+    bytes: u64,
+}
+
+/// Fixed cost charged per overlay slot beyond its containers.
+const OVERLAY_SLOT_OVERHEAD: u64 = 64;
+/// Fixed cost charged per overlay container beyond its own heap bytes.
+const OVERLAY_CONTAINER_OVERHEAD: u64 = (std::mem::size_of::<(u128, Option<Container>)>() + 16) as u64;
+
+/// Heap bytes charged for a cached directory.
+fn base_bytes(base: &[DirEntry]) -> u64 {
+    std::mem::size_of_val(base) as u64
+}
+
+/// Group row ids by container key: `high → [low]`.
+fn group_rows(row_ids: &[u128]) -> BTreeMap<u128, Vec<u16>> {
+    let mut groups: BTreeMap<u128, Vec<u16>> = BTreeMap::new();
+    for &row in row_ids {
+        let (high, low) = decompose(row);
+        groups.entry(high).or_default().push(low);
+    }
+    groups
+}
 
 /// What [`FieldIndex::stage`] appended and [`FieldIndex::commit`] applies:
-/// `(slot, overlay version, offset, len)` for changed bitmaps, and
-/// `(slot, overlay version)` for emptied ones.
+/// `(slot, overlay version, directory offset, directory len)` for changed
+/// bitmaps, and `(slot, overlay version)` for emptied ones.
 #[derive(Debug, Default)]
 pub struct SpillStage {
     sets: Vec<(u128, u64, u64, u32)>,
@@ -98,11 +138,11 @@ pub struct SpillStage {
 impl<V: Ord + Clone> FieldIndex<V> {
     /// Create an empty index backed by an anonymous (transient) mmap.
     pub fn new() -> Self {
-        Self::from_parts(BTreeMap::new(), BlobStore::new_anon(), 0)
+        Self::from_parts(BTreeMap::new(), BlobStore::new_anon_with(BlobLayout::Directory), 0)
     }
 
     /// Reconstruct an index from a pre-loaded ordering map and an already-open
-    /// [`BlobStore`].
+    /// [`BlobStore`] in the directory layout.
     ///
     /// Called by [`DynFieldIndex`] after rebuilding the ordering from the
     /// keymap mmap store.
@@ -140,7 +180,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.overlay_bytes
     }
 
-    /// Write every bitmap in the overlay to the blob store and empty it:
+    /// Write every change in the overlay to the blob store and empty it:
     /// [`stage`](Self::stage), sync the values, [`commit`](Self::commit).
     /// Returns the slots that were freed (the owner removes their keymap
     /// entries). Syncs the value region; the key table is synced by
@@ -153,8 +193,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.commit(stage)
     }
 
-    /// Phase 1 of a spill: append every changed bitmap to the value region,
-    /// pointing no slot at it yet. The overlay keeps serving reads.
+    /// Phase 1 of a spill: for each changed slot, append its changed
+    /// containers and a new directory to the value region, pointing no slot at
+    /// them yet. The overlay keeps serving reads.
     ///
     /// Slots must not point at a blob before the blob is on disk, and the
     /// kernel writes a shared memory map back in any order, so the slots are
@@ -162,36 +203,58 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// the values ([`sync_values`](Self::sync_values)).
     pub fn stage(&mut self) -> SpillStage {
         let mut stage = SpillStage::default();
-        for (&slot_id, bm) in &self.overlay {
+        let slots: Vec<u128> = self.overlay.keys().copied().collect();
+        'slots: for slot_id in slots {
             let ver = self.overlay_ver[&slot_id];
-            if bm.is_empty() {
+            if self.overlay[&slot_id].empty {
                 stage.removals.push((slot_id, ver));
                 continue;
             }
-            match storage::serialize(bm) {
-                Ok(bytes) => {
-                    let (offset, len) = self.bitmaps.append_value(&bytes);
-                    stage.sets.push((slot_id, ver, offset, len));
-                }
-                Err(e) => {
-                    // Same policy as `store_bitmap`: keep the stored copy, flag it.
-                    self.corrupted.store(true, Ordering::Relaxed);
-                    log::error!("FieldIndex::stage: bitmap failed to serialize; keeping the stored copy (slot={slot_id}, error={e})");
+            let base = match &self.overlay[&slot_id].base {
+                Some(b) => b.clone(),
+                None => self.stored_dir(slot_id),
+            };
+            let mut entries: BTreeMap<u128, DirEntry> = base.into_iter().map(|e| (e.key, e)).collect();
+            let mut blobs = Vec::new();
+            for (&key, c) in &self.overlay[&slot_id].containers {
+                match c {
+                    None => {
+                        entries.remove(&key);
+                    }
+                    Some(c) => match storage::encode_container(c) {
+                        Ok(bytes) => blobs.push((key, bytes)),
+                        Err(e) => {
+                            // Keep the stored copy, flag it.
+                            self.corrupted.store(true, Ordering::Relaxed);
+                            log::error!("FieldIndex::stage: container failed to serialize; keeping the stored copy (slot={slot_id}, error={e})");
+                            continue 'slots;
+                        }
+                    },
                 }
             }
+            for (key, bytes) in blobs {
+                let (offset, len) = self.bitmaps.append_value(&bytes);
+                entries.insert(key, DirEntry { key, offset, len });
+            }
+            let dir: Vec<DirEntry> = entries.into_values().collect();
+            let (offset, len) = self.bitmaps.append_value(&storage::encode_dir(&dir));
+            stage.sets.push((slot_id, ver, offset, len));
         }
         stage
     }
 
-    /// Phase 2 of a spill: point the slots at the staged blobs, remove the
-    /// blobs of emptied slots, and drop every overlay entry that has not
+    /// Phase 2 of a spill: point the slots at the staged directories, remove
+    /// the blobs of emptied slots, and drop every overlay entry that has not
     /// changed since it was staged (one that has stays for the next spill).
     /// Returns the slots freed for good.
     pub fn commit(&mut self, stage: SpillStage) -> Vec<u128> {
         let mut freed = Vec::new();
         for (slot_id, ver, offset, len) in stage.sets {
             self.bitmaps.set_slot(slot_id, offset, len);
-            self.drop_overlay_entry_if_unchanged(slot_id, ver);
+            if !self.drop_overlay_entry_if_unchanged(slot_id, ver) {
+                // Its stored directory just changed: reload it on next touch.
+                self.forget_base(slot_id);
+            }
         }
         for (slot_id, ver) in stage.removals {
             if self.drop_overlay_entry_if_unchanged(slot_id, ver) {
@@ -212,10 +275,21 @@ impl<V: Ord + Clone> FieldIndex<V> {
             return false;
         }
         self.overlay_ver.remove(&slot_id);
-        if let Some(bm) = self.overlay.remove(&slot_id) {
-            self.charge(-(bm.heap_bytes() as i64 + OVERLAY_ENTRY_OVERHEAD as i64));
+        if let Some(ch) = self.overlay.remove(&slot_id) {
+            self.charge(-(ch.bytes as i64));
         }
         true
+    }
+
+    /// Drop the cached stored directory of `slot_id`'s overlay entry.
+    fn forget_base(&mut self, slot_id: u128) {
+        if let Some(ch) = self.overlay.get_mut(&slot_id)
+            && let Some(base) = ch.base.take()
+        {
+            let b = base_bytes(&base);
+            ch.bytes -= b;
+            self.charge(-(b as i64));
+        }
     }
 
     /// Sync the bitmap store's value region to disk (between
@@ -265,23 +339,101 @@ impl<V: Ord + Clone> FieldIndex<V> {
         self.budget.charge(delta);
     }
 
-    /// Run `f` on the overlay copy of `slot_id`'s bitmap, loading it from the
-    /// store first if it is not in the overlay yet. Keeps the budget current.
-    /// Returns `f`'s result and whether the bitmap is now empty.
-    fn mutate_slot<R>(&mut self, slot_id: u128, f: impl FnOnce(&mut RoaringBitmap) -> R) -> (R, bool) {
-        if !self.overlay.contains_key(&slot_id) {
-            let bm = self.load_from_store(slot_id);
-            self.charge(bm.heap_bytes() as i64 + OVERLAY_ENTRY_OVERHEAD as i64);
-            self.overlay.insert(slot_id, bm);
+    /// Charge `delta` bytes to `slot_id`'s overlay entry and the budget.
+    fn charge_slot(&mut self, slot_id: u128, delta: i64) {
+        if let Some(ch) = self.overlay.get_mut(&slot_id) {
+            ch.bytes = (ch.bytes as i64 + delta).max(0) as u64;
+        }
+        self.charge(delta);
+    }
+
+    /// Make sure `slot_id` has an overlay entry with its stored directory
+    /// loaded, and bump its version (the caller is about to change it).
+    fn touch(&mut self, slot_id: u128) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.overlay.entry(slot_id) {
+            e.insert(SlotChanges::default());
+            self.charge_slot(slot_id, OVERLAY_SLOT_OVERHEAD as i64);
+        }
+        if self.overlay[&slot_id].base.is_none() {
+            let base = self.stored_dir(slot_id);
+            let b = base_bytes(&base);
+            self.overlay.get_mut(&slot_id).expect("just inserted").base = Some(base);
+            self.charge_slot(slot_id, b as i64);
         }
         self.overlay_ver.insert(slot_id, self.next_ver);
         self.next_ver += 1;
-        let bm = self.overlay.get_mut(&slot_id).expect("just inserted");
-        let before = bm.heap_bytes() as i64;
-        let r = f(bm);
-        let (after, empty) = (bm.heap_bytes() as i64, bm.is_empty());
-        self.charge(after - before);
-        (r, empty)
+    }
+
+    /// Run `f` on container `key` of `slot_id` in the overlay, loading it from
+    /// the store on first touch. A container the slot does not hold is created
+    /// empty when `create` is set; otherwise `f` is not called and nothing
+    /// changes. A container left empty is recorded as removed. Keeps the
+    /// budget and the slot's `empty` flag current. Returns `f`'s result (or
+    /// `false` when `f` was not called).
+    fn modify_container(&mut self, slot_id: u128, key: u128, create: bool, f: impl FnOnce(&mut Container) -> bool) -> bool {
+        if !create && !self.slot_has_container(slot_id, key) {
+            return false;
+        }
+        self.touch(slot_id);
+        if !self.overlay[&slot_id].containers.contains_key(&key) {
+            let entry = self.overlay[&slot_id].base.as_deref().and_then(|b| storage::find_entry(b, key));
+            let c = entry.and_then(|e| self.stored_container(slot_id, e));
+            let charge = OVERLAY_CONTAINER_OVERHEAD + c.as_ref().map_or(0, |c| c.heap_bytes() as u64);
+            self.overlay.get_mut(&slot_id).expect("touched").containers.insert(key, c);
+            self.charge_slot(slot_id, charge as i64);
+        }
+        let ch = self.overlay.get_mut(&slot_id).expect("touched");
+        let slot = ch.containers.get_mut(&key).expect("just loaded");
+        if slot.is_none() {
+            if !create {
+                return false;
+            }
+            *slot = Some(Container::new_array());
+        }
+        let c = slot.as_mut().expect("set above");
+        let before = c.heap_bytes() as i64;
+        let changed = f(c);
+        let (after, emptied) = if c.is_empty() {
+            *slot = None;
+            (0, true)
+        } else {
+            (c.heap_bytes() as i64, false)
+        };
+        if emptied {
+            self.recompute_empty(slot_id);
+        } else {
+            self.overlay.get_mut(&slot_id).expect("touched").empty = false;
+        }
+        self.charge_slot(slot_id, after - before);
+        changed
+    }
+
+    /// Whether `slot_id`'s current bitmap (overlay over store) has a
+    /// container under `key`.
+    fn slot_has_container(&self, slot_id: u128, key: u128) -> bool {
+        if let Some(ch) = self.overlay.get(&slot_id) {
+            if let Some(c) = ch.containers.get(&key) {
+                return c.is_some();
+            }
+            if let Some(base) = &ch.base {
+                return storage::find_entry(base, key).is_some();
+            }
+        }
+        storage::find_entry(&self.stored_dir(slot_id), key).is_some()
+    }
+
+    /// Recompute whether `slot_id`'s bitmap is empty: every stored container
+    /// removed in the overlay and no overlay container left.
+    fn recompute_empty(&mut self, slot_id: u128) {
+        let ch = self.overlay.get_mut(&slot_id).expect("touched");
+        let any_live = ch.containers.values().any(Option::is_some);
+        let any_stored_left = ch.base.as_deref().unwrap_or_default().iter().any(|e| !ch.containers.contains_key(&e.key));
+        ch.empty = !any_live && !any_stored_left;
+    }
+
+    /// Whether the slot is now empty (only meaningful for a slot in the overlay).
+    fn slot_is_empty(&self, slot_id: u128) -> bool {
+        self.overlay.get(&slot_id).is_some_and(|ch| ch.empty)
     }
 
     /// The slot for `value`, allocating one (or reclaiming the slot it emptied
@@ -302,8 +454,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
         id
     }
 
-    /// Whether any bitmap blob has failed to load or store since this index was
-    /// opened.
+    /// Whether any stored directory or container has failed to load, or a
+    /// container to store, since this index was opened.
     ///
     /// A `true` here means at least one query may have silently returned fewer
     /// rows than it should (a corrupt blob is served as empty) or a write was
@@ -326,9 +478,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Record that every row in `row_ids` has `value` for this field.
     ///
     /// The point of this over a loop of [`insert`](Self::insert) is that the
-    /// value's slot is looked up and its overlay bitmap fetched (loaded from
-    /// the store on first touch) **once for the whole batch** rather than once
-    /// per row.
+    /// value's slot is looked up once, and each container the rows fall in is
+    /// fetched (loaded from the store on first touch) **once for the whole
+    /// batch** rather than once per row.
     ///
     /// Used by WAL replay, which knows its full key set up front and can group
     /// by value before writing. An empty `row_ids` is a no-op and does not
@@ -338,11 +490,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
             return;
         }
         let slot_id = self.slot_for_insert(value);
-        self.mutate_slot(slot_id, |bm| {
-            for &row_id in row_ids {
-                bm.insert(row_id);
-            }
-        });
+        for (high, lows) in group_rows(row_ids) {
+            self.modify_container(slot_id, high, true, |c| lows.iter().fold(false, |ch, &low| c.insert(low) | ch));
+        }
     }
 
     /// Scalar update: make `value` the **only** value `row_id` holds for this
@@ -369,8 +519,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Removes the map entry entirely when the bitmap becomes empty.
     pub fn remove(&mut self, value: V, row_id: u128) {
         let Some(&slot_id) = self.ordering.get(&value) else { return };
-        let (_, empty) = self.mutate_slot(slot_id, |bm| bm.remove(row_id));
-        if empty {
+        let (high, low) = decompose(row_id);
+        let changed = self.modify_container(slot_id, high, false, |c| c.remove(low));
+        if changed && self.slot_is_empty(slot_id) {
             self.ordering.remove(&value);
             self.emptied.insert(value, slot_id);
         }
@@ -434,18 +585,19 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// were removed from the index.
     ///
     /// Correct for both scalar and multi-valued use: it scans **all** buckets
-    /// and writes back **every** bucket that actually contained `row_id` (so a
+    /// and changes **every** bucket that actually contained `row_id` (so a
     /// multi-valued row is removed from all of them). Buckets that did not
     /// contain it are left untouched — this is load-bearing for high-cardinality
-    /// fields: a bucket that is written back joins the overlay (memory charged
-    /// to the budget) and is re-appended to the append-only bitmap store at the
-    /// next spill, so touching *every* bucket would cost O(distinct) of both.
-    /// For a scalar field the common case touches a single bucket.
+    /// fields: a changed bucket joins the overlay (memory charged to the
+    /// budget) and gets a new directory at the next spill, so touching *every*
+    /// bucket would cost O(distinct) of both. For a scalar field the common
+    /// case touches a single bucket.
     ///
-    /// The scan still *loads* each bucket to test membership — `O(distinct
-    /// values)`. **When the caller knows the row's old value** (the document
-    /// layer always does, from the prior document), prefer the `O(1)` targeted
-    /// path — [`remove(old, row)`](Self::remove), or `DynFieldIndex::update` /
+    /// The scan still *probes* each bucket for membership — `O(distinct
+    /// values)`, each probe one directory lookup and one container decode.
+    /// **When the caller knows the row's old value** (the document layer always
+    /// does, from the prior document), prefer the `O(1)` targeted path —
+    /// [`remove(old, row)`](Self::remove), or `DynFieldIndex::update` /
     /// `DynFieldIndex::remove` — which touches only the affected bucket. This
     /// full scan is the fallback for when the old value is unknown. A persistent
     /// `row → slot` reverse index is **deliberately not kept** (it would double
@@ -458,9 +610,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     /// Clear every row in `row_ids` from every bucket it occupies.
     ///
-    /// One membership probe and at most one change **per bucket for the whole
-    /// batch**, rather than per row: clearing N rows one at a time probes every
-    /// bucket N times.
+    /// One membership probe and at most one change per container **per bucket
+    /// for the whole batch**, rather than per row: clearing N rows one at a
+    /// time probes every bucket N times.
     ///
     /// Used by WAL replay, which clears its whole affected row set before
     /// re-inserting. An empty `row_ids` is a no-op.
@@ -468,22 +620,22 @@ impl<V: Ord + Clone> FieldIndex<V> {
         if row_ids.is_empty() {
             return Vec::new();
         }
+        let groups = group_rows(row_ids);
         let slots: Vec<(V, u128)> = self.ordering.iter().map(|(v, &id)| (v.clone(), id)).collect();
 
         let mut removed_slots: Vec<u128> = Vec::new();
         for (value, slot_id) in slots {
-            // Probe first, so a bucket none of these rows is in is neither
-            // loaded whole nor added to the overlay. A stored bucket is probed
-            // on its serialised form, decoding only the rows' containers.
-            if !self.slot_contains_any(slot_id, row_ids) {
+            // Probe first, so a bucket none of these rows is in is not added
+            // to the overlay. A stored bucket is probed through its directory,
+            // decoding only the rows' containers.
+            if !self.slot_contains_any(slot_id, &groups) {
                 continue;
             }
-            let (_, empty) = self.mutate_slot(slot_id, |bm| {
-                for &row_id in row_ids {
-                    bm.remove(row_id);
-                }
-            });
-            if empty {
+            let mut changed = false;
+            for (&high, lows) in &groups {
+                changed |= self.modify_container(slot_id, high, false, |c| lows.iter().fold(false, |ch, &low| c.remove(low) | ch));
+            }
+            if changed && self.slot_is_empty(slot_id) {
                 self.ordering.remove(&value);
                 self.emptied.insert(value, slot_id);
                 removed_slots.push(slot_id);
@@ -492,23 +644,24 @@ impl<V: Ord + Clone> FieldIndex<V> {
         removed_slots
     }
 
-    /// Whether `slot_id`'s bitmap holds any of `row_ids`, without loading the
-    /// whole bitmap when it is only in the store.
-    fn slot_contains_any(&self, slot_id: u128, row_ids: &[u128]) -> bool {
-        if let Some(bm) = self.overlay.get(&slot_id) {
-            return row_ids.iter().any(|&r| bm.contains(r));
-        }
-        match self.bitmaps.get(slot_id) {
-            None => false,
-            Some(bytes) => storage::contains_any(&bytes, row_ids).unwrap_or_else(|e| {
-                // Same policy as `load_bitmap`: treat as empty, flag corruption.
-                self.corrupted.store(true, Ordering::Relaxed);
-                log::error!(
-                    "slot_contains_any: bitmap blob failed to decode; treating as empty and flagging the index corrupt (slot={slot_id}, error={e})"
-                );
-                false
-            }),
-        }
+    /// Whether `slot_id`'s bitmap holds any of the grouped rows, decoding only
+    /// the containers they fall in.
+    fn slot_contains_any(&self, slot_id: u128, groups: &BTreeMap<u128, Vec<u16>>) -> bool {
+        let ch = self.overlay.get(&slot_id);
+        let stored;
+        let base: &[DirEntry] = match ch.and_then(|c| c.base.as_deref()) {
+            Some(b) => b,
+            None => {
+                stored = self.stored_dir(slot_id);
+                &stored
+            }
+        };
+        groups.iter().any(|(&high, lows)| match ch.and_then(|c| c.containers.get(&high)) {
+            Some(c) => c.as_ref().is_some_and(|c| lows.iter().any(|&l| c.contains(l))),
+            None => storage::find_entry(base, high)
+                .and_then(|e| self.stored_container(slot_id, e))
+                .is_some_and(|c| lows.iter().any(|&l| c.contains(l))),
+        })
     }
 
     /// Returns `true` if `value` already has an entry in the index.
@@ -528,8 +681,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     /// Iterate over all `(value, bitmap)` pairs in sorted value order.
     ///
-    /// Each bitmap is deserialised on demand; the iterator is lazy over the
-    /// `BTreeMap` but eagerly deserialises each bitmap as it is visited.
+    /// Each bitmap is assembled on demand; the iterator is lazy over the
+    /// `BTreeMap` but eagerly loads each bitmap as it is visited.
     pub fn iter(&self) -> impl Iterator<Item = (&V, RoaringBitmap)> {
         self.ordering.iter().map(|(v, &slot_id)| (v, self.load_bitmap(slot_id)))
     }
@@ -560,9 +713,9 @@ impl<V: Ord + Clone> FieldIndex<V> {
 
     /// `(logical, live)` bytes of the bitmap value region: total bytes ever
     /// appended vs. what survives compaction. The gap is reclaimable dead space:
-    /// each spill appends a fresh copy of every bitmap that changed and leaves
-    /// the old copy behind. See `BlobStore::logical_bytes` /
-    /// `BlobStore::live_bytes`.
+    /// each spill appends a fresh copy of every container that changed, plus a
+    /// new directory for its slot, and leaves the old copies behind. See
+    /// `BlobStore::logical_bytes` / `BlobStore::live_bytes`.
     pub fn bitmap_blob_bytes(&self) -> (u64, u64) {
         (self.bitmaps.logical_bytes(), self.bitmaps.live_bytes())
     }
@@ -575,41 +728,84 @@ impl<V: Ord + Clone> FieldIndex<V> {
     }
 
     /// Compact the bitmap value region, reclaiming the dead space left by
-    /// spills (old copies of changed bitmaps). See `BlobStore::compact`.
+    /// spills (old copies of changed containers and directories). See
+    /// `BlobStore::compact`.
     pub fn compact_bitmaps(&mut self) -> std::io::Result<u64> {
-        self.bitmaps.compact()
+        let reclaimed = self.bitmaps.compact()?;
+        // Every stored offset moved: cached directories are stale.
+        let slots: Vec<u128> = self.overlay.keys().copied().collect();
+        for slot_id in slots {
+            self.forget_base(slot_id);
+        }
+        Ok(reclaimed)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// The current bitmap for `slot_id`: the overlay copy if the slot changed
-    /// since the last spill, else the stored one.
+    /// The current bitmap for `slot_id`: the stored containers, with the
+    /// overlay's changed containers in place of theirs.
     fn load_bitmap(&self, slot_id: u128) -> RoaringBitmap {
-        match self.overlay.get(&slot_id) {
-            Some(bm) => bm.clone(),
-            None => self.load_from_store(slot_id),
+        let ch = self.overlay.get(&slot_id);
+        let stored;
+        let base: &[DirEntry] = match ch.and_then(|c| c.base.as_deref()) {
+            Some(b) => b,
+            None => {
+                stored = self.stored_dir(slot_id);
+                &stored
+            }
+        };
+        let mut bm = RoaringBitmap::new();
+        for &e in base {
+            if ch.is_some_and(|c| c.containers.contains_key(&e.key)) {
+                continue;
+            }
+            if let Some(c) = self.stored_container(slot_id, e) {
+                bm.store.insert_owned(e.key, c);
+            }
+        }
+        if let Some(ch) = ch {
+            for (&key, c) in &ch.containers {
+                if let Some(c) = c {
+                    bm.store.insert_owned(key, c.clone());
+                }
+            }
+        }
+        bm
+    }
+
+    /// `slot_id`'s stored directory. A *missing* slot is a normal empty
+    /// bitmap; a directory that does not decode is served as empty and latches
+    /// the corruption flag.
+    fn stored_dir(&self, slot_id: u128) -> Vec<DirEntry> {
+        match self.bitmaps.get_ref(slot_id) {
+            None => Vec::new(),
+            Some(bytes) => storage::decode_dir(bytes).unwrap_or_else(|e| {
+                self.corrupted.store(true, Ordering::Relaxed);
+                log::error!(
+                    "FieldIndex: bitmap directory failed to decode; serving empty and flagging the index corrupt (rebuild this field from the WAL) (slot={slot_id}, error={e})"
+                );
+                Vec::new()
+            }),
         }
     }
 
-    fn load_from_store(&self, slot_id: u128) -> RoaringBitmap {
-        match self.bitmaps.get(slot_id) {
-            // A *missing* slot is a normal empty bitmap, not corruption.
-            None => RoaringBitmap::new(),
-            Some(bytes) => match storage::deserialize(&bytes) {
-                Ok(bm) => bm,
-                Err(e) => {
-                    // The blob exists but won't deserialise: serve empty (so the
-                    // query/mutation stays infallible) but latch the corruption
-                    // flag so the owner can rebuild instead of trusting a result
-                    // that silently dropped this value's rows.
-                    self.corrupted.store(true, Ordering::Relaxed);
-                    log::error!(
-                        "load_bitmap: bitmap blob failed to deserialize; serving empty and flagging the index corrupt (rebuild this field from the WAL) (slot={slot_id}, error={e})"
-                    );
-                    RoaringBitmap::new()
-                }
-            },
-        }
+    /// Decode the stored container `entry` points at. A blob that is out of
+    /// range or does not decode is served as absent and latches the corruption
+    /// flag.
+    fn stored_container(&self, slot_id: u128, entry: DirEntry) -> Option<Container> {
+        let decoded = match self.bitmaps.value_slice(entry.offset, entry.len) {
+            Some(bytes) => storage::decode_container(bytes).map_err(|e| e.to_string()),
+            None => Err("container blob runs past the value region".to_string()),
+        };
+        decoded
+            .map_err(|e| {
+                self.corrupted.store(true, Ordering::Relaxed);
+                log::error!(
+                    "FieldIndex: bitmap container failed to load; serving it empty and flagging the index corrupt (rebuild this field from the WAL) (slot={slot_id}, key={}, error={e})",
+                    entry.key
+                );
+            })
+            .ok()
     }
 }
 
@@ -770,9 +966,9 @@ mod tests {
         idx.insert(7, 1);
         idx.spill(); // the corruption below is in the store, not the overlay
         let slot = idx.slot_id_for(&7).unwrap();
-        // A blob claiming one container but carrying no key bytes fails the
-        // length-framing check in storage::deserialize, so load_bitmap falls
-        // back to an empty bitmap instead of propagating an error.
+        // A blob that is not a directory fails its magic/checksum check, so
+        // load_bitmap falls back to an empty bitmap instead of propagating an
+        // error.
         idx.bitmaps.upsert(slot, &1u32.to_le_bytes());
         assert!(idx.load_bitmap(slot).is_empty());
         // …but the failure is now observable rather than silent.
@@ -789,24 +985,67 @@ mod tests {
 
     #[test]
     fn load_bitmap_returns_empty_on_corrupt_rkyv_payload() {
-        // The recoverable path the checked-deserialization fix protects: a blob
-        // with *valid framing* but an invalid rkyv payload. Under the old
-        // `access_unchecked` this was UB/panic inside load_bitmap; with checked
-        // access it surfaces an error that load_bitmap swallows into an empty
-        // bitmap. Framing = [count=1][16B key][blob_len=32][32 garbage bytes].
+        // A valid directory pointing at a container blob whose rkyv payload is
+        // garbage: checked access surfaces an error that load_bitmap swallows
+        // into an empty container, and the corruption flag latches.
         let mut idx = FieldIndex::<i64>::new();
         idx.insert(7, 1);
         idx.spill(); // the corruption below is in the store, not the overlay
         let slot = idx.slot_id_for(&7).unwrap();
 
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&1u32.to_le_bytes());
-        blob.extend_from_slice(&0u128.to_le_bytes());
-        blob.extend_from_slice(&32u32.to_le_bytes());
-        blob.extend_from_slice(&[0xFFu8; 32]);
-        idx.bitmaps.upsert(slot, &blob);
+        let (offset, len) = idx.bitmaps.append_value(&[0xFFu8; 32]);
+        let dir = storage::encode_dir(&[DirEntry { key: 0, offset, len }]);
+        idx.bitmaps.upsert(slot, &dir);
 
         assert!(idx.load_bitmap(slot).is_empty());
         assert!(idx.corruption_detected(), "an invalid rkyv payload must latch the corruption flag");
+    }
+
+    /// The point of the directory layout: one write to a large bitmap appends
+    /// one container and one directory at the next spill, not the bitmap.
+    #[test]
+    fn a_spill_appends_only_the_changed_container() {
+        let mut idx = FieldIndex::<bool>::new();
+        // 64 containers' worth of rows under `true`.
+        idx.insert_many(true, &(0..64u128 * 65_536).step_by(3).collect::<Vec<_>>());
+        idx.spill();
+        let (before, _) = idx.bitmap_blob_bytes();
+        let whole: u64 = idx.load_bitmap(idx.slot_id_for(&true).unwrap()).num_containers() as u64;
+        assert_eq!(whole, 64);
+
+        idx.insert(true, 5 * 65_536 + 1);
+        idx.spill();
+        let (after, live) = idx.bitmap_blob_bytes();
+        let appended = after - before;
+        // One bitset container (8 KiB + framing) plus a 64-entry directory.
+        assert!(
+            appended < 8_192 + 512 + 64 * 28 + 64,
+            "appended {appended} bytes for one changed container"
+        );
+        assert!(live > 64 * 8_192, "the bitmap itself is ~{live} bytes");
+        assert!(idx.evaluate(&Predicate::Eq(true)).contains(5 * 65_536 + 1));
+    }
+
+    /// Reads merge the overlay over the stored containers, and emptying every
+    /// container (some stored, some only in the overlay) frees the slot.
+    #[test]
+    fn overlay_and_store_merge_and_empty_together() {
+        let mut idx = FieldIndex::<i64>::new();
+        let rows: Vec<u128> = vec![1, 70_000, 140_000, 5 << 40];
+        idx.insert_many(3, &rows[..2]);
+        idx.spill();
+        idx.insert_many(3, &rows[2..]);
+        let got: Vec<u128> = idx.evaluate(&Predicate::Eq(3)).iter().collect();
+        assert_eq!(got, rows);
+        for &r in &rows[..3] {
+            idx.remove(3, r);
+        }
+        assert!(idx.contains_value(&3i64));
+        let emptied = idx.remove_all_for_row(5 << 40);
+        assert_eq!(emptied.len(), 1);
+        assert!(!idx.contains_value(&3i64));
+        assert_eq!(idx.spill().len(), 1, "the emptied slot is freed by the spill");
+        assert_eq!(idx.bitmaps.count(), 0);
+        assert_eq!(idx.overlay_bytes(), 0);
     }
 }

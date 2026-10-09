@@ -8,6 +8,14 @@
 //! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
 //! index.
 //!
+//! A store has one of two layouts ([`BlobLayout`]). In the **flat** layout
+//! (the keymap) a slot's blob is the whole value. In the **directory** layout
+//! (bitmaps) a slot's blob is a directory listing container blobs elsewhere in
+//! the same value region (format in `index::storage`), so replacing one
+//! container appends that container and a new directory, not the whole bitmap.
+//! The store reads directories only to account for space: dead bytes, live
+//! bytes, compaction, and open-time repair.
+//!
 //! **Key file** (`blobs.keys`):
 //! - 64-byte header (magic, version, capacity, counts, value write pos)
 //! - Fixed-size 48-byte slots forming an open-addressing linear-probing hash table
@@ -43,10 +51,22 @@ use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
 
+use crate::index::storage::{self, DirEntry};
+
+/// What a slot's blob is (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobLayout {
+    /// The blob is the whole value.
+    Flat,
+    /// The blob is a directory of container blobs (`index::storage`).
+    Directory,
+}
+
 // ── Layout constants ──────────────────────────────────────────────────────────
 
 const MAGIC: u64 = 0x4D494E4E414C4253; // "MINNALBS"
-const VERSION: u32 = 1;
+/// On-disk format version. 2: bitmap stores use the directory layout.
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 64;
 const SLOT_SIZE: usize = 48;
 const INITIAL_CAPACITY: usize = 16;
@@ -356,13 +376,20 @@ pub(crate) struct BlobStore {
     /// pointing outside the value file). The owner must rebuild from the source
     /// of truth: the dropped entries are gone.
     damaged_at_open: usize,
+    layout: BlobLayout,
 }
 
 impl BlobStore {
     // ── Construction ──────────────────────────────────────────────────────────
 
-    /// Create a new anonymous (transient) store.
+    /// Create a new anonymous (transient) store with the flat layout.
+    #[cfg(test)]
     pub fn new_anon() -> Self {
+        Self::new_anon_with(BlobLayout::Flat)
+    }
+
+    /// Create a new anonymous (transient) store with `layout`.
+    pub fn new_anon_with(layout: BlobLayout) -> Self {
         let mut key = GrowableMmap::new_anon(INITIAL_KEY_SIZE).expect("anon key mmap alloc failed");
         init_header(key.as_mut_slice(), INITIAL_CAPACITY);
         let val = GrowableMmap::new_anon(INITIAL_VAL_SIZE).expect("anon val mmap alloc failed");
@@ -372,12 +399,18 @@ impl BlobStore {
             dir: None,
             dead_bytes: 0,
             damaged_at_open: 0,
+            layout,
         }
     }
 
-    /// Create a new persistent store in `dir`, creating `blobs.keys` and
-    /// `blobs.vals`.
+    /// Create a new persistent flat-layout store in `dir`, creating
+    /// `blobs.keys` and `blobs.vals`.
     pub fn create(dir: &Path) -> io::Result<Self> {
+        Self::create_with(dir, BlobLayout::Flat)
+    }
+
+    /// Create a new persistent store with `layout` in `dir`.
+    pub fn create_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
         let mut key = GrowableMmap::create_file(&dir.join("blobs.keys"), INITIAL_KEY_SIZE)?;
         init_header(key.as_mut_slice(), INITIAL_CAPACITY);
         key.flush()?;
@@ -388,11 +421,17 @@ impl BlobStore {
             dir: Some(dir.to_path_buf()),
             dead_bytes: 0,
             damaged_at_open: 0,
+            layout,
         })
     }
 
-    /// Open an existing persistent store from `dir`.
+    /// Open an existing persistent flat-layout store from `dir`.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with(dir, BlobLayout::Flat)
+    }
+
+    /// Open an existing persistent store with `layout` from `dir`.
+    pub fn open_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
         // Complete or discard any compaction that was interrupted by a crash
         // before its file swap finished, so we always map a consistent pair.
         Self::recover_compaction(dir)?;
@@ -405,6 +444,7 @@ impl BlobStore {
             dir: Some(dir.to_path_buf()),
             dead_bytes: 0,
             damaged_at_open: 0,
+            layout,
         };
         store.repair_at_open();
         // Seed the dead-bytes hint from the loaded state (one O(capacity) scan at
@@ -432,9 +472,21 @@ impl BlobStore {
             let s = read_slot(self.key.as_slice(), i);
             match s.state {
                 STATE_OCCUPIED => {
-                    let end = s.offset.checked_add(s.len as u64);
+                    let end = s.offset.checked_add(s.len as u64).filter(|&e| ok && e <= val_len);
+                    // In the directory layout the slot's directory and every
+                    // container it lists must be intact and inside the file.
+                    let end = end.and_then(|end| match self.layout {
+                        BlobLayout::Flat => Some(end),
+                        BlobLayout::Directory => {
+                            let entries = storage::decode_dir(&self.val.as_slice()[s.offset as usize..end as usize]).ok()?;
+                            entries.iter().try_fold(end, |m, e| {
+                                let c_end = e.offset.checked_add(e.len as u64).filter(|&c| c <= val_len)?;
+                                Some(m.max(c_end))
+                            })
+                        }
+                    });
                     match end {
-                        Some(end) if ok && end <= val_len => {
+                        Some(end) => {
                             live += 1;
                             max_end = max_end.max(end);
                         }
@@ -540,8 +592,27 @@ impl BlobStore {
         (0..cap)
             .map(|i| read_slot(kdata, i))
             .filter(|s| s.state == STATE_OCCUPIED)
-            .map(|s| align_up(s.len as usize, VALUE_ALIGNMENT) as u64)
+            .map(|s| self.owned_bytes(&s))
             .sum()
+    }
+
+    /// The directory a directory-layout slot points at (`None` for the flat
+    /// layout, or a directory that does not decode).
+    fn dir_entries(&self, offset: u64, len: u32) -> Option<Vec<DirEntry>> {
+        if self.layout != BlobLayout::Directory {
+            return None;
+        }
+        storage::decode_dir(self.value_slice(offset, len)?).ok()
+    }
+
+    /// Value-region bytes a live slot owns, each blob rounded up to
+    /// `VALUE_ALIGNMENT`: its blob, plus the containers its directory lists.
+    fn owned_bytes(&self, s: &Slot) -> u64 {
+        let own = align_up(s.len as usize, VALUE_ALIGNMENT) as u64;
+        let containers: u64 = self
+            .dir_entries(s.offset, s.len)
+            .map_or(0, |es| es.iter().map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64).sum());
+        own + containers
     }
 
     /// Fraction (`0.0..1.0`) of the value region that is reclaimable dead space
@@ -714,7 +785,18 @@ impl BlobStore {
         // overwritten). This keeps `dead_bytes` O(1) and exact-since-compaction.
         if found {
             let old = read_slot(self.key.as_slice(), idx);
-            self.dead_bytes = self.dead_bytes.saturating_add(align_up(old.len as usize, VALUE_ALIGNMENT) as u64);
+            let mut dead = align_up(old.len as usize, VALUE_ALIGNMENT) as u64;
+            // Directory layout: the old directory's containers that the new
+            // one no longer lists are dead too.
+            if let Some(old_entries) = self.dir_entries(old.offset, old.len) {
+                let kept: std::collections::HashSet<u64> = self.dir_entries(offset, len).unwrap_or_default().iter().map(|e| e.offset).collect();
+                dead += old_entries
+                    .iter()
+                    .filter(|e| !kept.contains(&e.offset))
+                    .map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64)
+                    .sum::<u64>();
+            }
+            self.dead_bytes = self.dead_bytes.saturating_add(dead);
         }
 
         write_slot(
@@ -761,7 +843,7 @@ impl BlobStore {
             return;
         }
         // The removed key's blob is now dead — account it (aligned) as reclaimable.
-        let dead = align_up(read_slot(self.key.as_slice(), idx).len as usize, VALUE_ALIGNMENT) as u64;
+        let dead = self.owned_bytes(&read_slot(self.key.as_slice(), idx));
         self.dead_bytes = self.dead_bytes.saturating_add(dead);
 
         let kdata = self.key.as_mut_slice();
@@ -776,6 +858,7 @@ impl BlobStore {
     // ── Query ─────────────────────────────────────────────────────────────────
 
     /// Return the blob for `key`, or `None` if the key is absent.
+    #[cfg(test)]
     pub fn get(&self, key: u128) -> Option<Vec<u8>> {
         let (idx, found) = self.probe(key);
         if !found {
@@ -784,6 +867,24 @@ impl BlobStore {
         let s = read_slot(self.key.as_slice(), idx);
         let bytes = &self.val.as_slice()[s.offset as usize..s.offset as usize + s.len as usize];
         Some(bytes.to_vec())
+    }
+
+    /// Borrow the blob for `key`, or `None` if the key is absent.
+    pub fn get_ref(&self, key: u128) -> Option<&[u8]> {
+        let (idx, found) = self.probe(key);
+        if !found {
+            return None;
+        }
+        let s = read_slot(self.key.as_slice(), idx);
+        self.value_slice(s.offset, s.len)
+    }
+
+    /// Borrow `len` bytes of the value region at `offset`, or `None` if that
+    /// range runs past the region.
+    pub fn value_slice(&self, offset: u64, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len as usize)?;
+        self.val.as_slice().get(start..end)
     }
 
     /// Return all live `(key, blob)` pairs.
@@ -841,7 +942,23 @@ impl BlobStore {
                 if s.state != STATE_OCCUPIED {
                     continue;
                 }
-                let blob = &vdata[s.offset as usize..s.offset as usize + s.len as usize];
+                let mut blob = &vdata[s.offset as usize..s.offset as usize + s.len as usize];
+                // Directory layout: copy the containers first, then a
+                // directory pointing at their new offsets.
+                let moved_dir;
+                if let Some(entries) = self.dir_entries(s.offset, s.len) {
+                    let mut moved = Vec::with_capacity(entries.len());
+                    for e in entries {
+                        let c = &vdata[e.offset as usize..e.offset as usize + e.len as usize];
+                        let aligned = align_up(write_pos, VALUE_ALIGNMENT);
+                        val_buf.resize(aligned, 0);
+                        val_buf.extend_from_slice(c);
+                        moved.push(DirEntry { offset: aligned as u64, ..e });
+                        write_pos = aligned + c.len();
+                    }
+                    moved_dir = storage::encode_dir(&moved);
+                    blob = &moved_dir;
+                }
                 let aligned = align_up(write_pos, VALUE_ALIGNMENT);
                 val_buf.resize(aligned, 0); // honour VALUE_ALIGNMENT padding
                 val_buf.extend_from_slice(blob);
@@ -849,7 +966,7 @@ impl BlobStore {
                     state: STATE_OCCUPIED,
                     key: s.key,
                     offset: aligned as u64,
-                    len: s.len,
+                    len: u32_len(blob.len(), "blob"),
                 });
                 write_pos = aligned + blob.len();
             }
@@ -1480,5 +1597,109 @@ mod tests {
         assert!(!store.contains_key(1), "appending points no slot at the blob");
         assert!(store.set_slot(1, off, len));
         assert_eq!(store.get(1).unwrap(), b"hello");
+    }
+
+    // ── Directory layout ─────────────────────────────────────────────────────
+
+    /// Append `containers` (raw bytes) and a directory over them; return the
+    /// directory's `(offset, len)`.
+    fn append_dir(store: &mut BlobStore, containers: &[(u128, &[u8])]) -> (u64, u32) {
+        let entries: Vec<DirEntry> = containers
+            .iter()
+            .map(|&(key, bytes)| {
+                let (offset, len) = store.append_value(bytes);
+                DirEntry { key, offset, len }
+            })
+            .collect();
+        store.append_value(&storage::encode_dir(&entries))
+    }
+
+    #[test]
+    fn directory_layout_counts_containers_as_live_and_dead() {
+        let mut store = BlobStore::new_anon_with(BlobLayout::Directory);
+        let (d, l) = append_dir(&mut store, &[(0, &[1u8; 100]), (1, &[2u8; 100])]);
+        store.set_slot(7, d, l);
+        let dir_len = align_up(l as usize, VALUE_ALIGNMENT) as u64;
+        assert_eq!(store.live_bytes(), 2 * 112 + dir_len);
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Replace container 1 only: the old directory and the old container 1
+        // become dead; container 0 is shared and stays live.
+        let old = storage::decode_dir(store.get_ref(7).unwrap()).unwrap();
+        let (off1, len1) = store.append_value(&[3u8; 50]);
+        let new_dir = storage::encode_dir(&[
+            old[0],
+            DirEntry {
+                key: 1,
+                offset: off1,
+                len: len1,
+            },
+        ]);
+        let (d2, l2) = store.append_value(&new_dir);
+        store.set_slot(7, d2, l2);
+        assert_eq!(store.dead_bytes(), dir_len + 112);
+        assert_eq!(store.live_bytes(), 112 + 64 + align_up(l2 as usize, VALUE_ALIGNMENT) as u64);
+
+        store.remove_key(7);
+        assert_eq!(store.live_bytes(), 0);
+        assert_eq!(store.dead_bytes(), store.logical_bytes(), "everything is dead once the slot is gone");
+    }
+
+    #[test]
+    fn directory_layout_compaction_moves_containers_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            for round in 0..5u8 {
+                for slot in 0..3u128 {
+                    let (d, l) = append_dir(&mut store, &[(0, &[round; 40]), (9, &[slot as u8; 300])]);
+                    store.set_slot(slot, d, l);
+                }
+            }
+            let live = store.live_bytes();
+            assert!(store.compact().unwrap() > 0);
+            assert_eq!(store.logical_bytes(), live, "only the live containers and directories remain");
+            store.flush().unwrap();
+        }
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 0);
+        for slot in 0..3u128 {
+            let entries = storage::decode_dir(store.get_ref(slot).unwrap()).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(store.value_slice(entries[0].offset, entries[0].len).unwrap(), &[4u8; 40]);
+            assert_eq!(store.value_slice(entries[1].offset, entries[1].len).unwrap(), &[slot as u8; 300][..]);
+        }
+    }
+
+    #[test]
+    fn open_drops_a_directory_that_is_torn_or_points_past_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (torn_at, far) = {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            let (d, l) = append_dir(&mut store, &[(0, &[1u8; 64])]);
+            store.set_slot(1, d, l);
+            // Slot 2: a directory naming a container far past the file end.
+            let far = storage::encode_dir(&[DirEntry {
+                key: 0,
+                offset: 1 << 30,
+                len: 64,
+            }]);
+            let (d2, l2) = store.append_value(&far);
+            store.set_slot(2, d2, l2);
+            // Slot 3: fine.
+            let (d3, l3) = append_dir(&mut store, &[(5, &[3u8; 64])]);
+            store.set_slot(3, d3, l3);
+            store.flush().unwrap();
+            (d as usize + 4, 2u128)
+        };
+        // Tear slot 1's directory (its count field).
+        let mut vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+        vals[torn_at] ^= 0xFF;
+        std::fs::write(dir.path().join("blobs.vals"), &vals).unwrap();
+
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 2);
+        assert!(!store.contains_key(1) && !store.contains_key(far));
+        assert!(store.contains_key(3));
     }
 }

@@ -57,7 +57,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::index::RoaringBitmap;
-use crate::index::blob_store::BlobStore;
+use crate::index::blob_store::{BlobLayout, BlobStore};
 use crate::index::field::field_index::{FieldIndex, SpillStage};
 
 // ── Value types ────────────────────────────────────────────────────────────
@@ -183,9 +183,9 @@ impl DynFieldIndex {
     /// in-memory `BTreeMap` ordering.
     pub fn open(value_type: IndexValueType, dir: &Path) -> std::io::Result<Self> {
         let bitmaps = if BlobStore::exists(dir) {
-            BlobStore::open(dir)?
+            BlobStore::open_with(dir, BlobLayout::Directory)?
         } else {
-            BlobStore::create(dir)?
+            BlobStore::create_with(dir, BlobLayout::Directory)?
         };
 
         let keymap_dir = dir.join("keymap");
@@ -1193,6 +1193,44 @@ mod tests {
         assert_eq!(int_rows(&idx, 1).len(), 70_000);
     }
 
+    /// FR-005: once a field's bitmaps are bigger than the hard limit, every
+    /// write spills. Each spill must append the containers that changed (one
+    /// per bucket a write touches) plus their directories, not whole bitmaps.
+    #[test]
+    fn past_the_hard_limit_each_spill_appends_containers_not_bitmaps() {
+        const ROWS: u128 = 32 * 65_536; // 32 containers per value
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
+        for v in [false, true] {
+            let rows: Vec<u128> = (0..ROWS).filter(|r| (r % 2 == 1) == v).collect();
+            idx.insert_many(&IndexValue::Bool(v), &rows).unwrap();
+        }
+        idx.flush(dir.path()).unwrap();
+        let bitmap_bytes = idx.blob_stats().bitmap_live_bytes / 2;
+        assert!(bitmap_bytes > 32 * 8_192, "each bitmap is ~{bitmap_bytes} bytes");
+
+        // A hard limit far below one bitmap: every write spills.
+        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(4 * 1024, 8 * 1024));
+        idx.set_overlay_budget(budget.clone());
+        let before = idx.blob_stats().bitmap_logical_bytes;
+        let writes = 500u128;
+        for i in 0..writes {
+            let row = (i * 7_919) % ROWS;
+            // Flip the row to the other value: touches one container in each bitmap.
+            idx.update(
+                Some(&IndexValue::Bool(!row.is_multiple_of(2))),
+                Some(&IndexValue::Bool(row.is_multiple_of(2))),
+                row,
+            )
+            .unwrap();
+        }
+        let per_write = (idx.blob_stats().bitmap_logical_bytes - before) / writes as u64;
+        // Two containers (8 KiB bitset each, plus rkyv framing) and two
+        // 32-entry directories per write; a whole-bitmap spill would be 2 × ~260 KiB.
+        assert!(per_write < 2 * (8_192 + 64) + 2 * (32 * 28 + 32), "appended {per_write} bytes per write");
+        assert_eq!(idx.overlay_bytes(), 0, "every write spilled");
+    }
+
     #[test]
     fn reads_see_unspilled_changes_and_reopen_sees_spilled_ones() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1555,5 +1593,200 @@ mod tests {
         idx.insert(&IndexValue::Int(200), 1).unwrap();
         idx.flush(dir.path()).unwrap();
         assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
+    }
+
+    // ── Crash images: every spill phase, random page write-back ──────────────
+
+    /// The four files of a persistent field index, by path relative to its dir.
+    const INDEX_FILES: [&str; 4] = ["blobs.keys", "blobs.vals", "keymap/blobs.keys", "keymap/blobs.vals"];
+
+    type Image = Vec<Vec<u8>>;
+
+    fn snapshot(dir: &Path) -> Image {
+        INDEX_FILES.iter().map(|f| std::fs::read(dir.join(f)).unwrap()).collect()
+    }
+
+    /// Small deterministic PRNG (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// What the disk could hold after a crash: for each file in `unsynced`,
+    /// every 4 KiB page is independently the durable (`old`) or the in-memory
+    /// (`new`) copy, as the kernel writes a shared map back in any order. The
+    /// other files are fully `new` (synced).
+    fn crash_image(old: &Image, new: &Image, unsynced: &[usize], rng: &mut Rng) -> Image {
+        const PAGE: usize = 4096;
+        (0..INDEX_FILES.len())
+            .map(|f| {
+                if !unsynced.contains(&f) {
+                    return new[f].clone();
+                }
+                let mut out = new[f].clone();
+                for start in (0..out.len()).step_by(PAGE) {
+                    if rng.below(2) == 0 {
+                        let end = (start + PAGE).min(out.len());
+                        for (i, b) in out[start..end].iter_mut().enumerate() {
+                            *b = old[f].get(start + i).copied().unwrap_or(0);
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    fn write_image(dir: &Path, image: &Image) {
+        std::fs::create_dir_all(dir.join("keymap")).unwrap();
+        for (f, bytes) in INDEX_FILES.iter().zip(image) {
+            std::fs::write(dir.join(f), bytes).unwrap();
+        }
+    }
+
+    /// Apply the scalar end state of `rows` the way WAL replay does: clear
+    /// every affected row, then insert each under its value in `truth`.
+    fn replay(idx: &mut DynFieldIndex, rows: &[u128], truth: &BTreeMap<u128, i64>) {
+        idx.remove_all_for_rows(rows);
+        let mut by_value: BTreeMap<i64, Vec<u128>> = BTreeMap::new();
+        for r in rows {
+            if let Some(&v) = truth.get(r) {
+                by_value.entry(v).or_default().push(*r);
+            }
+        }
+        for (v, rs) in by_value {
+            idx.insert_many(&IndexValue::Int(v), &rs).unwrap();
+        }
+    }
+
+    fn assert_matches(idx: &DynFieldIndex, truth: &BTreeMap<u128, i64>, what: &str) {
+        let mut want: BTreeMap<i64, Vec<u128>> = BTreeMap::new();
+        for (&r, &v) in truth {
+            want.entry(v).or_default().push(r);
+        }
+        for v in 0..10i64 {
+            assert_eq!(int_rows(idx, v), want.get(&v).cloned().unwrap_or_default(), "{what}: value {v}");
+        }
+        assert_eq!(idx.distinct_count(), want.len(), "{what}: distinct values");
+    }
+
+    /// Crash at every phase of a spill (stage → sync values → commit → sync
+    /// keys), with a random subset of the unsynced pages written back; reopen,
+    /// replay the window since the last durable spill, and compare with the
+    /// ground truth. Rows span several containers so slots are rewritten
+    /// container by container; the window creates, moves and empties values,
+    /// and half the seeds compact the files first.
+    #[test]
+    fn every_spill_phase_crash_recovers_to_the_ground_truth() {
+        const ROW_SPAN: u64 = 4 * 65_536;
+        let (mut runs, mut damaged_runs) = (0, 0);
+        for seed in 1..=24u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let live = tempfile::TempDir::new().unwrap();
+            let mut idx = DynFieldIndex::open(IndexValueType::Int, live.path()).unwrap();
+            let mut truth: BTreeMap<u128, i64> = BTreeMap::new();
+            // Values 0..5 over many rows; value 6 on a handful (the window empties it).
+            for _ in 0..3_000 {
+                let r = rng.below(ROW_SPAN) as u128;
+                let v = rng.below(6) as i64;
+                idx.set(&IndexValue::Int(v), r).unwrap();
+                truth.insert(r, v);
+            }
+            let sixes: Vec<u128> = (0..5).map(|i| ROW_SPAN as u128 + i).collect();
+            for &r in &sixes {
+                idx.set(&IndexValue::Int(6), r).unwrap();
+                truth.insert(r, 6);
+            }
+            idx.flush(live.path()).unwrap();
+            if seed % 2 == 0 {
+                // Churn, then compact, so the durable state is a compacted file.
+                for _ in 0..200 {
+                    let r = rng.below(ROW_SPAN) as u128;
+                    let v = rng.below(6) as i64;
+                    idx.set(&IndexValue::Int(v), r).unwrap();
+                    truth.insert(r, v);
+                }
+                idx.flush(live.path()).unwrap();
+                assert!(idx.maybe_compact(0.0).unwrap());
+                idx.flush(live.path()).unwrap();
+            }
+            let durable = snapshot(live.path());
+            let durable_truth = truth.clone();
+
+            // The window: moves, deletes, a new value (7), value 6 emptied.
+            let mut window: Vec<u128> = Vec::new();
+            for _ in 0..300 {
+                let r = rng.below(ROW_SPAN) as u128;
+                match rng.below(5) {
+                    0 => {
+                        idx.remove_all_for_row(r);
+                        truth.remove(&r);
+                    }
+                    1 => {
+                        idx.set(&IndexValue::Int(7), r).unwrap();
+                        truth.insert(r, 7);
+                    }
+                    _ => {
+                        let v = rng.below(6) as i64;
+                        idx.set(&IndexValue::Int(v), r).unwrap();
+                        truth.insert(r, v);
+                    }
+                }
+                window.push(r);
+            }
+            for &r in &sixes {
+                idx.remove_all_for_row(r);
+                truth.remove(&r);
+                window.push(r);
+            }
+            window.sort_unstable();
+            window.dedup();
+
+            // Run the spill phase by phase, taking a crash image after each.
+            let mut images = Vec::new();
+            let stage = idx.stage();
+            images.push(("after stage", crash_image(&durable, &snapshot(live.path()), &[0, 1, 2, 3], &mut rng)));
+            idx.sync_values().unwrap();
+            images.push(("after sync_values", crash_image(&durable, &snapshot(live.path()), &[0, 2], &mut rng)));
+            idx.commit(stage);
+            images.push(("after commit", crash_image(&durable, &snapshot(live.path()), &[0, 2], &mut rng)));
+            idx.sync_keys().unwrap();
+            images.push(("after sync_keys", snapshot(live.path())));
+            assert_matches(&idx, &truth, "live index");
+
+            for (phase, image) in images {
+                let what = format!("seed {seed}, crash {phase}");
+                let crashed = tempfile::TempDir::new().unwrap();
+                write_image(crashed.path(), &image);
+                let mut rec = DynFieldIndex::open(IndexValueType::Int, crashed.path()).unwrap();
+                runs += 1;
+                if rec.damaged_at_open() > 0 {
+                    // A torn slot: the owner records a full-rebuild gap. Check
+                    // the rebuild path converges too.
+                    damaged_runs += 1;
+                    let all: Vec<u128> = durable_truth.keys().chain(truth.keys()).copied().collect();
+                    replay(&mut rec, &all, &truth);
+                } else {
+                    replay(&mut rec, &window, &truth);
+                }
+                assert_matches(&rec, &truth, &what);
+                // And it survives its own spill + reopen.
+                rec.flush(crashed.path()).unwrap();
+                drop(rec);
+                let reopened = DynFieldIndex::open(IndexValueType::Int, crashed.path()).unwrap();
+                assert_eq!(reopened.damaged_at_open(), 0, "{what}: clean after recovery");
+                assert_matches(&reopened, &truth, &format!("{what}, reopened"));
+            }
+        }
+        assert_eq!(runs, 24 * 4);
+        assert!(damaged_runs < runs, "most crash images must recover by replay alone");
     }
 }

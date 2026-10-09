@@ -735,6 +735,25 @@ impl ContainerStore {
         }
     }
 
+    /// Insert or replace the container for `key`, taking ownership (no copy
+    /// on the heap backing).
+    pub fn insert_owned(&mut self, key: u128, container: Container) {
+        match &mut self.backing {
+            Backing::Heap(h) => {
+                let (card, cost) = (container.cardinality() as u64, heap_cost(&container));
+                h.cardinality += card;
+                h.heap_bytes += cost;
+                if let Some(old) = h.map.insert(key, container) {
+                    h.cardinality -= old.cardinality() as u64;
+                    h.heap_bytes -= heap_cost(&old);
+                }
+            }
+            Backing::Mapped(m) => {
+                m.upsert(key, &container);
+            }
+        }
+    }
+
     /// Remove the container for `key`. Returns the removed container's
     /// cardinality, or 0 if the key was not present.
     #[allow(dead_code)]
