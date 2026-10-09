@@ -413,8 +413,67 @@ and would also hold that much more WAL.
 
 ### Open questions, as resolved
 
-- Budget defaults stay at 32 / 64 MiB; they have not been sized against a
-  production write rate.
+- Budget defaults stay at 32 / 64 MiB, now measured (see *1M-document test*
+  below): the write buffers of four indexed fields peak at about 8.5 MB at the
+  server's top write rate, so the soft limit has about 4× headroom.
 - Step 1 shipped together with steps 2 and 3a on one branch.
 - The power-loss gap was fixed in the current format (step 3a), ahead of and
   independent of the deferred format change.
+
+### 1M-document test
+
+A scratch API server (release build, NVMe disk) with a uuid-keyed document
+store of four indexed fields: `active` (bool, 70% true), `tier` (16 values),
+`country` (200 values, skewed) and `price` (50,000 values). Documents come from
+a seeded generator that also writes the expected count for every value.
+
+**Load and correctness, WAL on.** 1M documents in 39 min 45 s, about 416
+writes/s (one WAL fsync per write; more client threads do not help). Write
+buffers peaked at 0.58 MB during the load and 4.75 MB during 200k random
+updates. After the load, and again after the updates and 50k deletes (950,000
+documents), every checked query — equality on each field, ranges, `IN`, `AND`,
+`OR`, `NOT` — returned the generator's count, with no degraded fields. A
+`kill -9` in the middle of the updates came back healthy in 2.88 s (12,845 WAL
+entries replayed), with no gap on any field. On disk: field indexes 48 MB (most
+of it `price`'s 50,000 directories), row map 75 MB, whole database 293 MB.
+
+**Write-buffer budget.** The same 1M documents and 200k updates without the WAL
+(about 5,000 writes/s), on a fresh store per setting:
+
+| Soft / hard | Load | Updates | Peak | Soft crossings | Hard spills |
+|---|---:|---:|---:|---:|---:|
+| 2 / 4 MiB | 5,287/s | 2,393/s | 4.2 MB | 926 | 1 (8.9 ms) |
+| 8 / 16 MiB | 5,251/s | 5,103/s | 8.4 MB | 2 | 0 |
+| 32 / 64 MiB (default) | 5,259/s | 5,123/s | 8.5 MB | 0 | 0 |
+
+Random updates fill the buffers far faster than appends, which only touch each
+value's last container. The default never fired; a limit below the natural
+peak only adds early checkpoints, which at 2/4 MiB halved the update rate.
+
+**Query latency** (HTTP, page of 20, p50, 950,000 documents): 0.3–0.5 ms for
+equality, `AND`, `OR` and `NOT`; 0.8–1.1 ms for `IN` and `tier >= 8`; 5.1 ms for
+`price < 1000`, which merges about 1,000 values' bitmaps. Evaluating a
+predicate on the index itself takes 0.3–3 µs; the rest is fetching the page's
+documents. That fetch took 12–13 ms per query before `4ef7c04`, because the
+batch read loaded each touched bucket's whole L1 SSTable.
+
+**uuid keys before and after** (100k documents, `b29d1ae` against `4ef7c04`):
+`b29d1ae` took row IDs from the uuids and read whole SSTables per query page.
+
+| | `b29d1ae` | `4ef7c04` |
+|---|---:|---:|
+| `active` bitmap, live bytes | 3.4 MB | 33 KB |
+| `tier` / `country` bitmaps | 3.4 MB each | 198 / 202 KB |
+| `active = true` | 6.2 ms | 0.39 ms |
+| `tier >= 8` | 24.7 ms | 0.47 ms |
+| `price < 1000` | 66.9 ms | 0.95 ms |
+| `NOT active = true` | 38.0 ms | 0.36 ms |
+
+`price` stays at about 4 MB either way: its 50,000 values hold about two rows
+each, which no row-ID scheme can pack.
+
+**`bench_predicate`** at `4ef7c04` against `b29d1ae` (alternated, two rounds):
+equal or faster on every case — `str_eq` 631–686 → 367–370 ns, `compound_and`
+2.35 → 2.02–2.04 µs, `int_range` 143–144 → 139 µs, `three_way_and` 89–92 →
+87 µs; AND at 6% selectivity within noise (58.6–60.4 vs 59.1–60.7 µs).
+

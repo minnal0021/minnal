@@ -123,8 +123,8 @@ segment_gc_threshold = 10.0
 # tail_gc_min_garbage_pct = 50.0
 
 # Memory limits for field-index write buffers. A field-index update changes an
-# in-memory copy of the affected bitmap; the copies are written to the index
-# files (a "spill") once per index checkpoint. These limits cap the memory all
+# in-memory copy of the affected bitmap container; the copies are written to
+# the index files (a "spill") once per index checkpoint. These limits cap the memory all
 # field indexes of the database hold in those copies together (they are not
 # per field).
 #   soft: crossing it requests an index checkpoint now, which writes every
@@ -132,6 +132,14 @@ segment_gc_threshold = 10.0
 #   hard: a write that leaves the total above it writes its own field's buffer
 #         out before returning, so memory stays bounded even if checkpoints
 #         fall behind. A soft limit above the hard one is clamped to it.
+# Sizing: the buffers hold what changed within one checkpoint interval
+# (1.75 s), so they grow with the write rate and the number of indexed fields.
+# Four indexed fields at the server's top rate (about 5,000 no-WAL writes/s,
+# random updates) peak at about 8.5 MB; WAL-backed writes (about 400/s) at
+# under 5 MB. A limit set too low costs throughput, not correctness: at 2/4 MiB
+# the constant early checkpoints halved the update rate. Check
+# `index_overlay.peak_bytes` in GET /admin/storage/ops-metrics against the soft
+# limit when adding many indexed fields.
 # Defaults: 33554432 (32 MiB) soft, 67108864 (64 MiB) hard.
 index_overlay_soft_bytes = 33_554_432
 index_overlay_hard_bytes = 67_108_864
