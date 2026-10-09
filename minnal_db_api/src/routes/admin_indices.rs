@@ -144,8 +144,11 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
 
 /// `POST /admin/indices/{ns}/attribute/reindex-all`
 ///
-/// Drops every field index for `{ns}` and rebuilds them all from scratch.
-/// Returns `202 Accepted`; progress is visible via `GET /admin/indices/{ns}/progress`.
+/// Drops every field index for `{ns}`, frees its row IDs (the row map is reset,
+/// so the rebuilt indexes number only the live documents), and rebuilds every
+/// index from scratch. Crash-safe: a run interrupted by a crash is finished at
+/// the next start. Returns `202 Accepted`; progress is visible via
+/// `GET /admin/indices/{ns}/progress`.
 /// Returns `409 Conflict` when any attribute or vector index operation is already active
 /// for this namespace.
 pub async fn attribute_reindex_all(
@@ -192,9 +195,8 @@ pub async fn attribute_reindex_all(
 
     tokio::spawn(async move {
         let result: Result<(), DocStoreError> = async {
-            let specs = store.drop_all_attribute_indices(&ns)?;
-            for spec in specs {
-                let handle = store.add_index(&ns, spec).await?;
+            // Crash-safe: an interrupted run is finished at the next start.
+            for handle in store.reindex_all_attribute_indices(&ns).await? {
                 index_manager.insert_field_build(handle);
             }
             Ok(())
