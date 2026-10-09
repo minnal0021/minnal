@@ -135,9 +135,11 @@ When it comes time to assign an ID for a key, `KVStore::resolve_row_id_alloc`
 (`kv_store.rs`) consults two sources in order:
 
 1. A caller-supplied `RowIdFn` wins if present — an escape hatch for keys that
-   embed their own ID (a UUID, say), paired with a `RowToKeyFn` for the reverse
-   direction. Such IDs are scattered rather than dense, so this trades bitmap
-   compactness for a stable, caller-controlled identifier.
+   embed their own ID, paired with a `RowToKeyFn` for the reverse direction. It
+   suits keys that are already dense or clustered; the document store uses it
+   for `u64` keys only. Random keys (v4 UUIDs, say) would put every row in a
+   container of its own, so every value's bitmap would hold one container per
+   document.
 2. Otherwise the dense `RowMap`, the normal path.
 
 These are the only two sources: a namespace's row map is always loaded before any
@@ -265,10 +267,11 @@ A write does not touch the `BlobStore`. Inserting `(value, row_id)`:
 1. Find or allocate the `slot_id` for `value` in `ordering`.
 2. Split `row_id` into its container key (upper 112 bits) and its low 16 bits.
 3. If the field's **overlay** (`slot_id → container key → Container`, on the
-   heap) does not hold that container yet, load it: decode the slot's directory
-   (once per slot, then kept with the overlay entry), find the container's blob
-   and decode just that container. A container the bitmap does not have yet
-   starts empty.
+   heap) does not hold that container yet, load it: binary-search the slot's
+   stored directory in place for the container key, and decode just that
+   container's blob. A container the bitmap does not have yet starts empty.
+   The overlay never copies a directory, so its memory follows the containers
+   that changed, not the size of the bitmaps.
 4. Insert the low 16 bits into the overlay's copy of the container, in place.
 
 Reads consult the overlay first and fall back to the store, container by

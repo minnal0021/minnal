@@ -368,8 +368,9 @@ failure this FR exists to eliminate.
 
 A single-field rebuild stays consistent with the namespace's other fields:
 
-- `doc_store` namespaces register a key-derived `RowIdFn`, a pure function of the
-  key, so IDs are stable by construction.
+- `doc_store` namespaces with `u64` keys register a key-derived `RowIdFn`, a
+  pure function of the key, so IDs are stable by construction. Other doc stores
+  (`uuid`, `u128`, `str`) use the dense `RowMap` below.
 - Dense-`RowMap` namespaces: `get_or_alloc` returns the existing ID for known
   keys, and `run_index_checkpoint` flushes the row map **before** any field
   marker. So any key the restored row map lacks was written after that marker and

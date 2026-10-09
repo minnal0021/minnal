@@ -129,6 +129,49 @@ pub fn find_entry(entries: &[DirEntry], key: u128) -> Option<DirEntry> {
     entries.binary_search_by_key(&key, |e| e.key).ok().map(|i| entries[i])
 }
 
+/// Number of entries in an encoded directory. Checks the magic and that the
+/// length matches the count, not the checksum (see [`lookup_dir`]).
+pub fn dir_count(bytes: &[u8]) -> Result<usize, StorageError> {
+    if bytes.len() < DIR_HEADER + DIR_CRC || bytes[0..4] != DIR_MAGIC {
+        return Err(StorageError("not a bitmap directory".into()));
+    }
+    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    match count.checked_mul(DIR_ENTRY).and_then(|n| n.checked_add(DIR_HEADER + DIR_CRC)) {
+        Some(n) if n == bytes.len() => Ok(count),
+        _ => Err(StorageError(format!("directory length {} does not match count {count}", bytes.len()))),
+    }
+}
+
+/// The entry for container `key` in an encoded directory, by binary search
+/// over its bytes: O(log n), no allocation.
+///
+/// Checks the magic and length but not the checksum, which costs a pass over
+/// the whole directory. That is safe because a directory is never changed
+/// once written: one torn by a crash is caught by the store's repair at open,
+/// and [`decode_dir`] checks the checksum on every full read.
+pub fn lookup_dir(bytes: &[u8], key: u128) -> Result<Option<DirEntry>, StorageError> {
+    let count = dir_count(bytes)?;
+    let entry = |i: usize| {
+        let c = &bytes[DIR_HEADER + i * DIR_ENTRY..DIR_HEADER + (i + 1) * DIR_ENTRY];
+        DirEntry {
+            key: u128::from_le_bytes(c[0..16].try_into().unwrap()),
+            offset: u64::from_le_bytes(c[16..24].try_into().unwrap()),
+            len: u32::from_le_bytes(c[24..28].try_into().unwrap()),
+        }
+    };
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let e = entry(mid);
+        match e.key.cmp(&key) {
+            std::cmp::Ordering::Equal => return Ok(Some(e)),
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +211,15 @@ mod tests {
         assert_eq!(decode_dir(&bytes).unwrap(), entries);
         assert_eq!(find_entry(&entries, 7).unwrap().offset, 64);
         assert!(find_entry(&entries, 8).is_none());
+        assert_eq!(dir_count(&bytes).unwrap(), 3);
+        for e in &entries {
+            assert_eq!(lookup_dir(&bytes, e.key).unwrap(), Some(*e));
+        }
+        for missing in [1, 6, 8, u128::MAX] {
+            assert_eq!(lookup_dir(&bytes, missing).unwrap(), None);
+        }
+        assert_eq!(lookup_dir(&encode_dir(&[]), 0).unwrap(), None);
+        assert!(lookup_dir(&bytes[..bytes.len() - 1], 7).is_err());
         assert!(decode_dir(&encode_dir(&[])).unwrap().is_empty());
     }
 
