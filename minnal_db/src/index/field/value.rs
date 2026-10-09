@@ -1761,11 +1761,25 @@ mod tests {
             images.push(("after stage", crash_image(&durable, &snapshot(live.path()), &[0, 1, 2, 3], &mut rng)));
             idx.sync_values().unwrap();
             images.push(("after sync_values", crash_image(&durable, &snapshot(live.path()), &[0, 2], &mut rng)));
+            // Writes between the stage and its commit (the checkpoint releases
+            // the lock between phases): their containers must stay buffered.
+            for _ in 0..50 {
+                let r = rng.below(ROW_SPAN) as u128;
+                let v = rng.below(8) as i64;
+                idx.set(&IndexValue::Int(v), r).unwrap();
+                truth.insert(r, v);
+                window.push(r);
+            }
+            window.sort_unstable();
+            window.dedup();
             idx.commit(stage);
             images.push(("after commit", crash_image(&durable, &snapshot(live.path()), &[0, 2], &mut rng)));
             idx.sync_keys().unwrap();
             images.push(("after sync_keys", snapshot(live.path())));
             assert_matches(&idx, &truth, "live index");
+            idx.flush(live.path()).unwrap();
+            assert_eq!(idx.overlay_bytes(), 0);
+            assert_matches(&idx, &truth, "live index after the next spill");
 
             for (phase, image) in images {
                 let what = format!("seed {seed}, crash {phase}");

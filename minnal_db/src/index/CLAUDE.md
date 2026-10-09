@@ -63,7 +63,8 @@ CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / sh
       2. sync_values()  READ lock:  msync both stores' value regions
                                     (failure → abort(stage): overlay kept, nothing pointed)
       3. commit(stage)  WRITE lock: point slots at the staged blobs; remove emptied slots;
-                                    drop overlay entries unchanged since stage (version check)
+                                    drop overlay entries unchanged since stage; of one
+                                    changed since, drop the containers it staged (versions)
       4. sync_keys()    READ lock:  msync both key tables
       if bitmap or keymap waste ≥ index_blob_waste_threshold (default 50%):
         WRITE lock: maybe_compact() → BlobStore::compact(); flush()
@@ -140,7 +141,7 @@ Both files of a `BlobStore` are `MAP_SHARED` mmaps the kernel writes back **at a
 
 1. `stage` (write lock) — `append_value` every changed container, a new directory for each changed bitmap, and every pending keymap entry. No slot points at them, so a crash here leaves only unreachable bytes. Reads keep using the overlay.
 2. `sync_values` (read lock) — msync both stores' value regions. On failure, `abort(stage)`: the overlay still holds everything and the pending keymap work is re-queued.
-3. `commit` (write lock) — `set_slot` each staged blob; remove emptied slots. An overlay entry is dropped only if its **version** is unchanged since the stage (a write between stage and commit keeps its entry for the next spill — this is what makes releasing the lock between phases safe).
+3. `commit` (write lock) — `set_slot` each staged blob; remove emptied slots. An overlay entry is dropped only if its **version** is unchanged since the stage (a write between stage and commit keeps its entry for the next spill — this is what makes releasing the lock between phases safe). A kept entry still sheds every container whose **container version** is unchanged since the stage (`drop_staged_containers`), and forgets its cached directory. Load-bearing: under concurrent writes the hot values (a boolean's two, a few popular strings) are written in every checkpoint window, so without shedding their entries never leave the overlay, accumulate every container they ever touched, and every spill rewrites all of them — whole-bitmap amplification again, and overlay memory growing with the bitmap. Found in the 1M-doc load (overlay 4.4 MB at 86k docs and climbing; ~0.6 MB expected). Regression test: `a_commit_sheds_the_containers_it_wrote_even_when_the_slot_changed_since`.
 4. `sync_keys` (read lock) — msync the key tables, bitmaps first, then keymap.
 
 No fsync runs under the write lock on the checkpoint path. `DynFieldIndex::spill` runs the same four steps in one call (hard-limit spill, `flush`), and returns early while the checkpoint has a stage in flight (`stage_in_flight`).

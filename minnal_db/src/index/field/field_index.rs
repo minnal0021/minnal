@@ -100,6 +100,9 @@ struct SlotChanges {
     /// Changed containers: the new contents, or `None` for a container that
     /// emptied (the spill drops it from the directory).
     containers: BTreeMap<u128, Option<Container>>,
+    /// The slot version at each container's last change, so a commit can drop
+    /// the containers it wrote out even when others changed after the stage.
+    container_ver: HashMap<u128, u64>,
     /// Whether the slot's whole bitmap is now empty (the spill removes it).
     empty: bool,
     /// Bytes this entry has charged to the budget.
@@ -127,12 +130,24 @@ fn group_rows(row_ids: &[u128]) -> BTreeMap<u128, Vec<u16>> {
 }
 
 /// What [`FieldIndex::stage`] appended and [`FieldIndex::commit`] applies:
-/// `(slot, overlay version, directory offset, directory len)` for changed
-/// bitmaps, and `(slot, overlay version)` for emptied ones.
+/// a new directory for each changed bitmap, and `(slot, overlay version)` for
+/// emptied ones.
 #[derive(Debug, Default)]
 pub struct SpillStage {
-    sets: Vec<(u128, u64, u64, u32)>,
+    sets: Vec<StagedDir>,
     removals: Vec<(u128, u64)>,
+}
+
+/// One changed bitmap's staged directory.
+#[derive(Debug)]
+struct StagedDir {
+    slot: u128,
+    /// The slot's overlay version when staged.
+    ver: u64,
+    offset: u64,
+    len: u32,
+    /// `(container key, container version)` of every container staged.
+    containers: Vec<(u128, u64)>,
 }
 
 impl<V: Ord + Clone> FieldIndex<V> {
@@ -216,6 +231,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
             };
             let mut entries: BTreeMap<u128, DirEntry> = base.into_iter().map(|e| (e.key, e)).collect();
             let mut blobs = Vec::new();
+            let staged: Vec<(u128, u64)> = self.overlay[&slot_id].container_ver.iter().map(|(&k, &v)| (k, v)).collect();
             for (&key, c) in &self.overlay[&slot_id].containers {
                 match c {
                     None => {
@@ -238,7 +254,13 @@ impl<V: Ord + Clone> FieldIndex<V> {
             }
             let dir: Vec<DirEntry> = entries.into_values().collect();
             let (offset, len) = self.bitmaps.append_value(&storage::encode_dir(&dir));
-            stage.sets.push((slot_id, ver, offset, len));
+            stage.sets.push(StagedDir {
+                slot: slot_id,
+                ver,
+                offset,
+                len,
+                containers: staged,
+            });
         }
         stage
     }
@@ -249,11 +271,16 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Returns the slots freed for good.
     pub fn commit(&mut self, stage: SpillStage) -> Vec<u128> {
         let mut freed = Vec::new();
-        for (slot_id, ver, offset, len) in stage.sets {
-            self.bitmaps.set_slot(slot_id, offset, len);
-            if !self.drop_overlay_entry_if_unchanged(slot_id, ver) {
-                // Its stored directory just changed: reload it on next touch.
-                self.forget_base(slot_id);
+        for set in stage.sets {
+            self.bitmaps.set_slot(set.slot, set.offset, set.len);
+            if !self.drop_overlay_entry_if_unchanged(set.slot, set.ver) {
+                // Written to after the stage: keep only the containers that
+                // changed since, and reload the stored directory (it just
+                // changed) on next touch. Without this a bitmap written in
+                // every checkpoint window would never shed a container, and
+                // every spill would rewrite all of them.
+                self.drop_staged_containers(set.slot, &set.containers);
+                self.forget_base(set.slot);
             }
         }
         for (slot_id, ver) in stage.removals {
@@ -279,6 +306,24 @@ impl<V: Ord + Clone> FieldIndex<V> {
             self.charge(-(ch.bytes as i64));
         }
         true
+    }
+
+    /// Drop from `slot_id`'s overlay entry every container in `staged` whose
+    /// version is unchanged: the commit just made the staged copy the stored
+    /// one.
+    fn drop_staged_containers(&mut self, slot_id: u128, staged: &[(u128, u64)]) {
+        let Some(ch) = self.overlay.get_mut(&slot_id) else { return };
+        let mut freed = 0u64;
+        for &(key, ver) in staged {
+            if ch.container_ver.get(&key) == Some(&ver) {
+                ch.container_ver.remove(&key);
+                if let Some(c) = ch.containers.remove(&key) {
+                    freed += OVERLAY_CONTAINER_OVERHEAD + c.map_or(0, |c| c.heap_bytes() as u64);
+                }
+            }
+        }
+        ch.bytes = ch.bytes.saturating_sub(freed);
+        self.charge(-(freed as i64));
     }
 
     /// Drop the cached stored directory of `slot_id`'s overlay entry.
@@ -375,6 +420,8 @@ impl<V: Ord + Clone> FieldIndex<V> {
             return false;
         }
         self.touch(slot_id);
+        let ver = self.overlay_ver[&slot_id];
+        self.overlay.get_mut(&slot_id).expect("touched").container_ver.insert(key, ver);
         if !self.overlay[&slot_id].containers.contains_key(&key) {
             let entry = self.overlay[&slot_id].base.as_deref().and_then(|b| storage::find_entry(b, key));
             let c = entry.and_then(|e| self.stored_container(slot_id, e));
@@ -1024,6 +1071,32 @@ mod tests {
         );
         assert!(live > 64 * 8_192, "the bitmap itself is ~{live} bytes");
         assert!(idx.evaluate(&Predicate::Eq(true)).contains(5 * 65_536 + 1));
+    }
+
+    /// A bitmap written between a spill's stage and its commit keeps only the
+    /// containers changed since the stage; the ones the commit wrote out leave
+    /// the overlay (and the budget), and later spills do not rewrite them.
+    #[test]
+    fn a_commit_sheds_the_containers_it_wrote_even_when_the_slot_changed_since() {
+        let mut idx = FieldIndex::<bool>::new();
+        // Touch 8 containers of `true`.
+        idx.insert_many(true, &(0..8u128).map(|c| c * 65_536 + 1).collect::<Vec<_>>());
+        let stage = idx.stage();
+        idx.insert(true, 8 * 65_536 + 1); // a 9th container, after the stage
+        idx.commit(stage);
+        let slot = idx.slot_id_for(&true).unwrap();
+        let held: Vec<u128> = idx.overlay[&slot].containers.keys().copied().collect();
+        assert_eq!(held, vec![8], "only the container changed after the stage stays buffered");
+        let one = idx.overlay_bytes();
+        assert!(one < 1_024, "overlay holds {one} bytes for one small container");
+
+        let (before, _) = idx.bitmap_blob_bytes();
+        idx.spill();
+        let (after, _) = idx.bitmap_blob_bytes();
+        assert!(after - before < 512, "the next spill rewrites one container, appended {}", after - before);
+        let got: Vec<u128> = idx.evaluate(&Predicate::Eq(true)).iter().collect();
+        assert_eq!(got, (0..9u128).map(|c| c * 65_536 + 1).collect::<Vec<_>>());
+        assert_eq!(idx.overlay_bytes(), 0);
     }
 
     /// Reads merge the overlay over the stored containers, and emptying every

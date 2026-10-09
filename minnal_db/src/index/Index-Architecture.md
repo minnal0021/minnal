@@ -414,7 +414,8 @@ would, after a power loss, point at zeros. So a spill runs in four steps:
 2. **Sync values** — msync both stores' value regions. If this fails, the spill
    is abandoned and the overlay keeps every change.
 3. **Commit** — point the slots at the staged directories and remove emptied slots.
-   An overlay entry that changed after the stage stays for the next spill.
+   If a bitmap changed after the stage, only its containers changed since then
+   stay in the overlay for the next spill; the ones just written leave it.
 4. **Sync keys** — msync both key tables.
 
 A slot is still rewritten in place, so a crash can tear one. Each slot carries a
