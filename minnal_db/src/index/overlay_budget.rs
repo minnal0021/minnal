@@ -21,6 +21,7 @@
 //! such write spills its own field again).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Default soft limit: request an early checkpoint (32 MiB).
 pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = 32 * 1024 * 1024;
@@ -34,6 +35,35 @@ pub struct IndexOverlayBudget {
     used: AtomicU64,
     soft: u64,
     hard: u64,
+    /// Highest `used` seen since the budget was created.
+    peak: AtomicU64,
+    /// Times `used` rose from below the soft limit to at or above it.
+    soft_crossings: AtomicU64,
+    /// Spills a writer ran because the hard limit was exceeded, and their
+    /// total duration.
+    hard_spills: AtomicU64,
+    hard_spill_nanos: AtomicU64,
+}
+
+/// A snapshot of an [`IndexOverlayBudget`]: current and peak use, its limits,
+/// and how often each limit fired. Served under `index_overlay` in
+/// `GET /admin/storage/ops-metrics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct IndexOverlayStats {
+    /// Bytes every field's write buffer holds now.
+    pub used_bytes: u64,
+    /// Highest `used_bytes` since the database opened.
+    pub peak_bytes: u64,
+    /// The soft limit (requests an early checkpoint).
+    pub soft_limit_bytes: u64,
+    /// The hard limit (the writer spills its own field).
+    pub hard_limit_bytes: u64,
+    /// Times use crossed the soft limit going up.
+    pub soft_crossings: u64,
+    /// Writes that spilled their field because use was over the hard limit.
+    pub hard_spills: u64,
+    /// Total time those writes spent spilling, in microseconds.
+    pub hard_spill_micros: u64,
 }
 
 impl IndexOverlayBudget {
@@ -44,6 +74,10 @@ impl IndexOverlayBudget {
             used: AtomicU64::new(0),
             soft: soft.min(hard),
             hard,
+            peak: AtomicU64::new(0),
+            soft_crossings: AtomicU64::new(0),
+            hard_spills: AtomicU64::new(0),
+            hard_spill_nanos: AtomicU64::new(0),
         }
     }
 
@@ -75,7 +109,12 @@ impl IndexOverlayBudget {
     /// Apply a change in one overlay's size.
     pub(crate) fn charge(&self, delta: i64) {
         if delta >= 0 {
-            self.used.fetch_add(delta as u64, Ordering::Relaxed);
+            let before = self.used.fetch_add(delta as u64, Ordering::Relaxed);
+            let after = before + delta as u64;
+            self.peak.fetch_max(after, Ordering::Relaxed);
+            if before < self.soft && after >= self.soft {
+                self.soft_crossings.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             let d = delta.unsigned_abs();
             // Saturate rather than wrap: a release can never exceed what was
@@ -83,6 +122,27 @@ impl IndexOverlayBudget {
             let _ = self
                 .used
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(d)));
+        }
+    }
+}
+
+impl IndexOverlayBudget {
+    /// Record a spill a writer ran because the hard limit was exceeded.
+    pub(crate) fn note_hard_spill(&self, took: Duration) {
+        self.hard_spills.fetch_add(1, Ordering::Relaxed);
+        self.hard_spill_nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Current use, peak, limits and counters.
+    pub fn stats(&self) -> IndexOverlayStats {
+        IndexOverlayStats {
+            used_bytes: self.used(),
+            peak_bytes: self.peak.load(Ordering::Relaxed),
+            soft_limit_bytes: self.soft,
+            hard_limit_bytes: self.hard,
+            soft_crossings: self.soft_crossings.load(Ordering::Relaxed),
+            hard_spills: self.hard_spills.load(Ordering::Relaxed),
+            hard_spill_micros: self.hard_spill_nanos.load(Ordering::Relaxed) / 1_000,
         }
     }
 }
@@ -107,5 +167,19 @@ mod tests {
         b.charge(-1000);
         assert_eq!(b.used(), 0, "a release saturates at zero");
         assert_eq!(IndexOverlayBudget::new(500, 200).soft_limit(), 200, "soft is clamped to hard");
+    }
+
+    #[test]
+    fn stats_track_peak_and_soft_crossings() {
+        let b = IndexOverlayBudget::new(100, 200);
+        b.charge(60);
+        b.charge(60); // crosses soft
+        b.charge(30);
+        b.charge(-150);
+        b.charge(120); // crosses soft again
+        b.note_hard_spill(Duration::from_micros(250));
+        let s = b.stats();
+        assert_eq!((s.used_bytes, s.peak_bytes, s.soft_crossings), (120, 150, 2));
+        assert_eq!((s.hard_spills, s.hard_spill_micros), (1, 250));
     }
 }

@@ -32,6 +32,11 @@ impl DocStore {
         self.db.ops_metrics()
     }
 
+    /// Field-index write buffers: use, peak, limits and how often each fired.
+    pub fn index_overlay_stats(&self) -> crate::IndexOverlayStats {
+        self.db.index_overlay_stats()
+    }
+
     /// Operational metrics for a single namespace, by name.
     ///
     /// The only failure mode is an unknown namespace, so any underlying error is

@@ -1183,8 +1183,8 @@ value. There are two distinct kinds:
 #### Operational metrics — `GET /admin/storage/ops-metrics`
 
 All counters below are **in-memory and reset to zero on restart**. They are grouped
-in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`, plus a
-top-level `uptime_s`.
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
+`index_overlay`, plus a top-level `uptime_s`.
 
 | Field | Group | Meaning | Survives restart? |
 |-------|-------|---------|-------------------|
@@ -1219,6 +1219,12 @@ top-level `uptime_s`.
 | `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
 | `wal_gc_runs` | gc | WAL GC passes run | **No** |
 | `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+| `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
+| `peak_bytes` | index_overlay | Highest `used_bytes` since startup | **No** |
+| `soft_limit_bytes` / `hard_limit_bytes` | index_overlay | `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` | n/a (config) |
+| `soft_crossings` | index_overlay | Times `used_bytes` rose past the soft limit, each asking for an early index checkpoint | **No** |
+| `hard_spills` | index_overlay | Writes that found `used_bytes` over the hard limit and wrote their field's buffer out before returning (two fsyncs each). A steady rate means the hard limit is too small for the write rate | **No** |
+| `hard_spill_micros` | index_overlay | Total time those writes spent writing their buffers out | **No** |
 
 > **Startup-repopulation note.** Although these counters start at zero, they are
 > wired in *before* recovery, so the work the engine does on the way up bumps some
@@ -1244,6 +1250,9 @@ returning the same grouped shape as the engine endpoint:
 - `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
   lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
   `uptime_s`).
+
+Neither per-namespace view has `index_overlay`: the write-buffer budget is shared
+by every field of every namespace.
 
 #### Storage metrics — field reference
 

@@ -648,7 +648,9 @@ impl DynFieldIndex {
     /// these methods, so the bound holds wherever the index is changed.
     fn spill_if_over_budget(&mut self) {
         if self.overlay_budget().over_hard() && self.overlay_bytes() > 0 {
+            let started = std::time::Instant::now();
             self.spill();
+            self.overlay_budget().note_hard_spill(started.elapsed());
         }
     }
 

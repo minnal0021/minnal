@@ -188,6 +188,8 @@ pub use crate::index::IndexValue;
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
 /// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
 pub use crate::index::IndexBlobStats;
+/// Field-index write-buffer use and limits ([`Db::index_overlay_stats`]).
+pub use crate::index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
 pub use db::namespace::FieldId;

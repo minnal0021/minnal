@@ -399,6 +399,12 @@ impl Db {
         self.inner.metrics_snapshot()
     }
 
+    /// Field-index write buffers: bytes held now and at peak, the soft and
+    /// hard limits, and how often each fired.
+    pub fn index_overlay_stats(&self) -> crate::IndexOverlayStats {
+        self.inner.index_overlay_budget.stats()
+    }
+
     /// Operational metrics for a single namespace, by name.
     pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
         self.inner.metrics_snapshot_for(namespace)
@@ -1531,6 +1537,12 @@ impl AsyncDb {
     /// Snapshot of engine-wide operational metrics (runtime counters).
     pub fn ops_metrics(&self) -> crate::db::metrics::MetricsSnapshot {
         self.inner.ops_metrics()
+    }
+
+    /// Field-index write buffers: bytes held now and at peak, the soft and
+    /// hard limits, and how often each fired.
+    pub fn index_overlay_stats(&self) -> crate::IndexOverlayStats {
+        self.inner.index_overlay_stats()
     }
 
     /// Operational metrics for a single namespace, by name.
