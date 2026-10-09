@@ -189,3 +189,19 @@ Before starting, re-run the search; the list below is what it found on
   `bench_predicate` vs `b29d1ae`: equal or faster on every case (`str_eq`
   635 → 345–366 ns, `int_range` 140–145 → 135–137 µs, `three_way_and` 89–92 →
   84–86 µs). Ops-metrics gained `index_overlay` (`734ae03`).
+
+- **Fixes found by the 1M-document test** (2026-10-09):
+  - `a9e7525` — a commit sheds the containers it wrote out, even when the slot
+    changed after the stage; without it, values written in every checkpoint
+    window never left the overlay and every spill rewrote all their containers.
+  - `711b1a6` — `uuid` / `u128` doc stores take dense row IDs from the row map
+    (key-derived IDs gave every document its own container: 33 MB for a
+    two-value field at 250k documents), and the overlay no longer caches
+    directories (it searches them in place), so its memory follows the
+    containers changed, not the bitmap size.
+  - `4ef7c04` — the LSM batch read reads near its keys instead of whole L1
+    files: query p50 on 950k documents 12–13 ms → 0.3–1 ms.
+- **1M-document test and budget sweep** (`d753e70`): results in the
+  evaluation's *1M-document test*. The 32 / 64 MiB defaults stay: four indexed
+  fields peak at about 8.5 MB at the top write rate. Follow-up filed as FR-006
+  (row-map compaction in `reindex-all`).
