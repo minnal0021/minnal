@@ -27,7 +27,7 @@ pub use self::schema::{
 pub use self::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
 
 // ── Store types ────────────────────────────────────────────────────────────
-pub use self::store::{DiskBuildProgress, DocId, DocStore, IndexBuildHandle, IndexBuildProgress};
+pub use self::store::{DiskBuildProgress, DocId, DocStore, IndexBuildHandle, IndexBuildProgress, RowMapStats};
 #[cfg(feature = "semantic-search")]
 pub use self::store::{ReindexStats, SemanticSearchContext, VecReindexProgress, VectorReindexOutcome};
 

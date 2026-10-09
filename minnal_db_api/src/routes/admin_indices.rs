@@ -1011,6 +1011,39 @@ pub async fn index_health(
     })))
 }
 
+/// `GET /admin/indices/{ns}/rowmap`
+///
+/// How much of the store's row map is spent on deleted documents. The row map
+/// gives every document a dense row ID for the field indexes and never frees
+/// one; `dead_ids` counts the IDs of documents that no longer exist, which
+/// [`reindex-all`](attribute_reindex_all) frees. Counts live documents with a
+/// key scan, so it is not free on a large store.
+///
+/// `uses_row_map: false` (and no counts) for a store without one: `u64` keys
+/// take their row IDs from the key, and a store whose indexes were never built
+/// has none yet. `404` for an unknown document store.
+pub async fn rowmap_stats(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
+    let stats = state.store.rowmap_stats(&ns).await.map_err(|e| match e {
+        DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+    Ok(Json(match stats {
+        Some(s) => serde_json::json!({
+            "namespace": ns,
+            "uses_row_map": true,
+            "ids_allocated": s.ids_allocated,
+            "live_docs": s.live_docs,
+            "dead_ids": s.dead_ids,
+            "bytes_on_disk": s.bytes_on_disk,
+        }),
+        None => serde_json::json!({ "namespace": ns, "uses_row_map": false }),
+    }))
+}
+
 /// `POST /admin/indices/{ns}/attribute/{field}/repair`
 ///
 /// Repair a degraded field index and clear its gap record.

@@ -109,6 +109,24 @@ pub struct DiskBuildProgress {
     pub error: Option<String>,
 }
 
+/// How much of a document store's row map is spent on deleted documents
+/// ([`DocStore::rowmap_stats`](super::DocStore::rowmap_stats)).
+///
+/// The row map gives every document a dense row ID for the field indexes and
+/// never frees one, so it grows with every document ever written. `dead_ids`
+/// counts the IDs of documents that no longer exist; `reindex-all` frees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RowMapStats {
+    /// Row IDs allocated: every document ever indexed, live or deleted.
+    pub ids_allocated: u64,
+    /// Documents in the store now.
+    pub live_docs: u64,
+    /// `ids_allocated - live_docs`: IDs held by deleted documents.
+    pub dead_ids: u64,
+    /// Bytes of the row map's files on disk.
+    pub bytes_on_disk: u64,
+}
+
 /// Path to the build-progress file for `(ns_id, field_id)`.
 ///
 /// The directory comes from [`crate::db::layout`] — the engine owns where index

@@ -392,7 +392,20 @@ mod tests {
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let (store, _) = seeded(db_dir.path(), schema_dir.path()).await;
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
+        let before = store.rowmap_stats("events").await.unwrap().unwrap();
+        assert_eq!(
+            (before.ids_allocated, before.live_docs, before.dead_ids),
+            (DOCS as u64, DOCS as u64 / 5, DOCS as u64 * 4 / 5)
+        );
         assert_eq!(store.drop_all_attribute_indices("events").unwrap().len(), 2);
         assert_eq!(store.db.rowmap_ids_allocated(ns_id).unwrap(), Some(0));
+        let after = store.rowmap_stats("events").await.unwrap().unwrap();
+        assert_eq!((after.ids_allocated, after.dead_ids), (0, 0));
+        assert!(
+            after.bytes_on_disk < before.bytes_on_disk,
+            "{} -> {} bytes",
+            before.bytes_on_disk,
+            after.bytes_on_disk
+        );
     }
 }

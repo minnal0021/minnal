@@ -22,6 +22,33 @@ impl DocStore {
         Ok(keys.len())
     }
 
+    /// Row-map usage of a document store: row IDs allocated against live
+    /// documents, and the files' size. `None` when the store has no row map —
+    /// `u64` keys (row IDs come from the key) or no index ever built.
+    ///
+    /// Counts the live documents by listing every key, so it costs a key scan
+    /// of the store; meant for occasional admin checks, not a hot path.
+    pub async fn rowmap_stats(&self, namespace: &str) -> Result<Option<RowMapStats>, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let Some(ids_allocated) = self.db.rowmap_ids_allocated(ns_id)? else {
+            return Ok(None);
+        };
+        let dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(&self.db_path), ns_id).join("rowmap");
+        let bytes_on_disk = std::fs::read_dir(&dir)
+            .map(|entries| entries.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum())
+            .unwrap_or(0);
+        let live_docs = self.count_docs(namespace).await? as u64;
+        Ok(Some(RowMapStats {
+            ids_allocated,
+            live_docs,
+            dead_ids: ids_allocated.saturating_sub(live_docs),
+            bytes_on_disk,
+        }))
+    }
+
     /// Returns engine-wide value-log statistics.
     pub fn db_stats(&self) -> crate::Stats {
         self.db.stats()
