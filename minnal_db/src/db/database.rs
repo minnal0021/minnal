@@ -675,7 +675,7 @@ pub struct Database {
     // namespaces inherit it. `None` until the checkpoint worker is enabled.
     pub(crate) index_checkpoint_trigger: Arc<parking_lot::RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
     /// Memory budget shared by every field index's write buffer (its overlay
-    /// of changed bitmaps). Set on each index when it is activated, before WAL
+    /// of changed containers). Set on each index when it is activated, before WAL
     /// replay, so replay is bounded by it too.
     pub(crate) index_overlay_budget: Arc<crate::index::IndexOverlayBudget>,
     /// Rejected field-index updates awaiting the next checkpoint, which turns
@@ -3032,10 +3032,10 @@ impl IndexCheckpointTarget for Database {
                         let over = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
                         (over, stats)
                     };
-                    // Guardrail: every spill appends each changed bitmap whole and
-                    // leaves the old copy behind, so a field whose bitmaps are large
-                    // and spill often (hard-limit spills between checkpoints) piles
-                    // up dead space (see index/CLAUDE.md). The compaction below
+                    // Guardrail: every spill appends each changed container and a
+                    // new directory and leaves the old copies behind, so a field
+                    // that spills often (hard-limit spills between checkpoints)
+                    // piles up dead space (see index/CLAUDE.md). The compaction below
                     // reclaims it, but warn when a field's bitmap blob has grown
                     // large with a small live footprint so operators can spot
                     // runaway growth between checkpoints.

@@ -1178,8 +1178,9 @@ fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
 
 /// Replaying a **low-cardinality** field must not balloon its blob store.
 ///
-/// The bitmap store is append-only and rewrites a whole bitmap per key, so a
-/// value shared by N keys leaves N-1 stale copies. On the write path the
+/// The bitmap store is append-only: each spill appends the changed containers
+/// and a new directory, leaving the old copies as dead space, and a replay
+/// window larger than the write-buffer budget spills repeatedly. On the write path the
 /// backpressure valve bounds that; during `activate_field_index`'s replay the
 /// valve is a no-op, because it signals the checkpoint *worker* and the workers
 /// are not started until every field has been activated.

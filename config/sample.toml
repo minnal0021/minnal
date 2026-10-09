@@ -138,8 +138,8 @@ index_overlay_hard_bytes = 67_108_864
 
 # Compact a field-index bitmap store at checkpoint when this percentage of its
 # value region is dead space (0.0–100.0). The bitmap store is append-only: each
-# spill appends every changed bitmap whole and leaves its previous copy behind;
-# compaction reclaims it. Lower = reclaim sooner (more compaction work),
+# spill appends every changed bitmap container plus a new directory for its
+# bitmap, and leaves the previous copies behind; compaction reclaims them. Lower = reclaim sooner (more compaction work),
 # higher = let more dead space accumulate first. Default 50.
 index_blob_waste_threshold = 50.0
 
@@ -147,10 +147,10 @@ index_blob_waste_threshold = 50.0
 # blob bytes, the write path requests an index checkpoint (which compacts the
 # field) immediately instead of waiting for the next periodic tick. Dead space
 # grows per spill, so this matters only when the write buffers stay over their
-# hard limit and spill on most writes (fields with very large bitmaps). It is an
-# absolute BYTE cap, not a ratio: such a field crosses any waste ratio after a
-# few spills and stays near 100%, so a ratio trigger would fire on nearly every
-# write. Self-debounces — compaction resets the field's dead-byte count. 0
+# hard limit and spill on most writes. It is an absolute BYTE cap, not a ratio:
+# a field whose few bitmaps change on every spill crosses any waste ratio after
+# a few spills and stays near 100%, so a ratio trigger would fire on nearly
+# every write. Self-debounces — compaction resets the field's dead-byte count. 0
 # disables it on the write path (WAL replay at open still compacts on the
 # default cap). Default: 67108864 (64 MiB).
 index_blob_backpressure_bytes = 67_108_864

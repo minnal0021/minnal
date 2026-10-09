@@ -15,7 +15,7 @@ re-check them before starting work.
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
-| [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | Proposed |
+| [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
 
 ---
 
@@ -848,6 +848,7 @@ by construction.
 **Source:** field-index write-back work on branch `roaring_bit_map_fixes`
 (steps 1–3a done; this is step 3b–3d of
 `minnal_db/src/index/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+**✅ Implemented:** 2026-10-09 (`0c04268`) — see *Implementation* below.
 
 ### Summary
 
@@ -882,3 +883,26 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
   containers) per spill, not O(bitmap size) per write.
 - Query latency on file-backed indexes (`bench_predicate`) does not regress.
 - The crash tests above pass.
+
+### Implementation
+
+- **Format** (`index/storage.rs`): each container is its own rkyv blob; a value's
+  slot points at a checksummed directory (`MBD1`, container key → offset, len).
+  `BlobStore` gained `BlobLayout::{Flat, Directory}` (keymap / bitmaps); dead and
+  live bytes, open-time repair (a torn directory, or one listing a container past
+  the file, counts as damaged → full-rebuild gap) and compaction read
+  directories. On-disk version 1 → 2: older stores refuse to open (greenfield;
+  delete and rebuild).
+- **Overlay** (`index/field/field_index.rs`): `slot → container key →
+  Option<Container>`, with the slot's decoded directory cached; a spill appends
+  only the changed containers and a new directory.
+- **Tests:** `every_spill_phase_crash_recovers_to_the_ground_truth` (crash after
+  each of stage / sync values / commit / sync keys, unsynced 4 KiB pages taken at
+  random from the old or new image, 24 seeds, half compacted first; reopen +
+  replay must equal the ground truth), and
+  `past_the_hard_limit_each_spill_appends_containers_not_bitmaps` (bool, 32
+  containers per value, 8 KiB hard limit: each write appends 18.2 KB — two
+  containers and two directories — where spilling both whole bitmaps would
+  append about 527 KB).
+- **Queries:** `bench_predicate` equal or faster than `b29d1ae` on every case
+  (`str_eq` 635 → 345–366 ns, `int_range` 140–145 → 135–137 µs).

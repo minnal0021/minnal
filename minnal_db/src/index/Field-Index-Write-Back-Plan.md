@@ -12,8 +12,8 @@ layout and write order (step 3).
 ## Resume here
 
 To pick up: read this file, run `git log --oneline main..` on the branch, and
-continue at the first unticked item. Steps 1–3a and their docs (step 4) are
-done; 3b–3d are deferred (see step 3, and FR-005 in `FEATURE-REQUEST.md`).
+continue at the first unticked item. Every step is done (3b–3d on 2026-10-09,
+as FR-005 in `FEATURE-REQUEST.md`).
 
 ## Step 1: heap-backed in-memory bitmap
 
@@ -77,14 +77,14 @@ containers (≤ 8 KB each), which removes the case.
       `BlobStore::upsert` is now test-only, so production code cannot skip the
       ordering.
 
-**Deferred** (agreed 2026-10-07: steps 1–3a deliver most of the gain; resume
-here only if the large-bitmap case matters):
+Deferred on 2026-10-07 (steps 1–3a delivered most of the gain), then done on
+2026-10-09 as FR-005:
 
-- [ ] 3b. Container-granular files: `blobs.vals` holds container blobs and
+- [x] 3b. Container-granular files: `blobs.vals` holds container blobs and
       per-slot directories; the overlay holds only changed containers (fixes
       the whole-bitmap spill loop past the budget, see above)
-- [ ] 3c. Compaction rewritten for the new layout (same staged-swap protocol)
-- [ ] 3d. Crash tests: crash before each write step, with a random subset of
+- [x] 3c. Compaction rewritten for the new layout (same staged-swap protocol)
+- [x] 3d. Crash tests: crash before each write step, with a random subset of
       dirty pages "written back"; reopen + replay must equal a full rebuild
 
 ## Step 4: docs (every place that describes index storage)
@@ -179,3 +179,13 @@ Before starting, re-run the search; the list below is what it found on
   replay is about 3 ms per indexed field. Interval kept at 1750 ms. Gotcha: the
   tests leak each crashed database, which slows the third case of a run by ~9 ms
   whatever its size (confirmed by reversing the order).
+
+- **Steps 3b–3d** (2026-10-09, `0c04268`): container-granular bitmap files
+  (directory + per-container blobs, `BlobStore` format version 2), container
+  overlay, directory-aware compaction and repair, crash-image tests (every spill
+  phase × random page write-back × 24 seeds). Past the hard limit a write appends
+  about one container and one directory per changed bitmap instead of the
+  bitmap (bool, 32 containers per value: about 527 KB → 18.2 KB per write).
+  `bench_predicate` vs `b29d1ae`: equal or faster on every case (`str_eq`
+  635 → 345–366 ns, `int_range` 140–145 → 135–137 µs, `three_way_and` 89–92 →
+  84–86 µs). Ops-metrics gained `index_overlay` (`734ae03`).

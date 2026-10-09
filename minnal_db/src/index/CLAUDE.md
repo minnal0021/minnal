@@ -16,10 +16,10 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 | `src/bitmap.rs` | `RoaringBitmap` — **custom** from-scratch Roaring implementation over a `u128` keyspace (no `roaring` crate dependency); backed by a `ContainerStore` (heap for transient bitmaps, mmap files for persistent ones) |
 | `src/container/` | The three container types (`Array`, `Bitset`, `Run`) + the `Container` enum dispatch and all cross-type set ops (`mod.rs`, `array.rs`, `bitset.rs`, `run.rs`, `ops.rs`) |
 | `src/container_store.rs` | `ContainerStore` — `u128 → Container` map behind one bitmap. **Heap** backing (`BTreeMap`, changed in place) for every transient bitmap (`RoaringBitmap::new`, loaded copies, query results); **Mapped** two-file store (`containers.keys` + `containers.vals`) for `create`/`open`. Never put transient bitmaps on the mapped backing: it appends a container copy per change (65,536 inserts → 514 MiB for an 8 KB bitmap) |
-| `src/blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store (same layout as `ContainerStore`); holds each `FieldIndex`'s serialised bitmaps off-heap. Crash-ordered writes (`append_value` → `sync_values` → `set_slot` → `sync_keys`), checksummed slots, repair at open. Also defines the `pub(crate) GrowableMmap` helper that `RowMap` reuses (`ContainerStore` keeps its own private one) |
+| `src/blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store (same layout as `ContainerStore`); holds each `FieldIndex`'s bitmaps off-heap in the **directory** layout (`BlobLayout::Directory`: slot → directory blob → container blobs; the keymap uses `Flat`). Space accounting, open-time repair and compaction read directories. On-disk `VERSION` 2. Crash-ordered writes (`append_value` → `sync_values` → `set_slot` → `sync_keys`), checksummed slots, repair at open. Also defines the `pub(crate) GrowableMmap` helper that `RowMap` reuses (`ContainerStore` keeps its own private one) |
 | `src/overlay_budget.rs` | `IndexOverlayBudget` — one atomic byte counter per `Database`, shared by every field's overlay, with a soft limit (request a checkpoint) and a hard limit (the writer spills its own field) |
 | `src/rowmap.rs` | `RowMap` — per-namespace dense row-ID map (`key↔id` + counter), mmap sidecar |
-| `src/storage.rs` | `serialize` / `deserialize` — `RoaringBitmap` ⇄ bytes (length-prefixed, rkyv per `Container`) for blob storage |
+| `src/storage.rs` | On-disk bitmap encoding: one rkyv blob per `Container` (`encode_container` / `decode_container`) and the checksummed per-bitmap **directory** (`MBD1`: sorted container key → offset, len; `encode_dir` / `decode_dir`) |
 | `src/simd_support/` | SIMD helpers for container set ops (popcount, bitwise, array merge, extract, sum, run-bitset). Each kernel has AVX-512/AVX2 (x86_64, runtime-detected) **and NEON (aarch64/Apple Silicon, baseline, compile-time)** paths plus a scalar fallback; all are unit-tested against the scalar reference. When adding a kernel, provide all three or guard the missing arch with `cfg`. |
 
 ## How it works
@@ -43,7 +43,8 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
                 v = extractor(value)                       (ExtractorFn: bytes → IndexValue)
                 DynFieldIndex::insert / update / set:      (clear old bucket(s) if any, insert new)
                   slot_id = ordering[v]                    (BTreeMap<V,u128>, in heap)
-                  overlay[slot_id] ← bitmap (loaded from the store on first touch), changed in place
+                  overlay[slot_id][row_id >> 16] ← container (loaded from the store on first
+                                                   touch via the slot's directory), changed in place
                   budget.charge(Δ heap bytes)
                   if budget.over_hard(): spill() THIS field  ← stage, msync vals, commit, msync keys
               after the lock: over_soft() → IndexCheckpointTrigger::request()
@@ -56,8 +57,9 @@ CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / sh
     wal_tail = wal_cut_ceiling()           (below any in-flight write)
     flush every row map first (its marker before any field's)
     per active field — spill, crash-ordered, no fsync under the write lock:
-      1. stage()        WRITE lock: append every overlay bitmap + pending keymap entry
-                                    to the value regions; no slot points at them yet
+      1. stage()        WRITE lock: append every changed container, a new directory per
+                                    changed bitmap, and pending keymap entries to the
+                                    value regions; no slot points at them yet
       2. sync_values()  READ lock:  msync both stores' value regions
                                     (failure → abort(stage): overlay kept, nothing pointed)
       3. commit(stage)  WRITE lock: point slots at the staged blobs; remove emptied slots;
@@ -76,8 +78,9 @@ COMPACTION (staged, crash-safe swap)                       [index/blob_store.rs]
 
 RECOVERY (on open)                                         [index + minnal_db]
   BlobStore::open → recover_compaction():  marker present ⇒ finish swap; absent ⇒ drop *.new
-                  → repair_at_open():      tombstone torn (bad CRC) / out-of-range slots,
-                                           recompute counts + write cursor from the slots
+                  → repair_at_open():      tombstone torn (bad CRC) / out-of-range slots, and
+                                           slots whose directory is torn or lists a container
+                                           past the file; recompute counts + write cursor
   DynFieldIndex::open → reconcile_at_open(): drop values with no bitmap, remove bitmaps no
                                            value maps to, new slot ids above both stores
   activate_field_index: damaged_at_open > 0 ⇒ gap (GapCause::DamagedIndexFile, FullRebuild);
@@ -115,15 +118,15 @@ Exceeding either yields `QueryError::TooComplex`.
 
 Field indexes live under `{db_path}/index/{ns_id}/{field_id}/` (layout in `db/index_manager.rs`). `IndexCheckpointWorker` in `minnal_db` spills every field's overlay and records the WAL offset the files reflect; on open, `minnal_db` replays the WAL from that offset to bring the index back in sync.
 
-### Writes are buffered in an overlay and spilled whole-bitmap — compaction reclaims dead space
+### Writes are buffered in an overlay of changed containers — compaction reclaims dead space
 
-`FieldIndex` holds each distinct value's `RoaringBitmap` as one blob in a `BlobStore` (`blobs.keys` open-addressing table + `blobs.vals` append-only value region). **A write never touches the blob store.** It changes an in-memory copy of the affected bitmap in the field's **overlay** (`slot → bitmap`), which reads consult first. The overlay is written out by a **spill** — at each index checkpoint, or by the writer itself when the shared `IndexOverlayBudget` passes its hard limit — which appends every changed bitmap **whole** and repoints its slot, leaving the previous copy as dead space.
+`FieldIndex` stores each distinct value's `RoaringBitmap` **container by container** in a `BlobStore` (`blobs.keys` open-addressing table + `blobs.vals` append-only value region): every container is its own blob, and the value's slot points at a **directory** blob listing them (`storage.rs`). **A write never touches the blob store.** It changes an in-memory copy of the one container the row falls in, held in the field's **overlay** (`slot → container key → Option<Container>`, `None` = container emptied), which reads consult first. The overlay entry also caches the slot's decoded directory (`SlotChanges::base`) so repeated writes to a big bitmap do not re-decode it; the cache is dropped when the stored directory changes under it (a commit that keeps the entry, or `compact_bitmaps`), because compaction moves every offset. The overlay is written out by a **spill** — at each index checkpoint, or by the writer itself when the shared `IndexOverlayBudget` passes its hard limit — which appends each changed container plus a new directory per changed bitmap and repoints the slot. Unchanged containers are shared between the old and new directory; the old directory and old copies of changed containers become dead space.
 
-Why: before the overlay, every insert re-serialised and appended the whole bitmap, which is O(N²) cumulative bytes per value — a boolean over 200k rows appended 3 GB for 54 KB live, and a 5-value field replayed over 16k docs left a 2.6 GB file that could not be opened. With the overlay, one bitmap is appended per changed value per spill (measured: bool 200k rows 3,076 MiB → 3.6 MiB; see `Field-Index-Write-Back-Evaluation.md` → *Results*). **Do not reintroduce a per-write blob write** (`BlobStore::upsert` is `#[cfg(test)]` for this reason and because it is not crash-ordered).
+Why: before the overlay, every insert re-serialised and appended the whole bitmap, which is O(N²) cumulative bytes per value — a boolean over 200k rows appended 3 GB for 54 KB live, and a 5-value field replayed over 16k docs left a 2.6 GB file that could not be opened. The overlay (step 2) made that one bitmap per changed value per spill (bool 200k rows 3,076 MiB → 3.6 MiB). It still held **whole** bitmaps, so once the changed bitmaps exceeded the hard limit (a boolean over ~300M rows) every write spilled its whole bitmap again; the container-granular layout (FR-005, steps 3b–3d) removed that: past the hard limit each write now appends about one container and a directory (`past_the_hard_limit_each_spill_appends_containers_not_bitmaps`). See `Field-Index-Write-Back-Evaluation.md` → *Results*. **Do not reintroduce a per-write blob write** (`BlobStore::upsert` is `#[cfg(test)]` for this reason and because it is not crash-ordered), and **do not go back to whole-bitmap blobs**.
 
-The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_bytes` 64 MiB) is **one counter per `Database`**, shared by every field (`Database::index_overlay_budget`, set on each `DynFieldIndex` at activation). Soft → `IndexCheckpointTrigger::request()` (uncapped; fires even with backpressure disabled). Hard → `spill_if_over_budget` on the writer's thread, under the field's write lock, including the two msyncs — so a write that crosses the hard limit is slow. A soft limit above the hard one is clamped; a hard limit of 0 spills every write.
+The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_bytes` 64 MiB) is **one counter per `Database`**, shared by every field (`Database::index_overlay_budget`, set on each `DynFieldIndex` at activation). It charges each overlay container's heap bytes plus a fixed overhead, each slot's overhead, and its cached directory. Soft → `IndexCheckpointTrigger::request()` (uncapped; fires even with backpressure disabled). Hard → `spill_if_over_budget` on the writer's thread, under the field's write lock, including the two msyncs — so a write that crosses the hard limit is slow. A soft limit above the hard one is clamped; a hard limit of 0 spills every write. `IndexOverlayBudget::stats()` (peak, soft crossings, hard spills and their time) is served under `index_overlay` in `GET /admin/storage/ops-metrics`.
 
-**Known limit (step 3b, deferred):** the overlay holds whole bitmaps. Once the bitmaps being changed add up to more than the hard limit (a boolean over ~300M rows), every write spills its whole bitmap again — the old per-write behaviour returns for that field. The fix is container-granular files (only changed ≤8 KB containers in the overlay); see `Field-Index-Write-Back-Plan.md` step 3.
+**Format version.** `BlobStore` `VERSION` is 2 (directory layout). A version-1 store fails `validate_open` with `InvalidData` and the field cannot activate — greenfield: delete the database (or the field's directory) and rebuild. There is no migration.
 
 `BlobStore::compact()` rebuilds the value region from live slots only, clears tombstones, and shrinks the file. `BlobStore::waste_ratio()` reports the reclaimable fraction (alignment padding counts as live). The checkpoint calls `DynFieldIndex::maybe_compact` per field when waste crosses `ThresholdConfig::index_blob_waste_threshold` (percent, default 50). `Db::checkpoint_index()` forces a flush+compaction on demand.
 
@@ -135,7 +138,7 @@ The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_b
 
 Both files of a `BlobStore` are `MAP_SHARED` mmaps the kernel writes back **at any time, in any order**, and slots are rewritten in place. So a spill is two-phase, and every step is load-bearing:
 
-1. `stage` (write lock) — `append_value` every changed bitmap and pending keymap entry. No slot points at them, so a crash here leaves only unreachable bytes. Reads keep using the overlay.
+1. `stage` (write lock) — `append_value` every changed container, a new directory for each changed bitmap, and every pending keymap entry. No slot points at them, so a crash here leaves only unreachable bytes. Reads keep using the overlay.
 2. `sync_values` (read lock) — msync both stores' value regions. On failure, `abort(stage)`: the overlay still holds everything and the pending keymap work is re-queued.
 3. `commit` (write lock) — `set_slot` each staged blob; remove emptied slots. An overlay entry is dropped only if its **version** is unchanged since the stage (a write between stage and commit keeps its entry for the next spill — this is what makes releasing the lock between phases safe).
 4. `sync_keys` (read lock) — msync the key tables, bitmaps first, then keymap.

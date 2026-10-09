@@ -139,8 +139,9 @@ pub struct ThresholdConfig {
     /// Percentage (`0..100`) of a field-index bitmap value region that may be
     /// dead space before the index checkpoint compacts it. The bitmap store is
     /// append-only: each time a field's buffered changes are written out (a
-    /// *spill*), every changed bitmap is appended whole and its previous copy
-    /// becomes dead space; compaction reclaims it.
+    /// *spill*), every changed container and a new directory for its bitmap are
+    /// appended, and their previous copies become dead space; compaction
+    /// reclaims it.
     pub index_blob_waste_threshold: f64,
     /// Absolute cap (bytes) on a single field index's reclaimable dead blob
     /// bytes before the write path requests an index checkpoint early (which
@@ -149,8 +150,8 @@ pub struct ThresholdConfig {
     /// Dead bytes accrue per spill, not per write. Spills happen once per
     /// checkpoint and, between checkpoints, whenever the write buffers pass
     /// [`index_overlay_hard_bytes`](Self::index_overlay_hard_bytes), so this
-    /// valve matters for fields whose changed bitmaps are large enough to keep
-    /// the buffers over the hard limit and spill on most writes.
+    /// valve matters only when the buffers stay over the hard limit and spill
+    /// on most writes.
     ///
     /// It is an absolute byte cap on purpose — a *ratio* trigger is useless
     /// here because a field with one large, often-rewritten bitmap crosses any
@@ -166,7 +167,7 @@ pub struct ThresholdConfig {
     /// database unable to open.
     pub index_blob_backpressure_bytes: u64,
     /// Soft limit (bytes) on the memory all of a database's field indexes hold
-    /// in their write buffers (changed bitmaps not yet written to their files).
+    /// in their write buffers (changed containers not yet written to their files).
     /// Crossing it requests an early index checkpoint, which writes every
     /// buffer out. Shared across fields, not per field.
     pub index_overlay_soft_bytes: u64,

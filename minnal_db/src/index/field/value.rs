@@ -459,7 +459,8 @@ impl DynFieldIndex {
     }
 
     /// Fraction (`0.0..1.0`) of the bitmap value region that is reclaimable
-    /// dead space: old copies left behind when a spill appends a changed bitmap.
+    /// dead space: old copies of changed containers and directories, left behind
+    /// when a spill appends their new copies.
     pub fn bitmap_waste_ratio(&self) -> f64 {
         match &self.inner {
             DynFieldIndexInner::Bool(fi) => fi.bitmap_waste_ratio(),
@@ -494,9 +495,10 @@ impl DynFieldIndex {
     }
 
     /// Snapshot of this field's on-disk blob growth and reclaimable waste, for
-    /// monitoring write amplification (each spill appends every changed bitmap
-    /// whole — see `index/CLAUDE.md`). Cheap: reads cached header fields and
-    /// scans live slots, no blob deserialisation.
+    /// monitoring write amplification (each spill appends every changed
+    /// container and a new directory per changed bitmap — see
+    /// `index/CLAUDE.md`). Reads the header and every live slot's directory;
+    /// decodes no container.
     pub fn blob_stats(&self) -> IndexBlobStats {
         let (bitmap_logical_bytes, bitmap_live_bytes) = match &self.inner {
             DynFieldIndexInner::Bool(fi) => fi.bitmap_blob_bytes(),
@@ -1378,8 +1380,9 @@ mod tests {
         let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
 
         // Two distinct values over many rows, spilled after every insert: each
-        // spill appends the whole changed bitmap, so the append-only value
-        // region accumulates dead space (the bloat compaction exists to reclaim).
+        // spill appends the changed container and a new directory, so the
+        // append-only value region accumulates dead space (the bloat compaction
+        // exists to reclaim).
         for row in 0..2_000u128 {
             let v = if row % 2 == 0 { 1 } else { 2 };
             idx.insert(&IndexValue::Int(v), row).unwrap();

@@ -130,7 +130,7 @@ fn total_blob_value_bytes(root: &std::path::Path) -> u64 {
 /// to it left one dead copy of the whole bitmap per document: 500 documents over
 /// two values bloated the value region past 256 KiB before any checkpoint. Now
 /// nothing reaches the store before the checkpoint, the checkpoint writes each
-/// value's bitmap once, and the index stays correct throughout.
+/// changed container once, and the index stays correct throughout.
 #[test]
 fn field_index_writes_are_buffered_until_the_checkpoint() -> Result<(), KVError> {
     let dir = tempfile::TempDir::new().unwrap();

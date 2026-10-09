@@ -8,7 +8,7 @@
 //! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
 //! index.
 //!
-//! A store has one of two layouts ([`BlobLayout`]). In the **flat** layout
+//! A store has one of two layouts (`BlobLayout`). In the **flat** layout
 //! (the keymap) a slot's blob is the whole value. In the **directory** layout
 //! (bitmaps) a slot's blob is a directory listing container blobs elsewhere in
 //! the same value region (format in `index::storage`), so replacing one

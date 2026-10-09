@@ -29,8 +29,8 @@ documents that hold them:
         ┌───────────────────────────────────────────────┐
         │ DynFieldIndex  (one per indexed field)          │
         │   ordering: BTreeMap<Value, slot_id>  (heap)    │  ← sorted, drives ranges
-        │   overlay:  slot_id → bitmap          (heap)    │  ← changes not yet written
-        │   bitmaps:  BlobStore  slot_id → serialised bm  │  ← off-heap, on disk
+        │   overlay:  slot_id → changed containers (heap) │  ← changes not yet written
+        │   bitmaps:  BlobStore  slot_id → container dir  │  ← off-heap, on disk
         │   keymap:   BlobStore  slot_id → value bytes    │  ← rebuilds ordering on open
         └───────────────────────────────────────────────┘
                               │  each bitmap is a …
@@ -57,11 +57,11 @@ memory-mapped store underneath are all implemented here, in `bitmap.rs` and
 
 The second is that **bitmaps live off-heap and are materialised only on demand.**
 A field index keeps just a small `BTreeMap` resident in memory. Each value's
-bitmap is a serialised byte blob in a memory-mapped `BlobStore`, deserialised into
-a live `RoaringBitmap` only when a query or a write actually touches it. This is
+bitmap is stored container by container in a memory-mapped `BlobStore`, and is
+decoded into a live `RoaringBitmap` only when a query actually touches it. This is
 what lets a namespace carry many large indexes without a proportional heap cost.
-The one exception is a bitmap that a write has changed: it stays in memory (the
-field's **overlay**) until the next checkpoint writes it out, under a memory
+The one exception is a container that a write has changed: it stays in memory
+(the field's **overlay**) until the next checkpoint writes it out, under a memory
 budget shared by every field of the database.
 
 The sections below walk up this stack: first how a field comes into existence,
@@ -246,38 +246,46 @@ field into many such bitmaps and routes queries to the right ones:
 
 ```
 ordering:  BTreeMap<V, u128>   // value → slot_id  (sorted; drives range queries)
-bitmaps:   BlobStore           // slot_id → serialised RoaringBitmap bytes
+bitmaps:   BlobStore           // slot_id → directory of that value's containers
 next_slot: u128
 ```
 
 The `ordering` map is kept on the heap — the values and their slot IDs, but
 none of the bitmap data. The bitmaps live in a `BlobStore` (`src/blob_store.rs`),
 which uses the same two-file mmap layout as `ContainerStore` (a header
-"MINNALBS", 48-byte slots, and an append-only `blobs.vals`) but stores arbitrary
-byte blobs rather than containers.
+"MINNALBS", 48-byte slots, and an append-only `blobs.vals`) but stores byte
+blobs. In a field's bitmap store, each container of each bitmap is its own blob,
+and a value's slot points at a small **directory** blob listing where its
+containers are (§5).
 
 ### Writes go to an in-memory overlay
 
 A write does not touch the `BlobStore`. Inserting `(value, row_id)`:
 
 1. Find or allocate the `slot_id` for `value` in `ordering`.
-2. If the slot has no entry in the field's **overlay** (`slot_id → RoaringBitmap`,
-   on the heap), load its blob and `storage::deserialize` it into one.
-3. `bitmap.insert(row_id)` on the overlay copy, in place.
+2. Split `row_id` into its container key (upper 112 bits) and its low 16 bits.
+3. If the field's **overlay** (`slot_id → container key → Container`, on the
+   heap) does not hold that container yet, load it: decode the slot's directory
+   (once per slot, then kept with the overlay entry), find the container's blob
+   and decode just that container. A container the bitmap does not have yet
+   starts empty.
+4. Insert the low 16 bits into the overlay's copy of the container, in place.
 
-Reads consult the overlay first and fall back to the store, so a query always
-sees every write. Removal is the mirror image. A document **update** removes the
-row from its old value's bitmap and inserts it under the new one. When the caller
-knows the old value — the document store always does — that touches one bitmap
+Reads consult the overlay first and fall back to the store, container by
+container, so a query always sees every write. Removal is the mirror image; a
+container that empties is recorded as removed, and a bitmap whose containers
+have all gone is empty. A document **update** removes the row from its old
+value's bitmap and inserts it under the new one. When the caller knows the old
+value — the document store always does — that touches one bitmap
 (`DynFieldIndex::update`). When it does not, `remove_all_for_row` clears the row
-from *every* value bucket; it checks membership on each stored bitmap's
-serialised form, decoding only the container the row falls in, and adds only the
-buckets that held the row to the overlay.
+from *every* value bucket; it checks membership by decoding only the container
+the row falls in, and adds only the buckets that held the row to the overlay.
 
 The overlay is written to the store by a **spill**, which appends each changed
-bitmap whole and points its slot at the new copy (§6). A spill happens at every
-index checkpoint (§7), and sooner if memory runs short. A bitmap that empties
-keeps its slot until the spill, which then frees it.
+container plus a new directory for its bitmap, and points the slot at the new
+directory (§6). A spill happens at every index checkpoint (§7), and sooner if
+memory runs short. A bitmap that empties keeps its slot until the spill, which
+then frees it.
 
 ### The memory budget
 
@@ -292,11 +300,17 @@ Every field of a database charges its overlay to one shared counter (an
 The hard limit keeps memory bounded even when checkpoints fall behind, at a
 cost to that one write: it appends and syncs the field's changes while holding
 the field's write lock. Total overlay memory stays below the hard limit plus,
-for each field written after it was crossed, one changed bitmap.
+for each field written after it was crossed, the containers that one write
+changed (a container is at most 8 KB).
 
-The overlay holds whole bitmaps, so it cannot help a field whose changed bitmaps
-together exceed the hard limit (a boolean over hundreds of millions of rows):
-every write to such a field spills its whole bitmap again.
+Because the overlay holds containers, not whole bitmaps, a write that has to
+spill writes only what changed: on a boolean over hundreds of millions of rows a
+spill appends one or two containers and their bitmaps' directories, not the
+bitmaps.
+
+`GET /admin/storage/ops-metrics` reports the budget under `index_overlay`: bytes
+held now and at peak, both limits, how often the soft limit was crossed, and how
+many writes spilled past the hard limit and for how long.
 
 Queries run through `evaluate`, which uses `ordering` to locate the slots a
 predicate needs and then OR-folds their bitmaps together. The lookup shape follows
@@ -333,8 +347,8 @@ Pulling the pieces together, a namespace's index directory looks like this:
     rows.slots                 ← key → id hash table, rebuilt from rows.idarray on open
     rowmap.ckpt                ← marker: magic "MINNALRM", next_id, keybytes_pos, wal_offset
   {field_id}/                  ← one directory per indexed field
-    blobs.keys                 ← mmap hash table: slot_id → (offset, len, CRC) into blobs.vals
-    blobs.vals                 ← append-only: serialised RoaringBitmap blobs
+    blobs.keys                 ← mmap hash table: slot_id → (offset, len, CRC) of its directory
+    blobs.vals                 ← append-only: container blobs, and one directory per bitmap
     keymap/
       blobs.keys               ← mmap hash table: slot_id → (offset, len) into keymap/blobs.vals
       blobs.vals               ← append-only: raw value bytes (1B bool, 8B LE i64, UTF-8 str)
@@ -343,21 +357,28 @@ Pulling the pieces together, a namespace's index directory looks like this:
 ```
 
 The bitmap blobs in `blobs.vals` warrant a note, because they are **not** a copy
-of the `ContainerStore` mmap. A stored bitmap is an independent, length-prefixed
-encoding (`src/storage.rs`):
+of the `ContainerStore` mmap. Each container is its own blob (rkyv-serialised
+`Container`, 16-byte aligned), and each bitmap is a **directory** blob listing
+its containers (`src/storage.rs`):
 
 ```
-[4B  LE u32   container_count]
-for each container (sorted by high key):
-  [16B LE u128  high key]
-  [4B  LE u32   blob_len]
-  [blob_len bytes  rkyv-serialised Container]
+[4B  magic "MBD1"]
+[4B  LE u32   count]
+count × [16B LE u128 container key][8B LE u64 offset][4B LE u32 len]   (sorted by key)
+[4B  LE u32   CRC-32 of everything before it]
 ```
 
-`deserialize` rebuilds a heap-backed `RoaringBitmap` from these bytes; the
-`unaligned` rkyv feature lets the archived containers be read straight out of the
-buffer without an aligned copy. Neither store has a log of its own: both are
+A directory lets a reader decode one container without the rest of the bitmap,
+and lets a spill append only the containers that changed: the new directory
+points at the new copies of those and at the existing blobs of the rest. The
+checksum lets open-time repair tell a torn directory from a good one (§8); a
+container blob is validated by rkyv's checked access when it is read. The
+`unaligned` rkyv feature lets the archived containers be read straight out of
+the map without an aligned copy. Neither store has a log of its own: both are
 derived from the KV data, and the engine's WAL rebuilds them after a crash (§8).
+
+The on-disk format version (in the `MINNALBS` header) is 2. A store with any
+other version refuses to open; delete the field's directory and rebuild it.
 
 ---
 
@@ -365,11 +386,14 @@ derived from the KV data, and the engine's WAL rebuilds them after a crash (§8)
 
 ### What a spill writes
 
-A spill appends every changed bitmap **whole** to `blobs.vals` and points its slot
-at the new copy. The previous copy stays in the file as dead space, because the
-value region is append-only (§3.3). So the file grows by the size of the changed
-bitmaps at each spill, not at each write: a value that gains a thousand rows
-between two checkpoints is appended once.
+For each changed bitmap, a spill appends the containers that changed and a new
+directory to `blobs.vals`, and points the slot at the new directory. The old
+directory and the old copies of the changed containers stay in the file as dead
+space, because the value region is append-only (§3.3); containers that did not
+change are shared by the old and new directory. So the file grows by what
+changed at each spill, not at each write and not by the size of the bitmaps: a
+value that gains a thousand rows between two checkpoints, all in its last
+container, appends one container and one directory.
 
 The keymap store has the same shape of problem in a milder form. It is written
 once per distinct value, so a fixed value set never grows it — but distinct-value
@@ -384,24 +408,28 @@ The files are shared memory maps, which the kernel writes back to disk at any
 time and in any order. A slot that reached disk before the blob it points at
 would, after a power loss, point at zeros. So a spill runs in four steps:
 
-1. **Stage** — append every changed bitmap and new keymap entry. No slot points
-   at them yet; reads keep using the overlay.
+1. **Stage** — append every changed container, a new directory for each changed
+   bitmap, and every new keymap entry. No slot points at them yet; reads keep
+   using the overlay.
 2. **Sync values** — msync both stores' value regions. If this fails, the spill
    is abandoned and the overlay keeps every change.
-3. **Commit** — point the slots at the staged blobs and remove emptied slots.
+3. **Commit** — point the slots at the staged directories and remove emptied slots.
    An overlay entry that changed after the stage stays for the next spill.
 4. **Sync keys** — msync both key tables.
 
 A slot is still rewritten in place, so a crash can tear one. Each slot carries a
 CRC-32 of its other bytes. On open, a store drops any slot that is torn or points
-past the end of its value file, and recomputes its counts and write position from
-the slots that remain (§8). Growing a key table writes the larger table to a new
+past the end of its value file — and, in a bitmap store, any slot whose directory
+fails its checksum or lists a container past the end of the file — and
+recomputes its counts and write position from the slots that remain (§8). Growing a key table writes the larger table to a new
 file and renames it into place.
 
 ### Compaction
 
 `BlobStore::compact()` reclaims dead space: it rebuilds the value region from the
-live slots only, dropping dead space and tombstones, and shrinks the file.
+live slots only — for a bitmap slot, the containers its directory lists followed
+by a new directory pointing at their new positions — dropping dead space and
+tombstones, and shrinks the file.
 `waste_ratio()` reports the reclaimable fraction — alignment padding counts as
 live, so it reads ≈0 immediately after a compaction. The trigger is a single
 threshold, `ThresholdConfig::index_blob_waste_threshold` (a percentage, default 50,
@@ -525,7 +553,8 @@ Per indexed namespace:
 
 activate_field_index()                            ← index-layer recovery
   ├── BlobStore::open() → recover_compaction() (finish or discard a staged swap)
-  │                      → drop torn (CRC) or out-of-range slots; recompute header
+  │                      → drop torn (CRC) or out-of-range slots, and slots whose
+  │                        directory is torn or out of range; recompute header
   ├── Rebuild ordering from the keymap store
   ├── Reconcile the two stores: drop values with no bitmap, bitmaps with no value;
   │       new slot ids start above both

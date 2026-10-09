@@ -40,7 +40,7 @@ fn status_extractor() -> ExtractorFn {
 }
 
 /// Sum the sizes of every `blobs.vals` value file under `root` — the append-only
-/// region holding the serialised bitmaps. With dense IDs a single-value bitmap is
+/// region holding the bitmap containers and directories. With dense IDs a single-value bitmap is
 /// one container regardless of doc count; with sparse hash IDs it would be one
 /// container per doc.
 fn total_blob_value_bytes(root: &std::path::Path) -> u64 {

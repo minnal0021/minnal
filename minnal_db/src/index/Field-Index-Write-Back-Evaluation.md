@@ -295,8 +295,9 @@ container per checkpoint, not per update:
 ## Results
 
 Implemented on `roaring_bit_map_fixes`: step 1 (`4e63447`), step 2 (`cb46a67`,
-`3ac93bd`), step 3a (`571c113`). Measured in release builds against `0270020`
-(the last commit before any code change), with separate target directories.
+`3ac93bd`), step 3a (`571c113`), steps 3b–3d (`0c04268`, FR-005). Measured in
+release builds against `0270020` (the last commit before any code change), with
+separate target directories, unless a section names another baseline.
 
 ### Write volume (step 2)
 
@@ -312,6 +313,17 @@ checkpoint interval):
 
 The 1,000-value field gains least: each spill rewrites most of its many small
 bitmaps.
+
+### Write volume past the hard limit (steps 3b–3d)
+
+With whole bitmaps in the overlay, a field whose changed bitmaps exceed the hard
+limit spilled its whole bitmap on every write. With container-granular files a
+spill appends only the changed containers and one directory per changed bitmap.
+Test `past_the_hard_limit_each_spill_appends_containers_not_bitmaps`: a boolean
+with 32 containers per value (264 KB per bitmap) and an 8 KiB hard limit, so
+every write spills. Each write moves one row between the two values and appends
+18.2 KB (two 8 KiB containers and two 32-entry directories), where spilling
+both whole bitmaps would append about 527 KB.
 
 ### Memory and insert cost (step 1)
 
@@ -329,6 +341,11 @@ it unchanged within noise. With indexes written to and read from their files
 (at `571c113`): `str_eq` 0.55 µs, `int_range` 148 µs, `compound_and` 2.2 µs,
 `three_way_and` 93 µs, `parse_and_eval` 88 µs.
 
+Steps 3b–3d, against `b29d1ae` (alternated, two rounds): equal or faster on every
+case. `str_eq` 635 → 345–366 ns, `int_range`
+140–145 → 135–137 µs, `compound_and` 2.26–2.29 → 1.98–2.04 µs, `three_way_and`
+89–92 → 84–86 µs, `parse_and_eval` 82–84 → 79–82 µs.
+
 ### Crash safety (step 3a)
 
 The power-loss gap described above is closed in the current file format: a
@@ -336,6 +353,15 @@ spill appends, syncs the values, then points the slots and syncs them; slots
 carry a checksum; open repairs torn slots and reconciles the bitmap and keymap
 stores; damaged files trigger a full rebuild of the field. A checkpoint adds one
 value-region `msync` per store and no measurable cost on the write path.
+
+Steps 3b–3d keep that write order and add a checksum to each directory; open
+treats a torn directory, or one that lists a container past the end of the file,
+like a torn slot. Test `every_spill_phase_crash_recovers_to_the_ground_truth`
+crashes after each spill phase (stage, sync values, commit, sync keys), with
+each unsynced 4 KiB page taken at random from the old or the new image, over 24
+seeds (half of them compacted first). Every image reopens, replays the window
+since the last durable spill, and matches the ground truth; removing the replay
+makes it fail.
 
 ### Restart time (WAL replay)
 
@@ -372,10 +398,11 @@ and would also hold that much more WAL.
 
 ### How the implementation differs from the proposal
 
-- **The overlay holds whole bitmaps, not containers.** Container granularity
-  needs the step-3 file format, which is deferred. Consequence: a field whose
-  changed bitmaps exceed the hard limit spills its whole bitmap on every write
-  (FR-005).
+- **Slots stay 48 bytes**, not the proposed 64. They carry a CRC-32 instead,
+  so a slot torn across a sector boundary is detected and dropped at open.
+- **Directories are flat**: one directory per bitmap, rewritten whole at each
+  spill that changes the bitmap (28 bytes per container, so 4.3 KB at 10M rows).
+  A two-level directory would only matter for bitmaps with far more containers.
 - **`index_blob_backpressure_bytes` keeps its meaning** (dead disk bytes per
   field). The overlay got two new settings instead, `index_overlay_soft_bytes`
   and `index_overlay_hard_bytes`, shared by all fields of a database. The

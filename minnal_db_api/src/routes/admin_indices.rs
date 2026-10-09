@@ -294,8 +294,9 @@ pub struct FieldBlobStatsResponse {
 ///
 /// Complements the fleet-wide [`GET /admin/storage/index-waste`](super::admin_storage::index_waste),
 /// which reports only waste *ratios*: this surfaces the absolute blob *growth*
-/// between compactions that a ratio hides — worst for fields with large bitmaps
-/// that change often, since every spill appends each changed bitmap whole. A
+/// between compactions that a ratio hides: every spill appends each changed
+/// container plus a new directory for its bitmap, leaving the old copies as dead
+/// space, so fields with many values that change often grow fastest. A
 /// large, high-waste `bitmap_logical_bytes` is the signal to force a
 /// [`POST /admin/storage/index-checkpoint`](super::admin_storage::trigger_index_checkpoint).
 ///
