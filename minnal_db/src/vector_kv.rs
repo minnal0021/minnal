@@ -1743,8 +1743,8 @@ mod queue_race_tests {
     //
     // Queue writes (enqueues, tombstones, and every conditional update, which the
     // WAL records as its resulting Upsert/Delete) are WAL-backed; vector writes
-    // are no-WAL. A crash is `std::mem::forget(db)` (no shutdown, no Drop-time
-    // flush), so reopening replays the WAL.
+    // are no-WAL. A crash is `db.crash()` (no shutdown, no Drop-time flush, but
+    // every file closed), so reopening replays the WAL.
 
     /// The worst case for R3: a delete races an embed, the worker's no-WAL vector
     /// writes reach disk, and the process dies before the worker can clean up.
@@ -1769,7 +1769,7 @@ mod queue_race_tests {
                     .flush_memtable_to_level0()
                     .unwrap();
             }
-            std::mem::forget(db); // crash before the worker completes
+            db.crash().await; // crash before the worker completes
         }
         let db = open_db(&dir).await;
         let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("tombstone survives replay");
@@ -1794,7 +1794,7 @@ mod queue_race_tests {
             let in_flight = snapshot(&db, b"x").await;
             enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
             finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("newer entry survives replay");
@@ -1815,7 +1815,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
             let f = snapshot(&db, b"failed").await;
             record_queue_failure(&db, &f, "timeout").await.unwrap();
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         assert!(
@@ -1938,7 +1938,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
             let second = snapshot(&db, b"x").await;
             finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
-            std::mem::forget(db); // crash: nothing flushed after finish_embed returned
+            db.crash().await; // crash: nothing flushed after finish_embed returned
         }
         let db = open_db(&dir).await;
         assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(), "the re-embed was completed");
@@ -1962,7 +1962,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
             upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap(); // the worker's write
             make_vector_writes_durable(&db, &["docs".to_string()]).await.unwrap(); // the batch flush
-            std::mem::forget(db); // crash before the completions
+            db.crash().await; // crash before the completions
         }
         let db = open_db(&dir).await;
         let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("entry still queued");
@@ -3024,7 +3024,7 @@ mod query_embedding_cache_tests {
             populate_and_flush(&db).await;
             assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 2);
             // Crash: skip shutdown and every Drop-time flush.
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         assert!(get_cached_query_embedding(&db, MODEL, "q1", 2, TEST_TTL).await.is_none());
@@ -3771,7 +3771,7 @@ mod crash_audit_tests {
                     Flushed::All => vec![sparse_vectors_ns(NS), sparse_vectors_meta_ns(NS), dense_vectors_ns(NS)],
                 };
                 db.flush_namespaces(names).await.unwrap();
-                std::mem::forget(db); // crash: unflushed no-WAL writes are lost
+                db.crash().await; // crash: unflushed no-WAL writes are lost
                 // Restart, in production's order: drain the queue left by the
                 // crash, then reconcile, then process what reconciliation queued.
                 let db = open(&dir).await;

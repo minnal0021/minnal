@@ -1165,6 +1165,44 @@ impl AsyncDb {
 
     /// Close the database, flushing all data to disk.
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_workers().await;
+
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Flush index state on clean shutdown, now that no worker can race
+            // with it. This is also what clears the no-WAL markers, so a clean
+            // shutdown reports no gap on the next open (FR-001).
+            if let Err(e) = db.inner.run_index_checkpoint() {
+                log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
+            }
+            db.shutdown()
+        })
+        .await
+        .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Test-only: simulate a crash. Stops the background workers, then drops
+    /// the database **without** the flushes `shutdown` and `Drop` would run,
+    /// so unflushed memtables and no-WAL writes are lost exactly as in a
+    /// process kill, while every file it had open is closed.
+    ///
+    /// Use this instead of `std::mem::forget(db)`, which also skips the flushes
+    /// but leaks every file descriptor and leaves the workers running against a
+    /// directory the test then reopens: a loop of forgotten databases runs a
+    /// test process out of descriptors (the vector crash audit hit 1,024).
+    ///
+    /// `self` must be the last handle to the database; a clone kept elsewhere
+    /// keeps it, and its files, alive. Compiled with the vector tests that use it.
+    #[cfg(all(test, feature = "semantic-search"))]
+    pub(crate) async fn crash(self) {
+        self.stop_workers().await;
+        self.inner.inner.mark_crashed();
+        debug_assert_eq!(Arc::strong_count(&self.inner), 1, "crash(): another handle still holds the database");
+    }
+
+    /// Stop every background worker (TTL, WAL GC, LSM compaction, value-log GC,
+    /// index checkpoint), waiting for each to finish its current pass.
+    async fn stop_workers(&self) {
         // Shutdown the global TTL worker first. The TTL config stays persisted in
         // the registry so it is restored on the next open.
         if let Some(worker) = self.inner.inner.ttl_worker.write().await.take() {
@@ -1206,19 +1244,6 @@ impl AsyncDb {
                 w.shutdown().await;
             }
         }
-
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            // Flush index state on clean shutdown, now that no worker can race
-            // with it. This is also what clears the no-WAL markers, so a clean
-            // shutdown reports no gap on the next open (FR-001).
-            if let Err(e) = db.inner.run_index_checkpoint() {
-                log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
-            }
-            db.shutdown()
-        })
-        .await
-        .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
     /// Test-only: whether the index checkpoint worker is currently installed.

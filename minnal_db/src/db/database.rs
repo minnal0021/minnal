@@ -2809,6 +2809,13 @@ impl Database {
         Ok(())
     }
 
+    /// Test-only: mark the database closed without flushing anything, so its
+    /// `Drop` skips the flushes a clean close runs. See `AsyncDb::crash`.
+    #[cfg(all(test, feature = "semantic-search"))]
+    pub(crate) fn mark_crashed(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
