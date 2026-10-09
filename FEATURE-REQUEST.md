@@ -16,6 +16,7 @@ re-check them before starting work.
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
+| [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | Proposed |
 
 ---
 
@@ -907,3 +908,83 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
   append about 527 KB).
 - **Queries:** `bench_predicate` equal or faster than `b29d1ae` on every case
   (`str_eq` 635 → 345–366 ns, `int_range` 140–145 → 135–137 µs).
+
+---
+
+## FR-006 — `reindex-all` compacts the row map
+
+**Filed:** 2026-10-09
+**Area:** `minnal_db` (`src/index/rowmap.rs`, `src/db/`), `minnal_db_api`
+(`POST /admin/indices/{ns}/attribute/reindex-all`)
+**Severity:** Low — disk and page cache only; affects namespaces that write many
+short-lived keys
+**Source:** discussion during the FR-005 1M-document test, after `uuid` and
+`u128` doc stores moved to dense row IDs (`711b1a6`)
+
+### Summary
+
+A namespace's row map (`index/{ns}/rowmap/`) gives each key a dense row ID and
+never frees one: a deleted key keeps its ID, and a key that comes back gets the
+same ID again. The files (`rows.keybytes`, `rows.idarray`, `rows.slots`) are
+memory-mapped, not heap, but they grow with **every distinct key ever written**,
+about 60 bytes per uuid key, and the row IDs of deleted keys leave holes that
+make the field bitmaps sparser over time. A namespace with steady key churn — TTL
+expiry, or documents deleted and re-created under fresh uuids — grows without
+bound.
+
+### Why IDs are never freed today
+
+A row ID is the only link between a key and its bits in every field index of the
+namespace. Giving a freed ID to a new key is safe only if no durable bitmap in
+any field still holds it. A bit can survive a delete: a field whose delete was
+not yet on disk at a crash, a field with an unrepaired gap, or one field rebuilt
+before or after the row map. WAL replay only re-applies writes and never clears a
+bit it does not know about, so a reused ID would make the new key match queries
+for the old key's values, silently. See the module docs in `index/rowmap.rs`.
+
+### Why the existing rebuilds do not fix it
+
+`reindex-all` drops every field index of the namespace and rebuilds each with
+`add_index`; per-field `repair` walks the live keys. Both go through
+`reindex_key` → `resolve_row_id_alloc` → `RowMap::get_or_alloc`, which returns
+each key's existing ID. The bitmaps end up holding only live rows, but the row
+map keeps every dead key and the live keys keep their sparse IDs.
+
+### Proposal
+
+`reindex-all` is the one point where freeing IDs is provably safe: once it has
+dropped every field index of the namespace, no bitmap references any row ID. At
+that point:
+
+1. Drop every field index, as today (the `dropped` flags are persisted first).
+2. Reset the namespace's row map: empty the three files and set `next_id` to 0.
+3. Rebuild every field, as today. Each live key is allocated a fresh dense ID.
+
+Row IDs are used only by the field bitmaps and the row map, and transiently to
+turn query hits back into keys. The vector index and `vector_kv` key by
+document ID, so they are unaffected.
+
+### Open questions
+
+- **Crash safety of step 2.** A crash between the reset and the end of the
+  rebuild must never leave a bitmap built under old IDs beside a reset row map.
+  The reset needs its own marker (or must happen only while every field is
+  durably dropped), and recovery must treat a half-done compaction as "rebuild
+  every field".
+- **Queries during the rebuild.** They already report the fields as
+  `degraded_fields` while `reindex-all` runs; confirm that still holds while the
+  row map is empty.
+- **`u64` stores** take row IDs from the key and have no row map; this applies
+  only to row-map namespaces (`str`, `uuid`, `u128` doc stores, and engine
+  namespaces without a `RowIdFn`).
+- Whether to also expose a dry-run that reports live keys versus keys in the row
+  map, so an operator can see when compaction is worth it.
+
+### Acceptance criteria
+
+- After deleting 90% of a namespace's documents and running `reindex-all`, the
+  row map files shrink to the live keys' size and `next_id` equals the live
+  document count.
+- Every query returns the same documents before and after.
+- A crash injected at each step of the reset and rebuild leaves either the old
+  state or a recorded full-rebuild gap, never wrong query results.
