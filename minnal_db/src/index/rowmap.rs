@@ -31,7 +31,13 @@
 //! WAL replay, so a crash mid-flush never yields an inconsistent map.
 //!
 //! Entries are **never removed** (a deleted-then-recreated key reuses its ID), so
-//! the table has no tombstones and `count == next_id` always.
+//! the table has no tombstones and `count == next_id` always. A field bitmap may
+//! still hold the ID of a deleted key (a delete not yet on disk at a crash, a
+//! gap not yet repaired), so handing a freed ID to another key would make it
+//! match the old key's values. The only way IDs are freed is
+//! [`reset`](RowMap::reset), and only when no field index of the namespace
+//! exists (`Database::reset_rowmap`; the document store's `reindex-all` and
+//! `drop-all` do it).
 //!
 //! ### The slot table is write-only (do not "optimise" the rebuild away)
 //!

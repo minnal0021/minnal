@@ -16,7 +16,7 @@ re-check them before starting work.
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
-| [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | Proposed |
+| [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 
 ---
 
@@ -988,3 +988,22 @@ document ID, so they are unaffected.
 - Every query returns the same documents before and after.
 - A crash injected at each step of the reset and rebuild leaves either the old
   state or a recorded full-rebuild gap, never wrong query results.
+
+### Implementation (2026-10-09, branch `fr006-rowmap-compaction`)
+
+- `Database::reset_rowmap` (`Db`/`AsyncDb`): refuses unless every field of the
+  namespace is dropped; `RowMap::reset` removes the marker first (the commit
+  point), then truncates the files.
+- `DocStore::reindex_all_attribute_indices`: intent file
+  `index/{ns_id}/reindex_all.json` → drop all → reset → re-add all → remove the
+  file; `resume_pending_builds` finishes an interrupted run. `drop-all` also
+  resets. `add_index` now records its build before saving the schema, closing a
+  window where a crash left a half-built index nothing resumed.
+- Queries list a field whose build is in progress or failed in
+  `degraded_fields` (`QueryOutcome::touched_fields`).
+- `GET /admin/indices/{ns}/rowmap`: IDs allocated, live documents, dead IDs,
+  bytes.
+- Manual test (100k uuid documents, 90k deleted): 100,000 → 10,000 IDs, row map
+  10.5 MB → 0.79 MB, `reindex-all` about 1 s; a `kill -9` mid-run was finished
+  at restart; every query matched the ground truth before and after.
+
