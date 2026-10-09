@@ -54,7 +54,7 @@ fn read_intent(path: &Path) -> Option<Intent> {
     match serde_json::from_slice(&bytes) {
         Ok(intent) => Some(intent),
         Err(e) => {
-            warn!("ignoring unreadable reindex-all intent file {}: {e}", path.display());
+            log::warn!("ignoring unreadable reindex-all intent file {}: {e}", path.display());
             None
         }
     }
