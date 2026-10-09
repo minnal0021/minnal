@@ -45,6 +45,7 @@ impl Database {
                 keys: Vec::new(),
                 total: 0,
                 degraded_fields,
+                touched_fields: touched.clone(),
             });
         }
 
@@ -70,6 +71,7 @@ impl Database {
             keys,
             total,
             degraded_fields,
+            touched_fields: touched.clone(),
         })
     }
 
@@ -154,6 +156,7 @@ impl Database {
                 keys: Vec::new(),
                 total: 0,
                 degraded_fields,
+                touched_fields: touched.clone(),
             });
         }
 
@@ -171,6 +174,7 @@ impl Database {
                 keys,
                 total,
                 degraded_fields,
+                touched_fields: touched.clone(),
             });
         }
 
@@ -184,6 +188,7 @@ impl Database {
                 keys,
                 total,
                 degraded_fields,
+                touched_fields: touched.clone(),
             });
         }
 
@@ -204,6 +209,7 @@ impl Database {
             keys,
             total,
             degraded_fields,
+            touched_fields: touched.clone(),
         })
     }
 }

@@ -250,7 +250,9 @@ mod tests {
         let ns_id = schema.ns_id.unwrap();
         let mut want: Vec<u128> = live.iter().filter(|d| d.1).map(|d| d.0).collect();
         want.sort_unstable();
-        assert_eq!(ids(store, "active = true").await.0, want, "{what}: active = true");
+        let (got, degraded) = ids(store, "active = true").await;
+        assert_eq!(got, want, "{what}: active = true");
+        assert!(degraded.is_empty(), "{what}: finished builds are not degraded ({degraded:?})");
         for t in 0..4 {
             let mut want: Vec<u128> = live.iter().filter(|d| d.2 == t).map(|d| d.0).collect();
             want.sort_unstable();
@@ -346,6 +348,43 @@ mod tests {
             h.wait().await.unwrap();
         }
         assert_rebuilt(&store, &live, "re-adds interrupted before reporting").await;
+    }
+
+    /// A query on a field whose index is still building (or whose build
+    /// failed) reports it in `degraded_fields`: the index holds only the
+    /// documents the build reached. Other fields are not tainted.
+    #[tokio::test]
+    async fn a_field_being_built_is_reported_degraded() {
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (store, _) = seeded(db_dir.path(), schema_dir.path()).await;
+        let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
+        let fid = store
+            .db
+            .list_index_fields(ns_id)
+            .iter()
+            .find(|f| f.field_name == "active")
+            .unwrap()
+            .field_id;
+        let progress = build_progress_path(&store.db_path, ns_id, fid);
+        let set = |status: &str| {
+            let p = DiskBuildProgress {
+                status: status.to_owned(),
+                total: 10,
+                indexed: 3,
+                last_key_hex: None,
+                error: None,
+            };
+            std::fs::write(&progress, serde_json::to_vec(&p).unwrap()).unwrap();
+        };
+        assert!(ids(&store, "active = true").await.1.is_empty());
+        set("in_progress");
+        assert_eq!(ids(&store, "active = true").await.1, vec!["active".to_owned()]);
+        assert_eq!(ids(&store, "active = true AND tier = 1").await.1, vec!["active".to_owned()]);
+        assert!(ids(&store, "tier = 1").await.1.is_empty(), "an untouched field does not taint the query");
+        set("failed");
+        assert_eq!(ids(&store, "NOT active = true").await.1, vec!["active".to_owned()]);
+        set("complete");
+        assert!(ids(&store, "active = true").await.1.is_empty());
     }
 
     #[tokio::test]
