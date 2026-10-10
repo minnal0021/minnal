@@ -412,6 +412,9 @@ async fn vector_bench() {
     let target: u32 = env_or("MINNAL_BENCH_TARGET", "128").parse().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
+    // The background workers, as a doc store runs them: without LSM compaction
+    // every flush leaves its L0 files for good and indexing slows as they pile up.
+    db.enable_all_workers(&DbConfig::default()).await.unwrap();
     db.namespace(NS.to_string()).await.unwrap();
     match mode.as_str() {
         "bundled" => crate::vector_kv::seed_ivf(&db, NS, &raw).await.unwrap(),

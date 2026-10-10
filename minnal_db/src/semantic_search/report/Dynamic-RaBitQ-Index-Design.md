@@ -1757,12 +1757,32 @@ targets 128 and 256 run alternately, two rounds of five latency passes:
   0.971 against about 0.966 for 256). 256 is cheaper only at a fixed large
   budget and in indexing.
 
-**Indexing cost.** Growing FiQA costs about 6 ms per inserted document
-beyond M2d (300–370 s against 3.7 s, embedding excluded), almost all of it the
-split journal's WAL-backed meta writes (two per document per split, about 540
-fsyncs per split, about 1,200 splits). In production it runs in the background
-next to an embedding call that costs far more per document; batching the meta
-writes of a split is the obvious reduction if it ever shows.
+**Indexing cost.** Growing FiQA costs about 0.55 ms per inserted document
+beyond a fixed partition: 35.6 s and 35.8 s against 3.8 s with the bundled
+file (gemma, corpus order, embedding excluded, the same binary, runs
+alternated). That is about 24 ms for each of the 1,300 or so splits, spent in
+the per-document reads and writes of the copy and delete steps, not in fsyncs.
+A variant that wrote those steps without the WAL and made them durable with
+four flushes per split measured 35.5 s and 34.9 s, the same within noise, so
+the journal keeps its WAL-backed writes. In production this runs in the
+background beside an embedding call that costs far more per document.
+
+The gate runs above had a bench fault: the vector bench opened its database
+without the background workers, so LSM compaction never ran. Every split's
+flush left its level-0 files in place, reads slowed as they piled up (25,000
+files in the meta namespace by mid-run), and indexing measured 300–370 s. The
+bench now starts the workers as a doc store does. Recall and latency are
+unaffected, because the bench compacts before it searches: rerun with the
+workers, gemma FiQA in corpus order gave the same nDCG@10, recall and Pass-1
+recall to the fourth decimal at every probe count.
+
+**Engine fix found by the split audit.** Trying the no-WAL variant exposed a
+bug in the storage engine: after a crash the write sequence was recovered from
+the WAL alone, so it could restart below a no-WAL value already flushed to
+disk, and every later write to that key lost to the stale value. The engine
+now starts the sequence above every stored one (`minnal_db/CLAUDE.md`). Any
+no-WAL write was exposed, including the vector payloads and the
+query-embedding cache.
 
 **Two changes to the design found while building it.** The journal's meta
 writes are WAL-backed (as since M0-2), not no-WAL; and in the delete step the
