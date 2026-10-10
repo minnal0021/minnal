@@ -245,7 +245,36 @@ fn git_describe() -> String {
 }
 
 /// Insertion order of doc rows.
-fn insertion_order(order: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<usize> {
+/// The 8-topic drifting order and topic labels the M3-pre simulation uses,
+/// exported next to the frozen dump by `work/bench/analysis/m3pre/export_orders.py`
+/// (`sim.doc_order(ns, "drifting")`: k-means with k = 8 on the whole-document
+/// vectors, topics in a seeded random order, shuffled within each). Reading
+/// them, rather than recomputing, keeps one definition of drifting for the
+/// simulation and the bench.
+fn drifting_topics(frozen_dir: &std::path::Path, n_docs: usize) -> (Vec<usize>, Vec<u8>) {
+    let read = |name: &str| {
+        std::fs::read(frozen_dir.join(name)).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}; run work/bench/analysis/m3pre/export_orders.py for this dataset and model",
+                frozen_dir.join(name).display()
+            )
+        })
+    };
+    let order: Vec<usize> = read("drifting.order.u32")
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .collect();
+    let topics = read("topics.u8");
+    assert_eq!(
+        (order.len(), topics.len()),
+        (n_docs, n_docs),
+        "stale drifting order in {}",
+        frozen_dir.display()
+    );
+    (order, topics)
+}
+
+fn insertion_order(order: &str, frozen: &Frozen, frozen_dir: &std::path::Path) -> Vec<usize> {
     let mut rows: Vec<usize> = (0..frozen.n_docs()).collect();
     match order {
         "corpus" => {}
@@ -256,11 +285,8 @@ fn insertion_order(order: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<us
                 rows.swap(i, j);
             }
         }
-        // Topics arrive one at a time: docs grouped by their nearest bundled centroid.
-        "drifting" => {
-            let key: Vec<u32> = rows.iter().map(|&d| find_closest_cluster_id(&index.clusters, frozen.dense(d))).collect();
-            rows.sort_by_key(|&d| (key[d], d));
-        }
+        // Topics arrive one at a time: the simulation's 8 k-means topics.
+        "drifting" => rows = drifting_topics(frozen_dir, frozen.n_docs()).0,
         other => panic!("unknown MINNAL_BENCH_ORDER '{other}' (corpus | shuffled | drifting)"),
     }
     rows
@@ -268,10 +294,10 @@ fn insertion_order(order: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<us
 
 /// The documents a churn run deletes after indexing (`MINNAL_BENCH_CHURN`):
 /// `random:<frac>` picks that share of documents at random; `topic:<frac>`
-/// deletes whole topics (documents grouped by their nearest bundled centroid, as
-/// `drifting` orders them) in a seeded random order until that share is gone.
-/// Deterministic, so a grown run and its static baseline delete the same set.
-fn churn_set(spec: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<bool> {
+/// deletes whole topics (the 8 topics `drifting` arrives in) in a seeded random
+/// order until that share is gone. Deterministic, so a grown run and its static
+/// baseline delete the same set.
+fn churn_set(spec: &str, frozen: &Frozen, frozen_dir: &std::path::Path) -> Vec<bool> {
     let (kind, frac) = spec
         .split_once(':')
         .unwrap_or_else(|| panic!("MINNAL_BENCH_CHURN '{spec}': random:<frac> | topic:<frac>"));
@@ -292,12 +318,10 @@ fn churn_set(spec: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<bool> {
             }
         }
         "topic" => {
+            let topics = drifting_topics(frozen_dir, n).1;
             let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
-            for d in 0..n {
-                groups
-                    .entry(find_closest_cluster_id(&index.clusters, frozen.dense(d)))
-                    .or_default()
-                    .push(d);
+            for (d, &t) in topics.iter().enumerate() {
+                groups.entry(u32::from(t)).or_default().push(d);
             }
             let mut ids: Vec<u32> = groups.keys().copied().collect();
             ids.sort_unstable();
@@ -533,7 +557,7 @@ async fn vector_bench() {
     // ── Index through the production write path ──
     // As the vector worker does: route, write and count under the routing epoch
     // against the current snapshot; in `grow` mode split between batches.
-    let rows = insertion_order(&order, &frozen, &index);
+    let rows = insertion_order(&order, &frozen, &frozen_dir);
     let t = Instant::now();
     for batch in rows.chunks(GROW_BATCH) {
         let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
@@ -573,7 +597,7 @@ async fn vector_bench() {
     let deleted = if churn.is_empty() {
         vec![false; frozen.n_docs()]
     } else {
-        churn_set(&churn, &frozen, &index)
+        churn_set(&churn, &frozen, &frozen_dir)
     };
     let gone: Vec<usize> = (0..frozen.n_docs()).filter(|&d| deleted[d]).collect();
     if !gone.is_empty() {
