@@ -927,6 +927,14 @@ pub(crate) struct LSMTree {
 }
 
 impl LSMTree {
+    /// An upper bound on every sequence this tree holds below its active
+    /// memtable (folded from every L0 and L1 file at open, and from each flush).
+    /// At open the memtable is empty, so it bounds everything stored: the write
+    /// sequence must start above it (see `KVStore::set_seq_counter`).
+    pub(crate) fn max_stored_seq(&self) -> u64 {
+        self.max_lower_seq.load(Ordering::Relaxed)
+    }
+
     fn read_exact_at(file: &File, buf: &mut [u8], offset: &mut u64) -> Result<bool> {
         let mut read_total = 0usize;
         while read_total < buf.len() {

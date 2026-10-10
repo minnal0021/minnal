@@ -472,7 +472,7 @@ impl Db {
 
     /// Make every write already applied to the named namespaces durable, no-WAL
     /// writes included. See `Database::flush_namespaces`.
-    #[cfg(feature = "semantic-search")]
+    #[cfg(any(test, feature = "semantic-search"))]
     pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
         self.inner.flush_namespaces(names)
     }
@@ -1192,8 +1192,8 @@ impl AsyncDb {
     /// test process out of descriptors (the vector crash audit hit 1,024).
     ///
     /// `self` must be the last handle to the database; a clone kept elsewhere
-    /// keeps it, and its files, alive. Compiled with the vector tests that use it.
-    #[cfg(all(test, feature = "semantic-search"))]
+    /// keeps it, and its files, alive.
+    #[cfg(test)]
     pub(crate) async fn crash(self) {
         self.stop_workers().await;
         self.inner.inner.mark_crashed();
@@ -1563,7 +1563,7 @@ impl AsyncDb {
     }
 
     /// Async [`Db::flush_namespaces`].
-    #[cfg(feature = "semantic-search")]
+    #[cfg(any(test, feature = "semantic-search"))]
     pub(crate) async fn flush_namespaces(&self, names: Vec<String>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.flush_namespaces(&names))

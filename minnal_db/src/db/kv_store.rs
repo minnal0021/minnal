@@ -307,7 +307,20 @@ impl KVStore {
     /// Share a global write-sequence counter with this store (called by the
     /// `Database` coordinator with its WAL sequence counter, so all writes —
     /// WAL-backed and non-WAL — draw from one monotonic sequence space).
+    /// Share the database's write-sequence counter, first raising it above
+    /// every sequence this store already holds.
+    ///
+    /// **Load-bearing for no-WAL writes.** The counter is recovered from the WAL
+    /// at open, but a no-WAL write takes a sequence the WAL never sees. After a
+    /// crash the counter could restart below a no-WAL value already flushed to an
+    /// SSTable, and every later write to that key — WAL-backed or not — would
+    /// lose to the stale value under highest-sequence-wins: a delete silently
+    /// undone, an update silently reverted. Found by the M3a split crash audit
+    /// while trying no-WAL meta writes (a meta rewritten after a restart never
+    /// became visible). Regression
+    /// test: `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
     pub(crate) fn set_seq_counter(&self, counter: Arc<AtomicU64>) {
+        counter.fetch_max(self.lsm.max_stored_seq().saturating_add(1), Ordering::SeqCst);
         *self.seq_counter.write() = counter;
     }
 

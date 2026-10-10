@@ -2325,7 +2325,7 @@ impl Database {
     /// another thread is already flushing is waited for, not skipped.
     ///
     /// [`flush_no_wal_memtables`]: Self::flush_no_wal_memtables
-    #[cfg(feature = "semantic-search")]
+    #[cfg(any(test, feature = "semantic-search"))]
     pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
         for name in names {
             let Some(ns_id) = self.registry.read().get_id(name) else {
@@ -2811,7 +2811,7 @@ impl Database {
 
     /// Test-only: mark the database closed without flushing anything, so its
     /// `Drop` skips the flushes a clean close runs. See `AsyncDb::crash`.
-    #[cfg(all(test, feature = "semantic-search"))]
+    #[cfg(test)]
     pub(crate) fn mark_crashed(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
     }

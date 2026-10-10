@@ -839,4 +839,41 @@ mod iterator_tests {
         assert_eq!(db.scan_prefix(b"x")?.len(), 0);
         Ok(())
     }
+
+    /// A no-WAL write takes a sequence the WAL never records. After a crash the
+    /// counter recovered from the WAL alone restarted below a no-WAL value
+    /// already flushed to an SSTable, so every later write to that key lost to
+    /// the stale value under highest-sequence-wins. `KVStore::set_seq_counter`
+    /// now raises the counter above every stored sequence at open.
+    #[tokio::test]
+    async fn a_write_after_a_crash_beats_a_flushed_no_wal_value() {
+        let dir = TempDir::new().unwrap();
+        let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        ns.put(b"k".to_vec(), b"wal".to_vec()).await.unwrap();
+        // Push the sequence well past what the WAL has seen, without the WAL.
+        for i in 0..100u32 {
+            ns.put_no_wal(i.to_be_bytes().to_vec(), b"x".to_vec()).await.unwrap();
+        }
+        ns.put_no_wal(b"k".to_vec(), b"no-wal".to_vec()).await.unwrap();
+        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
+        drop(ns);
+        db.crash().await;
+
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"no-wal"[..]));
+        ns.put(b"k".to_vec(), b"after".to_vec()).await.unwrap();
+        assert_eq!(
+            ns.get(b"k".to_vec()).await.unwrap().as_deref(),
+            Some(&b"after"[..]),
+            "a WAL put lost to the stale value"
+        );
+        ns.put_no_wal(b"k".to_vec(), b"after2".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"after2"[..]));
+        ns.delete(b"k".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap(), None, "a delete lost to the stale value");
+        db.shutdown().await.unwrap();
+    }
 }
