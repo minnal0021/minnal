@@ -705,3 +705,41 @@ async fn the_gate_moves_fewer_chunks() {
     }
     assert!(moves[1].0 <= moves[0].0 && moves[1].1 <= moves[0].1, "{moves:?}");
 }
+
+/// A split that only isolates a few outliers would be merged straight back,
+/// and the merge's re-routing would push the chunks back into the big half:
+/// splits and merges took turns hundreds of times on SciFact. Such a split is
+/// refused, so maintenance ends at once with the posting left whole.
+#[tokio::test]
+async fn a_split_that_the_next_merge_would_undo_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir).await;
+    init_ivf(&db, NS, DIM).await.unwrap();
+    let h = handle(&db).await;
+    // 20 documents of one repeated chunk, then two whose chunks sit on another
+    // topic: the only division 2-means can make isolates those 6.
+    for d in 0..20 {
+        index_doc(&db, &h, d, &vec![chunk(0, 1); 3]).await.unwrap();
+    }
+    for d in 20..22 {
+        index_doc(&db, &h, d, &(0..3).map(|j| chunk(3, d * 10 + j)).collect::<Vec<_>>())
+            .await
+            .unwrap();
+    }
+    let ops = full(60, 6, 64); // 66 chunks: over the limit; the outliers are 6
+    let report = maintain_partition(&db, NS, &h, &ops).await.unwrap();
+    assert_eq!(
+        report,
+        MaintenanceReport::default(),
+        "nothing to do: the only split isolates the outliers"
+    );
+    assert!(h.is_unsplittable(0, 66));
+    check(&db, &h, &expected(22)).await.unwrap();
+    // Once the posting's size changes (it is not retried at the same size),
+    // with a merge limit below the outliers, the same split goes ahead.
+    index_doc(&db, &h, 22, &vec![chunk(0, 1); 3]).await.unwrap();
+    let report = maintain_partition(&db, NS, &h, &full(60, 5, 64)).await.unwrap();
+    assert_eq!(report.splits, 1, "{report:?}");
+    check(&db, &h, &expected(23)).await.unwrap();
+    db.shutdown().await.unwrap();
+}

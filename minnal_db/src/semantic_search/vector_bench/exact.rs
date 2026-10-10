@@ -59,12 +59,20 @@ pub(super) fn top_k(scores: &[f32], k: usize) -> Vec<u32> {
     rows
 }
 
-fn compute(frozen: &Frozen) -> GroundTruth {
+fn compute(frozen: &Frozen, keep: Option<&[bool]>) -> GroundTruth {
     let per_query: Vec<(Vec<u32>, Vec<u32>)> = (0..frozen.n_queries())
         .into_par_iter()
         .map(|qi| {
             let q = frozen.query(qi);
-            let pass1 = top_k(&doc_maxsim(frozen, q), PASS1_K);
+            let mut scores = doc_maxsim(frozen, q);
+            if let Some(keep) = keep {
+                for (s, &k) in scores.iter_mut().zip(keep) {
+                    if !k {
+                        *s = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let pass1 = top_k(&scores, PASS1_K);
             let mut dense: Vec<f32> = vec![f32::NEG_INFINITY; frozen.n_docs()];
             for &d in &pass1 {
                 dense[d as usize] = dot(q, frozen.dense(d as usize));
@@ -86,9 +94,21 @@ pub(super) fn load_or_compute(dir: &Path, frozen: &Frozen) -> GroundTruth {
         return gt;
     }
     let t = std::time::Instant::now();
-    let gt = compute(frozen);
+    let gt = compute(frozen, None);
     std::fs::write(&path, serde_json::to_vec(&gt).unwrap()).unwrap();
     eprintln!("  exact ground truth computed in {:.1}s", t.elapsed().as_secs_f64());
+    gt
+}
+
+/// Ground truth over the documents `keep` marks (the survivors of a churn run),
+/// cached under `tag`.
+pub(super) fn load_or_compute_kept(dir: &Path, frozen: &Frozen, keep: &[bool], tag: &str) -> GroundTruth {
+    let path = dir.join(format!("ground_truth_{}_{tag}.json", frozen.manifest.split));
+    if let Ok(bytes) = std::fs::read(&path) {
+        return serde_json::from_slice(&bytes).unwrap();
+    }
+    let gt = compute(frozen, Some(keep));
+    std::fs::write(&path, serde_json::to_vec(&gt).unwrap()).unwrap();
     gt
 }
 

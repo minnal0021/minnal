@@ -27,6 +27,16 @@
 //! `MINNAL_BENCH_ROOT` (`../work/bench`), `MINNAL_BEIR_ROOT` (`../work/beir`),
 //! `MINNAL_BEIR_SPLIT` (`test`), `MINNAL_BENCH_MODEL` (`gemma`),
 //! `MINNAL_EMBED_URL` (only for the dump).
+//!
+//! Partition knobs: `MINNAL_BENCH_PARTITION` (`bundled` | `file` with
+//! `MINNAL_BENCH_CENTROIDS` | `grow`); in `grow` mode the namespace starts from
+//! one root posting and runs the production maintenance between batches of
+//! inserts, at `MINNAL_BENCH_TARGET` (128) chunks per posting, reassigning over
+//! `MINNAL_BENCH_REASSIGN` (64) neighbours, with the error-bound gate when
+//! `MINNAL_BENCH_GATE=1`. `MINNAL_BENCH_CHURN` (`random:<frac>` |
+//! `topic:<frac>`) deletes that share of the documents after indexing and
+//! evaluates on the survivors. `MINNAL_BENCH_TRACE` prints maintenance
+//! counters after every batch.
 
 mod code_width;
 mod exact;
@@ -126,6 +136,12 @@ struct Partition {
     /// insert"; each move is a put plus a delete or rewrite).
     #[serde(default)]
     moves_per_chunk: f64,
+    /// `MINNAL_BENCH_CHURN`, if documents were deleted after indexing.
+    #[serde(default)]
+    churn: String,
+    /// Documents deleted by the churn.
+    #[serde(default)]
+    deleted_docs: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,6 +264,61 @@ fn insertion_order(order: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<us
         other => panic!("unknown MINNAL_BENCH_ORDER '{other}' (corpus | shuffled | drifting)"),
     }
     rows
+}
+
+/// The documents a churn run deletes after indexing (`MINNAL_BENCH_CHURN`):
+/// `random:<frac>` picks that share of documents at random; `topic:<frac>`
+/// deletes whole topics (documents grouped by their nearest bundled centroid, as
+/// `drifting` orders them) in a seeded random order until that share is gone.
+/// Deterministic, so a grown run and its static baseline delete the same set.
+fn churn_set(spec: &str, frozen: &Frozen, index: &ClusterIndex) -> Vec<bool> {
+    let (kind, frac) = spec
+        .split_once(':')
+        .unwrap_or_else(|| panic!("MINNAL_BENCH_CHURN '{spec}': random:<frac> | topic:<frac>"));
+    let frac: f64 = frac.parse().unwrap();
+    let n = frozen.n_docs();
+    let target = (frac * n as f64).round() as usize;
+    let mut deleted = vec![false; n];
+    let mut s = SEED ^ 0xC4A2;
+    match kind {
+        "random" => {
+            let mut rows: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let j = (splitmix(&mut s) % (i as u64 + 1)) as usize;
+                rows.swap(i, j);
+            }
+            for &d in &rows[..target] {
+                deleted[d] = true;
+            }
+        }
+        "topic" => {
+            let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+            for d in 0..n {
+                groups
+                    .entry(find_closest_cluster_id(&index.clusters, frozen.dense(d)))
+                    .or_default()
+                    .push(d);
+            }
+            let mut ids: Vec<u32> = groups.keys().copied().collect();
+            ids.sort_unstable();
+            for i in (1..ids.len()).rev() {
+                let j = (splitmix(&mut s) % (i as u64 + 1)) as usize;
+                ids.swap(i, j);
+            }
+            let mut gone = 0;
+            for id in ids {
+                if gone >= target {
+                    break;
+                }
+                for &d in &groups[&id] {
+                    deleted[d] = true;
+                    gone += 1;
+                }
+            }
+        }
+        other => panic!("unknown churn kind '{other}' (random | topic)"),
+    }
+    deleted
 }
 
 fn error_stats(errors: &[(f32, f32)]) -> ErrorStats {
@@ -483,9 +554,64 @@ async fn vector_bench() {
             r.unwrap();
         }
         if mode == "grow" {
+            let tm = Instant::now();
             crate::ivf_split::maintain_partition(&db, NS, &handle, &ops).await.unwrap();
+            if std::env::var("MINNAL_BENCH_TRACE").is_ok() {
+                let c = handle.counters().read();
+                eprintln!(
+                    "  [{:7.1}s] batch done, maintenance {:.2}s: {} postings, {c:?}",
+                    t.elapsed().as_secs_f64(),
+                    tm.elapsed().as_secs_f64(),
+                    handle.snapshot().postings()
+                );
+            }
         }
     }
+    // ── Churn: delete a share of the documents, maintaining between batches as
+    //    the worker would; the evaluation then covers the survivors only ──
+    let churn = std::env::var("MINNAL_BENCH_CHURN").unwrap_or_default();
+    let deleted = if churn.is_empty() {
+        vec![false; frozen.n_docs()]
+    } else {
+        churn_set(&churn, &frozen, &index)
+    };
+    let gone: Vec<usize> = (0..frozen.n_docs()).filter(|&d| deleted[d]).collect();
+    if !gone.is_empty() {
+        let t = Instant::now();
+        for batch in gone.chunks(GROW_BATCH) {
+            let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
+            let mut set = tokio::task::JoinSet::new();
+            for &d in batch {
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let (handle, db) = (handle.clone(), db.clone());
+                set.spawn(async move {
+                    let _permit = permit;
+                    let _epoch = handle.read_epoch().await;
+                    let delta = crate::vector_kv::delete_vector(&db, NS, &(d as u64).to_be_bytes()).await.unwrap();
+                    handle.snapshot().apply_delta(&delta);
+                });
+            }
+            while let Some(r) = set.join_next().await {
+                r.unwrap();
+            }
+            if mode == "grow" {
+                crate::ivf_split::maintain_partition(&db, NS, &handle, &ops).await.unwrap();
+            }
+        }
+        eprintln!(
+            "  churn {churn}: deleted {} of {} documents in {:.1}s; {} posting(s) left",
+            gone.len(),
+            frozen.n_docs(),
+            t.elapsed().as_secs_f64(),
+            handle.snapshot().postings()
+        );
+    }
+    let gt = if gone.is_empty() {
+        gt
+    } else {
+        let keep: Vec<bool> = deleted.iter().map(|&x| !x).collect();
+        exact::load_or_compute_kept(&frozen_dir, &frozen, &keep, &churn.replace(':', "-"))
+    };
     let maintenance = handle.counters().read();
     if mode == "grow" {
         eprintln!(
@@ -549,7 +675,16 @@ async fn vector_bench() {
         reassign_moves: maintenance.reassign_moves,
         drain_moves: maintenance.drain_moves,
         moves_per_chunk: maintenance.chunk_moves() as f64 / frozen.n_chunks().max(1) as f64,
+        churn: churn.clone(),
+        deleted_docs: gone.len(),
     };
+    if !gone.is_empty() {
+        // The survivors, one doc row per line, for fitting a static baseline on them.
+        let out_dir = bench_root.join("results").join(&label);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let rows: String = (0..frozen.n_docs()).filter(|&d| !deleted[d]).map(|d| format!("{d}\n")).collect();
+        std::fs::write(out_dir.join(format!("{dataset}-{order}.survivors")), rows).unwrap();
+    }
     let footprint = Footprint {
         sparse_bytes,
         sparse_meta_bytes,

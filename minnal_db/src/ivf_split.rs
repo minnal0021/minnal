@@ -642,7 +642,18 @@ async fn split_locked(
     let result = tokio::task::spawn_blocking(move || balanced_two_means(&points, &params, &mut rng))
         .await
         .map_err(|e| crate::KVError::Io(std::io::Error::other(e)))?;
-    let Some(result) = result else {
+    // A split whose smaller half is at or under the merge limit is undone by the
+    // next merge: the half is merged away, and its chunks, nearer their own old
+    // centre than the merge target's, are routed back to the larger half, which
+    // is over the limit again. Measured on SciFact (gemma): 2-means isolated 3
+    // outlier chunks from a 262-chunk posting, and splits and merges took turns
+    // 900 times in one maintenance pass. So it counts as unsplittable at this
+    // size, like a posting 2-means cannot divide at all.
+    let smaller = result.as_ref().map_or(0, |r| {
+        let ones = r.labels.iter().filter(|&&l| l == 1).count() as u64;
+        ones.min(r.labels.len() as u64 - ones)
+    });
+    let Some(result) = result.filter(|_| smaller > ops.merge_limit) else {
         handle.mark_unsplittable(posting, chunks);
         return Ok(SplitOutcome::Unsplittable);
     };
