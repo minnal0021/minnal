@@ -182,6 +182,28 @@ pub fn index_embedding_zero_centred<L: IvfLayout + ?Sized>(
     index_embedding_to_cluster(&layout.rotate(embedding), &origin, style)
 }
 
+/// The unbiased reconstruction of a 1-bit chunk code, in the rotated space codes
+/// are computed in: `Pᵀc + scaling_factor · (2b − 1)`, where `rotated_centre` is
+/// the code's own centre (its `centre_id`) rotated, and `b` its sign bits
+/// (dimension `i` is bit `i % 64` of word `i / 64`). Its inner product with any
+/// rotated query is exactly the estimate Pass 1 scores with, so maintenance
+/// (splits, reassignment) sees each chunk as search does. `None` for a code that
+/// is not 1-bit or does not match the centre's dimension.
+pub fn reconstruct_single_bit(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<f32>> {
+    use crate::semantic_search::index::vector_index::QuantisationStyle;
+    if vi.quantisation_style != QuantisationStyle::SingleBit || vi.packed_vector.len() < rotated_centre.len().div_ceil(64) {
+        return None;
+    }
+    let s = vi.scaling_factor;
+    Some(
+        rotated_centre
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s })
+            .collect(),
+    )
+}
+
 pub fn index_embedding_to_cluster(
     embedding: &[f32],
     cluster: &Cluster,
@@ -970,5 +992,40 @@ mod tests {
         let embedding = vec![0.5f32; 16];
         let result = index_embedding(&cluster_map, &embedding, QuantisationStyle::MultiBit { number_of_bits: 8 });
         assert!(matches!(result, Err(ClusterIndexError::EmptyClusterMap)));
+    }
+
+    #[test]
+    fn a_one_bit_reconstruction_is_unbiased_and_keeps_most_of_the_direction() {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let dim = 64;
+        let mut state = 0x5eed_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (1u64 << 31) as f32 - 0.5
+        };
+        let centre = Cluster::new(1, (0..dim).map(|_| next()).collect());
+        let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+        let (mut errs, mut cos) = (Vec::new(), Vec::new());
+        for _ in 0..3000 {
+            let x: Vec<f32> = centre.centroid.iter().map(|&c| c + next()).collect();
+            let vi = index_embedding_to_cluster(&x, &centre, QuantisationStyle::SingleBit);
+            let xh = reconstruct_single_bit(&vi, &centre.centroid).unwrap();
+            errs.push(dot(&xh, &q) - dot(&x, &q));
+            let r: Vec<f32> = x.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+            let rh: Vec<f32> = xh.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+            cos.push(dot(&r, &rh) / (dot(&r, &r).sqrt() * dot(&rh, &rh).sqrt()));
+        }
+        let n = errs.len() as f64;
+        let mean = errs.iter().sum::<f64>() / n;
+        let sd = (errs.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / n).sqrt();
+        assert!(mean.abs() < 4.0 * sd / n.sqrt(), "bias {mean} vs sd {sd}");
+        let mean_cos = cos.iter().sum::<f64>() / n;
+        assert!((0.7..0.9).contains(&mean_cos), "direction kept {mean_cos}");
+        // Not a 1-bit code, or a centre of the wrong size: no reconstruction.
+        let multi = index_embedding_to_cluster(&q, &centre, QuantisationStyle::MultiBit { number_of_bits: 8 });
+        assert!(reconstruct_single_bit(&multi, &centre.centroid).is_none());
+        let vi = index_embedding_to_cluster(&q, &centre, QuantisationStyle::SingleBit);
+        assert!(reconstruct_single_bit(&vi, &[0.0; 128]).is_none());
     }
 }

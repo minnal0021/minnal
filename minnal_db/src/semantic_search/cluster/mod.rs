@@ -1,5 +1,6 @@
 use log::info;
 pub mod layout;
+pub mod split;
 pub use layout::{
     CountTable, IvfLayout, NamespaceIvf, PartitionHandle, Posting, PostingCounts, PostingDelta, PostingInfo, PostingOrigin, PostingState,
     ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes,
@@ -247,6 +248,16 @@ impl ClusterIndex {
         let mut out = v.to_vec();
         if let Some(rotation) = &self.rotation {
             rotation.rotator.rotate_inplace(&mut out);
+        }
+        out
+    }
+
+    /// The inverse of [`rotate`](Self::rotate): `v` from the space codes are
+    /// computed in back to the original space (`Pv`).
+    pub fn unrotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut out = v.to_vec();
+        if let Some(rotation) = &self.rotation {
+            rotation.rotator.unrotate_inplace(&mut out);
         }
         out
     }

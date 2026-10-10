@@ -544,6 +544,11 @@ impl NamespaceIvf {
         Self::with_counts(postings.into_values().collect(), centres, seed, Arc::clone(&self.counts))
     }
 
+    /// `v` from the space codes are computed in back to the original space.
+    pub fn unrotate(&self, v: &[f32]) -> Vec<f32> {
+        self.centres.unrotate(v)
+    }
+
     /// The rotation seed (`None` for dimensions too small to rotate).
     pub fn rotation_seed(&self) -> Option<u64> {
         self.centres.rotation_seed()
