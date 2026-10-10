@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Cluster, ClusterIndex, DEFAULT_ROTATION_SEED, find_closest_cluster_id};
@@ -204,16 +205,17 @@ impl<L: IvfLayout> IvfLayout for WithEntryCounts<L> {
     }
 }
 
-/// How one document's write changed posting sizes: a posting gains an entry
-/// for each id in `added` and loses one for each id in `removed`. Returned by
-/// the vector writes in `vector_kv` and applied with
-/// [`NamespaceIvf::apply_delta`].
+/// How vector writes changed posting sizes. Each element is one entry (one
+/// document's chunks in one posting) with its chunk count: an entry in `added`
+/// was written, one in `removed` was deleted. A document whose entry in a
+/// posting is rewritten appears in both, so its chunk count is exact. Returned by
+/// the vector writes in `vector_kv` and applied with [`CountTable::apply`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostingDelta {
-    /// Postings that gained this document's entry.
-    pub added: Vec<u32>,
-    /// Postings that lost this document's entry.
-    pub removed: Vec<u32>,
+    /// `(posting, chunks)` of each entry written.
+    pub added: Vec<(u32, u32)>,
+    /// `(posting, chunks)` of each entry deleted.
+    pub removed: Vec<(u32, u32)>,
 }
 
 impl PostingDelta {
@@ -221,6 +223,146 @@ impl PostingDelta {
     pub fn extend(&mut self, other: PostingDelta) {
         self.added.extend(other.added);
         self.removed.extend(other.removed);
+    }
+
+    /// `true` when nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// One posting's size.
+#[derive(Debug, Default)]
+pub struct PostingCounts {
+    /// Entries: one per document with chunks in the posting.
+    pub entries: AtomicU64,
+    /// Chunks across those entries.
+    pub chunks: AtomicU64,
+}
+
+/// Every posting's size, **exact**: counted from the namespace's document
+/// records when its partition loads, then kept current by every vector write's
+/// [`PostingDelta`]. Shared by every snapshot of a namespace's partition, so a
+/// count never has to be copied when a split publishes a new snapshot. The
+/// split trigger and probing by budget both read it.
+#[derive(Debug, Default)]
+pub struct CountTable {
+    map: parking_lot::RwLock<HashMap<u32, Arc<PostingCounts>>>,
+}
+
+impl CountTable {
+    /// A table holding `counts` (`posting → (entries, chunks)`).
+    pub fn from_counts(counts: &HashMap<u32, (u64, u64)>) -> Self {
+        let t = Self::default();
+        t.set_all(counts);
+        t
+    }
+
+    /// Replace every count.
+    pub fn set_all(&self, counts: &HashMap<u32, (u64, u64)>) {
+        let mut map = self.map.write();
+        map.clear();
+        for (&id, &(e, c)) in counts {
+            map.insert(
+                id,
+                Arc::new(PostingCounts {
+                    entries: AtomicU64::new(e),
+                    chunks: AtomicU64::new(c),
+                }),
+            );
+        }
+    }
+
+    fn slot(&self, id: u32) -> Arc<PostingCounts> {
+        if let Some(c) = self.map.read().get(&id) {
+            return Arc::clone(c);
+        }
+        Arc::clone(self.map.write().entry(id).or_default())
+    }
+
+    /// Apply a delta. A count never goes below 0.
+    pub fn apply(&self, delta: &PostingDelta) {
+        for &(id, chunks) in &delta.added {
+            let c = self.slot(id);
+            c.entries.fetch_add(1, Ordering::Relaxed);
+            c.chunks.fetch_add(u64::from(chunks), Ordering::Relaxed);
+        }
+        for &(id, chunks) in &delta.removed {
+            let c = self.slot(id);
+            let _ = c
+                .entries
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            let _ = c
+                .chunks
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(u64::from(chunks))));
+        }
+    }
+
+    /// `(entries, chunks)` of `posting` (0, 0 for one never counted).
+    pub fn get(&self, posting: u32) -> (u64, u64) {
+        self.map
+            .read()
+            .get(&posting)
+            .map_or((0, 0), |c| (c.entries.load(Ordering::Relaxed), c.chunks.load(Ordering::Relaxed)))
+    }
+
+    /// Every posting's `(entries, chunks)`.
+    pub fn snapshot(&self) -> HashMap<u32, (u64, u64)> {
+        self.map
+            .read()
+            .iter()
+            .map(|(&id, c)| (id, (c.entries.load(Ordering::Relaxed), c.chunks.load(Ordering::Relaxed))))
+            .collect()
+    }
+}
+
+/// Lifecycle of a posting (design doc M3a, *Maintenance journal*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PostingState {
+    /// Takes new chunks and is probed.
+    Active = 0,
+    /// Being split or merged away: probed (it still holds chunks), but no new
+    /// chunk is routed to it.
+    Draining = 1,
+    /// Empty and gone from routing and probing; kept as a record (its centre
+    /// may still be what moved codes decode against).
+    Retired = 2,
+}
+
+impl PostingState {
+    /// The state a stored byte names.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Active),
+            1 => Some(Self::Draining),
+            2 => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
+/// How a posting came to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PostingOrigin {
+    /// The single posting a namespace starts with.
+    Root = 0,
+    /// Copied from a centroid file (namespaces enabled before M3).
+    Seed = 1,
+    /// One half of a split.
+    Split = 2,
+}
+
+impl PostingOrigin {
+    /// The origin a stored byte names.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Root),
+            1 => Some(Self::Seed),
+            2 => Some(Self::Split),
+            _ => None,
+        }
     }
 }
 
@@ -233,29 +375,73 @@ pub struct Posting {
     pub routing_centroid: Vec<f32>,
     /// The centre new codes in this posting are encoded against.
     pub centre_id: u32,
+    /// Where it is in its lifecycle.
+    pub state: PostingState,
+    /// The posting it was split from.
+    pub parent_id: Option<u32>,
+    /// How it was created.
+    pub origin: PostingOrigin,
 }
 
-/// A namespace's own partition: its postings, its centres, and its rotation.
+impl Posting {
+    /// An `Active` posting seeded from a centroid file (no parent).
+    pub fn seeded(posting_id: u32, routing_centroid: Vec<f32>, centre_id: u32) -> Self {
+        Self {
+            posting_id,
+            routing_centroid,
+            centre_id,
+            state: PostingState::Active,
+            parent_id: None,
+            origin: PostingOrigin::Seed,
+        }
+    }
+}
+
+/// What a namespace keeps about a posting besides its routing centroid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostingInfo {
+    /// The centre new codes in this posting are encoded against.
+    pub centre_id: u32,
+    /// Where it is in its lifecycle.
+    pub state: PostingState,
+    /// The posting it was split from.
+    pub parent_id: Option<u32>,
+    /// How it was created.
+    pub origin: PostingOrigin,
+}
+
+/// A namespace's own partition at one moment: its postings, its centres, and its
+/// rotation. Immutable; a split publishes a new one through the namespace's
+/// [`PartitionHandle`]. Counts live in the shared [`CountTable`].
 #[derive(Debug)]
 pub struct NamespaceIvf {
-    /// Routing centroids keyed by posting id (its rotation is unused).
+    /// Routing centroids of `Active` postings: where new chunks go.
     routing: ClusterIndex,
-    /// The centre each posting encodes new codes against.
-    posting_centre: HashMap<u32, u32>,
+    /// Routing centroids of `Active` and `Draining` postings: what queries probe.
+    probing: ClusterIndex,
+    /// Every stored posting, retired ones included.
+    postings: HashMap<u32, PostingInfo>,
+    /// Routing centroids of every posting that is not retired (for building the
+    /// next snapshot).
+    centroids: HashMap<u32, Vec<f32>>,
     /// Centres keyed by centre id, rotated with the namespace's seed.
     centres: ClusterIndex,
-    /// Entries per posting, for probing by budget. **An estimate:** counted
-    /// from the store when the partition is loaded, then kept up to date by the
-    /// vector worker's [`PostingDelta`]s. A write racing the load, or no-WAL
-    /// entries lost in a crash, can leave it slightly off until the next load
-    /// recounts. It steers how much a search reads, never what is correct.
-    entries: HashMap<u32, AtomicU64>,
+    /// Sizes, shared with every other snapshot of this namespace.
+    counts: Arc<CountTable>,
+    /// The namespace's rotation seed.
+    seed: u64,
 }
 
 impl NamespaceIvf {
-    /// Build from stored postings and centres. Fails if the two are empty, a
-    /// posting names a centre that does not exist, or dimensions differ.
+    /// Build from stored postings and centres, with a fresh count table. Fails if
+    /// there is no posting or centre, a posting names a centre that does not
+    /// exist, or dimensions differ.
     pub fn new(postings: Vec<Posting>, centres: HashMap<u32, Vec<f32>>, seed: u64) -> Result<Self, String> {
+        Self::with_counts(postings, centres, seed, Arc::new(CountTable::default()))
+    }
+
+    /// [`new`](Self::new) sharing `counts`.
+    pub fn with_counts(postings: Vec<Posting>, centres: HashMap<u32, Vec<f32>>, seed: u64, counts: Arc<CountTable>) -> Result<Self, String> {
         if postings.is_empty() || centres.is_empty() {
             return Err("a namespace index needs at least one posting and one centre".into());
         }
@@ -266,42 +452,55 @@ impl NamespaceIvf {
         if let Some((id, c)) = centres.iter().find(|(_, c)| c.len() != dim) {
             return Err(format!("centre {id} has {} dimensions, expected {dim}", c.len()));
         }
-        let mut posting_centre = HashMap::with_capacity(postings.len());
-        let mut routing = HashMap::with_capacity(postings.len());
+        let mut infos = HashMap::with_capacity(postings.len());
+        let mut centroids = HashMap::with_capacity(postings.len());
+        let (mut routing, mut probing) = (HashMap::new(), HashMap::new());
         for p in postings {
             if !centres.contains_key(&p.centre_id) {
                 return Err(format!("posting {} names centre {}, which does not exist", p.posting_id, p.centre_id));
             }
-            if p.routing_centroid.len() != dim {
+            if p.state != PostingState::Retired && p.routing_centroid.len() != dim {
                 return Err(format!(
                     "posting {} has a {}-dimensional routing centroid, expected {dim}",
                     p.posting_id,
                     p.routing_centroid.len()
                 ));
             }
-            posting_centre.insert(p.posting_id, p.centre_id);
-            routing.insert(p.posting_id, Cluster::new(p.posting_id, p.routing_centroid));
+            infos.insert(
+                p.posting_id,
+                PostingInfo {
+                    centre_id: p.centre_id,
+                    state: p.state,
+                    parent_id: p.parent_id,
+                    origin: p.origin,
+                },
+            );
+            if p.state == PostingState::Active {
+                routing.insert(p.posting_id, Cluster::new(p.posting_id, p.routing_centroid.clone()));
+            }
+            if p.state != PostingState::Retired {
+                probing.insert(p.posting_id, Cluster::new(p.posting_id, p.routing_centroid.clone()));
+                centroids.insert(p.posting_id, p.routing_centroid);
+            }
         }
-        let entries = posting_centre.keys().map(|&id| (id, AtomicU64::new(0))).collect();
+        if probing.is_empty() {
+            return Err("a namespace index needs at least one posting that is not retired".into());
+        }
         Ok(Self {
             routing: ClusterIndex::from_clusters_with_seed(routing, seed),
-            entries,
-            posting_centre,
+            probing: ClusterIndex::from_clusters_with_seed(probing, seed),
+            postings: infos,
+            centroids,
             centres: ClusterIndex::from_clusters_with_seed(centres.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(), seed),
+            counts,
+            seed,
         })
     }
 
     /// The layout a centroid set seeds: one posting per centroid, each encoding
     /// against itself (posting id = centre id = cluster id).
     pub fn seeded(centroids: &HashMap<u32, Vec<f32>>, seed: u64) -> Result<Self, String> {
-        let postings = centroids
-            .iter()
-            .map(|(&id, c)| Posting {
-                posting_id: id,
-                routing_centroid: c.clone(),
-                centre_id: id,
-            })
-            .collect();
+        let postings = centroids.iter().map(|(&id, c)| Posting::seeded(id, c.clone(), id)).collect();
         Self::new(postings, centroids.clone(), seed)
     }
 
@@ -312,14 +511,47 @@ impl NamespaceIvf {
         Ok(Self::seeded(&centroids, DEFAULT_ROTATION_SEED)?)
     }
 
+    /// The partition after a change: `new_centres` appended and every posting in
+    /// `changed` added or replaced; the counts stay shared.
+    pub fn evolve(&self, new_centres: &[(u32, Vec<f32>)], changed: &[Posting]) -> Result<Self, String> {
+        let seed = self.seed;
+        let mut centres: HashMap<u32, Vec<f32>> = self.centres.clusters.iter().map(|(&id, c)| (id, c.centroid.clone())).collect();
+        for (id, c) in new_centres {
+            if centres.insert(*id, c.clone()).is_some() {
+                return Err(format!("centre {id} already exists; centres are append-only"));
+            }
+        }
+        let mut postings: HashMap<u32, Posting> = self
+            .postings
+            .iter()
+            .map(|(&id, info)| {
+                (
+                    id,
+                    Posting {
+                        posting_id: id,
+                        routing_centroid: self.centroids.get(&id).cloned().unwrap_or_default(),
+                        centre_id: info.centre_id,
+                        state: info.state,
+                        parent_id: info.parent_id,
+                        origin: info.origin,
+                    },
+                )
+            })
+            .collect();
+        for p in changed {
+            postings.insert(p.posting_id, p.clone());
+        }
+        Self::with_counts(postings.into_values().collect(), centres, seed, Arc::clone(&self.counts))
+    }
+
     /// The rotation seed (`None` for dimensions too small to rotate).
     pub fn rotation_seed(&self) -> Option<u64> {
         self.centres.rotation_seed()
     }
 
-    /// Number of postings.
+    /// Number of postings that are not retired.
     pub fn postings(&self) -> usize {
-        self.posting_centre.len()
+        self.probing.len()
     }
 
     /// Number of centres.
@@ -327,31 +559,42 @@ impl NamespaceIvf {
         self.centres.len()
     }
 
-    /// Set the entry counts, typically from a count of the stored keys.
-    /// Postings not named are set to 0; ids that are not postings are ignored.
-    pub fn set_entry_counts(&self, counts: &HashMap<u32, u64>) {
-        for (id, n) in &self.entries {
-            n.store(counts.get(id).copied().unwrap_or(0), Ordering::Relaxed);
-        }
+    /// Every stored posting, retired ones included.
+    pub fn posting_infos(&self) -> &HashMap<u32, PostingInfo> {
+        &self.postings
     }
 
-    /// Apply one document's [`PostingDelta`]. A count never goes below 0.
+    /// A posting's routing centroid (`None` once retired).
+    pub fn routing_centroid(&self, posting: u32) -> Option<&[f32]> {
+        self.centroids.get(&posting).map(Vec::as_slice)
+    }
+
+    /// The largest posting id and centre id in use (new ids go above them).
+    pub fn max_ids(&self) -> (u32, u32) {
+        (
+            self.postings.keys().copied().max().unwrap_or(0),
+            self.centres.clusters.keys().copied().max().unwrap_or(0),
+        )
+    }
+
+    /// The shared size table.
+    pub fn counts(&self) -> &Arc<CountTable> {
+        &self.counts
+    }
+
+    /// Apply a vector write's [`PostingDelta`] to the shared counts.
     pub fn apply_delta(&self, delta: &PostingDelta) {
-        for id in &delta.added {
-            if let Some(n) = self.entries.get(id) {
-                n.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        for id in &delta.removed {
-            if let Some(n) = self.entries.get(id) {
-                let _ = n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
-            }
-        }
+        self.counts.apply(delta);
     }
 
-    /// Entries across every posting (an estimate; see the field's notes).
+    /// Entries across every posting.
     pub fn total_entries(&self) -> u64 {
-        self.entries.values().map(|n| n.load(Ordering::Relaxed)).sum()
+        self.postings.keys().map(|&id| self.counts.get(id).0).sum()
+    }
+
+    /// Chunks in `posting`.
+    pub fn posting_chunks(&self, posting: u32) -> u64 {
+        self.counts.get(posting).1
     }
 }
 
@@ -366,10 +609,10 @@ impl IvfLayout for NamespaceIvf {
         IvfLayout::route(&self.routing, embedding)
     }
     fn probe(&self, queries: &[Vec<f32>], n: usize) -> Vec<Vec<u32>> {
-        self.routing.find_top_n_cluster_ids_batch(queries, n)
+        self.probing.find_top_n_cluster_ids_batch(queries, n)
     }
     fn centre_of(&self, posting: u32) -> Option<u32> {
-        self.posting_centre.get(&posting).copied()
+        self.postings.get(&posting).map(|p| p.centre_id)
     }
     fn centre(&self, centre_id: u32) -> Option<&[f32]> {
         IvfLayout::centre(&self.centres, centre_id)
@@ -381,7 +624,79 @@ impl IvfLayout for NamespaceIvf {
         self.centres.clusters.keys().copied().collect()
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
-        self.entries.get(&posting).map(|n| n.load(Ordering::Relaxed))
+        self.postings.contains_key(&posting).then(|| self.counts.get(posting).0)
+    }
+}
+
+/// A namespace's live partition: the current snapshot, the shared counts, and
+/// the two locks maintenance relies on.
+///
+/// - **Routing epoch.** Every vector write (route, encode, write, apply its
+///   delta) and every search (choose postings, scan them) holds a read guard;
+///   publishing a new snapshot takes the write guard. So once a publish returns,
+///   no write is still filing chunks under the old routing and no search is still
+///   scanning by it: a split can then delete the old posting's keys without a
+///   search missing them (design doc M3a, rule 4).
+/// - **Maintenance lock.** One maintenance operation per namespace at a time.
+#[derive(Debug)]
+pub struct PartitionHandle {
+    current: parking_lot::RwLock<Arc<NamespaceIvf>>,
+    epoch: tokio::sync::RwLock<()>,
+    maintenance: tokio::sync::Mutex<()>,
+    unsplittable: parking_lot::Mutex<HashMap<u32, u64>>,
+}
+
+impl PartitionHandle {
+    /// A handle starting at `ivf`.
+    pub fn new(ivf: NamespaceIvf) -> Self {
+        Self {
+            current: parking_lot::RwLock::new(Arc::new(ivf)),
+            epoch: tokio::sync::RwLock::new(()),
+            maintenance: tokio::sync::Mutex::new(()),
+            unsplittable: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The current snapshot.
+    pub fn snapshot(&self) -> Arc<NamespaceIvf> {
+        Arc::clone(&self.current.read())
+    }
+
+    /// Enter the routing epoch as a writer of vectors or a search.
+    pub async fn read_epoch(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.epoch.read().await
+    }
+
+    /// Exclude every vector write and search, to publish a snapshot.
+    pub async fn write_epoch(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.epoch.write().await
+    }
+
+    /// Install `ivf` as the current snapshot. The caller holds the
+    /// [`write_epoch`](Self::write_epoch) guard (passed as proof).
+    pub fn publish(&self, _guard: &tokio::sync::RwLockWriteGuard<'_, ()>, ivf: NamespaceIvf) {
+        *self.current.write() = Arc::new(ivf);
+    }
+
+    /// Serialise maintenance on this namespace.
+    pub async fn lock_maintenance(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.maintenance.lock().await
+    }
+
+    /// The shared counts.
+    pub fn counts(&self) -> Arc<CountTable> {
+        Arc::clone(self.snapshot().counts())
+    }
+
+    /// Remember that `posting` could not be split at `chunks` chunks; it is
+    /// tried again only once its size changes.
+    pub fn mark_unsplittable(&self, posting: u32, chunks: u64) {
+        self.unsplittable.lock().insert(posting, chunks);
+    }
+
+    /// Whether `posting`, now at `chunks` chunks, failed to split at this size.
+    pub fn is_unsplittable(&self, posting: u32, chunks: u64) -> bool {
+        self.unsplittable.lock().get(&posting) == Some(&chunks)
     }
 }
 
@@ -428,18 +743,7 @@ mod tests {
     #[test]
     fn routing_and_centres_are_separate() {
         let c = centroids(16);
-        let postings = vec![
-            Posting {
-                posting_id: 10,
-                routing_centroid: c[&0].clone(),
-                centre_id: 0,
-            },
-            Posting {
-                posting_id: 11,
-                routing_centroid: c[&1].clone(),
-                centre_id: 0,
-            },
-        ];
+        let postings = vec![Posting::seeded(10, c[&0].clone(), 0), Posting::seeded(11, c[&1].clone(), 0)];
         let ivf = NamespaceIvf::new(postings, c.clone(), DEFAULT_ROTATION_SEED).unwrap();
         assert_eq!(IvfLayout::route(&ivf, &c[&1]), Some(11));
         assert_eq!(ivf.centre_of(11), Some(0));
@@ -450,20 +754,12 @@ mod tests {
     #[test]
     fn inconsistent_parts_are_rejected() {
         let c = centroids(16);
-        let bad = vec![Posting {
-            posting_id: 1,
-            routing_centroid: c[&0].clone(),
-            centre_id: 99,
-        }];
+        let bad = vec![Posting::seeded(1, c[&0].clone(), 99)];
         assert!(NamespaceIvf::new(bad, c.clone(), 1).unwrap_err().contains("centre 99"));
         assert!(NamespaceIvf::new(vec![], c.clone(), 1).is_err());
         let mut reserved = c.clone();
         reserved.insert(ZERO_CENTRE, vec![0.0; 16]);
-        let posting = vec![Posting {
-            posting_id: 1,
-            routing_centroid: c[&0].clone(),
-            centre_id: 0,
-        }];
+        let posting = vec![Posting::seeded(1, c[&0].clone(), 0)];
         assert!(NamespaceIvf::new(posting, reserved, 1).unwrap_err().contains("reserved"));
     }
 
@@ -531,19 +827,62 @@ mod tests {
     }
 
     #[test]
-    fn deltas_keep_entry_counts_and_never_go_below_zero() {
+    fn deltas_keep_exact_counts_and_never_go_below_zero() {
         let ivf = NamespaceIvf::seeded(&centroids(16), 1).unwrap();
         assert_eq!(ivf.posting_entries(0), Some(0));
-        ivf.set_entry_counts(&HashMap::from([(0, 5), (1, 2), (99, 7)]));
+        ivf.counts().set_all(&HashMap::from([(0, (5, 9)), (1, (2, 2)), (99, (7, 7))]));
         assert_eq!(
             (ivf.posting_entries(0), ivf.posting_entries(2), ivf.posting_entries(99)),
             (Some(5), Some(0), None)
         );
+        // Doc rewritten in posting 1 (2 chunks → 3) and moved out of 0 into 2.
         ivf.apply_delta(&PostingDelta {
-            added: vec![2, 99],
-            removed: vec![0, 3],
+            added: vec![(1, 3), (2, 4)],
+            removed: vec![(1, 2), (0, 4), (3, 1)],
         });
-        assert_eq!([0, 1, 2, 3].map(|id| ivf.posting_entries(id).unwrap()), [4, 2, 1, 0]);
+        assert_eq!([0, 1, 2, 3].map(|id| ivf.counts().get(id)), [(4, 5), (2, 3), (1, 4), (0, 0)]);
         assert_eq!(ivf.total_entries(), 7);
+        assert_eq!(ivf.posting_chunks(1), 3);
+    }
+
+    #[test]
+    fn draining_postings_are_probed_but_not_routed_and_retired_ones_neither() {
+        let c = centroids(16);
+        let mut postings: Vec<Posting> = (0..4u32).map(|id| Posting::seeded(id, c[&id].clone(), id)).collect();
+        postings[0].state = PostingState::Draining;
+        postings[1].state = PostingState::Retired;
+        let ivf = NamespaceIvf::new(postings, c.clone(), 1).unwrap();
+        assert_ne!(IvfLayout::route(&ivf, &c[&0]), Some(0));
+        assert_ne!(IvfLayout::route(&ivf, &c[&1]), Some(1));
+        let probed = ivf.probe(std::slice::from_ref(&c[&0]), 4).remove(0);
+        assert!(probed.contains(&0) && !probed.contains(&1), "{probed:?}");
+        assert_eq!(ivf.postings(), 3);
+        // A retired posting still names its centre: moved codes decode through it.
+        assert_eq!(ivf.centre_of(1), Some(1));
+    }
+
+    #[test]
+    fn evolve_appends_centres_replaces_postings_and_shares_the_counts() {
+        let c = centroids(16);
+        let ivf = NamespaceIvf::seeded(&c, 7).unwrap();
+        ivf.counts().set_all(&HashMap::from([(0, (3, 6))]));
+        let mut drained = Posting::seeded(0, c[&0].clone(), 0);
+        drained.state = PostingState::Draining;
+        let child = Posting {
+            posting_id: 10,
+            routing_centroid: c[&1].clone(),
+            centre_id: 10,
+            state: PostingState::Active,
+            parent_id: Some(0),
+            origin: PostingOrigin::Split,
+        };
+        let next = ivf.evolve(&[(10, c[&1].clone())], &[drained, child]).unwrap();
+        assert_eq!((next.centres(), next.postings()), (5, 5));
+        assert_eq!(next.posting_infos()[&0].state, PostingState::Draining);
+        assert_eq!(next.posting_infos()[&10].parent_id, Some(0));
+        assert_eq!(next.rotation_seed(), Some(7));
+        assert!(Arc::ptr_eq(next.counts(), ivf.counts()));
+        assert_eq!(next.max_ids(), (10, 10));
+        assert!(ivf.evolve(&[(1, c[&1].clone())], &[]).unwrap_err().contains("append-only"));
     }
 }

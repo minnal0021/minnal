@@ -1,6 +1,9 @@
 use log::info;
 pub mod layout;
-pub use layout::{IvfLayout, NamespaceIvf, Posting, PostingDelta, ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes};
+pub use layout::{
+    CountTable, IvfLayout, NamespaceIvf, PartitionHandle, Posting, PostingCounts, PostingDelta, PostingInfo, PostingOrigin, PostingState,
+    ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes,
+};
 
 use simsimd::SpatialSimilarity;
 use std::collections::HashMap;

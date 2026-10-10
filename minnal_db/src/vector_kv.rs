@@ -125,16 +125,35 @@ pub fn ivf_postings_ns(namespace: &str) -> String {
     format!("{}_ivf_postings", namespace)
 }
 
+/// Internal namespace for a namespace's maintenance journal (design doc M3a):
+/// `op_id (8B BE) → record`, WAL-backed.
+pub fn ivf_journal_ns(namespace: &str) -> String {
+    format!("{}_ivf_journal", namespace)
+}
+
 /// The suffixes that mark a namespace as a companion of another: its vector data
-/// and its partition (centres and postings).
+/// and its partition (centres, postings and maintenance journal).
 ///
 /// Listed longest-first so [`companion_base`] cannot mistake
 /// `x_sparse_vector_meta` for `x_sparse_vector`.
-pub const COMPANION_SUFFIXES: [&str; 5] = ["_sparse_vector_meta", "_sparse_vector", "_dense_vector", "_ivf_centres", "_ivf_postings"];
+pub const COMPANION_SUFFIXES: [&str; 6] = [
+    "_sparse_vector_meta",
+    "_sparse_vector",
+    "_dense_vector",
+    "_ivf_centres",
+    "_ivf_postings",
+    "_ivf_journal",
+];
 
-/// The companions that hold the vector index's *data*: removed when the vector
-/// index is dropped. The partition (`_ivf_*`) outlives that, so it is not listed.
-pub const VECTOR_DATA_SUFFIXES: [&str; 3] = ["_sparse_vector_meta", "_sparse_vector", "_dense_vector"];
+/// The companions removed when the vector index is dropped: all of them. The
+/// partition is derived from the data since M3 (a namespace grows it by
+/// splitting), so it goes with the data and re-enabling starts from the root.
+pub const VECTOR_DATA_SUFFIXES: [&str; 6] = COMPANION_SUFFIXES;
+
+/// Every companion namespace name of `namespace`.
+pub fn companion_namespaces(namespace: &str) -> Vec<String> {
+    COMPANION_SUFFIXES.iter().map(|suffix| format!("{namespace}{suffix}")).collect()
+}
 
 /// If `name` holds vector-index data of another namespace (see
 /// [`VECTOR_DATA_SUFFIXES`]), the base namespace it belongs to.
@@ -318,38 +337,64 @@ pub fn text_hash(text: &str) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// A decoded `{ns}_sparse_vector_meta` record.
+/// A decoded `{ns}_sparse_vector_meta` record: the hash of the text the vectors
+/// came from, and each posting holding the document's chunks with how many.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SparseMeta {
     text_hash: u64,
-    cluster_ids: Vec<u32>,
+    postings: Vec<(u32, u32)>,
 }
 
-fn encode_sparse_meta(text_hash: u64, cluster_ids: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + cluster_ids.len() * 4);
+impl SparseMeta {
+    fn posting_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.postings.iter().map(|&(id, _)| id)
+    }
+
+    fn cluster_ids(&self) -> Vec<u32> {
+        self.posting_ids().collect()
+    }
+}
+
+/// `text_hash (8B) ‖ n (2B) ‖ n × (posting_id (4B) ‖ chunks (2B))`, all big-endian.
+/// The chunk counts make every posting's size exact (deletes have only the meta
+/// to go by), which the split trigger needs.
+fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + postings.len() * 6);
     out.extend_from_slice(&text_hash.to_be_bytes());
-    out.extend_from_slice(&(cluster_ids.len() as u16).to_be_bytes());
-    for &id in cluster_ids {
+    out.extend_from_slice(&(postings.len() as u16).to_be_bytes());
+    for &(id, chunks) in postings {
         out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&(chunks.min(u32::from(u16::MAX)) as u16).to_be_bytes());
     }
     out
 }
 
+/// Decodes the current form, and the form written before chunk counts were
+/// recorded (`n × posting_id (4B)`; its counts read as 0). The two cannot be
+/// confused: `n` fixes the length of each.
 fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
     if bytes.len() < 10 {
         return None;
     }
     let text_hash = u64::from_be_bytes(bytes[..8].try_into().ok()?);
     let count = u16::from_be_bytes(bytes[8..10].try_into().ok()?) as usize;
-    if bytes.len() != 10 + count * 4 {
-        return None;
-    }
-    let mut cluster_ids = Vec::with_capacity(count);
+    let width = match bytes.len() - 10 {
+        l if l == count * 6 => 6,
+        l if l == count * 4 => 4,
+        _ => return None,
+    };
+    let mut postings = Vec::with_capacity(count);
     for i in 0..count {
-        let off = 10 + i * 4;
-        cluster_ids.push(u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?));
+        let off = 10 + i * width;
+        let id = u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        let chunks = if width == 6 {
+            u32::from(u16::from_be_bytes(bytes[off + 4..off + 6].try_into().ok()?))
+        } else {
+            0
+        };
+        postings.push((id, chunks));
     }
-    Some(SparseMeta { text_hash, cluster_ids })
+    Some(SparseMeta { text_hash, postings })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -434,29 +479,31 @@ pub async fn upsert_vectors(
     for vi in vector_indexes.iter().filter(|vi| vi.quantisation_style == QuantisationStyle::SingleBit) {
         new_cluster_groups.entry(vi.cluster_id).or_default().push(vi.clone());
     }
-    let new_cluster_ids: Vec<u32> = new_cluster_groups.keys().copied().collect();
+    let new_postings: Vec<(u32, u32)> = new_cluster_groups.iter().map(|(&id, v)| (id, v.len() as u32)).collect();
 
     // (1) Delete stale cluster keys no longer present (WAL).
-    let mut old_cluster_ids = Vec::new();
+    let mut old_postings = Vec::new();
     if let Some(old_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
         && let Some(old) = decode_sparse_meta(&old_bytes)
     {
-        old_cluster_ids = old.cluster_ids;
-        for &old_id in &old_cluster_ids {
-            if !new_cluster_ids.contains(&old_id) {
+        for old_id in old.posting_ids() {
+            if !new_cluster_groups.contains_key(&old_id) {
                 crash_point!();
                 sparse_ns.delete(composite_key::encode(old_id, doc_id_bytes)).await?;
             }
         }
+        old_postings = old.postings;
     }
+    // Every old entry is replaced or deleted, every new one written: exact counts
+    // even where a posting keeps the document with a different number of chunks.
     let delta = PostingDelta {
-        added: new_cluster_ids.iter().copied().filter(|id| !old_cluster_ids.contains(id)).collect(),
-        removed: old_cluster_ids.iter().copied().filter(|id| !new_cluster_ids.contains(id)).collect(),
+        added: new_postings.clone(),
+        removed: old_postings,
     };
     // (2) The new meta, durable before any key it lists is written (WAL).
     crash_point!();
     sparse_meta_ns
-        .put(doc_id_bytes.to_vec(), encode_sparse_meta(text_hash(text), &new_cluster_ids))
+        .put(doc_id_bytes.to_vec(), encode_sparse_meta(text_hash(text), &new_postings))
         .await?;
     // (3) The new chunk keys (no-WAL).
     for (&cluster_id, chunks) in &new_cluster_groups {
@@ -519,11 +566,11 @@ pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
     if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
         if let Some(meta) = decode_sparse_meta(&meta_bytes) {
             let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-            for &cluster_id in &meta.cluster_ids {
+            for cluster_id in meta.posting_ids() {
                 crash_point!();
                 sparse_ns.delete(composite_key::encode(cluster_id, doc_id_bytes)).await?;
             }
-            delta.removed = meta.cluster_ids;
+            delta.removed = meta.postings;
         }
         crash_point!();
         sparse_meta_ns.delete(doc_id_bytes.to_vec()).await?;
@@ -613,7 +660,7 @@ pub async fn has_valid_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes:
     if meta.text_hash != text_hash(text) {
         return Ok(false);
     }
-    let cluster_ids = meta.cluster_ids;
+    let cluster_ids = meta.cluster_ids();
 
     // Each sparse composite entry: present and deserializes.
     let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
@@ -1238,17 +1285,18 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
     }
 }
 
-// ── A namespace's partition: centres and postings (design doc M2b) ────────────
+// ── A namespace's partition: centres and postings (design doc M2b, M3a) ──────
 //
-// Seeded once from the model's centroid file when semantic search is first
-// enabled, then read only from here: the namespace never reads the file again.
-// Unlike codes they cannot be regenerated by re-embedding, so they are made
-// durable before the schema records the seed (written no-WAL, then flushed:
-// one flush instead of an fsync per row). A seed cut short by a crash is
-// incomplete (postings ≠ centres, or none) and is wiped and redone.
+// A namespace that enables semantic search starts with one root posting at the
+// zero centre (`init_ivf`) and grows by splitting (M3). Namespaces enabled
+// before M3 were seeded from their model's centroid file (`seed_ivf`) and keep
+// that partition. Either way the partition is read only from here. Unlike
+// codes it cannot be regenerated by re-embedding, so it is made durable before
+// the schema says the namespace is semantic (written no-WAL, then flushed).
 
-/// Posting state byte (only `Active` is written before M3).
-const POSTING_ACTIVE: u8 = 0;
+/// Posting rows written since M3 start with this byte, so they are told apart
+/// from the seed-only rows written before (`centre_id ‖ state ‖ centroid`).
+const POSTING_ROW_V2: u8 = 0xB2;
 
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -1262,22 +1310,89 @@ fn id_from_key(k: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(k.try_into().ok()?))
 }
 
+/// `0xB2 ‖ centre_id (4B BE) ‖ state (1B) ‖ parent_id (4B BE, u32::MAX = none)
+/// ‖ origin (1B) ‖ routing centroid (f32 LE × D)`.
+pub(crate) fn encode_posting(p: &crate::semantic_search::Posting) -> Vec<u8> {
+    let mut v = Vec::with_capacity(11 + p.routing_centroid.len() * 4);
+    v.push(POSTING_ROW_V2);
+    v.extend_from_slice(&p.centre_id.to_be_bytes());
+    v.push(p.state as u8);
+    v.extend_from_slice(&p.parent_id.unwrap_or(u32::MAX).to_be_bytes());
+    v.push(p.origin as u8);
+    v.extend(f32s_to_bytes(&p.routing_centroid));
+    v
+}
+
+/// Decodes the current row and the pre-M3 seed row (`centre_id (4B) ‖ state (1B)
+/// ‖ centroid`). An old row is `1 + 4·D` bytes after its centre id, a new one
+/// starts with the marker byte and is `11 + 4·D` bytes long; their lengths
+/// differ modulo 4, so the marker can never be an old centre id's first byte by
+/// accident.
+pub(crate) fn decode_posting(posting_id: u32, v: &[u8]) -> Option<crate::semantic_search::Posting> {
+    use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+    if v.len() >= 11 && v[0] == POSTING_ROW_V2 && (v.len() - 11).is_multiple_of(4) {
+        let parent = u32::from_be_bytes(v[6..10].try_into().ok()?);
+        return Some(Posting {
+            posting_id,
+            centre_id: u32::from_be_bytes(v[1..5].try_into().ok()?),
+            state: PostingState::from_byte(v[5])?,
+            parent_id: (parent != u32::MAX).then_some(parent),
+            origin: PostingOrigin::from_byte(v[10])?,
+            routing_centroid: bytes_to_f32s(&v[11..])?,
+        });
+    }
+    if v.len() >= 5 && (v.len() - 5).is_multiple_of(4) {
+        let mut p = Posting::seeded(posting_id, bytes_to_f32s(&v[5..])?, u32::from_be_bytes(v[..4].try_into().ok()?));
+        p.state = PostingState::from_byte(v[4])?;
+        return Some(p);
+    }
+    None
+}
+
 async fn ivf_rows(db: &AsyncDb, namespace: &str) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>), crate::KVError> {
     let centres = db.namespace(ivf_centres_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
     let postings = db.namespace(ivf_postings_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
     Ok((centres, postings))
 }
 
-/// Whether `namespace` holds a complete partition: at least one posting, and as
-/// many postings as centres (a seed writes one of each per centroid).
-pub async fn ivf_is_seeded(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KVError> {
-    let (centres, postings) = ivf_rows(db, namespace).await?;
-    Ok(!postings.is_empty() && postings.len() == centres.len())
+/// Whether `namespace` holds a partition: at least one posting. (A crash between
+/// writing a root's centre and its posting leaves none, and `init_ivf` simply
+/// runs again.)
+pub async fn ivf_exists(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KVError> {
+    let postings = db.namespace(ivf_postings_ns(namespace)).await?;
+    Ok(!postings.scan(None, None, 1).await?.0.is_empty())
+}
+
+/// Write `namespace`'s starting partition: centre 0 is the zero vector of `dim`
+/// dimensions and posting 0, the root, encodes against it. Replaces whatever a
+/// cut-short earlier attempt left. Durable on return.
+pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), crate::KVError> {
+    use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+    let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
+    let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
+    for ns in [&centres_ns, &postings_ns] {
+        for (k, _) in ns.scan_prefix(Vec::new()).await? {
+            ns.delete(k).await?;
+        }
+    }
+    let zero = vec![0.0f32; dim];
+    centres_ns.put_no_wal(0u32.to_be_bytes().to_vec(), f32s_to_bytes(&zero)).await?;
+    let root = Posting {
+        posting_id: 0,
+        routing_centroid: zero,
+        centre_id: 0,
+        state: PostingState::Active,
+        parent_id: None,
+        origin: PostingOrigin::Root,
+    };
+    postings_ns.put_no_wal(0u32.to_be_bytes().to_vec(), encode_posting(&root)).await?;
+    db.flush_namespaces(vec![ivf_centres_ns(namespace), ivf_postings_ns(namespace)]).await
 }
 
 /// Write `namespace`'s partition from a centroid set, replacing whatever an
 /// earlier, incomplete seed left: one posting per centroid, encoding against
-/// itself (posting id = centre id = cluster id). Durable on return.
+/// itself (posting id = centre id = cluster id). Durable on return. How
+/// namespaces were started before M3; benches use it to reproduce that.
 pub async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<u32, Vec<f32>>) -> Result<(), crate::KVError> {
     let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
     let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
@@ -1292,21 +1407,19 @@ pub async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<u32, Ve
         centres_ns.put_no_wal(id.to_be_bytes().to_vec(), f32s_to_bytes(&centroids[&id])).await?;
     }
     for &id in &ids {
-        let mut v = Vec::with_capacity(5 + centroids[&id].len() * 4);
-        v.extend_from_slice(&id.to_be_bytes());
-        v.push(POSTING_ACTIVE);
-        v.extend(f32s_to_bytes(&centroids[&id]));
-        postings_ns.put_no_wal(id.to_be_bytes().to_vec(), v).await?;
+        let p = crate::semantic_search::Posting::seeded(id, centroids[&id].clone(), id);
+        postings_ns.put_no_wal(id.to_be_bytes().to_vec(), encode_posting(&p)).await?;
     }
     db.flush_namespaces(vec![ivf_centres_ns(namespace), ivf_postings_ns(namespace)]).await
 }
 
-/// Load `namespace`'s partition with rotation `seed`; `None` when it holds none
-/// (or only an incomplete seed).
+/// Load `namespace`'s partition with rotation `seed`, counting every posting's
+/// entries and chunks from the document records. `None` when it holds no
+/// posting.
 pub async fn load_ivf(db: &AsyncDb, namespace: &str, seed: u64) -> Result<Option<crate::semantic_search::NamespaceIvf>, crate::KVError> {
-    use crate::semantic_search::{NamespaceIvf, Posting};
+    use crate::semantic_search::{CountTable, NamespaceIvf};
     let (centre_rows, posting_rows) = ivf_rows(db, namespace).await?;
-    if posting_rows.is_empty() || posting_rows.len() != centre_rows.len() {
+    if posting_rows.is_empty() {
         return Ok(None);
     }
     let bad = |what: String| crate::KVError::Serialization(format!("namespace '{namespace}': {what}"));
@@ -1318,23 +1431,47 @@ pub async fn load_ivf(db: &AsyncDb, namespace: &str, seed: u64) -> Result<Option
     let mut postings = Vec::with_capacity(posting_rows.len());
     for (k, v) in posting_rows {
         let id = id_from_key(&k).ok_or_else(|| bad("malformed posting key".into()))?;
-        if v.len() < 5 {
-            return Err(bad(format!("malformed posting {id}")));
-        }
-        postings.push(Posting {
-            posting_id: id,
-            centre_id: u32::from_be_bytes(v[..4].try_into().unwrap()),
-            routing_centroid: bytes_to_f32s(&v[5..]).ok_or_else(|| bad(format!("malformed posting {id}")))?,
-        });
+        postings.push(decode_posting(id, &v).ok_or_else(|| bad(format!("malformed posting {id}")))?);
     }
-    let ivf = NamespaceIvf::new(postings, centres, seed).map_err(bad)?;
-    ivf.set_entry_counts(&count_posting_entries(db, namespace).await?);
-    Ok(Some(ivf))
+    let counts = std::sync::Arc::new(CountTable::from_counts(&count_postings(db, namespace).await?));
+    NamespaceIvf::with_counts(postings, centres, seed, counts).map(Some).map_err(bad)
+}
+
+/// Every posting's `(entries, chunks)` in `namespace`, from its document records
+/// (`{ns}_sparse_vector_meta`, one small record per document, read a page at a
+/// time). Exact as far as the records go: a record lists every key its document
+/// has. Records written before chunk counts existed count 0 chunks.
+pub async fn count_postings(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, (u64, u64)>, crate::KVError> {
+    const PAGE: usize = 4096;
+    let mut counts: HashMap<u32, (u64, u64)> = HashMap::new();
+    let meta = sparse_vectors_meta_ns(namespace);
+    // Resolving a namespace creates it: count nothing rather than create one.
+    if !db.list_namespaces().iter().any(|(name, _)| *name == meta) {
+        return Ok(counts);
+    }
+    let ns = db.namespace(meta).await?;
+    let mut cursor = None;
+    loop {
+        let (page, next) = ns.scan(cursor, None, PAGE).await?;
+        for (_, v) in page {
+            if let Some(m) = decode_sparse_meta(&v) {
+                for (id, chunks) in m.postings {
+                    let c = counts.entry(id).or_default();
+                    c.0 += 1;
+                    c.1 += u64::from(chunks);
+                }
+            }
+        }
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return Ok(counts),
+        }
+    }
 }
 
 /// Entries per posting in `namespace`'s Pass-1 store, counted from its keys
-/// (`posting_id ‖ doc_id`) alone: the value log is never read. About 90k keys
-/// for FiQA.
+/// (`posting_id ‖ doc_id`) alone: the value log is never read. A check against
+/// the document records' counts ([`count_postings`]).
 pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
     let mut counts = HashMap::new();
     let sparse = sparse_vectors_ns(namespace);
@@ -1371,10 +1508,10 @@ mod ivf_store_tests {
         let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
             .await
             .unwrap();
-        assert!(!ivf_is_seeded(&db, "ns").await.unwrap());
+        assert!(!ivf_exists(&db, "ns").await.unwrap());
         assert!(load_ivf(&db, "ns", 7).await.unwrap().is_none());
         seed_ivf(&db, "ns", &centroids()).await.unwrap();
-        assert!(ivf_is_seeded(&db, "ns").await.unwrap());
+        assert!(ivf_exists(&db, "ns").await.unwrap());
         db.shutdown().await.unwrap();
         drop(db);
 
@@ -1396,20 +1533,74 @@ mod ivf_store_tests {
     }
 
     #[tokio::test]
-    async fn an_incomplete_seed_is_not_loaded_and_is_redone() {
+    async fn an_interrupted_init_is_not_loaded_and_is_redone() {
         let dir = TempDir::new().unwrap();
         let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
             .await
             .unwrap();
-        // A crash after the centres, before the postings.
+        // A crash after a centre, before any posting.
         let centres_ns = db.namespace(ivf_centres_ns("ns")).await.unwrap();
         centres_ns.put(9u32.to_be_bytes().to_vec(), f32s_to_bytes(&[1.0; 16])).await.unwrap();
-        assert!(!ivf_is_seeded(&db, "ns").await.unwrap());
+        assert!(!ivf_exists(&db, "ns").await.unwrap());
         assert!(load_ivf(&db, "ns", 7).await.unwrap().is_none());
-        seed_ivf(&db, "ns", &centroids()).await.unwrap();
+        init_ivf(&db, "ns", 16).await.unwrap();
         let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
-        assert_eq!((ivf.postings(), ivf.centres()), (4, 4), "the stray centre was wiped");
+        assert_eq!((ivf.postings(), ivf.centres()), (1, 1), "the stray centre was wiped");
         db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_partition_is_one_root_posting_at_the_zero_centre() {
+        use crate::semantic_search::{IvfLayout, PostingOrigin, PostingState};
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        init_ivf(&db, "ns", 16).await.unwrap();
+        db.shutdown().await.unwrap();
+        drop(db);
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        let root = ivf.posting_infos()[&0];
+        assert_eq!(
+            (root.state, root.origin, root.parent_id, root.centre_id),
+            (PostingState::Active, PostingOrigin::Root, None, 0)
+        );
+        assert_eq!(ivf.centre(0), Some(&[0.0f32; 16][..]));
+        let v: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        assert_eq!(IvfLayout::route(&ivf, &v), Some(0), "everything routes to the root");
+        db.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn posting_rows_round_trip_and_pre_m3_rows_still_decode() {
+        use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+        let p = Posting {
+            posting_id: 5,
+            routing_centroid: vec![0.5, -1.0, 2.0, 0.0],
+            centre_id: 9,
+            state: PostingState::Draining,
+            parent_id: Some(2),
+            origin: PostingOrigin::Split,
+        };
+        assert_eq!(decode_posting(5, &encode_posting(&p)), Some(p.clone()));
+        let root = Posting {
+            parent_id: None,
+            ..p.clone()
+        };
+        assert_eq!(decode_posting(5, &encode_posting(&root)), Some(root));
+        // centre_id ‖ state ‖ centroid, as seeded before M3.
+        let mut old = 9u32.to_be_bytes().to_vec();
+        old.push(0);
+        old.extend(f32s_to_bytes(&[0.5, -1.0, 2.0, 0.0]));
+        let o = decode_posting(5, &old).unwrap();
+        assert_eq!(
+            (o.centre_id, o.state, o.origin, o.parent_id),
+            (9, PostingState::Active, PostingOrigin::Seed, None)
+        );
+        assert_eq!(o.routing_centroid, vec![0.5, -1.0, 2.0, 0.0]);
     }
 
     /// The entry counts a search budgets by: counted from the keys at load, and
@@ -1450,10 +1641,18 @@ mod ivf_store_tests {
         ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "t", &chunks(&[1, 1, 2])).await.unwrap());
         ivf.apply_delta(&upsert_vectors(&db, "ns", b"b", "t", &chunks(&[2, 3])).await.unwrap());
         assert_eq!(counts(&ivf), [1, 2, 1, 0]);
-        // A re-embed moves "a" out of 1 and into 4; posting 2 keeps it.
-        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "u", &chunks(&[2, 4])).await.unwrap());
+        assert_eq!([1, 2, 3].map(|p| ivf.posting_chunks(p)), [2, 2, 1]);
+        // A re-embed moves "a" out of 1 and into 4; posting 2 keeps it with
+        // two chunks instead of one.
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "u", &chunks(&[2, 2, 4])).await.unwrap());
         assert_eq!(counts(&ivf), [0, 2, 1, 1]);
+        assert_eq!([1, 2, 3, 4].map(|p| ivf.posting_chunks(p)), [0, 3, 1, 1]);
         assert_eq!(counts(&ivf), recount(db.clone()).await);
+        let from_meta = count_postings(&db, "ns").await.unwrap();
+        assert_eq!(
+            ivf.counts().snapshot().into_iter().filter(|(_, c)| c.0 > 0).collect::<HashMap<_, _>>(),
+            from_meta
+        );
         // Deletes, including of a document that has no vectors.
         ivf.apply_delta(&delete_vector(&db, "ns", b"b").await.unwrap());
         ivf.apply_delta(&delete_vector(&db, "ns", b"ghost").await.unwrap());
@@ -1476,12 +1675,14 @@ mod ivf_store_tests {
     }
 
     #[test]
-    fn partition_namespaces_are_companions_but_not_vector_data() {
+    fn partition_namespaces_are_companions_and_go_with_the_data() {
         assert_eq!(companion_base("x_ivf_centres"), Some("x"));
         assert_eq!(companion_base("x_ivf_postings"), Some("x"));
-        assert_eq!(vector_data_base("x_ivf_centres"), None);
+        assert_eq!(companion_base("x_ivf_journal"), Some("x"));
+        assert_eq!(vector_data_base("x_ivf_centres"), Some("x"));
         assert_eq!(vector_data_base("x_sparse_vector_meta"), Some("x"));
         assert_eq!(vector_data_base("x_dense_vector"), Some("x"));
+        assert_eq!(companion_namespaces("x").len(), COMPANION_SUFFIXES.len());
     }
 }
 
@@ -1535,7 +1736,7 @@ mod doc_vector_race_tests {
                 .await
                 .unwrap()
                 .and_then(|b| decode_sparse_meta(&b))
-                .map(|m| m.cluster_ids)
+                .map(|m| m.cluster_ids())
                 .unwrap_or_default();
             for cluster in [3u32, 5, 7] {
                 let present = sparse_ns.get(composite_key::encode(cluster, &doc)).await.unwrap().is_some();
@@ -1917,7 +2118,7 @@ mod queue_race_tests {
             .get(doc.to_vec())
             .await
             .unwrap();
-        (present, meta.as_deref().and_then(decode_sparse_meta).map(|m| m.cluster_ids))
+        (present, meta.as_deref().and_then(decode_sparse_meta).map(|m| m.cluster_ids()))
     }
 
     /// A re-embed must be durable before its queue entry is completed. The worker
@@ -2157,23 +2358,33 @@ mod vector_upsert_tests {
 
     #[test]
     fn test_encode_decode_sparse_meta_roundtrip() {
-        let ids = vec![10u32, 20u32, 30u32];
-        let encoded = encode_sparse_meta(0xdead_beef, &ids);
+        let postings = vec![(10u32, 3u32), (20, 1), (30, 7)];
+        let encoded = encode_sparse_meta(0xdead_beef, &postings);
         let decoded = decode_sparse_meta(&encoded).unwrap();
         assert_eq!(
             decoded,
             SparseMeta {
                 text_hash: 0xdead_beef,
-                cluster_ids: ids
+                postings
             }
         );
+    }
+
+    #[test]
+    fn a_meta_written_before_chunk_counts_still_decodes() {
+        let mut old = 9u64.to_be_bytes().to_vec();
+        old.extend_from_slice(&2u16.to_be_bytes());
+        old.extend_from_slice(&5u32.to_be_bytes());
+        old.extend_from_slice(&8u32.to_be_bytes());
+        let m = decode_sparse_meta(&old).unwrap();
+        assert_eq!((m.text_hash, m.postings), (9, vec![(5, 0), (8, 0)]));
     }
 
     #[test]
     fn test_encode_decode_sparse_meta_empty() {
         let encoded = encode_sparse_meta(7, &[]);
         let decoded = decode_sparse_meta(&encoded).unwrap();
-        assert!(decoded.cluster_ids.is_empty());
+        assert!(decoded.postings.is_empty());
         assert_eq!(decoded.text_hash, 7);
     }
 
@@ -2335,7 +2546,7 @@ mod vector_upsert_tests {
         // The meta is still written (it records the text), listing no clusters.
         let meta_ns = db.namespace(sparse_vectors_meta_ns(ns)).await.unwrap();
         let meta = decode_sparse_meta(&meta_ns.get(doc_id.to_vec()).await.unwrap().expect("meta written")).unwrap();
-        assert!(meta.cluster_ids.is_empty(), "a dense-only document lists no clusters");
+        assert!(meta.postings.is_empty(), "a dense-only document lists no clusters");
         assert_eq!(meta.text_hash, text_hash("text"));
     }
 
@@ -3713,7 +3924,7 @@ mod crash_audit_tests {
                 .await
                 .unwrap()
                 .and_then(|b| decode_sparse_meta(&b))
-                .map(|m| m.cluster_ids.into_iter().collect());
+                .map(|m| m.cluster_ids().into_iter().collect());
             let present = keys.remove(doc).unwrap_or_default();
             let dense = DbVectorStore::new(db, NS).await.unwrap().get_dense_entry(doc).await.unwrap();
             let dense_tag = dense.map(|raw| VectorIndex::access_list(&raw).unwrap().iter().next().unwrap().addition_factor());

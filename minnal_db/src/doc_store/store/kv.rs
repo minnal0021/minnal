@@ -221,10 +221,14 @@ impl DocStore {
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+        // Search under the routing epoch: a split cannot delete a posting's old
+        // keys while this search may still be scanning by the routing before it.
+        let _epoch = ns.partition.read_epoch().await;
+        let partition = ns.partition.snapshot();
         let all = crate::semantic_search::service::search(
             &ns.config,
             namespace,
-            &*ns.ivf,
+            &*partition,
             &query_sparse,
             &query_dense,
             &db_store,

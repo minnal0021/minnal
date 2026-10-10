@@ -496,11 +496,19 @@ impl VecIndexWorker {
                     Some(Err(e)) => return Err(DocStoreError::EmbeddingFailed(e.clone())),
                     None => return Err(DocStoreError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
                 };
-                let vector_indexes = crate::semantic_search::service::embed_document(&ns.config, &*ns.ivf, &entry.text)
+                // The network call runs outside the routing epoch; routing,
+                // the write and its count update run inside it, against the
+                // snapshot current at that moment (a split may have published a
+                // new one while the text was being embedded).
+                let (dense, chunks) = crate::semantic_search::service::embed_document_floats(&ns.config, &entry.text)
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+                let _epoch = ns.partition.read_epoch().await;
+                let ivf = ns.partition.snapshot();
+                let vector_indexes = crate::semantic_search::service::index_embeddings(&ns.config, &*ivf, &dense, &chunks)
+                    .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 let delta = vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
-                ns.ivf.apply_delta(&delta);
+                ivf.apply_delta(&delta);
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {

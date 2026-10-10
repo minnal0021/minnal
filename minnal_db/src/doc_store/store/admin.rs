@@ -246,10 +246,10 @@ impl DocStore {
         }
     }
 
-    /// Seed `namespace`'s centres and postings from its model's centroid set (or
-    /// keep a complete earlier seed) and record it in `vector_index`. Without an
-    /// attached semantic context there is nothing to seed from; the namespace is
-    /// seeded when it is next enabled with one.
+    /// Give `namespace` its starting partition (one root posting at the zero
+    /// centre), unless it already has one. Without an attached semantic context
+    /// there is nothing to check the model against; the namespace gets its
+    /// partition when it is next enabled with one.
     async fn seed_vector_index(
         &self,
         _namespace: &str,
@@ -258,10 +258,7 @@ impl DocStore {
     ) -> Result<(), DocStoreError> {
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
-            let seeded = ctx.seed_namespace(&self.db, _namespace, _settings).await?;
-            if let Some(vi) = _vector_index {
-                vi.seeded_from = Some(seeded);
-            }
+            ctx.init_namespace(&self.db, _namespace, _settings).await?;
         }
         Ok(())
     }
@@ -449,11 +446,9 @@ impl DocStore {
         // storage) rather than just emptying their entries — otherwise the empty
         // namespaces linger in /admin/storage/kv-namespaces as orphaned
         // "companion" stores after the index is dropped.
-        for companion in [
-            vector_kv::sparse_vectors_meta_ns(namespace),
-            vector_kv::sparse_vectors_ns(namespace),
-            vector_kv::dense_vectors_ns(namespace),
-        ] {
+        // The partition and its journal go too: the partition is grown from the
+        // data, so re-enabling starts again from one root posting.
+        for companion in vector_kv::companion_namespaces(namespace) {
             if let Err(e) = self.db.remove_namespace(companion.clone()).await {
                 // Best-effort: a missing companion is fine (nothing was indexed).
                 debug!("drop_vector_index_data: removing companion '{companion}' for '{namespace}': {e}");
@@ -463,6 +458,9 @@ impl DocStore {
         // Clear the in-memory corruption counters so a dropped index stops
         // showing up in /admin/indices/vector/corruption-metrics.
         crate::semantic_search::metrics::reset(namespace);
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.evict(namespace);
+        }
 
         if let Ok(schema) = self.load_schema(namespace)
             && let Some(ns_id) = schema.ns_id
@@ -516,18 +514,10 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
     let mut ns_names = vec![namespace.to_owned()];
     #[cfg(feature = "semantic-search")]
     {
-        let _ = db.remove_namespace(vector_kv::sparse_vectors_ns(namespace)).await;
-        let _ = db.remove_namespace(vector_kv::sparse_vectors_meta_ns(namespace)).await;
-        let _ = db.remove_namespace(vector_kv::dense_vectors_ns(namespace)).await;
-        let _ = db.remove_namespace(vector_kv::ivf_centres_ns(namespace)).await;
-        let _ = db.remove_namespace(vector_kv::ivf_postings_ns(namespace)).await;
-        ns_names.extend([
-            vector_kv::sparse_vectors_ns(namespace),
-            vector_kv::sparse_vectors_meta_ns(namespace),
-            vector_kv::dense_vectors_ns(namespace),
-            vector_kv::ivf_centres_ns(namespace),
-            vector_kv::ivf_postings_ns(namespace),
-        ]);
+        for companion in vector_kv::companion_namespaces(namespace) {
+            let _ = db.remove_namespace(companion.clone()).await;
+            ns_names.push(companion);
+        }
     }
 
     for ns_name in &ns_names {

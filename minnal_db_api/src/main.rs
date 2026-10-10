@@ -158,12 +158,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // semantic namespace uses, so operators get an early warning if it is
         // unreachable or misconfigured. Non-fatal: semantic requests surface the
         // error at call time.
-        // Seed sources: a namespace copies its model's centroids when it first
-        // enables semantic search, and records the file it came from.
-        let seed_files: Vec<(String, std::path::PathBuf)> = cluster_indexes
-            .iter()
-            .map(|(m, _)| (m.clone(), semantic_cfg.centroid_dir.join(m).join("clusters.json")))
-            .collect();
         let mut in_use: std::collections::BTreeSet<(String, u32)> = std::collections::BTreeSet::new();
         for settings in schemas
             .values()
@@ -194,11 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         store.with_vector_index_config(cfg.to_vector_index_config()).with_semantic_search(
-            seed_files
-                .into_iter()
-                .fold(SemanticSearchContext::new(service, cluster_indexes), |ctx, (model, path)| {
-                    ctx.with_seed_file(&model, path)
-                })
+            SemanticSearchContext::new(service, cluster_indexes)
                 // Validated when the config was loaded.
                 .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load")),
         )

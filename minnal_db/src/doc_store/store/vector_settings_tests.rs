@@ -354,7 +354,6 @@ mod with_service {
     /// doc store's deletes, matching a fresh count of the stored keys.
     #[tokio::test]
     async fn entry_counts_track_indexing_updates_and_deletes() {
-        use crate::semantic_search::IvfLayout;
         let (url, _seen) = spawn_service();
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
@@ -368,12 +367,26 @@ mod with_service {
         let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
         let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
         let check = || async {
-            let ivf = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().ivf;
+            let ivf = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition.snapshot();
             let stored = vector_kv::count_posting_entries(&store.db, "g").await.unwrap();
-            let loaded: std::collections::HashMap<u32, u64> = (1..=2)
-                .filter_map(|p| ivf.posting_entries(p).filter(|&n| n > 0).map(|n| (p, n)))
+            let loaded: std::collections::HashMap<u32, u64> = ivf
+                .counts()
+                .snapshot()
+                .into_iter()
+                .filter(|&(_, (e, _))| e > 0)
+                .map(|(p, (e, _))| (p, e))
                 .collect();
             assert_eq!(loaded, stored);
+            // The chunk counts agree with the document records too.
+            let from_meta = vector_kv::count_postings(&store.db, "g").await.unwrap();
+            assert_eq!(
+                ivf.counts()
+                    .snapshot()
+                    .into_iter()
+                    .filter(|&(_, (e, _))| e > 0)
+                    .collect::<std::collections::HashMap<_, _>>(),
+                from_meta
+            );
             ivf.total_entries()
         };
 
@@ -440,9 +453,9 @@ mod with_service {
             "the test must tell the chunkings apart"
         );
 
-        // Each namespace's chunks sit in its own model's clusters.
-        assert!(sparse_clusters(&store, "g").await.iter().all(|c| (1..=2).contains(c)));
-        assert!(sparse_clusters(&store, "q").await.iter().all(|c| (101..=102).contains(c)));
+        // Each namespace's chunks sit in its own partition (each still its root).
+        assert_eq!(sparse_clusters(&store, "g").await, vec![0]);
+        assert_eq!(sparse_clusters(&store, "q").await, vec![0]);
 
         // Searches embed with the namespace's model and cache per model.
         let none = SearchSpec::default();
@@ -616,31 +629,31 @@ mod with_service {
     }
 
     #[tokio::test]
-    async fn seeding_is_recorded_once_and_survives_a_vector_index_drop_and_a_reopen() {
+    async fn a_new_namespace_starts_from_one_root_posting_and_a_drop_resets_it() {
         let (url, _seen) = spawn_service();
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
         store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
         let vi = store.get_schema("g").unwrap().vector_index.unwrap();
-        let seeded = vi.seeded_from.clone().expect("seeded on create");
-        assert_eq!((seeded.file.as_str(), seeded.centres, seeded.murmur3_128.len()), ("<in-memory>", 2, 32));
+        assert_eq!(vi.seeded_from, None, "no centroid file is copied");
         assert_eq!(vi.quantisation.unwrap().rotation_seed.as_deref(), Some("0x6d696e6e616c0001"));
-        assert!(vector_kv::ivf_is_seeded(&store.db, "g").await.unwrap());
+        let root = vector_kv::load_ivf(&store.db, "g", 1).await.unwrap().expect("a root posting");
+        assert_eq!((root.postings(), root.centres()), (1, 1));
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(sparse_clusters(&store, "g").await, vec![0], "every chunk is in the root");
 
-        // Dropping the vector index keeps the partition, also across a reopen
-        // (the interrupted-drop sweep at open must leave it alone).
+        // Dropping the vector index drops the partition with the data, also
+        // across a reopen.
         store.disable_semantic_search("g").unwrap();
         store.drop_vector_index_data("g").await.unwrap();
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
         drop(store);
         let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
-        assert!(
-            vector_kv::ivf_is_seeded(&store.db, "g").await.unwrap(),
-            "kept across the drop and the reopen"
-        );
+        assert!(!vector_kv::ivf_exists(&store.db, "g").await.unwrap(), "gone with the data");
 
-        // Re-enabling reuses it rather than seeding again.
+        // Re-enabling starts again from a root.
         store
             .amend(
                 "g",
@@ -651,13 +664,13 @@ mod with_service {
             )
             .await
             .unwrap();
-        assert_eq!(store.get_schema("g").unwrap().vector_index.unwrap().seeded_from, Some(seeded));
+        assert!(vector_kv::ivf_exists(&store.db, "g").await.unwrap());
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn after_seeding_a_namespace_never_reads_its_seed_source_again() {
+    async fn a_namespace_never_reads_the_servers_centroid_files() {
         let (url, _seen) = spawn_service();
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let store = open_fresh(db_dir.path(), schema_dir.path())
@@ -708,7 +721,7 @@ mod with_service {
             .unwrap();
         store.put("s", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
         wait_for_empty_queue(&store).await;
-        assert!(sparse_clusters(&store, "s").await.iter().all(|c| (101..=102).contains(c)));
+        assert_eq!(sparse_clusters(&store, "s").await, vec![0], "a fresh root");
         assert_eq!(results(&store, "s").await.len(), 1);
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();

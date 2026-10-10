@@ -174,6 +174,15 @@ pub async fn embed_document<L: IvfLayout + ?Sized>(
     layout: &L,
     text: &str,
 ) -> Result<Vec<VectorIndex>, EmbeddingError> {
+    let (dense, chunks) = embed_document_floats(config, text).await?;
+    index_embeddings(config, layout, &dense, &chunks)
+}
+
+/// The embedding-service half of [`embed_document`]: the whole-document vector
+/// and one vector per chunk, not yet routed or quantised. Kept apart so a
+/// caller can route under its partition's routing epoch without holding it
+/// across the network call.
+pub async fn embed_document_floats(config: &SemanticSearchConfig, text: &str) -> Result<(Vec<f32>, Vec<Vec<f32>>), EmbeddingError> {
     // payload[0] = whole document (dense); payload[1..] = sliding-window chunks (sparse).
     let mut payloads = Vec::with_capacity(1);
     payloads.push(text.to_string());
@@ -192,8 +201,9 @@ pub async fn embed_document<L: IvfLayout + ?Sized>(
     .await?;
 
     // Split the ordered response: first = dense (MultiBit), rest = sparse chunks (SingleBit).
-    let (dense, chunks) = embeddings.split_first().ok_or(EmbeddingError::EmptyResponse)?;
-    index_embeddings(config, layout, dense, chunks)
+    let mut embeddings = embeddings.into_iter();
+    let dense = embeddings.next().ok_or(EmbeddingError::EmptyResponse)?;
+    Ok((dense, embeddings.collect()))
 }
 
 /// Quantise a document's already-fetched embeddings into its vector-index entries:
