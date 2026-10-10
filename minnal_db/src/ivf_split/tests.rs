@@ -11,11 +11,8 @@ pub(super) const NS: &str = "docs";
 const DIM: usize = 16;
 const SEED: u64 = 7;
 
-pub(super) fn settings(limit: u64) -> SplitSettings {
-    SplitSettings {
-        split_limit: limit,
-        params: SplitParams::default(),
-    }
+pub(super) fn settings(limit: u64) -> MaintenanceOps {
+    MaintenanceOps::split_only(limit)
 }
 
 /// A deterministic unit vector near one of four directions (`topic`).
@@ -148,7 +145,7 @@ async fn an_oversized_posting_splits_until_every_posting_is_within_the_limit() {
     let dir = TempDir::new().unwrap();
     let db = setup(&dir, 60).await; // 180 chunks in the root
     let h = handle(&db).await;
-    let made = split_oversized(&db, NS, &h, &settings(40)).await.unwrap();
+    let made = maintain_partition(&db, NS, &h, &settings(40)).await.unwrap().splits;
     assert!(made >= 4, "{made} split(s)");
     let ivf = h.snapshot();
     for (&id, info) in ivf.posting_infos() {
@@ -193,7 +190,7 @@ async fn a_posting_within_the_limit_or_of_identical_chunks_is_left_alone() {
     }
     assert_eq!(split_posting(&db2, NS, &h2, 0, &settings(40)).await.unwrap(), SplitOutcome::Unsplittable);
     assert_eq!(
-        split_oversized(&db2, NS, &h2, &settings(40)).await.unwrap(),
+        maintain_partition(&db2, NS, &h2, &settings(40)).await.unwrap().splits,
         0,
         "not retried at the same size"
     );
@@ -240,8 +237,8 @@ async fn a_split_survives_a_crash_before_any_write() {
             db.crash().await; // unflushed no-WAL writes are lost
             let db = open(&dir).await;
             let h = handle(&db).await;
-            recover(&db, NS, &h).await.unwrap();
-            split_oversized(&db, NS, &h, &settings(40)).await.unwrap();
+            recover(&db, NS, &h, &settings(40)).await.unwrap();
+            maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
             if let Err(e) = check(&db, &h, &expected(20)).await {
                 failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
             }
@@ -265,7 +262,7 @@ async fn writes_racing_a_split_lose_nothing() {
         let h = std::sync::Arc::new(handle(&db).await);
         let splitter = {
             let (db, h) = (db.clone(), std::sync::Arc::clone(&h));
-            tokio::spawn(async move { split_oversized(&db, NS, &h, &settings(40)).await.unwrap() })
+            tokio::spawn(async move { maintain_partition(&db, NS, &h, &settings(40)).await.unwrap() })
         };
         let writer = {
             let (db, h) = (db.clone(), std::sync::Arc::clone(&h));
@@ -281,7 +278,7 @@ async fn writes_racing_a_split_lose_nothing() {
         };
         writer.await.unwrap();
         splitter.await.unwrap();
-        split_oversized(&db, NS, &h, &settings(40)).await.unwrap();
+        maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
         let mut want = expected(40);
         for d in [1u64, 3, 5] {
             want.insert(doc_id(d), 0);
@@ -293,14 +290,42 @@ async fn writes_racing_a_split_lose_nothing() {
 
 #[test]
 fn journal_records_round_trip() {
-    let r = SplitRecord {
-        state: JournalState::Copied,
-        posting: 3,
-        centres: [7, 8],
-        children: [9, 10],
+    for (state, op) in [
+        (
+            JournalState::Copied,
+            Op::Split {
+                posting: 3,
+                centres: [7, 8],
+                children: [9, 10],
+            },
+        ),
+        (JournalState::Published, Op::Merge { posting: 4, kept: 11 }),
+        (
+            JournalState::Planned,
+            Op::Reassign {
+                parent: 3,
+                parent_centre: 3,
+                children: [9, 10],
+                scope: vec![9, 10, 1, 2, 5],
+            },
+        ),
+    ] {
+        let r = Record { state, op };
+        assert_eq!(Record::decode(&r.encode()), Some(r));
+    }
+    // A split record is 23 bytes, as before reassignment and merges existed.
+    let split = Record {
+        state: JournalState::Planned,
+        op: Op::Split {
+            posting: 0,
+            centres: [1, 2],
+            children: [1, 2],
+        },
     };
-    assert_eq!(SplitRecord::decode(&r.encode()), Some(r));
-    assert_eq!(SplitRecord::decode(&[1, 0, 9]), None);
+    assert_eq!(split.encode().len(), 23);
+    assert_eq!(Record::decode(&[1, 0, 9]), None);
+    assert_eq!(Record::decode(&[1, 1, 1, 0, 0, 0, 1]), None, "a merge needs two ids");
+    assert_eq!(Record::decode(&[1, 2, 1, 0, 0, 0, 1]), None, "a reassignment needs four");
 }
 
 /// Searches running while postings split never miss a document: every
@@ -345,7 +370,7 @@ async fn a_search_during_a_split_misses_nothing() {
             }
         })
     };
-    split_oversized(&db, NS, &h, &settings(30)).await.unwrap();
+    maintain_partition(&db, NS, &h, &settings(30)).await.unwrap();
     done.store(true, std::sync::atomic::Ordering::Release);
     let searches = searcher.await.unwrap();
     assert!(searches > 1, "{searches} search(es)");
@@ -378,4 +403,305 @@ async fn e2e_partition_invariants() {
     assert_eq!(keys.values().sum::<u64>(), counted);
     eprintln!("{} postings, {} chunks: invariants hold", keys.len(), counted);
     db.shutdown().await.unwrap();
+}
+
+// ── Reassignment and merges (M3b) ──
+
+/// Maintenance with merges at `merge_limit` and reassignment over `range`
+/// neighbours.
+fn full(split_limit: u64, merge_limit: u64, range: usize) -> MaintenanceOps {
+    MaintenanceOps {
+        merge_limit,
+        reassign_range: range,
+        ..MaintenanceOps::split_only(split_limit)
+    }
+}
+
+async fn delete_doc(db: &AsyncDb, h: &PartitionHandle, d: u64) {
+    let delta = crate::vector_kv::delete_vector(db, NS, &doc_id(d)).await.unwrap();
+    h.snapshot().apply_delta(&delta);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scenario {
+    /// Topics 0 and 1 split the root at 40 chunks; then topics 2 and 3 arrive
+    /// and fill both halves past the limit, so the next splits leave chunks in
+    /// a neighbour that a new centre beats.
+    Reassign,
+    /// The root splits into a topic-0 and a topic-1 posting; then eight of the
+    /// ten topic-1 documents are deleted, leaving 6 chunks to merge.
+    Merge,
+}
+
+const DELETED: [u64; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+
+/// The state just before the maintenance a scenario is about, and the chunks
+/// each document must end with.
+async fn prepare(dir: &TempDir, scenario: Scenario) -> (AsyncDb, BTreeMap<Vec<u8>, usize>) {
+    let db = setup(dir, 20).await;
+    let h = handle(&db).await;
+    maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
+    let mut want = expected(20);
+    match scenario {
+        Scenario::Reassign => {
+            for d in 20..40 {
+                index_doc(&db, &h, d, &doc_chunks(d, true)).await.unwrap();
+                want.insert(doc_id(d), 3);
+            }
+        }
+        Scenario::Merge => {
+            for d in DELETED {
+                delete_doc(&db, &h, d).await;
+                want.insert(doc_id(d), 0);
+            }
+        }
+    }
+    db.flush_namespaces(crate::vector_kv::companion_namespaces(NS)).await.unwrap();
+    db.shutdown().await.unwrap();
+    drop((db, h));
+    (open(dir).await, want)
+}
+
+fn scenario_ops(scenario: Scenario) -> MaintenanceOps {
+    match scenario {
+        Scenario::Reassign => full(40, 0, 64),
+        Scenario::Merge => full(40, 12, 0),
+    }
+}
+
+/// Squared distance of every chunk's reconstruction from its posting's centre,
+/// summed: what reassignment lowers.
+async fn spread(db: &AsyncDb, h: &PartitionHandle) -> f64 {
+    let ivf = h.snapshot();
+    let mut total = 0.0;
+    for (k, v) in db.namespace(sparse_vectors_ns(NS)).await.unwrap().scan_prefix(Vec::new()).await.unwrap() {
+        let (p, _) = composite_key::decode(&k).unwrap();
+        let c = ivf.rotated_posting_centre(p).unwrap();
+        for code in VectorIndex::list_from_bytes(&v).unwrap() {
+            total += sq_dist(&reconstruct(&ivf, &code).unwrap(), c);
+        }
+    }
+    total
+}
+
+#[tokio::test]
+async fn reassign_moves_chunks_to_a_nearer_posting() {
+    let mut spreads = Vec::new();
+    for range in [0, 64] {
+        let dir = TempDir::new().unwrap();
+        let (db, want) = prepare(&dir, Scenario::Reassign).await;
+        let h = handle(&db).await;
+        let report = maintain_partition(&db, NS, &h, &full(40, 0, range)).await.unwrap();
+        assert!(report.splits >= 2, "{report:?}");
+        let c = h.counters().read();
+        assert_eq!(c.reassigns, c.splits, "one reassignment per split: {c:?}");
+        if range == 64 {
+            assert!(c.reassign_moves > 0 && c.reassign_candidates >= c.reassign_moves, "{c:?}");
+        }
+        check(&db, &h, &want).await.unwrap();
+        spreads.push(spread(&db, &h).await);
+        db.shutdown().await.unwrap();
+    }
+    assert!(
+        spreads[1] < spreads[0],
+        "reassigning over the neighbours brings chunks nearer their centres: {spreads:?}"
+    );
+}
+
+#[tokio::test]
+async fn deletes_merge_small_postings_and_never_the_last() {
+    let dir = TempDir::new().unwrap();
+    let (db, want) = prepare(&dir, Scenario::Merge).await;
+    let h = handle(&db).await;
+    let before = h.snapshot().postings();
+    let report = maintain_partition(&db, NS, &h, &scenario_ops(Scenario::Merge)).await.unwrap();
+    assert_eq!(report.merges, 1, "{report:?}");
+    assert_eq!(h.snapshot().postings(), before - 1);
+    check(&db, &h, &want).await.unwrap();
+    // Every document gone: the last posting stays, empty.
+    for d in 0..20 {
+        delete_doc(&db, &h, d).await;
+    }
+    maintain_partition(&db, NS, &h, &scenario_ops(Scenario::Merge)).await.unwrap();
+    let ivf = h.snapshot();
+    assert_eq!(ivf.postings(), 1);
+    assert_eq!(ivf.active_centres().len(), 1);
+    check(&db, &h, &(0..20).map(|d| (doc_id(d), 0)).collect()).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
+/// A crash before every write of a reassignment or a merge, under several flush
+/// patterns: after reopening and recovering, every invariant holds.
+#[tokio::test]
+async fn reassign_and_merge_survive_a_crash_before_any_write() {
+    let mut failures = Vec::new();
+    for scenario in [Scenario::Reassign, Scenario::Merge] {
+        let ops = scenario_ops(scenario);
+        let mut writes_seen = 0;
+        for flushed in [Flushed::None, Flushed::Sparse, Flushed::Meta, Flushed::All] {
+            for n in 0.. {
+                let dir = TempDir::new().unwrap();
+                let (db, want) = prepare(&dir, scenario).await;
+                let h = handle(&db).await;
+                crate::vector_kv::crash_point::arm(n);
+                let result = maintain_partition(&db, NS, &h, &ops).await;
+                let crashed = crate::vector_kv::crash_point::disarm();
+                if !crashed {
+                    result.unwrap();
+                    writes_seen = n;
+                }
+                let names = match flushed {
+                    Flushed::None => vec![],
+                    Flushed::Sparse => vec![sparse_vectors_ns(NS)],
+                    Flushed::Meta => vec![sparse_vectors_meta_ns(NS)],
+                    Flushed::All => crate::vector_kv::companion_namespaces(NS),
+                };
+                db.flush_namespaces(names).await.unwrap();
+                drop(h);
+                db.crash().await; // unflushed no-WAL writes are lost
+                let db = open(&dir).await;
+                let h = handle(&db).await;
+                recover(&db, NS, &h, &ops).await.unwrap();
+                maintain_partition(&db, NS, &h, &ops).await.unwrap();
+                if let Err(e) = check(&db, &h, &want).await {
+                    failures.push(format!("{scenario:?}, crash before write {n}, flushed {flushed:?}: {e}"));
+                }
+                db.shutdown().await.unwrap();
+                if !crashed {
+                    break;
+                }
+            }
+        }
+        assert!(writes_seen > 10, "{scenario:?} must cover a whole run ({writes_seen} writes)");
+    }
+    assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
+}
+
+/// Re-embeds and deletes racing reassignment and merges: no chunk is lost or
+/// orphaned and every count stays exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_racing_reassign_and_merge_lose_nothing() {
+    for round in 0..4u64 {
+        let dir = TempDir::new().unwrap();
+        let (db, mut want) = prepare(&dir, Scenario::Reassign).await;
+        let h = std::sync::Arc::new(handle(&db).await);
+        let ops = full(40, 12, 64);
+        let maintainer = {
+            let (db, h) = (db.clone(), std::sync::Arc::clone(&h));
+            tokio::spawn(async move { maintain_partition(&db, NS, &h, &ops).await.unwrap() })
+        };
+        let deleted: Vec<u64> = (round % 2..40).step_by(3).collect();
+        let writer = {
+            let (db, h, deleted) = (db.clone(), std::sync::Arc::clone(&h), deleted.clone());
+            tokio::spawn(async move {
+                for d in (round % 3..40).step_by(4) {
+                    index_doc(&db, &h, d, &doc_chunks(d, d < 20)).await.unwrap();
+                }
+                for d in deleted {
+                    delete_doc(&db, &h, d).await;
+                }
+            })
+        };
+        writer.await.unwrap();
+        maintainer.await.unwrap();
+        maintain_partition(&db, NS, &h, &ops).await.unwrap();
+        for d in deleted {
+            want.insert(doc_id(d), 0);
+        }
+        check(&db, &h, &want).await.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        db.shutdown().await.unwrap();
+    }
+}
+
+/// Searches running while chunks are reassigned and postings merged never miss
+/// a document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_search_during_reassign_and_merge_misses_nothing() {
+    use crate::semantic_search::ProbeSettings;
+    use crate::semantic_search::service::{SemanticSearchConfig, search};
+    for scenario in [Scenario::Reassign, Scenario::Merge] {
+        let dir = TempDir::new().unwrap();
+        let (db, want) = prepare(&dir, scenario).await;
+        let live = want.values().filter(|&&n| n > 0).count();
+        let h = std::sync::Arc::new(handle(&db).await);
+        let config = SemanticSearchConfig {
+            embedding_dim: DIM,
+            number_of_bits_for_dense_quantisation: 8,
+            probe: ProbeSettings::fixed(4096),
+            first_pass_sparse_search_top_k: 1000,
+            top_k_results: 1000,
+            ..SemanticSearchConfig::default()
+        };
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let searcher = {
+            let (db, h, done) = (db.clone(), std::sync::Arc::clone(&h), std::sync::Arc::clone(&done));
+            tokio::spawn(async move {
+                let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+                let q = chunk(0, 999);
+                let mut searches = 0;
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    let found = {
+                        let _epoch = h.read_epoch().await;
+                        let ivf = h.snapshot();
+                        search(&config, NS, &*ivf, std::slice::from_ref(&q), &q, &store, None::<fn(&[u8]) -> bool>, None)
+                            .await
+                            .unwrap()
+                    };
+                    let docs: BTreeSet<Vec<u8>> = found.into_iter().map(|r| r.document_id).collect();
+                    assert_eq!(docs.len(), live, "{scenario:?}: search {searches} found {} documents", docs.len());
+                    searches += 1;
+                    if finished {
+                        return searches;
+                    }
+                }
+            })
+        };
+        let report = maintain_partition(&db, NS, &h, &scenario_ops(scenario)).await.unwrap();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let searches = searcher.await.unwrap();
+        assert!(searches > 1, "{searches} search(es)");
+        assert!(report.splits + report.merges > 0, "{report:?}");
+        db.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn the_gate_skips_moves_within_the_code_error() {
+    use crate::semantic_search::index::vector_index::QuantisationStyle;
+    let code = |error_bound: f32| VectorIndex {
+        cluster_id: 0,
+        centre_id: 0,
+        quantisation_style: QuantisationStyle::SingleBit,
+        addition_factor: 0.0,
+        scaling_factor: 0.0,
+        error_bound,
+        packed_vector: vec![],
+    };
+    let (a, b) = ([0.0f32, 0.0], [1.0f32, 0.0]);
+    let x = [0.4f32, 0.0]; // D(x, a) = 0.16, D(x, b) = 0.36: a wins by 0.2; ‖a − b‖ = 1
+    assert!(nearer(&x, &a, &b, &code(0.5), false), "no gate: the nearer centre wins");
+    assert!(nearer(&x, &a, &b, &code(0.09), true), "0.2 > 2 · 0.09");
+    assert!(!nearer(&x, &a, &b, &code(0.11), true), "0.2 < 2 · 0.11: too close to call");
+    assert!(!nearer(&x, &b, &a, &code(0.0), false), "the farther centre never wins");
+}
+
+#[tokio::test]
+async fn the_gate_moves_fewer_chunks() {
+    let mut moves = Vec::new();
+    for gate in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (db, want) = prepare(&dir, Scenario::Reassign).await;
+        let h = handle(&db).await;
+        let ops = MaintenanceOps {
+            skip_uncertain_moves: gate,
+            ..scenario_ops(Scenario::Reassign)
+        };
+        maintain_partition(&db, NS, &h, &ops).await.unwrap();
+        check(&db, &h, &want).await.unwrap();
+        let c = h.counters().read();
+        moves.push((c.reassign_candidates, c.reassign_moves));
+        db.shutdown().await.unwrap();
+    }
+    assert!(moves[1].0 <= moves[0].0 && moves[1].1 <= moves[0].1, "{moves:?}");
 }

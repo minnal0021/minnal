@@ -601,6 +601,88 @@ impl NamespaceIvf {
     pub fn posting_chunks(&self, posting: u32) -> u64 {
         self.counts.get(posting).1
     }
+
+    /// The rotated centre of `posting` (what its codes and maintenance compare
+    /// against; a posting's centre is its routing centroid).
+    pub fn rotated_posting_centre(&self, posting: u32) -> Option<&[f32]> {
+        self.centres.rotated_centroid(self.postings.get(&posting)?.centre_id)
+    }
+
+    /// Every `Active` posting with its rotated centre, in posting-id order (so
+    /// maintenance breaks distance ties the same way every time).
+    pub fn active_centres(&self) -> Vec<(u32, &[f32])> {
+        let mut out: Vec<(u32, &[f32])> = self
+            .postings
+            .iter()
+            .filter(|(_, info)| info.state == PostingState::Active)
+            .filter_map(|(&id, info)| Some((id, self.centres.rotated_centroid(info.centre_id)?)))
+            .collect();
+        out.sort_unstable_by_key(|&(id, _)| id);
+        out
+    }
+}
+
+/// What a namespace's maintenance has done since its partition was loaded
+/// (design doc M3b). Reported by partition health and the vector bench.
+#[derive(Debug, Default)]
+pub struct MaintenanceCounters {
+    /// Postings split.
+    pub splits: AtomicU64,
+    /// Postings merged away.
+    pub merges: AtomicU64,
+    /// Reassignments run (one after each split).
+    pub reassigns: AtomicU64,
+    /// Chunks a reassignment found to be candidates.
+    pub reassign_candidates: AtomicU64,
+    /// Chunks a reassignment moved.
+    pub reassign_moves: AtomicU64,
+    /// Chunks copied out of a draining posting (a split's or a merge's).
+    pub drain_moves: AtomicU64,
+}
+
+impl MaintenanceCounters {
+    /// Add `n` to `counter`.
+    pub fn add(counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The current values.
+    pub fn read(&self) -> MaintenanceTotals {
+        let r = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        MaintenanceTotals {
+            splits: r(&self.splits),
+            merges: r(&self.merges),
+            reassigns: r(&self.reassigns),
+            reassign_candidates: r(&self.reassign_candidates),
+            reassign_moves: r(&self.reassign_moves),
+            drain_moves: r(&self.drain_moves),
+        }
+    }
+}
+
+/// A reading of [`MaintenanceCounters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceTotals {
+    /// Postings split.
+    pub splits: u64,
+    /// Postings merged away.
+    pub merges: u64,
+    /// Reassignments run.
+    pub reassigns: u64,
+    /// Chunks a reassignment found to be candidates.
+    pub reassign_candidates: u64,
+    /// Chunks a reassignment moved.
+    pub reassign_moves: u64,
+    /// Chunks copied out of a draining posting.
+    pub drain_moves: u64,
+}
+
+impl MaintenanceTotals {
+    /// Every chunk key move: drains (splits and merges) plus reassignments. Each
+    /// is a put and, once the source goes, a delete or rewrite.
+    pub fn chunk_moves(&self) -> u64 {
+        self.drain_moves + self.reassign_moves
+    }
 }
 
 impl IvfLayout for NamespaceIvf {
@@ -649,6 +731,10 @@ pub struct PartitionHandle {
     epoch: tokio::sync::RwLock<()>,
     maintenance: tokio::sync::Mutex<()>,
     unsplittable: parking_lot::Mutex<HashMap<u32, u64>>,
+    unmergeable: parking_lot::Mutex<HashMap<u32, u64>>,
+    counters: MaintenanceCounters,
+    /// `(split_limit, merge_limit)` in chunks; `(u64::MAX, 0)` until set.
+    limits: parking_lot::Mutex<(u64, u64)>,
 }
 
 impl PartitionHandle {
@@ -659,7 +745,52 @@ impl PartitionHandle {
             epoch: tokio::sync::RwLock::new(()),
             maintenance: tokio::sync::Mutex::new(()),
             unsplittable: parking_lot::Mutex::new(HashMap::new()),
+            unmergeable: parking_lot::Mutex::new(HashMap::new()),
+            counters: MaintenanceCounters::default(),
+            limits: parking_lot::Mutex::new((u64::MAX, 0)),
         }
+    }
+
+    /// Record the namespace's current split and merge limits (in chunks), which
+    /// [`needs_maintenance`](Self::needs_maintenance) checks writes against.
+    pub fn set_limits(&self, split_limit: u64, merge_limit: u64) {
+        *self.limits.lock() = (split_limit, merge_limit);
+    }
+
+    /// Whether a write that made `delta` (already applied) left a posting to
+    /// split (one it added to is over the split limit) or to merge (one it
+    /// removed from is at or under the merge limit, while another posting is
+    /// active).
+    pub fn needs_maintenance(&self, delta: &PostingDelta) -> bool {
+        let (split_limit, merge_limit) = *self.limits.lock();
+        let ivf = self.snapshot();
+        let active = |p: u32| ivf.posting_infos().get(&p).map(|i| i.state) == Some(PostingState::Active);
+        delta.added.iter().any(|&(p, _)| ivf.posting_chunks(p) > split_limit)
+            || (ivf.routing.len() > 1 && delta.removed.iter().any(|&(p, _)| active(p) && ivf.posting_chunks(p) <= merge_limit))
+    }
+
+    /// What maintenance has done since this handle was made.
+    pub fn counters(&self) -> &MaintenanceCounters {
+        &self.counters
+    }
+
+    /// Wait until no vector write or search that started before this call is
+    /// still running. Maintenance calls it between copying chunks and deleting
+    /// their old keys, so a search that could have missed a copy has finished
+    /// before the original goes.
+    pub async fn epoch_barrier(&self) {
+        drop(self.epoch.write().await);
+    }
+
+    /// Remember that `posting` found no neighbour with room to merge into at
+    /// `chunks` chunks; it is tried again only once its size changes.
+    pub fn mark_unmergeable(&self, posting: u32, chunks: u64) {
+        self.unmergeable.lock().insert(posting, chunks);
+    }
+
+    /// Whether `posting`, now at `chunks` chunks, found no merge at this size.
+    pub fn is_unmergeable(&self, posting: u32, chunks: u64) -> bool {
+        self.unmergeable.lock().get(&posting) == Some(&chunks)
     }
 
     /// The current snapshot.

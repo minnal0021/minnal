@@ -84,8 +84,13 @@ pub struct PartitionHealth {
     pub chunks: u64,
     /// Splits made so far (postings created by a split, halved).
     pub splits: usize,
-    /// Splits recorded in the journal and not finished.
-    pub unfinished_splits: usize,
+    /// Maintenance operations (splits, reassignments, merges) recorded in the
+    /// journal and not finished.
+    pub unfinished_operations: usize,
+    /// What maintenance has done since the partition was loaded (the server's
+    /// start, or the namespace's first use since): splits, merges,
+    /// reassignments and the chunk moves they made.
+    pub maintenance: crate::semantic_search::MaintenanceTotals,
     /// Chunk count of the live postings: 10th, 50th, 90th percentile and max.
     pub size_p10_p50_p90_max: [u64; 4],
     /// Entry-weighted means of the posting code metrics, when asked for.
@@ -245,7 +250,8 @@ pub async fn partition_health(
         entries: live.iter().map(|p| p.entries).sum(),
         chunks: live.iter().map(|p| p.chunks).sum(),
         splits: postings.iter().filter(|p| p.created_by == "split").count() / 2,
-        unfinished_splits: records(db, namespace).await?.len(),
+        unfinished_operations: records(db, namespace).await?.len(),
+        maintenance: handle.counters().read(),
         size_p10_p50_p90_max: [pct(0.1), pct(0.5), pct(0.9), sizes.last().copied().unwrap_or(0)],
         codes: summary_codes,
         reencode_candidates: candidates,
@@ -268,7 +274,7 @@ mod tests {
         let c = before.codes.unwrap();
         assert!(c.drift_mean.abs() < 1e-9, "{c:?}");
         assert_eq!((c.foreign_share, c.zero_centre_share), (0.0, 1.0));
-        split_oversized(&db, super::super::tests::NS, &h, &super::super::tests::settings(40))
+        maintain_partition(&db, super::super::tests::NS, &h, &super::super::tests::settings(40))
             .await
             .unwrap();
         let (after, postings) = partition_health(&db, super::super::tests::NS, &h, true).await.unwrap();
@@ -278,7 +284,7 @@ mod tests {
             c.drift_mean > 0.1 && c.drift_mean.is_finite(),
             "moved codes drift from their encoding centre: {c:?}"
         );
-        assert!(after.splits >= 1 && after.retired >= 1 && after.unfinished_splits == 0);
+        assert!(after.splits >= 1 && after.retired >= 1 && after.unfinished_operations == 0);
         assert_eq!(after.chunks, 180);
         assert!(after.size_p10_p50_p90_max[3] <= 40);
         assert_eq!(after.reencode_candidates.unwrap().len(), after.postings.min(20));

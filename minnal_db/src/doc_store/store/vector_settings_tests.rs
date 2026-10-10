@@ -416,6 +416,64 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// Deleting most of a grown namespace's documents merges its emptied
+    /// postings by themselves: the deletes wake maintenance, and the merges keep
+    /// every key in an active posting with exact counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postings_merge_by_themselves_as_documents_are_deleted() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16,"merge_ratio":0.3}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..60u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("{TEXT} Number {i}.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let settle = |partition: Arc<crate::semantic_search::PartitionHandle>| async move {
+            // Maintenance is woken asynchronously; wait until it has nothing left.
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _idle = partition.lock_maintenance().await;
+            }
+        };
+        settle(Arc::clone(&partition)).await;
+        let grown = partition.snapshot().postings();
+        assert!(grown > 2, "{grown} posting(s)");
+        for i in 0..54u64 {
+            store.delete("g", DocId::U64(i)).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        settle(Arc::clone(&partition)).await;
+        let ivf = partition.snapshot();
+        assert!(partition.counters().read().merges > 0, "{:?}", partition.counters().read());
+        assert!(ivf.postings() < grown, "{} posting(s), grown to {grown}", ivf.postings());
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+        }
+        assert_eq!(keys.values().sum::<u64>(), ivf.counts().snapshot().values().map(|c| c.1).sum::<u64>());
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 6, "every remaining document is found");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
     /// The loaded partition's entry counts track the worker's writes and the
     /// doc store's deletes, matching a fresh count of the stored keys.
     #[tokio::test]

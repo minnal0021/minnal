@@ -13,8 +13,8 @@ pub use self::chunking::chunk_document;
 pub use self::cluster::Cluster;
 pub use self::cluster::ClusterIndex;
 pub use self::cluster::{
-    CountTable, IvfLayout, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingInfo, PostingOrigin, PostingState, ProbeSettings,
-    WithEntryCounts, ZERO_CENTRE, select_probes,
+    CountTable, IvfLayout, MaintenanceCounters, MaintenanceTotals, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingInfo, PostingOrigin,
+    PostingState, ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes,
 };
 pub use self::index::composite_key;
 pub use self::index::vector_index::{QuantisationStyle, VectorIndex};

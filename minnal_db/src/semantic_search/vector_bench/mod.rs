@@ -110,6 +110,22 @@ struct Partition {
     p99_cluster_chunks: usize,
     /// Coefficient of variation of chunks per used cluster.
     cv_chunks: f64,
+    /// In `grow` mode, what maintenance did while indexing: splits, merges,
+    /// reassignments, and chunk key moves (drains plus reassignments).
+    #[serde(default)]
+    splits: u64,
+    #[serde(default)]
+    merges: u64,
+    #[serde(default)]
+    reassign_candidates: u64,
+    #[serde(default)]
+    reassign_moves: u64,
+    #[serde(default)]
+    drain_moves: u64,
+    /// Chunk key moves per inserted chunk (the simulation's "key moves per
+    /// insert"; each move is a put plus a delete or rewrite).
+    #[serde(default)]
+    moves_per_chunk: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,8 +448,14 @@ async fn vector_bench() {
             .unwrap()
             .expect("just made"),
     ));
-    let split_settings = crate::ivf_split::SplitSettings {
+    // The production maintenance at `target`: split at 2x, merge at SPFresh's
+    // 10/118 of that, reassign over `MINNAL_BENCH_REASSIGN` (64) neighbours, the
+    // error-bound gate when `MINNAL_BENCH_GATE=1`.
+    let ops = crate::ivf_split::MaintenanceOps {
         split_limit: 2 * u64::from(target),
+        merge_limit: (2.0 * f64::from(target) * 10.0 / 118.0).round() as u64,
+        reassign_range: env_or("MINNAL_BENCH_REASSIGN", "64").parse().unwrap(),
+        skip_uncertain_moves: env_or("MINNAL_BENCH_GATE", "0") == "1",
         params: crate::semantic_search::cluster::split::SplitParams::default(),
     };
 
@@ -442,7 +464,6 @@ async fn vector_bench() {
     // against the current snapshot; in `grow` mode split between batches.
     let rows = insertion_order(&order, &frozen, &index);
     let t = Instant::now();
-    let mut splits = 0;
     for batch in rows.chunks(GROW_BATCH) {
         let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
@@ -462,13 +483,22 @@ async fn vector_bench() {
             r.unwrap();
         }
         if mode == "grow" {
-            splits += crate::ivf_split::split_oversized(&db, NS, &handle, &split_settings).await.unwrap();
+            crate::ivf_split::maintain_partition(&db, NS, &handle, &ops).await.unwrap();
         }
     }
+    let maintenance = handle.counters().read();
     if mode == "grow" {
         eprintln!(
-            "  grown from one posting at target {target}: {splits} split(s), {} posting(s)",
-            handle.snapshot().postings()
+            "  grown from one posting at target {target}: {} split(s), {} merge(s), {} posting(s); \
+             reassign range {}, gate {}: {} candidate(s), {} moved; {:.2} chunk moves per inserted chunk",
+            maintenance.splits,
+            maintenance.merges,
+            handle.snapshot().postings(),
+            ops.reassign_range,
+            ops.skip_uncertain_moves,
+            maintenance.reassign_candidates,
+            maintenance.reassign_moves,
+            maintenance.chunk_moves() as f64 / frozen.n_chunks().max(1) as f64,
         );
     }
     drop(handle);
@@ -513,6 +543,12 @@ async fn vector_bench() {
         largest_share_chunks: *sizes.last().unwrap_or(&0) as f64 / total_chunks.max(1) as f64,
         p99_cluster_chunks: sizes[((sizes.len().max(1) - 1) as f64 * 0.99).round() as usize],
         cv_chunks: sd / mean_size,
+        splits: maintenance.splits,
+        merges: maintenance.merges,
+        reassign_candidates: maintenance.reassign_candidates,
+        reassign_moves: maintenance.reassign_moves,
+        drain_moves: maintenance.drain_moves,
+        moves_per_chunk: maintenance.chunk_moves() as f64 / frozen.n_chunks().max(1) as f64,
     };
     let footprint = Footprint {
         sparse_bytes,

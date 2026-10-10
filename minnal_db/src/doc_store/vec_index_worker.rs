@@ -519,8 +519,7 @@ impl VecIndexWorker {
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 let delta = vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
                 ivf.apply_delta(&delta);
-                let limit = u64::from(ns.maintenance.split_limit());
-                if delta.added.iter().any(|&(p, _)| ivf.posting_chunks(p) > limit) {
+                if ns.partition.needs_maintenance(&delta) {
                     self.ctx.request_maintenance(&entry.namespace);
                 }
                 Ok(Processed::Written)

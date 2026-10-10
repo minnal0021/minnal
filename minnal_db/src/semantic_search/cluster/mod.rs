@@ -2,8 +2,8 @@ use log::info;
 pub mod layout;
 pub mod split;
 pub use layout::{
-    CountTable, IvfLayout, NamespaceIvf, PartitionHandle, Posting, PostingCounts, PostingDelta, PostingInfo, PostingOrigin, PostingState,
-    ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes,
+    CountTable, IvfLayout, MaintenanceCounters, MaintenanceTotals, NamespaceIvf, PartitionHandle, Posting, PostingCounts, PostingDelta, PostingInfo,
+    PostingOrigin, PostingState, ProbeSettings, WithEntryCounts, ZERO_CENTRE, select_probes,
 };
 
 use simsimd::SpatialSimilarity;

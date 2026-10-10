@@ -376,10 +376,15 @@ impl SemanticSearchContext {
         if delta.added.is_empty() && delta.removed.is_empty() {
             return;
         }
+        let mut wake = false;
         for ((name, _), partition) in self.ivfs.read().iter() {
             if name == namespace {
                 partition.snapshot().apply_delta(delta);
+                wake |= partition.needs_maintenance(delta);
             }
+        }
+        if wake {
+            self.request_maintenance(namespace);
         }
     }
 
@@ -438,6 +443,10 @@ impl SemanticSearchContext {
                 Arc::clone(self.ivfs.write().entry(key).or_insert_with(|| Arc::new(PartitionHandle::new(ivf))))
             }
         };
+        partition.set_limits(
+            u64::from(settings.maintenance.split_limit()),
+            u64::from(settings.maintenance.merge_limit()),
+        );
         let ivf = partition.snapshot();
         if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
             return Err(DocStoreError::EmbeddingDimMismatch {

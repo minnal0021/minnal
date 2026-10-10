@@ -337,16 +337,19 @@ impl MaintenanceSettings {
         2 * self.target_posting_size
     }
 
-    /// A posting holding this many chunks or fewer merges (M3b).
+    /// A posting holding this many chunks or fewer merges.
     pub fn merge_limit(&self) -> u32 {
         (f64::from(self.split_limit()) * self.merge_ratio.0).round() as u32
     }
 
-    /// What the split executor runs with.
+    /// What the partition's maintenance runs with.
     #[cfg(feature = "semantic-search")]
-    pub fn split_settings(&self) -> crate::ivf_split::SplitSettings {
-        crate::ivf_split::SplitSettings {
+    pub fn ops(&self) -> crate::ivf_split::MaintenanceOps {
+        crate::ivf_split::MaintenanceOps {
             split_limit: u64::from(self.split_limit()),
+            merge_limit: u64::from(self.merge_limit()),
+            reassign_range: self.reassign_range as usize,
+            skip_uncertain_moves: self.skip_uncertain_moves,
             params: crate::semantic_search::cluster::split::SplitParams {
                 samples: self.split_samples as usize,
                 init_trials: self.split_init_trials as usize,

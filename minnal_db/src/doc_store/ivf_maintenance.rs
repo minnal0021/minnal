@@ -1,15 +1,16 @@
-//! Background maintenance of every namespace's partition (design doc M3a).
+//! Background maintenance of every namespace's partition (design doc M3a, M3b).
 //!
 //! One task per process. The vector worker wakes it with a namespace's name
-//! whenever a write leaves a posting over its namespace's split limit; it then
-//! splits that namespace's oversized postings ([`ivf_split::split_oversized`])
-//! with the namespace's own `maintenance` settings. At most `threads`
+//! whenever a write leaves a posting over its namespace's split limit, or a
+//! delete leaves one at or under its merge limit; it then splits, reassigns and
+//! merges that namespace's postings ([`ivf_split::maintain_partition`]) with
+//! the namespace's own `maintenance` settings. At most `threads`
 //! namespaces are maintained at once, and one namespace is never maintained by
 //! two at once (its partition's maintenance lock). The 2-means runs on the
 //! blocking pool, never on the rayon pool searches share (the `SCORING_GATE`
 //! rules in `semantic_search`).
 //!
-//! [`recover_all`] finishes or abandons the splits a crash interrupted. The
+//! [`recover_all`] finishes or abandons the operations a crash interrupted. The
 //! vector worker runs it before its first pass, so nothing writes a namespace's
 //! vectors while its journal is unfinished.
 
@@ -87,26 +88,29 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
     MaintenanceHandle { stop, task: Some(task) }
 }
 
-/// Split `namespace`'s oversized postings with its own settings.
+/// Split, reassign and merge `namespace`'s postings with its own settings.
 async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path, namespace: &str) {
     let result = async {
         let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
         let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-        let made = ivf_split::split_oversized(db, namespace, &ns.partition, &settings.maintenance.split_settings()).await?;
-        Ok::<usize, crate::doc_store::error::DocStoreError>(made)
+        let report = ivf_split::maintain_partition(db, namespace, &ns.partition, &settings.maintenance.ops()).await?;
+        Ok::<ivf_split::MaintenanceReport, crate::doc_store::error::DocStoreError>(report)
     }
     .await;
     match result {
-        Ok(0) => {}
-        Ok(n) => info!("partition maintenance: namespace='{namespace}' split {n} posting(s)"),
+        Ok(r) if r == ivf_split::MaintenanceReport::default() => {}
+        Ok(r) => info!(
+            "partition maintenance: namespace='{namespace}' split {} posting(s), merged {}",
+            r.splits, r.merges
+        ),
         Err(e) => warn!("partition maintenance: namespace='{namespace}' failed: {e}"),
     }
 }
 
-/// Finish or abandon every split a crash left unfinished, in every namespace,
-/// then ask for maintenance of every namespace with a partition (a crash may
-/// have left oversized postings unsplit). Returns how many unfinished splits
-/// were found.
+/// Finish or abandon every operation a crash left unfinished, in every
+/// namespace, then ask for maintenance of every namespace with a partition (a
+/// crash may have left postings to split or merge). Returns how many unfinished
+/// operations were found.
 pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path) -> usize {
     let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     let mut found = 0;
@@ -115,13 +119,13 @@ pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schem
         let result = async {
             let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
             let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-            Ok::<usize, crate::doc_store::error::DocStoreError>(ivf_split::recover(db, namespace, &ns.partition).await?)
+            Ok::<usize, crate::doc_store::error::DocStoreError>(ivf_split::recover(db, namespace, &ns.partition, &settings.maintenance.ops()).await?)
         }
         .await;
         match result {
             Ok(0) => {}
             Ok(n) => {
-                info!("partition recovery: namespace='{namespace}' finished {n} interrupted split(s)");
+                info!("partition recovery: namespace='{namespace}' finished {n} interrupted operation(s)");
                 found += n;
             }
             Err(e) => warn!("partition recovery: namespace='{namespace}' failed: {e}"),
