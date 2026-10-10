@@ -680,7 +680,7 @@ fn maintenance_json(m: &minnal_db::doc_store::vector_settings::MaintenanceSettin
 /// `GET /admin/indices/{ns}/vector/partition[?codes=true]` — the namespace's
 /// partition at a glance: postings (K), entries, chunks, size percentiles,
 /// splits, unfinished splits; with `codes=true` also the entry-weighted code
-/// metrics and the postings with the highest residual inflation (re-encode
+/// metrics and the postings with the highest centre drift (re-encode
 /// candidates). Without `codes` it reads memory only.
 pub async fn vector_partition(
     State(state): State<AppState>,
@@ -702,7 +702,7 @@ pub async fn vector_partition(
 /// Query of `GET /admin/indices/{ns}/vector/postings`.
 #[derive(Debug, Deserialize)]
 pub struct PostingsParams {
-    /// `id` (default), `entries`, `chunks` or `inflation` (implies `codes`).
+    /// `id` (default), `entries`, `chunks` or `drift` (implies `codes`).
     #[serde(default)]
     pub sort: Option<String>,
     /// `asc` or `desc` (default).
@@ -722,7 +722,7 @@ pub struct PostingsParams {
 /// `GET /admin/indices/{ns}/vector/postings` — every posting (retired ones
 /// included, as the parents of the split tree) with its size, state, centre,
 /// parent and origin, cursor-paginated, for size-distribution charts. Sorted by
-/// `sort` (`id`, `entries`, `chunks`, `inflation`) and `order`.
+/// `sort` (`id`, `entries`, `chunks`, `drift`) and `order`.
 pub async fn vector_postings(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -730,8 +730,8 @@ pub async fn vector_postings(
 ) -> axum::response::Response {
     let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
     let sort = params.sort.as_deref().unwrap_or("id");
-    if !matches!(sort, "id" | "entries" | "chunks" | "inflation") {
-        return bad(format!("sort must be id, entries, chunks or inflation, got {sort:?}"));
+    if !matches!(sort, "id" | "entries" | "chunks" | "drift") {
+        return bad(format!("sort must be id, entries, chunks or drift, got {sort:?}"));
     }
     let descending = match params.order.as_deref().unwrap_or("desc") {
         "desc" => true,
@@ -749,7 +749,7 @@ pub async fn vector_postings(
         },
         None => 0,
     };
-    let codes = params.codes || sort == "inflation";
+    let codes = params.codes || sort == "drift";
     let (maintenance, summary, mut postings) = match state.store.vector_partition_health(&ns, codes).await {
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
@@ -758,7 +758,7 @@ pub async fn vector_postings(
         match sort {
             "entries" => p.entries as f64,
             "chunks" => p.chunks as f64,
-            "inflation" => p.codes.map_or(f64::NEG_INFINITY, |c| c.inflation_mean),
+            "drift" => p.codes.map_or(f64::NEG_INFINITY, |c| c.drift_mean),
             _ => f64::from(p.posting_id),
         }
     };

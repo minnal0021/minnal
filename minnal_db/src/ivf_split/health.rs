@@ -6,15 +6,21 @@
 //! exact counts) and are cheap to poll. The code metrics read every chunk code
 //! of the namespace, so they are computed only when asked for (`codes`).
 //!
-//! **Residual inflation** of a code is its stored residual norm `‖r‖` (against
-//! the centre it was encoded with) over the residual a fresh encode against its
-//! current posting's centre `c'` would have:
-//! `‖x − c'‖² = ‖r‖² + ‖c − c'‖² + 2⟨r, c − c'⟩`, with `⟨r, c − c'⟩` estimated
-//! from the code exactly as Pass 1 estimates a score. 1 for a code encoded
-//! against its own posting's centre, above 1 for one whose key moved away. A
-//! code's **error band** is its stored `error_bound`. Both come from what each
-//! code already stores: `scaling_factor = ‖r‖ / (f·√D)` and
+//! **Centre drift** of a code is the distance from the centre it was encoded
+//! against, `c`, to its current posting's centre `c'`, relative to its residual
+//! norm: `‖c − c'‖ / ‖r‖`. 0 for a code at home; it grows as splits move the
+//! code's key away from where it was encoded, and a re-encode against `c'`
+//! would reset it. A code's **error band** is its stored `error_bound`. `‖r‖`
+//! comes from what each code stores: `scaling_factor = ‖r‖ / (f·√D)` and
 //! `error_bound = ‖r‖·√((1 − f²)/f²)·ε₀/√(D − 1)` give `‖r‖` and `f = ⟨ō, o⟩`.
+//!
+//! The design first asked for *residual inflation*, `‖r‖ / ‖x − c'‖`, with
+//! `‖x − c'‖² = ‖r‖² + ‖c − c'‖² + 2⟨r, c − c'⟩` estimated from the code. That
+//! estimate is biased and cannot be used: a posting's centre is the mean of its
+//! members' *reconstructions*, and with 1-bit codes 2-means groups chunks partly
+//! by their code noise, so `⟨r̂, c − c'⟩` correlates with the noise and the
+//! estimate of `‖x − c'‖²` came out negative on real data (an end-to-end SciFact
+//! run read means above 10,000). Drift needs no estimate.
 
 use std::collections::HashMap;
 
@@ -55,10 +61,10 @@ pub struct CodeHealth {
     /// Share of codes encoded against a zero centre (written while the
     /// namespace was one root posting).
     pub zero_centre_share: f64,
-    /// Mean residual inflation.
-    pub inflation_mean: f64,
-    /// 90th-percentile residual inflation.
-    pub inflation_p90: f64,
+    /// Mean centre drift, `‖c − c'‖ / ‖r‖`.
+    pub drift_mean: f64,
+    /// 90th-percentile centre drift.
+    pub drift_p90: f64,
     /// Mean error band (`error_bound`), in score units.
     pub error_band_mean: f64,
 }
@@ -85,8 +91,8 @@ pub struct PartitionHealth {
     /// Entry-weighted means of the posting code metrics, when asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codes: Option<CodeHealth>,
-    /// The postings with the highest mean inflation (at most 20): candidates for
-    /// a re-encode. Present when code metrics were asked for.
+    /// The postings with the highest mean centre drift (at most 20): candidates
+    /// for a re-encode. Present when code metrics were asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reencode_candidates: Option<Vec<u32>>,
 }
@@ -107,30 +113,27 @@ fn origin_name(o: PostingOrigin) -> &'static str {
     }
 }
 
-/// Inflation and error band of one code filed under a posting whose rotated
+/// Centre drift and error band of one code filed under a posting whose rotated
 /// centre is `posting_centre`.
 fn code_metrics(ivf: &NamespaceIvf, code: &VectorIndex, posting_centre: &[f32]) -> Option<(f64, f64)> {
     let own = ivf.rotated_centre(code.centre_id)?;
     let d = own.len() as f64;
     let sf = f64::from(code.scaling_factor);
     let eb = f64::from(code.error_bound);
+    let shift = own
+        .iter()
+        .zip(posting_centre)
+        .map(|(&c, &cp)| (f64::from(c) - f64::from(cp)).powi(2))
+        .sum::<f64>()
+        .sqrt();
     if sf <= 0.0 || d < 2.0 {
-        return Some((1.0, eb));
+        return Some((if shift > 0.0 { f64::INFINITY } else { 0.0 }, eb));
     }
     // √(1 − f²) from the two stored factors, then f and ‖r‖.
     let t = (eb / (sf * EPSILON_0 * (d / (d - 1.0)).sqrt())).clamp(0.0, 1.0);
     let f = (1.0 - t * t).sqrt().max(1e-6);
     let r_norm = sf * f * d.sqrt();
-    let r_hat = reconstruct_single_bit(code, own)?; // c + r̂
-    let mut shift_sq = 0.0;
-    let mut cross = 0.0;
-    for ((&x, &c), &cp) in r_hat.iter().zip(own).zip(posting_centre) {
-        let u = f64::from(c) - f64::from(cp); // c − c'
-        shift_sq += u * u;
-        cross += (f64::from(x) - f64::from(c)) * u; // ⟨r̂, c − c'⟩
-    }
-    let fresh = (r_norm * r_norm + shift_sq + 2.0 * cross).max(1e-12).sqrt();
-    Some((r_norm / fresh, eb))
+    Some((shift / r_norm.max(1e-12), eb))
 }
 
 /// A namespace's partition health; with `codes`, also the code metrics (reads
@@ -176,14 +179,14 @@ pub async fn partition_health(
                 continue;
             };
             let (mut n, mut foreign, mut zeroed, mut band) = (0usize, 0usize, 0usize, 0.0f64);
-            let mut inflation = Vec::new();
+            let mut drift = Vec::new();
             for (_, list) in posting_entries(db, namespace, p.posting_id).await? {
                 for code in &list {
                     n += 1;
                     foreign += usize::from(code.centre_id != p.centre_id);
                     zeroed += usize::from(zero.get(&code.centre_id).copied().unwrap_or(false));
-                    if let Some((inf, eb)) = code_metrics(&ivf, code, &posting_centre) {
-                        inflation.push(inf);
+                    if let Some((dr, eb)) = code_metrics(&ivf, code, &posting_centre) {
+                        drift.push(dr);
                         band += eb;
                     }
                 }
@@ -191,14 +194,14 @@ pub async fn partition_health(
             if n == 0 {
                 continue;
             }
-            inflation.sort_by(f64::total_cmp);
-            let m = inflation.len().max(1) as f64;
+            drift.sort_by(f64::total_cmp);
+            let m = drift.len().max(1) as f64;
             let h = CodeHealth {
                 foreign_share: foreign as f64 / n as f64,
                 zero_centre_share: zeroed as f64 / n as f64,
-                inflation_mean: inflation.iter().sum::<f64>() / m,
-                inflation_p90: inflation
-                    .get(((inflation.len() as f64 * 0.9) as usize).min(inflation.len().saturating_sub(1)))
+                drift_mean: drift.iter().sum::<f64>() / m,
+                drift_p90: drift
+                    .get(((drift.len() as f64 * 0.9) as usize).min(drift.len().saturating_sub(1)))
                     .copied()
                     .unwrap_or(1.0),
                 error_band_mean: band / m,
@@ -207,8 +210,8 @@ pub async fn partition_health(
             w_sum += w;
             acc.foreign_share += w * h.foreign_share;
             acc.zero_centre_share += w * h.zero_centre_share;
-            acc.inflation_mean += w * h.inflation_mean;
-            acc.inflation_p90 += w * h.inflation_p90;
+            acc.drift_mean += w * h.drift_mean;
+            acc.drift_p90 += w * h.drift_p90;
             acc.error_band_mean += w * h.error_band_mean;
             p.codes = Some(h);
         }
@@ -216,15 +219,12 @@ pub async fn partition_health(
             summary_codes = Some(CodeHealth {
                 foreign_share: acc.foreign_share / w_sum,
                 zero_centre_share: acc.zero_centre_share / w_sum,
-                inflation_mean: acc.inflation_mean / w_sum,
-                inflation_p90: acc.inflation_p90 / w_sum,
+                drift_mean: acc.drift_mean / w_sum,
+                drift_p90: acc.drift_p90 / w_sum,
                 error_band_mean: acc.error_band_mean / w_sum,
             });
         }
-        let mut ranked: Vec<(f64, u32)> = postings
-            .iter()
-            .filter_map(|p| p.codes.map(|c| (c.inflation_mean, p.posting_id)))
-            .collect();
+        let mut ranked: Vec<(f64, u32)> = postings.iter().filter_map(|p| p.codes.map(|c| (c.drift_mean, p.posting_id))).collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         candidates = Some(ranked.into_iter().take(20).map(|(_, id)| id).collect());
     }
@@ -257,16 +257,16 @@ pub async fn partition_health(
 mod tests {
     use super::*;
 
-    /// Codes encoded against their own posting's centre have inflation 1; after
-    /// a split, moved codes read above 1 and are foreign to their new posting.
+    /// Codes encoded against their own posting's centre have drift 0; after a
+    /// split, moved codes drift and are foreign to their new posting.
     #[tokio::test]
-    async fn inflation_is_one_at_home_and_above_one_after_a_move() {
+    async fn drift_is_zero_at_home_and_grows_after_a_move() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = super::super::tests::setup(&dir, 60).await;
         let h = super::super::tests::handle(&db).await;
         let (before, _) = partition_health(&db, super::super::tests::NS, &h, true).await.unwrap();
         let c = before.codes.unwrap();
-        assert!((c.inflation_mean - 1.0).abs() < 1e-3, "{c:?}");
+        assert!(c.drift_mean.abs() < 1e-9, "{c:?}");
         assert_eq!((c.foreign_share, c.zero_centre_share), (0.0, 1.0));
         split_oversized(&db, super::super::tests::NS, &h, &super::super::tests::settings(40))
             .await
@@ -274,7 +274,10 @@ mod tests {
         let (after, postings) = partition_health(&db, super::super::tests::NS, &h, true).await.unwrap();
         let c = after.codes.unwrap();
         assert!(c.foreign_share > 0.9, "every code moved off the root: {c:?}");
-        assert!(c.inflation_mean > 1.05, "moved codes are farther from their new centre's view: {c:?}");
+        assert!(
+            c.drift_mean > 0.1 && c.drift_mean.is_finite(),
+            "moved codes drift from their encoding centre: {c:?}"
+        );
         assert!(after.splits >= 1 && after.retired >= 1 && after.unfinished_splits == 0);
         assert_eq!(after.chunks, 180);
         assert!(after.size_p10_p50_p90_max[3] <= 40);

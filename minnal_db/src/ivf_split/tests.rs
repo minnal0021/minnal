@@ -352,3 +352,30 @@ async fn a_search_during_a_split_misses_nothing() {
     assert!(h.snapshot().postings() > 4);
     db.shutdown().await.unwrap();
 }
+
+/// Diagnostic over an existing database (`MINNAL_E2E_DB`, namespace
+/// `MINNAL_E2E_NS`): every key in an active posting, counts equal to a recount
+/// of the stored codes, no unfinished split; and the inflation of a few codes.
+#[tokio::test]
+#[ignore]
+async fn e2e_partition_invariants() {
+    let Ok(path) = std::env::var("MINNAL_E2E_DB") else { return };
+    let ns = std::env::var("MINNAL_E2E_NS").unwrap_or_else(|_| "e2e".into());
+    let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
+        .await
+        .unwrap();
+    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(records(&db, &ns).await.unwrap().is_empty(), "unfinished splits");
+    let keys = recount_chunks(&db, &ns).await.unwrap();
+    for (p, n) in &keys {
+        assert_eq!(ivf.posting_infos()[p].state, PostingState::Active, "posting {p}");
+        assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+    }
+    let counted: u64 = ivf.counts().snapshot().values().map(|c| c.1).sum();
+    assert_eq!(keys.values().sum::<u64>(), counted);
+    eprintln!("{} postings, {} chunks: invariants hold", keys.len(), counted);
+    db.shutdown().await.unwrap();
+}

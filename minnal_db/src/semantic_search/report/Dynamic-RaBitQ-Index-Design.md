@@ -1614,18 +1614,20 @@ can see it and a later re-encode can start with the worst postings.
 **Per code, from what is already stored.** A code holds its residual norm
 `‖r‖` against its encode centre (inside `scaling_factor`) and its
 `error_bound`, `ε · ‖r‖ · √((1/⟨ō,o⟩² − 1)/(D − 1))`: the width of the
-estimator's error band, which scales with `‖r‖`. What a fresh encode against
-the current posting's centre `c'` would have is estimated without the float:
-`‖x − c'‖² = ‖r‖² + ‖c − c'‖² + 2⟨r, c − c'⟩`, with `⟨r, c − c'⟩` from the
-same RaBitQ estimator search uses (unbiased). The ratio of the two is the
-code's **residual inflation**: 1 for a code encoded against its own posting's
-centre, above 1 for one that moved away from its centre. The error band
-inflates by the same ratio.
+estimator's error band, which scales with `‖r‖`. A code's **centre drift** is
+`‖c − c'‖ / ‖r‖`, the distance from the centre it was encoded against to its
+current posting's centre `c'`, relative to its residual: 0 for a code encoded
+in the posting it sits in, growing as splits move its key away. A re-encode
+against `c'` resets it.
 
-A code encoded against the zero centre (written while the namespace had one
-posting) has `‖r‖ = 1`. Against a fitted centre the mean is lower (gemma
-FiQA: 0.75 with 304 k-means centres, 0.88 with the bundled file), so early
-codes start at an inflation of about 1.3.
+The first design estimated a **residual inflation**, `‖r‖ / ‖x − c'‖`, with
+`‖x − c'‖² = ‖r‖² + ‖c − c'‖² + 2⟨r, c − c'⟩` and `⟨r, c − c'⟩` from the code.
+On real data that estimate is biased and unusable: a posting's centre is the
+mean of its members' reconstructions, and with 1-bit codes 2-means groups
+chunks partly by their code noise, so the cross term correlates with the noise
+and the estimate of `‖x − c'‖²` went negative (an end-to-end SciFact run read
+means above 10,000). Drift needs no estimate; on the same run its mean was
+0.40 and its 90th percentile 0.66.
 
 **Per posting.** Sizes, state and lineage come from memory (exact counts).
 The code metrics read every chunk code, so they are computed when asked for
@@ -1636,26 +1638,26 @@ deletes, which see only the meta, would leave them approximate:
 |---|---|
 | entries, chunks | size against the target (the split and merge triggers) |
 | foreign share | chunks whose `centre_id` is not the posting's own centre |
-| residual inflation, mean and p90 | how much precision moves have cost |
+| centre drift, mean and p90 | how far moves have taken codes from their encoding centre |
 | error band, mean | the mean `error_bound` of its codes, in score units |
 | zero-centre share | chunks still coded against the zero centre |
 
 **Per namespace**: postings (K), entries, posting-size spread (p10 / p50 / p90
 / max against the target), splits, merges and key moves since start, the
 entry-weighted means of the posting metrics, and the 20 postings with the
-highest mean inflation: the **re-encode candidates**.
+highest mean drift: the **re-encode candidates**.
 
 **Surfaced as** `GET /admin/indices/{ns}/vector/partition` (the namespace
 summary above), and in minnal_ui
 under Admin → Ops Metrics, per namespace: a "Vector partition" card with stat
-tiles (K, entries, foreign share, mean inflation, mean error band), a
+tiles (K, entries, foreign share, mean drift, mean error band), a
 histogram of posting sizes with the target marked, and the candidate table.
 
 **Posting list for visualisation.** A second endpoint returns every live
 posting with its size, so minnal_ui can draw the whole distribution rather than
 a summary:
 
-`GET /admin/indices/{ns}/vector/postings?sort=entries|inflation|id&order=desc&cursor=&limit=`
+`GET /admin/indices/{ns}/vector/postings?sort=id|entries|chunks|drift&order=desc&cursor=&limit=&codes=`
 
 ```json
 {
@@ -1668,7 +1670,7 @@ a summary:
     {"posting_id": 412, "entries": 251, "chunks": 388, "centre_id": 412,
      "parent_id": 97, "created_by": "split",
      "foreign_share": 0.34, "zero_centre_share": 0.0,
-     "inflation_mean": 1.08, "error_band_mean": 0.0061}
+     "drift_mean": 0.41, "error_band_mean": 0.0461}
   ],
   "next_cursor": "…"
 }
@@ -1691,7 +1693,7 @@ minnal_ui draws from it, in the same "Vector partition" card:
   (`split_limit`) and merge (`merge_limit`) thresholds marked;
 - every posting sorted by size, as a ranked bar strip, which shows skew at a
   glance (the bundled file put 43% of SciFact in one posting);
-- the same strip coloured by mean inflation, to see where drift sits;
+- the same strip coloured by mean drift, to see where it sits;
 - optionally, the split tree from `parent_id`.
 
 **Used later by** the re-encode queue (`reencode_source` = `stored` /
@@ -1768,7 +1770,19 @@ meta loses P **before** P's key is deleted — the crash test, which crashes a
 split before every one of its writes under four flush patterns, showed the
 other order leaves a meta naming P with no key behind it (*Maintenance
 journal*, rule 2). Partition health computes its code metrics on request
-(`?codes=true`) instead of keeping running sums.
+(`?codes=true`) instead of keeping running sums, and reports **centre drift**
+instead of residual inflation, whose estimate the end-to-end run showed to be
+biased (*Partition health*).
+
+**End-to-end check.** A scratch API server with the real embedding service,
+`target_posting_size = 16` from its TOML: a store created over REST took the
+TOML's maintenance defaults into its schema with no `seeded_from`; 400 SciFact
+documents grew it from 1 posting to 105 with none over the 32-chunk limit, and
+search returned relevant documents. The server was then killed with SIGKILL
+while splitting during a second batch of 400; on restart it drained the queue
+and finished at 209 postings, and a check of the database found every key in
+an active posting, every count equal to a recount of the stored codes, and no
+unfinished split.
 
 ### M3b — Reassign (LIRE) and merge
 
