@@ -306,7 +306,12 @@ async fn split_locked(
     // Finished records are deleted, so an id only has to beat unfinished ones.
     let op = records(db, namespace).await?.last().map_or(0, |(op, _)| op + 1);
     let mut rng = SplitRng::new(u64::from(posting).rotate_left(32) ^ op ^ chunks);
-    let Some(result) = balanced_two_means(&points, &settings.params, &mut rng) else {
+    let params = settings.params;
+    // Off the async threads (and off the rayon pool searches share).
+    let result = tokio::task::spawn_blocking(move || balanced_two_means(&points, &params, &mut rng))
+        .await
+        .map_err(|e| crate::KVError::Io(std::io::Error::other(e)))?;
+    let Some(result) = result else {
         handle.mark_unsplittable(posting, chunks);
         return Ok(SplitOutcome::Unsplittable);
     };

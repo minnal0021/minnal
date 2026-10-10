@@ -282,6 +282,10 @@ pub struct SemanticSearchContext {
     /// What a namespace's vector-index settings are filled with when it first
     /// enables semantic search (the server's TOML defaults, or built-in).
     pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
+    /// Namespaces maintained at once by the partition maintenance task.
+    pub maintenance_threads: usize,
+    /// Reaches the partition maintenance task, once it runs.
+    maintenance_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
@@ -302,6 +306,8 @@ pub struct NamespaceSemantics {
     /// The namespace's search settings, from which `config.probe` was computed
     /// (kept so a request's overrides apply to them, not to the computed budget).
     pub search: SearchSettings,
+    /// The namespace's partition maintenance settings.
+    pub maintenance: crate::doc_store::vector_settings::MaintenanceSettings,
 }
 
 #[cfg(feature = "semantic-search")]
@@ -313,7 +319,27 @@ impl SemanticSearchContext {
             config,
             cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
             index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
+            maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
+            maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Maintain at most `threads` namespaces' partitions at once.
+    pub fn with_maintenance_threads(mut self, threads: usize) -> Self {
+        self.maintenance_threads = threads.max(1);
+        self
+    }
+
+    pub(crate) fn set_maintenance_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        let _ = self.maintenance_tx.set(tx);
+    }
+
+    /// Ask the maintenance task to split `namespace`'s oversized postings. A
+    /// no-op until the task runs.
+    pub fn request_maintenance(&self, namespace: &str) {
+        if let Some(tx) = self.maintenance_tx.get() {
+            let _ = tx.send(namespace.to_owned());
         }
     }
 
@@ -435,6 +461,7 @@ impl SemanticSearchContext {
             config,
             partition,
             search: settings.search,
+            maintenance: settings.maintenance,
         })
     }
 }

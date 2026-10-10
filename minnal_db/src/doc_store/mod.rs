@@ -3,6 +3,8 @@ pub mod hex;
 pub mod index_manager;
 pub mod index_observer;
 pub mod index_progress;
+#[cfg(feature = "semantic-search")]
+pub(crate) mod ivf_maintenance;
 pub mod key;
 pub mod kv_schema;
 pub mod pagination;

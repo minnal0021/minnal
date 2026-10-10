@@ -342,6 +342,20 @@ impl MaintenanceSettings {
         (f64::from(self.split_limit()) * self.merge_ratio.0).round() as u32
     }
 
+    /// What the split executor runs with.
+    #[cfg(feature = "semantic-search")]
+    pub fn split_settings(&self) -> crate::ivf_split::SplitSettings {
+        crate::ivf_split::SplitSettings {
+            split_limit: u64::from(self.split_limit()),
+            params: crate::semantic_search::cluster::split::SplitParams {
+                samples: self.split_samples as usize,
+                init_trials: self.split_init_trials as usize,
+                max_iters: self.split_max_iters as usize,
+                lambda_factor: self.split_lambda_factor.0,
+            },
+        }
+    }
+
     /// Check every range.
     pub fn validate(&self) -> Result<(), SchemaError> {
         check_range(

@@ -350,6 +350,72 @@ mod with_service {
 
     const TEXT: &str = "One sentence here. Two sentences now. Three of them. Four in a row. Five so far. Six at last.";
 
+    /// A namespace grows from its root by itself: the worker wakes maintenance
+    /// when a posting passes its split limit, and the splits keep every key in
+    /// an active posting with exact counts, also across a reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postings_split_by_themselves_as_a_namespace_grows() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while partition.snapshot().posting_infos()[&0].state != crate::semantic_search::PostingState::Retired {
+            assert!(std::time::Instant::now() < deadline, "the root was never split");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let check = |partition: Arc<crate::semantic_search::PartitionHandle>| {
+            let db = Arc::clone(&store.db);
+            async move {
+                let ivf = partition.snapshot();
+                let keys = crate::ivf_split::recount_chunks(&db, "g").await.unwrap();
+                for (p, n) in &keys {
+                    assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+                    assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+                }
+                assert_eq!(keys.values().sum::<u64>(), ivf.counts().snapshot().values().map(|c| c.1).sum::<u64>());
+                ivf.postings()
+            }
+        };
+        // Let any further splits settle, then check.
+        let _ = partition.lock_maintenance().await;
+        let postings = check(Arc::clone(&partition)).await;
+        assert!(postings > 1, "{postings} posting(s)");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+        drop((store, ctx, partition));
+
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let ivf = partition.snapshot();
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p} after reopen");
+        }
+        assert_eq!(ivf.postings(), postings);
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is still found");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
     /// The loaded partition's entry counts track the worker's writes and the
     /// doc store's deletes, matching a fresh count of the stored keys.
     #[tokio::test]

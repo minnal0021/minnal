@@ -132,6 +132,8 @@ pub struct VecIndexWorkerHandle {
     notify: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
     startup_pass: tokio::sync::watch::Receiver<bool>,
+    /// The partition maintenance task, which this worker wakes; stopped with it.
+    maintenance: Option<crate::doc_store::ivf_maintenance::MaintenanceHandle>,
 }
 
 impl VecIndexWorkerHandle {
@@ -153,6 +155,9 @@ impl VecIndexWorkerHandle {
         self.notify.notify_one();
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+        if let Some(m) = self.maintenance.take() {
+            m.shutdown().await;
         }
     }
 }
@@ -197,6 +202,7 @@ impl VecIndexWorker {
     ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (pass_tx, pass_rx) = tokio::sync::watch::channel(false);
+        let maintenance = crate::doc_store::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), schema_dir.clone());
         let worker = VecIndexWorker {
             db,
             ctx,
@@ -212,10 +218,14 @@ impl VecIndexWorker {
             notify,
             task: Some(task),
             startup_pass: pass_rx,
+            maintenance: Some(maintenance),
         }
     }
 
     async fn run(self) {
+        // Splits a crash interrupted are finished first: nothing may write a
+        // namespace's vectors while its journal is unfinished.
+        crate::doc_store::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schema_dir).await;
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
         self.startup_pass.send_replace(true); // also covers an empty queue
@@ -509,6 +519,10 @@ impl VecIndexWorker {
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 let delta = vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
                 ivf.apply_delta(&delta);
+                let limit = u64::from(ns.maintenance.split_limit());
+                if delta.added.iter().any(|&(p, _)| ivf.posting_chunks(p) > limit) {
+                    self.ctx.request_maintenance(&entry.namespace);
+                }
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {
