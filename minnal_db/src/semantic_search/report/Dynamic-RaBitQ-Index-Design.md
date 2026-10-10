@@ -2117,8 +2117,11 @@ merges) happen *during* the measured run, not only before it.
 | `ingest_heavy` | 15% | 30% | 15% | 5% | 5% | 10% | 15% | 5% |
 
 **Ingestion is limited by the embedding service, not by minnal**, and the two
-run on the same host, sharing its CPU (the llama.cpp service has no GPU here).
-So the embedding service's cores are part of the setup and are recorded. Writes enter minnal at their arrival rate, but the vector
+run on the same host. The service (a gateway in front of one llama.cpp server
+per model, ROCm on the host's AMD GPU) embeds on the GPU, so it takes little
+CPU from minnal, but it caps ingestion: about 10 documents per second through
+the vector worker for gemma. Its batching settings (`EMBEDDING_MAX_BATCH_TEXTS`,
+`EMBEDDING_BATCH_WAIT_MS`, `LLAMA_PARALLEL`) are recorded with the run. Writes enter minnal at their arrival rate, but the vector
 worker embeds them only as fast as the service answers. So inserts are not
 just a share of a rate: the run also reports *ingestion lag*, the time from a
 write's acknowledgement to its document being searchable (polled through the
@@ -2128,12 +2131,12 @@ unsustainable whatever the latencies say.
 
 ### Procedure
 
-1. **Host.** This machine (32 cores, 89 GB), idle apart from the run. Release
+1. **Host.** This machine (32 cores, 89 GB, AMD GPU with 32 GB for the embedding models), idle apart from the run. Release
    binary, production TOML defaults, the real embedding service. The load
    generator runs on the same host, pinned with `taskset` to 4 cores that the
-   server is kept off; the embedding service and the server get fixed, disjoint
-   core sets from the other 28 (split decided by a short calibration run), and
-   the run records the host's CPU, memory and disk I/O.
+   server is kept off (the server and the embedding service's gateway share the
+   other 28; the models run on the GPU), and the run records the host's CPU,
+   memory, disk I/O and GPU use.
 2. **Warm-up.** Load the base set, wait for the vector queue to empty and for
    compaction to settle, then run the mix at 25% of the first step's rate for 5
    minutes. Warm-up is not measured.
@@ -2165,7 +2168,7 @@ before the run, not measured limits.
 | Freshness | Ingestion lag p50/p99; vector queue depth over time | `GET /admin/indices/vector/queue/summary`, polled every 5 s |
 | Background work | LSM compactions, L0 file count, value-log GC passes and bytes reclaimed, WAL segments and GC, index checkpoints, TTL passes, splits/reassigns/merges and maintenance backlog (postings over `split_limit`) | `GET /admin/storage/ops-metrics`, `/admin/storage/lsm`, `/admin/storage/wal`, `/admin/indices/{ns}/vector/partition`, polled every 5 s |
 | Quality under load | nDCG@{10, 20, 30, 40, 50, 100} and recall of the `search` replies during the run, against the same queries run alone after the system is quiet | `--record`-style run file, scored with `beir_eval` |
-| Resources | Server and embedding-service CPU and RSS, disk bytes written (write amplification = bytes written ÷ bytes accepted), open files | `/proc/{pid}/stat`, `/proc/{pid}/status`, `/proc/{pid}/io` |
+| Resources | Server CPU and RSS, disk bytes written (write amplification = bytes written ÷ bytes accepted), open files; GPU busy % and VRAM used | `/proc/{pid}/stat`, `/proc/{pid}/status`, `/proc/{pid}/io`; the GPU's sysfs `gpu_busy_percent` and `mem_info_vram_used` (no `rocm-smi` on the host) |
 
 **Validity check, before any number is reported.** Every background task must
 show work in every 10-minute step: LSM compaction count rose, value-log GC ran
