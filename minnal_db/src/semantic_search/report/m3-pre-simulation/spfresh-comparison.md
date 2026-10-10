@@ -34,9 +34,11 @@ error-bound gate **off** by default.
 With these choices the grown partition trails a k-means partition fitted on
 the whole corpus, at the same posting count, by 2–4 points of recall@10 when a
 query reads 1% of the chunks, 1–2.4 points at 2%, and under 1 point from 5%.
-nDCG@10 is unchanged (−0.5 to +0.3 points at 2% read): the documents it misses
-are the ones that barely make the exact top 10. At today's probe budget
-(70,000 entries, about 65% of FiQA) every variant returns the exact top 10.
+nDCG moves much less than recall: within 0.7 points of the static partition at
+every cutoff from @10 to @100 when a query reads 2% or 5% of the chunks, and
+within 0.3 points at 10%. The documents it misses are the ones that barely make
+the exact top 10. At today's probe budget (70,000 entries, about 65% of FiQA)
+every variant returns the exact top 10.
 
 ## Terms used here
 
@@ -193,6 +195,33 @@ nDCG@10 difference at 2% read:
 | gemma, shuffled | 23,199 / 0.576 | 0.839 | 0.890 | 4.56 / 16.8 |
 | gemma, drifting | 23,939 / 0.594 | 0.842 | 0.896 | 4.17 / 14.8 |
 
+### nDCG at every cutoff, against static k-means at the same K
+
+Points of nDCG@10 / @20 / @30 / @40 / @50 / @100, variant minus static k-means
+(the 2-bit search code against static k-means with the same code):
+
+| Variant | Read | qwen, shuffled | qwen, drifting | gemma, shuffled | gemma, drifting |
+|---|---|---|---|---|---|
+| 1-bit, mean | 2% | −0.52 / −0.61 / −0.67 / −0.59 / −0.66 / −0.69 | −0.17 / −0.18 / −0.25 / −0.18 / −0.30 / −0.38 | −0.09 / −0.04 / −0.02 / −0.08 / −0.08 / −0.11 | +0.25 / +0.22 / +0.15 / +0.18 / +0.23 / +0.15 |
+| | 5% | −0.16 / −0.18 / −0.21 / −0.21 / −0.18 / −0.25 | −0.06 / −0.05 / −0.04 / −0.07 / −0.07 / −0.11 | −0.39 / −0.44 / −0.43 / −0.50 / −0.54 / −0.54 | −0.15 / −0.21 / −0.19 / −0.18 / −0.24 / −0.27 |
+| | 10% | +0.09 / +0.10 / +0.09 / +0.07 / +0.07 / +0.04 | +0.06 / +0.06 / +0.09 / +0.07 / +0.08 / +0.04 | −0.15 / −0.26 / −0.21 / −0.25 / −0.22 / −0.24 | +0.12 / +0.07 / +0.11 / +0.10 / +0.08 / +0.01 |
+| 1-bit, mean, skip uncertain moves | 2% | −0.64 / −0.86 / −0.97 / −0.96 / −1.00 / −1.06 | −0.32 / −0.26 / −0.39 / −0.40 / −0.43 / −0.42 | +0.06 / +0.12 / +0.05 / +0.02 / +0.06 / +0.01 | −0.09 / −0.22 / −0.30 / −0.27 / −0.24 / −0.23 |
+| | 5% | −0.19 / −0.24 / −0.32 / −0.34 / −0.33 / −0.38 | +0.13 / +0.11 / +0.14 / +0.12 / +0.15 / +0.11 | −0.54 / −0.57 / −0.62 / −0.59 / −0.63 / −0.61 | −0.18 / −0.28 / −0.32 / −0.35 / −0.36 / −0.35 |
+| 2-bit maintenance, mean, skip uncertain moves | 2% | −0.22 / −0.32 / −0.47 / −0.43 / −0.39 / −0.46 | −0.21 / −0.27 / −0.30 / −0.26 / −0.38 / −0.40 | +0.29 / +0.34 / +0.36 / +0.28 / +0.33 / +0.31 | +0.25 / +0.37 / +0.24 / +0.28 / +0.31 / +0.22 |
+| | 5% | −0.07 / −0.10 / −0.12 / −0.11 / −0.10 / −0.16 | −0.01 / −0.06 / −0.08 / −0.10 / −0.07 / −0.09 | −0.24 / −0.33 / −0.35 / −0.38 / −0.37 / −0.35 | +0.06 / +0.01 / 0.00 / 0.00 / −0.04 / −0.13 |
+| 2-bit search, mean | 2% | −0.20 / −0.32 / −0.36 / −0.32 / −0.34 / −0.39 | −0.41 / −0.51 / −0.57 / −0.62 / −0.63 / −0.67 | −0.93 / −0.93 / −0.95 / −0.89 / −0.90 / −0.98 | −0.11 / −0.15 / −0.08 / −0.03 / 0.00 / −0.08 |
+| | 5% | −0.12 / −0.13 / −0.12 / −0.13 / −0.13 / −0.12 | −0.13 / −0.15 / −0.12 / −0.16 / −0.13 / −0.14 | −0.04 / −0.02 / −0.09 / −0.05 / −0.05 / −0.10 | −0.37 / −0.34 / −0.37 / −0.36 / −0.35 / −0.38 |
+
+- **1-bit with mean centres stays within 0.7 points at every cutoff** from 2%
+  read, and within 0.3 at 10%. The gap is usually a little larger at @100 than
+  at @10, so @10 alone understates it slightly; the largest is gemma shuffled at
+  5% read (−0.39 at @10, −0.54 at @100).
+- **No variant is consistently better.** The 2-bit options are ahead in some
+  cells and behind in others by similar amounts; skipping uncertain moves is
+  behind in 6 of 8 cells.
+- The 1-bit medoid run, not tabled, trails a full scan by 2.2–8.8 points at
+  these budgets.
+
 ## Findings
 
 **1. The medoid is the one part of LIRE that does not carry over.** With 1-bit
@@ -239,8 +268,9 @@ models, because some useful moves have margins within the bound. It stays
 available for namespaces where write amplification matters more.
 
 **6. What remains is a small-budget gap.** The recommended configuration trails
-static k-means at the same K by 2.1–3.8 points at 1% read and 0.5–0.9 at 5%.
-nDCG@10 does not move, so the misses are near-ties at the edge of the top 10.
+static k-means at the same K by 2.1–3.8 points of recall at 1% read and 0.5–0.9
+at 5%. nDCG moves far less (within 0.7 points at every cutoff from 2% read), so
+most misses are near-ties at the edge of the top 10.
 The gap matters only if the probe budget falls to a few percent of the
 namespace. The M2d default reads about 65% of FiQA's entries; a scaled budget
 of 30% of the entries (M3-pre) would read about 19% of FiQA's chunk count,

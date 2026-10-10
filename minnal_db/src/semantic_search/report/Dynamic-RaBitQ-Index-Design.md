@@ -1277,8 +1277,9 @@ number of postings:
 - **The error-bound gate** cuts key moves by 12–17% but costs 0.7–0.9 points at
   1% read when topics arrive in turn.
 - **Recommended configuration** (LIRE, mean centres, 1-bit, no replicas, gate
-  off): 2.1–3.8 points behind static k-means at the same K at 1% read, 0.5–0.9 at
-  5%, nDCG@10 unchanged (−0.5 to +0.3 points at 2% read).
+  off): recall@10 2.1–3.8 points behind static k-means at the same K at 1% read,
+  0.5–0.9 at 5%; nDCG within 0.7 points at every cutoff @10–@100 from 2% read and
+  within 0.3 at 10%.
 
 **Decided for M3 (2026-10-10):**
 
@@ -1375,7 +1376,7 @@ than `split_limit` chunks, the maintenance task is woken for it.
    Each candidate is routed again to its nearest `Active` posting. If that is
    its current posting it stays; otherwise its key moves (code and `centre_id`
    unchanged). A posting pushed past `split_limit` by a move is split in turn.
-6. **Error-bound gate** (`error_bound_gate`, off by default). Every comparison
+6. **Error-bound gate** (`skip_uncertain_moves`, off by default). Every comparison
    `D(x̂, A) < D(x̂, B)` in step 5 and in the merge below must win by more than
    `2 · error_bound · ‖A − B‖`, the most the code's estimate of that comparison
    can be off; otherwise the chunk stays.
@@ -1417,7 +1418,8 @@ target_posting_size = 128    # chunks; a posting splits above 2x, merges at
                              # round(2x * merge_ratio) or fewer
 reassign_range = 64          # nearest postings re-checked after a split (0 = none)
 merge_ratio = 0.0847         # 10/118, SPFresh's merge-to-split ratio
-error_bound_gate = false     # move a chunk only if it wins by more than its error bound
+skip_uncertain_moves = false # true: move a chunk only when its code shows it is
+                             # clearly closer (the gain exceeds its error bound)
 split_samples = 1000         # balanced 2-means: members sampled per iteration
 split_init_trials = 3        #   random starting pairs tried
 split_max_iters = 100        #   iteration cap
@@ -1440,7 +1442,7 @@ top_k = 100
 | `target_posting_size` | 128 chunks | fewer, larger postings: fewer probes per query and less maintenance per insert, but less recall per entry read | the reverse | M3-pre §1; 128 against 256 settled in M3a by measured probe cost |
 | `reassign_range` | 64 | more chunks re-checked per split (about 180 each): reads and CPU per split | more misplaced chunks; 0 re-checks only the split posting | SPFresh §5.5 (64 ≈ 128); M3-pre reassignment |
 | `merge_ratio` | 0.0847 | merges sooner: fewer tiny postings, more key moves | small postings linger, costing a probe each | SPFresh's ratio; M3-pre §5 |
-| `error_bound_gate` | off | on: 12–17% fewer key moves, up to 0.9 points less recall at 1% read under topic drift | — | SPFresh comparison |
+| `skip_uncertain_moves` | off | on: 12–17% fewer key moves, up to 0.9 points less recall at 1% read under topic drift | — | SPFresh comparison |
 | `split_samples`, `split_init_trials`, `split_max_iters`, `split_lambda_factor` | 1000, 3, 100, 100 | SPTAG's values; a posting of 256 chunks is never sampled | — | SPTAG |
 | `threads` | 2 | maintenance keeps up with heavier ingest, at more CPU taken from queries | slower to split under load | measured in M3a |
 | `probe_budget_entries` | 70,000 | more recall, more latency | less of both | M2d |
@@ -1579,8 +1581,9 @@ vectors it vouches for. M0-1 fixes that first, with the same barrier.
 **Gate (SciFact and FiQA, empty namespace, no file, all three orders):**
 recall within 2 pts of (iv) at equal entries scanned, from 5% of the chunks
 read upwards (the simulation predicts at most 0.9 there; below 5% it predicts
-2–4 points with nDCG unchanged, which is reported, not gated); largest posting
-< 1% (today 43% on SciFact); nDCG@10 ≥ M2d − 0.005 at the default budget.
+2–4 points, with nDCG within 0.7 points at every cutoff, which is reported,
+not gated); largest posting < 1% (today 43% on SciFact); nDCG@{10, 20, 30, 40,
+50, 100} each ≥ M2d − 0.005 at the default budget.
 Plus these tests:
 
 - a **crash at every step boundary** of the table above, next to
@@ -1696,6 +1699,7 @@ Steps 5–6 and the merge of *M3 split algorithm (LIRE)*: reassignment over the
 `reassign_range` nearest postings, merges at `merge_limit`, and the optional
 error-bound gate. Measured separately because each move costs a put plus a
 tombstone in the LSM. **Gate:** recall gain ≥ what the simulation predicted;
+nDCG@{10, 20, 30, 40, 50, 100} each ≥ M3a − 0.005;
 key moves per insert within 20% of the simulation's (about 2.0 at the
 defaults); compaction and write-amplification overhead reported; no query
 latency regression while maintenance runs.
@@ -1919,7 +1923,8 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
   dense vectors) and rewrites keys only. Triggered by hand, or by drift
   indicators (posting-size coefficient of variation, mean `‖x̂ − routing
   centroid‖` per posting, probes needed to reach the budget). **Gate:** a FiQA
-  rebuild makes zero embedding-service calls and lands within 1 pt of (iv).
+  rebuild makes zero embedding-service calls, lands within 1 pt of (iv) in
+  recall, and keeps nDCG@{10, 20, 30, 40, 50, 100} each ≥ the pre-rebuild value − 0.005.
 - **Delete:** `centroid_dir`, the bundled `service/embedding_support/*/clusters.json`
   files, `cluster_path` remnants, the M2b seeding code, and the "Cluster
   centroids" sections of the docs. No import path is kept.
@@ -1944,7 +1949,7 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 
 | # | Question | Decision |
 |---|---|---|
-| 1 | Gate thresholds (nDCG −0.005, ANN recall −0.5 pt, latency +5%) | Accepted |
+| 1 | Gate thresholds (nDCG −0.005, ANN recall −0.5 pt, latency +5%) | Accepted. Every nDCG gate applies at each of @10, @20, @30, @40, @50 and @100 separately, never at @10 alone (2026-10-04, restated for all later gates 2026-10-10) |
 | 2 | Where `embedding_dim` lives | In the namespace schema, next to `embedding_model` (M2a) |
 | 3 | Changing a store's model | Not supported: model and dimension are fixed once selected. A drop-and-re-index operation may be added later |
 | 4 | Existing data | Not a concern; stores are recreated after format changes |
