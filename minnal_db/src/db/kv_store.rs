@@ -97,6 +97,13 @@ pub struct KVStore {
     // data a crash would destroy outright rather than merely delay.
     pub(crate) unflushed_no_wal_writes: Arc<AtomicBool>,
 
+    // Test-only: set by a simulated crash (`AsyncDb::crash`) so that dropping
+    // the store skips the flush below, as a process kill would. Without it the
+    // flush made every unflushed memtable durable, no-WAL writes included, and
+    // no crash test could see a write that a real crash loses.
+    #[cfg(test)]
+    crashed: AtomicBool,
+
     // Flag to prevent concurrent value log GC operations
     pub(crate) value_log_gc_in_progress: Arc<AtomicBool>,
 
@@ -237,6 +244,8 @@ impl KVStore {
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            crashed: AtomicBool::new(false),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
@@ -1883,8 +1892,20 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     }
 }
 
+impl KVStore {
+    /// Test-only: make dropping this store skip its flush, as a crash would.
+    #[cfg(test)]
+    pub(crate) fn mark_crashed(&self) {
+        self.crashed.store(true, Ordering::SeqCst);
+    }
+}
+
 impl Drop for KVStore {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.crashed.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = self.value_log.sync_all();
         let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.flush_all_metadata();

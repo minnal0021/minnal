@@ -149,6 +149,8 @@ Two more invariants to preserve when touching SSTable I/O:
 
 > **Test note:** `compact_all()` drains only *read-only* memtables and L0 — it does **not** seal the active memtable, and returns early when both are empty. A test that wants data in L1 must call `flush_memtable_to_level0()` first, then `compact_all()`, and should assert the L1 file is non-empty rather than assuming it. Skipping the flush silently exercises the skip list instead.
 
+> **Test note:** `AsyncDb::crash()` must lose exactly what a process kill loses. Each `KVStore` flushes its memtable in `Drop`, so a crashed database marks its stores (`Database::mark_crashed` → `KVStore::mark_crashed`, test-only) and their `Drop` skips the flush. Until 2026-10-11 it did not, every unflushed no-WAL write survived a simulated crash, and no crash test could catch a missing barrier flush. Any new `Drop` that writes must honour the flag. Regression test: `a_simulated_crash_loses_unflushed_no_wal_writes`.
+
 ## Typed value API
 
 `put_typed<T>` / `get_typed<T>` / `merge_typed<T>` use `rkyv` for zero-copy serialisation. Types must derive `rkyv::Archive + rkyv::Serialize + rkyv::Deserialize`. These are re-exported via `minnal_db::rkyv_derives` so downstream crates don't need a direct `rkyv` dependency.

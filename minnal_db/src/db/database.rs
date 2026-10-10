@@ -2814,6 +2814,10 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn mark_crashed(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Each store flushes itself when dropped; a crash must not.
+        for store in self.stores.read().values() {
+            store.mark_crashed();
+        }
     }
 
     pub fn is_closed(&self) -> bool {
