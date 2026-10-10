@@ -1452,11 +1452,12 @@ top_k = 100
 **Validation**, at startup for the TOML and on every amendment:
 `target_posting_size` 16–65,536; `reassign_range` 0–1,024; `merge_ratio`
 greater than 0 and below 0.5 (a merged posting must stay under the split
-limit); `split_samples` at least 2; `split_init_trials` and `split_max_iters`
-at least 1; `split_lambda_factor` greater than 0; `threads` 1–64;
-`probe_budget_fraction` greater than 0 and at most 1, with
-`probe_budget_floor` at most `probe_budget_entries`. Unknown keys are rejected,
-as today.
+limit); `split_samples` 2–1,000,000; `split_init_trials` 1–100;
+`split_max_iters` 1–10,000; `split_lambda_factor` greater than 0; `threads`
+1–64; `probe_budget_fraction` above 0 and at most 1, or 0 to turn scaling off,
+with `probe_budget_floor` at most `probe_budget_entries` when a fraction is set.
+A request that overrides `probe_budget_entries` reads exactly that budget.
+Unknown keys are rejected, as today.
 
 ### M3a — Grow and split (split only, no reassign)
 
@@ -1520,9 +1521,9 @@ record.
 | 1. Plan | Read P, reconstruct `x̂ = c + scaling_factor · P(2b − 1)` (unrotated), run balanced 2-means. Write the record | WAL | `Planned` |
 | 2. Prepare | Append the two centres; write postings P1, P2 (`Active`); mark P `Draining` | WAL | `Planned` |
 | 3. Publish | Take the routing-epoch write guard (below), publish a snapshot where inserts never choose P but search still probes it | WAL | `Published` |
-| 4. Copy | Per doc, under `lock_doc_vectors`: add P1/P2 to the doc's meta, then write its chunks under `P1‖doc` / `P2‖doc` | **no-WAL** | `Published` |
+| 4. Copy | Per doc, under `lock_doc_vectors`: add P1/P2 to the doc's meta (WAL), then write its chunks under `P1‖doc` / `P2‖doc` (**no-WAL**) | WAL + no-WAL | `Published` |
 | 5. Barrier | Flush the sparse and meta namespaces to L0 (the flush fsyncs the value log first) | flush | `Copied` |
-| 6. Delete | Per doc, under the lock: delete `P‖doc`, then remove P from the doc's meta. Rescan P; it must be empty | WAL (deletes), no-WAL (meta) | `Copied` |
+| 6. Delete | Per doc, under the lock: remove P from the doc's meta, then delete `P‖doc`. Rescan P; it must be empty | WAL | `Copied` |
 | 7. Retire | Mark P `Retired`; publish the snapshot | WAL | `Done` |
 
 **Recovery** runs at open, before the vector worker and reconciliation start.
@@ -1549,13 +1550,17 @@ moves the entries the plan selects from neighbouring postings.
    Copy order alone does not help; durability order does. One flush per
    operation, not per entry. (Making the copies WAL-backed would also work, at
    roughly one extra fsync per insert at the measured 0.5–0.9 moves per insert.)
-2. **The meta is always a superset.** `{ns}_sparse_vector_meta` is the only
-   record of which postings hold a doc's chunks, and `delete_vector` deletes
-   exactly what it lists. A posting missing from the meta becomes an orphan: the
-   chunk of a deleted doc keeps appearing in search. So a posting is added to
-   the meta before the copy and removed only after the delete. An extra posting
-   is harmless (deleting an absent key does nothing). The barrier makes this
-   hold across the two no-WAL meta writes.
+2. **The meta is a superset of the live postings.** `{ns}_sparse_vector_meta`
+   is the only record of which postings hold a doc's chunks, and
+   `delete_vector` deletes exactly what it lists. A posting missing from the
+   meta becomes an orphan: the chunk of a deleted doc keeps appearing in search.
+   So a child is added to the meta (WAL-backed, as since M0-2) before the copy.
+   The draining parent P is the one exception: it leaves the meta just before
+   its key is deleted. The opposite order was the first design, and the crash
+   audit showed why it fails: a crash between the two left a meta naming P with
+   no key, and the redo, which walks P's keys, never came back to it. Removing
+   P first is safe because the redo of step 6 deletes every key still under P,
+   listed or not, and nothing writes to P after step 3.
 3. **Values are lists.** The key `posting ‖ doc_id` holds all of that doc's
    chunks in that posting, so a move splits or merges lists. Every move runs
    under `lock_doc_vectors`, which serialises all writers of a doc's vector keys,
@@ -1622,8 +1627,10 @@ posting) has `‖r‖ = 1`. Against a fitted centre the mean is lower (gemma
 FiQA: 0.75 with 304 k-means centres, 0.88 with the bundled file), so early
 codes start at an inflation of about 1.3.
 
-**Per posting**, kept as running sums next to the entry counts (updated on
-every encode, move and delete, recounted when a partition loads):
+**Per posting.** Sizes, state and lineage come from memory (exact counts).
+The code metrics read every chunk code, so they are computed when asked for
+(`?codes=true`) rather than kept as running sums on the write path, where
+deletes, which see only the meta, would leave them approximate:
 
 | Metric | Meaning |
 |---|---|
@@ -1692,6 +1699,76 @@ minnal_ui draws from it, in the same "Vector partition" card:
 and by M4's drift indicators. No threshold is set yet: the M3-pre simulation
 found no ranking cost from moved codes, so the first job of these numbers is
 to show what real namespaces look like.
+
+### M3a result (2026-10-10)
+
+**Passed on FiQA for both models and every insertion order; SciFact misses
+the recall gate at 5% read before reassignment.** A namespace now starts as
+one root posting at the zero centre and splits postings past `split_limit`
+chunks by SPTAG's balanced 2-means with mean centres, through the
+maintenance journal; the vector worker wakes a per-process maintenance task,
+and journal recovery runs before the worker's first pass. All levers are in
+the TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`)
+and owned by each namespace's schema. No reassignment or merges yet (M3b).
+
+**Gate runs.** The vector bench grew each namespace from its root
+(`MINNAL_BENCH_PARTITION=grow`, target 128, splitting after every 256
+documents) and compared it with static k-means fitted on the corpus's floats
+at the same posting count, indexed through the same production path
+(`fit_static.py`, `MINNAL_BENCH_PARTITION=file`). Recall@10 points behind
+static k-means at equal entries read (shares of the chunk count), and the
+worst nDCG difference over @10–@100 at 5% read:
+
+| | K | 2% read | 5% read | 10% read | nDCG @10–@100, worst, at 5% | Largest posting |
+|---|---|---|---|---|---|---|
+| FiQA gemma, shuffled / corpus / drifting | 1,226 / 1,216 / 1,196 | −3.6 / −2.7 / −4.3 | **−1.6 / −1.2 / −1.7** | −0.7 / −0.6 / −0.7 | −0.44 / −0.17 / −0.76 | 0.15% |
+| FiQA qwen | 1,150 / 1,114 / 1,138 | −2.1 / −1.7 / −2.7 | **−0.6 / −0.5 / −1.2** | −0.3 / −0.3 / −0.4 | +0.03 / +0.06 / −0.27 | 0.15% |
+| SciFact gemma | 154 / 159 / 150 | −5.7 / −5.2 / −7.6 | **−2.9 / −3.5 / −3.5** | −1.5 / −1.7 / −1.3 | −2.25 / −2.51 / −2.08 | 1.5% |
+| SciFact qwen | 160 / 154 / 162 | −4.5 / −5.1 / −4.8 | **−2.1 / −2.8 / −3.4** | −0.7 / −0.7 / −1.6 | −0.76 / −0.55 / −1.59 | 1.1% |
+
+- **Recall gate (within 2 points from 5% read):** passed on FiQA, every order,
+  both models. Missed on SciFact by up to 1.5 points: about 150 postings, 300
+  queries, and no reassignment yet; the simulation's comparable numbers
+  included reassignment over 64 neighbours (M3b). Re-measured after M3b.
+- **Largest posting under 1%:** 0.15% on FiQA. Not reachable on SciFact at
+  target 128: one full posting (256 chunks) is already 1.1% of its 22,787
+  chunks.
+- **nDCG@{10, 20, 30, 40, 50, 100} ≥ M2d − 0.005 at the default budget:**
+  passed everywhere; the worst cutoff is −0.0005 (qwen FiQA drifting). SciFact
+  is a full scan at 70k and is identical at every cutoff.
+
+**Probe cost and the default target.** FiQA gemma, corpus order, M2d and
+targets 128 and 256 run alternately, two rounds of five latency passes:
+
+| | M2d (bundled file) | Target 128 | Target 256 |
+|---|---|---|---|
+| Postings K | 245 | 1,216 | 522 |
+| Default 70k budget: probes / p50 / p99 | 65 / 14.6 / 18.3 ms | 603 / 14.9 / 18.3 ms | 293 / 13.8 / 17.3 ms |
+| Recall@10 (p50) at 2% read | — | 0.932 (2.5 ms) | 0.911 (2.3 ms) |
+| Recall@10 (p50) at 5% read | — | 0.971 (3.7 ms) | 0.962 (3.3 ms) |
+| Indexing, embedding excluded | 3.7 s | 353–367 s | 152–155 s |
+
+- A probe costs about 3.5 µs (310 more probes add about 1 ms at the same 70k
+  entries); entries read still dominate. Target 128 is +2.2% p50 against M2d
+  at the default, within the 5% latency gate.
+- **128 stays the default:** it gives more recall per millisecond (at 3.7 ms,
+  0.971 against about 0.966 for 256). 256 is cheaper only at a fixed large
+  budget and in indexing.
+
+**Indexing cost.** Growing FiQA costs about 6 ms per inserted document
+beyond M2d (300–370 s against 3.7 s, embedding excluded), almost all of it the
+split journal's WAL-backed meta writes (two per document per split, about 540
+fsyncs per split, about 1,200 splits). In production it runs in the background
+next to an embedding call that costs far more per document; batching the meta
+writes of a split is the obvious reduction if it ever shows.
+
+**Two changes to the design found while building it.** The journal's meta
+writes are WAL-backed (as since M0-2), not no-WAL; and in the delete step the
+meta loses P **before** P's key is deleted — the crash test, which crashes a
+split before every one of its writes under four flush patterns, showed the
+other order leaves a meta naming P with no key behind it (*Maintenance
+journal*, rule 2). Partition health computes its code metrics on request
+(`?codes=true`) instead of keeping running sums.
 
 ### M3b — Reassign (LIRE) and merge
 
