@@ -103,6 +103,9 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/{ns}/vector/reindex/{doc_id}", post(admin_indices::vector_reindex_doc))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))
         .route("/admin/indices/{ns}/vector/drop-all", delete(admin_indices::vector_drop_all))
+        // Admin / indices — vector partition (design doc M3a, partition health)
+        .route("/admin/indices/{ns}/vector/partition", get(admin_indices::vector_partition))
+        .route("/admin/indices/{ns}/vector/postings", get(admin_indices::vector_postings))
         // Admin / indices — vector queue inspection
         .route("/admin/indices/{ns}/vector/queue", get(admin_indices::vector_queue_by_namespace))
         .route(

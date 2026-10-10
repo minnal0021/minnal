@@ -659,6 +659,129 @@ pub async fn vector_corruption_metrics_ns(Path(ns): Path<String>) -> Json<minnal
     Json(minnal_db::semantic_search::metrics::snapshot(&ns))
 }
 
+// ── GET /admin/indices/{ns}/vector/partition and /postings ───────────────────
+
+/// Query of `GET /admin/indices/{ns}/vector/partition`.
+#[derive(Debug, Deserialize)]
+pub struct PartitionParams {
+    /// Also compute the code metrics (reads every chunk code of the namespace).
+    #[serde(default)]
+    pub codes: bool,
+}
+
+fn maintenance_json(m: &minnal_db::doc_store::vector_settings::MaintenanceSettings) -> serde_json::Value {
+    serde_json::json!({
+        "target_posting_size": m.target_posting_size,
+        "split_limit": m.split_limit(),
+        "merge_limit": m.merge_limit(),
+    })
+}
+
+/// `GET /admin/indices/{ns}/vector/partition[?codes=true]` — the namespace's
+/// partition at a glance: postings (K), entries, chunks, size percentiles,
+/// splits, unfinished splits; with `codes=true` also the entry-weighted code
+/// metrics and the postings with the highest residual inflation (re-encode
+/// candidates). Without `codes` it reads memory only.
+pub async fn vector_partition(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    Query(params): Query<PartitionParams>,
+) -> axum::response::Response {
+    let (maintenance, summary, _) = match state.store.vector_partition_health(&ns, params.codes).await {
+        Ok(r) => r,
+        Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    };
+    let mut body = serde_json::to_value(&summary).unwrap_or_default();
+    if let (Some(obj), serde_json::Value::Object(m)) = (body.as_object_mut(), maintenance_json(&maintenance)) {
+        obj.insert("namespace".into(), serde_json::Value::String(ns));
+        obj.extend(m);
+    }
+    Json(body).into_response()
+}
+
+/// Query of `GET /admin/indices/{ns}/vector/postings`.
+#[derive(Debug, Deserialize)]
+pub struct PostingsParams {
+    /// `id` (default), `entries`, `chunks` or `inflation` (implies `codes`).
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `asc` or `desc` (default).
+    #[serde(default)]
+    pub order: Option<String>,
+    /// Opaque cursor from a previous page's `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page size: default 1,000, at most 10,000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include each posting's code metrics (reads every chunk code).
+    #[serde(default)]
+    pub codes: bool,
+}
+
+/// `GET /admin/indices/{ns}/vector/postings` — every posting (retired ones
+/// included, as the parents of the split tree) with its size, state, centre,
+/// parent and origin, cursor-paginated, for size-distribution charts. Sorted by
+/// `sort` (`id`, `entries`, `chunks`, `inflation`) and `order`.
+pub async fn vector_postings(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    Query(params): Query<PostingsParams>,
+) -> axum::response::Response {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    let sort = params.sort.as_deref().unwrap_or("id");
+    if !matches!(sort, "id" | "entries" | "chunks" | "inflation") {
+        return bad(format!("sort must be id, entries, chunks or inflation, got {sort:?}"));
+    }
+    let descending = match params.order.as_deref().unwrap_or("desc") {
+        "desc" => true,
+        "asc" => false,
+        other => return bad(format!("order must be asc or desc, got {other:?}")),
+    };
+    let limit = params.limit.unwrap_or(1000);
+    if !(1..=10_000).contains(&limit) {
+        return bad(format!("limit must be between 1 and 10000, got {limit}"));
+    }
+    let start = match &params.cursor {
+        Some(c) => match c.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return bad("invalid cursor".into()),
+        },
+        None => 0,
+    };
+    let codes = params.codes || sort == "inflation";
+    let (maintenance, summary, mut postings) = match state.store.vector_partition_health(&ns, codes).await {
+        Ok(r) => r,
+        Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    };
+    let key = |p: &minnal_db::ivf_split::health::PostingHealth| -> f64 {
+        match sort {
+            "entries" => p.entries as f64,
+            "chunks" => p.chunks as f64,
+            "inflation" => p.codes.map_or(f64::NEG_INFINITY, |c| c.inflation_mean),
+            _ => f64::from(p.posting_id),
+        }
+    };
+    postings.sort_by(|a, b| {
+        let o = key(a).total_cmp(&key(b)).then(a.posting_id.cmp(&b.posting_id));
+        if descending { o.reverse() } else { o }
+    });
+    let page: Vec<_> = postings.iter().skip(start).take(limit).collect();
+    let next_cursor = (start + page.len() < postings.len()).then(|| (start + page.len()).to_string());
+    let mut body = serde_json::json!({
+        "namespace": ns,
+        "postings": summary.postings,
+        "entries": summary.entries,
+        "chunks": summary.chunks,
+        "results": page,
+        "next_cursor": next_cursor,
+    });
+    if let (Some(obj), serde_json::Value::Object(m)) = (body.as_object_mut(), maintenance_json(&maintenance)) {
+        obj.extend(m);
+    }
+    Json(body).into_response()
+}
+
 // ── POST /admin/indices/vector/reconcile ──────────────────────────────────────
 
 /// `POST /admin/indices/vector/reconcile` — **validating** vector-index reconciliation.

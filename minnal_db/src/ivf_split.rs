@@ -571,6 +571,8 @@ async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u6
     delete_record(db, namespace, op).await
 }
 
+pub mod health;
+
 #[cfg(test)]
 mod tests;
 

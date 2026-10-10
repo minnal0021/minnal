@@ -7,11 +7,11 @@ use crate::semantic_search::index::vector_index::QuantisationStyle;
 use crate::semantic_search::quantisation::rabitq::{index_embedding_rotated, index_embedding_zero_centred};
 use crate::vector_kv::{init_ivf, load_ivf, upsert_vectors};
 
-const NS: &str = "docs";
+pub(super) const NS: &str = "docs";
 const DIM: usize = 16;
 const SEED: u64 = 7;
 
-fn settings(limit: u64) -> SplitSettings {
+pub(super) fn settings(limit: u64) -> SplitSettings {
     SplitSettings {
         split_limit: limit,
         params: SplitParams::default(),
@@ -51,7 +51,7 @@ async fn open(dir: &TempDir) -> AsyncDb {
     db
 }
 
-async fn handle(db: &AsyncDb) -> PartitionHandle {
+pub(super) async fn handle(db: &AsyncDb) -> PartitionHandle {
     PartitionHandle::new(load_ivf(db, NS, SEED).await.unwrap().expect("a partition"))
 }
 
@@ -75,7 +75,7 @@ async fn index_doc(db: &AsyncDb, h: &PartitionHandle, d: u64, chunks: &[Vec<f32>
 }
 
 /// A namespace of `docs` documents (three chunks each), all in the root.
-async fn setup(dir: &TempDir, docs: u64) -> AsyncDb {
+pub(super) async fn setup(dir: &TempDir, docs: u64) -> AsyncDb {
     let db = open(dir).await;
     init_ivf(&db, NS, DIM).await.unwrap();
     let h = handle(&db).await;

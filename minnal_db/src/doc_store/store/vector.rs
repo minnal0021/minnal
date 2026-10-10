@@ -4,6 +4,33 @@
 use super::*;
 
 impl DocStore {
+    /// The health of `namespace`'s partition (document or KV store): every
+    /// posting's size, state and lineage from memory, and with `codes` also the
+    /// code metrics (residual inflation, error band, foreign and zero-centre
+    /// shares), which read every chunk code. Returns the namespace's
+    /// maintenance settings beside them.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_partition_health(
+        &self,
+        namespace: &str,
+        codes: bool,
+    ) -> Result<
+        (
+            crate::doc_store::vector_settings::MaintenanceSettings,
+            crate::ivf_split::health::PartitionHealth,
+            Vec<crate::ivf_split::health::PostingHealth>,
+        ),
+        DocStoreError,
+    > {
+        let Some(ctx) = &self.semantic_ctx else {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        };
+        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
+        let (summary, postings) = crate::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
+        Ok((settings.maintenance, summary, postings))
+    }
+
     /// Remove a document from the vector index: it was deleted, or its embedding
     /// text is now empty.
     ///
