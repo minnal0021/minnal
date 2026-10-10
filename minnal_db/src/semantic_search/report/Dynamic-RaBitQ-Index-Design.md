@@ -49,6 +49,24 @@ per-namespace model selection, and how a namespace bootstraps from nothing.
 - **Exact pipeline**: the same two-pass ranking computed on full-precision
   floats with no partitioning (exact MaxSim over all chunks, then exact dense
   rerank). It is the ground truth for ANN recall.
+- **Insertion order**: the order documents are indexed in, which decides how a
+  partition grows. `corpus` is file order and `shuffled` is a seeded random
+  order. **"Drifting" has two definitions, and they are different
+  experiments:**
+  - *Bench drifting* (the vector bench's `drifting`, M0 onwards): documents
+    sorted by their nearest **bundled** centroid, the model's 256 general
+    centroids fitted on ELI5, in centroid-id order and corpus order within
+    each. Up to 256 small, very uneven waves: SciFact puts 43% of its
+    documents under one bundled centroid, so one wave is nearly half the
+    corpus.
+  - *Simulation drifting* (`sim.py` and `spfresh.py`, M3-pre and the SPFresh
+    comparison): 8 topics found by k-means on the corpus's own whole-document
+    vectors, arriving in a seeded random order, shuffled within each. Eight
+    large, coarse waves.
+
+  Numbers from one do not predict the other: the simulation's drifting
+  figures (and its 2.0 key moves per insert, which come from shuffled order)
+  are not a target for bench-drifting runs.
 
 Postings and centres are numbered separately, written `P…` and `C…` below.
 Today they share one number (the `cluster_id`), which is why they are easy to
@@ -193,7 +211,9 @@ the commands.
    - `exact_final[q]`: `exact_pass1` reranked by exact dense `⟨q, d⟩`, top 100.
 4. **Insertion order** is a knob: `corpus` (file order), `shuffled` (seeded),
    and `drifting` (docs sorted by their nearest bundled centroid, so topics arrive
-   one at a time; this is the adversarial case for M3).
+   one at a time; this is the adversarial case for M3). This is *bench
+   drifting*; the M3-pre simulation used a different, 8-topic definition (see
+   *Insertion order* in *Terms used here*).
 
 ### Metrics (all per query, then aggregated)
 
@@ -1087,7 +1107,8 @@ full: correct behaviour at that size.
 The ivf_dynamic simulator (`splade-lite/data/ivf_dynamic/simulate_dynamic.py`)
 already models "keep the code centre, move only the key". Run it on the M0 f32
 dumps, with rotation and the M2 centre rules, over three insertion orders
-(`corpus`, `shuffled`, `drifting`). Compare:
+(`corpus`, `shuffled`, `drifting`; here *simulation drifting*, 8 k-means topics,
+not the bench's). Compare:
 
 - (i) grow from one posting with no staging (option C alone)
 - (ii) a flat phase that keeps the floats until `N_seed` chunks, then k-means on them and C (A + C)
@@ -1813,7 +1834,8 @@ error-bound gate. Measured separately because each move costs a put plus a
 tombstone in the LSM. **Gate:** recall gain ≥ what the simulation predicted;
 nDCG@{10, 20, 30, 40, 50, 100} each ≥ M3a − 0.005;
 key moves per insert within 20% of the simulation's (about 2.0 at the
-defaults); compaction and write-amplification overhead reported; no query
+defaults, measured in shuffled order, so the check applies to shuffled runs;
+bench-drifting runs report theirs); compaction and write-amplification overhead reported; no query
 latency regression while maintenance runs.
 
 ### M3c — Bootstrap phase (dropped)
