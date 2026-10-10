@@ -1,7 +1,7 @@
 # Dynamic RaBitQ index: design and milestones
 
-**Status:** draft under review; first-round decisions recorded (see *Decisions*
-at the end) · branch `dynamic-rabitq-index` · 2026-10-03
+**Status:** M0–M2 done; M3's design decided (decisions 11–13), M3a next ·
+branch `dynamic-rabitq-index` · 2026-10-10
 
 **Goal.** Remove the pre-trained centroid files. Each namespace should build and
 maintain its own IVF partition as documents arrive. Search quality (nDCG, recall)
@@ -18,7 +18,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M0-2** Write-path crash audit ✓ | Every multi-step vector write traced for crash safety, with a shared crash-test helper; gaps fixed | — | One crash test per path; all pass |
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index ✓ | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
-| **M3** Dynamic partitions | No centroid file: grow from one posting, split, reassign, merge; then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids; largest posting under 1% of entries |
+| **M3** Dynamic partitions | No centroid file: grow from one posting and split, reassign and merge by SPFresh's LIRE protocol (mean centres, 1-bit codes, no replicas); then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids from 5% read; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 | *Optional, future:* **BYO embeddings** | A write may bring its own vectors; dense-only namespaces (see *Caller-supplied embeddings*) | No | Not on the critical path; built on demand after M3d |
 
@@ -1061,39 +1061,25 @@ the counts exact first.
 
 ### Choosing the approach
 
-**Undecided.** When a namespace starts clustering, and when postings split, is
-still open. The options are kept open below, and M3-pre's simulation is the
-first step towards choosing. Two options were proposed; with the M2 split in
-place they can combine into one design.
+**Decided (2026-10-10): option C, built as SPFresh's LIRE protocol with one
+deviation.** A namespace starts with one posting and splits postings as they
+grow; there is no staging namespace, no seed threshold and no bootstrap job.
+The split, reassignment and merge rules follow SPFresh except that a new
+posting's centre is the **mean** of its members' code reconstructions, not a
+medoid; every code is 1 bit; and no chunk is stored in more than one posting.
+*M3 split algorithm (LIRE)* below specifies it, and *Levers and configuration*
+lists every setting. The evidence is in *M3-pre result*.
 
-| Option | How it works | Assessment |
+The three options considered:
+
+| Option | How it works | Outcome |
 |---|---|---|
-| **A. Brute force until critical mass, then cluster** | Keep full embeddings until N chunks, flat-scan until then, then k-means and index | **Candidate bootstrap.** Exact k-means on real floats gives the best first centroids. But A alone doesn't handle growth past N or topic drift, so it would still need a split mechanism. |
-| **B. Searchable from doc 1; centroids move until critical mass, then sealed** | Segments whose centroids settle, then freeze | **Candidate, at posting granularity, possibly without sealing.** Sealing exists only because codes depend on the centroid. Once codes have their own frozen centre (M2), a routing centroid can keep moving forever at the cost of a key move, never a re-encode. Segments that queries must each probe (Lucene/Milvus style) would add a per-segment probe cost and a merge policy on top of the LSM; postings are already global key prefixes, which avoids both. |
-| **C. Split as you grow (SPFresh/LIRE)** | One posting from the start; split at 2× target with 2-means on code reconstructions; reassign neighbours; merge small postings | **Likely steady state.** It is the only option here that handles unbounded growth and drift without the embedding service. |
+| **A. Brute force until critical mass, then cluster** | Keep full embeddings until N chunks, flat-scan until then, then k-means and index | **Not chosen.** Seeding from floats gained at most 0.2–0.3 points of recall over C on FiQA, for about 90 MB of staged floats and a bootstrap job. A alone also needs a split mechanism for growth past N |
+| **B. Searchable from doc 1; centroids move until critical mass, then sealed** | Segments whose centroids settle, then freeze | **Not chosen.** Sealing exists only because codes depend on the centroid; since M2 each code keeps its own centre, so nothing needs sealing. Per-segment probing would add a probe cost and a merge policy on top of the LSM |
+| **C. Split as you grow (SPFresh/LIRE)** | One posting from the start; split at 2× target; reassign neighbours; merge small postings | **Chosen.** Within 0.4–1.2 points of a corpus-fitted k-means at 10% read on FiQA for both models and every insertion order; handles unbounded growth, drift and churn without the embedding service |
 
-**One candidate lifecycle** (a combination of the above, to be tested against
-the alternatives in M3-pre, not a decision):
-
-1. **Flat phase** (chunks < `N_seed`, default ~10k; tuned in M3-pre). One
-   posting, centre = zero. Search is an exhaustive Pass 1, which is fine at this
-   size (the ivf_dynamic simulation put ~17k entries scanned at ≈5 ms on FiQA). The f32 chunk embeddings are also kept
-   in `{ns}_ivf_staging` (no-WAL; ~30 MB at 10k chunks, re-embeddable).
-2. **Seed** (at `N_seed`, background). Run exact k-means++ on the staged floats
-   (`k = N_seed / target_posting_size`). Write centres and postings. **Re-encode**
-   the staged chunks exactly against their new centres (the floats are still
-   there), move their keys, delete the staging floats, publish the snapshot. This
-   is option A's quality without its growth problem.
-3. **Grow** (forever after). Each insert is routed with its full-precision vector
-   and encoded against the target posting's pinned centre. The routing centroid
-   tracks a running mean. Postings past `2 × target` split; neighbours are
-   reassigned; postings under `target / 4` merge. All maintenance works from 1-bit
-   codes and their reconstructions, and **never re-encodes a code** (re-centring a
-   1-bit code was measured worse than leaving it, 0.861 vs 0.918).
-4. **Rebuild** (M4) when drift indicators say the partition has degraded.
-
-Tiny namespaces stay in phase 1 indefinitely, which is correct behaviour for
-them; their staging floats are bounded by `N_seed`.
+Tiny namespaces simply stay one posting (or a few), which a search scans in
+full: correct behaviour at that size.
 
 ### M3-pre — Settle the numbers by simulation before coding
 
@@ -1103,7 +1089,7 @@ dumps, with rotation and the M2 centre rules, over three insertion orders
 (`corpus`, `shuffled`, `drifting`). Compare:
 
 - (i) grow from one posting with no staging (option C alone)
-- (ii) the candidate lifecycle above, with a float-seeded bootstrap (A + C)
+- (ii) a flat phase that keeps the floats until `N_seed` chunks, then k-means on them and C (A + C)
 - (iii) flat until `N_seed`, then k-means from codes with no staging (B + C)
 - (iv) static k-means fitted on the whole corpus (upper bound)
 - (v) the bundled gemma file (today)
@@ -1258,43 +1244,243 @@ full replacement costs about 1.9 key moves per deleted chunk.
 
 ![FiQA: churn against a fresh fit](m3-pre-simulation/gemma/fiqa-churn.svg)
 
-**Proposed for M3 (for review):**
-
-| Question | Proposal | Evidence |
-|---|---|---|
-| Lifecycle | C only; drop the staging namespace and M3c (bootstrap) | §2: seeding gains ≤ 0.2 pt on FiQA |
-| Reassign | k = 8 from code reconstructions (M3b) | +0–0.6 pt, ~0.1 extra moves per insert; under churn 0.5 vs 1.4 pt |
-| Merge | below target / 4, into the nearest of 8 neighbours, codes kept (M3b) | §5: within 0.5–1.0 pt of a fresh fit after any churn |
-| Target posting size | 128 or 256, chosen after M3a measures per-probe cost | §1 |
-| Chunk code width | stay at 1 bit; codes keep their centre | §3: width changes nothing in the ranking |
-| `reencode_source` | not needed for partition quality; keep as a future option for rotation or width changes | §3 |
-| Probe budget | `clamp(p · E, floor, ceiling)`, e.g. 30% / 20k / 70k; `max_probes` stays absolute | §4 |
-| M4 rebuild | from 1-bit codes, no floats | §3: 0.978 vs 0.976 |
-
-**The same simulation on qwen (SciFact so far; FiQA next).** Report:
+**The same simulation on qwen.** Report:
 [`m3-pre-simulation/qwen/m3-pre-simulation.md`](m3-pre-simulation/qwen/m3-pre-simulation.md),
-which sets each number beside gemma's. Every proposal above holds on qwen
-SciFact:
+which sets each number beside gemma's. Every finding above holds on qwen FiQA:
+posting size (0.984 recall@10 at 10k entries at target 128, 0.850 with the
+bundled file), C within 0.5–0.8 points of static k-means on every order, a
+rebuild from 1-bit codes equal to one from floats (0.984 against 0.983), never
+re-encoding from a narrow code, unchanged ranking at every code width, and
+churn ending within 1.2 points of a fresh fit. On SciFact C had trailed static
+k-means by 2.2–4.5 points on qwen; FiQA does not reproduce that, so it came
+from SciFact's small namespace (about 43 postings), not from the model, and
+M3c and a periodic rebuild stay unneeded.
 
-- Posting size, rebuild from 1-bit codes, never re-encoding from a narrow code,
-  the probe-budget floor and merging with k = 8 all give the same answers.
-- Width still leaves the ranking unchanged when codes keep their centre.
+**Split algorithm: SPFresh compared (2026-10-10).** Report:
+[`m3-pre-simulation/spfresh-comparison.md`](m3-pre-simulation/spfresh-comparison.md).
+A second simulation followed SPFresh's LIRE protocol and SPTAG's parameters
+(balanced 2-means, medoid centres, up to 8 replicas, reassignment over the 64
+nearest postings, merges), on both models, FiQA, shuffled and drifting order,
+comparing each variant at equal entries read with static k-means at the same
+number of postings:
 
-The one difference is how close C gets to the best partition. In absolute
-terms C matches gemma (recall@10 0.878 against 0.883 at 10% read). But qwen's
-static k-means is better (0.900 against 0.876), so C trails it by 2.2–4.5
-points, where gemma was level. Seeding narrows the gap unevenly (0.7–1.1 points
-for the best seed per order), within SciFact's noise. If FiQA shows a gap of
-that size, it reopens M3c (float-seeded bootstrap) or a periodic M4 rebuild.
+- **The medoid does not survive codes.** With 1-bit codes a medoid is one
+  member's noisy reconstruction: FiQA fragments into 12,000–24,000 postings and
+  recall@10 at 1% read falls to 0.58–0.69. The mean of the reconstructions
+  averages that noise away and beats the medoid even with exact vectors (0.89–0.93
+  against 0.84–0.89).
+- **1-bit codes are enough.** 2-bit maintenance codes add at most about a point
+  at budgets of 2% or less; a 2-bit search code leaves final recall unchanged.
+- **Replicas do not pay.** Mean centres produce almost none; with medoids the
+  paper's 4–5 copies per chunk (15–20 key moves per insert) lose to an
+  unreplicated partition of the same size.
+- **The error-bound gate** cuts key moves by 12–17% but costs 0.7–0.9 points at
+  1% read when topics arrive in turn.
+- **Recommended configuration** (LIRE, mean centres, 1-bit, no replicas, gate
+  off): 2.1–3.8 points behind static k-means at the same K at 1% read, 0.5–0.9 at
+  5%, nDCG@10 unchanged (−0.5 to +0.3 points at 2% read).
+
+**Decided for M3 (2026-10-10):**
+
+| Question | Decision | Evidence |
+|---|---|---|
+| Lifecycle | C only: one posting at the zero centre, then splits. No staging namespace, no bootstrap (M3c dropped) | §2; qwen FiQA |
+| Split | SPTAG's balanced 2-means on the posting's code reconstructions; the new centres are the k-means **means** (deviation from SPFresh's medoid) | SPFresh comparison |
+| Reassign | LIRE's two conditions over the split posting and its **64** nearest postings (SPFresh's default); candidates move to their nearest posting | SPFresh comparison |
+| Merge | at `round(2 · target · 10/118)` chunks or fewer (SPFresh's 10/118 ratio), into the first nearby posting with room; its chunks move if the surviving centre is farther | SPFresh comparison; §5 |
+| Replicas | none: every chunk is in exactly one posting | SPFresh comparison |
+| Error-bound gate | built, off by default | SPFresh comparison |
+| Target posting size | 128 chunks by default; 128 against 256 decided by M3a's probe-cost measurement | §1 |
+| Chunk code width | 1 bit for search and maintenance; codes keep their centre | §3; SPFresh comparison |
+| `reencode_source` | not needed for partition quality; a future option for rotation or width changes | §3 |
+| Probe budget | 70,000 entries, absolute (M2d). The scaled form `clamp(p · E, floor, ceiling)` is available as an option, unset by default, and reviewed after M3a's latency measurement | §4 |
+| M4 rebuild | from 1-bit codes, no floats; triggered by hand or by drift indicators | §3: 0.978 vs 0.976 |
+
+### M3 split algorithm (LIRE)
+
+This is SPFresh's LIRE protocol (Xu et al., SOSP 2023) with the parameters of
+its reference implementation (SPTAG, `ExtraDynamicSearcher.h` and
+`BKTree.h`). Each step names where minnal differs, and why. The settings in
+`code` are the levers listed in the next section.
+
+**Deviations from SPFresh, all of them:**
+
+| SPFresh | minnal | Why |
+|---|---|---|
+| Postings store full vectors | Postings store 1-bit codes; maintenance works on their reconstructions `x̂` | No stored floats (the M3-pre result) |
+| A split's centres become medoids | The k-means **means** of the reconstructions | A medoid of noisy reconstructions fragments the partition; the mean averages the noise and also wins with exact vectors |
+| Up to 8 replicas per vector | One posting per chunk | Replicas did not pay at equal entries read |
+| Deleted vectors are garbage-collected at split time | Deletes remove keys at once; a split recounts the posting instead | minnal's deletes are immediate |
+| A posting that will not split is truncated to one vector | It is marked unsplittable until its contents change | minnal never drops data |
+| Centres found by an approximate graph search | Every centre scanned exactly | At thousands of centres an exact scan is microseconds |
+| Merges are found during search | Merges are found after the delete or move that shrank the posting | The maintenance task sees every size change |
+| A moved vector keeps its raw value | A moved code keeps its `centre_id` and only its key changes (M2 rule) | Re-encoding from a 1-bit code compounds its error |
+| — | Optional error-bound gate on every move decision | Uses the `error_bound` each code already stores |
+
+**Sizes.** Postings are measured in **chunks** (SPFresh counts vectors):
+`split_limit = 2 · target_posting_size` and
+`merge_limit = round(split_limit · merge_ratio)`; at the defaults, 256 and 22.
+The probe budget (M2d) still counts entries.
+
+**State.** Per namespace: the append-only centre table (`{ns}_ivf_centres`),
+the postings (`{ns}_ivf_postings`: posting id, centre id, state `Active` /
+`Draining` / `Retired`, parent id, how it was created), and exact chunk and
+entry counts per posting in `NamespaceIvf`. A namespace that enables semantic
+search starts with **one root posting whose centre is the zero vector**; it no
+longer copies a centroid file.
+
+**Insert** (unchanged from M2). A chunk's float is routed to the nearest
+`Active` posting centre and encoded against it. If the posting now holds more
+than `split_limit` chunks, the maintenance task is woken for it.
+
+**Split posting P** (maintenance task, through the journal):
+
+1. **Recount.** Count P's chunks exactly. If it holds `split_limit` or fewer,
+   stop.
+2. **Reconstruct** every chunk of P from its code:
+   `x̂ = c + scaling_factor · R(2b − 1)`, with `c` the chunk's own centre, `b`
+   its code bits and `R` the namespace's rotation matrix.
+3. **Balanced 2-means** (SPTAG `TryClustering`, k = 2). With
+   `S = min(split_samples, n)`:
+   1. *Start.* `split_init_trials` times, take two random members as centres
+      and assign a random sample of S members to the nearer one; keep the trial
+      with the smallest total squared distance. From it, take
+      `λ_spread = (largest distance − mean distance) / S` within its larger
+      cluster.
+   2. *Balance weight.* `λ = min(λ_spread, 1 / (split_lambda_factor · S))`.
+   3. *Iterate*, at most `split_max_iters` times: draw a fresh sample of S
+      members; assign each to the centre `k` minimising
+      `‖x̂ − c_k‖² + λ · size_k`, where `size_k` is cluster k's size in the
+      previous iteration; move each centre to the mean of its members (an empty
+      cluster takes the farthest member of the larger one). Stop when the
+      centres move less than 0.001 in total (squared), or after 5 iterations
+      without a lower total distance.
+   4. *Centres.* **Keep the two means** (the deviation: SPTAG replaces each with
+      its nearest member here).
+   5. *Assign* every member of P to the nearer centre, without the balance
+      term. If one side is empty, mark P unsplittable until a chunk is added to
+      or removed from it, and stop.
+4. **Write the split** (the journal table under M3a): append the two centres,
+   create P1 and P2, move each chunk's key to its side (code and `centre_id`
+   unchanged), retire P.
+5. **Reassign** (M3b). Candidates, each chunk at most once:
+   - a chunk now in P1 or P2 whose old centre is strictly closer than its new
+     one: `D(x̂, c_P) < D(x̂, c_Pi)` (SPFresh's first condition);
+   - a chunk in one of the `reassign_range` postings nearest `c_P` (excluding P1
+     and P2) for which a new centre beats both the old centre and its current
+     one: `min_i D(x̂, c_Pi) < D(x̂, c_P)` and `min_i D(x̂, c_Pi) < D(x̂, c_cur)`
+     (SPFresh's second condition, with SPTAG's check against the current
+     posting).
+
+   Each candidate is routed again to its nearest `Active` posting. If that is
+   its current posting it stays; otherwise its key moves (code and `centre_id`
+   unchanged). A posting pushed past `split_limit` by a move is split in turn.
+6. **Error-bound gate** (`error_bound_gate`, off by default). Every comparison
+   `D(x̂, A) < D(x̂, B)` in step 5 and in the merge below must win by more than
+   `2 · error_bound · ‖A − B‖`, the most the code's estimate of that comparison
+   can be off; otherwise the chunk stays.
+
+**Merge posting P** when a delete or a move leaves it with `merge_limit` chunks
+or fewer (M3b):
+
+1. Walk the 64 postings nearest P's centre, nearest first, and take the first Q
+   with `chunks(P) + chunks(Q) < split_limit`. If none has room, leave P.
+2. Keep the larger of P and Q; move the smaller one's chunks into it (codes
+   unchanged) and retire the smaller one.
+3. A moved chunk whose new centre is farther than its old one,
+   `D(x̂, c_kept) > D(x̂, c_old)`, is routed again as in split step 5.
+
+**Cost** (simulated on FiQA at the defaults): one split per about 166 inserted
+chunks; per split about 150 million multiply-adds (reconstruction and 2-means
+about 6 million, checking about 11,700 neighbouring chunks about 45 million,
+routing about 125 candidates again against every centre about 96 million) and
+about 1.3 MB of codes read; 2.0 key moves per inserted chunk (1.8 with the
+gate). Routing candidates and finding neighbours scan every centre, so at about
+100,000 postings they would need an index over the centres.
+
+### Levers and configuration
+
+Every setting has a built-in default. The server's TOML can change the
+defaults. When a namespace enables semantic search, the defaults in force are
+**written into its schema** (`vector_index`), and from then on the namespace
+owns them: a later TOML change affects only namespaces enabled afterwards.
+A namespace's values change through the schema amendment for search settings
+(`UpdateVectorSearch`, extended to `maintenance`). The engine-only settings are
+never copied. Search settings can also be overridden per request, as since M2a.
+
+```toml
+# Maintenance of each namespace's partition (M3). All but `threads` are
+# defaults, copied into a namespace's schema (vector_index.maintenance) when it
+# enables semantic search.
+[semantic_search.maintenance]
+target_posting_size = 128    # chunks; a posting splits above 2x, merges at
+                             # round(2x * merge_ratio) or fewer
+reassign_range = 64          # nearest postings re-checked after a split (0 = none)
+merge_ratio = 0.0847         # 10/118, SPFresh's merge-to-split ratio
+error_bound_gate = false     # move a chunk only if it wins by more than its error bound
+split_samples = 1000         # balanced 2-means: members sampled per iteration
+split_init_trials = 3        #   random starting pairs tried
+split_max_iters = 100        #   iteration cap
+split_lambda_factor = 100.0  #   balance weight: lambda <= 1 / (factor * samples)
+threads = 2                  # engine-only: maintenance threads per process
+
+# Search defaults, copied into vector_index.search.
+[semantic_search.search_defaults]
+probe_budget_entries = 70000 # entries a query reads (the ceiling when a fraction is set)
+min_probes = 1
+max_probes = 1024
+first_pass_top_k = 1000
+top_k = 100
+# probe_budget_fraction = 0.30  # optional: budget = clamp(fraction * E,
+# probe_budget_floor = 20000    #   floor, probe_budget_entries)
+```
+
+| Lever | Default | Raising it | Lowering it | Evidence |
+|---|---|---|---|---|
+| `target_posting_size` | 128 chunks | fewer, larger postings: fewer probes per query and less maintenance per insert, but less recall per entry read | the reverse | M3-pre §1; 128 against 256 settled in M3a by measured probe cost |
+| `reassign_range` | 64 | more chunks re-checked per split (about 180 each): reads and CPU per split | more misplaced chunks; 0 re-checks only the split posting | SPFresh §5.5 (64 ≈ 128); M3-pre reassignment |
+| `merge_ratio` | 0.0847 | merges sooner: fewer tiny postings, more key moves | small postings linger, costing a probe each | SPFresh's ratio; M3-pre §5 |
+| `error_bound_gate` | off | on: 12–17% fewer key moves, up to 0.9 points less recall at 1% read under topic drift | — | SPFresh comparison |
+| `split_samples`, `split_init_trials`, `split_max_iters`, `split_lambda_factor` | 1000, 3, 100, 100 | SPTAG's values; a posting of 256 chunks is never sampled | — | SPTAG |
+| `threads` | 2 | maintenance keeps up with heavier ingest, at more CPU taken from queries | slower to split under load | measured in M3a |
+| `probe_budget_entries` | 70,000 | more recall, more latency | less of both | M2d |
+| `probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | — | a fraction makes large namespaces cheaper (30% of FiQA: 32k entries, −0.0003 nDCG@10 on qwen, −0.0013 on gemma); the floor keeps small namespaces exact | M3-pre §4 |
+| `max_probes` | 1,024 | — | caps probes; keep it at least 1.5 × the fraction of postings the budget needs, or it cuts searches short | M3-pre §4 |
+
+**Validation**, at startup for the TOML and on every amendment:
+`target_posting_size` 16–65,536; `reassign_range` 0–1,024; `merge_ratio`
+greater than 0 and below 0.5 (a merged posting must stay under the split
+limit); `split_samples` at least 2; `split_init_trials` and `split_max_iters`
+at least 1; `split_lambda_factor` greater than 0; `threads` 1–64;
+`probe_budget_fraction` greater than 0 and at most 1, with
+`probe_budget_floor` at most `probe_budget_entries`. Unknown keys are rejected,
+as today.
 
 ### M3a — Grow and split (split only, no reassign)
 
+Builds steps 1–4 of *M3 split algorithm (LIRE)*:
+
+- **A new namespace starts with one root posting** at the zero centre instead
+  of copying a centroid file. The files stay loadable for model and dimension
+  checks until M4 removes them.
+- **Exact chunk and entry counts** per posting in `NamespaceIvf` (the split
+  trigger needs exact sizes; M2d's counts were an estimate).
+- **Splits** by balanced 2-means with mean centres, written through the
+  journal. No reassignment and no merges yet.
+- **Configuration**: `[semantic_search.maintenance]` and
+  `[semantic_search.search_defaults]` in the TOML, `vector_index.maintenance`
+  in the schema, the amendment extended to it, validation as listed under
+  *Levers and configuration*, and `probe_budget_fraction` /
+  `probe_budget_floor` (unset by default).
 - **Background maintenance task**, one writer per namespace, woken by
   posting-size events. It runs off the request path, on `spawn_blocking` plus its
-  own small thread budget, not the rayon pool searches share (the
+  own small thread budget (`threads`), not the rayon pool searches share (the
   `SCORING_GATE` rules).
 - **Every maintenance operation goes through a journal** (next section),
   so a crash at any point is finished by recovery, never left half done.
+- **Partition health** counters and endpoints (below).
+- **Measure probe cost**: per-probe latency at targets 128 and 256 on FiQA,
+  alternating binaries, to set the default target.
 
 #### Maintenance journal
 
@@ -1391,8 +1577,11 @@ rule 1 problem already: the queue entry's removal is durable before the
 vectors it vouches for. M0-1 fixes that first, with the same barrier.
 
 **Gate (SciFact and FiQA, empty namespace, no file, all three orders):**
-recall within 2 pts of (iv) at equal entries scanned; largest posting < 1%
-(today 43% on SciFact); nDCG@10 ≥ M2d − 0.005. Plus these tests:
+recall within 2 pts of (iv) at equal entries scanned, from 5% of the chunks
+read upwards (the simulation predicts at most 0.9 there; below 5% it predicts
+2–4 points with nDCG unchanged, which is reported, not gated); largest posting
+< 1% (today 43% on SciFact); nDCG@10 ≥ M2d − 0.005 at the default budget.
+Plus these tests:
 
 - a **crash at every step boundary** of the table above, next to
   `racing_upsert_and_delete_leave_no_orphaned_cluster_keys`. A crash here is
@@ -1488,8 +1677,8 @@ a summary:
 
 minnal_ui draws from it, in the same "Vector partition" card:
 
-- a histogram of posting sizes (entries), with the target and the split
-  (2 × target) and merge (target / 4) thresholds marked;
+- a histogram of posting sizes (chunks), with the target and the split
+  (`split_limit`) and merge (`merge_limit`) thresholds marked;
 - every posting sorted by size, as a ranked bar strip, which shows skew at a
   glance (the bundled file put 43% of SciFact in one posting);
 - the same strip coloured by mean inflation, to see where drift sits;
@@ -1503,16 +1692,18 @@ to show what real namespaces look like.
 
 ### M3b — Reassign (LIRE) and merge
 
-Neighbour reassignment with the `k` chosen in M3-pre, and merging of postings
-below `target / 4`. Measured separately because each move costs a put plus a
-tombstone in the LSM. **Gate:** recall gain ≥ the cost the simulation predicted;
-compaction and write-amplification overhead reported; no latency regression.
+Steps 5–6 and the merge of *M3 split algorithm (LIRE)*: reassignment over the
+`reassign_range` nearest postings, merges at `merge_limit`, and the optional
+error-bound gate. Measured separately because each move costs a put plus a
+tombstone in the LSM. **Gate:** recall gain ≥ what the simulation predicted;
+key moves per insert within 20% of the simulation's (about 2.0 at the
+defaults); compaction and write-amplification overhead reported; no query
+latency regression while maintenance runs.
 
-### M3c — Bootstrap phase
+### M3c — Bootstrap phase (dropped)
 
-Whichever bootstrap M3-pre's review chooses: for example a flat phase, or a
-float-seeded k-means with exact re-encode, or none if (i) is enough. **Gate:**
-the early-life recall curve (measured at 1k, 5k, 10k and 20k chunks) ≥ (i).
+Not built. Seeding from floats gained at most 0.2–0.3 points over growing from
+one posting on FiQA, on both models (*M3-pre result*).
 
 ### After M3: re-check the Pass-1 estimator form
 
@@ -1605,8 +1796,8 @@ to the service. minnal validates it, stores it in `{ns}_raw_vector` (the store
 `stored` introduces), and encodes it exactly as it would a service embedding.
 This generalises `stored`: there the first embedding comes from the service and
 is kept for later; here it comes from the caller and is kept for the same
-reasons (re-encoding, rebuilds, exact k-means for M3c's bootstrap and M4's
-rebuild, and exact ground truth on live data). It lets a caller reuse
+reasons (re-encoding, rebuilds, exact k-means for M4's rebuild, and exact
+ground truth on live data). It lets a caller reuse
 embeddings it already computed, or chunk its documents its own way.
 
 **Where document vectors come from: `embedding_source`** in `vector_index`,
@@ -1697,7 +1888,7 @@ covers the key), WAL-backed like every other vector-index delete.
 **Cost.** About 3 KB per vector at 768 dimensions in f32 (half as f16), the
 same as `stored`, and paid only by documents that supply vectors.
 
-**Sequencing.** M3a–M3c ship `none`, which every namespace needs. M3-pre's
+**Sequencing.** M3a and M3b ship `none`, which every namespace needs. M3-pre's
 simulation also measures what an exact re-encode is worth on gemma. On the 109k
 WordLlama test it lifted recall@10 before reranking from 0.918 to 0.955; after
 the Pass-2 rerank the gain will be smaller. Both optional strategies are planned:
@@ -1745,8 +1936,8 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | Hot-path cost of per-entry centre lookup | M2b | Dense `Vec` index; latency gate on this sub-step alone |
 | Split races with inserts and deletes; crash mid-split | M3a | Maintenance journal (redo only); barrier before delete; meta kept a superset; routing epoch + doc lock; crash tests that discard unflushed no-WAL writes |
 | No-WAL write lost while a WAL-backed delete or queue completion survives | M0-1, M3a | Queue completion after flush (M0-1); barrier before delete (M3a) |
-| Write amplification from reassignment | M3b | Measured in M3-pre; `k` is a knob (0 = off) |
-| Early-life quality before the first splits | M3 | M3-pre decides float seeding; flat scan while small |
+| Write amplification from reassignment | M3b | Simulated at 2.0 key moves per insert; `reassign_range` (0 = off) and the error-bound gate (−12–17%) are knobs; M3b gates on measured moves |
+| Early-life quality before the first splits | M3 | A small namespace is scanned in full under the default budget; seeding was measured not to pay (M3c dropped) |
 | Two models in one process | M2a | Per-namespace probe and cache key; test with gemma + qwen |
 
 ## Decisions (2026-10-03)
@@ -1757,9 +1948,12 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 | 2 | Where `embedding_dim` lives | In the namespace schema, next to `embedding_model` (M2a) |
 | 3 | Changing a store's model | Not supported: model and dimension are fixed once selected. A drop-and-re-index operation may be added later |
 | 4 | Existing data | Not a concern; stores are recreated after format changes |
-| 5 | When to start clustering and when to split | Open; M3-pre's simulation comes first and its results are reviewed before M3a |
+| 5 | When to start clustering and when to split | From the first chunk, by splitting (option C); see decision 11 |
 | 6 | Bundled centroid files | Deleted in M4 |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
 | 9 | BYO embeddings (2026-10-04) | An optional, future extra (M3f), designed but not scheduled. A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |
 | 10 | M2c done (2026-10-04) | Whole-document codes against the zero centre, one Pass-2 estimator per query; gated at nDCG@{10..100} on gemma and qwen, SciFact and FiQA |
+| 11 | How M3 grows a partition (2026-10-10) | Option C built as SPFresh's LIRE: balanced 2-means splits, reassignment over the 64 nearest postings, merges at SPFresh's 10/118 ratio. One deviation: split centres are the means of the code reconstructions, not medoids. 1-bit codes, no replicas, error-bound gate off by default. M3c dropped (*M3 split algorithm (LIRE)*) |
+| 12 | Where M3's levers live (2026-10-10) | Defaults in the server TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`), written into a namespace's schema when it enables semantic search and owned by the namespace from then on; `threads` is engine-only (*Levers and configuration*) |
+| 13 | Default probe budget (2026-10-10) | 70,000 entries, absolute, as M2d. The scaled form `clamp(fraction · E, floor, ceiling)` is available but unset by default, and reviewed after M3a measures probe cost |

@@ -37,6 +37,7 @@ KEY_STATIC = [("static k-means", "= fitted once on the whole corpus's floats: th
 TITLES = {
     ("qwen", "scifact", "lifecycles"): "SciFact (qwen, 300 queries, noisier): every lifecycle trails static k-means, by 0.7–4.5 points",
     ("qwen", "scifact", "churn"): "SciFact (qwen): after churn C ends within 2.1 points of a fresh fit",
+    ("qwen", "fiqa", "lifecycles"): "FiQA (qwen): every lifecycle is within 1.1 points of static k-means",
 }
 
 
