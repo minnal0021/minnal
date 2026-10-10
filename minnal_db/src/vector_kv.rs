@@ -340,9 +340,9 @@ pub fn text_hash(text: &str) -> u64 {
 /// A decoded `{ns}_sparse_vector_meta` record: the hash of the text the vectors
 /// came from, and each posting holding the document's chunks with how many.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SparseMeta {
-    text_hash: u64,
-    postings: Vec<(u32, u32)>,
+pub(crate) struct SparseMeta {
+    pub(crate) text_hash: u64,
+    pub(crate) postings: Vec<(u32, u32)>,
 }
 
 impl SparseMeta {
@@ -358,7 +358,7 @@ impl SparseMeta {
 /// `text_hash (8B) ‖ n (2B) ‖ n × (posting_id (4B) ‖ chunks (2B))`, all big-endian.
 /// The chunk counts make every posting's size exact (deletes have only the meta
 /// to go by), which the split trigger needs.
-fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
+pub(crate) fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + postings.len() * 6);
     out.extend_from_slice(&text_hash.to_be_bytes());
     out.extend_from_slice(&(postings.len() as u16).to_be_bytes());
@@ -372,7 +372,7 @@ fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
 /// Decodes the current form, and the form written before chunk counts were
 /// recorded (`n × posting_id (4B)`; its counts read as 0). The two cannot be
 /// confused: `n` fixes the length of each.
-fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
+pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
     if bytes.len() < 10 {
         return None;
     }
@@ -544,7 +544,7 @@ const DOC_VECTOR_LOCK_STRIPES: usize = 256;
 /// has a single owning process (the directory lock), so an in-process lock
 /// suffices; the stripes are shared across namespaces and databases, which only
 /// costs an occasional false conflict.
-async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
     static STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
         std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
     use std::hash::{Hash, Hasher};
@@ -1298,15 +1298,15 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
 /// from the seed-only rows written before (`centre_id ‖ state ‖ centroid`).
 const POSTING_ROW_V2: u8 = 0xB2;
 
-fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn bytes_to_f32s(b: &[u8]) -> Option<Vec<f32>> {
+pub(crate) fn bytes_to_f32s(b: &[u8]) -> Option<Vec<f32>> {
     (b.len().is_multiple_of(4)).then(|| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
-fn id_from_key(k: &[u8]) -> Option<u32> {
+pub(crate) fn id_from_key(k: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(k.try_into().ok()?))
 }
 
