@@ -17,7 +17,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use minnal_db::doc_store::vector_settings::{MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, SchemaError, StoreType};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
@@ -146,10 +146,14 @@ pub(crate) enum AmendRequest {
         #[serde(default)]
         vector_index: Option<VectorIndexSpec>,
     },
-    /// `{"op": "update_vector_search", "search": {"probe_budget_entries": 20000}}`: change the
-    /// store's search defaults (doc and KV stores).
+    /// `{"op": "update_vector_search", "search": {"probe_budget_entries": 20000},
+    /// "maintenance": {"target_posting_size": 256}}`: change the store's search
+    /// and/or partition maintenance settings (doc and KV stores).
     UpdateVectorSearch {
+        #[serde(default)]
         search: SearchSpec,
+        #[serde(default)]
+        maintenance: Option<MaintenanceSpec>,
     },
 }
 
@@ -185,7 +189,7 @@ impl From<AmendRequest> for SchemaAmendment {
                 vector_index,
             },
             AmendRequest::EnableVectorIndex { fields, vector_index } => SchemaAmendment::EnableVectorIndex { fields, vector_index },
-            AmendRequest::UpdateVectorSearch { search } => SchemaAmendment::UpdateVectorSearch { search },
+            AmendRequest::UpdateVectorSearch { search, maintenance } => SchemaAmendment::UpdateVectorSearch { search, maintenance },
         }
     }
 }
@@ -198,8 +202,8 @@ pub async fn amend_schema(
     info!(namespace = %ns, "amending schema");
 
     // Search defaults apply to doc and KV stores alike.
-    if let AmendRequest::UpdateVectorSearch { search } = &req {
-        state.store.update_vector_search(&ns, search).await?;
+    if let AmendRequest::UpdateVectorSearch { search, maintenance } = &req {
+        state.store.update_vector_search(&ns, search, maintenance.as_ref()).await?;
         match state.store.store_type(&ns)? {
             StoreType::Doc => reload_schema(&state, &ns).await,
             StoreType::Kv => reload_kv_schema(&state, &ns).await,

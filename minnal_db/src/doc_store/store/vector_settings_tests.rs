@@ -50,7 +50,11 @@ async fn create_writes_every_default_into_the_saved_schema() {
         "embedding_model": "gemma", "embedding_dim": 768,
         "chunking": {"window_size": 4, "sliding_size": 2},
         "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001", "pass2_centre": "zero"},
-        "search": {"probe_budget_entries": 70_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100}
+        "search": {"probe_budget_entries": 70_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100,
+                   "probe_budget_fraction": 0.0, "probe_budget_floor": 20_000},
+        "maintenance": {"target_posting_size": 128, "reassign_range": 64, "merge_ratio": 10.0 / 118.0,
+                        "skip_uncertain_moves": false, "split_samples": 1000, "split_init_trials": 3,
+                        "split_max_iters": 100, "split_lambda_factor": 100.0}
     });
     assert_eq!(saved_vector_index(schema_dir.path(), "docs"), expected);
     let kv_saved = saved_vector_index(schema_dir.path(), "kvs");
@@ -170,8 +174,8 @@ async fn update_vector_search_changes_only_search_settings() {
         top_k: Some(10),
         ..Default::default()
     };
-    store.update_vector_search("docs", &update).await.unwrap();
-    store.update_vector_search("kvs", &update).await.unwrap();
+    store.update_vector_search("docs", &update, None).await.unwrap();
+    store.update_vector_search("kvs", &update, None).await.unwrap();
     for ns in ["docs", "kvs"] {
         let saved = saved_vector_index(schema_dir.path(), ns);
         assert_eq!(
@@ -181,7 +185,9 @@ async fn update_vector_search_changes_only_search_settings() {
                 "min_probes": 1,
                 "max_probes": 1024,
                 "first_pass_top_k": 1000,
-                "top_k": 10
+                "top_k": 10,
+                "probe_budget_fraction": 0.0,
+                "probe_budget_floor": 20_000
             }),
             "{ns}"
         );
@@ -193,18 +199,18 @@ async fn update_vector_search_changes_only_search_settings() {
         ..Default::default()
     };
     assert!(matches!(
-        store.update_vector_search("docs", &bad).await.unwrap_err(),
+        store.update_vector_search("docs", &bad, None).await.unwrap_err(),
         DocStoreError::Schema(SchemaError::InvalidVectorSetting {
             field: "search.probe_budget_entries",
             ..
         })
     ));
     assert!(matches!(
-        store.update_vector_search("plain_kv", &update).await.unwrap_err(),
+        store.update_vector_search("plain_kv", &update, None).await.unwrap_err(),
         DocStoreError::Schema(SchemaError::VectorIndexNotConfigured { .. })
     ));
     assert!(matches!(
-        store.update_vector_search("docs", &SearchSpec::default()).await.unwrap_err(),
+        store.update_vector_search("docs", &SearchSpec::default(), None).await.unwrap_err(),
         DocStoreError::Schema(SchemaError::InvalidVectorSetting { field: "search", .. })
     ));
     store.shutdown().await.unwrap();

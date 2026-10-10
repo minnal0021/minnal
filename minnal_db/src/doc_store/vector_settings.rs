@@ -22,6 +22,11 @@
 //! | `embedding_model`, `embedding_dim`, `chunking.*` | fixed: they decide what the stored vectors are |
 //! | `quantisation.*` | read-only: only the current value is accepted |
 //! | `search.*` | changeable at any time; also overridable per request |
+//! | `maintenance.*` | changeable at any time (later splits and merges use the new values) |
+//!
+//! The defaults filled in at enable time are the built-in ones below unless the
+//! server configures others ([`IndexDefaults`], from the TOML's
+//! `[semantic_search.maintenance]` and `[semantic_search.search_defaults]`).
 //!
 //! [`DocStoreSchema`]: crate::doc_store::DocStoreSchema
 //! [`KvStoreSchema`]: crate::doc_store::kv_schema::KvStoreSchema
@@ -77,6 +82,49 @@ pub const MAX_FIRST_PASS_TOP_K: u32 = 10_000;
 pub const DEFAULT_TOP_K: u32 = 100;
 /// Largest accepted result count (the API's result-limit cap).
 pub const MAX_TOP_K: u32 = 1000;
+/// Default floor of a scaled probe budget (used only with `probe_budget_fraction`).
+pub const DEFAULT_PROBE_BUDGET_FLOOR: u32 = 20_000;
+/// Default target posting size, in chunks: a posting splits above twice this
+/// (design doc M3, *Levers and configuration*).
+pub const DEFAULT_TARGET_POSTING_SIZE: u32 = 128;
+/// Accepted `target_posting_size` range.
+pub const MIN_TARGET_POSTING_SIZE: u32 = 16;
+/// Accepted `target_posting_size` range.
+pub const MAX_TARGET_POSTING_SIZE: u32 = 65_536;
+/// Default number of nearest postings re-checked after a split (SPFresh §5.5).
+pub const DEFAULT_REASSIGN_RANGE: u32 = 64;
+/// Largest accepted `reassign_range`.
+pub const MAX_REASSIGN_RANGE: u32 = 1024;
+/// Default merge limit as a share of the split limit: SPFresh's 10 / 118.
+pub const DEFAULT_MERGE_RATIO: f64 = 10.0 / 118.0;
+/// Default members sampled per balanced 2-means iteration (SPTAG).
+pub const DEFAULT_SPLIT_SAMPLES: u32 = 1000;
+/// Default random starting pairs tried by balanced 2-means (SPTAG).
+pub const DEFAULT_SPLIT_INIT_TRIALS: u32 = 3;
+/// Default iteration cap of balanced 2-means (SPTAG).
+pub const DEFAULT_SPLIT_MAX_ITERS: u32 = 100;
+/// Default balance factor of balanced 2-means: `λ ≤ 1 / (factor · samples)` (SPTAG).
+pub const DEFAULT_SPLIT_LAMBDA_FACTOR: f64 = 100.0;
+
+/// A real-valued setting (a share or a factor). Compared by bit pattern so the
+/// settings can stay `Eq`; validation keeps it finite.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Ratio(pub f64);
+
+impl PartialEq for Ratio {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Ratio {}
+
+impl std::fmt::Display for Ratio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 // ── Spec: what a schema or a request carries ─────────────────────────────────
 
@@ -100,6 +148,9 @@ pub struct VectorIndexSpec {
     /// Search defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchSpec>,
+    /// How the namespace's partition is maintained (splits, reassignment, merges).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<MaintenanceSpec>,
     /// Where the namespace's centres came from. Written by the server when it
     /// seeds them; a request may not set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +223,47 @@ pub struct SearchSpec {
     /// Results returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// When set above 0, the budget scales with the namespace:
+    /// `clamp(fraction · entries, probe_budget_floor, probe_budget_entries)`.
+    /// 0 turns scaling off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_budget_fraction: Option<Ratio>,
+    /// Smallest scaled budget, so a small namespace is still read in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_budget_floor: Option<u32>,
+}
+
+/// How a namespace's partition is maintained: the split and merge limits, the
+/// reassignment range, and SPTAG's balanced 2-means parameters (design doc M3,
+/// *M3 split algorithm (LIRE)*).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceSpec {
+    /// Target posting size in chunks: a posting splits above twice this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_posting_size: Option<u32>,
+    /// Nearest postings re-checked after a split (0 = only the split posting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassign_range: Option<u32>,
+    /// A posting merges at `round(2 · target · merge_ratio)` chunks or fewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_ratio: Option<Ratio>,
+    /// Move a chunk only when its code shows it is clearly closer to the new
+    /// posting: the estimated gain must exceed the code's error bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_uncertain_moves: Option<bool>,
+    /// Balanced 2-means: members sampled per iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_samples: Option<u32>,
+    /// Balanced 2-means: random starting pairs tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_init_trials: Option<u32>,
+    /// Balanced 2-means: iteration cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_max_iters: Option<u32>,
+    /// Balanced 2-means: the balance weight is at most `1 / (factor · samples)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_lambda_factor: Option<Ratio>,
 }
 
 // ── Settings: resolved and validated ─────────────────────────────────────────
@@ -199,6 +291,125 @@ pub struct VectorIndexSettings {
     pub seeded_from: Option<SeededFrom>,
     /// Search defaults.
     pub search: SearchSettings,
+    /// Partition maintenance.
+    pub maintenance: MaintenanceSettings,
+}
+
+/// Resolved partition-maintenance settings (see [`MaintenanceSpec`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceSettings {
+    /// Target posting size in chunks.
+    pub target_posting_size: u32,
+    /// Nearest postings re-checked after a split.
+    pub reassign_range: u32,
+    /// Merge limit as a share of the split limit.
+    pub merge_ratio: Ratio,
+    /// Skip moves whose gain is within the code's error bound.
+    pub skip_uncertain_moves: bool,
+    /// Balanced 2-means: members sampled per iteration.
+    pub split_samples: u32,
+    /// Balanced 2-means: random starting pairs tried.
+    pub split_init_trials: u32,
+    /// Balanced 2-means: iteration cap.
+    pub split_max_iters: u32,
+    /// Balanced 2-means: balance factor.
+    pub split_lambda_factor: Ratio,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            target_posting_size: DEFAULT_TARGET_POSTING_SIZE,
+            reassign_range: DEFAULT_REASSIGN_RANGE,
+            merge_ratio: Ratio(DEFAULT_MERGE_RATIO),
+            skip_uncertain_moves: false,
+            split_samples: DEFAULT_SPLIT_SAMPLES,
+            split_init_trials: DEFAULT_SPLIT_INIT_TRIALS,
+            split_max_iters: DEFAULT_SPLIT_MAX_ITERS,
+            split_lambda_factor: Ratio(DEFAULT_SPLIT_LAMBDA_FACTOR),
+        }
+    }
+}
+
+impl MaintenanceSettings {
+    /// A posting holding more chunks than this splits.
+    pub fn split_limit(&self) -> u32 {
+        2 * self.target_posting_size
+    }
+
+    /// A posting holding this many chunks or fewer merges (M3b).
+    pub fn merge_limit(&self) -> u32 {
+        (f64::from(self.split_limit()) * self.merge_ratio.0).round() as u32
+    }
+
+    /// Check every range.
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        check_range(
+            "maintenance.target_posting_size",
+            self.target_posting_size,
+            MIN_TARGET_POSTING_SIZE,
+            MAX_TARGET_POSTING_SIZE,
+        )?;
+        check_range("maintenance.reassign_range", self.reassign_range, 0, MAX_REASSIGN_RANGE)?;
+        let r = self.merge_ratio.0;
+        if !(r.is_finite() && r > 0.0 && r < 0.5) {
+            return Err(invalid(
+                "maintenance.merge_ratio",
+                format!("must be greater than 0 and below 0.5 (a merged posting must stay under the split limit), got {r}"),
+            ));
+        }
+        check_range("maintenance.split_samples", self.split_samples, 2, 1_000_000)?;
+        check_range("maintenance.split_init_trials", self.split_init_trials, 1, 100)?;
+        check_range("maintenance.split_max_iters", self.split_max_iters, 1, 10_000)?;
+        let f = self.split_lambda_factor.0;
+        if !(f.is_finite() && f > 0.0) {
+            return Err(invalid("maintenance.split_lambda_factor", format!("must be greater than 0, got {f}")));
+        }
+        Ok(())
+    }
+}
+
+impl MaintenanceSpec {
+    /// Apply these values over `base` (unset fields keep `base`'s) and validate.
+    pub fn apply(&self, base: MaintenanceSettings) -> Result<MaintenanceSettings, SchemaError> {
+        let m = MaintenanceSettings {
+            target_posting_size: self.target_posting_size.unwrap_or(base.target_posting_size),
+            reassign_range: self.reassign_range.unwrap_or(base.reassign_range),
+            merge_ratio: self.merge_ratio.unwrap_or(base.merge_ratio),
+            skip_uncertain_moves: self.skip_uncertain_moves.unwrap_or(base.skip_uncertain_moves),
+            split_samples: self.split_samples.unwrap_or(base.split_samples),
+            split_init_trials: self.split_init_trials.unwrap_or(base.split_init_trials),
+            split_max_iters: self.split_max_iters.unwrap_or(base.split_max_iters),
+            split_lambda_factor: self.split_lambda_factor.unwrap_or(base.split_lambda_factor),
+        };
+        m.validate()?;
+        Ok(m)
+    }
+
+    /// `true` when no field is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The defaults a namespace's settings are filled with when it first enables
+/// semantic search. Built-in unless the server configures others; after that
+/// the namespace owns its values, so a later change of default never changes
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexDefaults {
+    /// Search defaults.
+    pub search: SearchSettings,
+    /// Maintenance defaults.
+    pub maintenance: MaintenanceSettings,
+}
+
+impl IndexDefaults {
+    /// Check both halves.
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        self.search.validate()?;
+        self.maintenance.validate()
+    }
 }
 
 /// Resolved search settings.
@@ -214,6 +425,10 @@ pub struct SearchSettings {
     pub first_pass_top_k: u32,
     /// Results returned.
     pub top_k: u32,
+    /// Scaled budget share (`None` = the absolute `probe_budget_entries`).
+    pub probe_budget_fraction: Option<Ratio>,
+    /// Smallest scaled budget.
+    pub probe_budget_floor: u32,
 }
 
 impl Default for SearchSettings {
@@ -224,6 +439,8 @@ impl Default for SearchSettings {
             max_probes: DEFAULT_MAX_PROBES,
             first_pass_top_k: DEFAULT_FIRST_PASS_TOP_K,
             top_k: DEFAULT_TOP_K,
+            probe_budget_fraction: None,
+            probe_budget_floor: DEFAULT_PROBE_BUDGET_FLOOR,
         }
     }
 }
@@ -344,7 +561,46 @@ impl SearchSettings {
                 ),
             ));
         }
+        if let Some(Ratio(f)) = self.probe_budget_fraction
+            && !(f.is_finite() && f > 0.0 && f <= 1.0)
+        {
+            return Err(invalid(
+                "search.probe_budget_fraction",
+                format!("must be above 0 and at most 1 (0 turns it off), got {f}"),
+            ));
+        }
+        // The floor only matters to a scaled budget.
+        if self.probe_budget_fraction.is_some() && self.probe_budget_floor > self.probe_budget_entries {
+            return Err(invalid(
+                "search.probe_budget_floor",
+                format!(
+                    "must be at most probe_budget_entries ({}), got {}",
+                    self.probe_budget_entries, self.probe_budget_floor
+                ),
+            ));
+        }
         Ok(())
+    }
+
+    /// The entries a query reads in a namespace holding `entries`: the absolute
+    /// budget, or `clamp(fraction · entries, floor, probe_budget_entries)` when
+    /// a fraction is set.
+    pub fn budget_for(&self, entries: u64) -> u64 {
+        let ceiling = u64::from(self.probe_budget_entries);
+        match self.probe_budget_fraction {
+            Some(Ratio(f)) => ((f * entries as f64).ceil() as u64).clamp(u64::from(self.probe_budget_floor), ceiling),
+            None => ceiling,
+        }
+    }
+}
+
+/// A requested budget fraction over `base`: unset keeps `base`, 0 turns scaling
+/// off.
+fn fraction_or(requested: Option<Ratio>, base: Option<Ratio>) -> Option<Ratio> {
+    match requested {
+        Some(r) if r.0 == 0.0 => None,
+        Some(r) => Some(r),
+        None => base,
     }
 }
 
@@ -358,6 +614,8 @@ impl SearchSpec {
             max_probes: self.max_probes.unwrap_or(base.max_probes),
             first_pass_top_k: self.first_pass_top_k.unwrap_or(base.first_pass_top_k),
             top_k: self.top_k.unwrap_or(base.top_k),
+            probe_budget_fraction: fraction_or(self.probe_budget_fraction, base.probe_budget_fraction),
+            probe_budget_floor: self.probe_budget_floor.unwrap_or(base.probe_budget_floor),
         };
         s.validate()?;
         Ok(s)
@@ -381,6 +639,13 @@ impl VectorIndexSpec {
 
     /// Fill omitted fields with the built-in defaults and validate.
     pub fn resolve(&self) -> Result<VectorIndexSettings, SchemaError> {
+        self.resolve_with(&IndexDefaults::default())
+    }
+
+    /// Fill omitted fields with `defaults` (and the built-in model, dimension,
+    /// chunking and code widths) and validate.
+    pub fn resolve_with(&self, defaults: &IndexDefaults) -> Result<VectorIndexSettings, SchemaError> {
+        let d = &defaults.search;
         let chunking = self.chunking.unwrap_or_default();
         let quantisation = self.quantisation.clone().unwrap_or_default();
         let search = self.search.unwrap_or_default();
@@ -390,13 +655,14 @@ impl VectorIndexSpec {
         // max_probes 4 alone probes at least 1, min_probes 2000 alone at most
         // 2000). Values the caller gives are checked as given.
         let window_size = chunking.window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
-        let first_pass_top_k = search.first_pass_top_k.unwrap_or(DEFAULT_FIRST_PASS_TOP_K);
+        let first_pass_top_k = search.first_pass_top_k.unwrap_or(d.first_pass_top_k);
         let (min_probes, max_probes) = match (search.min_probes, search.max_probes) {
             (Some(min), Some(max)) => (min, max),
-            (Some(min), None) => (min, DEFAULT_MAX_PROBES.max(min)),
-            (None, Some(max)) => (DEFAULT_MIN_PROBES.min(max), max),
-            (None, None) => (DEFAULT_MIN_PROBES, DEFAULT_MAX_PROBES),
+            (Some(min), None) => (min, d.max_probes.max(min)),
+            (None, Some(max)) => (d.min_probes.min(max), max),
+            (None, None) => (d.min_probes, d.max_probes),
         };
+        let probe_budget_entries = search.probe_budget_entries.unwrap_or(d.probe_budget_entries);
         let settings = VectorIndexSettings {
             embedding_model: normalise_model(self.embedding_model.as_deref().unwrap_or(DEFAULT_EMBEDDING_MODEL))?,
             embedding_dim: self.embedding_dim.unwrap_or(DEFAULT_EMBEDDING_DIM),
@@ -411,12 +677,15 @@ impl VectorIndexSpec {
             seeded_from: self.seeded_from.clone(),
             pass2_centre: quantisation.pass2_centre.clone().unwrap_or_else(|| PASS2_CENTRE.to_string()),
             search: SearchSettings {
-                probe_budget_entries: search.probe_budget_entries.unwrap_or(DEFAULT_PROBE_BUDGET_ENTRIES),
+                probe_budget_entries,
                 min_probes,
                 max_probes,
                 first_pass_top_k,
-                top_k: search.top_k.unwrap_or(DEFAULT_TOP_K.min(first_pass_top_k)),
+                top_k: search.top_k.unwrap_or(d.top_k.min(first_pass_top_k)),
+                probe_budget_fraction: fraction_or(search.probe_budget_fraction, d.probe_budget_fraction),
+                probe_budget_floor: search.probe_budget_floor.unwrap_or(d.probe_budget_floor.min(probe_budget_entries)),
             },
+            maintenance: self.maintenance.unwrap_or_default().apply(defaults.maintenance)?,
         };
         settings.validate()?;
         Ok(settings)
@@ -464,6 +733,7 @@ impl VectorIndexSpec {
         self.reject_seeded_from()?;
         Ok(VectorIndexSettings {
             search: self.search.unwrap_or_default().apply(current.search)?,
+            maintenance: self.maintenance.unwrap_or_default().apply(current.maintenance)?,
             ..current.clone()
         })
     }
@@ -482,7 +752,8 @@ impl VectorIndexSettings {
                 format!("is read-only and must be \"{PASS2_CENTRE}\", got {:?}", self.pass2_centre),
             ));
         }
-        self.search.validate()
+        self.search.validate()?;
+        self.maintenance.validate()
     }
 
     /// The fully filled-in spec, as saved in a schema.
@@ -506,6 +777,18 @@ impl VectorIndexSettings {
                 max_probes: Some(self.search.max_probes),
                 first_pass_top_k: Some(self.search.first_pass_top_k),
                 top_k: Some(self.search.top_k),
+                probe_budget_fraction: Some(self.search.probe_budget_fraction.unwrap_or(Ratio(0.0))),
+                probe_budget_floor: Some(self.search.probe_budget_floor),
+            }),
+            maintenance: Some(MaintenanceSpec {
+                target_posting_size: Some(self.maintenance.target_posting_size),
+                reassign_range: Some(self.maintenance.reassign_range),
+                merge_ratio: Some(self.maintenance.merge_ratio),
+                skip_uncertain_moves: Some(self.maintenance.skip_uncertain_moves),
+                split_samples: Some(self.maintenance.split_samples),
+                split_init_trials: Some(self.maintenance.split_init_trials),
+                split_max_iters: Some(self.maintenance.split_max_iters),
+                split_lambda_factor: Some(self.maintenance.split_lambda_factor),
             }),
             seeded_from: self.seeded_from.clone(),
         }
@@ -521,32 +804,44 @@ pub(crate) fn resolve_or_default(spec: Option<&VectorIndexSpec>) -> Result<Vecto
 /// The `vector_index` to save when semantic search is (first) enabled with
 /// `requested`: merged onto what the schema already holds, or resolved from
 /// the defaults when it holds nothing yet.
-pub(crate) fn settle(existing: Option<&VectorIndexSpec>, requested: Option<&VectorIndexSpec>) -> Result<VectorIndexSpec, SchemaError> {
+pub(crate) fn settle(
+    existing: Option<&VectorIndexSpec>,
+    requested: Option<&VectorIndexSpec>,
+    defaults: &IndexDefaults,
+) -> Result<VectorIndexSpec, SchemaError> {
     let requested = requested.cloned().unwrap_or_default();
     requested.reject_seeded_from()?;
     let settings = match existing {
         Some(e) => requested.merge_onto(&e.resolve()?)?,
-        None => requested.resolve()?,
+        None => requested.resolve_with(defaults)?,
     };
     Ok(settings.to_spec())
 }
 
-/// The `vector_index` to save after an `UpdateVectorSearch`: `search` applied
-/// over the namespace's current search settings, everything else unchanged.
-pub(crate) fn update_search(existing: Option<&VectorIndexSpec>, namespace: &str, search: &SearchSpec) -> Result<VectorIndexSpec, SchemaError> {
+/// The `vector_index` to save after an `UpdateVectorSearch`: `search` and
+/// `maintenance` applied over the namespace's current settings, everything else
+/// unchanged.
+pub(crate) fn update_search(
+    existing: Option<&VectorIndexSpec>,
+    namespace: &str,
+    search: &SearchSpec,
+    maintenance: Option<&MaintenanceSpec>,
+) -> Result<VectorIndexSpec, SchemaError> {
     let current = existing
         .ok_or_else(|| SchemaError::VectorIndexNotConfigured {
             namespace: namespace.to_owned(),
         })?
         .resolve()?;
-    if search.is_empty() {
+    let maintenance = maintenance.copied().unwrap_or_default();
+    if search.is_empty() && maintenance.is_empty() {
         return Err(invalid(
             "search",
-            "update must set at least one of probe_budget_entries, min_probes, max_probes, first_pass_top_k, top_k",
+            "update must set at least one search or maintenance setting (for example probe_budget_entries or target_posting_size)",
         ));
     }
     Ok(VectorIndexSettings {
         search: search.apply(current.search)?,
+        maintenance: maintenance.apply(current.maintenance)?,
         ..current
     }
     .to_spec())
@@ -620,8 +915,8 @@ mod tests {
             err_field(seeded.merge_onto(&VectorIndexSpec::default().resolve().unwrap())),
             "seeded_from"
         );
-        assert!(settle(None, Some(&seeded)).is_err());
-        let kept = settle(Some(&seeded), None).unwrap();
+        assert!(settle(None, Some(&seeded), &IndexDefaults::default()).is_err());
+        let kept = settle(Some(&seeded), None, &IndexDefaults::default()).unwrap();
         assert_eq!(kept.seeded_from, seeded.seeded_from, "kept across a re-enable");
     }
 
@@ -639,7 +934,9 @@ mod tests {
                 min_probes: 1,
                 max_probes: 1024,
                 first_pass_top_k: 1000,
-                top_k: 100
+                top_k: 100,
+                probe_budget_fraction: None,
+                probe_budget_floor: 20_000,
             }
         );
     }
@@ -870,7 +1167,7 @@ mod tests {
 
     #[test]
     fn update_search_changes_only_search_and_needs_settings() {
-        let current = settle(None, Some(&spec(r#"{"embedding_model":"qwen"}"#))).unwrap();
+        let current = settle(None, Some(&spec(r#"{"embedding_model":"qwen"}"#)), &IndexDefaults::default()).unwrap();
         let updated = update_search(
             Some(&current),
             "ns",
@@ -878,6 +1175,7 @@ mod tests {
                 top_k: Some(10),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         let (a, b) = (current.resolve().unwrap(), updated.resolve().unwrap());
@@ -890,11 +1188,12 @@ mod tests {
                 &SearchSpec {
                     top_k: Some(10),
                     ..Default::default()
-                }
+                },
+                None
             ),
             Err(SchemaError::VectorIndexNotConfigured { .. })
         ));
-        assert!(update_search(Some(&current), "ns", &SearchSpec::default()).is_err());
+        assert!(update_search(Some(&current), "ns", &SearchSpec::default(), None).is_err());
         assert!(
             update_search(
                 Some(&current),
@@ -902,7 +1201,8 @@ mod tests {
                 &SearchSpec {
                     probe_budget_entries: Some(0),
                     ..Default::default()
-                }
+                },
+                None
             )
             .is_err()
         );
@@ -910,12 +1210,107 @@ mod tests {
 
     #[test]
     fn settle_fills_defaults_first_time_and_merges_after() {
-        let first = settle(None, Some(&spec(r#"{"embedding_model":"qwen"}"#))).unwrap();
+        let first = settle(None, Some(&spec(r#"{"embedding_model":"qwen"}"#)), &IndexDefaults::default()).unwrap();
         assert_eq!(first.chunking.unwrap().window_size, Some(4));
         // A later enable may omit everything, or change only search settings.
-        assert_eq!(settle(Some(&first), None).unwrap(), first);
-        let again = settle(Some(&first), Some(&spec(r#"{"search":{"max_probes":4}}"#))).unwrap();
+        assert_eq!(settle(Some(&first), None, &IndexDefaults::default()).unwrap(), first);
+        let again = settle(Some(&first), Some(&spec(r#"{"search":{"max_probes":4}}"#)), &IndexDefaults::default()).unwrap();
         assert_eq!(again.search.unwrap().max_probes, Some(4));
-        assert!(settle(Some(&first), Some(&spec(r#"{"embedding_model":"gemma"}"#))).is_err());
+        assert!(settle(Some(&first), Some(&spec(r#"{"embedding_model":"gemma"}"#)), &IndexDefaults::default()).is_err());
+    }
+
+    #[test]
+    fn configured_defaults_fill_a_new_namespace_and_are_then_owned_by_it() {
+        let defaults = IndexDefaults {
+            search: SearchSettings {
+                probe_budget_entries: 40_000,
+                probe_budget_fraction: Some(Ratio(0.3)),
+                ..SearchSettings::default()
+            },
+            maintenance: MaintenanceSettings {
+                target_posting_size: 256,
+                skip_uncertain_moves: true,
+                ..MaintenanceSettings::default()
+            },
+        };
+        let saved = settle(None, None, &defaults).unwrap();
+        let s = saved.resolve().unwrap();
+        assert_eq!(s.search.probe_budget_entries, 40_000);
+        assert_eq!(s.search.probe_budget_fraction, Some(Ratio(0.3)));
+        assert_eq!((s.maintenance.target_posting_size, s.maintenance.skip_uncertain_moves), (256, true));
+        // Later defaults never change a namespace that has settings.
+        let again = settle(Some(&saved), None, &IndexDefaults::default()).unwrap();
+        assert_eq!(again.resolve().unwrap(), s);
+        // A request's own values win over the defaults.
+        let req = spec(r#"{"maintenance":{"target_posting_size":64},"search":{"probe_budget_entries":9000}}"#);
+        let r = settle(None, Some(&req), &defaults).unwrap().resolve().unwrap();
+        assert_eq!((r.maintenance.target_posting_size, r.search.probe_budget_entries), (64, 9000));
+    }
+
+    #[test]
+    fn maintenance_limits_follow_the_target_and_ratio() {
+        let m = MaintenanceSettings::default();
+        assert_eq!((m.split_limit(), m.merge_limit()), (256, 22));
+        let m = MaintenanceSettings {
+            target_posting_size: 256,
+            ..m
+        };
+        assert_eq!((m.split_limit(), m.merge_limit()), (512, 43));
+    }
+
+    #[test]
+    fn maintenance_values_are_validated() {
+        for (json, field) in [
+            (r#"{"maintenance":{"target_posting_size":8}}"#, "maintenance.target_posting_size"),
+            (r#"{"maintenance":{"reassign_range":5000}}"#, "maintenance.reassign_range"),
+            (r#"{"maintenance":{"merge_ratio":0.5}}"#, "maintenance.merge_ratio"),
+            (r#"{"maintenance":{"merge_ratio":0}}"#, "maintenance.merge_ratio"),
+            (r#"{"maintenance":{"split_samples":1}}"#, "maintenance.split_samples"),
+            (r#"{"maintenance":{"split_init_trials":0}}"#, "maintenance.split_init_trials"),
+            (r#"{"maintenance":{"split_max_iters":0}}"#, "maintenance.split_max_iters"),
+            (r#"{"maintenance":{"split_lambda_factor":0}}"#, "maintenance.split_lambda_factor"),
+            (r#"{"search":{"probe_budget_fraction":1.5}}"#, "search.probe_budget_fraction"),
+            (
+                r#"{"search":{"probe_budget_fraction":0.3,"probe_budget_floor":80000,"probe_budget_entries":70000}}"#,
+                "search.probe_budget_floor",
+            ),
+        ] {
+            assert_eq!(err_field(spec(json).resolve()), field, "{json}");
+        }
+        assert!(serde_json::from_str::<VectorIndexSpec>(r#"{"maintenance":{"targetsize":1}}"#).is_err());
+    }
+
+    #[test]
+    fn a_scaled_budget_is_clamped_between_floor_and_ceiling() {
+        let s = SearchSettings {
+            probe_budget_fraction: Some(Ratio(0.3)),
+            ..SearchSettings::default()
+        };
+        assert_eq!(s.budget_for(10_000), 20_000); // floor: a small namespace is read in full
+        assert_eq!(s.budget_for(100_000), 30_000);
+        assert_eq!(s.budget_for(1_000_000), 70_000); // ceiling
+        assert_eq!(SearchSettings::default().budget_for(1_000_000), 70_000);
+        // 0 turns scaling off, and the floor no longer matters.
+        let off = SearchSpec {
+            probe_budget_fraction: Some(Ratio(0.0)),
+            probe_budget_entries: Some(5_000),
+            ..Default::default()
+        }
+        .apply(s)
+        .unwrap();
+        assert_eq!((off.probe_budget_fraction, off.budget_for(1_000_000)), (None, 5_000));
+    }
+
+    #[test]
+    fn maintenance_can_be_updated_alone() {
+        let current = settle(None, None, &IndexDefaults::default()).unwrap();
+        let m = MaintenanceSpec {
+            target_posting_size: Some(256),
+            ..Default::default()
+        };
+        let updated = update_search(Some(&current), "ns", &SearchSpec::default(), Some(&m)).unwrap();
+        let (a, b) = (current.resolve().unwrap(), updated.resolve().unwrap());
+        assert_eq!(b.maintenance.target_posting_size, 256);
+        assert_eq!(b.search, a.search);
     }
 }

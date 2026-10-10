@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::doc_store::error::SchemaError;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::{StoreType, peek_store_type};
-use crate::doc_store::vector_settings::{self, SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use crate::doc_store::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// Key type for a KV store namespace.
 ///
@@ -100,20 +100,25 @@ impl KvStoreSchema {
     }
 
     /// Fill `vector_index` with its defaults when semantic search is on (or the
-    /// schema gives settings). Called when a store is created or imported.
-    pub fn settle_vector_index(&mut self) -> Result<(), SchemaError> {
+    /// schema gives settings). Called when a store is created or imported, with
+    /// the server's defaults.
+    pub fn settle_vector_index(&mut self, defaults: &IndexDefaults) -> Result<(), SchemaError> {
         if self.semantic_search_enabled || self.vector_index.is_some() {
-            self.vector_index = Some(vector_settings::settle(None, self.vector_index.as_ref())?);
+            self.vector_index = Some(vector_settings::settle(None, self.vector_index.as_ref(), defaults)?);
         }
         Ok(())
     }
 
-    /// Change the search defaults (probe budget and bounds, `first_pass_top_k`,
-    /// `top_k`);
+    /// Change the search settings and/or the partition maintenance settings;
     /// everything else is unchanged. Fails if the store has no vector-index
     /// settings.
-    pub fn update_vector_search(&mut self, search: &SearchSpec) -> Result<(), SchemaError> {
-        self.vector_index = Some(vector_settings::update_search(self.vector_index.as_ref(), &self.namespace, search)?);
+    pub fn update_vector_search(&mut self, search: &SearchSpec, maintenance: Option<&MaintenanceSpec>) -> Result<(), SchemaError> {
+        self.vector_index = Some(vector_settings::update_search(
+            self.vector_index.as_ref(),
+            &self.namespace,
+            search,
+            maintenance,
+        )?);
         Ok(())
     }
 

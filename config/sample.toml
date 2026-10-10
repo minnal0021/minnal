@@ -279,12 +279,15 @@ concurrency = 4
 # ---------------------------------------------------------------------------
 # [semantic_search] — the embedding service and the cluster centroids
 #
-# A store's embedding model, dimension, chunking, code widths and search
-# defaults are NOT set here: they live in the store's schema (`vector_index`),
-# with built-in defaults (gemma, 768 dimensions, 4-sentence windows sliding by
-# 2, a probe budget of 70,000 entries over 1 to 1,024 postings, first-pass
-# cut 1000, top_k 100). Leaving one of those keys
-# here is a startup error.
+# A store's embedding model, dimension, chunking, code widths, search settings
+# and partition maintenance live in the store's schema (`vector_index`). The
+# [semantic_search.maintenance] and [semantic_search.search_defaults] tables
+# below only set the values a store's schema is filled with when it first
+# enables semantic search; after that the store owns them (change them with the
+# schema amendment `update_vector_search`), and a later change here never
+# affects an existing store. A namespace key placed directly under
+# [semantic_search] (model, embedding_dim, probe_budget_entries, ...) is a
+# startup error.
 # ---------------------------------------------------------------------------
 [semantic_search]
 
@@ -321,6 +324,77 @@ centroid_dir = "service/embedding_support"
 # Fails fast when the host is unreachable. Should be shorter than
 # embedding_request_timeout_secs (the overall cap). Default: 10.
 # embedding_connect_timeout_secs = 10
+
+# ---------------------------------------------------------------------------
+# [semantic_search.maintenance] — how each store's partition grows
+#
+# A store's vectors are partitioned into postings. A store starts with one
+# posting; a posting that grows past twice the target is split in two by a
+# background task (SPFresh's LIRE protocol: balanced 2-means on the postings'
+# 1-bit codes, the new centres being the means of their members). Every key
+# but `threads` is a default copied into a store's schema.
+# ---------------------------------------------------------------------------
+[semantic_search.maintenance]
+
+# Target posting size, in chunks. A posting splits above twice this, so
+# postings hold between one and two times the target. Smaller postings find
+# more of the right documents per entry a query reads, at the cost of more
+# postings to probe and more maintenance. Range 16-65536. Default: 128.
+# target_posting_size = 128
+
+# Postings nearest a split whose chunks are re-checked afterwards (SPFresh's
+# reassign range). 0 re-checks only the split posting. Range 0-1024. Default: 64.
+# reassign_range = 64
+
+# A posting merges into a neighbour at round(2 * target * merge_ratio) chunks
+# or fewer (22 at the default target). Above 0, below 0.5. Default: 10/118,
+# SPFresh's ratio.
+# merge_ratio = 0.0847
+
+# true: move a chunk during maintenance only when its code shows it is clearly
+# closer to the new posting (the gain exceeds the code's error bound). Saves
+# 12-17% of key moves; costs up to a point of recall at very small probe
+# budgets when topics arrive one at a time. Default: false.
+# skip_uncertain_moves = false
+
+# Balanced 2-means (SPTAG's parameters): members sampled per iteration, random
+# starting pairs tried, iteration cap, and the balance factor
+# (lambda <= 1 / (factor * samples)). Defaults: 1000, 3, 100, 100.
+# split_samples = 1000
+# split_init_trials = 3
+# split_max_iters = 100
+# split_lambda_factor = 100.0
+
+# Engine-wide, not copied into schemas: maintenance threads per process. They
+# run off the query path. Range 1-64. Default: 2.
+# threads = 2
+
+# ---------------------------------------------------------------------------
+# [semantic_search.search_defaults] — search settings a new store starts with
+#
+# Copied into a store's schema when it enables semantic search; a search
+# request can still override probe_budget_entries, min_probes, max_probes,
+# first_pass_top_k and top_k.
+# ---------------------------------------------------------------------------
+[semantic_search.search_defaults]
+
+# Entries Pass 1 reads per query: it probes the nearest postings until their
+# entries reach this. A store with fewer entries is read in full. Default: 70000.
+# probe_budget_entries = 70000
+
+# Postings always probed / never exceeded, whatever the budget. Defaults: 1, 1024.
+# min_probes = 1
+# max_probes = 1024
+
+# Candidates Pass 1 hands to Pass 2, and results returned. Defaults: 1000, 100.
+# first_pass_top_k = 1000
+# top_k = 100
+
+# Optional scaled budget: budget = clamp(fraction * entries, floor,
+# probe_budget_entries). Large stores then read a share of themselves while
+# small ones stay exact. 0 (default) keeps the absolute budget.
+# probe_budget_fraction = 0.30
+# probe_budget_floor = 20000
 
 # ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — enabled embedding models

@@ -279,6 +279,9 @@ pub struct SemanticSearchContext {
     /// The file each seed source was loaded from, when known (recorded in a
     /// namespace's `seeded_from`).
     seed_files: std::collections::HashMap<String, std::path::PathBuf>,
+    /// What a namespace's vector-index settings are filled with when it first
+    /// enables semantic search (the server's TOML defaults, or built-in).
+    pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
@@ -294,6 +297,9 @@ pub struct NamespaceSemantics {
     pub config: SemanticSearchConfig,
     /// The namespace's own partition (its centres, postings and rotation).
     pub ivf: Arc<NamespaceIvf>,
+    /// The namespace's search settings, from which `config.probe` was computed
+    /// (kept so a request's overrides apply to them, not to the computed budget).
+    pub search: SearchSettings,
 }
 
 #[cfg(feature = "semantic-search")]
@@ -305,8 +311,15 @@ impl SemanticSearchContext {
             config,
             cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
             seed_files: std::collections::HashMap::new(),
+            index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Use `defaults` for namespaces that enable semantic search from now on.
+    pub fn with_index_defaults(mut self, defaults: crate::doc_store::vector_settings::IndexDefaults) -> Self {
+        self.index_defaults = defaults;
+        self
     }
 
     /// Record the file `model`'s seed source was loaded from.
@@ -438,12 +451,16 @@ impl SemanticSearchContext {
             window_size: settings.window_size as usize,
             sliding_size: settings.sliding_size as usize,
             number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
-            probe: probe_settings(&settings.search),
+            probe: probe_settings(&settings.search, ivf.total_entries()),
             first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
             top_k_results: settings.search.top_k as usize,
             ..self.config.clone()
         };
-        Ok(NamespaceSemantics { config, ivf })
+        Ok(NamespaceSemantics {
+            config,
+            ivf,
+            search: settings.search,
+        })
     }
 }
 
@@ -452,15 +469,9 @@ impl NamespaceSemantics {
     /// This namespace's config with one request's search overrides applied
     /// (validated against the same ranges as the schema).
     pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
-        let base = SearchSettings {
-            probe_budget_entries: self.config.probe.budget_entries as u32,
-            min_probes: self.config.probe.min_probes as u32,
-            max_probes: self.config.probe.max_probes as u32,
-            first_pass_top_k: self.config.first_pass_sparse_search_top_k as u32,
-            top_k: self.config.top_k_results as u32,
-        };
-        let s = overrides.apply(base)?;
-        self.config.probe = probe_settings(&s);
+        let s = overrides.apply(self.search)?;
+        self.config.probe = probe_settings(&s, self.ivf.total_entries());
+        self.search = s;
         self.config.first_pass_sparse_search_top_k = s.first_pass_top_k as usize;
         self.config.top_k_results = s.top_k as usize;
         Ok(self)
@@ -492,11 +503,12 @@ pub struct ReindexStats {
     pub enqueued: usize,
 }
 
-/// The probe settings a namespace's search settings describe.
+/// The probe settings a namespace's search settings describe, for a namespace
+/// holding `entries` (a scaled budget depends on it).
 #[cfg(feature = "semantic-search")]
-fn probe_settings(s: &SearchSettings) -> crate::semantic_search::ProbeSettings {
+fn probe_settings(s: &SearchSettings, entries: u64) -> crate::semantic_search::ProbeSettings {
     crate::semantic_search::ProbeSettings {
-        budget_entries: u64::from(s.probe_budget_entries),
+        budget_entries: s.budget_for(entries),
         min_probes: s.min_probes as usize,
         max_probes: s.max_probes as usize,
     }

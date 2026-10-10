@@ -4,7 +4,7 @@ use json_dotpath::DotPaths;
 use serde::{Deserialize, Serialize};
 
 use crate::doc_store::error::SchemaError;
-use crate::doc_store::vector_settings::{self, SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use crate::doc_store::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// The raw key-value store schema, split into its own module.
 ///
@@ -193,10 +193,16 @@ pub enum SchemaAmendment {
         fields: Vec<String>,
         vector_index: Option<VectorIndexSpec>,
     },
-    /// Change the namespace's search defaults (`probe_budget_entries`,
-    /// `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`). Takes effect on later searches; nothing is re-embedded. Fails
-    /// if the namespace has never had semantic search enabled.
-    UpdateVectorSearch { search: SearchSpec },
+    /// Change the namespace's search settings (`probe_budget_entries`,
+    /// `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`,
+    /// `probe_budget_fraction`, `probe_budget_floor`) and/or its partition
+    /// maintenance settings. Takes effect on later searches, splits and merges;
+    /// nothing is re-embedded. Fails if the namespace has never had semantic
+    /// search enabled.
+    UpdateVectorSearch {
+        search: SearchSpec,
+        maintenance: Option<MaintenanceSpec>,
+    },
 }
 
 /// Schema definition for a single document store instance.
@@ -361,10 +367,10 @@ impl DocStoreSchema {
 
     /// Fill `vector_index` with its defaults when semantic search is on (or the
     /// schema gives settings), so the saved schema shows the values in force.
-    /// Called when a store is created or imported.
-    pub fn settle_vector_index(&mut self) -> Result<(), SchemaError> {
+    /// Called when a store is created or imported, with the server's defaults.
+    pub fn settle_vector_index(&mut self, defaults: &IndexDefaults) -> Result<(), SchemaError> {
         if self.semantic_search_enabled || self.vector_index.is_some() {
-            self.vector_index = Some(vector_settings::settle(None, self.vector_index.as_ref())?);
+            self.vector_index = Some(vector_settings::settle(None, self.vector_index.as_ref(), defaults)?);
         }
         Ok(())
     }
@@ -497,7 +503,7 @@ impl DocStoreSchema {
                 if self.embedding_fields.contains(&name) {
                     return Err(SchemaError::DuplicateFieldName { field: name });
                 }
-                let settled = vector_settings::settle(self.vector_index.as_ref(), vector_index.as_ref())?;
+                let settled = vector_settings::settle(self.vector_index.as_ref(), vector_index.as_ref(), &IndexDefaults::default())?;
                 self.vector_index = Some(settled);
                 self.attributes.push(AttributeDef {
                     name: name.clone(),
@@ -535,7 +541,7 @@ impl DocStoreSchema {
                         return Err(SchemaError::DuplicateFieldName { field: name.clone() });
                     }
                 }
-                let settled = vector_settings::settle(self.vector_index.as_ref(), vector_index.as_ref())?;
+                let settled = vector_settings::settle(self.vector_index.as_ref(), vector_index.as_ref(), &IndexDefaults::default())?;
                 self.vector_index = Some(settled);
                 for name in fields {
                     self.attributes.push(AttributeDef {
@@ -548,8 +554,13 @@ impl DocStoreSchema {
                 self.semantic_search_enabled = true;
                 Ok(())
             }
-            SchemaAmendment::UpdateVectorSearch { search } => {
-                self.vector_index = Some(vector_settings::update_search(self.vector_index.as_ref(), &self.namespace, &search)?);
+            SchemaAmendment::UpdateVectorSearch { search, maintenance } => {
+                self.vector_index = Some(vector_settings::update_search(
+                    self.vector_index.as_ref(),
+                    &self.namespace,
+                    &search,
+                    maintenance.as_ref(),
+                )?);
                 Ok(())
             }
         }

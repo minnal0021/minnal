@@ -198,7 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .fold(SemanticSearchContext::new(service, cluster_indexes), |ctx, (model, path)| {
                     ctx.with_seed_file(&model, path)
-                }),
+                })
+                // Validated when the config was loaded.
+                .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load")),
         )
     } else {
         warn!(

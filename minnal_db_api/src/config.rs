@@ -154,6 +154,10 @@ impl DocStoreApiConfig {
         let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
         let config: Self = toml::from_str(&content).map_err(|e| format!("cannot parse '{}': {e}", path.display()))?;
         config.validate_supported_models()?;
+        config
+            .semantic_search
+            .index_defaults()
+            .map_err(|e| format!("invalid [semantic_search] defaults in '{}': {e}", path.display()))?;
         Ok(config)
     }
 
@@ -587,11 +591,13 @@ fn default_concurrency() -> usize {
 /// Semantic-search settings that belong to the server: how to reach the
 /// embedding service, and which models' centroids it loads.
 ///
-/// Everything that shapes one namespace's index (model, dimension, chunking,
-/// code widths, search defaults) lives in that namespace's schema
-/// (`vector_index`), not here. Unknown keys are rejected, so a config still
-/// carrying one of those (`model`, `embedding_dim`, `probe_budget_entries`, ...) fails at
-/// startup instead of being silently ignored.
+/// Everything that shapes one namespace's index lives in that namespace's
+/// schema (`vector_index`). The `maintenance` and `search_defaults` tables here
+/// only give the values a namespace's schema is filled with when it first
+/// enables semantic search; from then on the namespace owns them. Unknown keys
+/// are rejected, so a misplaced key (`model`, `embedding_dim`,
+/// `probe_budget_entries` at this level, ...) fails at startup instead of being
+/// silently ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticSearchSection {
@@ -635,6 +641,72 @@ pub struct SemanticSearchSection {
     /// `embedding_request_timeout_secs` (the overall cap). Default: 10.
     #[serde(default = "default_embedding_connect_timeout_secs")]
     pub embedding_connect_timeout_secs: u64,
+
+    /// Partition maintenance: defaults copied into a namespace's schema
+    /// (`vector_index.maintenance`) when it enables semantic search, plus the
+    /// engine-only `threads`.
+    #[serde(default)]
+    pub maintenance: MaintenanceSection,
+
+    /// Search defaults copied into a namespace's schema (`vector_index.search`)
+    /// when it enables semantic search.
+    #[serde(default)]
+    pub search_defaults: minnal_db::doc_store::vector_settings::SearchSpec,
+}
+
+/// `[semantic_search.maintenance]`: how each namespace's partition is split,
+/// reassigned and merged (design doc M3). All but `threads` are defaults for a
+/// namespace's schema; unset keys keep the built-in values.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceSection {
+    /// Target posting size in chunks; a posting splits above twice this.
+    pub target_posting_size: Option<u32>,
+    /// Nearest postings re-checked after a split (0 = none).
+    pub reassign_range: Option<u32>,
+    /// Merge limit as a share of the split limit (SPFresh: 10/118).
+    pub merge_ratio: Option<f64>,
+    /// Move a chunk only when its code shows it is clearly closer to the new
+    /// posting (the gain exceeds the code's error bound).
+    pub skip_uncertain_moves: Option<bool>,
+    /// Balanced 2-means: members sampled per iteration.
+    pub split_samples: Option<u32>,
+    /// Balanced 2-means: random starting pairs tried.
+    pub split_init_trials: Option<u32>,
+    /// Balanced 2-means: iteration cap.
+    pub split_max_iters: Option<u32>,
+    /// Balanced 2-means: balance factor.
+    pub split_lambda_factor: Option<f64>,
+    /// Engine-only: maintenance threads per process. Default 2.
+    pub threads: Option<usize>,
+}
+
+/// Default maintenance threads per process.
+pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
+
+impl MaintenanceSection {
+    fn spec(&self) -> minnal_db::doc_store::vector_settings::MaintenanceSpec {
+        use minnal_db::doc_store::vector_settings::{MaintenanceSpec, Ratio};
+        MaintenanceSpec {
+            target_posting_size: self.target_posting_size,
+            reassign_range: self.reassign_range,
+            merge_ratio: self.merge_ratio.map(Ratio),
+            skip_uncertain_moves: self.skip_uncertain_moves,
+            split_samples: self.split_samples,
+            split_init_trials: self.split_init_trials,
+            split_max_iters: self.split_max_iters,
+            split_lambda_factor: self.split_lambda_factor.map(Ratio),
+        }
+    }
+
+    /// Maintenance threads, defaulted and checked (1–64).
+    pub fn threads(&self) -> Result<usize, String> {
+        let t = self.threads.unwrap_or(DEFAULT_MAINTENANCE_THREADS);
+        if !(1..=64).contains(&t) {
+            return Err(format!("maintenance.threads must be between 1 and 64, got {t}"));
+        }
+        Ok(t)
+    }
 }
 
 impl Default for SemanticSearchSection {
@@ -646,6 +718,8 @@ impl Default for SemanticSearchSection {
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
             embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
             embedding_connect_timeout_secs: default_embedding_connect_timeout_secs(),
+            maintenance: MaintenanceSection::default(),
+            search_defaults: Default::default(),
         }
     }
 }
@@ -688,6 +762,19 @@ pub struct ResolvedSemanticSearchConfig {
 }
 
 impl SemanticSearchSection {
+    /// The defaults a namespace's vector-index settings are filled with, built
+    /// from `search_defaults` and `maintenance` over the built-in values and
+    /// validated (also checks `maintenance.threads`).
+    pub fn index_defaults(&self) -> Result<minnal_db::doc_store::vector_settings::IndexDefaults, String> {
+        use minnal_db::doc_store::vector_settings::IndexDefaults;
+        let builtin = IndexDefaults::default();
+        self.maintenance.threads()?;
+        Ok(IndexDefaults {
+            search: self.search_defaults.apply(builtin.search).map_err(|e| e.to_string())?,
+            maintenance: self.maintenance.spec().apply(builtin.maintenance).map_err(|e| e.to_string())?,
+        })
+    }
+
     /// The centroid directory, defaulted.
     pub fn centroid_dir(&self) -> PathBuf {
         self.centroid_dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CENTROID_DIR))
@@ -876,6 +963,73 @@ mod tests {
         let ok = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\ncentroid_dir = \"/c\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(ok).unwrap();
         assert_eq!(cfg.semantic_search.centroid_dir(), PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn maintenance_and_search_defaults_are_read_and_validated() {
+        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        assert_eq!(d, minnal_db::doc_store::vector_settings::IndexDefaults::default());
+        assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), DEFAULT_MAINTENANCE_THREADS);
+
+        let toml = format!(
+            "{base}[semantic_search.maintenance]\ntarget_posting_size = 256\nskip_uncertain_moves = true\nthreads = 4\n\
+             [semantic_search.search_defaults]\nprobe_budget_entries = 40000\nprobe_budget_fraction = 0.3\n"
+        );
+        let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        assert_eq!((d.maintenance.target_posting_size, d.maintenance.skip_uncertain_moves), (256, true));
+        assert_eq!(d.maintenance.reassign_range, 64, "unset keys keep the built-in value");
+        assert_eq!(d.search.probe_budget_entries, 40_000);
+        assert_eq!(d.search.probe_budget_fraction.map(|r| r.0), Some(0.3));
+        assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), 4);
+
+        for (table, key) in [
+            ("maintenance", "target_posting_size = 4"),
+            ("maintenance", "merge_ratio = 0.7"),
+            ("maintenance", "threads = 0"),
+            ("search_defaults", "probe_budget_fraction = 2.0"),
+        ] {
+            let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
+            let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+            assert!(cfg.semantic_search.index_defaults().is_err(), "{key}");
+        }
+        for (table, key) in [("maintenance", "error_bound_gate = true"), ("search_defaults", "n_probes = 64")] {
+            let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
+            assert!(toml::from_str::<DocStoreApiConfig>(&toml).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_sample_config_parses_with_every_commented_default_switched_on() {
+        let sample = include_str!("../../config/sample.toml");
+        let cfg: DocStoreApiConfig = toml::from_str(sample).unwrap();
+        cfg.semantic_search.index_defaults().unwrap();
+        // Uncomment the documented defaults of the two semantic-search tables:
+        // they must parse and equal the built-in values.
+        let mut table = "";
+        let uncommented: String = sample
+            .lines()
+            .map(|l| {
+                if l.starts_with('[') {
+                    table = l;
+                }
+                match l.strip_prefix("# ") {
+                    Some(kv) if table.starts_with("[semantic_search.") && kv.contains(" = ") && !kv.contains("fraction") && !kv.contains("floor") => {
+                        kv.to_string()
+                    }
+                    _ => l.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg: DocStoreApiConfig = toml::from_str(&uncommented).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        let builtin = minnal_db::doc_store::vector_settings::IndexDefaults::default();
+        assert_eq!(d.search, builtin.search);
+        assert_eq!(d.maintenance.target_posting_size, builtin.maintenance.target_posting_size);
+        assert!((d.maintenance.merge_ratio.0 - builtin.maintenance.merge_ratio.0).abs() < 1e-4);
     }
 
     #[test]

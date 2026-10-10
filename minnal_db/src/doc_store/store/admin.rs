@@ -17,7 +17,7 @@ impl DocStore {
     /// is already registered.
     pub async fn create(&self, mut schema: DocStoreSchema) -> Result<(), DocStoreError> {
         schema.validate()?;
-        schema.settle_vector_index()?;
+        schema.settle_vector_index(&self.index_defaults())?;
         if schema.semantic_search_enabled {
             self.check_vector_model(&schema.vector_settings()?)?;
         }
@@ -104,7 +104,7 @@ impl DocStore {
     /// [`create`]: DocStore::create
     pub async fn create_kv(&self, mut schema: KvStoreSchema) -> Result<(), DocStoreError> {
         schema.validate()?;
-        schema.settle_vector_index()?;
+        schema.settle_vector_index(&self.index_defaults())?;
         if schema.is_semantic_search_enabled() {
             self.check_vector_model(&schema.vector_settings()?)?;
         }
@@ -168,9 +168,22 @@ impl DocStore {
     /// and [`SchemaAmendment::UpdateAttribute`] are supported.  Attempting to
     /// remove or update an attribute that is used by an active index returns
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
-    pub async fn amend(&self, namespace: &str, amendment: SchemaAmendment) -> Result<(), DocStoreError> {
+    pub async fn amend(&self, namespace: &str, mut amendment: SchemaAmendment) -> Result<(), DocStoreError> {
         let mut schema = self.load_schema(namespace)?;
         let was_enabled = schema.semantic_search_enabled;
+
+        // A namespace without settings yet takes the server's defaults; one that
+        // has them keeps its own, whatever the defaults are now.
+        if schema.vector_index.is_none()
+            && let SchemaAmendment::AddEmbeddingAttribute { vector_index, .. } | SchemaAmendment::EnableVectorIndex { vector_index, .. } =
+                &mut amendment
+        {
+            *vector_index = Some(crate::doc_store::vector_settings::settle(
+                None,
+                vector_index.as_ref(),
+                &self.index_defaults(),
+            )?);
+        }
 
         // Re-map SchemaError::AttributeIsIndexed to DocStoreError with namespace context
         schema.apply_amendment(amendment).map_err(|e| match e {
@@ -199,18 +212,34 @@ impl DocStore {
         Ok(())
     }
 
-    /// Change a store's search defaults (`probe_budget_entries`, `min_probes`,
-    /// `max_probes`, `first_pass_top_k`, `top_k`), for document and KV stores alike. Later searches use them;
+    /// Change a store's search settings (`probe_budget_entries`, `min_probes`,
+    /// `max_probes`, `first_pass_top_k`, `top_k`, `probe_budget_fraction`,
+    /// `probe_budget_floor`) and/or its partition maintenance settings, for
+    /// document and KV stores alike. Later searches, splits and merges use them;
     /// nothing is re-embedded. Fails with
     /// [`SchemaError::VectorIndexNotConfigured`] if the store has never had
     /// semantic search enabled, and with [`SchemaError::InvalidVectorSetting`]
     /// for a value out of range.
-    pub async fn update_vector_search(&self, namespace: &str, search: &crate::doc_store::vector_settings::SearchSpec) -> Result<(), DocStoreError> {
+    pub async fn update_vector_search(
+        &self,
+        namespace: &str,
+        search: &crate::doc_store::vector_settings::SearchSpec,
+        maintenance: Option<&crate::doc_store::vector_settings::MaintenanceSpec>,
+    ) -> Result<(), DocStoreError> {
         match self.store_type(namespace)? {
-            StoreType::Doc => self.amend(namespace, SchemaAmendment::UpdateVectorSearch { search: *search }).await,
+            StoreType::Doc => {
+                self.amend(
+                    namespace,
+                    SchemaAmendment::UpdateVectorSearch {
+                        search: *search,
+                        maintenance: maintenance.copied(),
+                    },
+                )
+                .await
+            }
             StoreType::Kv => {
                 let mut schema = self.load_kv_schema(namespace)?;
-                schema.update_vector_search(search)?;
+                schema.update_vector_search(search, maintenance)?;
                 schema.save(&self.schema_dir)?;
                 Ok(())
             }
@@ -246,6 +275,17 @@ impl DocStore {
             ctx.check_model(_settings)?;
         }
         Ok(())
+    }
+
+    /// The defaults a namespace's vector-index settings are filled with when it
+    /// first enables semantic search: the attached context's (from the server
+    /// config), or the built-in ones.
+    pub fn index_defaults(&self) -> crate::doc_store::vector_settings::IndexDefaults {
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            return ctx.index_defaults;
+        }
+        crate::doc_store::vector_settings::IndexDefaults::default()
     }
 
     /// Return the schema for a namespace without the JSON round-trip overhead of [`list`].

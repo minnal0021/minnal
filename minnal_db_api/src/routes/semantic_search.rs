@@ -77,7 +77,9 @@ use tracing::{debug, warn};
 use crate::{AppState, error::AppError, id::doc_id_to_value};
 
 /// One request's search overrides. Validated by the store against the same
-/// ranges as the namespace's settings (out of range is a 400).
+/// ranges as the namespace's settings (out of range is a 400). A request that
+/// gives `probe_budget_entries` reads exactly that budget, so it also turns a
+/// namespace's scaled budget off for that search.
 pub(crate) fn search_overrides(top_k: Option<Limit>, probe: ProbeOverrides, first_pass_top_k: Option<u32>) -> SearchSpec {
     SearchSpec {
         probe_budget_entries: probe.probe_budget_entries,
@@ -85,6 +87,8 @@ pub(crate) fn search_overrides(top_k: Option<Limit>, probe: ProbeOverrides, firs
         max_probes: probe.max_probes,
         first_pass_top_k,
         top_k: top_k.map(|l| l.get() as u32),
+        probe_budget_fraction: probe.probe_budget_entries.map(|_| minnal_db::doc_store::vector_settings::Ratio(0.0)),
+        probe_budget_floor: None,
     }
 }
 
