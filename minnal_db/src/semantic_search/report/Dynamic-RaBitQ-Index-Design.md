@@ -1,13 +1,13 @@
 # Dynamic RaBitQ index: design and milestones
 
-**Status:** M0–M2 done; M3's design decided (decisions 11–13), M3a next ·
-branch `dynamic-rabitq-index` · 2026-10-10
+**Status:** M0–M3a done; M3b next; M5 (system benchmark) designed ·
+branch `dynamic-rabitq-index` · 2026-10-11
 
 **Goal.** Remove the pre-trained centroid files. Each namespace should build and
 maintain its own IVF partition as documents arrive. Search quality (nDCG, recall)
 and query latency must not regress at any step.
 
-**Approach.** Five milestones (M0–M4), plus two correctness steps (M0-1, M0-2)
+**Approach.** Six milestones (M0–M5), plus two correctness steps (M0-1, M0-2)
 found while designing M3. Each changes one thing and ends at a
 benchmark gate, so a regression shows up in the milestone that caused it.
 
@@ -20,6 +20,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M2** Namespace-owned index ✓ | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting and split, reassign and merge by SPFresh's LIRE protocol (mean centres, 1-bit codes, no replicas); then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids from 5% read; largest posting under 1% of entries |
 | **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
+| **M5** System benchmark under load | Nothing in the index: an open-loop, mixed-workload benchmark of the whole server (CRUD, scans, field queries, semantic search, ingestion) with every background task running | — | Run is valid only if every background task did work; reports the sustainable rate at a latency target, per operation |
 | *Optional, future:* **BYO embeddings** | A write may bring its own vectors; dense-only namespaces (see *Caller-supplied embeddings*) | No | Not on the critical path; built on demand after M3d |
 
 The research behind this design (production systems, papers, the 109k-passage
@@ -2041,6 +2042,167 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
   centroids" sections of the docs. No import path is kept.
 - **Optional later**, each gated on its own run: SOAR spilling, a second
   centroid level above ~15–20k postings, 2-bit chunk codes.
+
+---
+
+## M5 — System benchmark under load (last)
+
+Every earlier gate measures one thing at a time, in process or with one kind of
+request: the vector bench indexes and then searches, and `search_load` sends only
+searches. None of them answers what an operator asks: **how many requests per
+second can this server take, of a realistic mix, before latency goes past what
+users accept, while it is also ingesting and maintaining itself?** M5 answers
+that, once, after M4, on the release binary.
+
+It also closes the gap the M3a bench fault showed: a benchmark that runs without
+the background workers measures a database that never compacts, and gave
+indexing costs ten times too high. Here a run with any background task idle is
+**invalid**, not merely noted.
+
+### Why not a concurrency sweep and extrapolation
+
+A closed-loop client (each of N workers sends, waits for the reply, sends the
+next) is what `search_load` does, and it cannot answer the question above:
+
+- **It hides queueing.** When the server slows down, the clients slow down with
+  it, so the arrival rate drops exactly when the system is under strain and
+  measured latency stays low. This is *coordinated omission*: the requests that
+  would have waited are never sent.
+- **Throughput does not extrapolate.** It scales with concurrency only until a
+  shared resource saturates, and then flattens or falls. minnal has several
+  that saturate at different points: every write fsyncs the WAL under one global
+  lock, scoring holds one of 2 `SCORING_GATE` permits, the embedding service has
+  its own queue, and maintenance takes `threads` cores. A line through 4, 8, 16
+  and 32 clients predicts a capacity that does not exist.
+- **N clients is not a workload.** Users arrive at some rate whatever the
+  server's state; they don't wait for each other.
+
+So the main measurement is **open loop**: requests arrive on a fixed schedule
+(Poisson arrivals at a target rate), each is sent at its scheduled time whatever
+is still in flight, and its latency is measured **from its scheduled time**, so
+time spent waiting to be sent counts. The rate is stepped up until the latency
+target breaks. The closed-loop concurrency sweep (1, 2, 4, …, 64) is kept as a
+secondary view: it shows where the knee is and lets us check Little's law
+(in-flight requests = throughput × latency) against the open-loop numbers.
+
+### The workload
+
+**Data.** FiQA (57,638 documents, gemma) as the base, with three synthetic
+fields added to each document so field queries and filtered search have
+something to select on: `category` (12 values, skewed: Zipf s = 1.1), `year`
+(2010–2025, uniform) and `score` (0–1000, uniform). Field indices on all three.
+The first 40,000 documents are loaded and fully indexed before the run; the
+other 17,638 are the ingestion stream. That way splits (and M3b's reassigns and
+merges) happen *during* the measured run, not only before it.
+
+**Operations** (one request each, over REST):
+
+| Class | Request | Notes |
+|---|---|---|
+| `get` | `GET /stores/{ns}/docs/{id}` | Ids drawn Zipf (s = 1.0) over loaded documents, so a hot set exists |
+| `insert` | `PUT /stores/{ns}/docs/{id}` (new id) | From the ingestion stream; each triggers an embed (real service) and Pass-1 chunk routing |
+| `update` | `PUT /stores/{ns}/docs/{id}` (existing id) | Half change only a field (no re-embed), half change the text (re-embed, re-route chunks, stale-key deletes) |
+| `delete` | `DELETE /stores/{ns}/docs/{id}` | Deletes shrink postings, which is what drives merges |
+| `scan` | `GET /stores/{ns}/docs?cursor=…&limit=50` | Cursor-paginated; a scan session reads 1–20 pages |
+| `field_query` | `POST /stores/{ns}/query` | Predicates over `category`, `year`, `score`, 1–3 terms |
+| `search` | `POST /stores/{ns}/semantic-search` | FiQA's 648 test queries plus generated paraphrases, so the query-embedding cache sees both hits and misses (target 70% hit rate) |
+| `filtered_search` | `POST /stores/{ns}/semantic-search/filtered` | `search` with a field predicate (selectivity 5–50%) |
+
+**Mixes.** A run uses one mix; each mix is run on its own:
+
+| Mix | get | insert | update | delete | scan | field_query | search | filtered_search |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `read_heavy` | 40% | 3% | 4% | 1% | 5% | 15% | 25% | 7% |
+| `balanced` | 25% | 10% | 10% | 3% | 5% | 15% | 25% | 7% |
+| `ingest_heavy` | 15% | 30% | 15% | 5% | 5% | 10% | 15% | 5% |
+
+**Ingestion is limited by the embedding service, not by minnal**, and the two
+run on the same host, sharing its CPU (the llama.cpp service has no GPU here).
+So the embedding service's cores are part of the setup and are recorded. Writes enter minnal at their arrival rate, but the vector
+worker embeds them only as fast as the service answers. So inserts are not
+just a share of a rate: the run also reports *ingestion lag*, the time from a
+write's acknowledgement to its document being searchable (polled through the
+vector queue), and the queue depth over time. A mix whose embed demand exceeds
+the service's throughput has a growing queue, and the run reports it as
+unsustainable whatever the latencies say.
+
+### Procedure
+
+1. **Host.** This machine (32 cores, 89 GB), idle apart from the run. Release
+   binary, production TOML defaults, the real embedding service. The load
+   generator runs on the same host, pinned with `taskset` to 4 cores that the
+   server is kept off; the embedding service and the server get fixed, disjoint
+   core sets from the other 28 (split decided by a short calibration run), and
+   the run records the host's CPU, memory and disk I/O.
+2. **Warm-up.** Load the base set, wait for the vector queue to empty and for
+   compaction to settle, then run the mix at 25% of the first step's rate for 5
+   minutes. Warm-up is not measured.
+3. **Steps.** Offer the mix at a fixed rate for **10 minutes** per step,
+   starting low (about 50 req/s) and raising the rate by 1.5× per step until
+   the latency target fails for any class or errors pass 0.1%. Ten minutes is
+   long enough for several LSM compactions, value-log GC passes, index
+   checkpoints (every 1.75 s) and, at these ingestion rates, dozens of splits per
+   step. The best passing rate is then refined by bisection.
+4. **Soak.** Run the best passing rate for **60 minutes**, to catch what only
+   accumulates: L0 files, WAL retention, value-log waste, posting skew, memory
+   growth.
+5. **Concurrency sweep** (secondary). Closed loop at 1, 2, 4, …, 64 clients,
+   5 minutes each, same mix.
+
+**Latency target (the SLO)** used to call a step passing, per class at p99:
+`get` 5 ms, `insert`/`update`/`delete` 20 ms (acknowledgement, which includes
+the WAL fsync but not embedding), `scan` page 20 ms, `field_query` 20 ms,
+`search` and `filtered_search` 100 ms. These are starting values to agree on
+before the run, not measured limits.
+
+### What is measured
+
+| Group | Measure | Source |
+|---|---|---|
+| Throughput | Offered vs completed rate, per class and total | Load generator |
+| Latency | p50, p95, p99, p99.9, max per class, from scheduled time; full HDR histogram saved | Load generator |
+| Errors | Count and rate per class and status code | Load generator |
+| Freshness | Ingestion lag p50/p99; vector queue depth over time | `GET /admin/indices/vector/queue/summary`, polled every 5 s |
+| Background work | LSM compactions, L0 file count, value-log GC passes and bytes reclaimed, WAL segments and GC, index checkpoints, TTL passes, splits/reassigns/merges and maintenance backlog (postings over `split_limit`) | `GET /admin/storage/ops-metrics`, `/admin/storage/lsm`, `/admin/storage/wal`, `/admin/indices/{ns}/vector/partition`, polled every 5 s |
+| Quality under load | nDCG@{10, 20, 30, 40, 50, 100} and recall of the `search` replies during the run, against the same queries run alone after the system is quiet | `--record`-style run file, scored with `beir_eval` |
+| Resources | Server and embedding-service CPU and RSS, disk bytes written (write amplification = bytes written ÷ bytes accepted), open files | `/proc/{pid}/stat`, `/proc/{pid}/status`, `/proc/{pid}/io` |
+
+**Validity check, before any number is reported.** Every background task must
+show work in every 10-minute step: LSM compaction count rose, value-log GC ran
+(or the waste stayed below its trigger, reported with the waste), at least one
+index checkpoint per interval, WAL GC reclaimed segments, the vector worker
+drained work, and (from M3a on) at least one split. A step that fails the check
+is discarded and the cause is investigated.
+
+### Tooling
+
+A new `minnal_tools mixed_load` subcommand beside `search_load`, with the same
+dependencies (tokio, reqwest, serde_json; no new crates). It reads a TOML
+workload file (mix, rates, distributions, durations, SLO), runs the open-loop
+schedule (one task per request, scheduled from a precomputed seeded Poisson
+timeline so two runs send the same requests at the same times), polls the admin
+endpoints on its own timer, and writes `work/bench/results/m5/{mix}/` with
+per-step JSON, the latency histograms and a summary table. The closed-loop sweep
+is the same tool with `--closed N`. A small script draws the latency-vs-offered-
+rate curve per class (the main chart) and the background-work timeline.
+
+### Report and gate
+
+The report gives, per mix: the **sustainable rate** (the highest offered rate at
+which every class meets its p99 target, errors stay below 0.1% and the vector
+queue does not grow), the latency of each class at that rate, ingestion lag,
+quality under load against quality at rest, and write amplification over the
+soak. It states the host, binary commit and TOML, and its caveats (one host,
+client on the same machine, one dataset, synthetic fields).
+
+**Gate:** the run is valid (every background task did work in every step);
+quality under load is within 0.005 of quality at rest at every nDCG cutoff
+(@10–@100); the soak shows no unbounded growth (L0 files, WAL segments,
+value-log waste, RSS, maintenance backlog all level off); and the report is
+reviewed before `benchmark.md` takes its numbers.
+
+**To agree before building it:** the SLO values, the three mixes, and whether
+a second dataset (SciFact, which splits far less) is worth its run time.
 
 ---
 
