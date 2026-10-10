@@ -65,6 +65,12 @@ const PRODUCTION_NPROBES: usize = 64;
 /// Entry budgets swept, as shares of the namespace's entries (plus the default
 /// budget, [`DEFAULT_PROBE`]), so a small corpus gets a curve too.
 const BUDGET_SHARES: [f64; 9] = [0.025, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
+/// Budgets as shares of the namespace's **chunk count**: the same absolute
+/// number of entries whatever the partition, so runs of different partitions
+/// compare at equal cost (the M3a gate reads from 5% upwards).
+const CHUNK_SHARES: [f64; 5] = [0.01, 0.02, 0.05, 0.1, 0.2];
+/// Documents indexed between two rounds of splitting in `grow` mode.
+const GROW_BATCH: usize = 256;
 /// Candidates kept after Pass 1 (production default), and returned per query so
 /// the whole candidate list can be scored.
 const FIRST_PASS: usize = 1000;
@@ -90,6 +96,13 @@ struct ErrorStats {
 
 #[derive(Serialize, Deserialize)]
 struct Partition {
+    /// How the partition was made: `bundled` (the model's centroid file),
+    /// `file` (a given centroid file) or `grow` (from one root posting).
+    #[serde(default)]
+    mode: String,
+    /// Target posting size, in `grow` mode.
+    #[serde(default)]
+    target: u32,
     clusters_used: usize,
     entries: usize,
     chunks: usize,
@@ -394,37 +407,68 @@ async fn vector_bench() {
         raw.iter().map(|(&id, c)| (id, Cluster::new(id, c.clone()))).collect(),
     ));
 
-    // ── Index through the production write path ──
+    // ── The partition: the model's file, a given file, or grown from a root ──
+    let mode = env_or("MINNAL_BENCH_PARTITION", "bundled");
+    let target: u32 = env_or("MINNAL_BENCH_TARGET", "128").parse().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
     db.namespace(NS.to_string()).await.unwrap();
-    // The namespace's own partition, seeded and loaded back as a store does it:
-    // indexing and search run against it, not the file.
-    crate::vector_kv::seed_ivf(&db, NS, &raw).await.unwrap();
-    let ivf = Arc::new(
+    match mode.as_str() {
+        "bundled" => crate::vector_kv::seed_ivf(&db, NS, &raw).await.unwrap(),
+        "file" => {
+            let path = std::env::var("MINNAL_BENCH_CENTROIDS").expect("MINNAL_BENCH_CENTROIDS for MINNAL_BENCH_PARTITION=file");
+            let c = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
+            crate::vector_kv::seed_ivf(&db, NS, &c).await.unwrap();
+        }
+        "grow" => crate::vector_kv::init_ivf(&db, NS, config.embedding_dim).await.unwrap(),
+        other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (bundled | file | grow)"),
+    }
+    let handle = Arc::new(crate::semantic_search::PartitionHandle::new(
         crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
             .await
             .unwrap()
-            .expect("just seeded"),
-    );
+            .expect("just made"),
+    ));
+    let split_settings = crate::ivf_split::SplitSettings {
+        split_limit: 2 * u64::from(target),
+        params: crate::semantic_search::cluster::split::SplitParams::default(),
+    };
+
+    // ── Index through the production write path ──
+    // As the vector worker does: route, write and count under the routing epoch
+    // against the current snapshot; in `grow` mode split between batches.
     let rows = insertion_order(&order, &frozen, &index);
     let t = Instant::now();
-    {
+    let mut splits = 0;
+    for batch in rows.chunks(GROW_BATCH) {
         let sem = Arc::new(Semaphore::new(INDEX_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
-        for d in rows {
+        for &d in batch {
             let permit = sem.clone().acquire_owned().await.unwrap();
-            let (frozen, config, ivf, db) = (frozen.clone(), config.clone(), ivf.clone(), db.clone());
+            let (frozen, config, handle, db) = (frozen.clone(), config.clone(), handle.clone(), db.clone());
             set.spawn(async move {
                 let _permit = permit;
-                let vis = index_embeddings(&config, &ivf, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
-                upsert_vectors(&db, NS, &(d as u64).to_be_bytes(), "", &vis).await.unwrap();
+                let _epoch = handle.read_epoch().await;
+                let ivf = handle.snapshot();
+                let vis = index_embeddings(&config, &*ivf, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
+                let delta = upsert_vectors(&db, NS, &(d as u64).to_be_bytes(), "", &vis).await.unwrap();
+                ivf.apply_delta(&delta);
             });
         }
         while let Some(r) = set.join_next().await {
             r.unwrap();
         }
+        if mode == "grow" {
+            splits += crate::ivf_split::split_oversized(&db, NS, &handle, &split_settings).await.unwrap();
+        }
     }
+    if mode == "grow" {
+        eprintln!(
+            "  grown from one posting at target {target}: {splits} split(s), {} posting(s)",
+            handle.snapshot().postings()
+        );
+    }
+    drop(handle);
     let index_seconds = t.elapsed().as_secs_f64();
     eprintln!("  indexed in {index_seconds:.1}s ({:.0} docs/s)", frozen.n_docs() as f64 / index_seconds);
     // Settle the LSM so every setting reads the same on-disk shape.
@@ -458,6 +502,8 @@ async fn vector_bench() {
     let mean_size = total_chunks as f64 / sizes.len().max(1) as f64;
     let sd = (sizes.iter().map(|&s| (s as f64 - mean_size).powi(2)).sum::<f64>() / sizes.len().max(1) as f64).sqrt();
     let partition = Partition {
+        mode: mode.clone(),
+        target: if mode == "grow" { target } else { 0 },
         clusters_used: sizes.len(),
         entries: sparse_rows.len(),
         chunks: total_chunks,
@@ -516,12 +562,13 @@ async fn vector_bench() {
     }
     let total_entries = partition.entries as u64;
     let mut budgets: Vec<u64> = BUDGET_SHARES.iter().map(|s| (s * total_entries as f64).round() as u64).collect();
+    budgets.extend(CHUNK_SHARES.iter().map(|s| (s * partition.chunks as f64).round() as u64));
     budgets.push(DEFAULT_PROBE.budget_entries);
     budgets.sort_unstable();
     budgets.dedup();
     let sweep = NPROBES
         .iter()
-        .filter(|&&n| n <= index.len())
+        .filter(|&&n| n <= ivf.postings())
         .map(|&n| (n, None))
         .chain(budgets.into_iter().map(|b| (0, Some(b))));
     let mut settings = Vec::new();
