@@ -1,4 +1,5 @@
 use log::info;
+pub mod kmeans;
 pub mod layout;
 pub mod split;
 pub use layout::{

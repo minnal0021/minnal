@@ -75,7 +75,7 @@ impl SplitRng {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -84,12 +84,12 @@ impl SplitRng {
     }
 
     /// Uniform in `0..n` (`n > 0`).
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
 
     /// `k` distinct indices from `0..n`, in random order (partial Fisher–Yates).
-    fn sample(&mut self, n: usize, k: usize) -> Vec<usize> {
+    pub(crate) fn sample(&mut self, n: usize, k: usize) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..n).collect();
         for i in 0..k.min(n) {
             let j = i + self.below(n - i);
