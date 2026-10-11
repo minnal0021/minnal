@@ -70,7 +70,7 @@ use crate::AsyncDb;
 use crate::semantic_search::cluster::split::{SplitParams, SplitRng, balanced_two_means};
 use crate::semantic_search::index::composite_key;
 use crate::semantic_search::index::vector_index::VectorIndex;
-use crate::semantic_search::quantisation::rabitq::reconstruct_single_bit;
+use crate::semantic_search::quantisation::rabitq::{reconstruct_single_bit, reconstruct_single_bit_into};
 use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
 use crate::vector_kv::{
     decode_posting, decode_sparse_meta, encode_posting, encode_sparse_meta, f32s_to_bytes, ivf_centres_ns, ivf_journal_ns, ivf_postings_ns,
@@ -354,14 +354,18 @@ fn reconstruct(ivf: &NamespaceIvf, code: &VectorIndex) -> Option<Vec<f32>> {
     reconstruct_single_bit(code, ivf.rotated_centre(code.centre_id)?)
 }
 
+/// [`reconstruct`] into `buf`, for loops over many codes. `false` for a code
+/// that cannot be reconstructed.
+fn reconstruct_into(ivf: &NamespaceIvf, code: &VectorIndex, buf: &mut Vec<f32>) -> bool {
+    ivf.rotated_centre(code.centre_id)
+        .is_some_and(|c| reconstruct_single_bit_into(code, c, buf))
+}
+
+/// Squared Euclidean distance (SIMD). Maintenance compares millions of these
+/// per FiQA-sized namespace; a scalar f64 loop was most of reassignment's cost.
 fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = f64::from(*x) - f64::from(*y);
-            d * d
-        })
-        .sum()
+    use simsimd::SpatialSimilarity;
+    f32::sqeuclidean(a, b).expect("equal dimensions")
 }
 
 /// Whether centre `a` is nearer to `x` than centre `b`. With `gate`

@@ -75,19 +75,23 @@ impl<'a> Rule<'a> {
 
     /// For a chunk in posting `src` (centre `src_centre`): whether it is a
     /// candidate, and where it moves (`None` to stay).
-    fn decide(&self, ivf: &NamespaceIvf, src: u32, src_centre: &[f32], code: &VectorIndex) -> (bool, Option<u32>) {
-        let Some(x) = reconstruct(ivf, code) else { return (false, None) };
+    /// `x` is scratch space for the code's reconstruction.
+    fn decide(&self, ivf: &NamespaceIvf, src: u32, src_centre: &[f32], code: &VectorIndex, x: &mut Vec<f32>) -> (bool, Option<u32>) {
+        if !reconstruct_into(ivf, code, x) {
+            return (false, None);
+        }
+        let x = x.as_slice();
         let candidate = if self.children.iter().any(|&(id, _)| id == src) {
-            nearer(&x, self.parent, src_centre, code, self.gate)
+            nearer(x, self.parent, src_centre, code, self.gate)
         } else {
-            let (_, c_min) = nearest(&x, &self.children).expect("two halves");
-            nearer(&x, c_min, self.parent, code, self.gate) && nearer(&x, c_min, src_centre, code, self.gate)
+            let (_, c_min) = nearest(x, &self.children).expect("two halves");
+            nearer(x, c_min, self.parent, code, self.gate) && nearer(x, c_min, src_centre, code, self.gate)
         };
         if !candidate {
             return (false, None);
         }
-        match nearest(&x, &self.active) {
-            Some((n, c)) if n != src && nearer(&x, c, src_centre, code, self.gate) => (true, Some(n)),
+        match nearest(x, &self.active) {
+            Some((n, c)) if n != src && nearer(x, c, src_centre, code, self.gate) => (true, Some(n)),
             _ => (true, None),
         }
     }
@@ -122,8 +126,14 @@ pub(super) async fn run(
         .filter_map(|&p| Some((p, ivf.rotated_posting_centre(p)?.to_vec())))
         .collect();
 
+    // The entries with a moving chunk. A live run decides once and shrinks the
+    // same entries it copied from: a chunk written since by an upsert was routed
+    // by its float and is no candidate a shrink could take (and a shrink only
+    // takes chunks the destination holds). A redo from `Copied` decides again.
+    let mut reuse = None;
     if record.state == JournalState::Planned {
         let (selected, mut candidates) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
+        let mut x = Vec::new();
         let mut moved = 0;
         for (src, src_centre, doc) in &selected {
             let _doc = lock_doc_vectors(namespace, doc).await;
@@ -138,7 +148,7 @@ pub(super) async fn run(
             };
             let mut moving: BTreeMap<u32, Vec<VectorIndex>> = BTreeMap::new();
             for code in VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))? {
-                let (candidate, dest) = rule.decide(&ivf, *src, src_centre, &code);
+                let (candidate, dest) = rule.decide(&ivf, *src, src_centre, &code, &mut x);
                 candidates += u64::from(candidate);
                 if let Some(dest) = dest {
                     moving.entry(dest).or_default().push(VectorIndex { cluster_id: dest, ..code });
@@ -158,9 +168,13 @@ pub(super) async fn run(
         db.flush_namespaces(vec![sparse_vectors_ns(namespace), sparse_vectors_meta_ns(namespace)])
             .await?;
         write_record(db, namespace, op, &record.with_state(JournalState::Copied)).await?;
+        reuse = Some(selected);
     }
     handle.epoch_barrier().await;
-    let (selected, _) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
+    let selected = match reuse {
+        Some(selected) => selected,
+        None => select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?.0,
+    };
     for (src, src_centre, doc) in &selected {
         let _doc = lock_doc_vectors(namespace, doc).await;
         shrink_source(db, namespace, handle, &ivf, &rule, *src, src_centre, doc).await?;
@@ -193,11 +207,12 @@ async fn select(
     let (ivf, ops) = (std::sync::Arc::clone(ivf), *ops);
     tokio::task::spawn_blocking(move || {
         let rule = Rule::new(&ivf, &ops, parent_centre, children).expect("checked by the caller");
+        let mut x = Vec::new();
         let mut selected = Vec::new();
         let mut candidates = 0;
         for (src, centre, docs) in entries {
             for (doc, codes) in docs {
-                let decisions: Vec<(bool, Option<u32>)> = codes.iter().map(|c| rule.decide(&ivf, src, &centre, c)).collect();
+                let decisions: Vec<(bool, Option<u32>)> = codes.iter().map(|c| rule.decide(&ivf, src, &centre, c, &mut x)).collect();
                 if decisions.iter().any(|d| d.1.is_some()) {
                     selected.push((src, centre.clone(), doc));
                 } else {
@@ -232,8 +247,9 @@ async fn shrink_source(
     let codes = VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))?;
     // Which codes go where, then which of them their destination holds.
     let mut by_dest: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut x = Vec::new();
     for (i, code) in codes.iter().enumerate() {
-        if let (_, Some(dest)) = rule.decide(ivf, src, src_centre, code) {
+        if let (_, Some(dest)) = rule.decide(ivf, src, src_centre, code, &mut x) {
             by_dest.entry(dest).or_default().push(i);
         }
     }

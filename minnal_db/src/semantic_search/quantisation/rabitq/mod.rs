@@ -190,18 +190,27 @@ pub fn index_embedding_zero_centred<L: IvfLayout + ?Sized>(
 /// (splits, reassignment) sees each chunk as search does. `None` for a code that
 /// is not 1-bit or does not match the centre's dimension.
 pub fn reconstruct_single_bit(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<f32>> {
+    let mut out = Vec::new();
+    reconstruct_single_bit_into(vi, rotated_centre, &mut out).then_some(out)
+}
+
+/// [`reconstruct_single_bit`] into `out` (cleared first), so a caller
+/// reconstructing many codes reuses one buffer. `false` where that returns
+/// `None`.
+pub fn reconstruct_single_bit_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut Vec<f32>) -> bool {
     use crate::semantic_search::index::vector_index::QuantisationStyle;
+    out.clear();
     if vi.quantisation_style != QuantisationStyle::SingleBit || vi.packed_vector.len() < rotated_centre.len().div_ceil(64) {
-        return None;
+        return false;
     }
     let s = vi.scaling_factor;
-    Some(
+    out.extend(
         rotated_centre
             .iter()
             .enumerate()
-            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s })
-            .collect(),
-    )
+            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s }),
+    );
+    true
 }
 
 pub fn index_embedding_to_cluster(
