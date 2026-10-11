@@ -275,35 +275,44 @@ pub(super) async fn run(
     // takes chunks the destination holds). A redo from `Copied` decides again.
     let mut reuse = None;
     if record.state == JournalState::Planned {
-        let (selected, mut candidates) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
-        let mut x = Vec::new();
-        let mut moved = 0;
-        for (src, src_centre, doc) in &selected {
-            let _doc = lock_doc_vectors(namespace, doc).await;
-            // Re-read under the lock: an upsert or delete may have moved it on.
-            let Some(bytes) = db
-                .namespace(sparse_vectors_ns(namespace))
-                .await?
-                .get(composite_key::encode(*src, doc))
-                .await?
-            else {
-                continue;
-            };
-            let mut moving: BTreeMap<u32, Vec<VectorIndex>> = BTreeMap::new();
-            for code in VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))? {
-                let (candidate, dest) = rule.decide(&ivf, *src, src_centre, &code, &mut x);
-                candidates += u64::from(candidate);
-                if let Some(dest) = dest {
-                    moving.entry(dest).or_default().push(VectorIndex { cluster_id: dest, ..code });
+        let (selected, skipped) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
+        let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
+        let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
+        let counts = in_flight(&selected, |batch| async move {
+            let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
+            // Re-read under the locks: an upsert or delete may have moved them on.
+            let keys = batch
+                .iter()
+                .flat_map(|(doc, srcs)| srcs.iter().map(move |(src, _)| composite_key::encode(*src, doc)))
+                .collect();
+            let mut values = sparse.get_multiple(keys).await?.into_iter();
+            let (mut x, mut candidates, mut items) = (Vec::new(), 0u64, Vec::new());
+            for (doc, srcs) in batch {
+                // Every source's moves together, so two sources moving into one
+                // key are copied as one.
+                let mut moving: BTreeMap<u32, Vec<VectorIndex>> = BTreeMap::new();
+                for (src, src_centre) in srcs {
+                    let Some(bytes) = values.next().expect("one value per key") else {
+                        continue;
+                    };
+                    for code in VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))? {
+                        let (candidate, dest) = rule.decide(ivf, *src, src_centre, &code, &mut x);
+                        candidates += u64::from(candidate);
+                        if let Some(dest) = dest {
+                            moving.entry(dest).or_default().push(VectorIndex { cluster_id: dest, ..code });
+                        }
+                    }
+                }
+                if !moving.is_empty() {
+                    items.push((doc.clone(), moving));
                 }
             }
-            if moving.is_empty() {
-                continue;
-            }
-            let (delta, n) = copy_into(db, namespace, doc, moving).await?;
+            let (delta, n) = copy_into_batch(db, namespace, items).await?;
             handle.snapshot().apply_delta(&delta);
-            moved += n;
-        }
+            Ok::<(u64, u64), crate::KVError>((candidates, n))
+        })
+        .await?;
+        let (candidates, moved) = counts.into_iter().fold((skipped, 0), |(c, m), (dc, dm)| (c + dc, m + dm));
         MaintenanceCounters::add(&handle.counters().reassign_candidates, candidates);
         MaintenanceCounters::add(&handle.counters().reassign_moves, moved);
         // Barrier: the copies are durable before any source shrinks.
@@ -318,20 +327,23 @@ pub(super) async fn run(
         Some(selected) => selected,
         None => select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?.0,
     };
-    for (src, src_centre, doc) in &selected {
-        let _doc = lock_doc_vectors(namespace, doc).await;
-        shrink_source(db, namespace, handle, &ivf, &rule, *src, src_centre, doc).await?;
-    }
+    let (rule, ivf) = (&rule, &ivf);
+    in_flight(&selected, |batch| async move {
+        let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
+        shrink_sources(db, namespace, handle, ivf, rule, batch).await
+    })
+    .await?;
     MaintenanceCounters::add(&handle.counters().reassigns, 1);
     delete_record(db, namespace, op).await
 }
 
-/// A source posting, its rotated centre, and one document in it.
-type Selected = (u32, Vec<f32>, Vec<u8>);
+/// A document with a moving chunk, and the sources (posting, rotated centre)
+/// it has one in.
+type Selected = (Vec<u8>, Vec<(u32, Vec<f32>)>);
 
-/// The (source, document) entries holding a chunk that moves, and how many
-/// candidates the entries that move nothing hold (those that move are counted
-/// again, exactly, under their lock). Reads the sources' entries, then decides
+/// The documents holding a chunk that moves, each with its sources, and how
+/// many candidates the entries that move nothing hold (those that move are
+/// counted again, exactly, under their lock). Reads the sources' entries, then decides
 /// on the blocking pool: every chunk of the scope is reconstructed, and each
 /// candidate is compared with every active centre.
 async fn select(
@@ -353,95 +365,148 @@ async fn select(
     tokio::task::spawn_blocking(move || {
         let rule = Rule::new(&ivf, &ops, parent_centre, children).expect("checked by the caller");
         let mut x = Vec::new();
-        let mut selected = Vec::new();
+        let mut selected: BTreeMap<Vec<u8>, Vec<(u32, Vec<f32>)>> = BTreeMap::new();
         let mut candidates = 0;
         for (src, centre, docs) in entries {
             for (doc, codes) in docs {
                 let decisions: Vec<(bool, Option<u32>)> = codes.iter().map(|c| rule.decide(&ivf, src, &centre, c, &mut x)).collect();
                 if decisions.iter().any(|d| d.1.is_some()) {
-                    selected.push((src, centre.clone(), doc));
+                    selected.entry(doc).or_default().push((src, centre.clone()));
                 } else {
                     candidates += decisions.iter().filter(|d| d.0).count() as u64;
                 }
             }
         }
-        (selected, candidates)
+        (selected.into_iter().collect(), candidates)
     })
     .await
     .map_err(|e| crate::KVError::Io(std::io::Error::other(e)))
 }
 
-/// Remove from `src‖doc` every chunk the rule moves and whose destination holds
-/// it: the meta first (WAL), then the key, rewritten or deleted (WAL). Runs
-/// under the document's vector lock.
-#[allow(clippy::too_many_arguments)]
-async fn shrink_source(
+/// For each document of `batch`, remove from each source key every chunk the
+/// rule moves and whose destination holds it: per document, the meta first
+/// (WAL, one write for all its sources), then each source key, rewritten or
+/// deleted (WAL). The caller holds every document's vector lock.
+async fn shrink_sources(
     db: &AsyncDb,
     namespace: &str,
     handle: &PartitionHandle,
     ivf: &NamespaceIvf,
     rule: &Rule<'_>,
-    src: u32,
-    src_centre: &[f32],
-    doc: &[u8],
+    batch: &[Selected],
 ) -> Result<(), crate::KVError> {
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    let key = composite_key::encode(src, doc);
-    let Some(bytes) = sparse.get(key.clone()).await? else { return Ok(()) };
-    let codes = VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))?;
-    // Which codes go where, then which of them their destination holds.
-    let mut by_dest: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    // Each (document, source) key, its codes, and which go where.
+    struct Entry {
+        doc: usize,
+        src: u32,
+        codes: Vec<VectorIndex>,
+        by_dest: BTreeMap<u32, Vec<usize>>,
+    }
+    let keys: Vec<(usize, u32)> = batch
+        .iter()
+        .enumerate()
+        .flat_map(|(d, (_, srcs))| srcs.iter().map(move |(src, _)| (d, *src)))
+        .collect();
+    let values = sparse
+        .get_multiple(keys.iter().map(|&(d, src)| composite_key::encode(src, &batch[d].0)).collect())
+        .await?;
     let mut x = Vec::new();
-    for (i, code) in codes.iter().enumerate() {
-        if let (_, Some(dest)) = rule.decide(ivf, src, src_centre, code, &mut x) {
-            by_dest.entry(dest).or_default().push(i);
-        }
-    }
-    let mut gone = vec![false; codes.len()];
-    for (dest, idx) in by_dest {
-        let held = match sparse.get(composite_key::encode(dest, doc)).await? {
-            Some(b) => VectorIndex::list_from_bytes(&b).map_err(|e| corrupt(namespace, e))?,
-            None => continue,
-        };
-        let wanted: Vec<&VectorIndex> = idx.iter().map(|&i| &codes[i]).collect();
-        for (&i, ok) in idx.iter().zip(matched(&wanted, &held)) {
-            gone[i] = ok;
-        }
-    }
-    if !gone.iter().any(|&g| g) {
-        return Ok(());
-    }
-    let remaining: Vec<VectorIndex> = codes.into_iter().zip(&gone).filter(|(_, g)| !**g).map(|(c, _)| c).collect();
-    // The meta first: a redo walks the source's keys, so it comes back to a key
-    // whose meta already shrank (the drain's rule 2 exception, for the same
-    // reason). A document with no meta is being deleted: leave it to the delete.
-    let Some(mut meta) = meta_ns.get(doc.to_vec()).await?.and_then(|b| decode_sparse_meta(&b)) else {
-        return Ok(());
-    };
-    let mut delta = PostingDelta::default();
-    let n = remaining.len() as u32;
-    if let Some(i) = meta.postings.iter().position(|&(id, _)| id == src) {
-        let had = meta.postings[i].1;
-        if had != n {
-            delta.removed.push((src, had));
-            if n == 0 {
-                meta.postings.remove(i);
-            } else {
-                meta.postings[i].1 = n;
-                delta.added.push((src, n));
+    let mut entries = Vec::new();
+    for (&(d, src), value) in keys.iter().zip(values) {
+        let Some(bytes) = value else { continue };
+        let codes = VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))?;
+        let centre = &batch[d].1.iter().find(|(p, _)| *p == src).expect("listed").1;
+        let mut by_dest: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (i, code) in codes.iter().enumerate() {
+            if let (_, Some(dest)) = rule.decide(ivf, src, centre, code, &mut x) {
+                by_dest.entry(dest).or_default().push(i);
             }
+        }
+        if !by_dest.is_empty() {
+            entries.push(Entry { doc: d, src, codes, by_dest });
+        }
+    }
+    // What the destinations hold, each read once.
+    let dests: Vec<(usize, u32)> = entries
+        .iter()
+        .flat_map(|e| e.by_dest.keys().map(move |&dest| (e.doc, dest)))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let held_values = sparse
+        .get_multiple(dests.iter().map(|&(d, dest)| composite_key::encode(dest, &batch[d].0)).collect())
+        .await?;
+    let mut held: HashMap<(usize, u32), (Vec<VectorIndex>, Vec<bool>)> = HashMap::new();
+    for (&k, value) in dests.iter().zip(held_values) {
+        if let Some(bytes) = value {
+            let codes = VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))?;
+            let used = vec![false; codes.len()];
+            held.insert(k, (codes, used));
+        }
+    }
+    // Per entry, the codes its destinations hold go; the rest remain.
+    let mut shrunk: BTreeMap<usize, Vec<(u32, Vec<VectorIndex>)>> = BTreeMap::new();
+    for e in entries {
+        let mut gone = vec![false; e.codes.len()];
+        for (dest, idx) in &e.by_dest {
+            let Some((codes, used)) = held.get_mut(&(e.doc, *dest)) else { continue };
+            let wanted: Vec<&VectorIndex> = idx.iter().map(|&i| &e.codes[i]).collect();
+            for (&i, ok) in idx.iter().zip(matched_with(&wanted, codes, used)) {
+                gone[i] = ok;
+            }
+        }
+        if gone.iter().any(|&g| g) {
+            let remaining = e.codes.into_iter().zip(&gone).filter(|(_, g)| !**g).map(|(c, _)| c).collect();
+            shrunk.entry(e.doc).or_default().push((e.src, remaining));
+        }
+    }
+    if shrunk.is_empty() {
+        return Ok(());
+    }
+    let metas = meta_ns.get_multiple(shrunk.keys().map(|&d| batch[d].0.clone()).collect()).await?;
+    for ((d, sources), meta) in shrunk.into_iter().zip(metas) {
+        let doc = &batch[d].0;
+        // The meta first: a redo walks the sources' keys, so it comes back to a
+        // key whose meta already shrank (the drain's rule 2 exception, for the
+        // same reason). A document with no meta is being deleted: leave it to
+        // the delete.
+        let Some(mut meta) = meta.and_then(|b| decode_sparse_meta(&b)) else {
+            continue;
+        };
+        let mut delta = PostingDelta::default();
+        for (src, remaining) in &sources {
+            let n = remaining.len() as u32;
+            if let Some(i) = meta.postings.iter().position(|&(id, _)| id == *src) {
+                let had = meta.postings[i].1;
+                if had != n {
+                    delta.removed.push((*src, had));
+                    if n == 0 {
+                        meta.postings.remove(i);
+                    } else {
+                        meta.postings[i].1 = n;
+                        delta.added.push((*src, n));
+                    }
+                }
+            }
+        }
+        if !delta.is_empty() {
             crash_point!();
-            meta_ns.put(doc.to_vec(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
+            meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
             handle.snapshot().apply_delta(&delta);
         }
+        for (src, remaining) in sources {
+            let key = composite_key::encode(src, doc);
+            crash_point!();
+            if remaining.is_empty() {
+                sparse.delete(key).await?;
+            } else {
+                sparse.put(key, VectorIndex::list_to_bytes(&remaining)).await?;
+            }
+        }
     }
-    crash_point!();
-    if remaining.is_empty() {
-        sparse.delete(key).await
-    } else {
-        sparse.put(key, VectorIndex::list_to_bytes(&remaining)).await
-    }
+    Ok(())
 }
 
 #[cfg(test)]

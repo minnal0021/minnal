@@ -74,7 +74,7 @@ use crate::semantic_search::quantisation::rabitq::{reconstruct_single_bit, recon
 use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
 use crate::vector_kv::{
     decode_posting, decode_sparse_meta, encode_posting, encode_sparse_meta, f32s_to_bytes, ivf_centres_ns, ivf_journal_ns, ivf_postings_ns,
-    lock_doc_vectors, sparse_vectors_meta_ns, sparse_vectors_ns,
+    lock_docs_vectors, sparse_vectors_meta_ns, sparse_vectors_ns,
 };
 
 /// A point where the crash tests stop the process: before a write.
@@ -435,7 +435,13 @@ fn same_code(a: &VectorIndex, b: &VectorIndex) -> bool {
 /// whether `held` has a copy not already matched. Duplicates count, so three
 /// identical chunks need three copies.
 fn matched(wanted: &[&VectorIndex], held: &[VectorIndex]) -> Vec<bool> {
-    let mut used = vec![false; held.len()];
+    matched_with(wanted, held, &mut vec![false; held.len()])
+}
+
+/// [`matched`], with the copies already claimed in `used` (one flag per element
+/// of `held`): several sources of one document moving chunks into the same key
+/// share it, so two of them never count the same copy.
+fn matched_with(wanted: &[&VectorIndex], held: &[VectorIndex], used: &mut [bool]) -> Vec<bool> {
     wanted
         .iter()
         .map(|w| match (0..held.len()).find(|&i| !used[i] && same_code(w, &held[i])) {
@@ -491,65 +497,108 @@ impl DrainRule<'_> {
     }
 }
 
-/// Add `moving` (`destination → codes`, each already filed under its
-/// destination) to document `doc`'s keys and meta: the meta first (WAL), then
-/// the keys (no-WAL), each key gaining only the codes it does not already hold.
-/// Runs under the document's vector lock. A document with no meta is being
-/// deleted and is skipped (rule 2). Returns the count change and how many codes
-/// were newly written.
-async fn copy_into(
-    db: &AsyncDb,
-    namespace: &str,
-    doc: &[u8],
-    moving: BTreeMap<u32, Vec<VectorIndex>>,
-) -> Result<(PostingDelta, u64), crate::KVError> {
+/// Documents a maintenance step handles under one set of locks, and how many
+/// such batches it keeps in flight. Each batch reads its keys and metas with
+/// `get_multiple` (one read per kind, not one per key), and several batches
+/// overlap their reads and writes. The batches are polled in the calling task,
+/// never spawned, so a simulated crash in one stops the writes of the others
+/// (the crash point is per thread and sticky).
+const BATCH_DOCS: usize = 64;
+
+/// Run `work` on `items` in batches of [`BATCH_DOCS`], four batches in flight:
+/// four lanes, each taking every fourth batch in turn, joined in this task (not
+/// spawned). The first error ends the call. Returns each batch's result, in no
+/// particular order.
+async fn in_flight<'a, T, R, F, Fut>(items: &'a [T], work: F) -> Result<Vec<R>, crate::KVError>
+where
+    F: Fn(&'a [T]) -> Fut,
+    Fut: std::future::Future<Output = Result<R, crate::KVError>>,
+{
+    let work = &work;
+    let lane = |k: usize| async move {
+        let mut out = Vec::new();
+        for batch in items.chunks(BATCH_DOCS).skip(k).step_by(4) {
+            out.push(work(batch).await?);
+        }
+        Ok::<_, crate::KVError>(out)
+    };
+    let (a, b, c, d) = tokio::try_join!(lane(0), lane(1), lane(2), lane(3))?;
+    Ok(a.into_iter().chain(b).chain(c).chain(d).collect())
+}
+
+/// One document's chunks to copy: `destination → codes`, each code already
+/// filed under its destination.
+type Moving = BTreeMap<u32, Vec<VectorIndex>>;
+
+/// Add each document's `moving` codes (`destination → codes`, each already
+/// filed under its destination) to its keys and meta: per document, the meta
+/// first (WAL), then the keys (no-WAL), each key gaining only the codes it does
+/// not already hold. The caller holds every document's vector lock. A document
+/// with no meta is being deleted and is skipped (rule 2). Returns the count
+/// change and how many codes were newly written.
+async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Moving)>) -> Result<(PostingDelta, u64), crate::KVError> {
+    if items.is_empty() {
+        return Ok((PostingDelta::default(), 0));
+    }
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    let Some(mut meta) = meta_ns.get(doc.to_vec()).await?.and_then(|b| decode_sparse_meta(&b)) else {
-        return Ok((PostingDelta::default(), 0));
-    };
-    let mut writes = Vec::new();
-    let mut copied = 0;
-    for (dest, codes) in moving {
-        let key = composite_key::encode(dest, doc);
-        let held = match sparse.get(key.clone()).await? {
-            Some(b) => VectorIndex::list_from_bytes(&b).map_err(|e| corrupt(namespace, e))?,
-            None => Vec::new(),
-        };
-        let refs: Vec<&VectorIndex> = codes.iter().collect();
-        let present = matched(&refs, &held);
-        let mut merged = held.clone();
-        merged.extend(codes.iter().zip(&present).filter(|(_, p)| !**p).map(|(c, _)| c.clone()));
-        let new = merged.len() - held.len();
-        copied += new as u64;
-        writes.push((dest, key, merged, new > 0));
-    }
-    // The meta: each destination at the size its key will have.
+    let metas = meta_ns.get_multiple(items.iter().map(|(doc, _)| doc.clone()).collect()).await?;
+    let keys: Vec<Vec<u8>> = items
+        .iter()
+        .flat_map(|(doc, moving)| moving.keys().map(|&dest| composite_key::encode(dest, doc)))
+        .collect();
+    let mut held_all = sparse.get_multiple(keys.clone()).await?.into_iter();
+    let mut keys = keys.into_iter();
     let mut delta = PostingDelta::default();
-    for (dest, _, merged, _) in &writes {
-        let n = merged.len() as u32;
-        match meta.postings.iter_mut().find(|(id, _)| id == dest) {
-            Some((_, have)) if *have == n => {}
-            Some((_, have)) => {
-                delta.removed.push((*dest, *have));
-                delta.added.push((*dest, n));
-                *have = n;
-            }
-            None => {
-                meta.postings.push((*dest, n));
-                delta.added.push((*dest, n));
+    let mut copied = 0;
+    for ((doc, moving), meta) in items.into_iter().zip(metas) {
+        // Take this document's keys off the shared lists even if it is skipped.
+        let mut writes = Vec::with_capacity(moving.len());
+        for (dest, codes) in moving {
+            let key = keys.next().expect("one key per destination");
+            let held = match held_all.next().expect("one value per key") {
+                Some(b) => VectorIndex::list_from_bytes(&b).map_err(|e| corrupt(namespace, e))?,
+                None => Vec::new(),
+            };
+            let refs: Vec<&VectorIndex> = codes.iter().collect();
+            let present = matched(&refs, &held);
+            let mut merged = held.clone();
+            merged.extend(codes.iter().zip(&present).filter(|(_, p)| !**p).map(|(c, _)| c.clone()));
+            let new = merged.len() - held.len();
+            writes.push((dest, key, merged, new));
+        }
+        let Some(mut meta) = meta.and_then(|b| decode_sparse_meta(&b)) else {
+            continue;
+        };
+        // The meta: each destination at the size its key will have.
+        let mut doc_delta = PostingDelta::default();
+        for (dest, _, merged, _) in &writes {
+            let n = merged.len() as u32;
+            match meta.postings.iter_mut().find(|(id, _)| id == dest) {
+                Some((_, have)) if *have == n => {}
+                Some((_, have)) => {
+                    doc_delta.removed.push((*dest, *have));
+                    doc_delta.added.push((*dest, n));
+                    *have = n;
+                }
+                None => {
+                    meta.postings.push((*dest, n));
+                    doc_delta.added.push((*dest, n));
+                }
             }
         }
-    }
-    if !delta.is_empty() {
-        crash_point!();
-        meta_ns.put(doc.to_vec(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
-    }
-    for (_, key, merged, changed) in writes {
-        if changed {
+        if !doc_delta.is_empty() {
             crash_point!();
-            sparse.put_no_wal(key, VectorIndex::list_to_bytes(&merged)).await?;
+            meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
         }
+        for (_, key, merged, new) in writes {
+            if new > 0 {
+                crash_point!();
+                sparse.put_no_wal(key, VectorIndex::list_to_bytes(&merged)).await?;
+                copied += new as u64;
+            }
+        }
+        delta.extend(doc_delta);
     }
     Ok((delta, copied))
 }
@@ -823,23 +872,28 @@ async fn drain_copy(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops
     };
     let drained = op.drained().expect("a drain");
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
-    let mut copied = 0;
-    for (doc, _) in posting_entries(db, namespace, drained).await? {
-        let _doc = lock_doc_vectors(namespace, &doc).await;
-        // Re-read under the lock: an upsert or delete may have moved it on.
-        let Some(bytes) = sparse.get(composite_key::encode(drained, &doc)).await? else {
-            continue;
-        };
-        let mut moving: BTreeMap<u32, Vec<VectorIndex>> = BTreeMap::new();
-        for code in VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))? {
-            let dest = rule.destination(&ivf, &code);
-            moving.entry(dest).or_default().push(VectorIndex { cluster_id: dest, ..code });
+    let docs: Vec<Vec<u8>> = posting_entries(db, namespace, drained).await?.into_iter().map(|(doc, _)| doc).collect();
+    let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
+    let copied = in_flight(&docs, |batch| async move {
+        let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
+        // Re-read under the locks: an upsert or delete may have moved them on.
+        let keys = batch.iter().map(|doc| composite_key::encode(drained, doc)).collect();
+        let mut items = Vec::with_capacity(batch.len());
+        for (doc, bytes) in batch.iter().zip(sparse.get_multiple(keys).await?) {
+            let Some(bytes) = bytes else { continue };
+            let mut moving: BTreeMap<u32, Vec<VectorIndex>> = BTreeMap::new();
+            for code in VectorIndex::list_from_bytes(&bytes).map_err(|e| corrupt(namespace, e))? {
+                let dest = rule.destination(ivf, &code);
+                moving.entry(dest).or_default().push(VectorIndex { cluster_id: dest, ..code });
+            }
+            items.push((doc.clone(), moving));
         }
-        let (delta, n) = copy_into(db, namespace, &doc, moving).await?;
+        let (delta, n) = copy_into_batch(db, namespace, items).await?;
         handle.snapshot().apply_delta(&delta);
-        copied += n;
-    }
-    Ok(copied)
+        Ok::<u64, crate::KVError>(n)
+    })
+    .await?;
+    Ok(copied.into_iter().sum())
 }
 
 /// 6. Delete the drained posting's keys, and the posting from each document's
@@ -854,30 +908,38 @@ async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, d
         if keys.is_empty() {
             return Ok(());
         }
-        for (key, _) in keys {
-            let Some((_, doc)) = composite_key::decode(&key) else { continue };
-            let doc = doc.to_vec();
-            let _doc = lock_doc_vectors(namespace, &doc).await;
-            // The meta first, then the key. The other order lost track of the
-            // meta's entry: a crash between the two left a meta naming the
-            // posting with no key, and the redo, which walks the posting's keys,
-            // never came back to it. This order is safe only here: the posting
-            // is draining, and the redo deletes every key still under it whether
-            // or not a meta lists it.
-            if let Some(mut meta) = meta_ns.get(doc.clone()).await?.and_then(|b| decode_sparse_meta(&b))
-                && let Some(i) = meta.postings.iter().position(|&(id, _)| id == drained)
-            {
-                let (_, chunks) = meta.postings.remove(i);
+        let docs: Vec<Vec<u8>> = keys
+            .into_iter()
+            .filter_map(|(key, _)| composite_key::decode(&key).map(|(_, doc)| doc.to_vec()))
+            .collect();
+        let (sparse, meta_ns) = (&sparse, &meta_ns);
+        in_flight(&docs, |batch| async move {
+            let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
+            let metas = meta_ns.get_multiple(batch.to_vec()).await?;
+            for (doc, meta) in batch.iter().zip(metas) {
+                // The meta first, then the key. The other order lost track of
+                // the meta's entry: a crash between the two left a meta naming
+                // the posting with no key, and the redo, which walks the
+                // posting's keys, never came back to it. This order is safe
+                // only here: the posting is draining, and the redo deletes
+                // every key still under it whether or not a meta lists it.
+                if let Some(mut meta) = meta.and_then(|b| decode_sparse_meta(&b))
+                    && let Some(i) = meta.postings.iter().position(|&(id, _)| id == drained)
+                {
+                    let (_, chunks) = meta.postings.remove(i);
+                    crash_point!();
+                    meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
+                    handle.snapshot().apply_delta(&PostingDelta {
+                        added: vec![],
+                        removed: vec![(drained, chunks)],
+                    });
+                }
                 crash_point!();
-                meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
-                handle.snapshot().apply_delta(&PostingDelta {
-                    added: vec![],
-                    removed: vec![(drained, chunks)],
-                });
+                sparse.delete(composite_key::encode(drained, doc)).await?;
             }
-            crash_point!();
-            sparse.delete(key).await?;
-        }
+            Ok::<(), crate::KVError>(())
+        })
+        .await?;
     }
     Ok(())
 }

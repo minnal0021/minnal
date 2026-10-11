@@ -545,13 +545,35 @@ const DOC_VECTOR_LOCK_STRIPES: usize = 256;
 /// suffices; the stripes are shared across namespaces and databases, which only
 /// costs an occasional false conflict.
 pub(crate) async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
-    static STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
-        std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+    DOC_VECTOR_STRIPES[doc_vector_stripe(namespace, doc_id_bytes)].lock().await
+}
+
+static DOC_VECTOR_STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+
+fn doc_vector_stripe(namespace: &str, doc_id_bytes: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     namespace.hash(&mut hasher);
     doc_id_bytes.hash(&mut hasher);
-    STRIPES[(hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)].lock().await
+    (hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)
+}
+
+/// [`lock_doc_vectors`] for several documents at once (partition maintenance
+/// works in batches). Two documents can share a stripe, so the stripes are
+/// deduplicated, and they are taken in ascending order: two batches locking at
+/// once then cannot deadlock, and a writer holding one stripe never waits on a
+/// stripe while holding another. Don't take a document's lock again while
+/// holding these: the stripes are not reentrant.
+pub(crate) async fn lock_docs_vectors<'d>(namespace: &str, docs: impl IntoIterator<Item = &'d [u8]>) -> Vec<tokio::sync::MutexGuard<'static, ()>> {
+    let mut stripes: Vec<usize> = docs.into_iter().map(|d| doc_vector_stripe(namespace, d)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+    let mut guards = Vec::with_capacity(stripes.len());
+    for s in stripes {
+        guards.push(DOC_VECTOR_STRIPES[s].lock().await);
+    }
+    guards
 }
 
 /// Delete the quantised vector for a document from the vector KV store.
