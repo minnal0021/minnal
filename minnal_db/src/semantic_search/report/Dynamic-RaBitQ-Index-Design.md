@@ -1326,7 +1326,8 @@ its reference implementation (SPTAG, `ExtraDynamicSearcher.h` and
 | Deleted vectors are garbage-collected at split time | Deletes remove keys at once; a split recounts the posting instead | minnal's deletes are immediate |
 | A posting that will not split is truncated to one vector | It is marked unsplittable until its contents change | minnal never drops data |
 | Centres found by an approximate graph search | Every centre scanned exactly | At thousands of centres an exact scan is microseconds |
-| Merges are found during search | Merges are found after the delete or move that shrank the posting | The maintenance task sees every size change |
+| Merges are found during search: a query that probes a posting with `MergeThreshold` (10) live vectors or fewer queues an asynchronous merge, and an offline `RefineIndex` pass collects the rest | Merges are found eagerly: every maintenance pass merges each active posting at or under `merge_limit`, woken by the write that shrank it | The maintenance task sees every size change, and a small posting costs a probe on every query that reaches it |
+| A split writes both halves whatever their sizes | A split whose smaller half is at or under `merge_limit` is refused: the posting is marked unsplittable at its current size and stays whole, over the limit, until its size changes | Needed only because merges are eager (row above); see *Why a split can be refused* below |
 | A moved vector keeps its raw value | A moved code keeps its `centre_id` and only its key changes (M2 rule) | Re-encoding from a 1-bit code compounds its error |
 | — | Optional error-bound gate on every move decision | Uses the `error_bound` each code already stores |
 
@@ -1371,8 +1372,9 @@ than `split_limit` chunks, the maintenance task is woken for it.
    4. *Centres.* **Keep the two means** (the deviation: SPTAG replaces each with
       its nearest member here).
    5. *Assign* every member of P to the nearer centre, without the balance
-      term. If one side is empty, mark P unsplittable until a chunk is added to
-      or removed from it, and stop.
+      term. If one side is empty, **or the smaller side has `merge_limit`
+      chunks or fewer**, mark P unsplittable until a chunk is added to or
+      removed from it, and stop (*Why a split can be refused*, below).
 4. **Write the split** (the journal table under M3a): append the two centres,
    create P1 and P2, move each chunk's key to its side (code and `centre_id`
    unchanged), retire P.
@@ -1393,8 +1395,9 @@ than `split_limit` chunks, the maintenance task is woken for it.
    `2 · error_bound · ‖A − B‖`, the most the code's estimate of that comparison
    can be off; otherwise the chunk stays.
 
-**Merge posting P** when a delete or a move leaves it with `merge_limit` chunks
-or fewer (M3b):
+**Merge posting P** when it is active and holds `merge_limit` chunks or fewer,
+and another posting is active (M3b). Maintenance is woken by the delete or move
+that shrank it, and each pass checks every active posting:
 
 1. Walk the 64 postings nearest P's centre, nearest first, and take the first Q
    with `chunks(P) + chunks(Q) < split_limit`. If none has room, leave P.
@@ -1402,6 +1405,38 @@ or fewer (M3b):
    unchanged) and retire the smaller one.
 3. A moved chunk whose new centre is farther than its old one,
    `D(x̂, c_kept) > D(x̂, c_old)`, is routed again as in split step 5.
+
+**Why a split can be refused (M3b).** SPTAG has no such check, and in minnal
+without it maintenance did not finish. Balanced 2-means can isolate a few
+outliers: on SciFact (gemma) it split a 262-chunk posting into 259 and 3. The
+3-chunk half is under `merge_limit`, so the same maintenance pass merged it;
+its chunks were nearer their old centre than the kept posting's, so the merge
+routed them to their nearest active posting, the 259-chunk half, which was
+then over the limit and split the same way again. Splits and merges
+alternated about 900 times in one pass (85 s for one batch of inserts, against
+0.5 s before).
+
+SPTAG avoids a *tight* loop only through timing (`ExtraDynamicSearcher.h`,
+`microsoft/SPTAG` at `cafdd0ab`, 2026-09-29). `Split` writes both halves
+whatever their sizes, and `MergePostings` matches minnal's merge (the first
+nearby posting with room, the larger kept, far vectors reassigned). But a
+merge runs only when a search probes a posting with 10 or fewer live vectors
+(`AsyncMergeInSearch`, on by default) or in the offline `RefineIndex` pass,
+each as a separate asynchronous job, and a posting already queued is not
+queued twice. The same cycle can happen there, but each turn waits for a
+query to reach the small posting. minnal merges eagerly (the deviation above),
+so the cycle had nothing to slow it down.
+
+Refusing the split keeps the eager merge and removes the cycle: a split that
+the next merge would undo changes nothing, so it is not made. The posting
+stays whole, a little over `split_limit`, and is tried again once its size
+changes; it splits as soon as 2-means finds a division whose smaller side is
+over `merge_limit`. Two alternatives were set aside. Merging lazily, as SPTAG
+does, is closer to the paper but only slows the cycle, and it would need the
+search path to drive maintenance. Merging only postings that a delete or
+reassignment actually shrank does not remove it either: a reassignment that
+takes a chunk from the 3-chunk half makes it eligible again. Test:
+`a_split_that_the_next_merge_would_undo_is_refused`.
 
 **Cost** (simulated on FiQA at the defaults): one split per about 166 inserted
 chunks; per split about 150 million multiply-adds (reconstruction and 2-means
