@@ -16,11 +16,10 @@
 //! rotated with the seed its schema records.
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Cluster, ClusterIndex, DEFAULT_ROTATION_SEED, find_closest_cluster_id};
+use super::{Cluster, ClusterIndex, find_closest_cluster_id};
 
 /// The centre whole-document (Pass-2) codes are encoded against: the origin.
 /// Reserved: no stored centre may use this id. A zero centre makes Pass 2
@@ -348,7 +347,8 @@ impl PostingState {
 pub enum PostingOrigin {
     /// The single posting a namespace starts with.
     Root = 0,
-    /// Copied from a centroid file (namespaces enabled before M3).
+    /// Copied from a centroid file (namespaces enabled before M3; tests and
+    /// benches seed static baselines this way).
     Seed = 1,
     /// One half of a split.
     Split = 2,
@@ -505,13 +505,6 @@ impl NamespaceIvf {
     pub fn seeded(centroids: &HashMap<u32, Vec<f32>>, seed: u64) -> Result<Self, String> {
         let postings = centroids.iter().map(|(&id, c)| Posting::seeded(id, c.clone(), id)).collect();
         Self::new(postings, centroids.clone(), seed)
-    }
-
-    /// [`seeded`](Self::seeded) from a centroid file, with the default seed: what
-    /// benches and evaluations index against.
-    pub fn from_cluster_file(path: &str) -> Result<Self, Box<dyn Error>> {
-        let centroids = super::read_clusters_from_file(path)?;
-        Ok(Self::seeded(&centroids, DEFAULT_ROTATION_SEED)?)
     }
 
     /// The partition after a change: `new_centres` appended and every posting in
@@ -853,6 +846,7 @@ impl PartitionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic_search::cluster::DEFAULT_ROTATION_SEED;
 
     fn centroids(dim: usize) -> HashMap<u32, Vec<f32>> {
         (0..4u32)

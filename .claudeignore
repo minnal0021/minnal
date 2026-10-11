@@ -2,7 +2,6 @@
 target/
 
 # Large generated/binary data files — not useful to read
-service/embedding_support/clusters.json
 semantic_search/test_data/
 
 # Lock file — auto-managed by cargo, don't read or edit

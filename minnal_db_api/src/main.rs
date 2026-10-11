@@ -15,7 +15,7 @@ use config::DocStoreApiConfig;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
 use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Shared application state passed to every handler via axum's `State` extractor.
 #[derive(Clone)]
@@ -41,8 +41,8 @@ pub struct AppState {
     /// Embedding-service settings for semantic search (URL, timeouts, cache
     /// TTL), used to probe a namespace's model when it enables semantic search.
     ///
-    /// `None` when no model's centroids loaded at startup, so semantic search
-    /// is unavailable. Set once at startup and never mutated.
+    /// `None` only where a server is built without semantic search (tests).
+    /// Set once at startup and never mutated.
     pub embedding_service: Option<EmbeddingServiceConfig>,
     /// Monotonic timestamp recorded when the server process started.
     ///
@@ -134,24 +134,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let semantic_cfg = cfg.semantic_search.resolve();
-    let (cluster_indexes, problems) = semantic_cfg.load_cluster_indexes();
-    for problem in &problems {
-        warn!("centroid set not loaded: {problem}");
-    }
-    let embedding_service = (!cluster_indexes.is_empty()).then(|| semantic_cfg.service_config());
+    let embedding_service = Some(semantic_cfg.service_config());
 
-    // With at least one model's centroids loaded, attach a SemanticSearchContext
-    // so put/delete on semantic-search-enabled namespaces maintain their vector
-    // index. Each namespace picks its model; its centroids come from here.
+    // Attach a SemanticSearchContext so put/delete on semantic-search-enabled
+    // namespaces maintain their vector index. Each namespace picks its model
+    // and grows its own partition; the server only lists the allowed models,
+    // if any.
     let store = if let Some(service) = embedding_service.clone() {
+        let supported = semantic_cfg.supported_models();
         info!(
-            dir = %semantic_cfg.centroid_dir.display(),
-            models = %cluster_indexes
-                .iter()
-                .map(|(m, i)| format!("{m} ({} clusters, {}-d)", i.len(), i.dim()))
-                .collect::<Vec<_>>()
-                .join(", "),
-            "loaded cluster centroids for semantic search",
+            models = %if supported.is_empty() {
+                "any the embedding service serves".to_string()
+            } else {
+                supported.iter().map(|(m, d)| format!("{m} ({d}-d)")).collect::<Vec<_>>().join(", ")
+            },
+            "semantic search enabled",
         );
 
         // Probe the embedding service for each (model, dimension) an existing
@@ -188,17 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         store.with_vector_index_config(cfg.to_vector_index_config()).with_semantic_search(
-            SemanticSearchContext::new(service, cluster_indexes)
+            SemanticSearchContext::new(service)
+                .with_supported_models(supported)
                 // Validated when the config was loaded.
                 .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load"))
                 .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load"))
                 .with_rebuild_threads(cfg.semantic_search.maintenance.rebuild_threads().expect("validated at load")),
         )
     } else {
-        warn!(
-            dir = %semantic_cfg.centroid_dir.display(),
-            "no cluster centroids loaded — semantic search unavailable",
-        );
         store
     };
 

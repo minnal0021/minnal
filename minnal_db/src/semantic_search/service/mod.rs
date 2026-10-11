@@ -69,8 +69,7 @@ pub struct SemanticSearchConfig {
     /// `{embedding_service_url}/embedding/{model_name}/document` and
     /// `.../query` — so it picks which of the service's loaded models embeds
     /// the text; a model the service does not serve fails with a 404. It must
-    /// match the model the cluster centroids (`cluster_path`) were fitted on
-    /// and the model every stored vector was embedded with: vectors from
+    /// match the model every stored vector was embedded with: vectors from
     /// different models live in different spaces, so switching models means
     /// re-indexing the corpus. The startup probe
     /// ([`check_embedding_service`]) checks the service loads it.
@@ -793,6 +792,37 @@ mod tests {
     use super::*;
     use crate::semantic_search::index::vector_index::{ClusterBatchResult, ClusterEntries};
 
+    /// Sixteen 768-d unit centroids for the fixture embeddings: eight leaning
+    /// towards the fixture document (as a fitted centre near it would), eight
+    /// random. Deterministic.
+    fn fixture_clusters() -> crate::semantic_search::cluster::ClusterIndex {
+        use crate::semantic_search::cluster::{Cluster, ClusterIndex};
+        #[derive(serde::Deserialize)]
+        struct EmbeddingFile {
+            embeddings: Vec<Vec<f32>>,
+        }
+        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_data/doc_embedding.json");
+        let doc: Vec<f32> = serde_json::from_str::<EmbeddingFile>(&std::fs::read_to_string(doc_path).unwrap())
+            .unwrap()
+            .embeddings
+            .remove(0);
+        let mut state = 0x5eed_u64;
+        let mut noise = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let clusters = (0..16u32)
+            .map(|id| {
+                let lean = if id < 8 { 0.6 } else { 0.0 };
+                let mut c: Vec<f32> = doc.iter().map(|&x| lean * x + 0.05 * noise()).collect();
+                let n = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+                c.iter_mut().for_each(|v| *v /= n);
+                (id, Cluster::new(id, c))
+            })
+            .collect();
+        ClusterIndex::from_clusters(clusters)
+    }
+
     #[test]
     fn test_default_config() {
         let config = SemanticSearchConfig::default();
@@ -998,15 +1028,14 @@ mod tests {
     /// 5. The **relative** difference between the two must be < 0.1% (1e-3).
     #[test]
     fn test_quantised_dot_product_accuracy() {
-        use crate::semantic_search::cluster::{ClusterIndex, find_closest_cluster_id};
+        use crate::semantic_search::cluster::find_closest_cluster_id;
         use crate::semantic_search::index::distance_estimator::MultiBitQuanDotProductEstimator;
         use crate::semantic_search::quantisation::rabitq;
         use simsimd::SpatialSimilarity;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let n_bits = 8;
 
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found — run from the workspace root");
+        let cluster_index = fixture_clusters();
 
         // ── Load pre-saved real embeddings from fixture files ─────────────────
         #[derive(serde::Deserialize)]
@@ -1233,11 +1262,9 @@ mod tests {
     /// Single-bit packs 64 dimensions per u64 word; multi-bit packs 8 bytes per word.
     #[test]
     fn test_single_bit_and_multi_bit_produce_different_packed_layouts() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1264,12 +1291,10 @@ mod tests {
     /// This exercises the `iter().map(quantise)` loop without needing HTTP.
     #[test]
     fn test_multi_embedding_quantisation_produces_n_vector_indexes() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1292,12 +1317,10 @@ mod tests {
 
     #[test]
     fn test_single_embedding_quantisation_produces_one_vector_index() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1325,11 +1348,9 @@ mod tests {
     /// correct KV key discriminant.
     #[test]
     fn test_dual_quantisation_produces_both_styles() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1369,11 +1390,9 @@ mod tests {
     /// path carry the correct packed-vector sizes for the fixture embedding (768 dims).
     #[test]
     fn test_dual_quantisation_packed_vector_sizes() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1403,11 +1422,9 @@ mod tests {
     /// this test documents the invariant that cluster_id is independently computed.
     #[test]
     fn test_dual_quantisation_single_bit_cluster_is_independently_assigned() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {

@@ -15,7 +15,6 @@ use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
 #[cfg(feature = "semantic-search")]
-use crate::semantic_search::ClusterIndex;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::PartitionHandle;
 #[cfg(feature = "semantic-search")]
@@ -258,9 +257,8 @@ impl IndexBuildHandle {
 /// Construct once at startup and attach via [`DocStore::with_semantic_search`].
 ///
 /// It holds what is engine-wide: the embedding service settings, the defaults
-/// a namespace's vector-index settings start from, and one set of IVF cluster
-/// centroids per supported model (used to check a namespace's model and
-/// dimension). A namespace that enables semantic search starts with one root
+/// a namespace's vector-index settings start from, and optionally the models
+/// this server allows (each with its dimension). A namespace that enables semantic search starts with one root
 /// posting ([`init_namespace`]) and grows its own partition by splitting
 /// (design doc M3); it is loaded once into a registry of
 /// [`PartitionHandle`]s. Everything that shapes a namespace's index comes from
@@ -276,9 +274,10 @@ pub struct SemanticSearchContext {
     /// per-namespace fields are ignored; [`for_namespace`](Self::for_namespace)
     /// overwrites them from the namespace's settings.
     pub config: SemanticSearchConfig,
-    /// IVF cluster centroids per supported model (lower-cased name): which
-    /// models, at which dimension, this server serves.
-    pub cluster_indexes: std::collections::HashMap<String, Arc<ClusterIndex>>,
+    /// The models this server allows, lower-cased name → dimension. Empty:
+    /// any model the embedding service serves (checked by probing it when a
+    /// namespace enables semantic search).
+    pub supported_models: std::collections::BTreeMap<String, u32>,
     /// What a namespace's vector-index settings are filled with when it first
     /// enables semantic search (the server's TOML defaults, or built-in).
     pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
@@ -317,12 +316,11 @@ pub struct NamespaceSemantics {
 
 #[cfg(feature = "semantic-search")]
 impl SemanticSearchContext {
-    /// A context with the given service settings and centroids per model
-    /// (names are lower-cased).
-    pub fn new(config: SemanticSearchConfig, cluster_indexes: impl IntoIterator<Item = (String, Arc<ClusterIndex>)>) -> Self {
+    /// A context with the given service settings, allowing any model.
+    pub fn new(config: SemanticSearchConfig) -> Self {
         Self {
             config,
-            cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
+            supported_models: std::collections::BTreeMap::new(),
             index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
@@ -335,6 +333,12 @@ impl SemanticSearchContext {
     /// Maintain at most `threads` namespaces' partitions at once.
     pub fn with_maintenance_threads(mut self, threads: usize) -> Self {
         self.maintenance_threads = threads.max(1);
+        self
+    }
+
+    /// Allow only these models, each at its dimension (names are lower-cased).
+    pub fn with_supported_models(mut self, models: impl IntoIterator<Item = (String, u32)>) -> Self {
+        self.supported_models = models.into_iter().map(|(m, d)| (m.to_lowercase(), d)).collect();
         self
     }
 
@@ -414,7 +418,7 @@ impl SemanticSearchContext {
     /// from a centroid file before M3). Checks the model first. Durable on
     /// return.
     pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
-        self.cluster_index_for(settings)?;
+        self.check_model(settings)?;
         if !crate::vector_kv::ivf_exists(db, namespace).await? {
             crate::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
             self.ivfs.write().retain(|(name, _), _| name != namespace);
@@ -448,32 +452,27 @@ impl SemanticSearchContext {
         }
     }
 
-    /// Check that `settings` can run here: its model has centroids, and they
-    /// have its dimension.
+    /// Check that `settings` can run here: when the server lists its models,
+    /// the namespace's is one of them, at the listed dimension.
     pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
-        self.cluster_index_for(settings).map(|_| ())
-    }
-
-    fn cluster_index_for(&self, settings: &VectorIndexSettings) -> Result<&Arc<ClusterIndex>, DocStoreError> {
-        let index = self
-            .cluster_indexes
+        if self.supported_models.is_empty() {
+            return Ok(());
+        }
+        let dim = *self
+            .supported_models
             .get(&settings.embedding_model)
             .ok_or_else(|| DocStoreError::UnsupportedEmbeddingModel {
                 model: settings.embedding_model.clone(),
-                supported: {
-                    let mut m: Vec<&str> = self.cluster_indexes.keys().map(String::as_str).collect();
-                    m.sort_unstable();
-                    m.join(", ")
-                },
+                supported: self.supported_models.keys().map(String::as_str).collect::<Vec<_>>().join(", "),
             })?;
-        if index.dim() != settings.embedding_dim as usize {
+        if dim != settings.embedding_dim {
             return Err(DocStoreError::EmbeddingDimMismatch {
                 model: settings.embedding_model.clone(),
                 dim: settings.embedding_dim,
-                centroid_dim: index.dim(),
+                expected: dim as usize,
             });
         }
-        Ok(index)
+        Ok(())
     }
 
     /// The per-call config and partition for `namespace` (`ns_id`) with `settings`,
@@ -512,7 +511,7 @@ impl SemanticSearchContext {
             return Err(DocStoreError::EmbeddingDimMismatch {
                 model: settings.embedding_model.clone(),
                 dim: settings.embedding_dim,
-                centroid_dim: crate::semantic_search::IvfLayout::dim(ivf.as_ref()),
+                expected: crate::semantic_search::IvfLayout::dim(ivf.as_ref()),
             });
         }
         let config = SemanticSearchConfig {

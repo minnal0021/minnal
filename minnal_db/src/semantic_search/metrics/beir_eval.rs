@@ -26,8 +26,9 @@
 //!
 //! Env knobs (all optional): `MINNAL_BEIR_DATASET` (default `scifact`),
 //! `MINNAL_BEIR_ROOT` (default `../work/beir`), `MINNAL_BEIR_SPLIT` (default
-//! `test`), `MINNAL_BEIR_MODEL` (the model requested from the service and its
-//! cluster set, default `gemma`),
+//! `test`), `MINNAL_BEIR_MODEL` (the model requested from the service, default
+//! `gemma`), `MINNAL_BEIR_CENTROIDS` (required: a JSONL centroid file fitted
+//! for that model, which the corpus is indexed against),
 //! `MINNAL_EMBED_URL`, `MINNAL_BEIR_MAX_QUERIES`, and `MINNAL_BEIR_DB`, a
 //! directory to keep the built index in so later runs skip re-embedding the
 //! corpus. Results are also written to `{root}/{dataset}/beir_eval_{model}_{split}.{md,tsv}`.
@@ -179,7 +180,9 @@ async fn beir_eval() {
     let mut sorted_words = query_words.clone();
     sorted_words.sort_unstable();
 
-    let cluster_path = format!("../service/embedding_support/{model}/clusters.json");
+    // No centroid file ships with minnal (design doc M4): bring one, e.g. a
+    // static fit from `work/bench/analysis/m3pre/fit_static.py`.
+    let cluster_path = std::env::var("MINNAL_BEIR_CENTROIDS").expect("MINNAL_BEIR_CENTROIDS: a JSONL centroid file for this model");
     let raw = read_clusters_from_file(&cluster_path).unwrap_or_else(|e| panic!("load {cluster_path}: {e}"));
     let index = Arc::new(ClusterIndex::from_clusters(
         raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(),

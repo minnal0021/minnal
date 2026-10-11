@@ -15,7 +15,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use minnal_db::semantic_search::{
     ClusterIndex, ProbeSettings,
-    cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids, read_clusters_from_file},
+    cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
     index::vector_index::{ClusterBatchResult, QuantisationStyle, VectorIndex, VectorKvStore},
     index_embedding_to_cluster,
@@ -30,8 +30,9 @@ const DIM: usize = 768;
 const N_BITS_MULTI: usize = 8;
 const N_DOCS: usize = 1_000;
 
-// Relative to the crate root (semantic_search/).
-const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
+/// Centres the benches quantise against: k-means over the bench's own
+/// document embeddings (no centroid file ships with minnal).
+const N_CENTRES: usize = 64;
 const BENCH_DATA_PATH: &str = "benches/data/bench_embeddings.json";
 
 // ── Embedding data ─────────────────────────────────────────────────────────────
@@ -76,6 +77,21 @@ fn load_or_generate_embeddings() -> BenchEmbeddings {
     data
 }
 
+/// [`N_CENTRES`] centres fitted by k-means on the bench documents, keyed by id.
+fn bench_centroids() -> HashMap<u32, Vec<f32>> {
+    use minnal_db::semantic_search::cluster::{kmeans, split::SplitRng};
+    let docs = load_or_generate_embeddings().docs;
+    let fit = kmeans::kmeans(
+        docs.len(),
+        DIM,
+        |i, buf| buf.extend_from_slice(&docs[i]),
+        &kmeans::KmeansParams::new(N_CENTRES),
+        &mut SplitRng::new(7),
+    )
+    .expect("bench documents");
+    fit.centres.into_iter().enumerate().map(|(i, c)| (i as u32, c)).collect()
+}
+
 // ── Setup ──────────────────────────────────────────────────────────────────────
 
 struct BenchSetup {
@@ -87,8 +103,7 @@ struct BenchSetup {
 }
 
 fn setup() -> BenchSetup {
-    let raw = read_clusters_from_file(CLUSTER_PATH)
-        .expect("bench setup: failed to load clusters — is service/embedding_support/qwen/clusters.json present?");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
 
     let embeddings = load_or_generate_embeddings();
@@ -210,7 +225,7 @@ fn full_sort_top_n(cluster_map: &HashMap<u32, Cluster>, embedding: &[f32], n: us
 /// is the Pass-1 cluster-probing cost, paid once per query vector (production
 /// queries are not chunked, so once per query).
 fn bench_top_n_cluster_selection(c: &mut Criterion) {
-    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let query = load_or_generate_embeddings().query;
     let count = cluster_map.len();
@@ -276,7 +291,7 @@ fn union_dedup(per_query: Vec<Vec<u32>>) -> Vec<u32> {
 /// centroid matrix. Both produce the same probe set; this measures the speed-up as the
 /// query grows (the `T` factor the old serial loop scaled linearly with).
 fn bench_coarse_assignment(c: &mut Criterion) {
-    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let count = cluster_map.len();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
@@ -399,7 +414,7 @@ fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize, chunks_
 /// T to read off the coarse-assignment fraction of this total.
 fn bench_end_to_end_search(c: &mut Criterion) {
     const N_DOCS: usize = 5_000;
-    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let store = build_bench_store(&cluster_map, N_DOCS, 1);
@@ -461,7 +476,7 @@ fn bench_end_to_end_search(c: &mut Criterion) {
 fn bench_end_to_end_multichunk(c: &mut Criterion) {
     const N_DOCS: usize = 5_000;
     const T: usize = 1; // production: one whole-query vector
-    let raw = read_clusters_from_file(CLUSTER_PATH).expect("bench setup: failed to load clusters");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let dense_query = load_or_generate_embeddings().query;
@@ -557,7 +572,7 @@ struct ScoringInput {
 }
 
 fn build_scoring_input(t: usize, n_docs: usize) -> ScoringInput {
-    let raw = read_clusters_from_file(CLUSTER_PATH).expect("scoring bench: failed to load clusters");
+    let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
 
     let query = synthetic_query_chunks(t);

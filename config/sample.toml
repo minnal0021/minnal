@@ -276,7 +276,7 @@ max_retries = 5
 # Default: 4.
 concurrency = 4
 
-# ---------------------------------------------------------------------------
+# [semantic_search] — the embedding service and the allowed models
 # [semantic_search] — the embedding service and the cluster centroids
 #
 # A store's embedding model, dimension, chunking, code widths, search settings
@@ -298,13 +298,6 @@ concurrency = 4
 # Chunking/tokenisation happens in minnal, not the service.
 # Default: http://localhost:8001
 embedding_service_url = "http://localhost:8001"
-
-# Directory of IVF cluster centroids, one set per model at
-# {centroid_dir}/{model}/clusters.json. A store uses the set for its model.
-# Relative paths resolve against the working directory; release.sh and the
-# Docker image rewrite this line to where they stage the centroids.
-# Default: service/embedding_support
-centroid_dir = "service/embedding_support"
 
 # Time-to-live (seconds) for cached query embeddings in the system-wide
 # `system_qemb_cache` namespace. After this duration a cached entry is evicted by
@@ -402,21 +395,20 @@ centroid_dir = "service/embedding_support"
 # probe_budget_floor = 20000
 
 # ---------------------------------------------------------------------------
-# [[semantic_search.supported_models]] — enabled embedding models
+# [[semantic_search.supported_models]] — optional list of allowed models
 #
-# Each entry declares one embedding model this instance may serve.  The model
-# set is data-driven: any name is accepted.  At startup the server validates
-# that the cluster file for every listed model exists at
-#   {centroid_dir}/{name}/clusters.json
-# and that its centroids match the declared dimension, and loads only these
-# models.  Without any entry, every {centroid_dir}/*/clusters.json is loaded.
-# To add a model, drop its clusters.json under centroid_dir and add an entry
-# here — no code change needed.
+# With entries, a store may use only the models listed here, each at its
+# dimension. Without any, a store may use any model the embedding service
+# serves: when a store enables semantic search the server asks the service to
+# embed a probe with the store's model and rejects the request (422) if the
+# model is not served or answers at another dimension.
+#
+# No centroid file is needed for any model: every store grows its own
+# partition from its documents.
 #
 # Fields:
-#   name      — model identifier (case-insensitive; lower-cased to form the
-#               cluster-file sub-directory).  It is also the model key the
-#               embedding service is asked for, so use a name the service serves.
+#   name      — model identifier (case-insensitive). It is also the model key
+#               the embedding service is asked for, so use a name it serves.
 #   dimension — embedding dimensionality the model produces (u16).
 # ---------------------------------------------------------------------------
 

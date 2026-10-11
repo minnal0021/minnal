@@ -63,9 +63,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::
 
 /// Core doc-store creation, shared by `POST /stores` and schema import.
 pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<StatusCode, AppError> {
-    // Reject semantic-search-enabled stores when no centroids are loaded.
-    // Without them, writes would attempt (and fail) to quantise embeddings,
-    // leaving the namespace in a permanently broken state.
+    // Reject semantic-search-enabled stores when the server runs without
+    // semantic search: writes would never be embedded.
     if schema.semantic_search_enabled {
         require_semantic_search(state)?;
         // An invalid `vector_index` is reported by `create` itself.
@@ -274,15 +273,11 @@ pub async fn amend_schema(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Refuse a semantic-search operation when the server loaded no centroids.
+/// Refuse a semantic-search operation when the server runs without semantic
+/// search.
 fn require_semantic_search(state: &AppState) -> Result<(), AppError> {
     if state.embedding_service.is_none() {
-        return Err(DocStoreError::EmbeddingFailed(
-            "semantic search is unavailable: no cluster centroids are loaded \
-             (check semantic_search.centroid_dir and supported_models in config)"
-                .into(),
-        )
-        .into());
+        return Err(DocStoreError::EmbeddingFailed("semantic search is not configured on this server".into()).into());
     }
     Ok(())
 }
@@ -295,8 +290,8 @@ async fn probe_model(state: &AppState, settings: &VectorIndexSettings) -> Result
     let Some(service) = &state.embedding_service else {
         return Ok(());
     };
-    // The local check first: it is free, and names the models this server has
-    // centroids for.
+    // The local check first: it is free, and names the models this server
+    // allows, when it lists them.
     state.store.check_vector_model(settings)?;
     let probe = minnal_db::semantic_search::service::SemanticSearchConfig {
         model_name: settings.embedding_model.clone(),

@@ -7,33 +7,23 @@
 #      otherwise inline — waits up to 30 s before aborting).
 #   3. Creates ./work/bin/ (if needed) and copies both binaries into it.
 #   4. Copies minnal_tools/sample_data/ → ./work/sample_data/  (only with -s flag).
-#   5. Copies the per-model cluster centroids — service/embedding_support/,
-#      one {model}/clusters.json per model — → ./work/bin/embedding_support/.
-#      Each namespace uses the centroids of the model its schema names.
-#      Refuses to change the centroids while a database exists under
-#      ./work/doc_store (stored vectors are quantised against the old ones)
-#      unless -c is given.
-#   6. Generates ./work/bin/minnal.toml from config/sample.toml, rewriting
+#   5. Generates ./work/bin/minnal.toml from config/sample.toml, rewriting
 #      all data paths to use ./work/doc_store as the base directory.
-#   7. Generates ./work/bin/stop.sh   — gracefully stops the server.
-#   8. Generates ./work/bin/start.sh + run_tool.sh — helper scripts.
-#   9. Copies test_embedding.sh → ./work/bin/.
+#   6. Generates ./work/bin/stop.sh   — gracefully stops the server.
+#   7. Generates ./work/bin/start.sh + run_tool.sh — helper scripts.
+#   8. Copies test_embedding.sh → ./work/bin/.
 #
 # Run from the workspace root:
 #   ./service/scripts/release.sh          # skip sample data
 #   ./service/scripts/release.sh -s       # also copy sample data
-#   ./service/scripts/release.sh -c       # allow the centroids to change
-#                                         # (then re-index every semantic store)
 
 set -euo pipefail
 
 COPY_SAMPLE_DATA=false
-ALLOW_CENTROID_CHANGE=false
-while getopts ":sc" opt; do
+while getopts ":s" opt; do
     case $opt in
         s) COPY_SAMPLE_DATA=true ;;
-        c) ALLOW_CENTROID_CHANGE=true ;;
-        *) echo "usage: $0 [-s] [-c]" >&2; exit 1 ;;
+        *) echo "usage: $0 [-s]" >&2; exit 1 ;;
     esac
 done
 
@@ -44,48 +34,14 @@ BIN_DIR="${WORKSPACE_ROOT}/work/bin"
 CONFIG_SRC="${WORKSPACE_ROOT}/config/sample.toml"
 STOP_TIMEOUT=30
 
-# ── 0. Resolve and check the cluster centroids (before building or stopping) ─
-# One centroid set per model; each namespace uses the set for the model its
-# schema names, so there is no single file to pick here.
-CENTROID_SRC="${WORKSPACE_ROOT}/service/embedding_support"
-CENTROID_DST="${BIN_DIR}/embedding_support"
-if ! compgen -G "${CENTROID_SRC}/*/clusters.json" > /dev/null; then
-    echo "ERROR: no {model}/clusters.json under ${CENTROID_SRC}" >&2
-    exit 1
-fi
-# Changing the centroids under an existing database invalidates every stored
-# vector (both passes are quantised relative to a centroid), and search then
-# returns wrong results without any error. Only do it on purpose. A database
-# staged with a single clusters.bin was indexed against that one file, whatever
-# each namespace's model now selects.
-DB_EXISTS=false
-[[ -n "$(ls -A "${WORKSPACE_ROOT}/work/doc_store/db" 2>/dev/null)" ]] && DB_EXISTS=true
-if [[ "${DB_EXISTS}" == true ]] && [[ "${ALLOW_CENTROID_CHANGE}" != true ]]; then
-    reason=""
-    if [[ -f "${BIN_DIR}/clusters.bin" ]]; then
-        reason="the database was indexed against ${BIN_DIR}/clusters.bin; this release selects centroids per namespace model from ${CENTROID_DST}"
-    elif [[ -d "${CENTROID_DST}" ]] && ! diff -rq "${CENTROID_SRC}" "${CENTROID_DST}" > /dev/null; then
-        reason="${CENTROID_DST} differs from ${CENTROID_SRC}"
-    fi
-    if [[ -n "${reason}" ]]; then
-        echo "ERROR: the cluster centroids would change under an existing database:" >&2
-        echo "       ${reason}." >&2
-        echo "       Its vector indices were quantised against the current centroids;" >&2
-        echo "       changing them would make semantic search silently wrong." >&2
-        echo "       Re-run with -c to change them anyway, then re-index every semantic-search store" >&2
-        echo "       (POST /admin/indices/{ns}/vector/reindex-all)." >&2
-        exit 1
-    fi
-fi
-
 # ── 1. Build ──────────────────────────────────────────────────────────────────
-echo "==> [1/9] Building release binaries..."
+echo "==> [1/8] Building release binaries..."
 cargo build --release -p minnal_db_api -p minnal_tools
 echo "  Build complete."
 
 # ── 2. Gracefully stop any running server ─────────────────────────────────────
 echo ""
-echo "==> [2/9] Stopping any running server..."
+echo "==> [2/8] Stopping any running server..."
 # Prefer the generated stop.sh from a prior release so it matches the server's
 # own shutdown logic; fall back to the inline helper on first run.
 if [[ -x "${BIN_DIR}/stop.sh" ]]; then
@@ -96,7 +52,7 @@ fi
 
 # ── 3. Stage binaries ─────────────────────────────────────────────────────────
 echo ""
-echo "==> [3/9] Staging binaries → ${BIN_DIR}"
+echo "==> [3/8] Staging binaries → ${BIN_DIR}"
 mkdir -p "${BIN_DIR}"
 cp target/release/minnal_db_api "${BIN_DIR}/minnal_db_api"
 echo "  Copied minnal_db_api"
@@ -106,36 +62,27 @@ echo "  Copied minnal_tools"
 # ── 4. Copy sample data (optional: -s) ───────────────────────────────────────
 echo ""
 if [[ "${COPY_SAMPLE_DATA}" == true ]]; then
-    echo "==> [4/9] Copying sample data → ${WORKSPACE_ROOT}/work/sample_data"
+    echo "==> [4/8] Copying sample data → ${WORKSPACE_ROOT}/work/sample_data"
     mkdir -p "${WORKSPACE_ROOT}/work/sample_data"
     cp "${WORKSPACE_ROOT}/minnal_tools/sample_data/"* "${WORKSPACE_ROOT}/work/sample_data/"
     echo "  Sample data staged in ./work/sample_data/"
 else
-    echo "==> [4/9] Skipping sample data (pass -s to copy)"
+    echo "==> [4/8] Skipping sample data (pass -s to copy)"
 fi
 
-# ── 5. Copy cluster centroids ─────────────────────────────────────────────────
+# ── 5. Generate config ────────────────────────────────────────────────────────
 echo ""
-echo "==> [5/9] Copying cluster centroids → ${CENTROID_DST}"
-rm -rf "${CENTROID_DST}"
-cp -r "${CENTROID_SRC}" "${CENTROID_DST}"
-rm -f "${BIN_DIR}/clusters.bin"
-echo "  Copied centroids for: $(cd "${CENTROID_SRC}" && ls -d */ | tr -d / | tr '\n' ' ')"
-
-# ── 6. Generate config ────────────────────────────────────────────────────────
-echo ""
-echo "==> [6/9] Generating config → ${BIN_DIR}/minnal.toml"
+echo "==> [5/8] Generating config → ${BIN_DIR}/minnal.toml"
 sed \
     -e 's|db_path = "./data/db"|db_path = "./work/doc_store/db"|' \
     -e 's|schema_dir = "./data/schemas"|schema_dir = "./work/doc_store/schemas"|' \
     -e 's|log_dir = "./data/log"|log_dir = "./work/doc_store/log"|' \
-    -e 's|centroid_dir = "service/embedding_support"|centroid_dir = "./work/bin/embedding_support"|' \
     "${CONFIG_SRC}" > "${BIN_DIR}/minnal.toml"
 echo "  Written minnal.toml"
 
-# ── 7. Generate stop.sh ───────────────────────────────────────────────────────
+# ── 6. Generate stop.sh ───────────────────────────────────────────────────────
 echo ""
-echo "==> [7/9] Generating stop script → ${BIN_DIR}/stop.sh"
+echo "==> [6/8] Generating stop script → ${BIN_DIR}/stop.sh"
 cat > "${BIN_DIR}/stop.sh" << 'STOP_EOF'
 #!/usr/bin/env bash
 # Gracefully stop the minnal doc store server.
@@ -173,9 +120,9 @@ STOP_EOF
 chmod +x "${BIN_DIR}/stop.sh"
 echo "  Written stop.sh"
 
-# ── 8. Generate start.sh ──────────────────────────────────────────────────────
+# ── 7. Generate start.sh ──────────────────────────────────────────────────────
 echo ""
-echo "==> [8/9] Generating helper scripts → ${BIN_DIR}"
+echo "==> [7/8] Generating helper scripts → ${BIN_DIR}"
 cat > "${BIN_DIR}/start.sh" << 'EOF'
 #!/usr/bin/env bash
 # Start the minnal doc store using the binaries and config in this directory.
@@ -221,20 +168,19 @@ EOF
 chmod +x "${BIN_DIR}/run_tool.sh"
 echo "  Written run_tool.sh"
 
-# ── 9. Copy test script ───────────────────────────────────────────────────────
+# ── 8. Copy test script ───────────────────────────────────────────────────────
 echo ""
-echo "==> [9/10] Copying test script → ${BIN_DIR}"
+echo "==> [8/8] Copying test script → ${BIN_DIR}"
 cp "${SCRIPT_DIR}/test_embedding.sh" "${BIN_DIR}/test_embedding.sh"
 chmod +x "${BIN_DIR}/test_embedding.sh"
 echo "  Written test_embedding.sh"
 
-# ── 10. Done ──────────────────────────────────────────────────────────────────
+# ── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Release ready in ${BIN_DIR}:"
 echo "  minnal_db_api      — server binary"
 echo "  minnal_tools              — tools binary"
-echo "  embedding_support/        — ANN cluster centroids, one set per model"
 echo "  minnal.toml               — server config"
 echo "  stop.sh                   — gracefully stop the server"
 echo "  start.sh                  — start the server"

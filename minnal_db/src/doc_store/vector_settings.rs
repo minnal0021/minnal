@@ -151,23 +151,6 @@ pub struct VectorIndexSpec {
     /// How the namespace's partition is maintained (splits, reassignment, merges).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<MaintenanceSpec>,
-    /// Where the namespace's centres came from. Written by the server when it
-    /// seeds them; a request may not set it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seeded_from: Option<SeededFrom>,
-}
-
-/// The centroid file a namespace's centres were seeded from. After seeding the
-/// namespace never reads the file again; this records which one it was.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SeededFrom {
-    /// Path of the centroid file, as the server found it.
-    pub file: String,
-    /// MurmurHash3 (x64, 128-bit) of the file's bytes, hex.
-    pub murmur3_128: String,
-    /// Number of centres seeded.
-    pub centres: u32,
 }
 
 /// Document chunking: sentence windows of `window_size`, advancing by
@@ -287,8 +270,6 @@ pub struct VectorIndexSettings {
     pub rotation_seed: u64,
     /// What Pass-2 codes are encoded against (always [`PASS2_CENTRE`]).
     pub pass2_centre: String,
-    /// Where the centres came from, once seeded.
-    pub seeded_from: Option<SeededFrom>,
     /// Search defaults.
     pub search: SearchSettings,
     /// Partition maintenance.
@@ -645,15 +626,6 @@ impl SearchSpec {
 }
 
 impl VectorIndexSpec {
-    /// Reject `seeded_from` in a request: only the server writes it, when it
-    /// seeds the namespace's centres.
-    pub fn reject_seeded_from(&self) -> Result<(), SchemaError> {
-        if self.seeded_from.is_some() {
-            return Err(invalid("seeded_from", "is written by the server when it seeds the centres; omit it"));
-        }
-        Ok(())
-    }
-
     /// Fill omitted fields with the built-in defaults and validate.
     pub fn resolve(&self) -> Result<VectorIndexSettings, SchemaError> {
         self.resolve_with(&IndexDefaults::default())
@@ -691,7 +663,6 @@ impl VectorIndexSpec {
                 Some(s) => parse_seed(s)?,
                 None => DEFAULT_ROTATION_SEED,
             },
-            seeded_from: self.seeded_from.clone(),
             pass2_centre: quantisation.pass2_centre.clone().unwrap_or_else(|| PASS2_CENTRE.to_string()),
             search: SearchSettings {
                 probe_budget_entries,
@@ -747,7 +718,6 @@ impl VectorIndexSpec {
                 });
             }
         }
-        self.reject_seeded_from()?;
         Ok(VectorIndexSettings {
             search: self.search.unwrap_or_default().apply(current.search)?,
             maintenance: self.maintenance.unwrap_or_default().apply(current.maintenance)?,
@@ -807,7 +777,6 @@ impl VectorIndexSettings {
                 split_max_iters: Some(self.maintenance.split_max_iters),
                 split_lambda_factor: Some(self.maintenance.split_lambda_factor),
             }),
-            seeded_from: self.seeded_from.clone(),
         }
     }
 }
@@ -827,7 +796,6 @@ pub(crate) fn settle(
     defaults: &IndexDefaults,
 ) -> Result<VectorIndexSpec, SchemaError> {
     let requested = requested.cloned().unwrap_or_default();
-    requested.reject_seeded_from()?;
     let settings = match existing {
         Some(e) => requested.merge_onto(&e.resolve()?)?,
         None => requested.resolve_with(defaults)?,
@@ -922,19 +890,6 @@ mod tests {
             "quantisation.pass2_centre"
         );
         assert!(spec(r#"{"quantisation":{"pass2_centre":"zero"}}"#).merge_onto(&s).is_ok());
-    }
-
-    #[test]
-    fn seeded_from_is_server_written() {
-        let seeded = spec(r#"{"seeded_from":{"file":"f","murmur3_128":"ab","centres":2}}"#);
-        assert!(seeded.resolve().is_ok(), "a stored schema with it loads");
-        assert_eq!(
-            err_field(seeded.merge_onto(&VectorIndexSpec::default().resolve().unwrap())),
-            "seeded_from"
-        );
-        assert!(settle(None, Some(&seeded), &IndexDefaults::default()).is_err());
-        let kept = settle(Some(&seeded), None, &IndexDefaults::default()).unwrap();
-        assert_eq!(kept.seeded_from, seeded.seeded_from, "kept across a re-enable");
     }
 
     #[test]

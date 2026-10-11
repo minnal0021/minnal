@@ -303,7 +303,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
-Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup. The server asks the service for the model named in `semantic_search.model` (default `qwen`) on every embedding request, and its startup probe logs an error if the service does not load that model; `cluster_path` must hold the centroids fitted on that same model.
+Requires the external embedding service. Each store names its model in its schema (`vector_index.embedding_model`, default `gemma`), and the server asks the service for that model on every embedding request. Enabling semantic search probes the service and fails with `422` if it does not serve the model at the store's dimension; at startup the same probe only logs an error. No centroid file is needed: each store grows its own IVF partition from its documents (see [`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition)).
 
 ### KV store concept
 
@@ -780,8 +780,7 @@ build progresses; see `GET /admin/indices/{ns}/progress`).
 
 Two-pass ANN similarity search over the document vectors. Requires the store to
 have been created with `semantic_search_enabled = true` and `embedding_fields`
-set, a cluster index loaded at startup (`semantic_search.cluster_path`), and the
-external embedding service reachable. Because vector indexing is
+set, and the external embedding service reachable. Because vector indexing is
 [asynchronous](#semantic-search-async-vector-indexing), a document written moments
 earlier may not be searchable yet. Candidates whose document has since been
 deleted are dropped, so every hit resolves to a live document.
@@ -876,7 +875,7 @@ combinations.
 | `namespace` | string | yes | Unique name (`[a-zA-Z0-9_-]+`) |
 | `key_type` | `str` / `int` | yes | Key type |
 | `value_type` | `str` / `int` / `f32` / `vec_f32` | yes | Value type |
-| `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str` and a cluster index at startup) |
+| `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str`) |
 
 ```bash
 curl -X POST http://localhost:8080/stores \
@@ -1524,6 +1523,9 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/reindex/{doc_id}` | `200` | Re-enqueue one document for embedding (doc + KV stores) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
+| `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
+| `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
+| `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/{doc_id}` | `200` | Look up one queue entry |
@@ -1887,6 +1889,66 @@ Returns `409` when a cleanup or campaign is already running. Returns `422` when 
 
 ---
 
+#### `GET /admin/indices/{ns}/vector/partition`
+
+The store's IVF partition at a glance, from memory: `postings` (K), `entries`,
+`chunks`, `size_p10_p50_p90_max` (chunks per posting), `splits`,
+`unfinished_operations` (maintenance a crash interrupted, finished at startup),
+`maintenance` (splits, merges, reassignments and chunk moves since the partition
+loaded), the store's `target_posting_size`, `split_limit` and `merge_limit`, and
+`rebuild` (the last rebuild since the server started, or `null`). With
+`?codes=true` it also reads every chunk code and adds `codes` (mean centre drift
+and error band) and `reencode_candidates`.
+
+```bash
+curl http://localhost:8080/admin/indices/products/vector/partition
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/postings`
+
+Every posting, retired ones included, with its size, state (`active`,
+`draining`, `retired`), centre, parent and origin (`root`, `split`, `rebuild`,
+or `seed` for a store created before partitions grew by themselves).
+Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
+`sort` (`id`, `entries`, `chunks`, `drift`) and `order` (`asc`, `desc`).
+
+---
+
+#### `POST /admin/indices/{ns}/vector/rebuild`
+
+Re-cluster the store's partition from its stored 1-bit codes: k-means over every
+chunk, then each chunk moves to its nearest new posting, and the usual splits
+and merges follow. No embedding request is made and no code is re-encoded.
+Searches and writes continue throughout; a crash part-way is finished at the
+next start. Useful when a store's topics have shifted since its partition grew
+(growth that took topics one at a time leaves recall 1–2 points short of a fit
+on the whole corpus), and to move a store created before partitions grew by
+themselves onto its own centres.
+
+The optional body sets how many postings to fit; by default as many as are
+active now, so a search probes about as many as before. K-means runs on its own
+threads (`[semantic_search.maintenance] rebuild_threads`, 1 or 2), never those
+searches use.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild
+# → 202 {"namespace": "products", "rebuild": {"state": "running", ...}}
+curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild \
+  -H 'Content-Type: application/json' -d '{"postings": 500}'
+```
+
+Progress and the result are the `rebuild` field of
+[`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition):
+`state` (`running`, `done`, `failed`), `started_at_ms`, `finished_at_ms`, and
+`report` (`postings_before`, `postings_fitted`, `postings_after`, `chunks`,
+`iterations`, `chunks_moved`) or `error`. Returns `409` while a rebuild of the
+store runs, `400` for `postings` of 0, and `422` when semantic search is not
+enabled.
+
+---
+
 #### `GET /admin/indices/{ns}/vector/queue`
 
 All pending queue entries for one namespace, paginated.
@@ -1988,7 +2050,7 @@ All errors return JSON with an `"error"` key:
 | `400`       | Invalid ID / key format, bad schema, type mismatch, malformed request |
 | `404`       | Namespace, document, or KV key not found                 |
 | `409`       | Store already exists, field already indexed, build in progress, attribute/vector operation already active for namespace |
-| `422`       | Semantic search requested but not enabled / cluster index not loaded; no indices to rebuild; entry not yet exhausted |
+| `422`       | Semantic search requested but not enabled, or its model not allowed or not served; no indices to rebuild; entry not yet exhausted |
 | `500`       | Internal database error                                  |
 
 ---
@@ -2070,9 +2132,12 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
     config.json               ← namespace settings
     lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
-  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [cluster_id ‖ doc_id] (Pass 1)
+  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)
-  ns_{namespace}_sparse_vector_meta/ ← each document's clusters, used to clean up on update and delete
+  ns_{namespace}_sparse_vector_meta/ ← each document's postings and chunk counts, used to clean up on update and delete
+  ns_{namespace}_ivf_centres/        ← the store's IVF centres
+  ns_{namespace}_ivf_postings/       ← its postings: routing centre, state, parent
+  ns_{namespace}_ivf_journal/        ← partition maintenance in progress, finished after a crash
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   index/

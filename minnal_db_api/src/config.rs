@@ -28,7 +28,6 @@
 //!
 //! [semantic_search]
 //! embedding_service_url = "http://192.168.1.155:8001"
-//! # centroid_dir = "service/embedding_support"   # {centroid_dir}/{model}/clusters.json
 //! ```
 //!
 //! A namespace's model, dimension, chunking, code widths and search defaults
@@ -43,72 +42,36 @@ use serde::Deserialize;
 
 // ── Supported embedding models ────────────────────────────────────────────────
 
-/// Default directory under which each model's cluster centroid file lives, one
-/// sub-directory per model: `{centroid_dir}/{name}/clusters.json`.
-const DEFAULT_CENTROID_DIR: &str = "service/embedding_support";
-
-/// One entry in the `[[semantic_search.supported_models]]` TOML array.
+/// One entry in the optional `[[semantic_search.supported_models]]` TOML array.
 ///
-/// Each entry declares that a particular embedding model is available to this
-/// instance and records the dimensionality it produces. The model set is fully
-/// **data-driven**: any `name` is accepted as long as its cluster centroid file
-/// is present at `{centroid_dir}/{name}/clusters.json` and the centroids match
-/// the declared `dimension` — there is no hard-coded list of recognised models.
+/// When the array is given, a namespace may use only the models it lists, each
+/// at its dimension. When it is empty (the default), any model the embedding
+/// service serves is allowed: the server probes the service when a namespace
+/// enables semantic search and rejects a model it does not serve, or serves at
+/// another dimension (422).
 ///
 /// The name is also the model key the embedding service is asked for: a
 /// namespace naming this model sends it, lower-cased, as the `{model}` path
 /// segment of every request (`{url}/embedding/{model}/document` and
-/// `.../query`), so a declared name must be one the service serves (the
+/// `.../query`), so a listed name must be one the service serves (the
 /// companion service serves `gemma` and `qwen`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportedModelEntry {
-    /// Model identifier. The corresponding cluster file is expected at
-    /// `{centroid_dir}/{name}/clusters.json` (the name is lower-cased to form the
-    /// directory, so the lookup is case-insensitive).
+    /// Model identifier (matched case-insensitively).
     pub name: String,
-    /// Embedding dimensionality produced by this model. Must be non-zero and
-    /// must equal the dimension of the centroids in the cluster file (validated
-    /// at startup).
+    /// Embedding dimensionality produced by this model. Must be non-zero.
     pub dimension: u16,
 }
 
 impl SupportedModelEntry {
-    /// Lower-cased identifier used as the sub-directory name under the
-    /// centroid directory.
-    pub fn dir_name(&self) -> String {
-        self.name.to_lowercase()
-    }
-
-    /// Path to this model's cluster centroid file, rooted at `support_dir`
-    /// (`{support_dir}/{name}/clusters.json`).
-    pub fn cluster_file_path(&self, support_dir: &Path) -> PathBuf {
-        support_dir.join(self.dir_name()).join("clusters.json")
-    }
-
-    /// Validate this entry against cluster files rooted at `support_dir`.
-    ///
-    /// Checks the name is non-empty and the dimension is non-zero, then loads
-    /// the cluster file — which confirms it exists, is well-formed, and that its
-    /// centroids match the declared `dimension`.
-    fn validate(&self, support_dir: &Path) -> Result<(), String> {
+    /// Check the name is non-empty and the dimension non-zero.
+    fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("supported_models: an entry has an empty name".to_string());
         }
         if self.dimension == 0 {
             return Err(format!("supported_models: '{}' declares a zero dimension", self.name));
         }
-
-        let cluster_file = self.cluster_file_path(support_dir);
-        let cluster_path = cluster_file
-            .to_str()
-            .ok_or_else(|| format!("supported_models: cluster file path for '{}' is not valid UTF-8", self.name))?;
-
-        minnal_db::semantic_search::ClusterIndex::load_with_dim(cluster_path, self.dimension as usize).map_err(|e| {
-            format!(
-                "supported_models: cluster file for '{}' (expected at '{}') is unusable: {e}",
-                self.name, cluster_path
-            )
-        })?;
         Ok(())
     }
 }
@@ -148,8 +111,8 @@ pub struct DocStoreApiConfig {
 impl DocStoreApiConfig {
     /// Load and validate a `DocStoreApiConfig` from a TOML file.
     ///
-    /// Returns an error if the file cannot be read, fails to parse, or if any
-    /// supported model is missing its cluster file on disk.
+    /// Returns an error if the file cannot be read, fails to parse, or holds an
+    /// invalid setting.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
         let config: Self = toml::from_str(&content).map_err(|e| format!("cannot parse '{}': {e}", path.display()))?;
@@ -161,20 +124,15 @@ impl DocStoreApiConfig {
         Ok(config)
     }
 
-    /// Check that every entry in `semantic_search.supported_models`:
-    /// - has a non-empty `name`,
-    /// - declares a non-zero `dimension`, and
-    /// - has a usable cluster file at `{centroid_dir}/{name}/clusters.json`
-    ///   whose centroids match the declared `dimension`.
-    ///
-    /// The model set is **data-driven**: any name is accepted provided its
-    /// cluster file exists and is consistent. Loading the file via
-    /// [`ClusterIndex::load_with_dim`](minnal_db::semantic_search::ClusterIndex::load_with_dim)
-    /// validates existence, well-formedness, and centroid dimension in one step.
+    /// Check every `semantic_search.supported_models` entry: a non-empty name
+    /// and a non-zero dimension, each name listed once.
     fn validate_supported_models(&self) -> Result<(), String> {
-        let dir = self.semantic_search.centroid_dir();
+        let mut seen = std::collections::HashSet::new();
         for entry in &self.semantic_search.supported_models {
-            entry.validate(&dir)?;
+            entry.validate()?;
+            if !seen.insert(entry.name.to_lowercase()) {
+                return Err(format!("supported_models: '{}' is listed twice", entry.name));
+            }
         }
         Ok(())
     }
@@ -589,7 +547,7 @@ fn default_concurrency() -> usize {
 }
 
 /// Semantic-search settings that belong to the server: how to reach the
-/// embedding service, and which models' centroids it loads.
+/// embedding service, and optionally which models namespaces may use.
 ///
 /// Everything that shapes one namespace's index lives in that namespace's
 /// schema (`vector_index`). The `maintenance` and `search_defaults` tables here
@@ -611,16 +569,9 @@ pub struct SemanticSearchSection {
     #[serde(default = "default_embedding_service_url")]
     pub embedding_service_url: String,
 
-    /// Directory holding one cluster-centroid set per model, at
-    /// `{centroid_dir}/{model}/clusters.json`. Relative paths resolve against
-    /// the working directory. Default: `service/embedding_support`.
-    #[serde(default)]
-    pub centroid_dir: Option<PathBuf>,
-
-    /// Embedding models this instance serves, each with the dimension it
-    /// produces. Every entry's centroid file must exist and match its
-    /// dimension (validated at startup). When empty, every
-    /// `{centroid_dir}/{model}/clusters.json` found at startup is loaded.
+    /// Embedding models namespaces may use, each with the dimension it
+    /// produces. When empty (the default), any model the embedding service
+    /// serves.
     #[serde(default)]
     pub supported_models: Vec<SupportedModelEntry>,
 
@@ -727,7 +678,6 @@ impl Default for SemanticSearchSection {
     fn default() -> Self {
         Self {
             embedding_service_url: default_embedding_service_url(),
-            centroid_dir: None,
             supported_models: Vec::new(),
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
             embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
@@ -759,10 +709,7 @@ pub struct ResolvedSemanticSearchConfig {
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     pub embedding_service_url: String,
 
-    /// Directory holding `{model}/clusters.json` per model.
-    pub centroid_dir: PathBuf,
-
-    /// Declared models; empty means "every centroid set found".
+    /// Allowed models; empty means any the embedding service serves.
     pub supported_models: Vec<SupportedModelEntry>,
 
     /// Time-to-live for cached query embeddings in the system-wide cache.
@@ -790,16 +737,10 @@ impl SemanticSearchSection {
         })
     }
 
-    /// The centroid directory, defaulted.
-    pub fn centroid_dir(&self) -> PathBuf {
-        self.centroid_dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CENTROID_DIR))
-    }
-
     /// Resolve this section into a [`ResolvedSemanticSearchConfig`].
     pub fn resolve(&self) -> ResolvedSemanticSearchConfig {
         ResolvedSemanticSearchConfig {
             embedding_service_url: self.embedding_service_url.clone(),
-            centroid_dir: self.centroid_dir(),
             supported_models: self.supported_models.clone(),
             query_embedding_cache_ttl: std::time::Duration::from_secs(self.query_embedding_cache_ttl_secs),
             embedding_request_timeout: std::time::Duration::from_secs(self.embedding_request_timeout_secs),
@@ -822,45 +763,12 @@ impl ResolvedSemanticSearchConfig {
         }
     }
 
-    /// Load one centroid set per model: the declared models (each checked
-    /// against its dimension), or, when none are declared, every
-    /// `{centroid_dir}/{model}/clusters.json` found. Returns the loaded sets
-    /// (lower-cased model name → index) and a message for each set that could
-    /// not be loaded.
-    pub fn load_cluster_indexes(&self) -> (Vec<(String, std::sync::Arc<minnal_db::semantic_search::ClusterIndex>)>, Vec<String>) {
-        use minnal_db::semantic_search::ClusterIndex;
-        let mut loaded = Vec::new();
-        let mut problems = Vec::new();
-        let mut load = |name: String, dim: Option<usize>| {
-            let path = self.centroid_dir.join(&name).join("clusters.json");
-            let path_str = path.to_string_lossy();
-            let result = match dim {
-                Some(d) => ClusterIndex::load_with_dim(&path_str, d),
-                None => ClusterIndex::load(&path_str),
-            };
-            match result {
-                Ok(index) => loaded.push((name, std::sync::Arc::new(index))),
-                Err(e) => problems.push(format!("model '{name}': cannot load '{}': {e}", path.display())),
-            }
-        };
-        if self.supported_models.is_empty() {
-            let mut names: Vec<String> = std::fs::read_dir(&self.centroid_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.path().join("clusters.json").is_file())
-                .filter_map(|e| e.file_name().to_str().map(str::to_lowercase))
-                .collect();
-            names.sort_unstable();
-            for name in names {
-                load(name, None);
-            }
-        } else {
-            for entry in &self.supported_models {
-                load(entry.dir_name(), Some(entry.dimension as usize));
-            }
-        }
-        (loaded, problems)
+    /// The allowed models as (lower-cased name, dimension); empty: any.
+    pub fn supported_models(&self) -> Vec<(String, u32)> {
+        self.supported_models
+            .iter()
+            .map(|m| (m.name.to_lowercase(), u32::from(m.dimension)))
+            .collect()
     }
 }
 
@@ -868,83 +776,33 @@ impl ResolvedSemanticSearchConfig {
 mod tests {
     use super::*;
 
-    /// Create a unique temp directory and write a `{model}/clusters.json` with
-    /// `n` centroids of dimension `dim` (JSONL, one object per line). Returns the
-    /// support-dir root the entry validates against.
-    fn write_cluster_file(model: &str, dim: usize, n: usize) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let unique = format!("minnal_cfg_test_{}_{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-        let support_dir = std::env::temp_dir().join(unique);
-        let model_dir = support_dir.join(model.to_lowercase());
-        std::fs::create_dir_all(&model_dir).unwrap();
-        let mut body = String::new();
-        for id in 0..n {
-            let centroid: Vec<f32> = (0..dim).map(|j| (id + j) as f32).collect();
-            body.push_str(&serde_json::json!({ "cluster_id": id, "centroid": centroid }).to_string());
-            body.push('\n');
-        }
-        std::fs::write(model_dir.join("clusters.json"), body).unwrap();
-        support_dir
-    }
-
     #[test]
-    fn validate_accepts_any_model_name_with_a_matching_cluster_file() {
-        // Data-driven: a name that is NOT "qwen" is accepted as long as its
-        // cluster file exists and the centroid dimension matches.
-        let support_dir = write_cluster_file("brandnew", 1024, 3);
-        let entry = SupportedModelEntry {
-            name: "BrandNew".to_string(),
-            dimension: 1024,
-        };
-        assert!(entry.validate(&support_dir).is_ok());
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn validate_rejects_dimension_mismatch() {
-        let support_dir = write_cluster_file("modelx", 768, 2);
-        let err = SupportedModelEntry {
-            name: "modelx".to_string(),
-            dimension: 512,
-        }
-        .validate(&support_dir)
-        .unwrap_err();
-        assert!(err.contains("modelx"), "got: {err}");
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn validate_rejects_missing_cluster_file() {
-        let support_dir = std::env::temp_dir().join(format!("minnal_cfg_missing_{}", std::process::id()));
-        let err = SupportedModelEntry {
-            name: "ghost".to_string(),
-            dimension: 768,
-        }
-        .validate(&support_dir)
-        .unwrap_err();
-        assert!(err.contains("ghost"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_rejects_empty_name_and_zero_dimension() {
-        let support_dir = std::env::temp_dir();
-        assert!(
-            SupportedModelEntry {
-                name: "  ".to_string(),
-                dimension: 768
-            }
-            .validate(&support_dir)
-            .is_err()
+    fn supported_models_are_checked_and_optional() {
+        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
+        cfg.validate_supported_models().unwrap();
+        assert!(cfg.semantic_search.resolve().supported_models().is_empty(), "any model by default");
+        let listed = format!(
+            "{base}[[semantic_search.supported_models]]\nname = \"Gemma\"\ndimension = 768\n\
+             [[semantic_search.supported_models]]\nname = \"e5\"\ndimension = 1024\n"
         );
-        assert!(
-            SupportedModelEntry {
-                name: "ok".to_string(),
-                dimension: 0
-            }
-            .validate(&support_dir)
-            .is_err()
+        let cfg: DocStoreApiConfig = toml::from_str(&listed).unwrap();
+        cfg.validate_supported_models().unwrap();
+        assert_eq!(
+            cfg.semantic_search.resolve().supported_models(),
+            vec![("gemma".to_string(), 768), ("e5".to_string(), 1024)]
         );
+        for bad in ["name = \" \"\ndimension = 768", "name = \"x\"\ndimension = 0"] {
+            let toml = format!("{base}[[semantic_search.supported_models]]\n{bad}\n");
+            let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+            assert!(cfg.validate_supported_models().is_err(), "{bad}");
+        }
+        let twice = format!(
+            "{base}[[semantic_search.supported_models]]\nname = \"qwen\"\ndimension = 768\n\
+             [[semantic_search.supported_models]]\nname = \"QWEN\"\ndimension = 768\n"
+        );
+        let cfg: DocStoreApiConfig = toml::from_str(&twice).unwrap();
+        assert!(cfg.validate_supported_models().is_err());
     }
 
     #[test]
@@ -970,14 +828,15 @@ mod tests {
             "max_probes = 1024",
             "window_size = 4",
             "cluster_path = \"x\"",
+            "centroid_dir = \"x\"",
         ] {
             let toml = format!("[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\n{key}\n");
             let err = toml::from_str::<DocStoreApiConfig>(&toml).unwrap_err().to_string();
             assert!(err.contains("unknown field"), "{key}: {err}");
         }
-        let ok = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\ncentroid_dir = \"/c\"\n";
+        let ok = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(ok).unwrap();
-        assert_eq!(cfg.semantic_search.centroid_dir(), PathBuf::from("/c"));
+        assert_eq!(cfg.semantic_search.embedding_service_url, "http://h:1");
     }
 
     #[test]
@@ -1047,61 +906,6 @@ mod tests {
         assert_eq!(d.search, builtin.search);
         assert_eq!(d.maintenance.target_posting_size, builtin.maintenance.target_posting_size);
         assert!((d.maintenance.merge_ratio.0 - builtin.maintenance.merge_ratio.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn centroid_dir_defaults_to_the_bundled_sets() {
-        assert_eq!(
-            SemanticSearchSection::default().centroid_dir(),
-            PathBuf::from("service/embedding_support")
-        );
-    }
-
-    #[test]
-    fn without_declared_models_every_centroid_set_found_is_loaded() {
-        let dir = write_cluster_file("gemma", 8, 3);
-        let qwen = write_cluster_file("qwen", 16, 2);
-        std::fs::rename(qwen.join("qwen"), dir.join("qwen")).unwrap();
-        std::fs::create_dir_all(dir.join("empty")).unwrap(); // no clusters.json: not a model
-        std::fs::create_dir_all(dir.join("broken")).unwrap();
-        std::fs::write(dir.join("broken").join("clusters.json"), "not json").unwrap();
-        let section = SemanticSearchSection {
-            centroid_dir: Some(dir.clone()),
-            ..SemanticSearchSection::default()
-        };
-        let (loaded, problems) = section.resolve().load_cluster_indexes();
-        let got: Vec<(String, usize)> = loaded.iter().map(|(m, i)| (m.clone(), i.dim())).collect();
-        assert_eq!(got, vec![("gemma".to_string(), 8), ("qwen".to_string(), 16)]);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("broken"), "{problems:?}");
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&qwen).ok();
-    }
-
-    #[test]
-    fn declared_models_are_the_only_ones_loaded_and_are_checked_against_their_dimension() {
-        let dir = write_cluster_file("gemma", 8, 3);
-        let other = write_cluster_file("qwen", 8, 2);
-        std::fs::rename(other.join("qwen"), dir.join("qwen")).unwrap();
-        let section = SemanticSearchSection {
-            centroid_dir: Some(dir.clone()),
-            supported_models: vec![
-                SupportedModelEntry {
-                    name: "Gemma".into(),
-                    dimension: 8,
-                },
-                SupportedModelEntry {
-                    name: "qwen".into(),
-                    dimension: 16,
-                },
-            ],
-            ..SemanticSearchSection::default()
-        };
-        let (loaded, problems) = section.resolve().load_cluster_indexes();
-        assert_eq!(loaded.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(), vec!["gemma"]);
-        assert!(problems.len() == 1 && problems[0].contains("qwen"), "{problems:?}");
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&other).ok();
     }
 
     #[test]

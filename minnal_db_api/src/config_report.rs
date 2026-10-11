@@ -173,9 +173,8 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
 
     let ss = &cfg.semantic_search;
     r.add("semantic_search", "embedding_service_url", &ss.embedding_service_url);
-    r.add("semantic_search", "centroid_dir", ss.centroid_dir().display().to_string());
     let models = if ss.supported_models.is_empty() {
-        "every set in centroid_dir".to_string()
+        "any the embedding service serves".to_string()
     } else {
         ss.supported_models
             .iter()

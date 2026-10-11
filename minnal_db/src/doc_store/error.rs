@@ -121,7 +121,8 @@ pub enum SchemaError {
 /// [`DocStore`]: crate::doc_store::store::DocStore
 #[derive(Debug, Error)]
 pub enum DocStoreError {
-    /// A namespace names an embedding model this server has no centroids for.
+    /// A namespace names an embedding model this server's `supported_models`
+    /// does not list.
     #[error("embedding model '{model}' is not supported by this server (supported: {supported})")]
     UnsupportedEmbeddingModel { model: String, supported: String },
 
@@ -134,9 +135,10 @@ pub enum DocStoreError {
     #[error("namespace '{namespace}' has no seeded centres; re-enable its vector index")]
     VectorIndexNotSeeded { namespace: String },
 
-    /// A namespace's embedding dimension does not match its model's centroids.
-    #[error("embedding_dim {dim} does not match the {centroid_dim}-dimensional centroids of model '{model}'")]
-    EmbeddingDimMismatch { model: String, dim: u32, centroid_dim: usize },
+    /// A namespace's embedding dimension is not the one the server lists for
+    /// its model (or not its partition's).
+    #[error("embedding_dim {dim} does not match model '{model}', which this server runs at {expected} dimensions")]
+    EmbeddingDimMismatch { model: String, dim: u32, expected: usize },
 
     /// The underlying schema was invalid.
     #[error("schema error: {0}")]

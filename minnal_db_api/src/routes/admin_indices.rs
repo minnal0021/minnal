@@ -717,8 +717,24 @@ pub struct RebuildBody {
 /// chunk to its nearest new posting, in the background (design doc M4). 202 on
 /// start; 409 while one is running. Progress and the result are the `rebuild`
 /// field of `GET /admin/indices/{ns}/vector/partition`.
-pub async fn vector_rebuild(State(state): State<AppState>, Path(ns): Path<String>, body: Option<Json<RebuildBody>>) -> axum::response::Response {
-    let postings = body.and_then(|Json(b)| b.postings);
+pub async fn vector_rebuild(State(state): State<AppState>, Path(ns): Path<String>, body: axum::body::Bytes) -> axum::response::Response {
+    // The body is optional: an empty one (with or without a JSON content type)
+    // asks for the defaults.
+    let body: RebuildBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RebuildBody::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid rebuild body: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let postings = body.postings;
     if postings == Some(0) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "postings must be at least 1"}))).into_response();
     }

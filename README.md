@@ -17,7 +17,7 @@ For a hands-on server walkthrough — build, bulk-load, and every endpoint — s
 
 > **Companion UI:** [minnal0021/minnal_ui](https://github.com/minnal0021/minnal_ui) is a lightweight web UI that can be used to drive the minnal doc store.
 
-> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) serves the **gemma** (EmbeddingGemma-300M) and **qwen** (Qwen3-Embedding-8B) embedding models over HTTP — the external dependency semantic search needs. Run it to get started with the minnal doc store's semantic search, point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`), and set `semantic_search.model` to the model to embed with (default `qwen`) and `cluster_path` to that model's centroids.
+> **Companion embedding service:** [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service) serves the **gemma** (EmbeddingGemma-300M) and **qwen** (Qwen3-Embedding-8B) embedding models over HTTP — the external dependency semantic search needs. Run it to get started with the minnal doc store's semantic search, point `semantic_search.embedding_service_url` at it (default `http://localhost:8001`). Each store picks its model in its schema (`vector_index.embedding_model`, default `gemma`).
 
 ---
 
@@ -178,37 +178,43 @@ For the full design — how field attributes are created, updated, stored, and r
 
 Field indices answer *exact* questions. Semantic search answers *fuzzy* ones — "find the records that mean something similar to this query" — by comparing embedding vectors rather than literal values. It applies to any text-valued store: the indexed embedding fields of a JSON document store, or the string values of a `value_type = str` KV store (both expose a `semantic-search` endpoint).
 
-The `semantic-search` feature implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up step by step: how the embedding space is partitioned, how values are quantised at write time, and how a query is resolved.
+The `semantic-search` feature implements this as IVF (Inverted File Index) approximate nearest-neighbour search with **RaBitQ** quantisation and a **two-pass** sparse→dense search algorithm. The subsections below build it up step by step: how each store partitions its embeddings, how values are quantised at write time, and how a query is resolved.
 
-#### IVF Clustering
+#### IVF Partitions
 
-The embedding space is partitioned into a fixed number of clusters. The cluster centroids are pre-computed offline (e.g. with k-means over a representative corpus) and stored as a JSONL file (one `{cluster_id, centroid}` per line). At startup, minnal loads the centroids once into a read-only index shared across all requests.
+Each store partitions its own embeddings into **postings**: groups of nearby chunk vectors, each with a centre. Nothing is fitted in advance and no centroid file is needed. A store that enables semantic search starts with a single posting, and a background task keeps the partition in shape as documents arrive and leave, following SPFresh's LIRE protocol:
 
-This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their assigned `cluster_id`, so a query only has to scan the chunks in a handful of relevant clusters instead of the whole corpus. At query time the relevant clusters are chosen by an **exact** nearest-centroid scan — each query embedding's distance to every centroid is computed and the `n_probes` nearest are selected. There is deliberately **no precomputed neighbour graph over the clusters**: at the cluster counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest clusters, whereas an approximate graph traversal would trade away recall for no meaningful speed-up. (A neighbour graph would only pay off at much larger, sparser cluster counts.)
+- **Split.** A posting that grows past twice `target_posting_size` (default 128 chunks) is divided in two by balanced 2-means on its stored codes.
+- **Reassign.** After a split, any chunk of the two halves or of the 64 nearest postings that is now closer to another posting's centre moves to its nearest posting.
+- **Merge.** A posting that deletes have shrunk to under a tenth of the split size (22 chunks at the default target) is folded into a nearby one.
+
+Every step is journalled, so a crash at any point is finished on restart. `POST /admin/indices/{ns}/vector/rebuild` re-clusters a whole store from its stored codes (k-means, no embedding calls), for instance after its topics have shifted.
+
+This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their posting, so a query only has to scan the chunks of the postings nearest it instead of the whole corpus. The postings are chosen by an **exact** nearest-centre scan, nearest first, until their entries reach the store's probe budget (`probe_budget_entries`, default 70,000). There is deliberately **no precomputed neighbour graph over the postings**: at the counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest postings, whereas an approximate graph traversal would trade away recall for no meaningful speed-up.
 
 #### Dual Quantisation at Index Time
 
 Each document write triggers a **single embedding service call** that embeds one ordered payload list — `[whole_text, chunk₀, chunk₁, …]` — in one round trip (one GPU batch of `N+1`), then splits the order-preserving response by position into two complementary sets of quantised entries:
 
-1. **MultiBit (dense)** — one embedding for the entire document, quantised to `number_of_bits_for_dense_quantisation` bits per dimension. Stored in a `{ns}_dense_vector` companion namespace keyed directly by `doc_id`. At 8 bits, a 768-dimensional embedding compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction with high recall fidelity.
+1. **MultiBit (dense)** — one embedding for the entire document, quantised to 8 bits per dimension. Stored in a `{ns}_dense_vector` companion namespace keyed directly by `doc_id`. At 8 bits, a 768-dimensional embedding compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction with high recall fidelity.
 
-2. **SingleBit (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension. Stored in a `{ns}_sparse_vector` namespace under composite keys `[cluster_id (4 bytes) || doc_id]`. At 1 bit, each chunk entry is ~96 bytes — a 32× reduction, enabling fast cluster prefix scans over large corpora.
+2. **SingleBit (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension. Stored in a `{ns}_sparse_vector` namespace under composite keys `[posting_id (4 bytes) || doc_id]`. At 1 bit, each chunk entry is ~96 bytes — a 32× reduction, enabling fast posting prefix scans over large corpora.
 
-A third namespace, `{ns}_sparse_vector_meta`, records which clusters each document's sparse chunks were assigned to, used only for stale-key cleanup on delete and upsert.
+A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each document's sparse chunks, and how many, used for stale-key cleanup on delete and upsert and to count each posting's size.
 
 #### Two-Pass Search
 
 **Pass 1 — Sparse (SingleBit):**
 1. The query text is embedded **once, whole** (or fetched from the `system_qemb_cache` TTL namespace; TTL configurable via `query_embedding_cache_ttl_secs`, default 1 day). Queries are not chunked — this one vector is used by both passes.
-2. The top-`n_probes` clusters nearest the query vector by Euclidean distance are identified.
-3. All SingleBit (document-chunk) entries for the probed clusters are scanned from `{ns}_sparse_vector`.
+2. The postings nearest the query vector by Euclidean distance are chosen, nearest first, until their entries reach the probe budget.
+3. All SingleBit (document-chunk) entries for the probed postings are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
-5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed clusters.
+5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.
 6. The top `first_pass_sparse_search_top_k` candidates are retained.
 
 **Pass 2 — Dense (MultiBit):**
-1. MultiBit entries for all sparse candidates are fetched directly from `{ns}_dense_vector` by `doc_id` in parallel — a direct lookup per candidate, no cluster scan.
-2. Candidates are grouped by `cluster_id` and scored in parallel.
+1. MultiBit entries for all sparse candidates are fetched directly from `{ns}_dense_vector` by `doc_id` in one batch — a direct lookup per candidate, no posting scan.
+2. Candidates are scored in parallel. Whole-document codes are encoded against a zero centre, so one estimator serves every candidate.
 3. The top-K results are returned, sorted by estimated dot product (higher = more similar).
 
 The attribute-predicate filter is applied **only in Pass 1**. Pass 2 operates on the already-filtered candidate list.
@@ -221,7 +227,7 @@ Accuracy is validated in the test suite: at 8 bits, the relative error against t
 
 #### Embedding Service
 
-The embedding service is an external HTTP endpoint. Chunking/tokenisation happens in minnal (`semantic_search::chunking`); the service receives a batch of pre-prepared payload strings (one per chunk) and returns a parallel array of embeddings — one embedding per payload, in the same order. One service can load several models, so every request names the model in its path; `{model}` is the configured `semantic_search.model` (e.g. `gemma` or `qwen`):
+The embedding service is an external HTTP endpoint. Chunking/tokenisation happens in minnal (`semantic_search::chunking`); the service receives a batch of pre-prepared payload strings (one per chunk) and returns a parallel array of embeddings — one embedding per payload, in the same order. One service can load several models, so every request names the model in its path; `{model}` is the store's `vector_index.embedding_model` (e.g. `gemma` or `qwen`):
 
 ```
 POST {base_url}/embedding/{model}/document   {"payloads": [str, ...], "dimensions": N}  →  {"embeddings": [[f32], ...]}
@@ -229,36 +235,27 @@ POST {base_url}/embedding/{model}/query      (same request/response shape)
 GET  {base_url}/healthcheck                  → {"status": ..., "models": {"<model>": {"status": "ok", ...}, ...}}
 ```
 
-A model the service was not started with answers 404. At startup the server checks that the healthcheck lists the configured model as ready and that a probe embedding through both endpoints has `embedding_dim` dimensions; a failure is logged and semantic search reports the error at request time.
+A model the service was not started with answers 404. At startup the server checks, for each model an existing store uses, that the healthcheck lists it as ready and that a probe embedding through both endpoints has the store's `embedding_dim` dimensions; a failure is logged and semantic search reports the error at request time. The same probe runs when a store enables semantic search, and a model the service does not serve fails that request (422).
 
-#### Adding a New Embedding Model
+#### Using Another Embedding Model
 
-The set of models is **data-driven** — no code change or recompile is required. A model is defined entirely by (a) a cluster-centroid file on disk and (b) a config entry that names it. Adding one (assuming an external embedding service that serves it) is:
+The set of models is **data-driven**: no code change, recompile or centroid file is needed. To use a model:
 
-1. **Generate the cluster centroids offline.** Run k-means (or any IVF clustering) over a representative corpus *embedded with the new model*. The number of centroids is the IVF cluster count (more clusters → finer partitioning, the trade-off knob against `n_probes`). Every centroid vector must have the model's embedding dimension.
+1. **Serve it from the embedding service.** minnal sends the store's model name (lower-cased) as the `{model}` segment of every request (`/embedding/e5/document` and `/embedding/e5/query` for `e5`), so the service must load a model under that key. The companion service serves `gemma` and `qwen`; another model needs adding to the service first.
 
-2. **Write them as a JSONL file** — one `{cluster_id, centroid}` object per line, each centroid dimensioned to match the model. For the exact file format and the validation rules enforced at startup, see [`Semantic-Search-Architecture.md` §3 — IVF Index Structure](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#3-ivf-index-structure).
+2. **Name it in the store's schema** when creating the store or enabling semantic search: `"vector_index": {"embedding_model": "e5", "embedding_dim": 1024}`. The server asks the service to embed a probe with that model and rejects the request (422) if the model is not served or answers at another dimension. The store grows its own partition from its documents.
 
-3. **Place the file** at `service/embedding_support/{model}/clusters.json`, where `{model}` is the lower-cased model name (e.g. `service/embedding_support/e5/clusters.json`).
-
-4. **Declare the model** in the TOML config and select it as active:
+3. **Optionally restrict the models** a server accepts, in its TOML config:
 
    ```toml
-   [semantic_search]
-   model         = "e5"        # active model (must match an entry below; case-insensitive)
-   embedding_dim = 1024        # must equal the centroid dimension
-   cluster_path  = "service/embedding_support/e5/clusters.json"
-
    [[semantic_search.supported_models]]
-   name      = "e5"            # → service/embedding_support/e5/clusters.json
-   dimension = 1024            # must equal the centroid dimension
+   name      = "e5"
+   dimension = 1024
    ```
 
-   At startup the server validates that each declared model's cluster file exists and that its centroids match the declared `dimension`, and — when the list is non-empty — that the active `model` is one of the declared entries.
+   With entries, a store may use only the listed models at their dimensions; without any, every model the service serves.
 
-5. **Serve the model from the embedding service under the same name.** minnal sends the active `model` (lower-cased) as the `{model}` segment of every request — `/embedding/e5/document` and `/embedding/e5/query` here — so the service must load a model under that key and return vectors of `embedding_dim` dimensions for it. The companion service serves `gemma` and `qwen`; another model needs adding to the service first.
-
-6. **Re-index affected namespaces.** Existing vectors were quantised against the previous model's centroids/dimension and are not comparable. Since secondary indices are reconstructable, re-embed each namespace you want searchable under the new model with `POST /admin/indices/{ns}/vector/reindex-all` — it re-enqueues every document for embedding (a fresh full build) and returns `202 Accepted`. For a clean slate first (recommended when the dimension changes), clear the old vectors with `DELETE /admin/indices/{ns}/vector/drop-all` before re-indexing.
+A store's model and dimension are fixed once set, because its stored vectors come from that model. To search a corpus with another model, create a new store for it.
 
 For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md).
 
@@ -302,7 +299,7 @@ Document writes return immediately without blocking on the embedding service. Ve
 
 ### Layer 5 — REST API (`minnal_db_api`)
 
-An [Axum](https://github.com/tokio-rs/axum) HTTP server (the `minnal_db_api` binary crate) that wraps `minnal_db` (with `doc-store` + `semantic-search`) in a full REST interface. At startup it loads every store's schema and the IVF cluster index into memory, so requests can validate and route without touching disk first. It then serves all store, document, index, and semantic-search endpoints, tracking which namespaces have an index build or cleanup in progress so concurrent admin operations on the same namespace are rejected rather than racing each other.
+An [Axum](https://github.com/tokio-rs/axum) HTTP server (the `minnal_db_api` binary crate) that wraps `minnal_db` (with `doc-store` + `semantic-search`) in a full REST interface. At startup it loads every store's schema into memory, so requests can validate and route without touching disk first. It then serves all store, document, index, and semantic-search endpoints, tracking which namespaces have an index build or cleanup in progress so concurrent admin operations on the same namespace are rejected rather than racing each other.
 
 ---
 
@@ -343,7 +340,7 @@ It is organised by how you run minnal and which store type you use:
 - **[Getting Started](QUICKSTART.md#getting-started-bulk-load-a-store-and-query-it)** — the fastest end-to-end path: stage the release, start the server, bulk-load a bundled sample dataset, and query it.
 - **[Using minnal as a Service (REST)](QUICKSTART.md#using-minnal-as-a-service-rest)** — start the server, then work with [document and KV stores](QUICKSTART.md#document-and-kv-stores-rest-api) (CRUD, predicate queries, semantic search — full endpoint reference in [`minnal_db_api`](minnal_db_api/README.md)), plus [bulk loading](QUICKSTART.md#bulk-loading), [configuration](QUICKSTART.md#configuration), [admin/monitoring](QUICKSTART.md#admin-and-monitoring), [logging](QUICKSTART.md#logging), and [durability & recovery](QUICKSTART.md#write-durability-and-recovery).
 - **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — add `minnal_db` to a Rust process for in-process storage; feature selection (`kv-store`/`doc-store`/`semantic-search`) and code examples.
-- **[Scripts & Config](QUICKSTART.md#scripts-and-config)** — the `release.sh`/`start.sh`/`run_tool.sh` helpers, the bundled `curl` example scripts, cluster centroids, and the annotated sample config.
+- **[Scripts & Config](QUICKSTART.md#scripts-and-config)** — the `release.sh`/`start.sh`/`run_tool.sh` helpers, the bundled `curl` example scripts, vector index partitions, and the annotated sample config.
 
 ---
 
@@ -369,8 +366,7 @@ minnal/
 ├── minnal_tools/            ← minnal_tools binary (bulk_load and future tools)
 ├── service/
 │   ├── scripts/            ← release.sh / build_docker.sh / curl examples
-│   ├── docker/Dockerfile
-│   └── embedding_support/{gemma,qwen}/clusters.json  ← pre-computed IVF centroids (JSONL), one set per model
+│   └── docker/Dockerfile
 ├── config/sample.toml      ← annotated reference configuration
 └── work/bin/               ← generated by release.sh (not committed):
                                minnal_db_api, minnal.toml, start.sh, run_tool.sh

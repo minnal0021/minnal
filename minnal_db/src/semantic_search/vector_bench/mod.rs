@@ -28,14 +28,16 @@
 //! `MINNAL_BEIR_SPLIT` (`test`), `MINNAL_BENCH_MODEL` (`gemma`),
 //! `MINNAL_EMBED_URL` (only for the dump).
 //!
-//! Partition knobs: `MINNAL_BENCH_PARTITION` (`bundled` | `file` with
-//! `MINNAL_BENCH_CENTROIDS` | `grow`); in `grow` mode the namespace starts from
+//! Partition knobs: `MINNAL_BENCH_PARTITION` (`grow` | `file` with
+//! `MINNAL_BENCH_CENTROIDS`, a static baseline); in `grow` mode the namespace starts from
 //! one root posting and runs the production maintenance between batches of
 //! inserts, at `MINNAL_BENCH_TARGET` (128) chunks per posting, reassigning over
 //! `MINNAL_BENCH_REASSIGN` (64) neighbours, with the error-bound gate when
 //! `MINNAL_BENCH_GATE=1`. `MINNAL_BENCH_CHURN` (`random:<frac>` |
 //! `topic:<frac>`) deletes that share of the documents after indexing and
-//! evaluates on the survivors. `MINNAL_BENCH_TRACE` prints maintenance
+//! evaluates on the survivors. `MINNAL_BENCH_REBUILD=1` then rebuilds the
+//! partition from its codes (M4) before the evaluation, its k-means on
+//! `MINNAL_BENCH_REBUILD_THREADS` (2) threads. `MINNAL_BENCH_TRACE` prints maintenance
 //! counters after every batch.
 
 mod code_width;
@@ -106,8 +108,8 @@ struct ErrorStats {
 
 #[derive(Serialize, Deserialize)]
 struct Partition {
-    /// How the partition was made: `bundled` (the model's centroid file),
-    /// `file` (a given centroid file) or `grow` (from one root posting).
+    /// How the partition was made: `grow` (from one root posting) or `file`
+    /// (seeded from a given centroid file, for a static baseline).
     #[serde(default)]
     mode: String,
     /// Target posting size, in `grow` mode.
@@ -142,6 +144,20 @@ struct Partition {
     /// Documents deleted by the churn.
     #[serde(default)]
     deleted_docs: usize,
+    /// `MINNAL_BENCH_REBUILD=1`: the partition was rebuilt from its codes after
+    /// indexing (and churn), before the evaluation.
+    #[serde(default)]
+    rebuilt: bool,
+    /// Active postings before the rebuild.
+    #[serde(default)]
+    postings_before_rebuild: usize,
+    /// What the rebuild did, and how long it took (not in `index_seconds`).
+    #[serde(default)]
+    rebuild_seconds: f64,
+    #[serde(default)]
+    rebuild_iterations: usize,
+    #[serde(default)]
+    rebuild_moves: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -213,6 +229,36 @@ struct BenchResult {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Centres the study tools (and the worker-completion and residual benches)
+/// run against: the JSONL file named by `MINNAL_BENCH_CENTROIDS` (for example
+/// a static fit from `fit_static.py`), or else k-means on the dataset's own
+/// chunk vectors at [`STUDY_CENTRES`] centres. No centroid file ships with
+/// minnal (design doc M4).
+fn study_centroids(frozen: &Frozen) -> ClusterIndex {
+    if let Ok(path) = std::env::var("MINNAL_BENCH_CENTROIDS") {
+        let raw = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
+        return ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
+    }
+    let fit = crate::semantic_search::cluster::kmeans::kmeans(
+        frozen.n_chunks(),
+        frozen.dim(),
+        |i, buf| buf.extend_from_slice(frozen.chunk(i)),
+        &crate::semantic_search::cluster::kmeans::KmeansParams::new(STUDY_CENTRES),
+        &mut crate::semantic_search::cluster::split::SplitRng::new(SEED),
+    )
+    .expect("the dataset has chunks");
+    ClusterIndex::from_clusters(
+        fit.centres
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (i as u32, Cluster::new(i as u32, c)))
+            .collect(),
+    )
+}
+
+/// Centres [`study_centroids`] fits when given no file.
+const STUDY_CENTRES: usize = 256;
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -361,7 +407,7 @@ fn error_stats(errors: &[(f32, f32)]) -> ErrorStats {
 /// Builds codes and estimators the way indexing and `search()` do (rotated codes and
 /// query terms, ⟨q, c⟩ unrotated); a milestone that changes that wiring (centres)
 /// must change it here too.
-fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, dense_bits: usize) -> (ErrorStats, ErrorStats) {
+fn estimator_errors<L: IvfLayout + ?Sized>(frozen: &Frozen, gt: &GroundTruth, index: &L, dense_bits: usize) -> (ErrorStats, ErrorStats) {
     let nq = frozen.n_queries();
     let step = (nq / ESTIMATOR_QUERIES).max(1);
     let mut rng = SEED;
@@ -383,9 +429,9 @@ fn estimator_errors(frozen: &Frozen, gt: &GroundTruth, index: &ClusterIndex, den
         for c in chunks {
             let x = frozen.chunk(c);
             let vi = index_embedding_rotated(index, x, QuantisationStyle::SingleBit).unwrap();
-            let centroid = &index.clusters[&vi.cluster_id].centroid;
+            let centroid = index.centre(vi.centre_id).expect("the code's own centre");
             let sum = SingleBitQuanDotProductEstimator::query_sum(&rq);
-            let est = SingleBitQuanDotProductEstimator::with_query_sum(vi.cluster_id, q, centroid, sum).estimate_distance(&rq, &vi);
+            let est = SingleBitQuanDotProductEstimator::with_query_sum(vi.centre_id, q, centroid, sum).estimate_distance(&rq, &vi);
             sparse_err.push((est - dot(q, x), vi.error_bound));
         }
         let mut docs: Vec<usize> = gt.final_ranking[qi].iter().take(ESTIMATOR_TOP).map(|&d| d as usize).collect();
@@ -512,14 +558,8 @@ async fn vector_bench() {
         frozen.n_queries()
     );
 
-    let cluster_path = format!("../service/embedding_support/{model}/clusters.json");
-    let raw = read_clusters_from_file(&cluster_path).unwrap_or_else(|e| panic!("load {cluster_path}: {e}"));
-    let index = Arc::new(ClusterIndex::from_clusters(
-        raw.iter().map(|(&id, c)| (id, Cluster::new(id, c.clone()))).collect(),
-    ));
-
-    // ── The partition: the model's file, a given file, or grown from a root ──
-    let mode = env_or("MINNAL_BENCH_PARTITION", "bundled");
+    // ── The partition: grown from a root, or seeded from a given file ──
+    let mode = env_or("MINNAL_BENCH_PARTITION", "grow");
     let target: u32 = env_or("MINNAL_BENCH_TARGET", "128").parse().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
@@ -528,14 +568,13 @@ async fn vector_bench() {
     db.enable_all_workers(&DbConfig::default()).await.unwrap();
     db.namespace(NS.to_string()).await.unwrap();
     match mode.as_str() {
-        "bundled" => crate::vector_kv::seed_ivf(&db, NS, &raw).await.unwrap(),
         "file" => {
             let path = std::env::var("MINNAL_BENCH_CENTROIDS").expect("MINNAL_BENCH_CENTROIDS for MINNAL_BENCH_PARTITION=file");
             let c = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
             crate::vector_kv::seed_ivf(&db, NS, &c).await.unwrap();
         }
         "grow" => crate::vector_kv::init_ivf(&db, NS, config.embedding_dim).await.unwrap(),
-        other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (bundled | file | grow)"),
+        other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (grow | file)"),
     }
     let handle = Arc::new(crate::semantic_search::PartitionHandle::new(
         crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
@@ -651,9 +690,28 @@ async fn vector_bench() {
             maintenance.chunk_moves() as f64 / frozen.n_chunks().max(1) as f64,
         );
     }
-    drop(handle);
     let index_seconds = t.elapsed().as_secs_f64();
     eprintln!("  indexed in {index_seconds:.1}s ({:.0} docs/s)", frozen.n_docs() as f64 / index_seconds);
+    // ── Rebuild from the codes (M4), timed on its own ──
+    let rebuild = if env_or("MINNAL_BENCH_REBUILD", "0") == "1" {
+        let params = crate::ivf_split::rebuild::RebuildParams {
+            postings: None,
+            threads: env_or("MINNAL_BENCH_REBUILD_THREADS", "2").parse().unwrap(),
+        };
+        let tr = Instant::now();
+        let r = crate::ivf_split::rebuild::rebuild_partition(&db, NS, &handle, &ops, &params)
+            .await
+            .unwrap();
+        let secs = tr.elapsed().as_secs_f64();
+        eprintln!(
+            "  rebuilt in {secs:.1}s on {} thread(s): {} chunks, {} -> {} postings ({} fitted, {} iterations, {} moved)",
+            params.threads, r.chunks, r.postings_before, r.postings_after, r.postings_fitted, r.iterations, r.chunks_moved
+        );
+        Some((r, secs))
+    } else {
+        None
+    };
+    drop(handle);
     // Settle the LSM so every setting reads the same on-disk shape.
     db.shutdown().await.unwrap();
     drop(db);
@@ -698,6 +756,11 @@ async fn vector_bench() {
         reassign_candidates: maintenance.reassign_candidates,
         reassign_moves: maintenance.reassign_moves,
         drain_moves: maintenance.drain_moves,
+        rebuilt: rebuild.is_some(),
+        postings_before_rebuild: rebuild.map_or(0, |(r, _)| r.postings_before),
+        rebuild_seconds: rebuild.map_or(0.0, |(_, s)| s),
+        rebuild_iterations: rebuild.map_or(0, |(r, _)| r.iterations),
+        rebuild_moves: rebuild.map_or(0, |(r, _)| r.chunks_moved),
         moves_per_chunk: maintenance.chunk_moves() as f64 / frozen.n_chunks().max(1) as f64,
         churn: churn.clone(),
         deleted_docs: gone.len(),
@@ -720,7 +783,7 @@ async fn vector_bench() {
         assert_eq!(ivf.posting_entries(posting), Some(n as u64), "entry count of posting {posting}");
     }
 
-    let (estimator_pass1, estimator_pass2) = estimator_errors(&frozen, &gt, &index, config.number_of_bits_for_dense_quantisation);
+    let (estimator_pass1, estimator_pass2) = estimator_errors(&frozen, &gt, &*ivf, config.number_of_bits_for_dense_quantisation);
 
     // ── Search sweep ──
     let store = DbVectorStore::new(&db, NS).await.unwrap();
@@ -1007,8 +1070,7 @@ async fn vector_bench_worker_completion() {
         },
     )
     .await;
-    let raw = read_clusters_from_file(&format!("../service/embedding_support/{model}/clusters.json")).unwrap();
-    let index = ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
+    let index = study_centroids(&frozen);
     let ns = NS.to_string();
 
     let mut report = String::new();
@@ -1087,8 +1149,7 @@ fn vector_bench_residual_spread() {
             embed_url: &config.embedding_service_url,
         },
     ));
-    let raw = read_clusters_from_file(&format!("../service/embedding_support/{model}/clusters.json")).unwrap();
-    let index = ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
+    let index = study_centroids(&frozen);
     let dim = frozen.dim();
     let mut rng = SEED;
     let rows: Vec<usize> = (0..SAMPLE).map(|_| (splitmix(&mut rng) % frozen.n_chunks() as u64) as usize).collect();

@@ -1,6 +1,6 @@
 # Dynamic RaBitQ index: design and milestones
 
-**Status:** M0–M3b done; M4 next; M5 (system benchmark) designed ·
+**Status:** M0–M4 done; M5 (system benchmark) next ·
 branch `dynamic-rabitq-index` · 2026-10-11
 
 **Goal.** Remove the pre-trained centroid files. Each namespace should build and
@@ -19,7 +19,7 @@ benchmark gate, so a regression shows up in the milestone that caused it.
 | **M1** Rotation ✓ | Random orthogonal rotation of codes and query (`FhtKacRotator`) | No | Quality ≥ baseline; latency within noise |
 | **M2** Namespace-owned index ✓ | Model, dimension, chunking, code widths and search settings move into the schema; centres and postings become per-namespace data, seeded from the model's file; dense codes use a zero centre; probing by entry budget | No (same seeds) | M2a and M2b give byte-identical results to M1; M2c and M2d ≥ M1 |
 | **M3** Dynamic partitions | No centroid file: grow from one posting and split, reassign and merge by SPFresh's LIRE protocol (mean centres, 1-bit codes, no replicas); then optional per-namespace re-encoding (`stored` or `service`) | **Yes** | Within 2 pts of corpus-fitted centroids from 5% read; largest posting under 1% of entries |
-| **M4** Rebuild and clean-up | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
+| **M4** Rebuild and clean-up ✓ | Re-cluster from codes; drop centroid files and config | Yes | Rebuild uses no embedding calls; within 1 pt of fitted |
 | **M5** System benchmark under load | Nothing in the index: an open-loop, mixed-workload benchmark of the whole server (CRUD, scans, field queries, semantic search, ingestion) with every background task running | — | Run is valid only if every background task did work; reports the sustainable rate at a latency target, per operation |
 | *Optional, future:* **BYO embeddings** | A write may bring its own vectors; dense-only namespaces (see *Caller-supplied embeddings*) | No | Not on the critical path; built on demand after M3d |
 
@@ -2214,6 +2214,149 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
 - **Optional later**, each gated on its own run: SOAR spilling, a second
   centroid level above ~15–20k postings, 2-bit chunk codes.
 
+### M4 result (2026-10-11)
+
+**Passed.** A namespace's partition can be rebuilt from its 1-bit codes, and no
+centroid file remains: not in the repository, the configuration, the release
+script or the Docker image.
+
+**How the rebuild works.** It is one maintenance operation, journalled like a
+split, that drains every active posting at once (`ivf_split/rebuild.rs`):
+
+1. K-means runs over the reconstructions of every stored chunk code, in the
+   simulation's form: k-means++ on a 50,000-chunk sample, then 20 Lloyd
+   iterations (`cluster/kmeans.rs`). K is the number of active postings unless
+   the request sets it.
+2. The fitted centres become new active postings, and every old posting is
+   drained into its nearest new one through the split's copy, barrier and
+   delete steps.
+3. The ordinary maintenance then splits whatever k-means left oversized.
+
+No code is re-encoded and no embedding is requested. Writes and searches go on
+throughout, and a crash is finished at the next start (a `Planned` rebuild is
+abandoned, a published one redone).
+
+It is triggered by hand: `POST /admin/indices/{ns}/vector/rebuild` returns 202
+(409 while one runs), and progress is the `rebuild` field of the partition
+endpoint. Built otherwise than the plan above said:
+
+- **No automatic trigger.** No drift threshold was ever set (*Partition health*).
+  M3b measured that churn does not wear a partition (gate f), and the one gap a
+  rebuild closes, growth that took topics one at a time, is known when it
+  happens.
+- **No seeding from the 8-bit dense vectors.** Fitting on the 1-bit
+  reconstructions alone lands within 1 point of the float fit (below), so the
+  option was not needed.
+- **Our own k-means, not a crate (user decision).**
+  - `kmeans` needs a nightly compiler.
+  - `clustering` is unseeded and seeds by farthest point.
+  - `linfa-clustering` adds about ten crates and needs every point as floats in
+    memory (FiQA: 530 MB).
+
+  Ours streams over the codes, so memory is the codes (about 20 MB), and it uses
+  the same SIMD distances as search. Its centres are summed in point order, so a
+  seed gives the same centres on any thread count.
+- **K-means runs on a pool of its own**, of `rebuild_threads` threads, at most 2
+  (user decision). Searches share the global pool, so a long job there would be
+  stolen by a search waiting in a `join`.
+
+**Gate runs.** Each run grows the partition at target 128 with full M3b
+maintenance, rebuilds it, then evaluates. Two baselines:
+
+- "static" is k-means fitted on the floats at the grown K (*M3b result*);
+- "grown" is the same growth without the rebuild.
+
+Recall@10 is in points against static, at equal shares of the chunks read; the
+gate was within 1 point from 5% read.
+
+| | K before → after | Rebuild time | At 1% read: rebuilt / grown | At 5% read: rebuilt / grown | nDCG@10–@100 vs grown, 70k | p50 at 70k, rebuilt vs grown |
+|---|---|---|---|---|---|---|
+| SciFact gemma, drifting | 137 → 153 | 7 s | +1.7 / −1.1 | −0.5 / −1.8 | 0.0000 | 3.22 vs 3.11 ms |
+| SciFact gemma, shuffled | 133 → 151 | 7 s | +0.7 / −3.7 | −1.0 / −1.4 | 0.0000 | 3.17 vs 3.14 ms |
+| SciFact qwen, drifting | 137 → 156 | 7 s | −0.2 / −4.5 | +0.1 / −1.0 | 0.0000 | 3.09 vs 3.09 ms |
+| SciFact qwen, shuffled | 134 → 143 | 7 s | −2.4 / −5.6 | −0.6 / −1.8 | 0.0000 | 3.09 vs 3.01 ms |
+| FiQA gemma, drifting | 993 → 1,071 | 151 s | −0.1 / −3.3 | −0.2 / −1.0 | 0.0000 | 15.47 vs 14.64 ms |
+| FiQA gemma, shuffled | 988 → 1,088 | 151 s | −0.5 / −2.3 | −0.4 / −0.9 | 0.0000 | 15.49 vs 14.50 ms |
+| FiQA qwen, drifting | 976 → 1,084 | 147 s | −0.4 / −2.4 | −0.1 / −0.8 | 0.0000 | 15.77 vs 14.68 ms |
+| FiQA qwen, shuffled | 957 → 1,067 | 143 s | −0.8 / −1.9 | −0.1 / −0.4 | 0.0000 | 15.24 vs 14.89 ms |
+
+- **Recall within 1 point of static from 5% read:** passed in every run (worst
+  −1.00 exactly, SciFact gemma shuffled at 5%: 0.940 against 0.950, 30 of the
+  3,000 top-10 places across 300 queries). The rebuild gains most at small read shares and where topics
+  arrived in turn: up to 4.4 points at 1% read on SciFact, 3.2 on FiQA. It
+  reproduces the simulation's finding that a fit on 1-bit codes is as good as
+  one on floats (0.978 against 0.976).
+- **nDCG@{10..100} ≥ pre-rebuild − 0.005:** passed; every cutoff is unchanged
+  to 0.0001. SciFact is read in full at the default 70k budget, so its nDCG
+  cannot move.
+- **No embedding calls:** the rebuild has no path to the embedding service. A
+  doc-store test counts the service's requests across a rebuild (none), and the
+  end-to-end check below runs one with the service unreachable.
+- **Cost:**
+  - FiQA (173,000 chunks) takes 143–151 s on 2 threads: about 60 s of k-means
+    (2.8 s per iteration, 6 s of seeding), the rest moving every chunk's key
+    once and the follow-up splits.
+  - SciFact takes 7 s.
+- **The rebuilt partition has more, smaller postings.** K-means does not
+  balance sizes, so the splits that follow add 8–14% postings. Reaching the
+  70k-entry budget then takes about 13% more probes, which adds 2–7% to FiQA's
+  p50 at the default budget. Recall per entry read is what improves. Fitting
+  fewer centres (`{"postings": n}`) brings K back down if latency matters more.
+
+**Removed:**
+- the bundled `service/embedding_support/{gemma,qwen}/clusters.json` files and
+  their Git LFS rule;
+- the `centroid_dir` setting (a config that still sets it fails to load: unknown
+  keys are rejected), and the server's loading of centroid sets;
+- `seed_ivf` from production (it stays as a test and bench helper for static
+  baselines) and the `seeded_from` schema field;
+- the centroid staging in `release.sh` and the Docker image;
+- the "Cluster centroids" sections of the READMEs, QUICKSTARTs and the
+  architecture doc.
+
+Semantic search no longer depends on a file loading at startup.
+`[[semantic_search.supported_models]]` becomes an optional allow-list; without
+it, any model the embedding service serves is accepted, and the enable-time
+probe of the service rejects one it does not serve (422).
+
+Tests, benches and study tools that read a bundled file now fit their own
+centres:
+- the service unit tests use a fixed synthetic set;
+- the criterion bench runs k-means on its documents;
+- the study tools take `MINNAL_BENCH_CENTROIDS` or fit 256 centres on the
+  dataset's chunks;
+- `beir_eval` requires a centroid file (`MINNAL_BEIR_CENTROIDS`).
+
+`real_recall_vs_nprobes`, a recall harness for fixed probe counts, was deleted:
+it depended on the bundled file, and the vector bench (M0) replaced it.
+Namespaces seeded from a file before M3 still load (`PostingOrigin::Seed`
+decodes), and a rebuild moves them onto their own centres.
+
+**Crash safety.** `a_rebuild_survives_a_crash_before_any_write` stops a rebuild
+before each of its writes, under four flush patterns, then reopens and
+recovers. Every invariant holds, and with the barrier flush removed the test
+fails (202 failures). Writers racing a rebuild lose nothing, and searches
+during one miss nothing.
+
+**End to end** (`work/e2e_m4/run.py`). It runs a scratch API server on its own
+port and database, with the real embedding service and `target_posting_size`
+16:
+
+1. A config that still sets `centroid_dir` is refused at startup.
+2. 600 SciFact documents grow 125 postings.
+3. Restarted with the embedding service unreachable, a rebuild into 62
+   postings completes (131 after its splits). Each documented REST answer was
+   checked: 202 to start, 409 for a second start, 400 for `postings` 0, and 422
+   for a store without semantic search. The last was 202 before this run: a
+   bug, fixed.
+4. A second rebuild is killed with SIGKILL 0.7 s in, with its record in the
+   journal. On restart, recovery handles it and leaves no operation
+   unfinished; the chunk count is unchanged.
+5. A live document is still found first by its title.
+
+The on-disk check (`e2e_partition_invariants`, server stopped) finds every key
+in an active posting and every count equal to a recount.
+
 ---
 
 ## M5 — System benchmark under load (last)
@@ -2401,7 +2544,7 @@ a second dataset (SciFact, which splits far less) is worth its run time.
 | 3 | Changing a store's model | Not supported: model and dimension are fixed once selected. A drop-and-re-index operation may be added later |
 | 4 | Existing data | Not a concern; stores are recreated after format changes |
 | 5 | When to start clustering and when to split | From the first chunk, by splitting (option C); see decision 11 |
-| 6 | Bundled centroid files | Deleted in M4 |
+| 6 | Bundled centroid files | Deleted in M4 (done 2026-10-11) |
 | 7 | Which settings the namespace owns (2026-10-04) | Model (default gemma) and dimension (default 768), chunking (fixed once set), code widths (read-only, 1 and 8), search settings (changeable, with per-request overrides); defaults written into the schema (M2a) |
 | 8 | Pass-2 centre (2026-10-04) | Zero centre, recorded in the schema; Pass-2 widths limited to 4–8 bits when they become choosable (M2c-pre) |
 | 9 | BYO embeddings (2026-10-04) | An optional, future extra (M3f), designed but not scheduled. A write may carry the document's vectors (`embedding_source`: `service`, `supplied`, `either`), validated and stored WAL-backed in `{ns}_raw_vector`, encoded through an `Encode` queue kind. Queries are always embedded by the service with the namespace's model, which must be served (else 422). A namespace without chunks (`pass1 = none`, supplied only) is dense-only and single-pass (M3f) |

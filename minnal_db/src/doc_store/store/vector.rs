@@ -25,6 +25,7 @@ impl DocStore {
         let Some(ctx) = &self.semantic_ctx else {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         };
+        require_semantic_search(&self.schema_dir, namespace)?;
         let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
         let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
         let (summary, postings) = crate::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
@@ -42,6 +43,7 @@ impl DocStore {
         let Some(ctx) = &self.semantic_ctx else {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         };
+        require_semantic_search(&self.schema_dir, namespace)?;
         let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
         ctx.claim_rebuild(namespace, postings)?;
         let (db, ctx, namespace) = (Arc::clone(&self.db), Arc::clone(ctx), namespace.to_owned());
@@ -1672,7 +1674,7 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_reconciliation_runs_after_the_crash_queue_is_processed() {
-        use crate::semantic_search::{Cluster, ClusterIndex, service::SemanticSearchConfig};
+        use crate::semantic_search::service::SemanticSearchConfig;
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let store = open_kv_semantic(&db_dir, &schema_dir).await;
         store
@@ -1686,17 +1688,11 @@ mod tests {
         vector_kv::remove_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
         vector_kv::clear_vectors(&store.db, "sem_kv", b"x").await.unwrap(); // the delete, cut short by a crash
 
-        let ctx = SemanticSearchContext::new(
-            SemanticSearchConfig {
-                embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
-                embedding_connect_timeout: std::time::Duration::from_millis(200),
-                ..SemanticSearchConfig::default()
-            },
-            [(
-                "gemma".to_string(),
-                Arc::new(ClusterIndex::from_clusters([(1, Cluster::new(1, vec![0.0; 768]))].into_iter().collect())),
-            )],
-        );
+        let ctx = SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        });
         let store = store.with_semantic_search(ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {

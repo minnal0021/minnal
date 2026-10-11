@@ -30,8 +30,7 @@ use super::super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen;
 use super::paired_delta;
-use crate::semantic_search::ClusterIndex;
-use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
+use crate::semantic_search::cluster::Cluster;
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
 use crate::semantic_search::quantisation::rabitq::{index_embedding_rotated, index_embedding_to_cluster};
@@ -134,8 +133,7 @@ async fn vector_bench_code_width() {
     .await;
     let gt = exact::load_or_compute(&frozen_dir, &frozen);
     let qrels = read_qrels(&dataset_dir.join("qrels").join(format!("{split}.tsv")));
-    let raw = read_clusters_from_file(&format!("../service/embedding_support/{model}/clusters.json")).unwrap();
-    let index = ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
+    let index = super::study_centroids(&frozen);
     let (nd, nq, dim) = (frozen.n_docs(), frozen.n_queries(), frozen.dim());
     eprintln!(
         "\n=== code width: {dataset} ({model}), {nd} docs, {} chunks, {nq} queries ===",

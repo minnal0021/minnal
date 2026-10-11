@@ -219,9 +219,8 @@ async fn update_vector_search_changes_only_search_settings() {
 #[cfg(feature = "semantic-search")]
 mod with_service {
     use super::*;
-    use crate::semantic_search::cluster::Cluster;
+    use crate::semantic_search::chunk_document;
     use crate::semantic_search::service::SemanticSearchConfig;
-    use crate::semantic_search::{ClusterIndex, chunk_document};
 
     const DIM: usize = 8;
 
@@ -301,27 +300,12 @@ mod with_service {
         (url, seen)
     }
 
-    /// Centroids for one model: two clusters with ids starting at `first_id`.
-    fn centroids(first_id: u32, axis: usize) -> Arc<ClusterIndex> {
-        let mut a = vec![0.0f32; DIM];
-        a[axis] = 1.0;
-        let mut b = vec![0.0f32; DIM];
-        b[(axis + 2) % DIM] = 1.0;
-        Arc::new(ClusterIndex::from_clusters(
-            [(first_id, Cluster::new(first_id, a)), (first_id + 1, Cluster::new(first_id + 1, b))]
-                .into_iter()
-                .collect(),
-        ))
-    }
-
     fn context(url: &str) -> SemanticSearchContext {
-        SemanticSearchContext::new(
-            SemanticSearchConfig {
-                embedding_service_url: url.to_string(),
-                ..SemanticSearchConfig::default()
-            },
-            [("gemma".to_string(), centroids(1, 0)), ("qwen".to_string(), centroids(101, 1))],
-        )
+        SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: url.to_string(),
+            ..SemanticSearchConfig::default()
+        })
+        .with_supported_models([("gemma".to_string(), 8), ("qwen".to_string(), 8)])
     }
 
     async fn wait_for_empty_queue(store: &DocStore) {
@@ -505,6 +489,16 @@ mod with_service {
         let calls = seen.lock().len();
 
         assert_eq!(store.vector_rebuild_status("g"), None);
+        store
+            .create(semantic_schema("plain", Some(spec(r#"{"embedding_dim":8}"#))))
+            .await
+            .unwrap();
+        store.disable_semantic_search("plain").unwrap();
+        assert!(matches!(
+            store.start_vector_rebuild("plain", None),
+            Err(DocStoreError::SemanticSearchNotEnabled { .. })
+        ));
+        assert!(matches!(store.start_vector_rebuild("missing", None), Err(DocStoreError::NotFound { .. })));
         let busy = partition.lock_maintenance().await; // holds the rebuild back
         store.start_vector_rebuild("g", Some(2)).unwrap();
         assert!(matches!(
@@ -770,17 +764,7 @@ mod with_service {
             .create(semantic_schema("wide", Some(spec(r#"{"embedding_dim":16}"#))))
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                DocStoreError::EmbeddingDimMismatch {
-                    dim: 16,
-                    centroid_dim: 8,
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
+        assert!(matches!(err, DocStoreError::EmbeddingDimMismatch { dim: 16, expected: 8, .. }), "{err:?}");
         assert!(!schema_dir.path().join("e5.json").exists() && !schema_dir.path().join("wide.json").exists());
 
         store.create(make_schema("later", vec![])).await.unwrap();
@@ -802,17 +786,6 @@ mod with_service {
 
     // ── M2b: the namespace's own partition ──
 
-    /// A context whose `gemma` seed source holds `centroids(first_id, axis)`.
-    fn context_with(url: &str, first_id: u32, axis: usize) -> SemanticSearchContext {
-        SemanticSearchContext::new(
-            SemanticSearchConfig {
-                embedding_service_url: url.to_string(),
-                ..SemanticSearchConfig::default()
-            },
-            [("gemma".to_string(), centroids(first_id, axis)), ("qwen".to_string(), centroids(101, 1))],
-        )
-    }
-
     async fn results(store: &DocStore, ns: &str) -> Vec<(Vec<u8>, u32)> {
         let page = store
             .search_semantic(ns, "hello", &SearchSpec::default(), Pagination::default())
@@ -828,7 +801,6 @@ mod with_service {
         let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
         store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
         let vi = store.get_schema("g").unwrap().vector_index.unwrap();
-        assert_eq!(vi.seeded_from, None, "no centroid file is copied");
         assert_eq!(vi.quantisation.unwrap().rotation_seed.as_deref(), Some("0x6d696e6e616c0001"));
         let root = vector_kv::load_ivf(&store.db, "g", 1).await.unwrap().expect("a root posting");
         assert_eq!((root.postings(), root.centres()), (1, 1));
@@ -863,38 +835,6 @@ mod with_service {
     }
 
     #[tokio::test]
-    async fn a_namespace_never_reads_the_servers_centroid_files() {
-        let (url, _seen) = spawn_service();
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_fresh(db_dir.path(), schema_dir.path())
-            .await
-            .with_semantic_search(context_with(&url, 1, 0));
-        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
-        for i in 1..=3u64 {
-            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
-        }
-        wait_for_empty_queue(&store).await;
-        let before = results(&store, "g").await;
-        assert_eq!(before.len(), 3);
-        store.shutdown_vec_index_worker().await;
-        store.shutdown().await.unwrap();
-        drop(store);
-
-        // The server's gemma centroids change (same ids, other values): the
-        // namespace keeps its own, so every score is bit-identical.
-        let store = open_fresh(db_dir.path(), schema_dir.path())
-            .await
-            .with_semantic_search(context_with(&url, 1, 3));
-        assert_eq!(results(&store, "g").await, before);
-        // A document indexed now is encoded against the stored centres too.
-        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
-        wait_for_empty_queue(&store).await;
-        assert_eq!(results(&store, "g").await, before);
-        store.shutdown_vec_index_worker().await;
-        store.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn dropping_a_store_removes_its_partition_and_a_recreated_store_gets_its_own() {
         let (url, _seen) = spawn_service();
         let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
@@ -916,26 +856,6 @@ mod with_service {
         wait_for_empty_queue(&store).await;
         assert_eq!(sparse_clusters(&store, "s").await, vec![0], "a fresh root");
         assert_eq!(results(&store, "s").await.len(), 1);
-        store.shutdown_vec_index_worker().await;
-        store.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn seeded_from_cannot_be_given_in_a_request() {
-        let (url, _seen) = spawn_service();
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
-        let err = store
-            .create(semantic_schema(
-                "g",
-                Some(spec(r#"{"embedding_dim":8,"seeded_from":{"file":"x","murmur3_128":"00","centres":1}}"#)),
-            ))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, DocStoreError::Schema(SchemaError::InvalidVectorSetting { field: "seeded_from", .. })),
-            "{err:?}"
-        );
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
     }

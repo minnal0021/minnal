@@ -24,7 +24,7 @@ use super::super::metrics::beir_eval::{env_or, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen::{self, Frozen};
 use super::splitmix;
-use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
+use crate::semantic_search::cluster::find_closest_cluster_id;
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::QuantisationStyle;
 use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
@@ -272,10 +272,7 @@ async fn vector_bench_pass1_study() {
     );
     let gt = exact::load_or_compute(&frozen_dir, &frozen);
     let qrels = read_qrels(&dataset_dir.join("qrels").join(format!("{split}.tsv")));
-    let raw = read_clusters_from_file(&format!("../service/embedding_support/{model}/clusters.json")).unwrap();
-    let index = Arc::new(ClusterIndex::from_clusters(
-        raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(),
-    ));
+    let index = Arc::new(super::study_centroids(&frozen));
     let (nd, nq, dim) = (frozen.n_docs(), frozen.n_queries(), frozen.dim());
     eprintln!(
         "\n=== pass-1 study: {dataset} ({model}), {nd} docs, {} chunks, {nq} queries ===",

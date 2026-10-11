@@ -371,6 +371,30 @@ impl DocStore {
 /// The resolved vector-index settings and `ns_id` of `namespace`, whichever kind
 /// of store it is, read from its schema file.
 #[cfg(feature = "semantic-search")]
+/// `Err(SemanticSearchNotEnabled)` unless `namespace` (document or KV store)
+/// has semantic search enabled; `Err(NotFound)` for an unknown namespace.
+#[cfg(feature = "semantic-search")]
+pub(crate) fn require_semantic_search(schema_dir: &Path, namespace: &str) -> Result<(), DocStoreError> {
+    let json = std::fs::read_to_string(schema_dir.join(format!("{namespace}.json"))).map_err(|_| DocStoreError::NotFound {
+        namespace: namespace.to_owned(),
+    })?;
+    let enabled = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => serde_json::from_str::<KvStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .is_semantic_search_enabled(),
+        _ => serde_json::from_str::<DocStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .is_semantic_search_enabled(),
+    };
+    if enabled {
+        Ok(())
+    } else {
+        Err(DocStoreError::SemanticSearchNotEnabled {
+            namespace: namespace.to_owned(),
+        })
+    }
+}
+
 pub(crate) fn load_vector_settings(
     schema_dir: &Path,
     namespace: &str,

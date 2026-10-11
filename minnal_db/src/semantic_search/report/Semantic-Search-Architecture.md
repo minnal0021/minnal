@@ -14,9 +14,9 @@ Minnal does **not** generate embeddings itself. It relies on an **external embed
 
 The service is reached over **HTTP**. Its base URL is configured under `[semantic_search]` in the TOML config (`embedding_service_url`) and defaults to `http://localhost:8001`.
 
-One service can load several models, so **minnal names the model on every request**. The `model` setting under `[semantic_search]` (e.g. `gemma` or `qwen`; default `qwen`; lower-cased before use) is sent as the `{model}` path segment of both embedding endpoints, so it decides which of the service's models embeds the text. The service answers 404 for a model it was not started with. Which build of a model sits behind a name (its quantisation, say) is still the service's choice.
+One service can load several models, so **minnal names the model on every request**. Each store chooses its model in its schema (`vector_index.embedding_model`, e.g. `gemma` or `qwen`; default `gemma`; lower-cased before use), and that name is sent as the `{model}` path segment of both embedding endpoints, so it decides which of the service's models embeds the text. The service answers 404 for a model it was not started with. Which build of a model sits behind a name (its quantisation, say) is still the service's choice.
 
-The model must be the one the cluster centroids (`cluster_path`) were fitted on, and the one every stored vector was embedded with: the same text embeds to unrelated vectors under different models. `model` and `cluster_path` are separate settings, and both bundled centroid sets are 768-dimensional, so the wrong file loads without error. The API server compares the centroids at `cluster_path` with the bundled set for `model` (`service/embedding_support/{model}/clusters.json`) at startup and logs a warning when they differ; it is a warning, not an error, because centroids fitted on your own corpus legitimately differ. When there is no bundled set to compare against (a custom model, a working directory other than the workspace root, or the library used directly), the pairing is on the operator. Changing `model` therefore means pointing `cluster_path` at that model's centroids and re-indexing every semantic-search store.
+Every stored vector of a store must come from the same model: the same text embeds to unrelated vectors under different models. That is why a store's model, dimension and chunking are fixed once semantic search is enabled. When a store enables semantic search, the API server embeds a probe text with the store's model and rejects the request (422) if the service does not serve the model or returns another dimension. A server can also restrict the models it accepts (`[[semantic_search.supported_models]]`, each with its dimension); without that list it accepts any model the service serves.
 
 ### Service interface
 
@@ -67,9 +67,7 @@ The service answers 503 while *any* of its models is still loading, so minnal ju
 
 ### Embedding dimension
 
-The expected embedding size is configurable via `embedding_dim` under `[semantic_search]` and **defaults to 768**. Both bundled cluster-centroid files (`service/embedding_support/{gemma,qwen}/clusters.json`) contain **768-dimensional** centroids, so the default works out of the box.
-
-> ⚠️ **Changing `embedding_dim` requires regenerating the cluster-centroid file.** The centroids in `clusters.json` must have the *same dimensionality* as the embeddings the service returns — IVF cluster assignment computes Euclidean distance between an embedding and each centroid, which is only defined for equal-length vectors. If you point minnal at a service that produces a different embedding size, you **must** also supply a matching `clusters.json` (see [§3](#3-ivf-index-structure)) whose centroids have that dimensionality, and re-index the corpus. The default 768-dimensional centroids shipped in `clusters.json` are only valid for 768-dimensional embeddings.
+Each store sets the embedding size in its schema (`vector_index.embedding_dim`, **default 768**), sent to the service as `dimensions` on every request. Nothing else has to match it: a store's IVF centres are fitted from its own vectors (see [§3](#3-ivf-index-structure)), so a model of any dimension works without preparing a file. The rotation codes are computed in needs an even dimension of at least 8.
 
 ### Normalisation
 
@@ -84,8 +82,7 @@ Before storage, embeddings are compressed using **RaBitQ** (`quantisation/rabitq
 ### MultiBit (dense, whole-document)
 
 1. A single embedding is obtained for the entire document text.
-2. The nearest cluster centroid is found by Euclidean L2.
-3. The residual `embedding − centroid` is quantised to N bits per dimension (`number_of_bits_for_dense_quantisation`, default 8).
+2. It is quantised to 8 bits per dimension against a **zero centre**: the code depends on no IVF centre, so it never needs re-encoding when the partition changes, and one estimator scores every candidate.
 
 The result is stored in the **dense namespace** (`{ns}_dense_vector`) keyed directly by `doc_id`. For 768-dimensional embeddings at 8 bits, each entry compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction.
 
@@ -93,11 +90,11 @@ The result is stored in the **dense namespace** (`{ns}_dense_vector`) keyed dire
 
 1. The document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`).
 2. The embedding service returns one embedding per chunk.
-3. Each chunk embedding is independently assigned to its nearest IVF cluster and quantised to 1 bit per dimension.
+3. Each chunk embedding is routed to its nearest IVF posting and quantised to 1 bit per dimension, as a residual against that posting's centre.
 
-The result is stored in the **sparse namespace** (`{ns}_sparse_vector`) under composite keys `[cluster_id (4B BE) ‖ doc_id]`. For 768-dimensional embeddings, a SingleBit entry is ~96 bytes — a 32× reduction versus f32, enabling fast first-pass scans over large cluster partitions.
+The result is stored in the **sparse namespace** (`{ns}_sparse_vector`) under composite keys `[posting_id (4B BE) ‖ doc_id]`. For 768-dimensional embeddings, a SingleBit entry is ~96 bytes — a 32× reduction versus f32, enabling fast first-pass scans of the probed postings.
 
-A third companion namespace, **`{ns}_sparse_vector_meta`**, records which clusters each document's chunks were assigned to. This is used only by delete and upsert operations to clean up stale composite keys; it is never consulted during search.
+A third companion namespace, **`{ns}_sparse_vector_meta`**, records which postings hold each document's chunks, and how many. Delete and upsert use it to clean up stale composite keys, and each posting's size is counted from it when the partition loads; search never consults it.
 
 ### The `VectorIndex` struct
 
@@ -105,39 +102,33 @@ All quantised entries share the same `VectorIndex` struct:
 
 | Field | Purpose |
 |---|---|
-| `cluster_id` | The IVF cluster this entry belongs to |
-| `binary_quantised_vector` | Packed bit codes (96 bytes SingleBit, ~768 bytes 8-bit MultiBit) |
+| `cluster_id` | The IVF posting this entry is filed under (its key prefix) |
+| `centre_id` | The centre the code was encoded against. A code is always decoded through it, never through the posting it is filed under, so maintenance can move a code between postings without re-encoding it |
+| `packed_vector` | Packed bit codes (96 bytes SingleBit, ~768 bytes 8-bit MultiBit) |
 | `addition_factor` | Scalar correction coefficient for distance estimation |
 | `scaling_factor` | Scalar correction coefficient for distance estimation |
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
 | `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
 
-**Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one fixed orthogonal transform `P` (`semantic_search/quantisation/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
+**Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one orthogonal transform `P`, seeded per store (`vector_index.quantisation.rotation_seed`) (`semantic_search/quantisation/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
 
 ---
 
 ## 3. IVF Index Structure
 
-The index is **Inverted File (IVF) with flat scanning** (`cluster/mod.rs`):
+The index is **Inverted File (IVF) with flat scanning**, and every store has its own partition into **postings** (`cluster/layout.rs`, `ivf_split.rs`). No centroid file is prepared or shipped: a store that enables semantic search starts with one posting at the zero centre, and a background task grows the partition from the store's own vectors, following SPFresh's LIRE protocol (Xu et al., SOSP 2023):
 
-- A `ClusterIndex` maps `cluster_id → centroid (Vec<f32>)`.
-- **Cluster probing is exact and exhaustive.** For the Pass-1 query embedding, `find_top_n_cluster_ids` computes the Euclidean distance to **every** centroid — nothing is pruned. To pick the `n_probes` nearest it does *not* sort all `C` centroids: `select_nth_unstable` partitions the distance array in ~O(C) so the `n_probes` smallest end up on one side (unordered), then only that small set is sorted (~O(n_probes log n_probes)) to return them nearest-first. Production queries are not chunked, so there is **one** Pass-1 query vector and exactly `n_probes` clusters are scanned (`search()` still accepts several vectors, in which case the union of their sets is scanned once).
-- **Choosing clusters is cheap at this scale.** The cost is **T·C·D** (query vectors × centroids × dimensions), and in production `T = 1`, so it is one distance scan per query: about 9 µs at C = 256.
+- **Split.** A posting holding more than twice `target_posting_size` chunks (default 128) is divided by balanced 2-means on its codes' reconstructions. The two new centres are the means of their halves.
+- **Reassign.** The chunks of the two halves and of the 64 postings nearest the old centre that are now nearer another centre move to their nearest posting.
+- **Merge.** A posting that deletes have left with `round(2 · target · 10/118)` chunks or fewer (22 at the default target) is folded into a nearby posting with room.
+- **Rebuild, by hand.** `POST /admin/indices/{ns}/vector/rebuild` re-clusters the whole store: k-means over its codes' reconstructions, then every chunk moves to its nearest new posting. It needs no embedding calls.
 
-Clusters are loaded from the file at `cluster_path` (`clusters.json`) at startup. The file is **JSONL** — one JSON object per line, each describing a single cluster centroid with exactly two attributes:
+A moved code keeps the centre it was encoded against (`centre_id`), so no maintenance step re-encodes anything. Each step is a sequence of single-key writes recorded in a WAL-backed journal (`{ns}_ivf_journal`), and a crash part-way is finished at the next start. Searches and writes continue throughout: they hold a read guard on the store's routing epoch, and maintenance publishes a new routing snapshot under its write guard.
 
-| Attribute | Type | Meaning |
-|---|---|---|
-| `cluster_id` | unsigned integer (`u32`) | Stable identifier for the cluster; used as the 4-byte big-endian key prefix in `{ns}_sparse_vector` and to look up centroids during probing. |
-| `centroid` | array of `f32` | The centroid vector. Its length **must** equal the configured embedding dimension. |
+- **Probing is exact and exhaustive.** For the Pass-1 query embedding, the distance to **every** posting's routing centre is computed — nothing is pruned — and postings are taken nearest first until their entries reach the store's probe budget (`probe_budget_entries`, default 70,000), at least `min_probes` and at most `max_probes`. Production queries are not chunked, so there is **one** Pass-1 query vector (`search()` still accepts several, in which case the union of their sets is scanned once).
+- **Choosing postings is cheap at this scale.** The cost is **T·C·D** (query vectors × postings × dimensions), and in production `T = 1`, so it is one distance scan per query: about 9 µs at C = 256, growing linearly with the number of postings.
 
-```jsonl
-{"cluster_id": 0, "centroid": [0.0123, -0.0456, 0.0789, ...]}
-{"cluster_id": 1, "centroid": [-0.0210,  0.0337, 0.0042, ...]}
-{"cluster_id": 2, "centroid": [0.0500, -0.0011, -0.0623, ...]}
-```
-
-Lines are parsed independently (`read_clusters_from_file` in `cluster/mod.rs`): any line missing `cluster_id` is an error, and `centroid` is deserialised directly into a `Vec<f32>`. Extra attributes on a line are ignored, blank lines are skipped, and `cluster_id` values need not be contiguous or sorted.
+The partition's state is reported by `GET /admin/indices/{ns}/vector/partition` and `/postings`. The design, the simulation behind its numbers, and the measured gates are in [`Dynamic-RaBitQ-Index-Design.md`](Dynamic-RaBitQ-Index-Design.md).
 
 ---
 
@@ -155,8 +146,9 @@ Raw query text
   → cache it (TTL configurable; default 1 day)
 
 Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
-  find top-n_probes cluster IDs for q by Euclidean distance
-    (several query vectors → union of their cluster sets)
+  rank every posting by the distance of q to its routing centre; take them
+    nearest first until their entries reach the probe budget
+    (several query vectors → union of their posting sets)
   scan_sparse_clusters_batch(probed ids)        ← one LSM pass per layer for all
                                                   probed clusters, then one value-log
                                                   pread per entry
@@ -175,8 +167,7 @@ Pass 2 — Dense (MultiBit):
   get_dense_entries_batch(candidate doc_ids)    ← one batch read
   ── SCORING_GATE permit ──
   for each candidate (rayon parallel):
-    look up its centroid via the stored VectorIndex's cluster_id
-    score with MultiBitQuanDotProductEstimator against the single
+    score with MultiBitQuanDotProductEstimator (zero centre) against the single
       whole-query dense embedding
   build top-k min-heap
   return sorted descending
@@ -188,14 +179,15 @@ Almost all of a warm query's time goes into Pass 1's sparse scan: merging the
 LSM layers for each probed cluster, then one value-log read per entry, then
 decoding and scoring. Pass 2 is small and roughly fixed, since it re-scores a
 capped candidate set. So latency follows **how many sparse entries the probed
-clusters hold**. On FiQA (57,638 documents) with matching gemma centroids and
-the default 64 probes, a warm query takes about 17 ms.
+postings hold**, which the probe budget caps. On FiQA (57,638 documents,
+173,000 chunks) with gemma and the default 70,000-entry budget, a warm query
+takes about 15 ms.
 
-That makes cluster balance the main lever. The bundled centroids are fitted on
-general text; on a specialist corpus most chunks can land in a few clusters
-(43% of SciFact's documents fall in one), and then each probe reads a large
-share of the index. Centroids fitted on the corpus itself spread the entries
-out, so the same recall needs far fewer entries read.
+That makes small, on-topic postings the main lever: they find more of the right
+documents per entry read. Centroids fitted on general text, rather than on the
+store's own vectors, put most of a specialist corpus in a few clusters (43% of
+SciFact's documents fell in one of 256), so each probe read a large share of the
+index; that is why every store now fits its own.
 
 ### Concurrency
 
@@ -241,15 +233,18 @@ This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtere
 
 ## 5. Storage Layout
 
-Three companion KVStore namespaces per semantic-search-enabled store (`vector_kv.rs`):
+Companion KVStore namespaces per semantic-search-enabled store (`vector_kv.rs`):
 
 | Namespace | Key | Value |
 |---|---|---|
-| `{ns}_sparse_vector` | `cluster_id (4B BE u32) ‖ doc_id` | rkyv `Vec<VectorIndex>` (SingleBit only) |
-| `{ns}_sparse_vector_meta` | `doc_id` | `count (2B BE u16) ‖ [cluster_id (4B BE)]×N` |
+| `{ns}_sparse_vector` | `posting_id (4B BE u32) ‖ doc_id` | rkyv `Vec<VectorIndex>` (SingleBit only) |
+| `{ns}_sparse_vector_meta` | `doc_id` | `text_hash (8B) ‖ n (2B BE) ‖ n × (posting_id (4B BE) ‖ chunks (2B BE))` |
 | `{ns}_dense_vector` | `doc_id` | rkyv `Vec<VectorIndex>` (MultiBit only) |
+| `{ns}_ivf_centres` | `centre_id (4B BE)` | the centre, `f32` × D; append-only |
+| `{ns}_ivf_postings` | `posting_id (4B BE)` | routing centre, `centre_id`, state (`Active`, `Draining`, `Retired`), parent, origin |
+| `{ns}_ivf_journal` | operation id (8B BE) | a maintenance operation in progress (split, reassignment, merge, rebuild) |
 
-`_sparse_vector` uses a composite key with a cluster prefix so a `scan_prefix(cluster_id)` efficiently retrieves all SingleBit vectors in a cluster. `_sparse_vector_meta` is a reverse lookup used only to find and delete stale sparse keys when a document is updated (its chunks may move to different clusters) or deleted. `_dense_vector` is keyed directly by `doc_id` for O(1) fetch in Pass 2.
+`_sparse_vector` uses a composite key with a posting prefix so a `scan_prefix(posting_id)` efficiently retrieves all SingleBit vectors in a posting. `_sparse_vector_meta` is a reverse lookup used to find and delete stale sparse keys when a document is updated or deleted, and its chunk counts give each posting's exact size; its text hash tells reconciliation which text the vectors came from. `_dense_vector` is keyed directly by `doc_id` for O(1) fetch in Pass 2. The three `_ivf_` namespaces hold the store's partition and are WAL-backed: unlike codes, they cannot be regenerated by re-embedding.
 
 ---
 
@@ -364,72 +359,52 @@ Reverse reconciliation — deleting orphan index entries for documents that were
 
 ## 8. Configuration
 
-All parameters are under `[semantic_search]` in the TOML config:
+The server's `[semantic_search]` table holds only what concerns the embedding service:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `number_of_bits_for_dense_quantisation` | `8` | Bits per dimension for MultiBit (dense) quantisation. 4 = compact, 8 = high recall. Only affects Pass 2 precision. |
-| `n_probes` | `64` | Number of IVF clusters probed per query in the sparse pass. Higher = better recall, slower — see *Tuning & profiling* below. |
-| `first_pass_sparse_search_top_k` | `1000` | Candidates retained after Pass 1 before dense re-ranking. |
-| `window_size` | `4` | Sentences per sliding-window chunk for **document** SingleBit embeddings (queries are not chunked). Changing it requires a corpus re-index. |
-| `sliding_size` | `2` | Document window advance step, in sentences. Smaller than `window_size` → overlapping chunks. |
-| `model` | `qwen` | Embedding model requested from the service on every request (`/embedding/{model}/…`), lower-cased. Must be listed in `[[semantic_search.supported_models]]` when that list is non-empty, and must match the centroids at `cluster_path`. Changing it requires a re-index. The sample config sets `gemma`. |
-| `embedding_dim` | `768` | Dimension of the vectors the service returns; must match the cluster file. |
-| `cluster_path` | — | Path to the JSONL cluster centroids file. |
 | `embedding_service_url` | `http://localhost:8001` | Base URL of the external embedding service. |
-| `top_k_results` | `100` | Maximum results returned per query (overridable per-request). |
 | `query_embedding_cache_ttl_secs` | `86400` | TTL (seconds) for cached query embeddings in `system_qemb_cache`. Default is 1 day. |
+| `embedding_request_timeout_secs` / `embedding_connect_timeout_secs` | `30` / `10` | Caps on one embedding request, and on its connect phase. |
+| `[[supported_models]]` | none | Optional allow-list (`name`, `dimension`). Without it, any model the service serves. |
+| `[maintenance]` `threads` / `rebuild_threads` | `2` / `2` | Stores maintained at once; k-means threads of a rebuild (1 or 2), on a pool of its own. |
 
-### Tuning & profiling `n_probes`
+Everything that shapes one store's index lives in its schema's `vector_index`. `[semantic_search.maintenance]` and `[semantic_search.search_defaults]` only give the values a schema is filled with when the store first enables semantic search:
 
-`n_probes` is the primary recall/latency knob. Two on-demand harnesses in
-`minnal_db/src/vector_kv.rs` (both `#[ignore]`d tests) measure the two axes it
-trades off:
+| Setting | Default | Description |
+|---|---|---|
+| `embedding_model` | `gemma` | Model requested from the service on every request (`/embedding/{model}/…`). Fixed once set. |
+| `embedding_dim` | `768` | Dimension of the vectors the service returns. Fixed once set. |
+| `chunking.window_size` / `sliding_size` | `4` / `2` | Sentences per document chunk, and the step between chunks (queries are not chunked). Fixed once set. |
+| `quantisation` | 1 / 8 bits, zero Pass-2 centre | Code widths and the rotation seed; read-only. |
+| `search.probe_budget_entries` | `70000` | Pass 1 probes the nearest postings until their entries reach this. |
+| `search.min_probes` / `max_probes` | `1` / `1024` | Bounds on postings probed. |
+| `search.first_pass_top_k` | `1000` | Candidates kept after Pass 1 for dense re-ranking. |
+| `search.top_k` | `100` | Results returned. |
+| `maintenance.target_posting_size` | `128` | A posting splits above twice this. |
+| `maintenance.reassign_range` / `merge_ratio` | `64` / `10/118` | Postings re-checked after a split; merge limit as a share of the split limit. |
 
-- **Latency** — `real_kv_search_profile` runs the real two-pass `search()` over a real
-  `minnal_db`-backed store (synthetic vectors, but real LSM + value-log `pread` I/O) and
-  phase-times coarse cluster pick, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the
-  scoring remainder, and the whole query — sweeping `n_probes ∈ {10, 32, 64, 128}` at several
-  chunks-per-doc. It needs no embedding service.
-  ```sh
-  cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_kv_search_profile --release -- --ignored --nocapture
-  ```
-- **Recall** — `real_recall_vs_nprobes` indexes a real text corpus through the real
-  embedding service (the production `embed_document` → `upsert_vectors` path) and reports
-  `recall@k(n_probes) = |top_k(n_probes) ∩ top_k(exhaustive)| / k`, using the pipeline's
-  own **exhaustive-probe** (all clusters) ranking as ground truth — so it isolates the
-  recall lost by *reducing* `n_probes`, holding quantisation and re-ranking fixed. Requires
-  the embedding service and a JSONL corpus; env-gated via `MINNAL_EMBED_URL`,
-  `MINNAL_RECALL_CORPUS`, `MINNAL_RECALL_DOCS`, `MINNAL_RECALL_QUERIES` (soft-skips if either
-  is absent).
-  ```sh
-  MINNAL_EMBED_URL=http://<host>:8001 \
-    cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_recall_vs_nprobes --release -- --ignored --nocapture
-  ```
+Search settings can be changed later (`update_vector_search` amendment) and overridden per request.
 
-Measured tradeoff (recall: 2,000-document news corpus, 50 queries; latency:
-5,000-document synthetic store, 8 chunks per document, 4 query vectors, warm
-cache):
+### Profiling search latency
 
-| `n_probes` | recall@10 | recall@100 | sparse entries scanned | entire `search()` |
-|---|---|---|---|---|
-| 10 | 0.968 | 0.935 | 7,320 | 3.5 ms |
-| 32 | 0.986 | 0.978 | 17,278 | 6.7 ms |
-| **64 (default)** | not measured | not measured | **27,537** | **9.8 ms** |
-| 128 | 1.000 | 0.999 | 37,337 | 13.1 ms |
+`real_kv_search_profile` in `minnal_db/src/vector_kv.rs` (an `#[ignore]`d test)
+runs the real two-pass `search()` over a real `minnal_db`-backed store (synthetic
+vectors and centres, but real LSM + value-log `pread` I/O) and phase-times
+posting choice, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the scoring
+remainder, and the whole query, at several fixed probe counts and chunks per
+document. It needs no embedding service.
 
-`64` is the default because it is the smallest setting that stays close to
-exhaustive search on real data. End-to-end BEIR runs with the gemma centroids put
-it within 0.003 nDCG@10 of probing every cluster on both SciFact (5.2k documents)
-and FiQA (57.6k). `32` lost 0.010 on SciFact, and matching exhaustive search
-exactly needed `128`. FiQA warm-query latency was 13.9, 17.3 and 21.0 ms at 32,
-64 and 128.
+```sh
+cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_kv_search_profile --release -- --ignored --nocapture
+```
 
 Pass-1 sparse-scan I/O is 54–88% of `search()` at 8 chunks per document and
-grows roughly linearly with `n_probes`, because the entries scanned grow in
-step. The SIMD dot products are a minority of the cost. Pass 2 re-scores a fixed
-`first_pass_sparse_search_top_k` candidates, so its share shrinks as `n_probes`
-rises.
+grows roughly linearly with the entries scanned. The SIMD dot products are a
+minority of the cost. Pass 2 re-scores a fixed `first_pass_top_k` candidates, so
+its share shrinks as more is read. Recall and nDCG against entries read are
+measured on frozen BEIR embeddings by the vector bench
+(`semantic_search/vector_bench`, design doc M0).
 
 ---
 
@@ -441,10 +416,12 @@ rises.
 | RaBitQ quantisation (encode + decode) | `minnal_db/src/semantic_search/quantisation/rabitq/mod.rs` |
 | `VectorIndex` struct + `VectorKvStore` trait | `minnal_db/src/semantic_search/index/vector_index.rs` |
 | Distance estimators (SingleBit, MultiBit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
-| Cluster index (centroids) + exact top-`n_probes` probing | `minnal_db/src/semantic_search/cluster/mod.rs` |
-| Composite key encoding (cluster ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
+| A store's partition (postings, centres, routing epoch) + probing by budget | `minnal_db/src/semantic_search/cluster/layout.rs` |
+| Split, reassignment, merge, rebuild and their journal | `minnal_db/src/ivf_split.rs`, `minnal_db/src/ivf_split/` |
+| Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
+| Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/bench_distance_estimation.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_db/src/vector_kv.rs` |
-| Latency + recall profiling harnesses (see §8) | `minnal_db/src/vector_kv.rs` (ignored tests) |
+| Latency profiling harness (see §8) | `minnal_db/src/vector_kv.rs` (ignored test) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
 | Document store | `minnal_db/src/doc_store/store/` |

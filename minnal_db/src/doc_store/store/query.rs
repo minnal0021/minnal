@@ -760,16 +760,12 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn semantic_search_on_a_store_without_it_reports_not_enabled() {
-        use crate::semantic_search::{ClusterIndex, cluster::Cluster, service::SemanticSearchConfig};
+        use crate::semantic_search::service::SemanticSearchConfig;
 
         let db_dir = TempDir::new().unwrap();
         let schema_dir = TempDir::new().unwrap();
         let mut store = open_fresh(db_dir.path(), schema_dir.path()).await;
-        let clusters = std::collections::HashMap::from([(0, Cluster::new(0, vec![1.0, 0.0]))]);
-        store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(
-            SemanticSearchConfig::default(),
-            [("gemma".to_string(), Arc::new(ClusterIndex::from_clusters(clusters)))],
-        )));
+        store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(SemanticSearchConfig::default())));
         store.create(make_schema("plain", vec![])).await.unwrap();
         store
             .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))
