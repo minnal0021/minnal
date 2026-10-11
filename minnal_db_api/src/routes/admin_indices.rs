@@ -679,7 +679,9 @@ fn maintenance_json(m: &minnal_db::doc_store::vector_settings::MaintenanceSettin
 
 /// `GET /admin/indices/{ns}/vector/partition[?codes=true]` — the namespace's
 /// partition at a glance: postings (K), entries, chunks, size percentiles,
-/// splits, unfinished splits; with `codes=true` also the entry-weighted code
+/// splits, unfinished maintenance operations, and maintenance counters (splits,
+/// merges, reassignments, chunk moves) since the partition loaded; with
+/// `codes=true` also the entry-weighted code
 /// metrics and the postings with the highest centre drift (re-encode
 /// candidates). Without `codes` it reads memory only.
 pub async fn vector_partition(

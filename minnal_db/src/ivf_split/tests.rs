@@ -393,7 +393,7 @@ async fn e2e_partition_invariants() {
         .await
         .unwrap()
         .unwrap();
-    assert!(records(&db, &ns).await.unwrap().is_empty(), "unfinished splits");
+    assert!(records(&db, &ns).await.unwrap().is_empty(), "unfinished maintenance operations");
     let keys = recount_chunks(&db, &ns).await.unwrap();
     for (p, n) in &keys {
         assert_eq!(ivf.posting_infos()[p].state, PostingState::Active, "posting {p}");
@@ -741,5 +741,42 @@ async fn a_split_that_the_next_merge_would_undo_is_refused() {
     let report = maintain_partition(&db, NS, &h, &full(60, 5, 64)).await.unwrap();
     assert_eq!(report.splits, 1, "{report:?}");
     check(&db, &h, &expected(23)).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
+/// Diagnostic over an existing database (`MINNAL_E2E_DB`, `MINNAL_E2E_NS`,
+/// `MINNAL_E2E_SPLIT_LIMIT`): every active posting over the split limit, and the
+/// sides a split's 2-means would give it.
+#[tokio::test]
+#[ignore]
+async fn e2e_oversized_postings() {
+    let Ok(path) = std::env::var("MINNAL_E2E_DB") else { return };
+    let ns = std::env::var("MINNAL_E2E_NS").unwrap_or_else(|_| "e2e".into());
+    let limit: u64 = std::env::var("MINNAL_E2E_SPLIT_LIMIT").map_or(32, |v| v.parse().unwrap());
+    let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
+        .await
+        .unwrap();
+    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut over = 0;
+    for (&p, info) in ivf.posting_infos() {
+        let chunks = ivf.posting_chunks(p);
+        if info.state != PostingState::Active || chunks <= limit {
+            continue;
+        }
+        over += 1;
+        let entries = posting_entries(&db, &ns, p).await.unwrap();
+        let points: Vec<Vec<f32>> = entries.iter().flat_map(|(_, c)| c.iter().filter_map(|c| reconstruct(&ivf, c))).collect();
+        let mut rng = SplitRng::new(u64::from(p).rotate_left(32) ^ chunks);
+        let sides = balanced_two_means(&points, &SplitParams::default(), &mut rng).map(|r| {
+            let ones = r.labels.iter().filter(|&&l| l == 1).count();
+            (r.labels.len() - ones, ones)
+        });
+        let docs = entries.len();
+        eprintln!("posting {p}: {chunks} chunks in {docs} documents, 2-means sides {sides:?}");
+    }
+    eprintln!("{over} active posting(s) over {limit}");
     db.shutdown().await.unwrap();
 }
