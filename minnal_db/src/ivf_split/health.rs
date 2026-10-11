@@ -115,6 +115,7 @@ fn origin_name(o: PostingOrigin) -> &'static str {
         PostingOrigin::Root => "root",
         PostingOrigin::Seed => "seed",
         PostingOrigin::Split => "split",
+        PostingOrigin::Rebuild => "rebuild",
     }
 }
 

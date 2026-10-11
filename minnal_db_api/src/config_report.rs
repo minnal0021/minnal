@@ -200,6 +200,11 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
         r.add("semantic_search.maintenance", "split_max_iters", m.split_max_iters);
         r.add("semantic_search.maintenance", "split_lambda_factor", m.split_lambda_factor.0);
         r.add("semantic_search.maintenance", "threads", ss.maintenance.threads().unwrap_or_default());
+        r.add(
+            "semantic_search.maintenance",
+            "rebuild_threads",
+            ss.maintenance.rebuild_threads().unwrap_or_default(),
+        );
         let q = d.search;
         r.add("semantic_search.search_defaults", "probe_budget_entries", q.probe_budget_entries);
         r.add("semantic_search.search_defaults", "min_probes", q.min_probes);

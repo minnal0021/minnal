@@ -219,6 +219,10 @@ pub enum DocStoreError {
     #[error("a vector index reindex for namespace '{namespace}' is already in progress")]
     VecReindexInProgress { namespace: String },
 
+    /// A partition rebuild is already running for this namespace.
+    #[error("a partition rebuild for namespace '{namespace}' is already running")]
+    VecRebuildInProgress { namespace: String },
+
     /// The vector index for this namespace is currently being dropped (background cleanup).
     /// Wait for the cleanup to complete before re-enabling semantic search.
     #[error("vector index cleanup for namespace '{namespace}' is already in progress")]

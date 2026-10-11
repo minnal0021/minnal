@@ -474,6 +474,75 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A rebuild started through the store re-clusters a grown namespace from
+    /// its codes in the background: no embedding request, every key in an
+    /// active posting with exact counts, every document still found; a second
+    /// rebuild is refused while one runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_runs_in_the_background_without_the_embedding_service() {
+        use crate::ivf_split::rebuild::RebuildState;
+        let (url, seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("{TEXT} Number {i}.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let _ = partition.lock_maintenance().await;
+        let calls = seen.lock().len();
+
+        assert_eq!(store.vector_rebuild_status("g"), None);
+        let busy = partition.lock_maintenance().await; // holds the rebuild back
+        store.start_vector_rebuild("g", Some(2)).unwrap();
+        assert!(matches!(
+            store.start_vector_rebuild("g", None),
+            Err(DocStoreError::VecRebuildInProgress { .. })
+        ));
+        drop(busy);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            let s = store.vector_rebuild_status("g").unwrap();
+            if s.state != RebuildState::Running {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "the rebuild never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(status.state, RebuildState::Done, "{status:?}");
+        let report = status.report.unwrap();
+        assert_eq!(report.postings_fitted, 2, "{report:?}");
+        assert_eq!(report.chunks_moved, report.chunks);
+        assert_eq!(seen.lock().len(), calls, "a rebuild makes no embedding request");
+
+        let ivf = partition.snapshot();
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+        }
+        assert_eq!(keys.values().sum::<u64>(), report.chunks);
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is still found");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
     /// The loaded partition's entry counts track the worker's writes and the
     /// doc store's deletes, matching a fresh count of the stored keys.
     #[tokio::test]

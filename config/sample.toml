@@ -369,6 +369,11 @@ centroid_dir = "service/embedding_support"
 # run off the query path. Range 1-64. Default: 2.
 # threads = 2
 
+# Engine-wide: threads a partition rebuild (POST
+# /admin/indices/{ns}/vector/rebuild) uses for its k-means, on a pool of its
+# own, never the one searches use. 1 or 2. Default: 2.
+# rebuild_threads = 2
+
 # ---------------------------------------------------------------------------
 # [semantic_search.search_defaults] — search settings a new store starts with
 #

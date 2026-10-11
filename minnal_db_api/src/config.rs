@@ -679,6 +679,9 @@ pub struct MaintenanceSection {
     pub split_lambda_factor: Option<f64>,
     /// Engine-only: maintenance threads per process. Default 2.
     pub threads: Option<usize>,
+    /// Engine-only: threads a partition rebuild's k-means uses, 1 or 2.
+    /// Default 2.
+    pub rebuild_threads: Option<usize>,
 }
 
 /// Default maintenance threads per process.
@@ -704,6 +707,17 @@ impl MaintenanceSection {
         let t = self.threads.unwrap_or(DEFAULT_MAINTENANCE_THREADS);
         if !(1..=64).contains(&t) {
             return Err(format!("maintenance.threads must be between 1 and 64, got {t}"));
+        }
+        Ok(t)
+    }
+
+    /// Rebuild threads, defaulted and checked (1 to
+    /// [`MAX_REBUILD_THREADS`](minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub fn rebuild_threads(&self) -> Result<usize, String> {
+        let max = minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS;
+        let t = self.rebuild_threads.unwrap_or(max);
+        if !(1..=max).contains(&t) {
+            return Err(format!("maintenance.rebuild_threads must be between 1 and {max}, got {t}"));
         }
         Ok(t)
     }
@@ -769,6 +783,7 @@ impl SemanticSearchSection {
         use minnal_db::doc_store::vector_settings::IndexDefaults;
         let builtin = IndexDefaults::default();
         self.maintenance.threads()?;
+        self.maintenance.rebuild_threads()?;
         Ok(IndexDefaults {
             search: self.search_defaults.apply(builtin.search).map_err(|e| e.to_string())?,
             maintenance: self.maintenance.spec().apply(builtin.maintenance).map_err(|e| e.to_string())?,
@@ -984,11 +999,13 @@ mod tests {
         assert_eq!(d.search.probe_budget_entries, 40_000);
         assert_eq!(d.search.probe_budget_fraction.map(|r| r.0), Some(0.3));
         assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), 4);
+        assert_eq!(cfg.semantic_search.maintenance.rebuild_threads().unwrap(), 2);
 
         for (table, key) in [
             ("maintenance", "target_posting_size = 4"),
             ("maintenance", "merge_ratio = 0.7"),
             ("maintenance", "threads = 0"),
+            ("maintenance", "rebuild_threads = 3"),
             ("search_defaults", "probe_budget_fraction = 2.0"),
         ] {
             let toml = format!("{base}[semantic_search.{table}]\n{key}\n");

@@ -694,11 +694,42 @@ pub async fn vector_partition(
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
     let mut body = serde_json::to_value(&summary).unwrap_or_default();
+    let rebuild = state.store.vector_rebuild_status(&ns);
     if let (Some(obj), serde_json::Value::Object(m)) = (body.as_object_mut(), maintenance_json(&maintenance)) {
         obj.insert("namespace".into(), serde_json::Value::String(ns));
         obj.extend(m);
+        obj.insert("rebuild".into(), serde_json::to_value(rebuild).unwrap_or_default());
     }
     Json(body).into_response()
+}
+
+/// Body of `POST /admin/indices/{ns}/vector/rebuild` (optional).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebuildBody {
+    /// Postings to fit; default: as many as are active now.
+    #[serde(default)]
+    pub postings: Option<usize>,
+}
+
+/// `POST /admin/indices/{ns}/vector/rebuild` — re-cluster the namespace's
+/// partition from its stored codes (k-means, no embedding calls) and move every
+/// chunk to its nearest new posting, in the background (design doc M4). 202 on
+/// start; 409 while one is running. Progress and the result are the `rebuild`
+/// field of `GET /admin/indices/{ns}/vector/partition`.
+pub async fn vector_rebuild(State(state): State<AppState>, Path(ns): Path<String>, body: Option<Json<RebuildBody>>) -> axum::response::Response {
+    let postings = body.and_then(|Json(b)| b.postings);
+    if postings == Some(0) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "postings must be at least 1"}))).into_response();
+    }
+    match state.store.start_vector_rebuild(&ns, postings) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"namespace": ns, "rebuild": state.store.vector_rebuild_status(&ns)})),
+        )
+            .into_response(),
+        Err(e) => crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    }
 }
 
 /// Query of `GET /admin/indices/{ns}/vector/postings`.

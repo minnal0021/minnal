@@ -309,6 +309,15 @@ fn journal_records_round_trip() {
                 scope: vec![9, 10, 1, 2, 5],
             },
         ),
+        (
+            JournalState::Published,
+            Op::Rebuild {
+                first_centre: 20,
+                first_posting: 30,
+                postings: 4,
+                drained: vec![1, 2, 5],
+            },
+        ),
     ] {
         let r = Record { state, op };
         assert_eq!(Record::decode(&r.encode()), Some(r));
@@ -778,5 +787,182 @@ async fn e2e_oversized_postings() {
         eprintln!("posting {p}: {chunks} chunks in {docs} documents, 2-means sides {sides:?}");
     }
     eprintln!("{over} active posting(s) over {limit}");
+    db.shutdown().await.unwrap();
+}
+
+// ── Rebuild (M4) ──
+
+fn rebuild_params(postings: usize) -> rebuild::RebuildParams {
+    rebuild::RebuildParams {
+        postings: Some(postings),
+        threads: 1,
+    }
+}
+
+/// Four topics (40 documents), split while only two had arrived: topics 2 and 3
+/// share postings with 0 and 1. A rebuild into four gives each its own.
+#[tokio::test]
+async fn a_rebuild_fits_postings_to_the_chunks_they_hold() {
+    let dir = TempDir::new().unwrap();
+    let (db, want) = prepare(&dir, Scenario::Reassign).await;
+    let h = handle(&db).await;
+    let before = spread(&db, &h).await;
+    let ops = full(1000, 0, 0); // nothing splits or merges afterwards
+    let report = rebuild::rebuild_partition(&db, NS, &h, &ops, &rebuild_params(4)).await.unwrap();
+    assert_eq!((report.chunks, report.postings_fitted, report.postings_after), (120, 4, 4), "{report:?}");
+    assert_eq!(report.chunks_moved, 120);
+    let c = h.counters().read();
+    assert_eq!((c.rebuilds, c.rebuild_moves, c.chunk_moves()), (1, 120, 0), "{c:?}");
+    check(&db, &h, &want).await.unwrap();
+    let ivf = h.snapshot();
+    let routes: BTreeSet<u32> = (0..4).map(|t| ivf.route(&chunk(t, 1)).unwrap()).collect();
+    assert_eq!(routes.len(), 4, "each topic routed to its own posting");
+    for (&id, info) in ivf.posting_infos() {
+        if info.state == PostingState::Active {
+            assert_eq!(info.origin, PostingOrigin::Rebuild, "posting {id}");
+        }
+    }
+    let after = spread(&db, &h).await;
+    assert!(after < before, "chunks nearer their centres: {before} -> {after}");
+
+    // Reopened, the partition and counts are the same.
+    db.shutdown().await.unwrap();
+    drop((db, h));
+    let db = open(&dir).await;
+    let h = handle(&db).await;
+    check(&db, &h, &want).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
+/// A crash before every write of a rebuild, under several flush patterns:
+/// after reopening and recovering, every invariant holds.
+#[tokio::test]
+async fn a_rebuild_survives_a_crash_before_any_write() {
+    let ops = full(40, 3, 8);
+    let mut failures = Vec::new();
+    let mut writes_seen = 0;
+    for flushed in [Flushed::None, Flushed::Sparse, Flushed::Meta, Flushed::All] {
+        for n in 0.. {
+            let dir = TempDir::new().unwrap();
+            let (db, want) = prepare(&dir, Scenario::Reassign).await;
+            let h = handle(&db).await;
+            crate::vector_kv::crash_point::arm(n);
+            let result = rebuild::rebuild_partition(&db, NS, &h, &ops, &rebuild_params(4)).await;
+            let crashed = crate::vector_kv::crash_point::disarm();
+            if !crashed {
+                result.unwrap();
+                writes_seen = n;
+            }
+            let names = match flushed {
+                Flushed::None => vec![],
+                Flushed::Sparse => vec![sparse_vectors_ns(NS)],
+                Flushed::Meta => vec![sparse_vectors_meta_ns(NS)],
+                Flushed::All => crate::vector_kv::companion_namespaces(NS),
+            };
+            db.flush_namespaces(names).await.unwrap();
+            drop(h);
+            db.crash().await; // unflushed no-WAL writes are lost
+            let db = open(&dir).await;
+            let h = handle(&db).await;
+            recover(&db, NS, &h, &ops).await.unwrap();
+            maintain_partition(&db, NS, &h, &ops).await.unwrap();
+            if let Err(e) = check(&db, &h, &want).await {
+                failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
+            }
+            db.shutdown().await.unwrap();
+            if !crashed {
+                break;
+            }
+        }
+    }
+    assert!(writes_seen > 40, "the scenario must cover a whole rebuild ({writes_seen} writes)");
+    assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
+}
+
+/// Re-embeds and deletes racing a rebuild: no chunk is lost or orphaned and
+/// every count stays exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_racing_a_rebuild_lose_nothing() {
+    for round in 0..4u64 {
+        let dir = TempDir::new().unwrap();
+        let (db, mut want) = prepare(&dir, Scenario::Reassign).await;
+        let h = std::sync::Arc::new(handle(&db).await);
+        let ops = full(40, 3, 8);
+        let rebuilder = {
+            let (db, h) = (db.clone(), std::sync::Arc::clone(&h));
+            tokio::spawn(async move { rebuild::rebuild_partition(&db, NS, &h, &ops, &rebuild_params(4)).await.unwrap() })
+        };
+        let deleted: Vec<u64> = (round % 2..40).step_by(3).collect();
+        let writer = {
+            let (db, h, deleted) = (db.clone(), std::sync::Arc::clone(&h), deleted.clone());
+            tokio::spawn(async move {
+                for d in (round % 3..40).step_by(4) {
+                    index_doc(&db, &h, d, &doc_chunks(d, d < 20)).await.unwrap();
+                }
+                for d in deleted {
+                    delete_doc(&db, &h, d).await;
+                }
+            })
+        };
+        writer.await.unwrap();
+        rebuilder.await.unwrap();
+        maintain_partition(&db, NS, &h, &ops).await.unwrap();
+        for d in deleted {
+            want.insert(doc_id(d), 0);
+        }
+        check(&db, &h, &want).await.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        db.shutdown().await.unwrap();
+    }
+}
+
+/// Searches running while the partition is rebuilt never miss a document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_search_during_a_rebuild_misses_nothing() {
+    use crate::semantic_search::ProbeSettings;
+    use crate::semantic_search::service::{SemanticSearchConfig, search};
+    let dir = TempDir::new().unwrap();
+    let (db, want) = prepare(&dir, Scenario::Reassign).await;
+    let live = want.len();
+    let h = std::sync::Arc::new(handle(&db).await);
+    let config = SemanticSearchConfig {
+        embedding_dim: DIM,
+        number_of_bits_for_dense_quantisation: 8,
+        probe: ProbeSettings::fixed(4096),
+        first_pass_sparse_search_top_k: 1000,
+        top_k_results: 1000,
+        ..SemanticSearchConfig::default()
+    };
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let searcher = {
+        let (db, h, done) = (db.clone(), std::sync::Arc::clone(&h), std::sync::Arc::clone(&done));
+        tokio::spawn(async move {
+            let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+            let q = chunk(0, 999);
+            let mut searches = 0;
+            loop {
+                let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                let found = {
+                    let _epoch = h.read_epoch().await;
+                    let ivf = h.snapshot();
+                    search(&config, NS, &*ivf, std::slice::from_ref(&q), &q, &store, None::<fn(&[u8]) -> bool>, None)
+                        .await
+                        .unwrap()
+                };
+                let docs: BTreeSet<Vec<u8>> = found.into_iter().map(|r| r.document_id).collect();
+                assert_eq!(docs.len(), live, "search {searches} found {} documents", docs.len());
+                searches += 1;
+                if finished {
+                    return searches;
+                }
+            }
+        })
+    };
+    let report = rebuild::rebuild_partition(&db, NS, &h, &full(1000, 0, 0), &rebuild_params(4))
+        .await
+        .unwrap();
+    done.store(true, std::sync::atomic::Ordering::Release);
+    let searches = searcher.await.unwrap();
+    assert!(searches > 1, "{searches} search(es)");
+    assert_eq!(report.postings_fitted, 4, "{report:?}");
     db.shutdown().await.unwrap();
 }

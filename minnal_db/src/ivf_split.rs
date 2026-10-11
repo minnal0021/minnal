@@ -87,6 +87,7 @@ macro_rules! crash_point {
 
 pub mod merge;
 pub mod reassign;
+pub mod rebuild;
 
 /// What a namespace's maintenance runs with (its `maintenance` settings).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,6 +147,7 @@ const RECORD_VERSION: u8 = 1;
 const KIND_SPLIT: u8 = 0;
 const KIND_MERGE: u8 = 1;
 const KIND_REASSIGN: u8 = 2;
+const KIND_REBUILD: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalState {
@@ -172,6 +174,15 @@ enum Op {
         children: [u32; 2],
         scope: Vec<u32>,
     },
+    /// Drain every posting of `drained` into `postings` new postings with ids
+    /// from `first_posting`, encoded against centres with ids from
+    /// `first_centre`; each chunk to the nearest new centre (M4).
+    Rebuild {
+        first_centre: u32,
+        first_posting: u32,
+        postings: u32,
+        drained: Vec<u32>,
+    },
 }
 
 impl Op {
@@ -179,7 +190,7 @@ impl Op {
     fn drained(&self) -> Option<u32> {
         match *self {
             Op::Split { posting, .. } | Op::Merge { posting, .. } => Some(posting),
-            Op::Reassign { .. } => None,
+            Op::Reassign { .. } | Op::Rebuild { .. } => None,
         }
     }
 }
@@ -198,7 +209,8 @@ impl Record {
 
     /// `version ‖ kind ‖ state ‖ ids` (ids 4B BE). A split's ids are
     /// `posting, centre × 2, child × 2`; a merge's `posting, kept`; a
-    /// reassignment's `parent, parent centre, child × 2, scope…`.
+    /// reassignment's `parent, parent centre, child × 2, scope…`; a rebuild's
+    /// `first centre, first posting, postings, drained…`.
     fn encode(&self) -> Vec<u8> {
         let (kind, ids): (u8, Vec<u32>) = match &self.op {
             Op::Split { posting, centres, children } => (KIND_SPLIT, vec![*posting, centres[0], centres[1], children[0], children[1]]),
@@ -212,6 +224,16 @@ impl Record {
                 let mut ids = vec![*parent, *parent_centre, children[0], children[1]];
                 ids.extend(scope);
                 (KIND_REASSIGN, ids)
+            }
+            Op::Rebuild {
+                first_centre,
+                first_posting,
+                postings,
+                drained,
+            } => {
+                let mut ids = vec![*first_centre, *first_posting, *postings];
+                ids.extend(drained);
+                (KIND_REBUILD, ids)
             }
         };
         let mut v = vec![RECORD_VERSION, kind, self.state as u8];
@@ -247,6 +269,12 @@ impl Record {
                 parent_centre: ids[1],
                 children: [ids[2], ids[3]],
                 scope: ids[4..].to_vec(),
+            },
+            (KIND_REBUILD, n) if n >= 3 => Op::Rebuild {
+                first_centre: ids[0],
+                first_posting: ids[1],
+                postings: ids[2],
+                drained: ids[3..].to_vec(),
             },
             _ => return None,
         };
@@ -467,6 +495,8 @@ enum DrainRule<'a> {
         active: Vec<(u32, &'a [f32])>,
         gate: bool,
     },
+    /// A rebuild: the nearest of the new postings.
+    Nearest { postings: Vec<(u32, &'a [f32])> },
 }
 
 impl DrainRule<'_> {
@@ -493,6 +523,10 @@ impl DrainRule<'_> {
                     _ => *kept,
                 }
             }
+            // The first new posting for a code that cannot be reconstructed.
+            DrainRule::Nearest { postings } => reconstruct(ivf, code)
+                .and_then(|x| nearest(&x, postings))
+                .map_or(postings[0].0, |(id, _)| id),
         }
     }
 }
@@ -807,7 +841,9 @@ async fn finish_drain(
 ) -> Result<(), crate::KVError> {
     let drained = record.op.drained().expect("a drain");
     if record.state == JournalState::Published {
-        let copied = drain_copy(db, namespace, handle, ops, &record.op).await?;
+        let ivf = handle.snapshot();
+        let rule = drain_rule(namespace, &ivf, ops, &record.op)?;
+        let copied = drain_copy(db, namespace, handle, &ivf, &rule, drained).await?;
         MaintenanceCounters::add(&handle.counters().drain_moves, copied);
         // 5. Barrier: the copies are durable before any delete.
         crash_point!();
@@ -844,14 +880,12 @@ async fn finish_drain(
             MaintenanceCounters::add(&handle.counters().merges, 1);
             delete_record(db, namespace, op).await
         }
-        Op::Reassign { .. } => unreachable!("not a drain"),
+        Op::Reassign { .. } | Op::Rebuild { .. } => unreachable!("not a single-posting drain"),
     }
 }
 
-/// 4. Copy each document's chunks from the drained posting to where the rule
-///    sends them. Returns how many codes were newly written.
-async fn drain_copy(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops: &MaintenanceOps, op: &Op) -> Result<u64, crate::KVError> {
-    let ivf = handle.snapshot();
+/// Where `op` sends a drained posting's chunks, against snapshot `ivf`.
+fn drain_rule<'a>(namespace: &str, ivf: &'a NamespaceIvf, ops: &MaintenanceOps, op: &Op) -> Result<DrainRule<'a>, crate::KVError> {
     let missing = |what: &str| corrupt(namespace, format!("{op:?}: {what} is missing"));
     let rule = match *op {
         Op::Split { centres, children, .. } => {
@@ -868,12 +902,34 @@ async fn drain_copy(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops
             active: ivf.active_centres(),
             gate: ops.skip_uncertain_moves,
         },
+        Op::Rebuild { first_posting, postings, .. } => {
+            let new: Vec<(u32, &[f32])> = (first_posting..first_posting + postings)
+                .map(|id| ivf.rotated_posting_centre(id).map(|c| (id, c)).ok_or_else(|| missing("a new posting")))
+                .collect::<Result<_, _>>()?;
+            if new.is_empty() {
+                return Err(missing("every new posting"));
+            }
+            DrainRule::Nearest { postings: new }
+        }
         Op::Reassign { .. } => unreachable!("not a drain"),
     };
-    let drained = op.drained().expect("a drain");
+    Ok(rule)
+}
+
+/// 4. Copy each document's chunks from the `drained` posting to where `rule`
+///    sends them (`ivf`: the snapshot the rule was built from). Returns how
+///    many codes were newly written.
+async fn drain_copy(
+    db: &AsyncDb,
+    namespace: &str,
+    handle: &PartitionHandle,
+    ivf: &NamespaceIvf,
+    rule: &DrainRule<'_>,
+    drained: u32,
+) -> Result<u64, crate::KVError> {
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let docs: Vec<Vec<u8>> = posting_entries(db, namespace, drained).await?.into_iter().map(|(doc, _)| doc).collect();
-    let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
+    let sparse = &sparse;
     let copied = in_flight(&docs, |batch| async move {
         let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
         // Re-read under the locks: an upsert or delete may have moved them on.
@@ -955,6 +1011,8 @@ pub async fn recover(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op
         // after it, was found too; finishing a drain re-checks the store.
         match (&record.op, record.state) {
             (Op::Reassign { .. }, _) => reassign::run(db, namespace, handle, ops, *op, record.clone()).await?,
+            (Op::Rebuild { .. }, JournalState::Planned) => abandon(db, namespace, handle, *op, record).await?,
+            (Op::Rebuild { .. }, _) => rebuild::finish(db, namespace, handle, ops, *op, record.clone()).await?,
             (_, JournalState::Planned) => abandon(db, namespace, handle, *op, record).await?,
             (_, JournalState::Published | JournalState::Copied) => finish_drain(db, namespace, handle, ops, *op, record.clone()).await?,
         }
@@ -967,9 +1025,22 @@ pub async fn recover(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op
 /// appended stay, unreferenced.
 async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u64, record: &Record) -> Result<(), crate::KVError> {
     let mut changed = Vec::new();
-    let (new_ids, centres) = match record.op {
-        Op::Split { centres, children, .. } => (children.to_vec(), centres.to_vec()),
-        _ => (vec![], vec![]),
+    let (new_ids, centres, drained) = match &record.op {
+        Op::Split {
+            posting, centres, children, ..
+        } => (children.to_vec(), centres.to_vec(), vec![*posting]),
+        Op::Rebuild {
+            first_centre,
+            first_posting,
+            postings,
+            drained,
+        } => (
+            (*first_posting..first_posting + postings).collect(),
+            (*first_centre..first_centre + postings).collect(),
+            drained.clone(),
+        ),
+        Op::Merge { posting, .. } => (vec![], vec![], vec![*posting]),
+        Op::Reassign { .. } => unreachable!("a reassignment is redone, never abandoned"),
     };
     for id in new_ids {
         if let Some(mut child) = stored_posting(db, namespace, id).await? {
@@ -978,13 +1049,14 @@ async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u6
             changed.push(child);
         }
     }
-    let drained = record.op.drained().expect("a drain");
-    if let Some(mut posting) = stored_posting(db, namespace, drained).await?
-        && posting.state != PostingState::Active
-    {
-        posting.state = PostingState::Active;
-        write_posting(db, namespace, &posting).await?;
-        changed.push(posting);
+    for id in drained {
+        if let Some(mut posting) = stored_posting(db, namespace, id).await?
+            && posting.state != PostingState::Active
+        {
+            posting.state = PostingState::Active;
+            write_posting(db, namespace, &posting).await?;
+            changed.push(posting);
+        }
     }
     let mut new_centres = Vec::new();
     let ivf = handle.snapshot();

@@ -352,6 +352,8 @@ pub enum PostingOrigin {
     Seed = 1,
     /// One half of a split.
     Split = 2,
+    /// Fitted by a rebuild (design doc M4).
+    Rebuild = 3,
 }
 
 impl PostingOrigin {
@@ -361,6 +363,7 @@ impl PostingOrigin {
             0 => Some(Self::Root),
             1 => Some(Self::Seed),
             2 => Some(Self::Split),
+            3 => Some(Self::Rebuild),
             _ => None,
         }
     }
@@ -638,6 +641,10 @@ pub struct MaintenanceCounters {
     pub reassign_moves: AtomicU64,
     /// Chunks copied out of a draining posting (a split's or a merge's).
     pub drain_moves: AtomicU64,
+    /// Rebuilds run.
+    pub rebuilds: AtomicU64,
+    /// Chunks a rebuild copied to a new posting.
+    pub rebuild_moves: AtomicU64,
 }
 
 impl MaintenanceCounters {
@@ -656,6 +663,8 @@ impl MaintenanceCounters {
             reassign_candidates: r(&self.reassign_candidates),
             reassign_moves: r(&self.reassign_moves),
             drain_moves: r(&self.drain_moves),
+            rebuilds: r(&self.rebuilds),
+            rebuild_moves: r(&self.rebuild_moves),
         }
     }
 }
@@ -675,11 +684,16 @@ pub struct MaintenanceTotals {
     pub reassign_moves: u64,
     /// Chunks copied out of a draining posting.
     pub drain_moves: u64,
+    /// Rebuilds run.
+    pub rebuilds: u64,
+    /// Chunks a rebuild copied to a new posting.
+    pub rebuild_moves: u64,
 }
 
 impl MaintenanceTotals {
-    /// Every chunk key move: drains (splits and merges) plus reassignments. Each
-    /// is a put and, once the source goes, a delete or rewrite.
+    /// Every chunk key move of ongoing maintenance: drains (splits and merges)
+    /// plus reassignments. Each is a put and, once the source goes, a delete or
+    /// rewrite. A rebuild's moves are counted apart (`rebuild_moves`).
     pub fn chunk_moves(&self) -> u64 {
         self.drain_moves + self.reassign_moves
     }

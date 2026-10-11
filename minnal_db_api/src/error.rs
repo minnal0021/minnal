@@ -49,6 +49,7 @@ impl IntoResponse for AppError {
             | DocStoreError::IndexBuildInProgress { .. }
             | DocStoreError::AttributeIsIndexed { .. }
             | DocStoreError::VecReindexInProgress { .. }
+            | DocStoreError::VecRebuildInProgress { .. }
             | DocStoreError::VecIndexCleanupInProgress { .. }
             | DocStoreError::AttrIndexOpInProgress { .. }
             | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. })

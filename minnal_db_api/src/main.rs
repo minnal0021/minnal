@@ -191,7 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SemanticSearchContext::new(service, cluster_indexes)
                 // Validated when the config was loaded.
                 .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load"))
-                .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load")),
+                .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load"))
+                .with_rebuild_threads(cfg.semantic_search.maintenance.rebuild_threads().expect("validated at load")),
         )
     } else {
         warn!(

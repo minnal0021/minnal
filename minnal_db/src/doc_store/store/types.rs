@@ -284,6 +284,11 @@ pub struct SemanticSearchContext {
     pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
     /// Namespaces maintained at once by the partition maintenance task.
     pub maintenance_threads: usize,
+    /// Threads a partition rebuild's k-means uses (at most
+    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub rebuild_threads: usize,
+    /// Each namespace's last rebuild since start.
+    rebuilds: parking_lot::Mutex<std::collections::HashMap<String, crate::ivf_split::rebuild::RebuildStatus>>,
     /// Reaches the partition maintenance task, once it runs.
     maintenance_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
@@ -320,6 +325,8 @@ impl SemanticSearchContext {
             cluster_indexes: cluster_indexes.into_iter().map(|(m, c)| (m.to_lowercase(), c)).collect(),
             index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
+            rebuild_threads: crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
@@ -329,6 +336,59 @@ impl SemanticSearchContext {
     pub fn with_maintenance_threads(mut self, threads: usize) -> Self {
         self.maintenance_threads = threads.max(1);
         self
+    }
+
+    /// Run rebuilds' k-means on `threads` threads (1 to
+    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub fn with_rebuild_threads(mut self, threads: usize) -> Self {
+        self.rebuild_threads = threads.clamp(1, crate::ivf_split::rebuild::MAX_REBUILD_THREADS);
+        self
+    }
+
+    /// Mark a rebuild of `namespace` as running, unless one already is.
+    pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
+        use crate::ivf_split::rebuild::{RebuildState, RebuildStatus};
+        let mut rebuilds = self.rebuilds.lock();
+        if rebuilds.get(namespace).is_some_and(|s| s.state == RebuildState::Running) {
+            return Err(DocStoreError::VecRebuildInProgress {
+                namespace: namespace.to_owned(),
+            });
+        }
+        rebuilds.insert(
+            namespace.to_owned(),
+            RebuildStatus {
+                state: RebuildState::Running,
+                postings_requested: postings,
+                started_at_ms: unix_ms(),
+                finished_at_ms: None,
+                report: None,
+                error: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record how `namespace`'s running rebuild ended.
+    pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::ivf_split::rebuild::RebuildReport, String>) {
+        use crate::ivf_split::rebuild::RebuildState;
+        if let Some(status) = self.rebuilds.lock().get_mut(namespace) {
+            status.finished_at_ms = Some(unix_ms());
+            match result {
+                Ok(report) => {
+                    status.state = RebuildState::Done;
+                    status.report = Some(report);
+                }
+                Err(e) => {
+                    status.state = RebuildState::Failed;
+                    status.error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// `namespace`'s last rebuild since start, if any.
+    pub fn rebuild_status(&self, namespace: &str) -> Option<crate::ivf_split::rebuild::RebuildStatus> {
+        self.rebuilds.lock().get(namespace).cloned()
     }
 
     pub(crate) fn set_maintenance_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
@@ -523,6 +583,13 @@ fn probe_settings(s: &SearchSettings, entries: u64) -> crate::semantic_search::P
         min_probes: s.min_probes as usize,
         max_probes: s.max_probes as usize,
     }
+}
+
+#[cfg(feature = "semantic-search")]
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]

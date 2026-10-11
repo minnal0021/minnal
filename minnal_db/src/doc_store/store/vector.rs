@@ -31,6 +31,54 @@ impl DocStore {
         Ok((settings.maintenance, summary, postings))
     }
 
+    /// Start rebuilding `namespace`'s partition from its codes (design doc M4)
+    /// in the background: k-means into `postings` postings (default: as many as
+    /// are active), every chunk moved to its nearest, then the usual splits and
+    /// merges. No embedding call is made. Progress and the result show in
+    /// [`vector_rebuild_status`](Self::vector_rebuild_status). Fails with
+    /// [`DocStoreError::VecRebuildInProgress`] while one is running.
+    #[cfg(feature = "semantic-search")]
+    pub fn start_vector_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
+        let Some(ctx) = &self.semantic_ctx else {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        };
+        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        ctx.claim_rebuild(namespace, postings)?;
+        let (db, ctx, namespace) = (Arc::clone(&self.db), Arc::clone(ctx), namespace.to_owned());
+        tokio::spawn(async move {
+            let result = async {
+                let ns = ctx.for_namespace(&db, &namespace, ns_id, &settings).await?;
+                let params = crate::ivf_split::rebuild::RebuildParams {
+                    postings,
+                    threads: ctx.rebuild_threads,
+                };
+                let ops = settings.maintenance.ops();
+                Ok::<_, DocStoreError>(crate::ivf_split::rebuild::rebuild_partition(&db, &namespace, &ns.partition, &ops, &params).await?)
+            }
+            .await;
+            match &result {
+                Ok(r) => log::info!(
+                    "partition rebuild: namespace='{namespace}' {} chunks, {} -> {} postings ({} fitted, {} iterations, {} moved)",
+                    r.chunks,
+                    r.postings_before,
+                    r.postings_after,
+                    r.postings_fitted,
+                    r.iterations,
+                    r.chunks_moved
+                ),
+                Err(e) => log::warn!("partition rebuild: namespace='{namespace}' failed: {e}"),
+            }
+            ctx.finish_rebuild(&namespace, result.map_err(|e| e.to_string()));
+        });
+        Ok(())
+    }
+
+    /// `namespace`'s last partition rebuild since the server started.
+    #[cfg(feature = "semantic-search")]
+    pub fn vector_rebuild_status(&self, namespace: &str) -> Option<crate::ivf_split::rebuild::RebuildStatus> {
+        self.semantic_ctx.as_ref()?.rebuild_status(namespace)
+    }
+
     /// Remove a document from the vector index: it was deleted, or its embedding
     /// text is now empty.
     ///

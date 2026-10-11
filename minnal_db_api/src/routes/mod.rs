@@ -106,6 +106,7 @@ pub fn router() -> Router<AppState> {
         // Admin / indices — vector partition (design doc M3a, partition health)
         .route("/admin/indices/{ns}/vector/partition", get(admin_indices::vector_partition))
         .route("/admin/indices/{ns}/vector/postings", get(admin_indices::vector_postings))
+        .route("/admin/indices/{ns}/vector/rebuild", post(admin_indices::vector_rebuild))
         // Admin / indices — vector queue inspection
         .route("/admin/indices/{ns}/vector/queue", get(admin_indices::vector_queue_by_namespace))
         .route(
