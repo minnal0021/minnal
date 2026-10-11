@@ -527,8 +527,12 @@ pub async fn upsert_vectors(
     Ok(delta)
 }
 
-/// Number of stripes in [`lock_doc_vectors`]; a power of two.
-const DOC_VECTOR_LOCK_STRIPES: usize = 256;
+/// Number of stripes in [`lock_doc_vectors`]; a power of two. Partition
+/// maintenance locks a batch of documents at once ([`lock_docs_vectors`]), and
+/// every foreground write or delete whose document shares a stripe with the
+/// batch waits for it: with 256 stripes a batch covered a large share of them.
+/// At 4,096 a batch of 16 covers under 0.4%. A stripe is one small mutex.
+const DOC_VECTOR_LOCK_STRIPES: usize = 4096;
 
 /// Serialise every write to one document's vectors: [`upsert_vectors`] and
 /// [`delete_vector`] each hold this across their whole body.

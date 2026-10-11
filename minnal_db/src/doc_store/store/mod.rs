@@ -395,6 +395,7 @@ pub(crate) fn require_semantic_search(schema_dir: &Path, namespace: &str) -> Res
     }
 }
 
+#[cfg(feature = "semantic-search")]
 pub(crate) fn load_vector_settings(
     schema_dir: &Path,
     namespace: &str,

@@ -278,7 +278,7 @@ pub(super) async fn run(
         let (selected, skipped) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
         let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
         let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
-        let counts = in_flight(&selected, |batch| async move {
+        let counts = in_batches(&selected, |batch| async move {
             let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
             // Re-read under the locks: an upsert or delete may have moved them on.
             let keys = batch
@@ -328,7 +328,7 @@ pub(super) async fn run(
         None => select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?.0,
     };
     let (rule, ivf) = (&rule, &ivf);
-    in_flight(&selected, |batch| async move {
+    in_batches(&selected, |batch| async move {
         let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
         shrink_sources(db, namespace, handle, ivf, rule, batch).await
     })

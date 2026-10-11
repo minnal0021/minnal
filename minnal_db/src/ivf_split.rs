@@ -531,33 +531,32 @@ impl DrainRule<'_> {
     }
 }
 
-/// Documents a maintenance step handles under one set of locks, and how many
-/// such batches it keeps in flight. Each batch reads its keys and metas with
-/// `get_multiple` (one read per kind, not one per key), and several batches
-/// overlap their reads and writes. The batches are polled in the calling task,
-/// never spawned, so a simulated crash in one stops the writes of the others
-/// (the crash point is per thread and sticky).
-const BATCH_DOCS: usize = 64;
+/// Documents a maintenance step handles under one set of locks. Each batch
+/// reads its keys and metas with `get_multiple` (one read per kind, not one per
+/// key), then writes per document, so it holds its documents' locks for about
+/// `BATCH_DOCS` meta writes (WAL fsyncs, ~2.3 ms each here). Batches run one at
+/// a time: writers and deletes wait for any document lock a batch holds, and for
+/// the WAL lock its writes queue on, so a wide batch, or several at once, is
+/// foreground tail latency. Four lanes of 64 held up to 256 documents' locks (as
+/// many as there were stripes) and put a delete's p99 at 580 ms under a
+/// delete-and-insert load while partitions split; 16 at a time, with 4,096
+/// stripes, 110 ms (M5 investigation).
+const BATCH_DOCS: usize = 16;
 
-/// Run `work` on `items` in batches of [`BATCH_DOCS`], four batches in flight:
-/// four lanes, each taking every fourth batch in turn, joined in this task (not
-/// spawned). The first error ends the call. Returns each batch's result, in no
-/// particular order.
-async fn in_flight<'a, T, R, F, Fut>(items: &'a [T], work: F) -> Result<Vec<R>, crate::KVError>
+/// Run `work` on `items` in batches of [`BATCH_DOCS`], one batch at a time, in
+/// this task (never spawned, so a simulated crash in one stops every later
+/// write: the crash point is per thread and sticky). The first error ends the
+/// call. Returns each batch's result, in order.
+async fn in_batches<'a, T, R, F, Fut>(items: &'a [T], work: F) -> Result<Vec<R>, crate::KVError>
 where
     F: Fn(&'a [T]) -> Fut,
     Fut: std::future::Future<Output = Result<R, crate::KVError>>,
 {
-    let work = &work;
-    let lane = |k: usize| async move {
-        let mut out = Vec::new();
-        for batch in items.chunks(BATCH_DOCS).skip(k).step_by(4) {
-            out.push(work(batch).await?);
-        }
-        Ok::<_, crate::KVError>(out)
-    };
-    let (a, b, c, d) = tokio::try_join!(lane(0), lane(1), lane(2), lane(3))?;
-    Ok(a.into_iter().chain(b).chain(c).chain(d).collect())
+    let mut out = Vec::with_capacity(items.len().div_ceil(BATCH_DOCS));
+    for batch in items.chunks(BATCH_DOCS) {
+        out.push(work(batch).await?);
+    }
+    Ok(out)
 }
 
 /// One document's chunks to copy: `destination → codes`, each code already
@@ -930,7 +929,7 @@ async fn drain_copy(
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let docs: Vec<Vec<u8>> = posting_entries(db, namespace, drained).await?.into_iter().map(|(doc, _)| doc).collect();
     let sparse = &sparse;
-    let copied = in_flight(&docs, |batch| async move {
+    let copied = in_batches(&docs, |batch| async move {
         let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
         // Re-read under the locks: an upsert or delete may have moved them on.
         let keys = batch.iter().map(|doc| composite_key::encode(drained, doc)).collect();
@@ -969,7 +968,7 @@ async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, d
             .filter_map(|(key, _)| composite_key::decode(&key).map(|(_, doc)| doc.to_vec()))
             .collect();
         let (sparse, meta_ns) = (&sparse, &meta_ns);
-        in_flight(&docs, |batch| async move {
+        in_batches(&docs, |batch| async move {
             let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
             let metas = meta_ns.get_multiple(batch.to_vec()).await?;
             for (doc, meta) in batch.iter().zip(metas) {
