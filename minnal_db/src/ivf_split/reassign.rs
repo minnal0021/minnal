@@ -25,7 +25,7 @@
 //! the postings, so it decides the same way, and a source gives up a chunk only
 //! once its destination holds it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::*;
 
@@ -52,46 +52,189 @@ pub(super) fn plan(ivf: &NamespaceIvf, ops: &MaintenanceOps, parent: u32, childr
     })
 }
 
+/// `⟨σ, v⟩` for a 1-bit code's sign vector `σ` (`+1` where its bit is set,
+/// `−1` elsewhere), by table lookup: one 256-entry table per byte of the packed
+/// bits, holding the sum of `v` over the bits set in that byte. 96 lookups for
+/// 768 dimensions, against a full reconstruction and a distance.
+struct SignDot {
+    tables: Vec<[f32; 256]>,
+    total: f32,
+}
+
+impl SignDot {
+    fn new(v: &[f32]) -> Self {
+        let tables = v
+            .chunks(8)
+            .map(|byte| {
+                let mut t = [0.0f32; 256];
+                for b in 1..256usize {
+                    // The table of `b` is that of `b` without its lowest bit,
+                    // plus the dimension of that bit.
+                    t[b] = t[b & (b - 1)] + byte.get(b.trailing_zeros() as usize).copied().unwrap_or(0.0);
+                }
+                t
+            })
+            .collect();
+        Self {
+            tables,
+            total: v.iter().sum(),
+        }
+    }
+
+    fn dot(&self, packed: &[u64]) -> f64 {
+        let mut set = 0.0f32;
+        for (j, t) in self.tables.iter().enumerate() {
+            set += t[((packed[j / 8] >> (8 * (j % 8))) & 0xff) as usize];
+        }
+        f64::from(2.0 * set - self.total)
+    }
+}
+
+/// Distances from a code's reconstruction to a few fixed centres, without
+/// reconstructing it. With `x̂ = c + s·σ` (its own centre `c`, scale `s`, signs
+/// `σ`), `D(x̂, t) − ‖x̂‖² = ‖t‖² − 2⟨c, t⟩ − 2s⟨σ, t⟩`: comparing that *score*
+/// across targets is comparing distances. `⟨c, t⟩` is cached per (own centre,
+/// target), since a scope's codes share few centres. Targets are keyed by
+/// centre id.
+struct Scorer<'a> {
+    ivf: &'a NamespaceIvf,
+    targets: parking_lot::Mutex<HashMap<u32, std::sync::Arc<(f64, SignDot)>>>,
+    own: parking_lot::Mutex<HashMap<(u32, u32), f64>>,
+}
+
+impl<'a> Scorer<'a> {
+    fn new(ivf: &'a NamespaceIvf) -> Self {
+        Self {
+            ivf,
+            targets: parking_lot::Mutex::new(HashMap::new()),
+            own: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `D(x̂, t) − ‖x̂‖²` for target centre `t`, or `None` if a centre is unknown.
+    /// The code must be 1-bit and match the dimension (checked by the caller).
+    fn score(&self, code: &VectorIndex, t: u32) -> Option<f64> {
+        let target = {
+            let mut targets = self.targets.lock();
+            match targets.get(&t) {
+                Some(x) => std::sync::Arc::clone(x),
+                None => {
+                    let c = self.ivf.rotated_centre(t)?;
+                    let made = std::sync::Arc::new((c.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>(), SignDot::new(c)));
+                    targets.insert(t, std::sync::Arc::clone(&made));
+                    made
+                }
+            }
+        };
+        let key = (code.centre_id, t);
+        // Read, release, then compute: a guard held across the `match` would
+        // deadlock on the insert below (the lock is not reentrant).
+        let cached = self.own.lock().get(&key).copied();
+        let own = match cached {
+            Some(d) => d,
+            None => {
+                use simsimd::SpatialSimilarity;
+                let d = f32::dot(self.ivf.rotated_centre(code.centre_id)?, self.ivf.rotated_centre(t)?)?;
+                self.own.lock().insert(key, d);
+                d
+            }
+        };
+        Some(target.0 - 2.0 * (own + f64::from(code.scaling_factor) * target.1.dot(&code.packed_vector)))
+    }
+
+    /// Whether centre `a` is nearer to the code than centre `b`, as
+    /// [`nearer`] decides it on the reconstruction.
+    fn nearer(&self, code: &VectorIndex, a: u32, b: u32, gate: bool) -> Option<bool> {
+        let (sa, sb) = (self.score(code, a)?, self.score(code, b)?);
+        if sa >= sb {
+            return Some(false);
+        }
+        Some(!gate || sb - sa > 2.0 * f64::from(code.error_bound) * sq_dist(self.ivf.rotated_centre(a)?, self.ivf.rotated_centre(b)?).sqrt())
+    }
+}
+
 /// LIRE's conditions for one reassignment.
 struct Rule<'a> {
-    parent: &'a [f32],
-    children: [(u32, &'a [f32]); 2],
+    parent_centre: u32,
+    children: [(u32, u32); 2],
     active: Vec<(u32, &'a [f32])>,
+    scorer: Scorer<'a>,
     gate: bool,
 }
 
 impl<'a> Rule<'a> {
     fn new(ivf: &'a NamespaceIvf, ops: &MaintenanceOps, parent_centre: u32, children: [u32; 2]) -> Option<Self> {
+        ivf.rotated_centre(parent_centre)?;
+        let centre_of = |p: u32| {
+            let c = ivf.posting_infos().get(&p)?.centre_id;
+            ivf.rotated_centre(c).map(|_| c)
+        };
         Some(Self {
-            parent: ivf.rotated_centre(parent_centre)?,
-            children: [
-                (children[0], ivf.rotated_posting_centre(children[0])?),
-                (children[1], ivf.rotated_posting_centre(children[1])?),
-            ],
+            parent_centre,
+            children: [(children[0], centre_of(children[0])?), (children[1], centre_of(children[1])?)],
             active: ivf.active_centres(),
+            scorer: Scorer::new(ivf),
             gate: ops.skip_uncertain_moves,
         })
     }
 
-    /// For a chunk in posting `src` (centre `src_centre`): whether it is a
-    /// candidate, and where it moves (`None` to stay).
-    /// `x` is scratch space for the code's reconstruction.
+    /// For a chunk in posting `src`: whether it is a candidate, and where it
+    /// moves (`None` to stay). `x` is scratch space for the reconstruction a
+    /// candidate needs. LIRE's conditions are decided from the code without
+    /// reconstructing it (`Scorer`); only a candidate is reconstructed, to find
+    /// its nearest active posting.
     fn decide(&self, ivf: &NamespaceIvf, src: u32, src_centre: &[f32], code: &VectorIndex, x: &mut Vec<f32>) -> (bool, Option<u32>) {
-        if !reconstruct_into(ivf, code, x) {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let dim = src_centre.len();
+        let Some(src_c) = ivf.posting_infos().get(&src).map(|i| i.centre_id) else {
+            return (false, None);
+        };
+        if code.quantisation_style != QuantisationStyle::SingleBit
+            || code.packed_vector.len() < dim.div_ceil(64)
+            || ivf.rotated_centre(code.centre_id).is_none_or(|c| c.len() != dim)
+        {
+            return (false, None);
+        }
+        let s = &self.scorer;
+        let candidate = if self.children.iter().any(|&(id, _)| id == src) {
+            s.nearer(code, self.parent_centre, src_c, self.gate)
+        } else {
+            // The nearer half (the first on a tie, as `nearest` picks).
+            let [(_, c0), (_, c1)] = self.children;
+            let c_min = match (s.score(code, c0), s.score(code, c1)) {
+                (Some(a), Some(b)) => Some(if b < a { c1 } else { c0 }),
+                _ => None,
+            };
+            c_min.and_then(|c| Some(s.nearer(code, c, self.parent_centre, self.gate)? && s.nearer(code, c, src_c, self.gate)?))
+        };
+        if candidate != Some(true) || !reconstruct_into(ivf, code, x) {
             return (false, None);
         }
         let x = x.as_slice();
+        match nearest(x, &self.active) {
+            Some((n, c)) if n != src && nearer(x, c, src_centre, code, self.gate) => (true, Some(n)),
+            _ => (true, None),
+        }
+    }
+
+    /// [`decide`](Self::decide) on the reconstruction, as it was written before
+    /// the scorer: the oracle the scorer is tested against.
+    #[cfg(test)]
+    fn decide_reconstructed(&self, ivf: &NamespaceIvf, src: u32, src_centre: &[f32], code: &VectorIndex) -> (bool, Option<u32>) {
+        let Some(x) = reconstruct(ivf, code) else { return (false, None) };
+        let parent = ivf.rotated_centre(self.parent_centre).unwrap();
+        let children: Vec<(u32, &[f32])> = self.children.iter().map(|&(p, c)| (p, ivf.rotated_centre(c).unwrap())).collect();
         let candidate = if self.children.iter().any(|&(id, _)| id == src) {
-            nearer(x, self.parent, src_centre, code, self.gate)
+            nearer(&x, parent, src_centre, code, self.gate)
         } else {
-            let (_, c_min) = nearest(x, &self.children).expect("two halves");
-            nearer(x, c_min, self.parent, code, self.gate) && nearer(x, c_min, src_centre, code, self.gate)
+            let (_, c_min) = nearest(&x, &children).expect("two halves");
+            nearer(&x, c_min, parent, code, self.gate) && nearer(&x, c_min, src_centre, code, self.gate)
         };
         if !candidate {
             return (false, None);
         }
-        match nearest(x, &self.active) {
-            Some((n, c)) if n != src && nearer(x, c, src_centre, code, self.gate) => (true, Some(n)),
+        match nearest(&x, &self.active) {
+            Some((n, c)) if n != src && nearer(&x, c, src_centre, code, self.gate) => (true, Some(n)),
             _ => (true, None),
         }
     }
@@ -200,10 +343,12 @@ async fn select(
     children: [u32; 2],
     sources: &[(u32, Vec<f32>)],
 ) -> Result<(Vec<Selected>, u64), crate::KVError> {
-    let mut entries = Vec::with_capacity(sources.len());
-    for (src, centre) in sources {
-        entries.push((*src, centre.clone(), posting_entries(db, namespace, *src).await?));
-    }
+    let ids: Vec<u32> = sources.iter().map(|(p, _)| *p).collect();
+    let mut read = postings_entries(db, namespace, &ids).await?;
+    let entries: Vec<_> = sources
+        .iter()
+        .map(|(src, centre)| (*src, centre.clone(), read.remove(src).unwrap_or_default()))
+        .collect();
     let (ivf, ops) = (std::sync::Arc::clone(ivf), *ops);
     tokio::task::spawn_blocking(move || {
         let rule = Rule::new(&ivf, &ops, parent_centre, children).expect("checked by the caller");
@@ -296,5 +441,105 @@ async fn shrink_source(
         sparse.delete(key).await
     } else {
         sparse.put(key, VectorIndex::list_to_bytes(&remaining)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{Scenario, full, handle, prepare};
+    use super::*;
+
+    #[test]
+    fn sign_dot_matches_the_explicit_inner_product() {
+        let mut state = 7u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 11
+        };
+        for dim in [8usize, 16, 70, 768] {
+            let v: Vec<f32> = (0..dim).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let packed: Vec<u64> = (0..dim.div_ceil(64)).map(|_| next()).collect();
+            let explicit: f64 = (0..dim)
+                .map(|i| f64::from(v[i]) * if (packed[i / 64] >> (i % 64)) & 1 == 1 { 1.0 } else { -1.0 })
+                .sum();
+            let got = SignDot::new(&v).dot(&packed);
+            assert!((got - explicit).abs() < 1e-3, "dim {dim}: {got} vs {explicit}");
+        }
+    }
+
+    /// The scorer decides exactly as the reconstruction does: for every split
+    /// in a grown partition, every stored chunk gets the same decision both
+    /// ways, with and without the error-bound gate.
+    #[tokio::test]
+    async fn the_scorer_decides_as_the_reconstruction_does() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _) = prepare(&dir, Scenario::Reassign).await;
+        let h = handle(&db).await;
+        maintain_partition(&db, super::super::tests::NS, &h, &full(40, 0, 64)).await.unwrap();
+        let ivf = h.snapshot();
+        let mut checked = 0;
+        let mut candidates = 0;
+        for (&p, info) in ivf.posting_infos() {
+            if info.state != PostingState::Retired {
+                continue;
+            }
+            let children: Vec<u32> = ivf
+                .posting_infos()
+                .iter()
+                .filter(|(_, i)| i.parent_id == Some(p) && i.state == PostingState::Active)
+                .map(|(&id, _)| id)
+                .collect();
+            let [c0, c1] = children[..] else { continue };
+            for gate in [false, true] {
+                let ops = MaintenanceOps {
+                    skip_uncertain_moves: gate,
+                    ..full(40, 0, 64)
+                };
+                let rule = Rule::new(&ivf, &ops, info.centre_id, [c0, c1]).unwrap();
+                let mut x = Vec::new();
+                for &(src, centre) in &ivf.active_centres() {
+                    for (doc, codes) in posting_entries(&db, super::super::tests::NS, src).await.unwrap() {
+                        for code in &codes {
+                            let fast = rule.decide(&ivf, src, centre, code, &mut x);
+                            let slow = rule.decide_reconstructed(&ivf, src, centre, code);
+                            assert_eq!(fast, slow, "posting {src}, doc {doc:?}, split of {p}, gate {gate}");
+                            checked += 1;
+                            candidates += usize::from(fast.0);
+                        }
+                    }
+                }
+                // Random codes too: random signs and scales, own centres drawn
+                // from every centre, filed under every active posting.
+                let centres = crate::semantic_search::IvfLayout::centre_ids(&*ivf);
+                let active = ivf.active_centres();
+                let mut state = 11u64 ^ u64::from(p);
+                let mut next = || {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state >> 11
+                };
+                for _ in 0..2000 {
+                    let (src, centre) = active[next() as usize % active.len()];
+                    let code = VectorIndex {
+                        cluster_id: src,
+                        centre_id: centres[next() as usize % centres.len()],
+                        quantisation_style: crate::semantic_search::index::vector_index::QuantisationStyle::SingleBit,
+                        addition_factor: 0.0,
+                        scaling_factor: (next() % 1000) as f32 / 4000.0,
+                        error_bound: (next() % 1000) as f32 / 20000.0,
+                        packed_vector: vec![next() ^ (next() << 40); centre.len().div_ceil(64)],
+                    };
+                    let fast = rule.decide(&ivf, src, centre, &code, &mut x);
+                    assert_eq!(
+                        fast,
+                        rule.decide_reconstructed(&ivf, src, centre, &code),
+                        "random code, split of {p}, gate {gate}"
+                    );
+                    checked += 1;
+                    candidates += usize::from(fast.0);
+                }
+            }
+        }
+        assert!(checked > 4000 && candidates > 10, "{checked} decisions, {candidates} candidates");
+        db.shutdown().await.unwrap();
     }
 }

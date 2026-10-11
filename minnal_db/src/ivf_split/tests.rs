@@ -409,7 +409,7 @@ async fn e2e_partition_invariants() {
 
 /// Maintenance with merges at `merge_limit` and reassignment over `range`
 /// neighbours.
-fn full(split_limit: u64, merge_limit: u64, range: usize) -> MaintenanceOps {
+pub(super) fn full(split_limit: u64, merge_limit: u64, range: usize) -> MaintenanceOps {
     MaintenanceOps {
         merge_limit,
         reassign_range: range,
@@ -423,7 +423,7 @@ async fn delete_doc(db: &AsyncDb, h: &PartitionHandle, d: u64) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Scenario {
+pub(super) enum Scenario {
     /// Topics 0 and 1 split the root at 40 chunks; then topics 2 and 3 arrive
     /// and fill both halves past the limit, so the next splits leave chunks in
     /// a neighbour that a new centre beats.
@@ -437,7 +437,7 @@ const DELETED: [u64; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 
 /// The state just before the maintenance a scenario is about, and the chunks
 /// each document must end with.
-async fn prepare(dir: &TempDir, scenario: Scenario) -> (AsyncDb, BTreeMap<Vec<u8>, usize>) {
+pub(super) async fn prepare(dir: &TempDir, scenario: Scenario) -> (AsyncDb, BTreeMap<Vec<u8>, usize>) {
     let db = setup(dir, 20).await;
     let h = handle(&db).await;
     maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();

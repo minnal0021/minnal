@@ -333,6 +333,27 @@ async fn posting_entries(db: &AsyncDb, namespace: &str, posting: u32) -> Result<
     Ok(out)
 }
 
+/// Several postings' entries in one read (each LSM layer is read once for the
+/// whole set, as a search's probe is): `posting → [(doc id, codes)]`.
+async fn postings_entries(db: &AsyncDb, namespace: &str, postings: &[u32]) -> Result<HashMap<u32, Vec<(Vec<u8>, Vec<VectorIndex>)>>, crate::KVError> {
+    let rows = db
+        .namespace(sparse_vectors_ns(namespace))
+        .await?
+        .scan_prefixes_batch(postings.to_vec())
+        .await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for (posting, rows) in rows {
+        let mut entries = Vec::with_capacity(rows.len());
+        for (k, v) in rows {
+            let Some((_, doc)) = composite_key::decode(&k) else { continue };
+            let codes = VectorIndex::list_from_bytes(&v).map_err(|e| corrupt(namespace, format!("posting {posting}: {e}")))?;
+            entries.push((doc.to_vec(), codes));
+        }
+        out.insert(posting, entries);
+    }
+    Ok(out)
+}
+
 /// The posting as stored, as it is in `ivf` (for writing it back changed).
 fn posting_of(ivf: &NamespaceIvf, id: u32) -> Option<Posting> {
     let info = ivf.posting_infos().get(&id)?;
