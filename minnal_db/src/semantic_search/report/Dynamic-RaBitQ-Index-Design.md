@@ -1,6 +1,6 @@
 # Dynamic RaBitQ index: design and milestones
 
-**Status:** M0–M3a done; M3b next; M5 (system benchmark) designed ·
+**Status:** M0–M3b done; M4 next; M5 (system benchmark) designed ·
 branch `dynamic-rabitq-index` · 2026-10-11
 
 **Goal.** Remove the pre-trained centroid files. Each namespace should build and
@@ -1882,6 +1882,111 @@ gemma and qwen, corpus, shuffled and drifting order, background workers on:
   `m3b_wear.py`): what deletes and merges cost. A churn gap of −1.4 against a
   pre-churn −0.9 at the same entries is a wear of −0.5.
 
+### M3b result (2026-10-11)
+
+**Passed gates (a)–(e) on every run; gate (f) passed on 7 of 8 churn runs.**
+Each split is now followed by a reassignment over its two halves and the 64
+postings nearest its old centre (LIRE step 5), postings at or under
+`merge_limit` are merged, and the optional error-bound gate is built (off by
+default). Final code `c7f7132`; the gate matrix ran on `c0e7654`, and the
+batched moves added since (`3c8c10f`) give identical partitions (checked on
+SciFact and FiQA).
+
+**Gate runs** (grown at target 128 with the background workers, against
+static k-means fitted on the same chunks at the shuffled run's K; M3a figures
+for drifting are its re-runs under the shared 8-topic order):
+
+| | K (M3a) | Recall@10 vs static at 5% read | Chunk moves per inserted chunk | Worst nDCG change vs M3a at 70k, @10–@100 |
+|---|---|---|---|---|
+| SciFact gemma, shuffled / corpus / drifting | 133 / 133 / 137 (154 / 159 / 148) | −1.4 / −1.0 / −1.8 | 2.13 / 2.11 / 2.78 | 0.0000 |
+| SciFact qwen | 134 / 139 / 137 (160 / 154 / 150) | −1.8 / −0.9 / −1.0 | 2.18 / 2.20 / 2.73 | 0.0000 |
+| FiQA gemma | 988 / 979 / 993 (1,226 / 1,216 / 1,205) | −0.9 / −0.8 / −1.0 | 1.97 / 1.95 / 2.07 | +0.0006 at worst |
+| FiQA qwen | 957 / 952 / 976 (1,150 / 1,114 / 1,123) | −0.4 / −0.6 / −0.8 | 1.90 / 1.89 / 2.06 | −0.0005 at worst |
+
+- **(a) Recall within 2 points of static from 5% read:** passed everywhere,
+  including SciFact, which M3a missed by up to 1.5 points. At equal read
+  shares (1–20%) M3b's recall is at or above M3a's in every run (the one
+  exception is −0.03 points, FiQA qwen drifting at 20%), most where topics
+  arrive in turn (SciFact gemma drifting: +10.2 points at 1% read, +3.2 at 5%).
+- **(b) nDCG@{10..100} ≥ M3a − 0.005:** passed; the worst cutoff anywhere is
+  −0.0005. SciFact is a full scan at 70k and identical.
+- **(c) Moves within 20% of 2.0 in shuffled order:** 1.90–2.18. Drifting runs
+  move more (2.06–2.78, most on SciFact).
+- **(d) Latency:** FiQA gemma, corpus order, M3a and M3b alternated, two rounds
+  of five passes at the default 70k budget: p50 14.62 → 14.68 ms (+0.4%), p95
+  16.47 → 16.63 ms (+1.0%), the rounds agreeing within 0.25 ms. M3b reaches the
+  same entries with fewer probes (579 against 603), since it has about 20% fewer
+  postings.
+- **(e) Indexing cost** (embedding excluded): FiQA 47 s against 35 s for M3a
+  (alternated, the same runs), SciFact 3.6 s against 2.6–2.8 s (M3a's
+  drifting re-runs). About 0.2 ms more per document, against roughly 100 ms
+  for the embedding call.
+
+**Churn (gate f, *wear*).** Half the documents deleted after growing, in
+shuffled order, compared with static k-means fitted on the survivors at the
+same K:
+
+| Churn | Run | Postings left (merges) | Churn gap | Pre-churn gap at the same entries | Wear |
+|---|---|---|---|---|---|
+| Whole topics | SciFact gemma | 85 (49) | −1.8 | −2.9 | +1.1 |
+| | SciFact qwen | 87 (47) | −5.5 | −3.0 | **−2.5** |
+| | FiQA gemma | 691 (298) | −0.6 | −1.5 | +0.8 |
+| | FiQA qwen | 634 (323) | −1.4 | −0.9 | −0.5 |
+| Random | SciFact gemma | 131 (2) | −2.1 | −2.6 | +0.5 |
+| | SciFact qwen | 127 (8) | −3.0 | −2.9 | −0.1 |
+| | FiQA gemma | 967 (22) | −1.0 | −1.4 | +0.4 |
+| | FiQA qwen | 944 (13) | −0.3 | −0.9 | +0.5 |
+
+Deletes and merges cost nothing measurable on FiQA (wear within ±0.8 points,
+its noise is about ±0.4) and on SciFact with random deletes. **Known
+limitation:** SciFact qwen with whole topics deleted wears 2.5 points (SciFact's
+noise is about ±1): a small namespace (87 postings left) where half the topics
+vanished. A merge that dissolves a posting into each chunk's nearest neighbour
+(the M3-pre simulation's merge, not SPFresh's) was considered and not adopted:
+the merge stays SPFresh's. (The churn runs used the gate's binary, whose
+decisions the final code reproduces.)
+
+**Indexing cost, and what it was spent on.** The first gate run indexed FiQA
+in 245 s. A profile showed maintenance spent 172 of 241 s deciding which scope
+chunks move (every chunk checked against a few centres, twice per split), 32 s
+reading the scope, and about 10 s on all WAL writes together. The decision is
+now made once per split, without reconstructing codes (`Scorer`: per-byte lookup
+tables for `⟨σ, t⟩`, cached `⟨c, t⟩`; only a candidate is reconstructed), the
+scope is read in one batched scan, and per-document moves run in locked batches
+of 64 with batched reads, four at a time: 245 → 91 → 55 → 47 s. Every step gives
+the same partition. Scheduling batches on demand instead of in fixed lanes
+measured the same (47.3 s against 46.8–47.1 s) and was not kept.
+
+**End-to-end check.** A scratch API server (real embedding service,
+`target_posting_size = 16`) indexed 400 SciFact documents, then took 200
+deletes and 400 inserts and was killed with SIGKILL while maintenance was
+running. After a restart it drained its queue, search returned no deleted
+document and found a live one at rank 1, and a check of the stopped database
+found no unfinished journal record, every key in an active posting and every
+count equal to a recount (133 postings, 2,451 chunks). One posting stayed over
+the split limit (46 chunks against 32): its only 2-means division is 44 + 2, which
+the split rule below refuses.
+
+**Found while building it:**
+
+- **The crash tests could not see a missing barrier.** The simulated crash
+  (`AsyncDb::crash`) let every store flush its memtable when dropped, so no-WAL
+  writes always survived it, and deleting a split's barrier flush left its crash
+  test green. Fixed in the engine's test support; with an honest crash every
+  earlier crash test still passes, and removing either barrier (split or
+  reassignment) fails them.
+- **A split whose smaller half the next merge would undo is refused.** On
+  SciFact, 2-means split a 262-chunk posting into 259 and 3, the merge sent the 3
+  back, and the two alternated 900 times in one maintenance pass. A deviation
+  from SPTAG, needed because minnal merges eagerly (*Why a split can be
+  refused*).
+- **Drifting has one definition.** The bench's drifting order sorted documents
+  by their nearest bundled centroid, the simulation's used 8 k-means topics; the
+  bench now reads the simulation's exact order (*Terms used here*). M0–M3a
+  drifting figures were measured the old way.
+- **Gate (f) measures wear,** not the gap at 5% of the survivors, whose budget
+  is half the pre-churn one (decided 2026-10-11).
+
 ### M3c — Bootstrap phase (dropped)
 
 Not built. Seeding from floats gained at most 0.2–0.3 points over growing from
@@ -2283,7 +2388,7 @@ a second dataset (SciFact, which splits far less) is worth its run time.
 | Hot-path cost of per-entry centre lookup | M2b | Dense `Vec` index; latency gate on this sub-step alone |
 | Split races with inserts and deletes; crash mid-split | M3a | Maintenance journal (redo only); barrier before delete; meta kept a superset; routing epoch + doc lock; crash tests that discard unflushed no-WAL writes |
 | No-WAL write lost while a WAL-backed delete or queue completion survives | M0-1, M3a | Queue completion after flush (M0-1); barrier before delete (M3a) |
-| Write amplification from reassignment | M3b | Simulated at 2.0 key moves per insert; `reassign_range` (0 = off) and the error-bound gate (−12–17%) are knobs; M3b gates on measured moves |
+| Write amplification from reassignment | M3b | Measured 1.89–2.20 chunk moves per inserted chunk in shuffled and corpus order (the simulation: 2.0), 2.06–2.78 in drifting order; `reassign_range` (0 = halves only) and the error-bound gate are knobs |
 | Early-life quality before the first splits | M3 | A small namespace is scanned in full under the default budget; seeding was measured not to pay (M3c dropped) |
 | Two models in one process | M2a | Per-namespace probe and cache key; test with gemma + qwen |
 
