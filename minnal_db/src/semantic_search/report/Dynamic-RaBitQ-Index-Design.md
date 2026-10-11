@@ -1856,12 +1856,31 @@ unfinished split.
 Steps 5–6 and the merge of *M3 split algorithm (LIRE)*: reassignment over the
 `reassign_range` nearest postings, merges at `merge_limit`, and the optional
 error-bound gate. Measured separately because each move costs a put plus a
-tombstone in the LSM. **Gate:** recall gain ≥ what the simulation predicted;
-nDCG@{10, 20, 30, 40, 50, 100} each ≥ M3a − 0.005;
-key moves per insert within 20% of the simulation's (about 2.0 at the
-defaults, measured in shuffled order, so the check applies to shuffled runs;
-drifting runs report theirs); compaction and write-amplification overhead reported; no query
-latency regression while maintenance runs.
+tombstone in the LSM.
+
+**Gate** (2026-10-11; the simulation never ran split-only, so "recall gain ≥ the
+simulation's" had no number to meet, and these replace it). SciFact and FiQA,
+gemma and qwen, corpus, shuffled and drifting order, background workers on:
+
+- (a) Recall@10 within 2 points of static k-means at the same K, at equal
+  entries read, from 5% of the chunks read.
+- (b) nDCG@{10, 20, 30, 40, 50, 100} at the default budget, each ≥ M3a − 0.005.
+- (c) Chunk moves per inserted chunk within 20% of the simulation's 2.0 in
+  shuffled order (the simulation's figure is a shuffled-order one); drifting
+  runs report theirs.
+- (d) p50 and p95 search latency within +5% of M3a.
+- (e) Indexing cost reported.
+- (f) **Churn wear** within 1.0 point. A churn run grows the corpus in
+  shuffled order, deletes half its documents (whole topics, or at random) with
+  maintenance between batches, and is compared with static k-means fitted on
+  the survivors at the same K. Its *churn gap* is the recall@10 difference at
+  5% of the survivors' chunks. That budget is about half the pre-churn one in
+  absolute entries, and the grown partition already trails static by more at
+  smaller budgets, so the churn gap mixes budget size with damage. **Wear** is
+  the churn gap minus the gap the same partition had before any delete at the
+  same absolute entries read (log-interpolated between budgets;
+  `m3b_wear.py`): what deletes and merges cost. A churn gap of −1.4 against a
+  pre-churn −0.9 at the same entries is a wear of −0.5.
 
 ### M3c — Bootstrap phase (dropped)
 
