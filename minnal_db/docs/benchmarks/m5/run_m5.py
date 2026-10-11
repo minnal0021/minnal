@@ -39,8 +39,14 @@ MIXES = {
     "balanced": dict(get=25, insert=10, update=10, delete=3, scan=5, field_query=15, search=25, filtered_search=7),
     "ingest_heavy": dict(get=15, insert=30, update=15, delete=5, scan=5, field_query=10, search=15, filtered_search=5),
 }
-# p99 latency targets (ms), from scheduled time.
-SLO = dict(get=5, insert=20, update=20, delete=20, scan=20, field_query=20, search=100, filtered_search=100)
+# p99 latency targets (ms), from scheduled time. Writes are bounded below by
+# their WAL fsyncs (~2.3 ms each on this host, one WAL lock for the server):
+# insert/update ~2 before the reply, delete ~8. So their targets are ~2-3x the
+# p99 one client sees at low load (user decision, 2026-10-11): insert/update
+# 20-23 ms, delete 35 ms (~120 ms while maintenance runs), scan ~26 ms at
+# 50 req/s. The design's starting values (20 ms for every write and scan)
+# failed at every rate.
+SLO = dict(get=5, insert=50, update=50, delete=150, scan=50, field_query=20, search=100, filtered_search=100)
 MAX_ERROR_RATE = 0.001
 
 mix = sys.argv[1]

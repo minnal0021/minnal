@@ -2467,10 +2467,16 @@ unsustainable whatever the latencies say.
    5 minutes each, same mix.
 
 **Latency target (the SLO)** used to call a step passing, per class at p99:
-`get` 5 ms, `insert`/`update`/`delete` 20 ms (acknowledgement, which includes
-the WAL fsync but not embedding), `scan` page 20 ms, `field_query` 20 ms,
-`search` and `filtered_search` 100 ms. These are starting values to agree on
-before the run, not measured limits.
+`get` 5 ms, `insert`/`update` 50 ms, `delete` 150 ms (acknowledgement, which
+includes the WAL fsyncs but not embedding), `scan` page 50 ms, `field_query`
+20 ms, `search` and `filtered_search` 100 ms. A write cannot be faster than its
+WAL fsyncs: about 2.3 ms each on this host, one at a time for the whole server,
+about 2 before an insert or update is acknowledged and 8 before a delete is. One
+client at low load measured p99 20–23 ms for inserts and updates, 35 ms for
+deletes (about 120 ms while partitions split) and 26 ms for a scan page, so the
+write targets are about 2–3× those (agreed 2026-10-11). The starting values
+(20 ms for every write and scan) failed at every rate, so stepping could never
+find a passing one.
 
 ### What is measured
 
