@@ -1526,6 +1526,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
 | `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
+| `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find within their budget: the signal for a rebuild |
 | `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
@@ -1990,7 +1991,7 @@ bounds its memory (a search holds what it scans until it returns);
 | `min_overlap` | 0.95 | Overlap@10 below which the verdict is `below_target` |
 | `probe_budget_entries`, `min_probes`, `max_probes` | the store's | Check another budget, validated as for a search |
 
-The response holds `verdict`, `query_source`, `sampled`, `entries`, `postings`,
+The response holds `verdict`, `seed`, `query_source`, `sampled`, `entries`, `postings`,
 `budget_entries`, `read_share` (mean share of entries a search read),
 `probes_mean`, `reference_is_full_read`, `reference_share`, `overlap` (`k` and
 `mean` at 10, 20, 30, 40, 50 and 100),
@@ -2028,6 +2029,24 @@ unknown store and `422` when semantic search is not enabled.
 
 ---
 
+#### `GET /admin/indices/vector/settings`
+
+The server's `[semantic_search]` settings as it runs with them:
+`embedding_service_url`, `supported_models` (empty: any model the service
+serves), the request and connect timeouts, `query_embedding_cache_ttl_secs`,
+`partition_history_ttl_secs`, `maintenance_threads`, `rebuild_threads` (at most
+`max_rebuild_threads`), the recall check's limits (`max_sample`,
+`min_cached_queries`, `max_reference_entries`, `default_min_overlap`), and
+`namespace_defaults`: the search and maintenance settings a store is given when
+it enables semantic search. A store's own settings are in its schema
+(`vector_index`). Returns `422` when semantic search is not configured.
+
+```bash
+curl http://localhost:8080/admin/indices/vector/settings
+```
+
+---
+
 #### `GET /admin/indices/{ns}/vector/history`
 
 What the store's partition looked like over time, without recomputing anything:
@@ -2036,8 +2055,8 @@ every `partition?codes=true` read (`kind` `codes`), recall check
 the result as its endpoint returned it under `data`. Newest first; `kind` keeps
 one kind, `limit` sets how many (default 50, at most 1,000). Records are kept in
 the system TTL store `system_partition_history` for
-`[semantic_search] partition_history_ttl_secs` (default 30 days), and written
-only when one of those operations runs.
+`[semantic_search] partition_history_ttl_secs` (default 30 days; the response's
+`ttl_secs`), and written only when one of those operations runs.
 
 ```bash
 curl 'http://localhost:8080/admin/indices/products/vector/history?kind=recall_check&limit=10'

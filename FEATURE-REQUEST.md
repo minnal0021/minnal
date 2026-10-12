@@ -1053,6 +1053,14 @@ partition can change its results), `ok`, `below_target` (overlap@10 under
 `min_overlap`, default 0.95) or `empty`. The same `seed` samples the same queries,
 so a check before and after a rebuild compares like with like.
 
+**Server settings.** `GET /admin/indices/vector/settings` returns the server's
+`[semantic_search]` values (embedding service, allowed models, timeouts, both
+TTLs, maintenance and rebuild threads, the recall check's limits, and the
+defaults new stores get), so a console can show them beside a store's own
+`vector_index`. Each recall check also returns its `seed`, so checks around a
+rebuild can be matched. minnal_ui shows all of it in a per-store **Vector Index
+Ops** tab (branch `dynamic-rabitq-index` of minnal_ui).
+
 **The history.** Every recall check, `partition?codes=true` read and finished
 rebuild is written to the system TTL namespace `system_partition_history`
 (`partition_history_ttl_secs`, default 30 days; one WAL-backed put each). `GET .../vector/history` reads them back,

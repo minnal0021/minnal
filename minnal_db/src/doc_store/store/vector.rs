@@ -32,7 +32,7 @@ impl DocStore {
         if codes {
             record_history(
                 &self.db,
-                self.history_ttl(),
+                self.vector_partition_history_ttl(),
                 namespace,
                 crate::ivf_split::history::RecordKind::Codes,
                 &summary,
@@ -60,10 +60,9 @@ impl DocStore {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
         require_semantic_search(&self.schema_dir, namespace)?;
-        let schema = self.load_schema(namespace)?;
-        let ns = self
-            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
-            .await?;
+        // Document or KV store alike.
+        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        let ns = self.namespace_semantics(namespace, Some(ns_id), &settings, overrides).await?;
         // Real queries first: the cache holds the embeddings of recent searches
         // for this model and dimension (one bounded page read, no service call).
         let cached = vector_kv::sample_cached_query_embeddings(
@@ -78,7 +77,7 @@ impl DocStore {
         let check = crate::ivf_split::recall_check::recall_check(&self.db, namespace, &ns.partition, &ns.config, params, cached).await?;
         record_history(
             &self.db,
-            self.history_ttl(),
+            self.vector_partition_history_ttl(),
             namespace,
             crate::ivf_split::history::RecordKind::RecallCheck,
             &check,
@@ -87,10 +86,61 @@ impl DocStore {
         Ok(check)
     }
 
-    /// How long partition-history records are kept (the server's
-    /// `partition_history_ttl_secs`).
+    /// The server's semantic-search settings, as configured (`[semantic_search]`
+    /// in the server's TOML): the embedding service, the allowed models, the
+    /// TTLs, the maintenance and rebuild threads, and the defaults a namespace's
+    /// vector-index settings are filled with when it enables semantic search.
+    /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
-    fn history_ttl(&self) -> std::time::Duration {
+    pub fn vector_server_settings(&self) -> Option<serde_json::Value> {
+        let ctx = self.semantic_ctx.as_ref()?;
+        let (search, m) = (ctx.index_defaults.search, ctx.index_defaults.maintenance);
+        Some(serde_json::json!({
+            "embedding_service_url": ctx.config.embedding_service_url,
+            "supported_models": ctx.supported_models,
+            "embedding_request_timeout_secs": ctx.config.embedding_request_timeout.as_secs(),
+            "embedding_connect_timeout_secs": ctx.config.embedding_connect_timeout.as_secs(),
+            "query_embedding_cache_ttl_secs": ctx.config.query_embedding_cache_ttl.as_secs(),
+            "partition_history_ttl_secs": ctx.config.partition_history_ttl.as_secs(),
+            "maintenance_threads": ctx.maintenance_threads,
+            "rebuild_threads": ctx.rebuild_threads,
+            "max_rebuild_threads": crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            "recall_check": {
+                "max_sample": crate::ivf_split::recall_check::MAX_SAMPLE,
+                "min_cached_queries": crate::ivf_split::recall_check::MIN_GIVEN_QUERIES,
+                "max_reference_entries": crate::ivf_split::recall_check::MAX_REFERENCE_ENTRIES,
+                "default_min_overlap": crate::ivf_split::recall_check::DEFAULT_MIN_OVERLAP,
+            },
+            "namespace_defaults": {
+                "search": {
+                    "probe_budget_entries": search.probe_budget_entries,
+                    "min_probes": search.min_probes,
+                    "max_probes": search.max_probes,
+                    "first_pass_top_k": search.first_pass_top_k,
+                    "top_k": search.top_k,
+                    "probe_budget_fraction": search.probe_budget_fraction.map(|r| r.0),
+                    "probe_budget_floor": search.probe_budget_floor,
+                },
+                "maintenance": {
+                    "target_posting_size": m.target_posting_size,
+                    "split_limit": m.split_limit(),
+                    "merge_limit": m.merge_limit(),
+                    "reassign_range": m.reassign_range,
+                    "merge_ratio": m.merge_ratio.0,
+                    "skip_uncertain_moves": m.skip_uncertain_moves,
+                    "split_samples": m.split_samples,
+                    "split_init_trials": m.split_init_trials,
+                    "split_max_iters": m.split_max_iters,
+                    "split_lambda_factor": m.split_lambda_factor.0,
+                },
+            },
+        }))
+    }
+
+    /// How long partition-history records are kept (the server's
+    /// `partition_history_ttl_secs`; default 30 days without semantic search).
+    #[cfg(feature = "semantic-search")]
+    pub fn vector_partition_history_ttl(&self) -> std::time::Duration {
         self.semantic_ctx
             .as_ref()
             .map_or(crate::ivf_split::history::DEFAULT_HISTORY_TTL, |c| c.config.partition_history_ttl)
@@ -111,7 +161,7 @@ impl DocStore {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
         require_semantic_search(&self.schema_dir, namespace)?;
-        Ok(crate::ivf_split::history::read(&self.db, namespace, kind, limit, self.history_ttl()).await?)
+        Ok(crate::ivf_split::history::read(&self.db, namespace, kind, limit, self.vector_partition_history_ttl()).await?)
     }
 
     /// Start rebuilding `namespace`'s partition from its codes (design doc M4)

@@ -711,6 +711,22 @@ pub async fn vector_partition(
     Json(body).into_response()
 }
 
+/// `GET /admin/indices/vector/settings` — the server's semantic-search
+/// settings (`[semantic_search]` in its config): embedding service, allowed
+/// models, TTLs, maintenance and rebuild threads, the recall check's limits, and
+/// the defaults new namespaces' vector-index settings are filled with. `422`
+/// when semantic search is not configured.
+pub async fn vector_server_settings(State(state): State<AppState>) -> axum::response::Response {
+    match state.store.vector_server_settings() {
+        Some(v) => Json(v).into_response(),
+        None => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "semantic search is not configured on this server"})),
+        )
+            .into_response(),
+    }
+}
+
 /// Query of `GET /admin/indices/{ns}/vector/recall-check`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -827,7 +843,12 @@ pub async fn vector_history(State(state): State<AppState>, Path(ns): Path<String
         ));
     }
     match state.store.vector_partition_history(&ns, kind, limit).await {
-        Ok(records) => Json(serde_json::json!({ "namespace": ns, "records": records })).into_response(),
+        Ok(records) => Json(serde_json::json!({
+            "namespace": ns,
+            "ttl_secs": state.store.vector_partition_history_ttl().as_secs(),
+            "records": records,
+        }))
+        .into_response(),
         Err(e) => crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     }
 }

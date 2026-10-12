@@ -125,6 +125,9 @@ pub struct RecallCheck {
     pub verdict: RecallVerdict,
     /// The threshold used.
     pub min_overlap: f64,
+    /// The sample's seed: a check with the same seed (and source) searches the
+    /// same queries, so two checks around a rebuild compare like with like.
+    pub seed: u64,
     /// Where the queries came from.
     pub query_source: QuerySource,
     /// Queries searched.
@@ -266,6 +269,7 @@ pub async fn recall_check(
     Ok(RecallCheck {
         verdict,
         min_overlap: params.min_overlap,
+        seed: params.seed,
         query_source,
         sampled: n,
         entries,
