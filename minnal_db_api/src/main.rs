@@ -247,7 +247,18 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
 
-    info!("shutdown signal received — draining connections");
+    info!("shutdown signal received — draining connections (Ctrl-C again to force exit)");
+
+    // The handler stays installed, so without this a second Ctrl-C would be
+    // swallowed while a slow shutdown runs. Forcing exit is crash-equivalent:
+    // WAL-backed writes replay at the next start; no-WAL vector payloads not
+    // yet flushed are re-embedded by reconciliation.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            error!("second Ctrl-C — exiting without a clean shutdown");
+            std::process::exit(130);
+        }
+    });
 }
 
 /// Resolve and load configuration.

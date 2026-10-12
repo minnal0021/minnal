@@ -141,6 +141,25 @@ fn expected(docs: u64) -> BTreeMap<Vec<u8>, usize> {
 }
 
 #[tokio::test]
+async fn maintenance_stops_between_operations_when_asked_and_resumes_later() {
+    use std::sync::atomic::AtomicBool;
+    let dir = TempDir::new().unwrap();
+    let db = setup(&dir, 60).await;
+    let h = handle(&db).await;
+    // Set before the first operation: nothing is split, so server shutdown does
+    // not wait for a whole partition to grow.
+    let stopped = super::maintain_partition_until(&db, NS, &h, &settings(40), &AtomicBool::new(true))
+        .await
+        .unwrap();
+    assert_eq!(stopped, MaintenanceReport::default());
+    assert_eq!(h.snapshot().posting_infos()[&0].state, PostingState::Active);
+    check(&db, &h, &expected(60)).await.unwrap();
+    // The next request does the work.
+    assert!(maintain_partition(&db, NS, &h, &settings(40)).await.unwrap().splits >= 4);
+    check(&db, &h, &expected(60)).await.unwrap();
+}
+
+#[tokio::test]
 async fn an_oversized_posting_splits_until_every_posting_is_within_the_limit() {
     let dir = TempDir::new().unwrap();
     let db = setup(&dir, 60).await; // 180 chunks in the root

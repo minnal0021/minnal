@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
 use tokio::sync::{Notify, Semaphore, mpsc};
@@ -29,15 +30,20 @@ use crate::ivf_split;
 pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
 
 /// A running maintenance task. [`shutdown`](Self::shutdown) stops it after the
-/// splits in progress finish; dropping it stops it too.
+/// split or merge in progress in each namespace finishes, leaving the rest for
+/// the next start (startup recovery asks for maintenance of every namespace);
+/// dropping it stops it too.
 pub(crate) struct MaintenanceHandle {
     stop: Arc<Notify>,
+    /// Set on shutdown; running jobs check it between operations.
+    stopping: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MaintenanceHandle {
     /// Stop the task and wait for it.
     pub(crate) async fn shutdown(mut self) {
+        self.stopping.store(true, Ordering::Release);
         self.stop.notify_one();
         if let Some(task) = self.task.take() {
             let _ = task.await;
@@ -47,6 +53,7 @@ impl MaintenanceHandle {
 
 impl Drop for MaintenanceHandle {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         self.stop.notify_one();
     }
 }
@@ -56,10 +63,12 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     ctx.set_maintenance_sender(tx);
     let stop = Arc::new(Notify::new());
+    let stopping = Arc::new(AtomicBool::new(false));
     let permits = Arc::new(Semaphore::new(ctx.maintenance_threads.max(1)));
     let schema_dir = Arc::new(schema_dir);
     let task = {
         let stop = Arc::clone(&stop);
+        let stopping = Arc::clone(&stopping);
         tokio::spawn(async move {
             let mut running = tokio::task::JoinSet::new();
             loop {
@@ -74,9 +83,12 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
                 }
                 for namespace in pending {
                     let Ok(permit) = Arc::clone(&permits).acquire_owned().await else { break };
-                    let (db, ctx, schema_dir) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schema_dir));
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (db, ctx, schema_dir, stopping) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schema_dir), Arc::clone(&stopping));
                     running.spawn(async move {
-                        maintain(&db, &ctx, &schema_dir, &namespace).await;
+                        maintain(&db, &ctx, &schema_dir, &namespace, &stopping).await;
                         drop(permit);
                     });
                 }
@@ -85,15 +97,20 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
             while running.join_next().await.is_some() {}
         })
     };
-    MaintenanceHandle { stop, task: Some(task) }
+    MaintenanceHandle {
+        stop,
+        stopping,
+        task: Some(task),
+    }
 }
 
-/// Split, reassign and merge `namespace`'s postings with its own settings.
-async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path, namespace: &str) {
+/// Split, reassign and merge `namespace`'s postings with its own settings,
+/// until none is left or `stopping` is set.
+async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path, namespace: &str, stopping: &AtomicBool) {
     let result = async {
         let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
         let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-        let report = ivf_split::maintain_partition(db, namespace, &ns.partition, &settings.maintenance.ops()).await?;
+        let report = ivf_split::maintain_partition_until(db, namespace, &ns.partition, &settings.maintenance.ops(), stopping).await?;
         Ok::<ivf_split::MaintenanceReport, crate::doc_store::error::DocStoreError>(report)
     }
     .await;
@@ -104,6 +121,9 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::p
             r.splits, r.merges
         ),
         Err(e) => warn!("partition maintenance: namespace='{namespace}' failed: {e}"),
+    }
+    if stopping.load(Ordering::Acquire) {
+        info!("partition maintenance: namespace='{namespace}' stopped for shutdown; resumes at the next start");
     }
 }
 

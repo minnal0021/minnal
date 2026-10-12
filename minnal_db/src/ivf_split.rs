@@ -660,6 +660,23 @@ pub async fn maintain_partition(
     handle: &PartitionHandle,
     ops: &MaintenanceOps,
 ) -> Result<MaintenanceReport, crate::KVError> {
+    maintain_partition_until(db, namespace, handle, ops, &std::sync::atomic::AtomicBool::new(false)).await
+}
+
+/// [`maintain_partition`], returning early once `stop` is set: it is checked
+/// before each split or merge, so the one in progress finishes and the rest are
+/// left for the next request. Every operation is journaled on its own, so
+/// stopping between two leaves the partition consistent. Server shutdown sets
+/// `stop`: growing a large namespace from its root posting is thousands of
+/// splits, and shutdown would otherwise wait for all of them.
+pub async fn maintain_partition_until(
+    db: &AsyncDb,
+    namespace: &str,
+    handle: &PartitionHandle,
+    ops: &MaintenanceOps,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<MaintenanceReport, crate::KVError> {
+    use std::sync::atomic::Ordering;
     let _maintenance = handle.lock_maintenance().await;
     let mut report = MaintenanceReport::default();
     // A guard against splits and merges undoing each other for ever; far above
@@ -682,6 +699,9 @@ pub async fn maintain_partition(
         over.sort_unstable_by(|a, b| b.cmp(a)); // largest first
         let mut progressed = false;
         for (_, id) in over {
+            if stop.load(Ordering::Acquire) {
+                return Ok(report);
+            }
             if let SplitOutcome::Split { .. } = split_locked(db, namespace, handle, id, ops).await? {
                 report.splits += 1;
                 progressed = true;
@@ -698,6 +718,9 @@ pub async fn maintain_partition(
             .collect();
         under.sort_unstable(); // smallest first
         for (_, id) in under {
+            if stop.load(Ordering::Acquire) {
+                return Ok(report);
+            }
             if merge::merge_locked(db, namespace, handle, id, ops).await? {
                 report.merges += 1;
                 progressed = true;
