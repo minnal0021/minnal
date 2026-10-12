@@ -1075,6 +1075,8 @@ async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u6
 }
 
 pub mod health;
+pub mod history;
+pub mod recall_check;
 
 #[cfg(test)]
 mod tests;

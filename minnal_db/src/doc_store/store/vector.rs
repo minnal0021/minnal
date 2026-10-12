@@ -29,7 +29,89 @@ impl DocStore {
         let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
         let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
         let (summary, postings) = crate::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
+        if codes {
+            record_history(
+                &self.db,
+                self.history_ttl(),
+                namespace,
+                crate::ivf_split::history::RecordKind::Codes,
+                &summary,
+            )
+            .await;
+        }
         Ok((settings.maintenance, summary, postings))
+    }
+
+    /// Check whether `namespace`'s searches miss what a full read finds, the
+    /// signal for a rebuild (FR-007): sample real queries from the query-embedding
+    /// cache, or stored chunks when fewer than 20 are cached (no embedding call
+    /// either way), and compare each search under the namespace's settings,
+    /// or `overrides` of them, with one that probes every posting. The result is
+    /// recorded in the partition history. Costs `params.sample` normal searches
+    /// plus as many full reads, one at a time.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_recall_check(
+        &self,
+        namespace: &str,
+        params: &crate::ivf_split::recall_check::RecallCheckParams,
+        overrides: &crate::doc_store::vector_settings::SearchSpec,
+    ) -> Result<crate::ivf_split::recall_check::RecallCheck, DocStoreError> {
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
+        require_semantic_search(&self.schema_dir, namespace)?;
+        let schema = self.load_schema(namespace)?;
+        let ns = self
+            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .await?;
+        // Real queries first: the cache holds the embeddings of recent searches
+        // for this model and dimension (one bounded page read, no service call).
+        let cached = vector_kv::sample_cached_query_embeddings(
+            &self.db,
+            &ns.config.model_name,
+            ns.config.embedding_dim,
+            ns.config.query_embedding_cache_ttl,
+            CACHED_QUERIES_READ,
+            params.seed,
+        )
+        .await?;
+        let check = crate::ivf_split::recall_check::recall_check(&self.db, namespace, &ns.partition, &ns.config, params, cached).await?;
+        record_history(
+            &self.db,
+            self.history_ttl(),
+            namespace,
+            crate::ivf_split::history::RecordKind::RecallCheck,
+            &check,
+        )
+        .await;
+        Ok(check)
+    }
+
+    /// How long partition-history records are kept (the server's
+    /// `partition_history_ttl_secs`).
+    #[cfg(feature = "semantic-search")]
+    fn history_ttl(&self) -> std::time::Duration {
+        self.semantic_ctx
+            .as_ref()
+            .map_or(crate::ivf_split::history::DEFAULT_HISTORY_TTL, |c| c.config.partition_history_ttl)
+    }
+
+    /// `namespace`'s partition history, newest first: code-health reads, recall
+    /// checks and rebuilds, kept for the server's `partition_history_ttl_secs`
+    /// (default 30 days). `kind` keeps one
+    /// kind only; at most `limit` records.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_partition_history(
+        &self,
+        namespace: &str,
+        kind: Option<crate::ivf_split::history::RecordKind>,
+        limit: usize,
+    ) -> Result<Vec<crate::ivf_split::history::HistoryRecord>, DocStoreError> {
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
+        require_semantic_search(&self.schema_dir, namespace)?;
+        Ok(crate::ivf_split::history::read(&self.db, namespace, kind, limit, self.history_ttl()).await?)
     }
 
     /// Start rebuilding `namespace`'s partition from its codes (design doc M4)
@@ -71,6 +153,16 @@ impl DocStore {
                 Err(e) => log::warn!("partition rebuild: namespace='{namespace}' failed: {e}"),
             }
             ctx.finish_rebuild(&namespace, result.map_err(|e| e.to_string()));
+            if let Some(status) = ctx.rebuild_status(&namespace) {
+                record_history(
+                    &db,
+                    ctx.config.partition_history_ttl,
+                    &namespace,
+                    crate::ivf_split::history::RecordKind::Rebuild,
+                    &status,
+                )
+                .await;
+            }
         });
         Ok(())
     }
@@ -879,6 +971,26 @@ async fn reconcile_kv_namespace_vectors(db: &AsyncDb, schema: &KvStoreSchema, ch
         info!("vec reconcile: kv namespace '{}' re-enqueued {} missing entry(ies)", namespace, enqueued);
     }
     Ok(enqueued)
+}
+
+/// Cached query embeddings a recall check reads at most (about 3 KB each at 768
+/// dimensions), to sample from.
+#[cfg(feature = "semantic-search")]
+const CACHED_QUERIES_READ: usize = 2_000;
+
+/// Record a partition-history entry; a failure loses the record, never the
+/// result it describes.
+#[cfg(feature = "semantic-search")]
+async fn record_history(
+    db: &AsyncDb,
+    ttl: std::time::Duration,
+    namespace: &str,
+    kind: crate::ivf_split::history::RecordKind,
+    data: &impl serde::Serialize,
+) {
+    if let Err(e) = crate::ivf_split::history::record(db, namespace, kind, data, ttl).await {
+        log::warn!("partition history: namespace='{namespace}' {kind:?} not recorded: {e}");
+    }
 }
 
 #[cfg(test)]

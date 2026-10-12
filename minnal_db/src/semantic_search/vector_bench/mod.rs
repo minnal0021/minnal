@@ -692,6 +692,12 @@ async fn vector_bench() {
     }
     let index_seconds = t.elapsed().as_secs_f64();
     eprintln!("  indexed in {index_seconds:.1}s ({:.0} docs/s)", frozen.n_docs() as f64 / index_seconds);
+    // ── FR-007 calibration: the recall check and centre drift, before and after
+    //    the rebuild ──
+    let recall_check = env_or("MINNAL_BENCH_RECALL_CHECK", "0") == "1";
+    if recall_check {
+        recall_check_report("before rebuild", &db, &handle, &config, &frozen).await;
+    }
     // ── Rebuild from the codes (M4), timed on its own ──
     let rebuild = if env_or("MINNAL_BENCH_REBUILD", "0") == "1" {
         let params = crate::ivf_split::rebuild::RebuildParams {
@@ -711,6 +717,9 @@ async fn vector_bench() {
     } else {
         None
     };
+    if recall_check && rebuild.is_some() {
+        recall_check_report("after rebuild", &db, &handle, &config, &frozen).await;
+    }
     drop(handle);
     // Settle the LSM so every setting reads the same on-disk shape.
     db.shutdown().await.unwrap();
@@ -1477,5 +1486,62 @@ fn vector_bench_compare() {
         let out = parent.join(format!("compare_{}_vs_{}-{}.md", new.dataset, base.label, new.order));
         std::fs::write(&out, &md).unwrap();
         eprintln!("  written to {}", out.display());
+    }
+}
+
+/// Print the FR-007 recall check at entry budgets of 1%, 5% and 20% of the
+/// namespace and at the default, plus centre drift (`MINNAL_BENCH_RECALL_CHECK`).
+async fn recall_check_report(
+    when: &str,
+    db: &AsyncDb,
+    handle: &crate::semantic_search::PartitionHandle,
+    config: &SemanticSearchConfig,
+    frozen: &Frozen,
+) {
+    use crate::ivf_split::recall_check::{RecallCheckParams, recall_check};
+    let (summary, _) = crate::ivf_split::health::partition_health(db, NS, handle, true).await.unwrap();
+    let c = summary.codes.unwrap_or_default();
+    eprintln!(
+        "  [{when}] {} postings; drift mean {:.3}, p90 {:.3}, foreign {:.3}",
+        summary.postings, c.drift_mean, c.drift_p90, c.foreign_share
+    );
+    let entries = handle.snapshot().total_entries();
+    let sample = env_or("MINNAL_BENCH_RECALL_SAMPLE", "300").parse().unwrap();
+    for (label, budget) in [
+        ("1%", Some(entries / 100)),
+        ("5%", Some(entries / 20)),
+        ("20%", Some(entries / 5)),
+        ("default", None),
+    ] {
+        let mut cfg = config.clone();
+        if let Some(b) = budget {
+            cfg.probe = ProbeSettings {
+                budget_entries: b.max(1),
+                min_probes: 1,
+                max_probes: handle.snapshot().postings(),
+            };
+        }
+        let params = RecallCheckParams {
+            sample,
+            ..RecallCheckParams::default()
+        };
+        // Real (judged) queries, as the query-embedding cache would hold them,
+        // then stored chunks.
+        let real: Vec<Vec<f32>> = (0..frozen.n_queries()).map(|q| frozen.query(q).to_vec()).collect();
+        for (source, given) in [("queries", real), ("chunks", Vec::new())] {
+            let r = recall_check(db, NS, handle, &cfg, &params, given).await.unwrap();
+            let o: Vec<String> = r.overlap.iter().map(|o| format!("@{} {:.3}", o.k, o.mean)).collect();
+            eprintln!(
+                "  [{when}] {source:>7} budget {label:>7}: read {:.3}, {:.1} probes, overlap {} (p10@10 {:.2}), {:?}; {:.1} / {:.1} ms per normal / full search, {:.1}s total",
+                r.read_share,
+                r.probes_mean,
+                o.join(" "),
+                r.overlap_at_10_p10,
+                r.verdict,
+                r.search_ms,
+                r.full_read_ms,
+                r.elapsed_ms / 1e3
+            );
+        }
     }
 }

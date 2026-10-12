@@ -262,6 +262,46 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
         .await;
 }
 
+/// Up to `limit` cached whole-query embeddings of `model` at `dim` dimensions:
+/// real queries recently searched, which the recall check (FR-007) prefers to
+/// queries made from stored chunks. One bounded page read, starting at a point
+/// in the key space chosen by `seed` and wrapping once, so a large cache is not
+/// read in full and the page does not always begin at the same query text.
+pub async fn sample_cached_query_embeddings(
+    db: &AsyncDb,
+    model: &str,
+    dim: usize,
+    ttl: Duration,
+    limit: usize,
+    seed: u64,
+) -> Result<Vec<Vec<f32>>, crate::KVError> {
+    let cache_ns = db
+        .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
+        .await?;
+    let prefix = query_cache_key(model, dim, "");
+    // The key just past every key with this prefix: the prefix ends in the
+    // dimension's last byte, so add one to it with carry.
+    let mut end = prefix.clone();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            break;
+        }
+    }
+    let end = (!end.is_empty()).then_some(end);
+    let mut start = prefix.clone();
+    start.push((seed % 256) as u8);
+    let mut out = Vec::new();
+    for (from, to) in [(start.clone(), end.clone()), (prefix, Some(start))] {
+        if out.len() >= limit {
+            break;
+        }
+        let (rows, _) = cache_ns.scan(Some(from), to, limit - out.len()).await?;
+        out.extend(rows.into_iter().filter_map(|(_, v)| bytes_to_f32_vec_list(&v, dim)?.into_iter().next()));
+    }
+    Ok(out)
+}
+
 /// Delete every entry from the system-wide query-embedding cache.
 ///
 /// Returns the number of cached entries removed. This is an explicit
@@ -3187,6 +3227,28 @@ mod query_embedding_cache_tests {
         let cached_b = get_cached_query_embedding(&db, MODEL, "query-b", 2, TEST_TTL).await.unwrap();
         assert!((cached_a[0] - 1.0f32).abs() < 1e-6);
         assert!((cached_b[1] - 1.0f32).abs() < 1e-6);
+    }
+
+    /// The recall check's sample of cached queries holds only the asked model at
+    /// the asked dimension, at most `limit`, and every one of them whatever the
+    /// seed's starting point (the read wraps).
+    #[tokio::test]
+    async fn sampled_cached_queries_are_the_models_own_and_bounded() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        for (i, q) in ["alpha", "beta", "gamma", "zeta", "~tilde"].iter().enumerate() {
+            put_cached_query_embedding(&db, MODEL, q, &[i as f32, 1.0], TEST_TTL).await;
+        }
+        put_cached_query_embedding(&db, "other", "alpha", &[9.0, 9.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "three", &[9.0, 9.0, 9.0], TEST_TTL).await;
+        for seed in [0u64, 0x62, 0x7a, 255] {
+            let mut got = sample_cached_query_embeddings(&db, MODEL, 2, TEST_TTL, 100, seed).await.unwrap();
+            got.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let firsts: Vec<f32> = got.iter().map(|v| v[0]).collect();
+            assert_eq!(firsts, [0.0, 1.0, 2.0, 3.0, 4.0], "seed {seed}");
+            assert_eq!(sample_cached_query_embeddings(&db, MODEL, 2, TEST_TTL, 2, seed).await.unwrap().len(), 2);
+        }
+        assert!(sample_cached_query_embeddings(&db, "none", 2, TEST_TTL, 10, 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

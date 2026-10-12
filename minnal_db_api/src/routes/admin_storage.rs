@@ -1216,6 +1216,9 @@ fn system_ns_purpose(name: &str) -> &'static str {
     match name {
         "system" => "system namespace root (reserved; never stores user data)",
         "system_qemb_cache" => "query-embedding cache shared across all semantic-search namespaces (TTL configurable; default 1 day)",
+        "system_partition_history" => {
+            "vector-partition history: code health, recall checks and rebuilds per namespace (TTL configurable; default 30 days)"
+        }
         _ => "internal system namespace",
     }
 }

@@ -581,6 +581,13 @@ pub struct SemanticSearchSection {
     #[serde(default = "default_query_embedding_cache_ttl_secs")]
     pub query_embedding_cache_ttl_secs: u64,
 
+    /// Time-to-live, in seconds, for the partition history in the system-wide
+    /// `system_partition_history` namespace: each namespace's recorded
+    /// code-health reads (`partition?codes=true`), recall checks and rebuilds.
+    /// Default: 2592000 (30 days).
+    #[serde(default = "default_partition_history_ttl_secs")]
+    pub partition_history_ttl_secs: u64,
+
     /// Overall timeout, in seconds, for a single embedding-service HTTP request
     /// (connect + send + receive). Caps how long indexing/search can block on a
     /// slow or hanging service. Default: 30.
@@ -680,6 +687,7 @@ impl Default for SemanticSearchSection {
             embedding_service_url: default_embedding_service_url(),
             supported_models: Vec::new(),
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
+            partition_history_ttl_secs: default_partition_history_ttl_secs(),
             embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
             embedding_connect_timeout_secs: default_embedding_connect_timeout_secs(),
             maintenance: MaintenanceSection::default(),
@@ -693,6 +701,9 @@ fn default_embedding_service_url() -> String {
 }
 fn default_query_embedding_cache_ttl_secs() -> u64 {
     86_400
+}
+fn default_partition_history_ttl_secs() -> u64 {
+    30 * 86_400
 }
 fn default_embedding_request_timeout_secs() -> u64 {
     30
@@ -714,6 +725,9 @@ pub struct ResolvedSemanticSearchConfig {
 
     /// Time-to-live for cached query embeddings in the system-wide cache.
     pub query_embedding_cache_ttl: std::time::Duration,
+
+    /// Time-to-live for the partition history.
+    pub partition_history_ttl: std::time::Duration,
 
     /// Overall timeout for a single embedding-service HTTP request.
     pub embedding_request_timeout: std::time::Duration,
@@ -743,6 +757,7 @@ impl SemanticSearchSection {
             embedding_service_url: self.embedding_service_url.clone(),
             supported_models: self.supported_models.clone(),
             query_embedding_cache_ttl: std::time::Duration::from_secs(self.query_embedding_cache_ttl_secs),
+            partition_history_ttl: std::time::Duration::from_secs(self.partition_history_ttl_secs),
             embedding_request_timeout: std::time::Duration::from_secs(self.embedding_request_timeout_secs),
             embedding_connect_timeout: std::time::Duration::from_secs(self.embedding_connect_timeout_secs),
         }
@@ -757,6 +772,7 @@ impl ResolvedSemanticSearchConfig {
         minnal_db::semantic_search::service::SemanticSearchConfig {
             embedding_service_url: self.embedding_service_url.clone(),
             query_embedding_cache_ttl: self.query_embedding_cache_ttl,
+            partition_history_ttl: self.partition_history_ttl,
             embedding_request_timeout: self.embedding_request_timeout,
             embedding_connect_timeout: self.embedding_connect_timeout,
             ..Default::default()

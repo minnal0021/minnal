@@ -107,6 +107,8 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/{ns}/vector/partition", get(admin_indices::vector_partition))
         .route("/admin/indices/{ns}/vector/postings", get(admin_indices::vector_postings))
         .route("/admin/indices/{ns}/vector/rebuild", post(admin_indices::vector_rebuild))
+        .route("/admin/indices/{ns}/vector/recall-check", get(admin_indices::vector_recall_check))
+        .route("/admin/indices/{ns}/vector/history", get(admin_indices::vector_history))
         // Admin / indices — vector queue inspection
         .route("/admin/indices/{ns}/vector/queue", get(admin_indices::vector_queue_by_namespace))
         .route(

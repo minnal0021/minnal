@@ -106,6 +106,10 @@ pub struct SemanticSearchConfig {
     /// the TTL worker once this duration elapses. Default: 1 day.
     pub query_embedding_cache_ttl: std::time::Duration,
 
+    /// Time-to-live for the partition history (`system_partition_history`):
+    /// recorded code-health reads, recall checks and rebuilds. Default: 30 days.
+    pub partition_history_ttl: std::time::Duration,
+
     /// Overall timeout for a single embedding-service HTTP request (connect +
     /// send + receive). Caps how long an indexing or search call can block on a
     /// slow or hanging service. Default: 30s.
@@ -132,6 +136,7 @@ impl Default for SemanticSearchConfig {
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
             query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
+            partition_history_ttl: crate::ivf_split::history::DEFAULT_HISTORY_TTL,
             embedding_request_timeout: std::time::Duration::from_secs(30),
             embedding_connect_timeout: std::time::Duration::from_secs(10),
         }

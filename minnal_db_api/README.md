@@ -1526,6 +1526,8 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
 | `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
+| `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find within their budget: the signal for a rebuild |
+| `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/{doc_id}` | `200` | Look up one queue entry |
@@ -1898,7 +1900,15 @@ The store's IVF partition at a glance, from memory: `postings` (K), `entries`,
 loaded), the store's `target_posting_size`, `split_limit` and `merge_limit`, and
 `rebuild` (the last rebuild since the server started, or `null`). With
 `?codes=true` it also reads every chunk code and adds `codes` (mean centre drift
-and error band) and `reencode_candidates`.
+and error band) and `reencode_candidates`, and records them in the
+[history](#get-adminindicesnsvectorhistory). `last_recall_check` is the latest
+recorded [recall check](#get-adminindicesnsvectorrecall-check), or `null`; it is
+read from the history, never run here.
+
+Centre drift says how far codes have moved from the centre they were encoded
+against. It is a reason to re-encode (re-embed with `vector/reindex-all`), not
+to rebuild: a rebuild re-encodes nothing and moves every code, so it raises
+drift.
 
 ```bash
 curl http://localhost:8080/admin/indices/products/vector/partition
@@ -1922,9 +1932,12 @@ Re-cluster the store's partition from its stored 1-bit codes: k-means over every
 chunk, then each chunk moves to its nearest new posting, and the usual splits
 and merges follow. No embedding request is made and no code is re-encoded.
 Searches and writes continue throughout; a crash part-way is finished at the
-next start. Useful when a store's topics have shifted since its partition grew
-(growth that took topics one at a time leaves recall 1–2 points short of a fit
-on the whole corpus), and to move a store created before partitions grew by
+next start. Centres chosen one split at a time are a worse map than one fit on
+everything stored now, which costs recall when a search reads a small share of
+the store (measured: up to 4.4 points of recall@10 at a 1% read, up to 1.3 at
+5%, nothing at the default budget on stores of 5k and 57k documents). Run the
+[recall check](#get-adminindicesnsvectorrecall-check) to see whether it applies,
+and again afterwards. It also moves a store created before partitions grew by
 themselves onto its own centres.
 
 The optional body sets how many postings to fit; by default as many as are
@@ -1943,9 +1956,95 @@ Progress and the result are the `rebuild` field of
 [`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition):
 `state` (`running`, `done`, `failed`), `started_at_ms`, `finished_at_ms`, and
 `report` (`postings_before`, `postings_fitted`, `postings_after`, `chunks`,
-`iterations`, `chunks_moved`) or `error`. Returns `409` while a rebuild of the
-store runs, `400` for `postings` of 0, and `422` when semantic search is not
+`iterations`, `chunks_moved`) or `error`. The finished status is also recorded in
+the [history](#get-adminindicesnsvectorhistory). Returns `409` while a rebuild of
+the store runs, `400` for `postings` of 0, and `422` when semantic search is not
 enabled.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/recall-check`
+
+Answers "would a rebuild help this store?" by measuring what a rebuild can
+change: how much of a full read's results a search finds within its probe
+budget.
+
+It samples real queries from the query-embedding cache: the embeddings of recent
+searches with the store's model and dimension. With fewer than 20 cached, it
+samples stored chunks instead and uses each one's reconstruction as a query
+(leaving that chunk's own document out of the results). Either way it makes no
+embedding request; `query_source` (`cached_queries` or `stored_chunks`) says
+which it used. Chunk queries are a weaker signal: on one store they did not
+move after a rebuild that gained 3 points of recall@10. Each query is
+searched twice: with the store's settings, and with every posting read.
+**Overlap@k** is the share of the full read's top k that the normal search also
+found. On a store of more than 500,000 entries the second search
+reads the nearest postings up to 500,000 entries instead of every posting, which
+bounds its memory (a search holds what it scans until it returns);
+`reference_is_full_read` says which.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `sample` | 100 | Queries, 1 to 1,000 |
+| `seed` | fixed | Same seed, same queries: use it to compare before and after a rebuild |
+| `min_overlap` | 0.95 | Overlap@10 below which the verdict is `below_target` |
+| `probe_budget_entries`, `min_probes`, `max_probes` | the store's | Check another budget, validated as for a search |
+
+The response holds `verdict`, `query_source`, `sampled`, `entries`, `postings`,
+`budget_entries`, `read_share` (mean share of entries a search read),
+`probes_mean`, `reference_is_full_read`, `reference_share`, `overlap` (`k` and
+`mean` at 10, 20, 30, 40, 50 and 100),
+`overlap_at_10_p10`, `search_ms`, `full_read_ms` and `elapsed_ms`. The verdict:
+
+| `verdict` | Meaning | Do |
+|---|---|---|
+| `read_in_full` | Every search already reads every posting | Nothing: no partition can change the results |
+| `ok` | Overlap@10 ≥ `min_overlap` | Nothing |
+| `below_target` | Searches miss part of what a full read finds | Rebuild, wait for it, check again with the same `seed`. Keep the rebuild if overlap rose; if it did not, raise `probe_budget_entries` instead |
+| `empty` | No chunks stored | — |
+
+Read the overlap against the same check before and after a change, not against
+a fixed bar: its level depends on the data. On stores grown from one posting,
+real-query overlap@10 at a 1% read share was 0.56–0.63 (5,000 documents) and
+0.85–0.91 (57,000 documents); a rebuild raised it 2–5 points there, matching the
+recall@10 it gained, up to 3 at 5%, and nothing at 20% or at the default
+budget.
+
+**Cost.** One search and one full read per query, one query at a time; each
+takes the same scoring slot as a client search, so a check adds about one
+client's load while it runs. Measured with 300 queries: 1.2–2.1 s on a store of
+23,000 chunks (full read 3–4 ms), 7.5–12.7 s on one of 173,000 chunks (full read
+21–24 ms). The full read costs in proportion to the entries read, up to the
+500,000-entry cap (about 0.1 s and 150 MB per query), so on a large store use a
+smaller `sample`, off-peak. Nothing runs unless asked.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/recall-check?sample=200'
+```
+
+Each result is recorded in the [history](#get-adminindicesnsvectorhistory).
+Returns `400` for a parameter out of range or an unknown one, `404` for an
+unknown store and `422` when semantic search is not enabled.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/history`
+
+What the store's partition looked like over time, without recomputing anything:
+every `partition?codes=true` read (`kind` `codes`), recall check
+(`recall_check`) and finished rebuild (`rebuild`), each with `recorded_at_ms` and
+the result as its endpoint returned it under `data`. Newest first; `kind` keeps
+one kind, `limit` sets how many (default 50, at most 1,000). Records are kept in
+the system TTL store `system_partition_history` for
+`[semantic_search] partition_history_ttl_secs` (default 30 days), and written
+only when one of those operations runs.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/history?kind=recall_check&limit=10'
+```
+
+Returns `400` for an unknown `kind` or a `limit` out of range, `404` for an
+unknown store and `422` when semantic search is not enabled.
 
 ---
 

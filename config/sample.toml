@@ -308,6 +308,13 @@ embedding_service_url = "http://localhost:8001"
 # Default: 86400 (1 day).
 # query_embedding_cache_ttl_secs = 86400
 
+# Time-to-live (seconds) for the partition history in the system-wide
+# `system_partition_history` namespace: each store's recorded code-health reads
+# (GET .../vector/partition?codes=true), recall checks and rebuilds, read back by
+# GET /admin/indices/{ns}/vector/history. Records are written only when one of
+# those runs. Default: 2592000 (30 days).
+# partition_history_ttl_secs = 2592000
+
 # Overall timeout (seconds) for a single embedding-service HTTP request
 # (connect + send + receive). Caps how long an indexing or search call can block
 # on a slow or hanging embedding service. Default: 30.

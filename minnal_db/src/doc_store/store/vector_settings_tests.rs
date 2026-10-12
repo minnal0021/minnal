@@ -521,6 +521,36 @@ mod with_service {
         assert_eq!(report.chunks_moved, report.chunks);
         assert_eq!(seen.lock().len(), calls, "a rebuild makes no embedding request");
 
+        // A recall check makes none either; it and the rebuild are in the history.
+        let params = crate::ivf_split::recall_check::RecallCheckParams {
+            sample: 10,
+            ..Default::default()
+        };
+        let check = store.vector_recall_check("g", &params, &SearchSpec::default()).await.unwrap();
+        assert_eq!(check.sampled, 10, "{check:?}");
+        assert_eq!(seen.lock().len(), calls, "a recall check makes no embedding request");
+        use crate::ivf_split::history::RecordKind;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let kinds = loop {
+            let kinds: Vec<RecordKind> = store
+                .vector_partition_history("g", None, 10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.kind)
+                .collect();
+            if kinds.contains(&RecordKind::Rebuild) || std::time::Instant::now() > deadline {
+                break kinds;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            kinds.contains(&RecordKind::Rebuild) && kinds.contains(&RecordKind::RecallCheck),
+            "{kinds:?}"
+        );
+        let last = store.vector_partition_history("g", Some(RecordKind::RecallCheck), 1).await.unwrap();
+        assert_eq!(last[0].data["sampled"], 10);
+
         let ivf = partition.snapshot();
         let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
         for (p, n) in &keys {
@@ -533,6 +563,20 @@ mod with_service {
             .await
             .unwrap();
         assert_eq!(all.results.len(), 40, "every document is still found");
+
+        // The escape hatch still works after a rebuild: `reindex-all` enqueues
+        // every document, re-embeds each through the service, and every
+        // document is found afterwards.
+        let before = seen.lock().len();
+        let stats = store.index_all("g").await.unwrap();
+        assert_eq!(stats.enqueued, 40, "{stats:?}");
+        wait_for_empty_queue(&store).await;
+        assert!(seen.lock().len() > before, "reindex-all calls the embedding service");
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is found after reindex-all");
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
     }

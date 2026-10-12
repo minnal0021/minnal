@@ -184,6 +184,7 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     };
     r.add("semantic_search", "supported_models", models);
     r.add("semantic_search", "query_embedding_cache_ttl_secs", ss.query_embedding_cache_ttl_secs);
+    r.add("semantic_search", "partition_history_ttl_secs", ss.partition_history_ttl_secs);
     r.add("semantic_search", "embedding_request_timeout_secs", ss.embedding_request_timeout_secs);
     r.add("semantic_search", "embedding_connect_timeout_secs", ss.embedding_connect_timeout_secs);
     // The values a namespace is filled with when it enables semantic search

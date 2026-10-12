@@ -1307,7 +1307,7 @@ number of postings:
 | Chunk code width | 1 bit for search and maintenance; codes keep their centre | §3; SPFresh comparison |
 | `reencode_source` | not needed for partition quality; a future option for rotation or width changes | §3 |
 | Probe budget | 70,000 entries, absolute (M2d). The scaled form `clamp(p · E, floor, ceiling)` is available as an option, unset by default, and reviewed after M3a's latency measurement | §4 |
-| M4 rebuild | from 1-bit codes, no floats; triggered by hand or by drift indicators | §3: 0.978 vs 0.976 |
+| M4 rebuild | from 1-bit codes, no floats; triggered by hand (*M4 result*) | §3: 0.978 vs 0.976 |
 
 ### M3 split algorithm (LIRE)
 
@@ -1744,8 +1744,9 @@ minnal_ui draws from it, in the same "Vector partition" card:
 - optionally, the split tree from `parent_id`.
 
 **Used later by** the re-encode queue (`reencode_source` = `stored` /
-`service`, *Re-encode strategies*), which takes postings in candidate order,
-and by M4's drift indicators. No threshold is set yet: the M3-pre simulation
+`service`, *Re-encode strategies*), which takes postings in candidate order.
+Centre drift says how precise codes are, not how good the partition is, so it
+is a re-encode signal and never a rebuild one. No threshold is set: the M3-pre simulation
 found no ranking cost from moved codes, so the first job of these numbers is
 to show what real namespaces look like.
 
@@ -2240,10 +2241,31 @@ It is triggered by hand: `POST /admin/indices/{ns}/vector/rebuild` returns 202
 (409 while one runs), and progress is the `rebuild` field of the partition
 endpoint. Built otherwise than the plan above said:
 
-- **No automatic trigger.** No drift threshold was ever set (*Partition health*).
-  M3b measured that churn does not wear a partition (gate f), and the one gap a
-  rebuild closes, growth that took topics one at a time, is known when it
-  happens.
+- **No automatic trigger.** The plan named three signals for one: how uneven
+  posting sizes are, how far each chunk's reconstruction sits from its posting's
+  centre, and how many postings a query opens to fill its budget. None was given
+  a threshold, and only the first is reported (`size_p10_p50_p90_max`). Centre
+  drift is not one of them: it says how precise codes are, which a rebuild does
+  not change (see the last bullet). Instead the recall check (FR-007,
+  `GET /admin/indices/{ns}/vector/recall-check`) measures what a rebuild can
+  change, how much of a full read's results a search finds within its budget, so
+  an operator checks, rebuilds, and checks again.
+- **What a rebuild fixes, and when.** Centres chosen one split at a time are a
+  worse map than one k-means over everything stored now. The gap shows only when
+  a search reads a small share of the namespace: over the grown partition, up to
+  4.4 points of recall@10 at a 1% read and up to 1.3 at 5% (table below), and no
+  nDCG change at the default budget on either dataset. Arrival order is not a
+  reliable cue: on FiQA
+  the gain is largest when topics arrive in turn (3.2 points against 1.8), but
+  on SciFact shuffled order gains as much (4.4 and 3.2 against 2.8 and 4.3).
+  Deletes do not call for one either: churn wore 7 of 8 partitions by under a
+  point (gate f), the exception being SciFact qwen with whole topics deleted.
+- **A rebuild raises centre drift.** It moves every chunk into a posting with a
+  new centre and re-encodes none, so afterwards every code is foreign. Measured
+  on SciFact and FiQA grown from one posting: mean drift 0.28–0.40 before,
+  0.45–0.51 after, foreign share 0.70–0.85 before, 1.00 after. The M3-pre simulation found
+  no ranking cost from drift, and recall rose regardless; lowering drift needs a
+  re-encode, which is not built (*Re-encode strategies*).
 - **No seeding from the 8-bit dense vectors.** Fitting on the 1-bit
   reconstructions alone lands within 1 point of the float fit (below), so the
   option was not needed.
@@ -2282,8 +2304,9 @@ gate was within 1 point from 5% read.
 
 - **Recall within 1 point of static from 5% read:** passed in every run (worst
   −1.00 exactly, SciFact gemma shuffled at 5%: 0.940 against 0.950, 30 of the
-  3,000 top-10 places across 300 queries). The rebuild gains most at small read shares and where topics
-  arrived in turn: up to 4.4 points at 1% read on SciFact, 3.2 on FiQA. It
+  3,000 top-10 places across 300 queries). The rebuild gains most at small read
+  shares: at 1% read, up to 4.4 points on SciFact (gemma, shuffled) and 3.2 on
+  FiQA (gemma, drifting). It
   reproduces the simulation's finding that a fit on 1-bit codes is as good as
   one on floats (0.978 against 0.976).
 - **nDCG@{10..100} ≥ pre-rebuild − 0.005:** passed; every cutoff is unchanged
@@ -2356,6 +2379,83 @@ port and database, with the real embedding service and `target_posting_size`
 
 The on-disk check (`e2e_partition_invariants`, server stopped) finds every key
 in an active posting and every count equal to a recount.
+
+### When to rebuild: the recall check (FR-007, 2026-10-12)
+
+**The question.** The rebuild has no automatic trigger, and the partition
+endpoint's metrics do not say when to call it. Centre drift measures code
+precision, which a rebuild makes worse, not better. Posting-size spread does not
+predict recall. What a rebuild changes is which postings hold which chunks, and
+so how much of what a full read would return a search reaches within its probe
+budget. The recall check measures exactly that.
+
+**How it works** (`ivf_split/recall_check.rs`,
+`GET /admin/indices/{ns}/vector/recall-check`):
+
+1. Take a sample of queries, with no embedding call:
+   - real queries' embeddings from the query-embedding cache (`system_qemb_cache`,
+     filtered to the namespace's model and dimension), by default;
+   - with fewer than 20 cached, stored chunks' 1-bit reconstructions instead.
+2. Search each query twice through the production search: with the namespace's
+   settings, and probing every posting (a full read, capped at 500,000 entries).
+3. Report overlap@10, 20, 30, 40, 50 and 100: the share of the full read's top k
+   the normal search also returned. The verdict is `read_in_full`, `ok` or
+   `below_target`.
+4. Record the result in the partition history (`system_partition_history`, TTL
+   `partition_history_ttl_secs`, default 30 days), beside every `?codes=true`
+   read and finished rebuild, read back by `GET .../vector/history`.
+
+A low overlap means the budget loses results. It does not by itself say a
+rebuild will help, because a budget that is simply too small for the namespace
+looks the same. So the check is used twice: before a rebuild and after it, with
+the same seed (the same queries). A rise is what the rebuild gained; no rise
+means only a larger budget recovers the rest.
+
+**Calibration.** Each run grew a namespace from one posting at target 128 (as
+in the gate runs above), ran the check with 300 queries at entry budgets of 1%,
+5% and 20% of the namespace and at the default 70,000, rebuilt, and ran it again
+with the same seed. Overlap@10 before → after the rebuild, with real (judged)
+queries and with stored-chunk queries:
+
+| Run | Real queries, 1% read | Real, 5% | Real, 20% | Chunk queries, 1% | Chunks, 5% | Gate recall@10 gain at 1% (M4) |
+|---|---|---|---|---|---|---|
+| SciFact gemma, drifting | 0.588 → 0.629 | 0.847 → 0.853 | 0.966 → 0.969 | 0.600 → 0.641 | 0.840 → 0.858 | +2.8 |
+| SciFact gemma, shuffled | 0.559 → 0.600 | 0.824 → 0.850 | 0.966 → 0.964 | 0.577 → 0.660 | 0.836 → 0.868 | +4.4 |
+| SciFact qwen, drifting | 0.631 → 0.675 | 0.858 → 0.883 | 0.978 → 0.981 | 0.617 → 0.669 | 0.833 → 0.852 | +4.3 |
+| SciFact qwen, shuffled | 0.597 → 0.651 | 0.864 → 0.870 | 0.971 → 0.977 | 0.608 → 0.660 | 0.822 → 0.842 | +3.2 |
+| FiQA gemma, drifting | 0.852 → 0.883 | 0.961 → 0.974 | 0.996 → 0.994 | 0.805 → 0.804 | 0.944 → 0.938 | +3.2 |
+| FiQA gemma, shuffled | 0.861 → 0.885 | 0.964 → 0.974 | 0.995 → 0.995 | 0.814 → 0.843 | 0.946 → 0.957 | +1.8 |
+| FiQA qwen, drifting | 0.902 → 0.925 | 0.981 → 0.987 | 0.997 → 0.999 | 0.854 → 0.867 | 0.954 → 0.961 | +2.0 |
+| FiQA qwen, shuffled | 0.909 → 0.927 | 0.986 → 0.987 | 0.997 → 0.998 | 0.835 → 0.875 | 0.953 → 0.967 | +1.1 |
+
+At the default 70,000-entry budget overlap@10 was 1.000 before and after in every run, for both kinds of query (SciFact is read in full there: verdict `read_in_full`).
+
+- **Real queries track what a rebuild gains.** At a 1% read, real-query overlap
+  rose 1.8–5.4 points, against a gate recall gain of 1.1–4.4 in the same runs;
+  on FiQA the runs rank the same way (gemma drifting +3.1 against +3.2, qwen
+  shuffled +1.8 against +1.1). At 5% the rise was 0.1–2.6 points.
+- **Chunk queries can miss it.** On FiQA gemma drifting, the run with FiQA's
+  largest gate gain, they did not move at all (0.805 → 0.804), and elsewhere
+  they over- or under-stated the gain (FiQA qwen shuffled +4.0 against +1.1). Chunk reconstructions are noisy
+  and sit where documents are, not where queries are, so they are only a
+  fallback for a namespace with no cached queries, and the response names its
+  `query_source`.
+- **Nothing changes at a large read share.** At 20% and at the default budget
+  overlap was the same before and after, as the gate's nDCG was.
+- **The level differs by dataset.** Before the rebuild, real-query overlap at a
+  1% read was 0.56–0.63 on SciFact and 0.85–0.91 on FiQA. A fixed `min_overlap` (0.95
+  by default) marks where to look, not a promise that a rebuild helps.
+- **Drift rises with every rebuild**, as expected from codes that keep their
+  centre: mean 0.28–0.40 before, 0.45–0.51 after, on both datasets; the foreign
+  share went from 0.70–0.85 to 1.00.
+
+**Cost.** One normal and one reference search per query, one query at a time,
+each through the scoring gate, so a check adds about one client's load. 300
+queries took 1.2–2.1 s on SciFact (full read 3–4 ms) and 7.5–12.7 s on FiQA
+(full read 21–24 ms). The reference search holds what it scans in memory until it returns,
+so it is capped at 500,000 entries (about 150 MB and 0.1 s per query); above
+that it reads the nearest postings up to the cap. Nothing runs unless asked, and
+each run writes one history record.
 
 ---
 

@@ -693,14 +693,143 @@ pub async fn vector_partition(
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
+    // The last recall check, from the history (never run here: it is costly).
+    let last_check = state
+        .store
+        .vector_partition_history(&ns, Some(minnal_db::ivf_split::history::RecordKind::RecallCheck), 1)
+        .await
+        .ok()
+        .and_then(|mut r| r.pop());
     let mut body = serde_json::to_value(&summary).unwrap_or_default();
     let rebuild = state.store.vector_rebuild_status(&ns);
     if let (Some(obj), serde_json::Value::Object(m)) = (body.as_object_mut(), maintenance_json(&maintenance)) {
         obj.insert("namespace".into(), serde_json::Value::String(ns));
         obj.extend(m);
         obj.insert("rebuild".into(), serde_json::to_value(rebuild).unwrap_or_default());
+        obj.insert("last_recall_check".into(), serde_json::to_value(last_check).unwrap_or_default());
     }
     Json(body).into_response()
+}
+
+/// Query of `GET /admin/indices/{ns}/vector/recall-check`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallCheckParams {
+    /// Queries to sample: default 100, at most 1,000.
+    #[serde(default)]
+    pub sample: Option<usize>,
+    /// Sample seed; the same seed samples the same chunks before and after a rebuild.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Overlap@10 below which the verdict is `below_target` (default 0.95).
+    #[serde(default)]
+    pub min_overlap: Option<f64>,
+    /// Check a probe budget other than the namespace's (validated like a search's).
+    #[serde(default)]
+    pub probe_budget_entries: Option<u32>,
+    /// Override of the namespace's `min_probes`.
+    #[serde(default)]
+    pub min_probes: Option<u32>,
+    /// Override of the namespace's `max_probes`.
+    #[serde(default)]
+    pub max_probes: Option<u32>,
+}
+
+/// `GET /admin/indices/{ns}/vector/recall-check` — does the namespace's search
+/// miss what a full read finds (FR-007)? Samples stored chunks as queries (no
+/// embedding calls), searches each under the namespace's settings and again
+/// probing every posting, and returns the overlap at @10–@100, the share read,
+/// the cost, and a verdict: `read_in_full` (a rebuild cannot help), `ok`, or
+/// `below_target`. Synchronous; it costs `sample` searches plus `sample`
+/// full reads. The result is recorded in the partition history.
+pub async fn vector_recall_check(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    Query(params): Query<RecallCheckParams>,
+) -> axum::response::Response {
+    use minnal_db::ivf_split::recall_check as rc;
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    let defaults = rc::RecallCheckParams::default();
+    let sample = params.sample.unwrap_or(defaults.sample);
+    if !(1..=rc::MAX_SAMPLE).contains(&sample) {
+        return bad(format!("sample must be between 1 and {}, got {sample}", rc::MAX_SAMPLE));
+    }
+    let min_overlap = params.min_overlap.unwrap_or(defaults.min_overlap);
+    if !(0.0..=1.0).contains(&min_overlap) {
+        return bad(format!("min_overlap must be between 0 and 1, got {min_overlap}"));
+    }
+    let check = rc::RecallCheckParams {
+        sample,
+        seed: params.seed.unwrap_or(defaults.seed),
+        min_overlap,
+    };
+    let overrides = crate::routes::semantic_search::search_overrides(
+        None,
+        crate::routes::semantic_search::ProbeOverrides {
+            probe_budget_entries: params.probe_budget_entries,
+            min_probes: params.min_probes,
+            max_probes: params.max_probes,
+        },
+        None,
+    );
+    match state.store.vector_recall_check(&ns, &check, &overrides).await {
+        Ok(r) => {
+            let mut body = serde_json::to_value(&r).unwrap_or_default();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("namespace".into(), serde_json::Value::String(ns));
+            }
+            Json(body).into_response()
+        }
+        Err(e) => crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    }
+}
+
+/// Query of `GET /admin/indices/{ns}/vector/history`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryParams {
+    /// `codes`, `recall_check` or `rebuild`; all kinds when absent.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Records to return, newest first: default 50, at most 1,000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+fn parse_history_kind(kind: &str) -> Option<minnal_db::ivf_split::history::RecordKind> {
+    use minnal_db::ivf_split::history::RecordKind;
+    match kind {
+        "codes" => Some(RecordKind::Codes),
+        "recall_check" => Some(RecordKind::RecallCheck),
+        "rebuild" => Some(RecordKind::Rebuild),
+        _ => None,
+    }
+}
+
+/// `GET /admin/indices/{ns}/vector/history` — the namespace's partition history,
+/// newest first: every code-health read (`partition?codes=true`), recall check
+/// and rebuild still within `partition_history_ttl_secs` (default 30 days),
+/// without recomputing any of them.
+pub async fn vector_history(State(state): State<AppState>, Path(ns): Path<String>, Query(params): Query<HistoryParams>) -> axum::response::Response {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    let kind = match params.kind.as_deref() {
+        None => None,
+        Some(k) => match parse_history_kind(k) {
+            Some(kind) => Some(kind),
+            None => return bad(format!("kind must be codes, recall_check or rebuild, got {k:?}")),
+        },
+    };
+    let limit = params.limit.unwrap_or(50);
+    if !(1..=minnal_db::ivf_split::history::MAX_HISTORY_LIMIT).contains(&limit) {
+        return bad(format!(
+            "limit must be between 1 and {}, got {limit}",
+            minnal_db::ivf_split::history::MAX_HISTORY_LIMIT
+        ));
+    }
+    match state.store.vector_partition_history(&ns, kind, limit).await {
+        Ok(records) => Json(serde_json::json!({ "namespace": ns, "records": records })).into_response(),
+        Err(e) => crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    }
 }
 
 /// Body of `POST /admin/indices/{ns}/vector/rebuild` (optional).
