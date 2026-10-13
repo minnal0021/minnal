@@ -6,7 +6,7 @@
 use crate::db::error::Result;
 use log::{debug, error, info};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
@@ -18,6 +18,68 @@ pub trait LsmCompactionTarget: Send + Sync + 'static {
     /// Flush namespaces whose no-WAL writes exist only in memory, bounding what
     /// a crash destroys to one tick. Returns how many were flushed.
     fn flush_no_wal_memtables(&self) -> usize;
+}
+
+/// How often the worker reports what it did, when it did anything.
+const SUMMARY_EVERY: Duration = Duration::from_secs(60);
+
+/// What the worker did since its last INFO summary.
+///
+/// A store being written continuously (an embedding job, partition
+/// maintenance) seals a memtable about every second, and each seal triggers a
+/// compaction: logging every one at INFO measured **1,649 compactions plus 208
+/// no-WAL flushes in 46 minutes** of FiQA indexing, two lines each. They are
+/// logged at DEBUG and rolled up here into at most one INFO line per
+/// [`SUMMARY_EVERY`]; a quiet worker logs nothing.
+#[derive(Debug)]
+struct CompactionTally {
+    since: Instant,
+    compactions: u32,
+    total: Duration,
+    longest: Duration,
+    no_wal_flushes: usize,
+}
+
+impl CompactionTally {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            compactions: 0,
+            total: Duration::ZERO,
+            longest: Duration::ZERO,
+            no_wal_flushes: 0,
+        }
+    }
+
+    fn record_compaction(&mut self, took: Duration) {
+        self.compactions += 1;
+        self.total += took;
+        self.longest = self.longest.max(took);
+    }
+
+    /// The summary line once [`SUMMARY_EVERY`] has passed (or `force`, at
+    /// shutdown), resetting the tally; `None` when there is nothing to report.
+    fn take_summary(&mut self, now: Instant, force: bool) -> Option<String> {
+        let window = now.saturating_duration_since(self.since);
+        if !force && window < SUMMARY_EVERY {
+            return None;
+        }
+        let tally = std::mem::replace(self, Self::new(now));
+        if tally.compactions == 0 && tally.no_wal_flushes == 0 {
+            return None;
+        }
+        let mut line = format!(
+            "{} compaction(s) in the last {}s, {:.1?} in total, longest {:.1?}",
+            tally.compactions,
+            window.as_secs(),
+            tally.total,
+            tally.longest
+        );
+        if tally.no_wal_flushes > 0 {
+            line.push_str(&format!("; {} no-WAL memtable flush(es)", tally.no_wal_flushes));
+        }
+        Some(line)
+    }
 }
 
 /// Commands that can be sent to the LSM compaction worker
@@ -71,12 +133,13 @@ impl LsmCompactionWorker {
         info!("[LsmCompactionWorker] started (interval={}ms)", check_interval.as_millis());
         let mut interval = time::interval(check_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut tally = CompactionTally::new(Instant::now());
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     match target.upgrade() {
-                        Some(t) => Self::perform_compaction_check(&t),
+                        Some(t) => Self::perform_compaction_check(&t, &mut tally),
                         None => break,
                     }
                     if Self::drain_self_triggers(&mut rx) {
@@ -88,7 +151,7 @@ impl LsmCompactionWorker {
                         LsmCompactionCommand::Trigger => {
                             debug!("[LsmCompactionWorker] Triggered immediate compaction check");
                             match target.upgrade() {
-                                Some(t) => Self::perform_compaction_check(&t),
+                                Some(t) => Self::perform_compaction_check(&t, &mut tally),
                                 None => break,
                             }
                             if Self::drain_self_triggers(&mut rx) {
@@ -108,6 +171,9 @@ impl LsmCompactionWorker {
             }
         }
 
+        if let Some(line) = tally.take_summary(Instant::now(), true) {
+            info!("[LsmCompactionWorker] {line}");
+        }
         info!("[LsmCompactionWorker] stopped");
         shutdown_notify.notify_one();
     }
@@ -137,31 +203,43 @@ impl LsmCompactionWorker {
         shutdown
     }
 
-    fn perform_compaction_check<T: LsmCompactionTarget>(target: &Arc<T>) {
+    fn perform_compaction_check<T: LsmCompactionTarget>(target: &Arc<T>, tally: &mut CompactionTally) {
         if target.is_closed() {
             return;
         }
+        Self::compact_once(target, tally);
+        if let Some(line) = tally.take_summary(Instant::now(), false) {
+            info!("[LsmCompactionWorker] {line}");
+        }
+    }
 
+    /// One check: flush no-WAL memtables, then compact if there is work.
+    /// Routine outcomes go to DEBUG and into `tally`; failures are logged at
+    /// ERROR straight away.
+    fn compact_once<T: LsmCompactionTarget>(target: &Arc<T>, tally: &mut CompactionTally) {
         // Before deciding there is nothing to do: no-WAL writes are unrecoverable
         // once the process dies, so they must not be left sitting in a memtable
         // until it happens to fill. Flushing here also means the L0 files this
         // produces are compacted by the same tick.
         let flushed = target.flush_no_wal_memtables();
         if flushed > 0 {
-            info!("[LsmCompactionWorker] tick — flushed {flushed} namespace(s) holding un-flushed no-WAL writes");
+            debug!("[LsmCompactionWorker] tick — flushed {flushed} namespace(s) holding un-flushed no-WAL writes");
+            tally.no_wal_flushes += flushed;
         }
 
         if !target.has_lsm_compaction_work() {
-            // Routine "nothing to do" tick: DEBUG, not INFO. INFO is reserved
-            // for ticks that actually compact or flush something.
             debug!("[LsmCompactionWorker] tick — memtable below flush threshold, no level-0 files; nothing to compact");
             return;
         }
 
-        info!("[LsmCompactionWorker] tick — starting compaction");
-        let start = std::time::Instant::now();
+        debug!("[LsmCompactionWorker] tick — starting compaction");
+        let start = Instant::now();
         match target.compact_lsm() {
-            Ok(()) => info!("[LsmCompactionWorker] compaction complete in {:?}", start.elapsed()),
+            Ok(()) => {
+                let took = start.elapsed();
+                debug!("[LsmCompactionWorker] compaction complete in {took:?}");
+                tally.record_compaction(took);
+            }
             Err(err) => error!("[LsmCompactionWorker] compaction failed: {:?}", err),
         }
     }
@@ -187,6 +265,33 @@ mod tests {
         let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
         config.num_buckets = crate::support::TEST_NUM_BUCKETS;
         config
+    }
+
+    /// Compactions roll up into one summary per window, and an idle window
+    /// reports nothing.
+    #[test]
+    fn compactions_are_summarised_once_per_window() {
+        let t0 = Instant::now();
+        let mut tally = CompactionTally::new(t0);
+        tally.record_compaction(Duration::from_millis(200));
+        tally.record_compaction(Duration::from_millis(300));
+        tally.no_wal_flushes += 2;
+        assert_eq!(tally.take_summary(t0 + Duration::from_secs(30), false), None, "too early to report");
+
+        let line = tally.take_summary(t0 + SUMMARY_EVERY, false).expect("a window with work reports it");
+        assert!(line.starts_with("2 compaction(s) in the last 60s"), "{line}");
+        assert!(line.contains("longest 300.0ms"), "{line}");
+        assert!(line.contains("2 no-WAL memtable flush(es)"), "{line}");
+
+        // The tally was reset: an idle window says nothing, even when forced.
+        let later = t0 + SUMMARY_EVERY * 2;
+        assert_eq!(tally.take_summary(later, false), None);
+        assert_eq!(tally.take_summary(later, true), None);
+
+        // Shutdown flushes a partial window.
+        tally.record_compaction(Duration::from_millis(5));
+        let line = tally.take_summary(later + Duration::from_secs(1), true).expect("forced summary");
+        assert!(line.starts_with("1 compaction(s) in the last 1s"), "{line}");
     }
 
     #[tokio::test]
