@@ -1,6 +1,6 @@
 # Semantic Search Architecture
 
-This document describes how semantic search works end to end: embedding generation, dual quantisation, index structure, two-pass query execution (with optional predicate filtering), storage layout, and crash recovery.
+This document describes how semantic search works end to end: embedding generation, dual quantisation, the dynamically partitioned index, two-pass query execution (with optional predicate filtering), storage layout, and crash recovery.
 
 ---
 
@@ -67,7 +67,7 @@ The service answers 503 while *any* of its models is still loading, so minnal ju
 
 ### Embedding dimension
 
-Each store sets the embedding size in its schema (`vector_index.embedding_dim`, **default 768**), sent to the service as `dimensions` on every request. Nothing else has to match it: a store's IVF centres are fitted from its own vectors (see [§3](#3-ivf-index-structure)), so a model of any dimension works without preparing a file. The rotation codes are computed in needs an even dimension of at least 8.
+Each store sets the embedding size in its schema (`vector_index.embedding_dim`, **default 768**), sent to the service as `dimensions` on every request. Nothing else has to match it: a store's IVF centres are fitted from its own vectors (see [§3](#3-dynamic-partitioning-the-ivf-index)), so a model of any dimension works without preparing a file. The rotation codes are computed in needs an even dimension of at least 8.
 
 ### Normalisation
 
@@ -114,21 +114,130 @@ All quantised entries share the same `VectorIndex` struct:
 
 ---
 
-## 3. IVF Index Structure
+## 3. Dynamic Partitioning (the IVF index)
 
-The index is **Inverted File (IVF) with flat scanning**, and every store has its own partition into **postings** (`cluster/layout.rs`, `ivf_split.rs`). No centroid file is prepared or shipped: a store that enables semantic search starts with one posting at the zero centre, and a background task grows the partition from the store's own vectors, following SPFresh's LIRE protocol (Xu et al., SOSP 2023):
+Pass 1 of a search (§4) must not compare the query with every chunk in the store. Like most vector indexes, minnal divides the chunks into groups of nearby vectors and reads only the groups nearest the query. This is an **IVF** (inverted file) index. This section explains how a store builds those groups and keeps them in shape as documents are added and deleted, what can be tuned, and what each design choice trades away.
 
-- **Split.** A posting holding more than twice `target_posting_size` chunks (default 128) is divided by balanced 2-means on its codes' reconstructions. The two new centres are the means of their halves.
-- **Reassign.** The chunks of the two halves and of the 64 postings nearest the old centre that are now nearer another centre move to their nearest posting.
-- **Merge.** A posting that deletes have left with `round(2 · target · 10/118)` chunks or fewer (22 at the default target) is folded into a nearby posting with room.
-- **Rebuild, by hand.** `POST /admin/indices/{ns}/vector/rebuild` re-clusters the whole store: k-means over its codes' reconstructions, then every chunk moves to its nearest new posting. It needs no embedding calls.
+The design follows LIRE (Lightweight Incremental REbalancing), the update protocol of the SPFresh vector index (see [Acknowledgements](#acknowledgements)) with a few deliberate differences, listed in [§3.6](#36-where-minnal-differs-from-spfresh). The full study behind the numbers here (the simulations, every gate run and the rejected alternatives) is in [`Dynamic-RaBitQ-Index-Design.md`](Dynamic-RaBitQ-Index-Design.md).
 
-A moved code keeps the centre it was encoded against (`centre_id`), so no maintenance step re-encodes anything. Each step is a sequence of single-key writes recorded in a WAL-backed journal (`{ns}_ivf_journal`), and a crash part-way is finished at the next start. Searches and writes continue throughout: they hold a read guard on the store's routing epoch, and maintenance publishes a new routing snapshot under its write guard.
+### 3.1 Terms
 
-- **Probing is exact and exhaustive.** For the Pass-1 query embedding, the distance to **every** posting's routing centre is computed — nothing is pruned — and postings are taken nearest first until their entries reach the store's probe budget (`probe_budget_entries`, default 70,000), at least `min_probes` and at most `max_probes`. Production queries are not chunked, so there is **one** Pass-1 query vector (`search()` still accepts several, in which case the union of their sets is scanned once).
-- **Choosing postings is cheap at this scale.** The cost is **T·C·D** (query vectors × postings × dimensions), and in production `T = 1`, so it is one distance scan per query: about 9 µs at C = 256, growing linearly with the number of postings.
+- **Chunk**: the **embedding** of one sliding-window piece of a document's text (§2, *SingleBit*), stored as a 1-bit code. In this section "chunk" always means that embedding, never the text: partitioning groups embeddings, and the text is not stored in the index. A document has one chunk per window, and its chunks can sit in different postings.
+- **Posting**: one group of chunks. Every chunk is in exactly one posting. A posting is stored as a key prefix: its chunks live under `posting_id ‖ doc_id` keys in `{ns}_sparse_vector`, so reading a posting is one prefix scan.
+- **Entry**: one such key. It holds all of one document's chunks in that posting. Search cost is counted in entries read.
+- **Centre**: a vector stored in the store's centre table (`{ns}_ivf_centres`). Each posting has a **routing centre**: new chunks go to the posting whose centre is nearest, and a query reads the postings nearest to it. Each chunk code is also encoded *against* a centre (it stores the chunk's difference from that centre); that is the code's `centre_id`.
+- **Target posting size** (`target_posting_size`, default 128 chunks): the size the partition aims for. A posting **splits** once it holds more than twice the target (the **split limit**, 256) and **merges** once it shrinks to `round(split limit × merge_ratio)` chunks or fewer (the **merge limit**, 22).
+- **Read share**: the entries a search reads as a share of all entries in the store. Partition quality is compared at equal read shares, because a partition can always find more by reading more.
+- **Recall@10**: the share of the true top 10 that a search returns, where the true top 10 is the same two-pass ranking computed exactly, on full-precision vectors, over every chunk. It measures what partitioning and probing lose. **nDCG** (normalised discounted cumulative gain) scores the final ranking against human relevance judgements.
 
-The partition's state is reported by `GET /admin/indices/{ns}/vector/partition` and `/postings`. The design, the simulation behind its numbers, and the measured gates are in [`Dynamic-RaBitQ-Index-Design.md`](Dynamic-RaBitQ-Index-Design.md).
+### 3.2 Why each store builds its own partition
+
+The groups must match the store's own text. A fixed set of centroids fitted on general text put 43% of SciFact's documents (a scientific-claims dataset) into one of 256 groups, so a query probing that group read nearly half the index. Smaller, on-topic postings find more of the right documents per entry read: in a simulation on FiQA (57,638 financial Q&A documents, 173,000 chunks), with the gemma model, recall@10 at 10,000 entries read was 0.975 with postings of target 128, 0.942 at target 1,024, and 0.811 with the general-purpose centroids.
+
+So no centroid file is prepared, shipped or loaded. Each store starts with one posting and grows its partition from its own vectors, without the embedding service and without keeping any float vectors.
+
+### 3.3 Overall design
+
+```
+enable semantic search
+        │
+        ▼
+ one root posting (centre = zero vector)
+        │   documents arrive; each chunk goes to its nearest active posting
+        ▼
+ ┌───────────── background maintenance, per store ─────────────┐
+ │  posting > split limit  ──►  SPLIT into two  ──►  REASSIGN   │
+ │                                                  neighbours  │
+ │  posting ≤ merge limit  ──►  MERGE into a nearby posting     │
+ └──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+ optional, by hand: REBUILD (k-means over every stored code)
+```
+
+**Insert.** A chunk's embedding is compared with every active posting's routing centre, filed under the nearest, and encoded against that posting's centre. If the posting is now over the split limit, the write wakes the maintenance task.
+
+**Split.** The maintenance task rebuilds an approximate vector for every chunk of the posting from its 1-bit code (its *reconstruction*), then divides the posting in two with balanced 2-means (two-group k-means with a penalty that keeps the halves of similar size). The two halves become new postings whose centres are the **means** of their members; the old posting is retired. If the smaller half would be at or under the merge limit, the split is refused and the posting stays whole until its contents change (see [§3.5](#35-design-choices-and-trade-offs)).
+
+**Reassign.** A split moves two centres, so some chunks nearby are now in the wrong posting. After each split, the task checks the chunks of the two halves and of the `reassign_range` (64) postings nearest the old centre. A chunk in one of the halves is a candidate if the old centre is nearer to it than its new one; a chunk in a neighbouring posting is a candidate if a new centre is nearer to it than both the old centre and its own posting's centre (SPFresh's two conditions). Each candidate moves to its nearest active posting, which may be where it already is.
+
+**Merge.** Deletes and moves shrink postings. A posting at or under the merge limit is folded into the first of the 64 postings nearest its centre that has room (the two together stay under the split limit). The larger of the two is kept. A moved chunk that ends up farther from its new centre than its old one is routed again to its nearest posting.
+
+**Rebuild** (by hand). `POST /admin/indices/{ns}/vector/rebuild` re-clusters the whole store: k-means over the reconstructions of every stored chunk (k-means++ on a 50,000-chunk sample, then 20 Lloyd iterations), with as many centres as there are active postings unless the request body sets `{"postings": n}`. Every chunk then moves to its nearest new posting, and ordinary maintenance splits whatever k-means left oversized. It makes no embedding calls and runs in the background (202; 409 while one is running).
+
+**Codes keep their centre.** A moved chunk changes only its key: its code and its `centre_id` stay as they were, and search decodes every code through its own `centre_id`, never through the posting it is filed under. So no maintenance step re-encodes anything or needs the original text. Whole-document (Pass 2) codes are encoded against the zero vector (§2), so they never depend on the partition at all.
+
+**Crash safety and concurrency.** The store has no multi-key transactions, so every operation is written as a plan in a WAL-backed journal (`{ns}_ivf_journal`) and carried out as single-key writes that are safe to repeat: create the new postings, copy each document's chunks to their destination, flush, then delete the originals and retire the old posting. Copies are written without the WAL, so the flush (the *barrier*) must come before any original is deleted; otherwise a crash could lose the copy and the original both. At startup, before the vector worker runs, recovery finishes every operation that had published its new postings and abandons one that had not. Searches and writes carry on during maintenance: each holds a read guard on the store's routing epoch while it chooses postings and reads or writes them, and maintenance takes the write guard only to publish a new snapshot of the partition. During a move a chunk may briefly sit in two postings; MaxSim (§4) takes each document's best chunk, so a duplicate changes no score.
+
+**Who runs it.** One maintenance task per process serves every store, at most `[semantic_search.maintenance] threads` (default 2) stores at a time and never one store twice. The 2-means runs on the blocking thread pool, and a rebuild's k-means on a pool of its own (`rebuild_threads`, 1 or 2), never on the pool that search scoring uses. Per-document moves run in batches of 16 documents, one batch at a time, because a batch holds those documents' write locks and every write to them waits.
+
+**Probing at search time.** Pass 1 computes the distance from the query to **every** active posting's routing centre (nothing is pruned), then takes postings nearest first until their entries reach the probe budget (`probe_budget_entries`, default 70,000), reading at least `min_probes` and at most `max_probes` postings. The cost is T × C × D (query vectors × postings × dimensions); production sends one query vector, so it is one scan of the centres: about 9 µs at 256 postings, growing linearly with their number. Entry counts per posting are kept exactly in memory, loaded from `{ns}_sparse_vector_meta` at startup and updated by every write.
+
+### 3.4 Parameters
+
+Every store owns its partition settings: they are copied into its schema (`vector_index.maintenance` and `vector_index.search`) when it enables semantic search, from the server's `[semantic_search.maintenance]` and `[semantic_search.search_defaults]` (or the built-in defaults). A later change to the server config affects only stores enabled afterwards. A store's search settings can be changed later and overridden per request.
+
+| Setting | Default | Allowed | What it controls |
+|---|---|---|---|
+| `target_posting_size` | 128 | 16–65,536 | Chunks per posting the partition aims for; split limit = 2 × this |
+| `reassign_range` | 64 | 0–1,024 | Postings near a split re-checked for misplaced chunks (0: only the two halves) |
+| `merge_ratio` | 10/118 ≈ 0.0847 | above 0, below 0.5 | Merge limit as a share of the split limit (SPFresh's ratio) |
+| `skip_uncertain_moves` | `false` | | Move a chunk only when its code shows it is clearly nearer, by more than the code's error bound |
+| `split_samples` | 1,000 | 2–1,000,000 | Balanced 2-means: chunks sampled per iteration |
+| `split_init_trials` | 3 | 1–100 | Balanced 2-means: random starting pairs tried |
+| `split_max_iters` | 100 | 1–10,000 | Balanced 2-means: iteration cap |
+| `split_lambda_factor` | 100 | above 0 | Balanced 2-means: balance weight, λ ≤ 1 / (factor × samples) |
+| `search.probe_budget_entries` | 70,000 | | Entries Pass 1 reads |
+| `search.min_probes` / `max_probes` | 1 / 1,024 | | Bounds on the postings Pass 1 reads |
+| `search.probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | fraction 0–1 | Optional budget that scales with the store: `clamp(fraction × entries, floor, probe_budget_entries)` |
+
+The `split_*` settings are the values of SPFresh's reference implementation (SPTAG); at the default target a posting being split holds far fewer than 1,000 chunks, so every chunk takes part in every iteration. Two server-only settings sit under `[semantic_search.maintenance]`: `threads` (default 2, 1–64: stores maintained at once) and `rebuild_threads` (default 2, 1 or 2: a rebuild's k-means threads).
+
+### 3.5 Design choices and trade-offs
+
+Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the gemma and qwen embedding models, in three insertion orders (file order, random order, and topic by topic). "Static k-means" is a partition fitted once on all the full-precision vectors, with the same number of postings: a strong fixed baseline.
+
+| Choice | What it gains | What it costs |
+|---|---|---|
+| **Grow from one posting**, no seeding phase | Searchable from the first document; nothing to prepare; handles growth, topic drift and deletes the same way | Postings are placed one split at a time, so the partition trails static k-means. On FiQA recall@10 is 0.4–1.0 points behind at a 5% read share; on SciFact 0.9–1.8. Seeding with k-means on the first floats gained at most 0.3 points, for about 90 MB of staged floats |
+| **Target 128 chunks** | More recall per millisecond than 256 (FiQA: 0.971 against about 0.966 at 3.7 ms) | About twice as many postings, so more probes to fill the same budget (603 against 293 at 70,000 entries, about 3.5 µs each: p50 14.9 ms against 13.8 ms) and more splits while indexing |
+| **Mean centres**, not SPFresh's medoid (the member nearest the mean) | With 1-bit codes a medoid is one member's noisy reconstruction, and the partition fragments (FiQA: 12,000–24,000 postings, recall@10 0.58–0.69 at a 1% read). The mean averages the noise away, and beat the medoid even on exact vectors | None measured |
+| **1-bit codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 20 MB of codes instead of 530 MB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors; 2-bit codes would add at most about a point at read shares of 2% or less |
+| **Codes keep their centre** when moved | No re-encoding, no embedding calls, no compounding error (re-encoding from a 1-bit code measured 0.861 against 0.918) | A moved code is a little less precise than a fresh encode against its new posting's centre. This is reported as *centre drift*; no ranking cost from it has been measured |
+| **No replicas** (each chunk in one posting) | One write per chunk; SPFresh's 4–5 copies per chunk cost 15–20 key moves per insert | None measured: replicated partitions lost to unreplicated ones of the same size |
+| **Reassignment over 64 neighbours** | SciFact's gap to static k-means at a 5% read narrowed from up to 3.5 points to under 2; when topics arrive one at a time, recall@10 at a 1% read rose by up to 10 points | About 2 key moves per inserted chunk (1.9–2.2 in random order, up to 2.8 topic by topic); FiQA indexing (embedding excluded) 47 s against 35 s without it, about 0.2 ms per document beside an embedding call of about 100 ms |
+| **Eager merges**, with refused splits | A small posting is merged as soon as it appears, instead of costing a probe on every query that reaches it | Needs the refused-split rule: on SciFact, 2-means split a 262-chunk posting into 259 and 3, the merge sent the 3 back, and the two alternated about 900 times in one pass. A refused posting stays a little over the split limit until its contents change |
+| **Error-bound gate off** by default | Keeps recall when topics arrive one at a time | On, it saves 12–17% of key moves for up to 0.9 points of recall@10 at a 1% read |
+| **Exact scan of every centre** at search and maintenance time | No approximation in the most recall-sensitive step; microseconds at thousands of postings | Linear in the number of postings: at about 100,000 postings (roughly 17 million chunks at FiQA's average posting size) the centres would need an index of their own |
+| **Rebuild only by hand** | A rebuild never runs unasked; it costs FiQA 143–151 s on 2 threads | A grown partition can trail a fresh k-means. A rebuild gained up to 4.4 points of recall@10 at a 1% read share and up to 1.3 at 5%; at the default budget nDCG did not change in any run. Use the recall check (§3.7) before and after to see whether it helped |
+
+Deletes do not wear the partition down. Deleting half the documents at random, or whole topics, left FiQA within ±0.8 points of what the partition reached before the deletes. **Known limitation:** SciFact with qwen, after half of its topics were deleted, lost 2.5 points; a small store (87 postings left) is the worst case.
+
+### 3.6 Where minnal differs from SPFresh
+
+| SPFresh | minnal | Why |
+|---|---|---|
+| Postings hold full vectors | Postings hold 1-bit codes; maintenance works on their reconstructions | No float copy of the store |
+| A split's centres are medoids | The means of the two halves | Medoids of noisy reconstructions fragment the partition |
+| Up to 8 replicas per vector | One posting per chunk | Replicas did not pay at equal entries read |
+| Merges are found lazily, when a search probes a small posting | Merges are found eagerly, when a write or delete leaves a posting small | Maintenance sees every size change; a small posting costs a probe on every query reaching it |
+| A split always writes both halves | A split whose smaller half is at or under the merge limit is refused | Without it, eager merges and splits undo each other in a loop |
+| A posting that will not split is truncated | It is kept whole and tried again when it changes | minnal never drops data |
+| Nearest centres found by an approximate graph | Every centre scanned exactly | Microseconds at this scale |
+| A moved vector keeps its value | A moved code keeps its `centre_id`; only its key changes | Re-encoding a 1-bit code compounds its error |
+| — | Optional error-bound gate on move decisions | Uses the `error_bound` every code already stores |
+
+### 3.7 Watching the partition
+
+| Endpoint | Shows |
+|---|---|
+| `GET /admin/indices/{ns}/vector/partition` | Postings, entries, posting-size spread, splits, merges and key moves since start, and a running rebuild's progress. With `?codes=true` it also reads every code to report centre drift and the mean error band |
+| `GET /admin/indices/{ns}/vector/postings` | Every live posting with its size, centre, parent and how it was created (`root`, `split`, `rebuild`); cursor-paginated |
+| `GET /admin/indices/{ns}/vector/recall-check` | How much of a full read's top 10…100 a normal search finds within its budget, on a sample of real queries from the query-embedding cache (or, with fewer than 20 cached, stored chunks). Verdict `read_in_full`, `ok` or `below_target` (overlap@10 under `min_overlap`, default 0.95). Pass the same `seed` before and after a rebuild to compare |
+| `GET /admin/indices/{ns}/vector/history` | Past recall checks, `?codes=true` reads and rebuilds (kept `partition_history_ttl_secs`, default 30 days) |
+| `POST /admin/indices/{ns}/vector/rebuild` | Starts a rebuild (body optional: `{"postings": n}`) |
+
+Use the recall check, not centre drift, to decide on a rebuild. Drift measures how precise the codes are, and a rebuild makes it higher (every code ends up in a posting with a new centre). What a rebuild changes is which postings hold which chunks, and that is what the recall check measures. A low overlap that does not rise after a rebuild means the probe budget, not the partition, is the limit.
 
 ---
 
@@ -187,7 +296,7 @@ That makes small, on-topic postings the main lever: they find more of the right
 documents per entry read. Centroids fitted on general text, rather than on the
 store's own vectors, put most of a specialist corpus in a few clusters (43% of
 SciFact's documents fell in one of 256), so each probe read a large share of the
-index; that is why every store now fits its own.
+index. That is why every store builds its own partition (§3).
 
 ### Concurrency
 
@@ -368,6 +477,7 @@ The server's `[semantic_search]` table holds only what concerns the embedding se
 | `embedding_request_timeout_secs` / `embedding_connect_timeout_secs` | `30` / `10` | Caps on one embedding request, and on its connect phase. |
 | `[[supported_models]]` | none | Optional allow-list (`name`, `dimension`). Without it, any model the service serves. |
 | `[maintenance]` `threads` / `rebuild_threads` | `2` / `2` | Stores maintained at once; k-means threads of a rebuild (1 or 2), on a pool of its own. |
+| `partition_history_ttl_secs` | `2592000` | How long recall checks, code reads and rebuilds stay in the partition history (30 days). |
 
 Everything that shapes one store's index lives in its schema's `vector_index`. `[semantic_search.maintenance]` and `[semantic_search.search_defaults]` only give the values a schema is filled with when the store first enables semantic search:
 
@@ -381,8 +491,7 @@ Everything that shapes one store's index lives in its schema's `vector_index`. `
 | `search.min_probes` / `max_probes` | `1` / `1024` | Bounds on postings probed. |
 | `search.first_pass_top_k` | `1000` | Candidates kept after Pass 1 for dense re-ranking. |
 | `search.top_k` | `100` | Results returned. |
-| `maintenance.target_posting_size` | `128` | A posting splits above twice this. |
-| `maintenance.reassign_range` / `merge_ratio` | `64` / `10/118` | Postings re-checked after a split; merge limit as a share of the split limit. |
+| `maintenance.*` | see §3.4 | How the store's partition splits, reassigns and merges. |
 
 Search settings can be changed later (`update_vector_search` amendment) and overridden per request.
 
@@ -418,6 +527,9 @@ measured on frozen BEIR embeddings by the vector bench
 | Distance estimators (SingleBit, MultiBit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
 | A store's partition (postings, centres, routing epoch) + probing by budget | `minnal_db/src/semantic_search/cluster/layout.rs` |
 | Split, reassignment, merge, rebuild and their journal | `minnal_db/src/ivf_split.rs`, `minnal_db/src/ivf_split/` |
+| Recall check and partition history | `minnal_db/src/ivf_split/recall_check.rs`, `ivf_split/history.rs` |
+| Background maintenance task and crash recovery | `minnal_db/src/doc_store/ivf_maintenance.rs` |
+| Per-store vector-index settings (defaults, validation) | `minnal_db/src/doc_store/vector_settings.rs` |
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/bench_distance_estimation.rs` |
@@ -425,3 +537,29 @@ measured on frozen BEIR embeddings by the vector bench
 | Latency profiling harness (see §8) | `minnal_db/src/vector_kv.rs` (ignored test) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
 | Document store | `minnal_db/src/doc_store/store/` |
+
+---
+
+## Acknowledgements
+
+### SPFresh
+
+The way each store grows and maintains its partition (§3) follows SPFresh's LIRE protocol: split a posting that grows too large, reassign the nearby vectors the split leaves misplaced, and merge postings that shrink too small, all in place and while the index keeps serving reads and writes. minnal takes LIRE's split, reassignment and merge rules, its reassignment range and merge ratio, and the balanced 2-means parameters of its reference implementation, SPTAG. Where minnal departs from them, and why, is listed in §3.6.
+
+> **SPFresh: Incremental In-Place Update for Billion-Scale Vector Search**
+> Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, Mao Yang
+> *ACM SOSP '23*
+> https://arxiv.org/pdf/2410.14452 (the protocol is §3, *LIRE Protocol Design*)
+
+The reference implementation (`ExtraDynamicSearcher.h` for the update protocol, `BKTree.h` for balanced k-means) is part of SPTAG:
+
+> https://github.com/microsoft/SPTAG
+
+### RaBitQ
+
+The 1-bit and multi-bit codes (§2), their error bound, and the random rotation they are computed in come from RaBitQ:
+
+> **RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search**
+> Jianyang Gao, Cheng Long
+> *ACM SIGMOD '24*
+> https://dl.acm.org/doi/10.1145/3654970

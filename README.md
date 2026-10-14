@@ -182,13 +182,13 @@ The `semantic-search` feature implements this as IVF (Inverted File Index) appro
 
 #### IVF Partitions
 
-Each store partitions its own embeddings into **postings**: groups of nearby chunk vectors, each with a centre. Nothing is fitted in advance and no centroid file is needed. A store that enables semantic search starts with a single posting, and a background task keeps the partition in shape as documents arrive and leave, following SPFresh's LIRE protocol:
+Each store partitions its own embeddings into **postings**: groups of nearby chunk vectors, each with a centre. Nothing is fitted in advance and no centroid file is needed. A store that enables semantic search starts with a single posting, and a background task keeps the partition in shape as documents arrive and leave, following SPFresh's LIRE protocol (see [Acknowledgements](#spfresh); the design, its parameters and trade-offs are in [Semantic-Search-Architecture.md §3](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#3-dynamic-partitioning-the-ivf-index)):
 
 - **Split.** A posting that grows past twice `target_posting_size` (default 128 chunks) is divided in two by balanced 2-means on its stored codes.
 - **Reassign.** After a split, any chunk of the two halves or of the 64 nearest postings that is now closer to another posting's centre moves to its nearest posting.
 - **Merge.** A posting that deletes have shrunk to under a tenth of the split size (22 chunks at the default target) is folded into a nearby one.
 
-Every step is journalled, so a crash at any point is finished on restart. `POST /admin/indices/{ns}/vector/rebuild` re-clusters a whole store from its stored codes (k-means, no embedding calls), for instance after its topics have shifted.
+Every step is journalled, so a crash at any point is finished on restart. `POST /admin/indices/{ns}/vector/rebuild` re-clusters a whole store from its stored codes (k-means, no embedding calls). A partition grown one split at a time can trail a fresh fit when a search reads only a small share of the store; to see whether a rebuild helps, run `GET /admin/indices/{ns}/vector/recall-check` before and after it with the same `seed`.
 
 This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their posting, so a query only has to scan the chunks of the postings nearest it instead of the whole corpus. The postings are chosen by an **exact** nearest-centre scan, nearest first, until their entries reach the store's probe budget (`probe_budget_entries`, default 70,000). There is deliberately **no precomputed neighbour graph over the postings**: at the counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest postings, whereas an approximate graph traversal would trade away recall for no meaningful speed-up.
 
@@ -210,7 +210,7 @@ A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each d
 3. All SingleBit (document-chunk) entries for the probed postings are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
 5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.
-6. The top `first_pass_sparse_search_top_k` candidates are retained.
+6. The top `first_pass_top_k` candidates (a store search setting, default 1,000) are retained.
 
 **Pass 2 — Dense (MultiBit):**
 1. MultiBit entries for all sparse candidates are fetched directly from `{ns}_dense_vector` by `doc_id` in one batch — a direct lookup per candidate, no posting scan.
@@ -316,7 +316,7 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers, using a stored key fingerprint and file-level bounds to skip work before falling back to a SIMD-accelerated byte comparison. See [Prefix scan with SIMD acceleration](#prefix-scan-with-simd-acceleration) above. |
 | **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates. |
 | **Restartable index builds** | Checkpoint files track progress; interrupted builds resume automatically on startup. |
-| **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact 1-bit chunk embeddings (32× compression vs f32) over IVF clusters for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
+| **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact 1-bit chunk embeddings (32× compression vs f32) over the nearest IVF postings for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
 | **Async vector indexing** | Document writes enqueue a pending embedding job and return immediately. A background worker (round-robin across namespaces, bounded concurrency) drains the queue and retries on failure. Configurable retry budget and concurrency under `[vector_index]`. |
 | **Quantisation error bounds** | Per-document `error_bound` field gives a theoretical guarantee on the dot-product estimate. |
 | **Filtered semantic search** | Combine ANN scoring with an index predicate in a single request. |
@@ -403,6 +403,19 @@ The quantisation scheme used in the `semantic-search` layer is RaBitQ, which pro
 The reference C++ implementation of RaBitQ, which informed the multi-bit quantisation and distance estimation code in this project, is available at:
 
 > https://github.com/gaoj0017/RaBitQ
+
+### SPFresh
+
+The way each store grows and maintains its own IVF partition is SPFresh's LIRE (Lightweight Incremental REbalancing) protocol: a posting that grows too large is split, the nearby vectors the split leaves misplaced are reassigned, and postings that shrink too small are merged, all in place while the index keeps serving reads and writes. minnal follows LIRE's split, reassignment and merge rules and uses the parameters of its reference implementation, SPTAG. It works on 1-bit codes instead of full vectors, uses mean centres instead of medoids, and keeps no replicas; the full list of differences, and why, is in [Semantic-Search-Architecture.md §3.6](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#36-where-minnal-differs-from-spfresh).
+
+> **SPFresh: Incremental In-Place Update for Billion-Scale Vector Search**
+> Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, Mao Yang
+> *ACM SOSP '23*
+> https://arxiv.org/pdf/2410.14452 (the protocol is §3, *LIRE Protocol Design*)
+
+The reference implementation of the update protocol is part of Microsoft's SPTAG library:
+
+> https://github.com/microsoft/SPTAG
 
 ### RoaringBitmap
 

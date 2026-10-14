@@ -345,7 +345,7 @@ On top of that there's a set of `/admin/*` routes for backup, diagnostics, and b
 
 ### Store lifecycle
 
-These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendment via `PATCH` applies to document stores only.)
+These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendments via `PATCH` apply to document stores only; `update_vector_search` applies to both kinds.)
 
 #### `GET /stores`
 
@@ -484,7 +484,7 @@ Returns `404 Not Found` if the namespace does not exist.
 
 Amend the schema. Cannot be used to change indexed fields — drop the index first.
 
-**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries and the `{ns}_sparse_vector`, `{ns}_dense_vector`, `{ns}_sparse_vector_meta` companion namespaces) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
+**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries, the `{ns}_sparse_vector`, `{ns}_dense_vector` and `{ns}_sparse_vector_meta` companion namespaces, and the store's partition in `{ns}_ivf_centres`, `{ns}_ivf_postings` and `{ns}_ivf_journal`) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
 
 **Add an attribute:**
 
@@ -545,6 +545,33 @@ vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
 returns `409` if a vector index already exists, and `400` if `fields` is empty,
 contains duplicates, or names an existing index/attribute.
 
+**Change search or partition settings:** once semantic search is enabled, the
+store owns its search settings (`vector_index.search`) and the settings that
+shape its partition (`vector_index.maintenance`). `update_vector_search` changes
+either or both; settings you leave out keep their current values. It works on
+KV stores as well as document stores, takes effect on later searches, splits and
+merges, and re-embeds nothing.
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "update_vector_search",
+       "search": {"probe_budget_entries": 20000, "top_k": 20},
+       "maintenance": {"target_posting_size": 256}}'
+# → 204 No Content
+```
+
+`search` accepts `probe_budget_entries`, `min_probes`, `max_probes`,
+`first_pass_top_k`, `top_k`, `probe_budget_fraction` and `probe_budget_floor`;
+`maintenance` accepts `target_posting_size`, `reassign_range`, `merge_ratio`,
+`skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
+and `split_lambda_factor`. What each one does, its default and its allowed range
+are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
+The embedding model, dimension and chunking are fixed once semantic search is
+enabled and cannot be changed here. A value out of range returns `400`; a store
+without semantic search returns `422`. Read the current values with
+`GET /stores/{ns}/schema`.
+
 | `op` value                | Required fields          |
 |---------------------------|--------------------------|
 | `add_attribute`           | `name`, `attr_type`      |
@@ -552,8 +579,9 @@ contains duplicates, or names an existing index/attribute.
 | `remove_attribute`        | `name`                   |
 | `add_embedding_attribute` | `name`                   |
 | `enable_vector_index`     | `fields` (non-empty)     |
+| `update_vector_search`    | `search` and/or `maintenance` |
 
-All ops except `enable_vector_index` accept an optional `"description"` string.
+`add_attribute`, `update_attribute` and `add_embedding_attribute` accept an optional `"description"` string.
 
 ---
 

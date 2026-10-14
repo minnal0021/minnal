@@ -277,7 +277,6 @@ max_retries = 5
 concurrency = 4
 
 # [semantic_search] — the embedding service and the allowed models
-# [semantic_search] — the embedding service and the cluster centroids
 #
 # A store's embedding model, dimension, chunking, code widths, search settings
 # and partition maintenance live in the store's schema (`vector_index`). The

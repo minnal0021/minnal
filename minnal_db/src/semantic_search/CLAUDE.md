@@ -149,8 +149,8 @@ Everything that shapes one namespace's index lives in its schema's `vector_index
 
 ## Key types
 
-- `VectorIndex` — a quantised embedding entry: holds `cluster_id`, packed bit codes (`binary_quantised_vector`), scalar correction coefficients (`addition_factor`, `scaling_factor`, `error_bound`), and `quantisation_style` (`SingleBit` or `MultiBit { number_of_bits }`).
-- `VectorKvStore` — trait over the storage backend; exposes `scan_sparse_cluster(cluster_id)` (returns all SingleBit entries for that cluster) and `get_dense_entry(doc_id_bytes)` (returns the MultiBit bytes for a document).
+- `VectorIndex` — a quantised embedding entry: holds `cluster_id` (the posting it is filed under), `centre_id` (the centre it was encoded against, which decodes it), packed bit codes (`packed_vector`), scalar correction coefficients (`addition_factor`, `scaling_factor`, `error_bound`), and `quantisation_style` (`SingleBit` or `MultiBit { number_of_bits }`).
+- `VectorKvStore` — trait over the storage backend: `scan_sparse_clusters_batch` (every SingleBit entry of the probed postings, one call) and `get_dense_entries_batch` (MultiBit bytes per candidate), which `search()` uses, plus their single-item forms `scan_sparse_cluster` / `get_dense_entry`.
 - `Cluster` — a single centroid + its pre-computed norms for fast distance estimation.
 - `ClusterIndex` — a fixed set of centroids with its rotation: the identity layout (posting = centre = cluster) for tests, benches and raw `vector_kv` users. Namespaces use `NamespaceIvf` instead.
 - `SemanticSearchConfig` — all tunable parameters for the search pipeline.
