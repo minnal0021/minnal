@@ -176,6 +176,11 @@ below the retired cut. Delete in order, oldest first; fsync the directory after.
 A segment is never deleted while it holds an unretired record. No field index
 reads these namespaces, so there is no index-replay watermark to respect.
 
+The pass shares the main WAL GC's tick, not its decisions: it runs after the
+main WAL's pass, uses only its own retired cut, and an error in either pass is
+logged without skipping the other. A stuck main-WAL GC must not leave the vector
+index WAL growing, nor the reverse.
+
 Disk use is bounded by what the vector namespaces have not flushed: at most one
 memtable each (100,000 entries), plus the segment in progress.
 
