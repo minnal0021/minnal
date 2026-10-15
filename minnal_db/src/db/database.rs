@@ -2636,6 +2636,24 @@ impl Database {
         stores.values().any(|s| s.has_lsm_compaction_work())
     }
 
+    /// What the compaction worker runs: every namespace's read-only memtables
+    /// flushed, and only the buckets whose L0→L1 merge is due merged
+    /// (`LSMTree::compaction_due`). [`compact_lsm`](Self::compact_lsm) merges
+    /// everything.
+    pub(crate) fn compact_lsm_due(&self) -> Result<()> {
+        self.check_closed()?;
+        let stores = self.stores.read();
+        for (_, kv_store) in stores.iter() {
+            kv_store.compact_lsm_due()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_due_lsm_compaction_work(&self) -> bool {
+        let stores = self.stores.read();
+        stores.values().any(|s| s.has_due_lsm_compaction_work())
+    }
+
     // ── Stats ──────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Stats {
@@ -3201,12 +3219,12 @@ impl LsmCompactionTarget for Database {
         self.flush_no_wal_memtables()
     }
 
-    fn has_lsm_compaction_work(&self) -> bool {
-        self.has_lsm_compaction_work()
+    fn has_due_compaction_work(&self) -> bool {
+        self.has_due_lsm_compaction_work()
     }
 
-    fn compact_lsm(&self) -> Result<()> {
-        self.compact_lsm()
+    fn compact_due(&self) -> Result<()> {
+        self.compact_lsm_due()
     }
 }
 

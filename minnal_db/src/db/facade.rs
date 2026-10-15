@@ -800,11 +800,11 @@ impl LsmCompactionTarget for Db {
     fn flush_no_wal_memtables(&self) -> usize {
         self.inner.flush_no_wal_memtables()
     }
-    fn has_lsm_compaction_work(&self) -> bool {
-        self.inner.has_lsm_compaction_work()
+    fn has_due_compaction_work(&self) -> bool {
+        self.inner.has_due_lsm_compaction_work()
     }
-    fn compact_lsm(&self) -> Result<()> {
-        self.inner.compact_lsm()
+    fn compact_due(&self) -> Result<()> {
+        self.inner.compact_lsm_due()
     }
 }
 

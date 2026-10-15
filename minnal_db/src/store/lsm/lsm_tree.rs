@@ -49,6 +49,18 @@ pub enum LSMError {
 
 pub(crate) type Result<T> = std::result::Result<T, LSMError>;
 
+/// A bucket's Level-0 files are merged into its Level 1 once this many have
+/// built up, however small. Every L0 file a point read cannot rule out by its
+/// key range, Bloom filter or `max_seq` is read, so this bounds the read cost
+/// that waiting adds. See [`LSMTree::compaction_due`].
+pub(crate) const L0_COMPACTION_MAX_FILES: usize = 8;
+
+/// A bucket's Level-0 files are merged into its Level 1 once they hold at least
+/// this percentage of Level 1's entries. A merge rewrites the whole Level-1
+/// file, so this bounds what compaction rewrites to about 100 / this times what
+/// was flushed. See [`LSMTree::compaction_due`].
+pub(crate) const L0_COMPACTION_RATIO_PERCENT: u64 = 10;
+
 /// Configuration for LSM tree compaction behavior
 #[derive(Clone, Debug)]
 pub struct LSMConfig {
@@ -672,6 +684,8 @@ struct L0Summary {
     min_key: Vec<u8>,
     max_key: Vec<u8>,
     max_seq: u64,
+    /// Records in the file; what [`LSMTree::compaction_due`] weighs against Level 1.
+    entries: u64,
     bloom: BloomFilter,
     /// Offsets of every `SAMPLE_INTERVAL`-th frame, so a hit scans a few entries
     /// instead of the file. Each hint is still validated against the file
@@ -693,6 +707,7 @@ impl L0Summary {
             min_key: min_key.to_vec(),
             max_key: max_key.to_vec(),
             max_seq,
+            entries: len as u64,
             bloom: BloomFilter::build(records.map(|(key, _)| key), len),
             index: None,
         })
@@ -1305,6 +1320,7 @@ impl LSMTree {
             min_key: meta.min_key,
             max_key: meta.max_key,
             max_seq,
+            entries: meta.entry_count,
             bloom,
             index,
         }))
@@ -2387,6 +2403,84 @@ impl LSMTree {
 
     pub(crate) fn has_compaction_work(&self) -> bool {
         !self.read_only_memtables.read().is_empty() || self.has_level0_files()
+    }
+
+    /// Whether `bucket`'s Level-0 files should be merged into its Level 1 now.
+    ///
+    /// A merge rewrites the bucket's whole Level-1 file, so merging whatever L0
+    /// holds at every opportunity costs the size of Level 1 per flush. Callers
+    /// that flush small memtables often (the vector worker's durability barrier,
+    /// one flush per batch) then rewrote megabytes to add a dozen entries: at 50
+    /// requests/s the M5 benchmark measured 10 flushes and 16 merges a second,
+    /// about 2 MB rewritten per document and 93% of all disk writes.
+    ///
+    /// So a bucket waits until its L0 files hold [`L0_COMPACTION_RATIO_PERCENT`]
+    /// of Level 1's entries, which bounds the rewrite to about 100 / that times
+    /// what was flushed, or until there are [`L0_COMPACTION_MAX_FILES`] of them,
+    /// which bounds what a point read may have to open. An L0 file without a
+    /// summary counts as due: its size is unknown.
+    pub(crate) fn compaction_due(&self, bucket: u32) -> bool {
+        let files = self.level0_files[bucket as usize].read();
+        let live: Vec<&Arc<L0FileEntry>> = files.iter().filter(|f| !f.is_obsolete()).collect();
+        if live.is_empty() {
+            return false;
+        }
+        if live.len() >= L0_COMPACTION_MAX_FILES {
+            return true;
+        }
+        let mut l0_entries = 0u64;
+        for f in &live {
+            match &f.summary {
+                Some(s) => l0_entries += s.entries,
+                None => return true,
+            }
+        }
+        let l1_entries: u64 = self.sstable_metadata[bucket as usize].read().iter().map(|m| m.entry_count).sum();
+        l0_entries * 100 >= l1_entries * L0_COMPACTION_RATIO_PERCENT
+    }
+
+    /// Whether [`compact_due`](Self::compact_due) has anything to do: a read-only
+    /// memtable to flush or release (a flushed one is held until a tick drops
+    /// it), or a bucket whose merge is due.
+    pub(crate) fn has_due_compaction_work(&self) -> bool {
+        !self.read_only_memtables.read().is_empty() || (0..self.config.num_buckets as u32).any(|b| self.compaction_due(b))
+    }
+
+    /// The background worker's compaction: flush every read-only memtable to
+    /// Level 0 (they pin the WAL), then merge only the buckets whose merge is
+    /// [due](Self::compaction_due). [`compact_all`](Self::compact_all) merges
+    /// every bucket with any L0 file, for shutdown and explicit requests.
+    pub(crate) fn compact_due(&self) -> Result<()> {
+        self.cleanup_pending_memtables();
+        self.cleanup_obsolete_level0_files();
+
+        let ro_snapshot = self.read_only_memtables.read().clone();
+        let mut changed = false;
+        for ro in ro_snapshot.iter() {
+            changed |= !ro.is_flushed_to_level0();
+            self.flush_ro_memtable_to_level0(ro)?;
+        }
+
+        for bucket in 0u32..self.config.num_buckets as u32 {
+            if !self.compaction_due(bucket) {
+                continue;
+            }
+            changed = true;
+            if let Err(err) = self.compact_bucket(bucket) {
+                if let LSMError::Io(io_err) = &err
+                    && io_err.kind() == std::io::ErrorKind::NotFound
+                {
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+
+        self.defer_old_memtables_cleanup()?;
+        if changed {
+            self.write_manifest_snapshot()?;
+        }
+        Ok(())
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -6902,6 +6996,121 @@ mod tests {
             cursor = page[20].0.clone();
         }
         assert_eq!(walked, reference, "bounded paginated walk must equal the unbounded reference");
+        Ok(())
+    }
+
+    /// Live (not yet merged) Level-0 files in `bucket`.
+    fn live_l0(lsm: &LSMTree, bucket: usize) -> usize {
+        lsm.level0_files[bucket].read().iter().filter(|f| !f.is_obsolete()).count()
+    }
+
+    /// The worker merges a bucket's L0 into L1 only when the L0 files hold
+    /// `L0_COMPACTION_RATIO_PERCENT` of L1's entries, not after every flush: a
+    /// merge rewrites the whole L1 file. Into an empty L1 any L0 is due.
+    #[test]
+    fn small_flushes_wait_until_level0_is_a_share_of_level1() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        let key = |i: u64| format!("doc:{i:08}").into_bytes();
+        let mut seq = 1u64;
+        lsm.insert_with_seq(&key(0), 1, seq)?;
+        seq += 1;
+        lsm.flush_memtable_to_level0()?;
+        assert!(lsm.compaction_due(0), "an empty L1 takes any L0");
+        lsm.compact_due()?;
+        assert_eq!(live_l0(&lsm, 0), 0);
+
+        for i in 1..1_000u64 {
+            lsm.insert_with_seq(&key(i), 1, seq)?;
+            seq += 1;
+        }
+        lsm.flush_and_compact_all()?;
+        // 1,000 entries in L1: flushes of 30 wait until L0 holds 100 (10%).
+        let mut flushed = 0u64;
+        for round in 0..3u64 {
+            for i in 0..30u64 {
+                lsm.insert_with_seq(&key(2_000 + round * 30 + i), 1, seq)?;
+                seq += 1;
+            }
+            lsm.flush_memtable_to_level0()?;
+            flushed += 30;
+            assert!(!lsm.compaction_due(0), "{flushed} L0 entries against 1,000 in L1 is not due");
+            lsm.compact_due()?;
+            assert_eq!(live_l0(&lsm, 0), round as usize + 1, "nothing merged yet");
+            assert!(!lsm.has_due_compaction_work(), "the tick released the flushed memtable");
+        }
+        for i in 0..10u64 {
+            lsm.insert_with_seq(&key(3_000 + i), 1, seq)?;
+            seq += 1;
+        }
+        lsm.flush_memtable_to_level0()?;
+        assert!(lsm.compaction_due(0), "100 L0 entries is 10% of L1");
+        lsm.compact_due()?;
+        assert_eq!(live_l0(&lsm, 0), 0);
+        for i in (0..1_000u64).chain(2_000..2_090).chain(3_000..3_010) {
+            assert!(lsm.get_with_seq(&key(i))?.is_some(), "key {i} survives the merge");
+        }
+        Ok(())
+    }
+
+    /// However small, `L0_COMPACTION_MAX_FILES` L0 files make a merge due: each
+    /// one a point read cannot rule out is a file it reads.
+    #[test]
+    fn many_tiny_flushes_are_merged_at_the_file_cap() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        let key = |i: u64| format!("doc:{i:08}").into_bytes();
+        let mut seq = 1u64;
+        for i in 0..10_000u64 {
+            lsm.insert_with_seq(&key(i), 1, seq)?;
+            seq += 1;
+        }
+        lsm.flush_and_compact_all()?;
+        for n in 1..=L0_COMPACTION_MAX_FILES {
+            lsm.insert_with_seq(&key(n as u64), 2, seq)?;
+            seq += 1;
+            lsm.flush_memtable_to_level0()?;
+            assert_eq!(lsm.compaction_due(0), n == L0_COMPACTION_MAX_FILES, "{n} one-entry files");
+        }
+        lsm.compact_due()?;
+        assert_eq!(live_l0(&lsm, 0), 0);
+        Ok(())
+    }
+
+    /// The explicit and shutdown path, `compact_all`, still merges every bucket
+    /// that has any L0 file; only the worker's `compact_due` waits.
+    #[test]
+    fn compact_all_merges_what_compact_due_leaves() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        };
+        let lsm = LSMTree::open(temp_dir.path(), config)?;
+        let key = |i: u64| format!("doc:{i:08}").into_bytes();
+        let mut seq = 1u64;
+        for i in 0..1_000u64 {
+            lsm.insert_with_seq(&key(i), 1, seq)?;
+            seq += 1;
+        }
+        lsm.flush_and_compact_all()?;
+        lsm.delete_with_seq(&key(5), seq)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_due()?;
+        assert_eq!(live_l0(&lsm, 0), 1, "one tombstone is not due");
+        assert!(lsm.get_with_seq(&key(5))?.is_none(), "the L0 tombstone shadows L1");
+        lsm.compact_all()?;
+        assert_eq!(live_l0(&lsm, 0), 0);
+        assert!(lsm.get_with_seq(&key(5))?.is_none(), "the merge drops the tombstone and the key");
+        assert!(lsm.get_with_seq(&key(6))?.is_some());
         Ok(())
     }
 }

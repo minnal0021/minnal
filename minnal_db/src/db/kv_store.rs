@@ -1843,6 +1843,17 @@ impl KVStore {
         self.lsm.has_compaction_work()
     }
 
+    /// The background worker's compaction: flush read-only memtables and merge
+    /// only the buckets whose merge is due (`LSMTree::compaction_due`).
+    pub(crate) fn compact_lsm_due(&self) -> Result<()> {
+        self.lsm.compact_due().map_err(KVError::from)
+    }
+
+    /// Whether [`compact_lsm_due`](Self::compact_lsm_due) has anything to do.
+    pub(crate) fn has_due_lsm_compaction_work(&self) -> bool {
+        self.lsm.has_due_compaction_work()
+    }
+
     // ── Shutdown ──────────────────────────────────────────────────────────
 
     /// Flush and sync all data for this namespace.

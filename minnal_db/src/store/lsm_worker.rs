@@ -13,8 +13,10 @@ use tokio::time;
 /// Trait for types that support LSM compaction.
 pub trait LsmCompactionTarget: Send + Sync + 'static {
     fn is_closed(&self) -> bool;
-    fn has_lsm_compaction_work(&self) -> bool;
-    fn compact_lsm(&self) -> Result<()>;
+    /// A read-only memtable to flush, or a bucket whose L0→L1 merge is due.
+    fn has_due_compaction_work(&self) -> bool;
+    /// Flush read-only memtables and merge the buckets that are due.
+    fn compact_due(&self) -> Result<()>;
     /// Flush namespaces whose no-WAL writes exist only in memory, bounding what
     /// a crash destroys to one tick. Returns how many were flushed.
     fn flush_no_wal_memtables(&self) -> usize;
@@ -27,7 +29,8 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(60);
 ///
 /// A store being written continuously (an embedding job, partition
 /// maintenance) seals a memtable about every second, and each seal triggers a
-/// compaction: logging every one at INFO measured **1,649 compactions plus 208
+/// check (which merges only the buckets that are due, `LSMTree::compaction_due`):
+/// logging every compaction at INFO measured **1,649 compactions plus 208
 /// no-WAL flushes in 46 minutes** of FiQA indexing, two lines each. They are
 /// logged at DEBUG and rolled up here into at most one INFO line per
 /// [`SUMMARY_EVERY`]; a quiet worker logs nothing.
@@ -227,14 +230,14 @@ impl LsmCompactionWorker {
             tally.no_wal_flushes += flushed;
         }
 
-        if !target.has_lsm_compaction_work() {
-            debug!("[LsmCompactionWorker] tick — memtable below flush threshold, no level-0 files; nothing to compact");
+        if !target.has_due_compaction_work() {
+            debug!("[LsmCompactionWorker] tick — no read-only memtable, no bucket due a merge; nothing to compact");
             return;
         }
 
         debug!("[LsmCompactionWorker] tick — starting compaction");
         let start = Instant::now();
-        match target.compact_lsm() {
+        match target.compact_due() {
             Ok(()) => {
                 let took = start.elapsed();
                 debug!("[LsmCompactionWorker] compaction complete in {took:?}");
@@ -328,10 +331,10 @@ mod tests {
             fn is_closed(&self) -> bool {
                 false
             }
-            fn has_lsm_compaction_work(&self) -> bool {
+            fn has_due_compaction_work(&self) -> bool {
                 true
             }
-            fn compact_lsm(&self) -> Result<()> {
+            fn compact_due(&self) -> Result<()> {
                 self.compactions.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
