@@ -734,7 +734,8 @@ pub struct RecallCheckParams {
     /// Queries to sample: default 100, at most 1,000.
     #[serde(default)]
     pub sample: Option<usize>,
-    /// Sample seed; the same seed samples the same chunks before and after a rebuild.
+    /// Sample seed; the same seed (and query source) samples the same queries
+    /// before and after a rebuild.
     #[serde(default)]
     pub seed: Option<u64>,
     /// Overlap@10 below which the verdict is `below_target` (default 0.95).
@@ -752,12 +753,16 @@ pub struct RecallCheckParams {
 }
 
 /// `GET /admin/indices/{ns}/vector/recall-check` — does the namespace's search
-/// miss what a full read finds (FR-007)? Samples stored chunks as queries (no
-/// embedding calls), searches each under the namespace's settings and again
-/// probing every posting, and returns the overlap at @10–@100, the share read,
-/// the cost, and a verdict: `read_in_full` (a rebuild cannot help), `ok`, or
-/// `below_target`. Synchronous; it costs `sample` searches plus `sample`
-/// full reads. The result is recorded in the partition history.
+/// miss what a full read finds (FR-007)? Samples real queries from the
+/// query-embedding cache (this namespace's model and dimension); with fewer than
+/// 20 cached it samples stored chunks instead (their 1-bit reconstructions).
+/// Neither makes an embedding call; `query_source` in the result says which was
+/// used. Each query is searched under the namespace's settings and again probing
+/// every posting (the nearest postings up to 500,000 entries on a larger
+/// namespace), and the result gives the overlap at @10–@100, the share read, the
+/// cost, and a verdict: `read_in_full` (a rebuild cannot help), `ok`,
+/// `below_target`, or `empty`. Synchronous; it costs `sample` searches plus
+/// `sample` reference reads. The result is recorded in the partition history.
 pub async fn vector_recall_check(
     State(state): State<AppState>,
     Path(ns): Path<String>,
