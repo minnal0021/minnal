@@ -566,9 +566,15 @@ impl LsmFlushObserver for LsmFlushObserverHub {
 
     // Before the memtable's L0 files are registered, and through
     // `SyncValueLogBeforePersist`, so the values the retired records point at
-    // are fsynced first. See `LsmFlushObserver` for the order of events.
-    fn on_ro_memtable_written(&self, version: u64) {
-        self.vector_index_wal.on_memtable_written(self.namespace_id, version);
+    // are fsynced first. An error (the progress marker could not be written)
+    // undoes the flush. See `LsmFlushObserver` for the order of events.
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        self.vector_index_wal
+            .on_memtable_written(self.namespace_id, version)
+            .map_err(|e| match e {
+                crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+                other => std::io::Error::other(other.to_string()),
+            })
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
@@ -1318,8 +1324,10 @@ impl Database {
         // could not replay it from there (FR-001's no-WAL marker).
         self.note_no_wal_index_exposure(namespace_id);
         // Applied with the logged seq; one retry, as the WAL path's apply. On a
-        // second failure the record stays in the log and replays at the next
-        // open, and the caller does not complete its work.
+        // second failure the caller gets the error and does not complete its
+        // work (the vector worker redoes the entry). The record stays in the
+        // log but is in no memtable: it replays only if the database stops
+        // before the namespace's next seal, which otherwise retires it.
         kv_store
             .put_to_storage_seq(key, value, seq)
             .or_else(|_| kv_store.put_to_storage_seq(key, value, seq))?;
@@ -2455,18 +2463,24 @@ impl Database {
     /// as [`Self::flush_namespaces_pinning_wal`] does for the main WAL. A vector
     /// namespace that writes a little and goes idle would otherwise keep every
     /// later segment on disk. Returns how many were flushed.
+    ///
+    /// Seals the memtable even when it is empty: a namespace is released only
+    /// by a seal and its flush, and one can hold the cut with an empty
+    /// memtable (its last record was logged but never applied, for one).
     pub(crate) fn flush_namespaces_pinning_vector_wal(&self) -> usize {
         let holding = self.vector_index_wal.namespaces_holding_cut();
         if holding.is_empty() {
             return 0;
         }
-        let stores = self.stores.read();
+        // Cloned so no flush (and its fsyncs) holds the store map, which
+        // creating or dropping a namespace needs.
+        let stores: Vec<(u32, Arc<KVStore>)> = {
+            let stores = self.stores.read();
+            holding.iter().filter_map(|ns| stores.get(ns).map(|s| (*ns, Arc::clone(s)))).collect()
+        };
         let mut flushed = 0;
-        for ns_id in holding {
-            let Some(kv_store) = stores.get(&ns_id) else {
-                continue;
-            };
-            match kv_store.flush_memtable_to_level0() {
+        for (ns_id, kv_store) in stores {
+            match kv_store.seal_and_flush_to_level0() {
                 Ok(()) => {
                     flushed += 1;
                     crate::db::metrics::Metrics::bump(&self.metrics.vector_wal_pin_flushes);
@@ -2494,10 +2508,10 @@ impl Database {
     /// The vector index WAL's state: segments, tail, retired cut, and the
     /// namespaces holding the cut back.
     pub fn vector_index_wal_stats(&self) -> Result<VectorIndexWalStats> {
-        let registry = self.registry.read();
+        // The registry is read per name, not held across the log's file I/O.
         Ok(self
             .vector_index_wal
-            .stats(|ns| registry.get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned))?)
+            .stats(|ns| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned))?)
     }
 
     pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
@@ -2510,17 +2524,24 @@ impl Database {
     // ── Recovery ───────────────────────────────────────────────────────
 
     /// Replay the vector index WAL's unretired records into their memtables,
-    /// with their original seqs, then raise the seq counter above every record.
+    /// with their original seqs, then make them durable in L0 and record that.
     ///
     /// Runs at open, before main-WAL recovery and before the flush observers
     /// are wired: both logs replay with original seqs into memtables that
-    /// resolve by seq, so their order does not matter, and a seal made while
-    /// replaying is unobserved, so that memtable retires nothing when flushed
-    /// (its namespace holds the cut until the GC tick's flush seals it again).
-    /// Each record is applied only if it lies at or above its namespace's
-    /// durable safe offset (`VectorIndexWal::replay`); records of a namespace
-    /// no longer in the registry are skipped. A record that fails twice goes
-    /// to the fail log, as in main-WAL recovery.
+    /// resolve by seq, so their order does not matter. Each record is applied
+    /// only if it lies at or above its namespace's durable safe offset
+    /// (`VectorIndexWal::replay`); records of a namespace no longer in the
+    /// registry are skipped. A record that fails twice goes to the fail log,
+    /// as in main-WAL recovery, and is retired with the rest.
+    ///
+    /// **Load-bearing:** no observer sees the replay, so the namespaces it
+    /// replayed into are flushed to L0, their value logs fsynced, and the log
+    /// told they are safe up to its tail, all **before** `recover_from_wal`
+    /// runs. That recovery compacts every store into L1, which drops
+    /// tombstones; had the marker stayed behind, a second crash would replay a
+    /// record whose delete the compaction erased, and the key would come
+    /// back (`a_second_crash_does_not_bring_back_a_deleted_key`). It would
+    /// also leave an idle namespace holding the cut.
     fn recover_from_vector_index_wal(&self) -> Result<()> {
         // A new write must never draw a seq below a replayed record's, or it
         // would lose to it.
@@ -2565,6 +2586,22 @@ impl Database {
             );
             let failures: Vec<(&WalEntry, String)> = failed.iter().map(|(e, msg)| (e, msg.clone())).collect();
             crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
+        }
+
+        // Every namespace still holding the cut had its records replayed above
+        // (dropped ones were forgotten at open). Flush them and record it.
+        let holding = self.vector_index_wal.namespaces_holding_cut();
+        if !holding.is_empty() {
+            let mut flushed = Vec::with_capacity(holding.len());
+            for ns_id in holding {
+                let Some(store) = stores.get(&ns_id) else {
+                    continue;
+                };
+                store.flush_memtable_to_level0()?;
+                store.sync_value_log()?;
+                flushed.push(ns_id);
+            }
+            self.vector_index_wal.retire_replayed(&flushed)?;
         }
         Ok(())
     }
@@ -2995,6 +3032,17 @@ impl Database {
             return Err(KVError::DatabaseClosed);
         }
 
+        // Every step runs even if an earlier one failed (a failed shutdown
+        // cannot be retried: the database is already closed); the first error
+        // is returned.
+        fn note(first: &mut Option<KVError>, step: &str, r: Result<()>) {
+            if let Err(e) = r {
+                error!("[SHUTDOWN] {step} failed: {e:?}");
+                first.get_or_insert(e);
+            }
+        }
+        let mut first_error: Option<KVError> = None;
+
         // Shutdown all KVStores
         let stores = self.stores.read();
         // Flush first, with the observers still attached, so the vector index
@@ -3004,32 +3052,46 @@ impl Database {
         // would make the next open replay records whose keys were deleted
         // (`a_clean_shutdown_does_not_bring_back_deleted_keys`). The main WAL
         // sees these flushes too; it marks everything persisted below anyway.
-        for (_, kv_store) in stores.iter() {
-            kv_store.flush_memtable_to_level0()?;
+        let mut flush_failed = std::collections::HashSet::new();
+        for (ns_id, kv_store) in stores.iter() {
+            if let Err(e) = kv_store.flush_memtable_to_level0() {
+                flush_failed.insert(*ns_id);
+                note(&mut first_error, &format!("flushing ns={ns_id}"), Err(e));
+            }
         }
-        for (_, kv_store) in stores.iter() {
-            kv_store.set_flush_observer(None);
-            kv_store.shutdown()?;
+        for (ns_id, kv_store) in stores.iter() {
+            // A store whose flush failed keeps its observers: its shutdown
+            // flushes again before compacting, and that flush must be seen by
+            // the vector index WAL (which vetoes it if its marker cannot be
+            // written), so nothing it holds is merged unrecorded.
+            if !flush_failed.contains(ns_id) {
+                kv_store.set_flush_observer(None);
+            }
+            note(&mut first_error, &format!("shutting down ns={ns_id}"), kv_store.shutdown());
         }
         drop(stores);
+        // An entry may be marked persisted only once its key is in an SSTable.
+        let stores_on_disk = first_error.is_none();
 
         // Flush all active field indices (keymap + bitmap data) to disk.
         // This persists in-memory index state accumulated during the session,
         // including entries written via put_no_wal which have no WAL to replay.
-        self.run_index_checkpoint()?;
+        note(&mut first_error, "the index checkpoint", self.run_index_checkpoint().map(|_| ()));
 
         // Mark remaining WAL entries as persisted
-        let start = *self.last_persisted_wal_offset.read();
-        let tail = self.wal_metadata.read().tail;
-        self.wal_flush_observer.mark_persisted_range(start, tail);
+        if stores_on_disk {
+            let start = *self.last_persisted_wal_offset.read();
+            let tail = self.wal_metadata.read().tail;
+            self.wal_flush_observer.mark_persisted_range(start, tail);
+        }
 
         // Flush WAL metadata
-        self.flush_wal_metadata_internal()?;
+        note(&mut first_error, "writing the WAL metadata", self.flush_wal_metadata_internal());
 
         // Sync WAL
-        self.wal.sync()?;
+        note(&mut first_error, "syncing the WAL", self.wal.sync().map_err(KVError::from));
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Test-only: mark the database closed without flushing anything, so its

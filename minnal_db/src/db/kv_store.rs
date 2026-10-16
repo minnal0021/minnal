@@ -1431,6 +1431,20 @@ impl KVStore {
         result
     }
 
+    /// As [`Self::flush_memtable_to_level0`], but seals the memtable even when
+    /// it is empty, so the flush observers always see a seal and a flush. The
+    /// vector index WAL's GC pass uses it: a namespace holding that log's
+    /// retired cut is released only by a seal, and its memtable can be empty.
+    pub(crate) fn seal_and_flush_to_level0(&self) -> Result<()> {
+        // Same flag handling as `flush_memtable_to_level0`.
+        let was_set = self.unflushed_no_wal_writes.swap(false, Ordering::AcqRel);
+        let result = self.lsm.seal_and_flush_to_level0().map_err(KVError::from);
+        if result.is_err() && was_set {
+            self.unflushed_no_wal_writes.store(true, Ordering::Release);
+        }
+        result
+    }
+
     /// Record that a no-WAL write landed in this namespace's memtable.
     pub(crate) fn note_no_wal_write(&self) {
         self.unflushed_no_wal_writes.store(true, Ordering::Release);
@@ -1895,14 +1909,16 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     // The vector index WAL retires records here, so the values they point at
     // must be on stable storage first, exactly as for the persisted event below.
     // The second fsync, before that event, then finds little or nothing to write.
-    fn on_ro_memtable_written(&self, version: u64) {
+    // A failed fsync vetoes the flush: the files are not registered and the
+    // memtable is flushed again later.
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
         for log in &self.logs {
             if let Err(e) = log.sync() {
-                error!("value-log fsync failed before memtable {version}'s L0 files were registered; nothing is retired: {e:?}");
-                return;
+                error!("value-log fsync failed before memtable {version}'s L0 files were registered; the flush is undone: {e:?}");
+                return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
             }
         }
-        self.inner.on_ro_memtable_written(version);
+        self.inner.on_ro_memtable_written(version)
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {

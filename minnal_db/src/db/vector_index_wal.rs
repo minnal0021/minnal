@@ -27,10 +27,14 @@
 //! ceiling is in `v` or an older memtable. When `v`'s L0 files are written —
 //! in version order, and **before they are registered**
 //! (`LsmFlushObserver::on_ro_memtable_written`) — the namespace's
-//! `safe_offset` advances to that ceiling. The **retired cut** is the lowest
-//! `safe_offset` over namespaces with records above theirs, capped by the
-//! global ceiling (the oldest append of any namespace not yet applied). It
-//! only moves forward; GC deletes segments wholly below it.
+//! `safe_offset` advances to that ceiling, and the change takes effect only
+//! once the marker recording it is on disk: if the marker cannot be written,
+//! the event returns an error, the LSM undoes the flush (nothing registered,
+//! the memtable kept for a retry) and nothing changes here. The **retired
+//! cut** is the lowest `safe_offset` over namespaces with records above
+//! theirs, capped by the global ceiling (the oldest append of any namespace
+//! not yet applied). It only moves forward; GC deletes segments wholly below
+//! it.
 //!
 //! # Replay is per namespace, and progress is durable before files are mergeable
 //!
@@ -52,17 +56,44 @@
 //! record's end). Without that, the first flush of any other namespace would
 //! find nobody holding the cut and move it to the tail, retiring records that
 //! exist only in replayed memtables. Records of a namespace dropped since are
-//! released by [`forget_namespace`](VectorIndexWal::forget_namespace).
+//! released by [`forget_namespace`](VectorIndexWal::forget_namespace), and a
+//! forgotten namespace is never tracked again (ids are not reused), so a late
+//! append for it cannot hold the cut.
+//!
+//! Replay applies the records with no observer attached, so no seal or flush
+//! reports them. Recovery therefore flushes the namespaces it replayed into,
+//! fsyncs their value logs, and records them as safe up to the tail
+//! ([`retire_replayed`](VectorIndexWal::retire_replayed)) **before** main-WAL
+//! recovery compacts anything. Otherwise that compaction could drop a delete's
+//! tombstone while the marker still lists the deleted key's record, and a
+//! second crash would replay it.
 //!
 //! The ceiling is per namespace, not global as in the main WAL, so that a
 //! namespace sealed while *another* namespace's write is in flight still
-//! retires everything it flushed; otherwise an idle namespace could hold the
-//! cut back with an empty memtable that no flush ever seals again.
+//! retires everything it flushed. A namespace whose memtable is empty but
+//! that still holds the cut (its last record was never applied, say) is
+//! released by the WAL GC tick, which seals even an empty memtable.
 //!
-//! **Lock order:** memtable (seal callback) → `retirement` → `active` →
-//! `in_flight`. The write path takes `active` (and `in_flight` inside it),
-//! releases both, then `retirement`, and never holds any of them while
-//! applying to a memtable.
+//! # Locks
+//!
+//! `retirement` serialises changes to the namespaces' progress and is held
+//! across the marker write. Neither the write path nor a seal takes it: a
+//! seal takes `tracking` (and `in_flight` inside it) and does no I/O, so a
+//! memtable's write lock — held during the seal callback, for every namespace
+//! of the database — never waits on this log's fsyncs. Order: `retirement` →
+//! `tracking` → `in_flight`, and `active` → `in_flight`; `active` is never
+//! held together with `tracking` or `retirement`, and none is held while a
+//! memtable is applied to.
+//!
+//! # A failed fsync stops the log
+//!
+//! After an `fsync` fails, the kernel may have dropped the dirty pages it
+//! could not write, and a later `fsync` that succeeds says nothing about
+//! them. Advancing the durable tail past them would let later batches
+//! complete over a hole, which `open` then reads as a torn tail, dropping
+//! those batches' records. So the first failure poisons the log: appends and
+//! syncs fail until the database is reopened, and the vector worker keeps its
+//! entries queued meanwhile.
 //!
 //! # Format
 //!
@@ -93,13 +124,16 @@
 //! segment syncs it first. So a frame that runs past the end, or whose CRC
 //! fails, in the **last** segment is a torn tail: [`open`](VectorIndexWal::open)
 //! truncates the file there, so stale bytes can never be read as records once
-//! new appends land behind them. The same in an **earlier** segment, a gap in
-//! the segment ids, or a bad header fails the open.
+//! new appends land behind them. The same in an **earlier** segment at or
+//! above the retired cut, a gap in the segment ids, or a bad header fails the
+//! open. Records below the cut are retired and never read again, so `open`
+//! does not read them: it walks the log from the cut (and the whole last
+//! segment, to find the tail).
 
 use crate::db::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -167,6 +201,10 @@ pub enum VectorIndexWalError {
         /// The largest framed record a segment holds.
         max: u64,
     },
+    /// An earlier fsync failed; the log refuses appends and syncs until the
+    /// database is reopened (see the module docs).
+    #[error("vector index WAL stopped after a failed fsync ({0}); reopen the database to recover")]
+    Poisoned(String),
 }
 
 /// Result type of this module.
@@ -294,6 +332,9 @@ pub struct VectorIndexWalStats {
     pub last_sequence: u64,
     /// Namespaces holding the retired cut back.
     pub holding_cut: Vec<VectorIndexWalHolder>,
+    /// Set after a failed fsync, with its error: the log refuses appends and
+    /// syncs until the database is reopened. `None` while it works.
+    pub stopped: Option<String>,
 }
 
 /// What [`VectorIndexWal::open`] found.
@@ -313,11 +354,23 @@ pub(crate) struct VectorIndexWal {
     segment_size: u32,
     /// The append lock and the active segment.
     active: Mutex<Active>,
+    /// Position of the next append. Stored under `active`, after the append's
+    /// `in_flight` registration, so a reader that sees a tail including a
+    /// record also finds it in flight (or already applied). It lets a seal
+    /// read the tail without waiting on `active`, which a rotation holds
+    /// across fsyncs.
+    tail: AtomicU64,
     /// Every byte below this position is on stable storage.
     durable_tail: AtomicU64,
+    /// Why the log stopped, once an fsync has failed (see the module docs).
+    poisoned: Mutex<Option<String>>,
     /// Appends not yet applied to a memtable: start → namespace.
     in_flight: Mutex<BTreeMap<u64, u32>>,
-    /// Seal records and per-namespace progress.
+    /// Which namespaces are tracked, their latest records and their seals.
+    /// Held briefly, never across I/O.
+    tracking: Mutex<Tracking>,
+    /// Each namespace's durable progress and the marker on disk. Held across
+    /// the marker write.
     retirement: Mutex<Retirement>,
     /// Records below this position are retired. Durable in `retired_cut`.
     retired_cut: AtomicU64,
@@ -329,15 +382,28 @@ pub(crate) struct VectorIndexWal {
     /// Test-only fault: the next `sync` fails.
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Test-only fault: the next marker write fails.
+    #[cfg(test)]
+    fail_next_marker_write: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct Tracking {
+    /// The end of each tracked namespace's latest record. A namespace is
+    /// tracked from its first append (at open: from a record at or above where
+    /// its replay starts).
+    last_write: HashMap<u32, u64>,
+    /// `(namespace, memtable version)` → the namespace's ceiling at the seal.
+    seals: BTreeMap<(u32, u64), PendingFlush>,
+    /// Dropped namespaces. Ids are never reused, so these are never tracked
+    /// again: a late append for one would otherwise hold the cut for good.
+    forgotten: HashSet<u32>,
 }
 
 #[derive(Default)]
 struct Retirement {
-    /// `(namespace, memtable version)` → the namespace's ceiling at the seal.
-    pending: BTreeMap<(u32, u64), PendingFlush>,
-    /// Namespaces that have appended, from their first append (or that have a
-    /// record above their safe offset, or an entry in the marker, at open).
-    progress: HashMap<u32, NsProgress>,
+    /// Every record of the namespace below here is in an SSTable (absent: 0).
+    safe: HashMap<u32, u64>,
     /// What the marker on disk says now.
     written: Progress,
 }
@@ -345,20 +411,6 @@ struct Retirement {
 struct PendingFlush {
     ceiling: u64,
     flushed: bool,
-}
-
-#[derive(Default, Clone, Copy)]
-struct NsProgress {
-    /// Every record of this namespace below here is in an SSTable.
-    safe_offset: u64,
-    /// The end of this namespace's latest record.
-    last_write: u64,
-}
-
-impl NsProgress {
-    fn holds_cut(&self) -> bool {
-        self.last_write > self.safe_offset
-    }
 }
 
 struct Active {
@@ -610,11 +662,13 @@ fn file_len(file: &File) -> Result<u32> {
 impl VectorIndexWal {
     /// Opens the log in `dir`, creating it if absent, and finds its tail.
     ///
-    /// Validates every segment and reads every record (for the highest seq). A
-    /// torn tail in the last segment is truncated away; any other damage fails
-    /// the open. A last segment that was sealed but has no successor (a crash
-    /// mid-rotation) gets one. The last segment is fsynced before returning, so
-    /// everything below the tail is durable.
+    /// Validates the segments at or above the retired cut and reads their
+    /// records (for the highest seq, and who holds the cut); segments wholly
+    /// below the cut are retired and only checked to exist. A torn tail in the
+    /// last segment is truncated away; any other damage fails the open. A last
+    /// segment that was sealed but has no successor (a crash mid-rotation)
+    /// gets one. The last segment is fsynced before returning, so everything
+    /// below the tail is durable.
     pub(crate) fn open(dir: &Path, segment_size: u32, metrics: Arc<Metrics>) -> Result<(Self, OpenReport)> {
         let segment_size = segment_size.max(MIN_SEGMENT_SIZE);
         if !dir.exists() {
@@ -634,11 +688,42 @@ impl VectorIndexWal {
             )));
         }
 
+        // The marker first: it says where reading starts.
+        let marker = read_progress(dir)?;
+        let oldest = ids.first().copied();
+        if let Some(p) = &marker {
+            if let Some((ns, safe)) = p.safe.iter().find(|(_, s)| *s < p.cut) {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "namespace {ns}'s safe offset {:?} is below the cut",
+                    VectorIndexWalPosition::of(*safe)
+                )));
+            }
+            if let Some(oldest) = oldest
+                && split(p.cut).0 < oldest
+            {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "the retired cut {:?} is below the oldest segment {oldest}",
+                    VectorIndexWalPosition::of(p.cut)
+                )));
+            }
+        } else if let Some(oldest) = oldest.filter(|&o| o > 0) {
+            return Err(VectorIndexWalError::Corruption(format!(
+                "the retired-cut marker is missing but segments start at {oldest}"
+            )));
+        }
+        let cut = marker.as_ref().map_or(0, |p| p.cut);
+        let (cut_id, cut_byte) = split(cut);
+
         let mut last_seq = 0u64;
         // Each namespace's last record end, to rebuild who holds the cut.
         let mut last_write: HashMap<u32, u64> = HashMap::new();
         let mut buf = Vec::new();
+        // Records below the cut are retired: their seqs are in SSTables (which
+        // raise the seq counter themselves) and they are never replayed.
         let mut note_seq = |at: u64, r: RecordRef<'_>| -> Result<()> {
+            if at < cut {
+                return Ok(());
+            }
             last_seq = last_seq.max(r.seq);
             let end = at + u64::from(FRAME_HEADER_LEN) + (BODY_FIXED_LEN + r.key.len() + r.value.len()) as u64;
             let e = last_write.entry(r.ns_id).or_insert(end);
@@ -658,7 +743,17 @@ impl VectorIndexWal {
                 return Err(VectorIndexWalError::Corruption(format!("segment {id} is shorter than its header")));
             }
             check_header(&file, id)?;
-            match walk_segment(&file, id, SEGMENT_HEADER_LEN, len, &mut buf, &mut note_seq)? {
+            let from = match id.cmp(&cut_id) {
+                std::cmp::Ordering::Less => continue, // wholly retired
+                std::cmp::Ordering::Equal => cut_byte.max(SEGMENT_HEADER_LEN),
+                std::cmp::Ordering::Greater => SEGMENT_HEADER_LEN,
+            };
+            if from >= len {
+                // A cut past a sealed segment's end: a marker naming records a
+                // power loss took (an earlier open started a new segment).
+                continue;
+            }
+            match walk_segment(&file, id, from, len, &mut buf, &mut note_seq)? {
                 WalkEnd::Sealed { .. } => {}
                 WalkEnd::Clean { .. } => {
                     return Err(VectorIndexWalError::Corruption(format!("segment {id} is not sealed but is not the last")));
@@ -671,7 +766,8 @@ impl VectorIndexWal {
             }
         }
 
-        // The last segment: the active one, possibly torn.
+        // The last segment: the active one, possibly torn. Read in full, to
+        // find the tail.
         let mut torn_bytes_dropped = 0u64;
         let (mut segment_id, mut file, mut pos) = match last {
             None => (0, create_segment(dir, 0)?, SEGMENT_HEADER_LEN),
@@ -708,15 +804,7 @@ impl VectorIndexWal {
         };
         file.sync_all()?;
 
-        let oldest = ids.first().copied().unwrap_or(segment_id);
-        let marker = read_progress(dir)?;
         if let Some(p) = &marker {
-            if let Some((ns, safe)) = p.safe.iter().find(|(_, s)| *s < p.cut) {
-                return Err(VectorIndexWalError::Corruption(format!(
-                    "namespace {ns}'s safe offset {:?} is below the cut",
-                    VectorIndexWalPosition::of(*safe)
-                )));
-            }
             let furthest = p.safe.iter().map(|(_, s)| *s).chain([p.cut]).max().unwrap_or(0);
             if split(furthest).0 > segment_id {
                 return Err(VectorIndexWalError::Corruption(format!(
@@ -743,47 +831,18 @@ impl VectorIndexWal {
             }
         }
         let tail = position(segment_id, pos);
-        let retired_cut = match marker.as_ref().map(|p| p.cut) {
-            Some(cut) if split(cut).0 < oldest => {
-                return Err(VectorIndexWalError::Corruption(format!(
-                    "the retired cut {:?} is below the oldest segment {oldest}",
-                    VectorIndexWalPosition::of(cut)
-                )));
-            }
-            Some(cut) => cut,
-            None if oldest > 0 => {
-                return Err(VectorIndexWalError::Corruption(format!(
-                    "the retired-cut marker is missing but segments start at {oldest}"
-                )));
-            }
-            None => 0,
-        };
         // Each namespace's records below its safe offset (the cut, if the
         // marker does not list it) are in SSTables; one with a record above it
         // holds the cut until a flush covers that record. Namespaces the marker
-        // lists stay tracked, so their safe offsets are written again.
+        // lists keep their safe offsets, so they are written again.
         let opened_progress = marker.unwrap_or_default();
-        let mut progress: HashMap<u32, NsProgress> = opened_progress
-            .safe
-            .iter()
-            .map(|&(ns, safe)| {
-                (
-                    ns,
-                    NsProgress {
-                        safe_offset: safe,
-                        last_write: 0,
-                    },
-                )
-            })
-            .collect();
+        let mut safe: HashMap<u32, u64> = opened_progress.safe.iter().copied().collect();
+        let mut tracked: HashMap<u32, u64> = HashMap::new();
         for (ns, end) in last_write {
-            let safe = opened_progress.replay_from(ns);
-            if end > safe {
-                let p = progress.entry(ns).or_insert(NsProgress {
-                    safe_offset: safe,
-                    last_write: 0,
-                });
-                p.last_write = end;
+            let from = opened_progress.replay_from(ns);
+            if end > from {
+                safe.entry(ns).or_insert(from);
+                tracked.insert(ns, end);
             }
         }
         let wal = Self {
@@ -795,18 +854,25 @@ impl VectorIndexWal {
                 pos,
                 last_seq,
             }),
+            tail: AtomicU64::new(tail),
             durable_tail: AtomicU64::new(tail),
+            poisoned: Mutex::new(None),
             in_flight: Mutex::new(BTreeMap::new()),
+            tracking: Mutex::new(Tracking {
+                last_write: tracked,
+                ..Tracking::default()
+            }),
             retirement: Mutex::new(Retirement {
-                pending: BTreeMap::new(),
-                progress,
+                safe,
                 written: opened_progress.clone(),
             }),
-            retired_cut: AtomicU64::new(retired_cut),
+            retired_cut: AtomicU64::new(cut),
             opened_progress,
             metrics,
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_marker_write: std::sync::atomic::AtomicBool::new(false),
         };
         Ok((
             wal,
@@ -841,6 +907,7 @@ impl VectorIndexWal {
         let frame_len = frame.len() as u32;
 
         let mut a = self.active.lock();
+        self.check_poisoned()?;
         if u64::from(a.pos) + u64::from(frame_len) + u64::from(END_MARKER_LEN) > u64::from(self.segment_size) {
             self.rotate(&mut a)?;
         }
@@ -851,18 +918,22 @@ impl VectorIndexWal {
         a.pos += frame_len;
         a.last_seq = a.last_seq.max(seq);
         let end = position(a.segment_id, a.pos);
-        // Registered under the append lock: no ceiling can see a tail that
-        // includes this record without also seeing it in flight.
+        // Registered under the append lock, and before the tail is published:
+        // no ceiling can see a tail that includes this record without also
+        // seeing it in flight.
         self.in_flight.lock().insert(start, ns_id);
+        self.tail.store(end, Ordering::Release);
         drop(a);
         let write = LoggedWrite { wal: self, start, end };
 
         // Before the caller can apply (and drop `write`), so a seal never
         // misses a namespace with a record in its memtable.
         {
-            let mut r = self.retirement.lock();
-            let p = r.progress.entry(ns_id).or_default();
-            p.last_write = p.last_write.max(end);
+            let mut t = self.tracking.lock();
+            if !t.forgotten.contains(&ns_id) {
+                let e = t.last_write.entry(ns_id).or_insert(end);
+                *e = (*e).max(end);
+            }
         }
 
         Metrics::bump(&self.metrics.vector_wal_appends);
@@ -874,23 +945,28 @@ impl VectorIndexWal {
     /// fsynced first, so only the last segment can ever hold unsynced bytes.
     fn rotate(&self, a: &mut Active) -> Result<()> {
         a.file.write_all_at(&0u32.to_le_bytes(), u64::from(a.pos))?;
-        a.file.sync_data()?;
+        if let Err(e) = a.file.sync_data() {
+            return Err(self.poison(e));
+        }
         self.durable_tail.fetch_max(position(a.segment_id, a.pos), Ordering::AcqRel);
         let next = a.segment_id + 1;
         a.file = Arc::new(create_segment(&self.dir, next)?);
         a.segment_id = next;
         a.pos = SEGMENT_HEADER_LEN;
+        self.tail.store(position(next, SEGMENT_HEADER_LEN), Ordering::Release);
         Ok(())
     }
 
     /// Makes every append that returned before this call durable.
     ///
     /// The fsync runs outside the append lock, so appends carry on meanwhile.
-    /// Does no I/O when nothing was appended since the last sync.
+    /// Does no I/O when nothing was appended since the last sync. A failure
+    /// poisons the log (see the module docs).
     pub(crate) fn sync(&self) -> Result<()> {
+        self.check_poisoned()?;
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            return Err(std::io::Error::other("injected sync failure").into());
+            return Err(self.poison(std::io::Error::other("injected sync failure")));
         }
         let (file, tail) = {
             let a = self.active.lock();
@@ -901,10 +977,27 @@ impl VectorIndexWal {
         }
         // Earlier segments were fsynced when they were sealed; the one at
         // `tail` holds every append that returned before the snapshot.
-        file.sync_data()?;
+        if let Err(e) = file.sync_data() {
+            return Err(self.poison(e));
+        }
         self.durable_tail.fetch_max(tail, Ordering::AcqRel);
         Metrics::bump(&self.metrics.vector_wal_fsyncs);
         Ok(())
+    }
+
+    /// Stops the log after a failed fsync. Returns the error to report.
+    fn poison(&self, e: std::io::Error) -> VectorIndexWalError {
+        let why = e.to_string();
+        log::error!("[vector index WAL] fsync failed; appends and syncs are refused until the database is reopened: {why}");
+        self.poisoned.lock().get_or_insert(why.clone());
+        VectorIndexWalError::Poisoned(why)
+    }
+
+    fn check_poisoned(&self) -> Result<()> {
+        match self.poisoned.lock().as_ref() {
+            Some(why) => Err(VectorIndexWalError::Poisoned(why.clone())),
+            None => Ok(()),
+        }
     }
 
     /// Reads every record from `start` (a record's position, or a segment's
@@ -961,8 +1054,7 @@ impl VectorIndexWal {
     /// Position of the next append.
     #[cfg(test)]
     pub(crate) fn tail(&self) -> u64 {
-        let a = self.active.lock();
-        position(a.segment_id, a.pos)
+        self.tail.load(Ordering::Acquire)
     }
 
     /// Every byte below this position is on stable storage.
@@ -970,26 +1062,35 @@ impl VectorIndexWal {
         self.durable_tail.load(Ordering::Acquire)
     }
 
-    /// Highest seq of any record appended or found at open (0 if none).
+    /// Highest seq of any record appended since open, or found at open at or
+    /// above the retired cut (0 if none).
     pub(crate) fn last_seq(&self) -> u64 {
         self.active.lock().last_seq
     }
 
-    /// Every segment on disk, `(segment_id, bytes)`, oldest first.
+    /// Every segment on disk, `(segment_id, bytes)`, oldest first. A segment
+    /// GC deletes while this runs is left out.
     pub(crate) fn segments(&self) -> Result<Vec<(u64, u64)>> {
-        list_segments(&self.dir)?
-            .into_iter()
-            .map(|id| Ok((id, std::fs::metadata(segment_path(&self.dir, id))?.len())))
-            .collect()
+        let mut out = Vec::new();
+        for id in list_segments(&self.dir)? {
+            match std::fs::metadata(segment_path(&self.dir, id)) {
+                Ok(m) => out.push((id, m.len())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(out)
     }
 
     // ── Retirement ──────────────────────────────────────────────────────
 
     /// The tail lowered to the oldest append not yet applied — of `ns` only,
-    /// or of any namespace when `ns` is `None`.
+    /// or of any namespace when `ns` is `None`. Reads the published tail
+    /// first, then `in_flight`: an append registers there before publishing
+    /// its tail, so a record below the tail read is either still found in
+    /// flight or already applied.
     fn ceiling(&self, ns: Option<u32>) -> u64 {
-        let a = self.active.lock();
-        let tail = position(a.segment_id, a.pos);
+        let tail = self.tail.load(Ordering::Acquire);
         let in_flight = self.in_flight.lock();
         let oldest = match ns {
             None => in_flight.keys().next().copied(),
@@ -1006,13 +1107,14 @@ impl VectorIndexWal {
 
     /// `ns` sealed memtable `version`. Called under that memtable's write
     /// lock, so no record can be applied into the next memtable meanwhile.
+    /// Takes only `tracking` and `in_flight`, never a lock held across I/O.
     pub(crate) fn on_memtable_sealed(&self, ns: u32, version: u64) {
-        let mut r = self.retirement.lock();
-        if !r.progress.contains_key(&ns) {
+        let mut t = self.tracking.lock();
+        if !t.last_write.contains_key(&ns) {
             return;
         }
         let ceiling = self.ceiling(Some(ns));
-        r.pending.entry((ns, version)).or_insert(PendingFlush { ceiling, flushed: false });
+        t.seals.entry((ns, version)).or_insert(PendingFlush { ceiling, flushed: false });
     }
 
     /// `ns`'s memtable `version` is written to L0 and fsynced, value log
@@ -1020,93 +1122,165 @@ impl VectorIndexWal {
     /// dropped a tombstone in them). Advances the namespace's `safe_offset`
     /// over its written versions in order, then writes the marker.
     ///
+    /// The change takes effect only once the marker is on disk. If it cannot
+    /// be written, nothing changes and the error vetoes the flush: the LSM
+    /// removes the files and flushes the memtable again later, under the same
+    /// version.
+    ///
     /// A version with no seal record (the seal came before the namespace's
     /// first append, or before this log observed it) retires nothing but
     /// lets later versions fold past it; a later flush covers its records.
-    pub(crate) fn on_memtable_written(&self, ns: u32, version: u64) {
+    pub(crate) fn on_memtable_written(&self, ns: u32, version: u64) -> Result<()> {
         let mut r = self.retirement.lock();
-        if !r.progress.contains_key(&ns) {
-            r.pending.remove(&(ns, version));
-            return;
-        }
-        r.pending
-            .entry((ns, version))
-            .or_insert(PendingFlush { ceiling: 0, flushed: false })
-            .flushed = true;
-        let mut safe = 0u64;
-        while let Some((&key, p)) = r.pending.range((ns, 0)..=(ns, u64::MAX)).next() {
-            if !p.flushed {
-                break;
+        // Under `retirement`, which serialises written events: nothing else
+        // changes this namespace's seals meanwhile, except new seals of later
+        // versions.
+        let (folded, ceiling, recorded) = {
+            let mut t = self.tracking.lock();
+            if !t.last_write.contains_key(&ns) {
+                t.seals.remove(&(ns, version));
+                return Ok(());
             }
-            safe = safe.max(p.ceiling);
-            r.pending.remove(&key);
+            let recorded = t.seals.contains_key(&(ns, version));
+            t.seals
+                .entry((ns, version))
+                .or_insert(PendingFlush { ceiling: 0, flushed: false })
+                .flushed = true;
+            let mut folded = Vec::new();
+            let mut ceiling = 0u64;
+            for (&key, p) in t.seals.range((ns, 0)..=(ns, u64::MAX)) {
+                if !p.flushed {
+                    break;
+                }
+                ceiling = ceiling.max(p.ceiling);
+                folded.push(key);
+            }
+            (folded, ceiling, recorded)
+        };
+        let before = r.safe.get(&ns).copied();
+        r.safe.insert(ns, before.unwrap_or(0).max(ceiling));
+        match self.persist_progress(&mut r) {
+            Ok(()) => {
+                let mut t = self.tracking.lock();
+                for key in folded {
+                    t.seals.remove(&key);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Undo, so no later marker carries this flush.
+                match before {
+                    Some(s) => r.safe.insert(ns, s),
+                    None => r.safe.remove(&ns),
+                };
+                let mut t = self.tracking.lock();
+                if recorded {
+                    if let Some(p) = t.seals.get_mut(&(ns, version)) {
+                        p.flushed = false;
+                    }
+                } else {
+                    t.seals.remove(&(ns, version));
+                }
+                Err(e)
+            }
         }
-        if let Some(p) = r.progress.get_mut(&ns) {
-            p.safe_offset = p.safe_offset.max(safe);
+    }
+
+    /// Records that every record of `namespaces` so far is in an SSTable:
+    /// recovery replayed them with no observer attached, then flushed those
+    /// namespaces to L0 and fsynced their value logs. Writes the marker before
+    /// returning; run at open, before anything can merge.
+    pub(crate) fn retire_replayed(&self, namespaces: &[u32]) -> Result<()> {
+        let mut r = self.retirement.lock();
+        // Nothing is in flight at open, so this is the tail.
+        let tail = self.ceiling(None);
+        for &ns in namespaces {
+            let s = r.safe.entry(ns).or_insert(0);
+            *s = (*s).max(tail);
         }
-        self.persist_progress(&mut r);
+        self.persist_progress(&mut r)
     }
 
     /// Stop tracking a dropped namespace: it can never flush again, and replay
-    /// skips its records.
+    /// skips its records. It is never tracked again.
     pub(crate) fn forget_namespace(&self, ns: u32) {
         let mut r = self.retirement.lock();
-        r.progress.remove(&ns);
-        r.pending.retain(|(n, _), _| *n != ns);
-        self.persist_progress(&mut r);
+        {
+            let mut t = self.tracking.lock();
+            t.forgotten.insert(ns);
+            t.last_write.remove(&ns);
+            t.seals.retain(|(n, _), _| *n != ns);
+        }
+        r.safe.remove(&ns);
+        // A failed write keeps the older marker, which only replays more (the
+        // namespace's records are skipped at replay anyway).
+        if let Err(e) = self.persist_progress(&mut r) {
+            log::error!("[vector index WAL] could not write the progress marker after dropping ns={ns}: {e}");
+        }
     }
 
-    /// Namespaces the log tracks (every one that has a record above the cut
-    /// or has appended since open).
+    /// Namespaces the log tracks (every one that has a record above where its
+    /// replay starts or has appended since open), plus those the marker lists.
     pub(crate) fn tracked_namespaces(&self) -> Vec<u32> {
-        let mut ns: Vec<u32> = self.retirement.lock().progress.keys().copied().collect();
+        let r = self.retirement.lock();
+        let t = self.tracking.lock();
+        let mut ns: Vec<u32> = t.last_write.keys().chain(r.safe.keys()).copied().collect();
         ns.sort_unstable();
+        ns.dedup();
         ns
+    }
+
+    /// Namespaces with records no flush has covered yet, with their safe
+    /// offsets.
+    fn holders(r: &Retirement, t: &Tracking) -> Vec<(u32, u64)> {
+        let mut h: Vec<(u32, u64)> = t
+            .last_write
+            .iter()
+            .filter_map(|(&ns, &last)| {
+                let safe = r.safe.get(&ns).copied().unwrap_or(0);
+                (last > safe).then_some((ns, safe))
+            })
+            .collect();
+        h.sort_unstable();
+        h
     }
 
     /// Namespaces with records no flush has covered yet.
     pub(crate) fn namespaces_holding_cut(&self) -> Vec<u32> {
         let r = self.retirement.lock();
-        let mut ns: Vec<u32> = r.progress.iter().filter(|(_, p)| p.holds_cut()).map(|(n, _)| *n).collect();
-        ns.sort_unstable();
-        ns
+        let t = self.tracking.lock();
+        Self::holders(&r, &t).into_iter().map(|(ns, _)| ns).collect()
     }
 
     /// Writes the marker when the cut or any namespace's safe offset above it
-    /// changed, then publishes the cut. The cut only moves forward.
-    ///
-    /// A failed write leaves the marker as it was: replay then starts earlier
-    /// than it could, which is safe until a merge drops a tombstone over a
-    /// record the stale marker still replays. The write is retried on the next
-    /// flush; a disk that cannot write a 100-byte file is failing anyway.
-    fn persist_progress(&self, r: &mut Retirement) {
+    /// changed, then publishes the cut. The cut only moves forward. On an
+    /// error the marker on disk and the published cut are unchanged.
+    fn persist_progress(&self, r: &mut Retirement) -> Result<()> {
+        // The ceiling before the latest writes: a record not in flight any
+        // more was added to `last_write` before it left `in_flight`.
         let ceiling = self.ceiling(None);
-        let cut = r
-            .progress
-            .values()
-            .filter(|p| p.holds_cut())
-            .map(|p| p.safe_offset)
-            .min()
-            .map_or(ceiling, |s| s.min(ceiling))
-            .max(self.retired_cut());
-        let mut safe: Vec<(u32, u64)> = r
-            .progress
-            .iter()
-            .filter(|(_, p)| p.safe_offset > cut)
-            .map(|(n, p)| (*n, p.safe_offset))
-            .collect();
+        let slowest = {
+            let t = self.tracking.lock();
+            Self::holders(r, &t).into_iter().map(|(_, safe)| safe).min()
+        };
+        let cut = slowest.map_or(ceiling, |s| s.min(ceiling)).max(self.retired_cut());
+        let mut safe: Vec<(u32, u64)> = r.safe.iter().filter(|(_, s)| **s > cut).map(|(n, s)| (*n, *s)).collect();
         safe.sort_unstable();
         let next = Progress { cut, safe };
         if next == r.written {
-            return;
+            return Ok(());
         }
-        match crate::support::write_atomic_durable(&self.dir.join(RETIRED_CUT_FILE), &progress_bytes(&next)) {
-            Ok(()) => {
-                self.retired_cut.store(next.cut, Ordering::Release);
-                r.written = next;
-            }
-            Err(e) => log::error!("[vector index WAL] could not write the progress marker: {e}"),
+        #[cfg(test)]
+        if self.fail_next_marker_write.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected marker write failure").into());
         }
+        crate::support::write_atomic_durable(&self.dir.join(RETIRED_CUT_FILE), &progress_bytes(&next)).map_err(|e| {
+            log::error!("[vector index WAL] could not write the progress marker: {e}");
+            VectorIndexWalError::Io(e)
+        })?;
+        self.retired_cut.store(next.cut, Ordering::Release);
+        r.written = next;
+        Ok(())
     }
 
     /// Hands every record that replay must apply to `f`, in log order: those
@@ -1121,10 +1295,16 @@ impl VectorIndexWal {
         self.for_each_from(progress.cut, |at, r| if at >= progress.replay_from(r.ns_id) { f(r) } else { Ok(()) })
     }
 
-    /// Test-only: make the next `sync` fail.
-    #[cfg(all(test, feature = "semantic-search"))]
+    /// Test-only: make the next `sync` fail (and so poison the log).
+    #[cfg(test)]
     pub(crate) fn fail_next_sync(&self) {
         self.fail_next_sync.store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only: make the next marker write fail.
+    #[cfg(test)]
+    pub(crate) fn fail_next_marker_write(&self) {
+        self.fail_next_marker_write.store(true, Ordering::SeqCst);
     }
 
     /// Test-only: drop every byte appended since the last `sync`, as a power
@@ -1171,16 +1351,10 @@ impl VectorIndexWal {
 
     /// The log's state, naming namespaces with `name_of`.
     pub(crate) fn stats(&self, name_of: impl Fn(u32) -> String) -> Result<VectorIndexWalStats> {
-        let holders: Vec<(u32, u64)> = {
+        let holders = {
             let r = self.retirement.lock();
-            let mut h: Vec<(u32, u64)> = r
-                .progress
-                .iter()
-                .filter(|(_, p)| p.holds_cut())
-                .map(|(n, p)| (*n, p.safe_offset))
-                .collect();
-            h.sort_unstable();
-            h
+            let t = self.tracking.lock();
+            Self::holders(&r, &t)
         };
         let (tail, last_sequence) = {
             let a = self.active.lock();
@@ -1217,6 +1391,7 @@ impl VectorIndexWal {
                     safe_offset: VectorIndexWalPosition::of(safe),
                 })
                 .collect(),
+            stopped: self.poisoned.lock().clone(),
         })
     }
 }
@@ -1617,7 +1792,7 @@ mod tests {
 
     fn seal_and_flush(wal: &VectorIndexWal, ns: u32, version: u64) {
         wal.on_memtable_sealed(ns, version);
-        wal.on_memtable_written(ns, version);
+        wal.on_memtable_written(ns, version).unwrap();
     }
 
     #[test]
@@ -1645,9 +1820,9 @@ mod tests {
         wal.on_memtable_sealed(1, 0);
         applied(&wal, 1, 1);
         wal.on_memtable_sealed(1, 1);
-        wal.on_memtable_written(1, 1);
+        wal.on_memtable_written(1, 1).unwrap();
         assert_eq!(wal.retired_cut(), 0, "version 0 is not flushed yet");
-        wal.on_memtable_written(1, 0);
+        wal.on_memtable_written(1, 0).unwrap();
         assert_eq!(wal.retired_cut(), wal.tail());
     }
 
@@ -1705,7 +1880,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
         applied(&wal, 1, 2);
-        wal.on_memtable_written(1, 0);
+        wal.on_memtable_written(1, 0).unwrap();
         assert_eq!(wal.retired_cut(), 0);
         assert_eq!(wal.namespaces_holding_cut(), vec![1]);
         seal_and_flush(&wal, 1, 1);
@@ -1927,7 +2102,7 @@ mod tests {
         let held = applied(&wal, 2, 1);
         let after = applied(&wal, 1, 1);
         wal.on_memtable_sealed(1, 0); // covers all of namespace 1's records so far
-        wal.on_memtable_written(1, 0);
+        wal.on_memtable_written(1, 0).unwrap();
         assert_eq!(wal.retired_cut(), 0, "namespace 2 holds the global cut");
         drop(wal);
 
@@ -1967,6 +2142,116 @@ mod tests {
         })
         .unwrap();
         assert_eq!(replayed, vec![b"new".to_vec()], "the new record at {:?} is replayed", fresh);
+    }
+
+    /// A marker that cannot be written changes nothing: the event fails (so
+    /// the LSM undoes the flush), the cut and the marker stay, no later marker
+    /// carries the failed flush, and the retry retires the records.
+    #[test]
+    fn a_failed_marker_write_changes_nothing_and_the_retry_retires() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let ns1 = applied(&wal, 1, 3);
+        wal.on_memtable_sealed(1, 0);
+        let marker_before = read_progress(dir.path()).unwrap();
+        wal.fail_next_marker_write();
+        assert!(wal.on_memtable_written(1, 0).is_err());
+        assert_eq!(wal.retired_cut(), 0);
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+        assert_eq!(read_progress(dir.path()).unwrap(), marker_before);
+
+        // Another namespace's flush writes a marker: it must not carry 1's.
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 2, 0);
+        assert!(wal.retired_cut() <= ns1[0].start, "1's records are not retired");
+        let marker = read_progress(dir.path()).unwrap().unwrap();
+        assert!(marker.replay_from(1) <= ns1[0].start);
+
+        // The LSM retries the same memtable version.
+        wal.on_memtable_written(1, 0).unwrap();
+        assert!(wal.namespaces_holding_cut().is_empty());
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
+    /// A dropped namespace is never tracked again: a write that raced the
+    /// drop would otherwise hold the cut until the next restart.
+    #[test]
+    fn an_append_after_a_namespace_is_forgotten_does_not_hold_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 1);
+        wal.forget_namespace(1);
+        applied(&wal, 1, 1); // a late write that raced the drop
+        assert!(wal.namespaces_holding_cut().is_empty());
+        wal.on_memtable_sealed(1, 0);
+        wal.on_memtable_written(1, 0).unwrap();
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 2, 0);
+        assert_eq!(wal.retired_cut(), wal.tail(), "nothing holds the cut");
+    }
+
+    /// After an fsync fails, the log refuses appends and syncs until it is
+    /// reopened, and the stats say why.
+    #[test]
+    fn a_failed_fsync_stops_the_log_until_it_is_reopened() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 1);
+        wal.fail_next_sync();
+        assert!(matches!(wal.sync(), Err(VectorIndexWalError::Poisoned(_))));
+        assert!(matches!(wal.append(1, b"k", b"v", 9), Err(VectorIndexWalError::Poisoned(_))));
+        assert!(
+            matches!(wal.sync(), Err(VectorIndexWalError::Poisoned(_))),
+            "a later sync must not succeed"
+        );
+        assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_some());
+        drop(wal);
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        wal.append(1, b"k", b"v", 9).unwrap();
+        wal.sync().unwrap();
+        assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_none());
+    }
+
+    /// Segments wholly below the cut are retired: open does not read them, so
+    /// damage there (they only wait for GC) does not stop the database.
+    #[test]
+    fn open_does_not_read_segments_below_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        let records = applied(&wal, 1, 8); // segments 0, 1, 2
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(split(wal.retired_cut()).0, 2);
+        let last_seq = wal.last_seq();
+        drop(wal);
+        flip(dir.path(), 0, u64::from(SEGMENT_HEADER_LEN + FRAME_HEADER_LEN + 2));
+        let (wal, report) = open_at(dir.path(), 256);
+        assert_eq!(report.tail, records.last().unwrap().end);
+        assert!(wal.namespaces_holding_cut().is_empty());
+        // Nothing at or above the cut, so no seq to report from the log.
+        assert!(report.last_seq < last_seq);
+    }
+
+    /// A seal runs under a memtable's write lock, for every namespace of the
+    /// database. It must never wait for `retirement`, which is held across
+    /// the marker's fsyncs.
+    #[test]
+    fn a_seal_never_waits_for_a_marker_write() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 1);
+        let held = wal.retirement.lock(); // as during a marker write
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wal = &wal;
+            s.spawn(move || {
+                wal.on_memtable_sealed(1, 0); // tracked
+                wal.on_memtable_sealed(7, 0); // untracked
+                tx.send(()).unwrap();
+            });
+            let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            assert!(done.is_ok(), "a seal waited for the retirement lock");
+        });
     }
 
     // ── Wired into Database ─────────────────────────────────────────────
@@ -2052,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_keeps_the_cut_behind_records_nobody_flushed() {
+    fn a_restart_keeps_records_nobody_flushed() {
         let dir = TempDir::new().unwrap();
         let (v, first) = {
             let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -2069,15 +2354,23 @@ mod tests {
         };
 
         let db = Database::open(dir.path(), create_db_config()).unwrap();
-        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![v], "999 was released at open");
+        // 999 was released at open; v's records were replayed, flushed and
+        // retired by recovery.
+        assert!(db.vector_index_wal.namespaces_holding_cut().is_empty());
+        assert!(db.vector_index_wal.retired_cut() > first);
         assert_eq!(db.metrics_snapshot().vector_wal_records_skipped, 1, "999's record is not replayed");
         assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 2);
+        // Another namespace's flush moves the cut to the tail; v's records must
+        // be on disk by then, which a second crash shows.
         let u = db.registry.read().get_id("u").unwrap();
         log_and_apply(&db, u, b"k", b"v");
         db.get_store(u).unwrap().flush_memtable_to_level0().unwrap();
-        assert!(db.vector_index_wal.retired_cut() <= first, "u's flush must not retire v's records");
-        let stats = db.vector_index_wal_stats().unwrap();
-        assert_eq!(stats.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["v"]);
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+        db.mark_crashed();
+        drop(db);
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(db.get_ns(v, b"k1").unwrap(), Some(b"x".to_vec()));
+        assert_eq!(db.get_ns(v, b"k2").unwrap(), Some(b"y".to_vec()));
     }
 
     /// The timeline from the step 3 review: a chunk key whose delete reached
@@ -2139,7 +2432,7 @@ mod tests {
     }
 
     #[test]
-    fn records_are_replayed_after_a_crash_and_retire_once_flushed() {
+    fn records_are_replayed_after_a_crash_and_retired_by_recovery() {
         let dir = TempDir::new().unwrap();
         let ns = {
             let db = reopen_db(&dir);
@@ -2155,9 +2448,8 @@ mod tests {
             assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)), "key {i} replayed");
         }
         assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 20);
-        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![ns]);
-        // The GC tick's flush retires them.
-        assert_eq!(db.flush_namespaces_pinning_vector_wal(), 1);
+        // Recovery flushed what it replayed and retired it: nothing holds the cut.
+        assert!(db.vector_index_wal.namespaces_holding_cut().is_empty());
         assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
         db.mark_crashed();
         drop(db);
@@ -2207,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_during_recovery_recovers_the_same() {
+    fn a_crash_right_after_recovery_loses_nothing() {
         let dir = TempDir::new().unwrap();
         let ns = {
             let db = reopen_db(&dir);
@@ -2218,13 +2510,99 @@ mod tests {
             db.mark_crashed();
             ns
         };
-        // Replays, then crashes before anything is flushed.
-        reopen_db(&dir).mark_crashed();
+        // Replays (recovery makes the records durable in L0), then crashes
+        // before anything else runs.
         let db = reopen_db(&dir);
         assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 5);
+        db.mark_crashed();
+        drop(db);
+        let db = reopen_db(&dir);
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 0, "retired by the first recovery");
         for i in 0..5u64 {
             assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)));
         }
+    }
+
+    /// Two crashes in a row. Recovery replays the chunk key and, from the main
+    /// WAL, its delete; main-WAL recovery then compacts into L1 (tombstone
+    /// dropped) and marks the delete persisted, and a later compaction pass
+    /// removes the obsolete L0 file. Had recovery not recorded what it
+    /// replayed, the second crash would replay the key with nothing left to
+    /// delete it.
+    #[test]
+    fn a_second_crash_does_not_bring_back_a_deleted_key() {
+        let dir = TempDir::new().unwrap();
+        let k: &[u8] = b"posting-7|doc-42";
+        let sparse = {
+            let db = reopen_db(&dir);
+            let sparse = db.create_namespace("docs_sparse_vector").unwrap();
+            log_and_apply(&db, sparse, k, b"chunk code"); // vector index WAL, synced
+            db.delete_ns(sparse, k).unwrap(); // main WAL, later seq
+            db.mark_crashed(); // neither in an SSTable
+            sparse
+        };
+        {
+            let db = reopen_db(&dir);
+            assert_eq!(db.get_ns(sparse, k).unwrap(), None);
+            // The compaction worker's pass: nothing to seal (the memtable is
+            // empty), but it removes the L0 files recovery's merge made obsolete.
+            db.get_store(sparse).unwrap().compact_lsm().unwrap();
+            db.mark_crashed();
+        }
+        let db = reopen_db(&dir);
+        assert_eq!(db.get_ns(sparse, k).unwrap(), None, "a deleted chunk key must stay deleted");
+    }
+
+    /// A namespace can hold the cut with an empty memtable (here: a logged
+    /// record whose apply failed). The GC tick's flush must still release it,
+    /// which takes a seal of the empty memtable.
+    #[test]
+    fn a_pin_flush_releases_a_holder_whose_memtable_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let db = reopen_db(&dir);
+        let ns = db.create_namespace("v").unwrap();
+        let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
+        drop(db.vector_index_wal.append(ns, b"k", b"v", seq).unwrap()); // never applied
+        db.vector_index_wal.sync().unwrap();
+        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![ns]);
+        assert_eq!(db.flush_namespaces_pinning_vector_wal(), 1);
+        assert!(db.vector_index_wal.namespaces_holding_cut().is_empty());
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+    }
+
+    /// A flush whose marker cannot be written registers no L0 file, keeps the
+    /// data readable, and is completed by the next flush; the namespace's
+    /// progress is not wedged.
+    #[test]
+    fn a_flush_whose_marker_fails_registers_nothing_and_is_retried() {
+        let dir = TempDir::new().unwrap();
+        let db = reopen_db(&dir);
+        let ns = db.create_namespace("v").unwrap();
+        log_and_apply(&db, ns, b"k1", b"x");
+        let store = db.get_store(ns).unwrap();
+        let l0_files = || -> usize {
+            let m = store.lsm.build_manifest_snapshot().unwrap();
+            m.levels
+                .iter()
+                .filter(|l| l.level == 0)
+                .flat_map(|l| &l.buckets)
+                .map(|b| b.files.len())
+                .sum()
+        };
+        db.vector_index_wal.fail_next_marker_write();
+        assert!(store.flush_memtable_to_level0().is_err());
+        assert_eq!(l0_files(), 0, "nothing registered");
+        assert_eq!(db.get_ns(ns, b"k1").unwrap(), Some(b"x".to_vec()));
+        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![ns]);
+
+        store.flush_memtable_to_level0().unwrap();
+        assert!(l0_files() > 0);
+        assert!(db.vector_index_wal.namespaces_holding_cut().is_empty());
+        // Later flushes keep retiring.
+        log_and_apply(&db, ns, b"k2", b"y");
+        store.flush_memtable_to_level0().unwrap();
+        assert!(db.vector_index_wal.namespaces_holding_cut().is_empty());
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
     }
 
     /// A sealed memtable is not on disk until its L0 files are written; its

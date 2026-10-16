@@ -46,13 +46,18 @@ struct WrittenLevel0File {
 /// 2. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
 ///    and **none is registered yet**: nothing can read or merge them, so no
 ///    merge can have dropped a tombstone they hold. The vector index WAL makes
-///    its progress durable here (`db/vector_index_wal.rs`);
+///    its progress durable here (`db/vector_index_wal.rs`). An error **vetoes
+///    the flush**: the files are removed, the memtable stays read-only and
+///    unflushed, and a later flush retries it under the same version;
 /// 3. `on_ro_memtable_flushed_to_level0` — the files are registered and the
 ///    memtable is marked flushed. The main WAL marks entries persisted here.
 pub(crate) trait LsmFlushObserver: Send + Sync {
     fn on_memtable_sealed(&self, version: u64);
-    /// The memtable's L0 files are durable but not yet registered. Default: no-op.
-    fn on_ro_memtable_written(&self, _version: u64) {}
+    /// The memtable's L0 files are durable but not yet registered. An error
+    /// keeps them from being registered. Default: no-op.
+    fn on_ro_memtable_written(&self, _version: u64) -> std::io::Result<()> {
+        Ok(())
+    }
     fn on_ro_memtable_flushed_to_level0(&self, version: u64);
 }
 
@@ -1250,9 +1255,10 @@ impl LSMTree {
         }
     }
 
-    fn notify_ro_memtable_written(&self, version: u64) {
-        if let Some(observer) = self.flush_observer.read().as_ref() {
-            observer.on_ro_memtable_written(version);
+    fn notify_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        match self.flush_observer.read().as_ref() {
+            Some(observer) => observer.on_ro_memtable_written(version),
+            None => Ok(()),
         }
     }
 
@@ -1528,7 +1534,16 @@ impl LSMTree {
             }
         }
 
-        self.notify_ro_memtable_written(ro_memtable.version());
+        if let Err(e) = self.notify_ro_memtable_written(ro_memtable.version()) {
+            // An observer could not record the flush (the vector index WAL's
+            // progress marker, or the value-log fsync before it). Registering
+            // anyway would make the files mergeable while that progress is not
+            // durable, so the flush is undone and retried later.
+            for (_, file) in &written {
+                let _ = std::fs::remove_file(&file.path);
+            }
+            return Err(LSMError::Io(e));
+        }
         for (bucket, file) in written {
             self.register_level0_file(bucket, file.path, file.created_at_ms, file.summary);
         }
@@ -1974,11 +1989,23 @@ impl LSMTree {
     /// GC path where we only need to guarantee that in-memory LSM pointer updates
     /// survive a crash before the GCJournal is deleted.
     pub(crate) fn flush_memtable_to_level0(&self) -> Result<()> {
+        self.flush_to_level0(false)
+    }
+
+    /// As [`Self::flush_memtable_to_level0`], but seals the active memtable
+    /// even when it is empty, so the observers see a seal and a flush. The
+    /// vector index WAL needs that to retire a namespace whose records are all
+    /// on disk already (or were never applied) while its memtable is empty.
+    pub(crate) fn seal_and_flush_to_level0(&self) -> Result<()> {
+        self.flush_to_level0(true)
+    }
+
+    fn flush_to_level0(&self, seal_empty: bool) -> Result<()> {
         {
             let memtable = self.memtable.read();
             let has_data = memtable.skip_list.number_of_live_nodes() > 0 || memtable.skip_list.number_of_tombstone_nodes() > 0;
             drop(memtable);
-            if has_data {
+            if has_data || seal_empty {
                 self.flush_memtable()?;
             }
         }
@@ -5944,9 +5971,10 @@ mod tests {
 
     impl LsmFlushObserver for EventLog {
         fn on_memtable_sealed(&self, _version: u64) {}
-        fn on_ro_memtable_written(&self, version: u64) {
+        fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
             let n = self.registered();
             self.events.lock().push(("written", version, n));
+            Ok(())
         }
         fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
             let n = self.registered();
@@ -6002,6 +6030,60 @@ mod tests {
                 .collect();
             assert_eq!(*log.events.lock(), want, "round {round}");
         }
+        Ok(())
+    }
+
+    /// Refuses the first `fail` written events, then accepts.
+    struct Veto {
+        fail: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LsmFlushObserver for Veto {
+        fn on_memtable_sealed(&self, _version: u64) {}
+        fn on_ro_memtable_written(&self, _version: u64) -> std::io::Result<()> {
+            let left = self.fail.load(Ordering::SeqCst);
+            if left == 0 {
+                return Ok(());
+            }
+            self.fail.store(left - 1, Ordering::SeqCst);
+            Err(std::io::Error::other("cannot record the flush"))
+        }
+        fn on_ro_memtable_flushed_to_level0(&self, _version: u64) {}
+    }
+
+    // A written event that fails must leave nothing registered and no file
+    // behind, and the memtable must stay readable and be flushed by a retry.
+    #[test]
+    fn a_failed_written_event_undoes_the_flush_and_a_retry_completes_it() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(
+            temp_dir.path(),
+            LSMConfig {
+                num_buckets: 2,
+                ..LSMConfig::default()
+            },
+        )?;
+        lsm.set_flush_observer(Some(Arc::new(Veto {
+            fail: std::sync::atomic::AtomicUsize::new(1),
+        })));
+        for i in 0..20u64 {
+            lsm.insert_with_seq(format!("k{i:02}").as_bytes(), u128::from(i), i + 1)?;
+        }
+        let registered = |lsm: &LSMTree| (0..2).map(|b| lsm.level0_entries_snapshot(b).len()).sum::<usize>();
+        let l0_files = || {
+            std::fs::read_dir(temp_dir.path().join("level0"))
+                .map(|d| d.flatten().filter(|e| e.path().is_file()).count())
+                .unwrap_or(0)
+        };
+
+        assert!(lsm.flush_memtable_to_level0().is_err(), "the vetoed flush reports its error");
+        assert_eq!(registered(&lsm), 0, "nothing registered");
+        assert_eq!(l0_files(), 0, "no L0 file left behind");
+        assert_eq!(lsm.get(b"k07")?, Some(7), "the read-only memtable still serves reads");
+
+        lsm.flush_memtable_to_level0()?;
+        assert_eq!(registered(&lsm), 2, "the retry registers one file per bucket");
+        assert_eq!(lsm.get(b"k07")?, Some(7));
         Ok(())
     }
 
