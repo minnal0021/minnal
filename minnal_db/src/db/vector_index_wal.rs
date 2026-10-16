@@ -32,6 +32,14 @@
 //! `retired_cut` before it is published, so GC never deletes past a durable
 //! cut.
 //!
+//! **After a restart** the in-memory state is gone, so `open` rebuilds it from
+//! the log: every namespace with a record at or above the durable cut starts
+//! out *holding* the cut (`safe_offset` = the cut, `last_write` = its last
+//! record's end). Without that, the first flush of any other namespace would
+//! find nobody holding the cut and move it to the tail, retiring records that
+//! exist only in replayed memtables. Records of a namespace dropped since are
+//! released by [`forget_namespace`](VectorIndexWal::forget_namespace).
+//!
 //! The ceiling is per namespace, not global as in the main WAL, so that a
 //! namespace sealed while *another* namespace's write is in flight still
 //! retires everything it flushed; otherwise an idle namespace could hold the
@@ -560,9 +568,14 @@ impl VectorIndexWal {
         }
 
         let mut last_seq = 0u64;
+        // Each namespace's last record end, to rebuild who holds the cut.
+        let mut last_write: HashMap<u32, u64> = HashMap::new();
         let mut buf = Vec::new();
-        let mut note_seq = |_: u64, r: RecordRef<'_>| -> Result<()> {
+        let mut note_seq = |at: u64, r: RecordRef<'_>| -> Result<()> {
             last_seq = last_seq.max(r.seq);
+            let end = at + u64::from(FRAME_HEADER_LEN) + (BODY_FIXED_LEN + r.key.len() + r.value.len()) as u64;
+            let e = last_write.entry(r.ns_id).or_insert(end);
+            *e = (*e).max(end);
             Ok(())
         };
 
@@ -652,6 +665,21 @@ impl VectorIndexWal {
             }
             None => 0,
         };
+        // Everything below the cut is in SSTables; a namespace with a record
+        // above it holds the cut until a flush covers that record.
+        let progress = last_write
+            .into_iter()
+            .filter(|&(_, end)| end > retired_cut)
+            .map(|(ns, end)| {
+                (
+                    ns,
+                    NsProgress {
+                        safe_offset: retired_cut,
+                        last_write: end,
+                    },
+                )
+            })
+            .collect();
         let wal = Self {
             dir: dir.to_path_buf(),
             segment_size,
@@ -663,7 +691,10 @@ impl VectorIndexWal {
             }),
             durable_tail: AtomicU64::new(tail),
             in_flight: Mutex::new(BTreeMap::new()),
-            retirement: Mutex::new(Retirement::default()),
+            retirement: Mutex::new(Retirement {
+                pending: BTreeMap::new(),
+                progress,
+            }),
             retired_cut: AtomicU64::new(retired_cut),
             metrics,
         };
@@ -902,6 +933,14 @@ impl VectorIndexWal {
         r.progress.remove(&ns);
         r.pending.retain(|(n, _), _| *n != ns);
         self.advance_cut(&r);
+    }
+
+    /// Namespaces the log tracks (every one that has a record above the cut
+    /// or has appended since open).
+    pub(crate) fn tracked_namespaces(&self) -> Vec<u32> {
+        let mut ns: Vec<u32> = self.retirement.lock().progress.keys().copied().collect();
+        ns.sort_unstable();
+        ns
     }
 
     /// Namespaces with records no flush has covered yet.
@@ -1646,6 +1685,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reopened_log_holds_the_cut_for_records_nobody_flushed() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 3, 1);
+        seal_and_flush(&wal, 3, 0);
+        let cut = wal.retired_cut();
+        let unflushed = applied(&wal, 1, 2);
+        drop(wal); // a crash: the in-memory state is gone, the records are not
+
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        // Namespace 3 has nothing above the cut, so only 1 holds it.
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+        assert_eq!(wal.tracked_namespaces(), vec![1]);
+        // Another namespace's flush must not carry the cut past 1's records.
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 2, 0);
+        assert_eq!(wal.retired_cut(), cut);
+        assert!(wal.retired_cut() <= unflushed[0].start);
+        // Only 1's own flush releases it.
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
     // ── Wired into Database ─────────────────────────────────────────────
 
     use crate::db::database::Database;
@@ -1723,5 +1786,31 @@ mod tests {
         assert!(cut > 0);
         let db = Database::open(dir.path(), create_db_config()).unwrap();
         assert_eq!(db.vector_index_wal.retired_cut(), cut);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_cut_behind_records_nobody_flushed() {
+        let dir = TempDir::new().unwrap();
+        let (v, first) = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let v = db.create_namespace("v").unwrap();
+            db.create_namespace("u").unwrap();
+            let first = db.vector_index_wal.tail();
+            log_and_apply(&db, v, b"k1", b"x");
+            log_and_apply(&db, v, b"k2", b"y");
+            // A namespace that no longer exists after the restart.
+            db.vector_index_wal.append(999, b"gone", b"z", 1).unwrap();
+            db.mark_crashed();
+            (v, first)
+        };
+
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![v], "999 was released at open");
+        let u = db.registry.read().get_id("u").unwrap();
+        log_and_apply(&db, u, b"k", b"v");
+        db.get_store(u).unwrap().flush_memtable_to_level0().unwrap();
+        assert!(db.vector_index_wal.retired_cut() <= first, "u's flush must not retire v's records");
+        let stats = db.vector_index_wal_stats().unwrap();
+        assert_eq!(stats.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["v"]);
     }
 }

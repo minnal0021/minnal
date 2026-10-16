@@ -223,6 +223,13 @@ starts:
 6. Main-WAL recovery runs as it does now. Both logs replay with original seqs
    into memtables that resolve by seq, so their relative order does not matter.
 
+Before any of this, opening the log rebuilds which namespaces hold the cut: the
+in-memory seal records and per-namespace progress are lost in a crash, so every
+namespace with a record at or above the cut starts out holding it, and
+namespaces no longer in the registry are released. Otherwise the first flush of
+any namespace would find nobody holding the cut and retire the replayed
+records while they exist only in memtables.
+
 Then the vector worker starts and finds the queue as the crash left it.
 
 ### Why replaying an old seq is safe here

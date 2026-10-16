@@ -920,7 +920,7 @@ impl Database {
 
         // The engine-wide counters, shared with the vector index WAL.
         let metrics = Arc::new(crate::db::metrics::Metrics::default());
-        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
@@ -997,8 +997,9 @@ impl Database {
     }
 
     /// Open the vector index WAL in its directory, sharing the engine-wide
-    /// counters.
-    fn open_vector_index_wal(db_path: &Path, metrics: &Arc<crate::db::metrics::Metrics>) -> Result<VectorIndexWal> {
+    /// counters. Records of namespaces no longer in the registry are released
+    /// at once: replay skips them, so they must not hold the retired cut.
+    fn open_vector_index_wal(db_path: &Path, registry: &NamespaceRegistry, metrics: &Arc<crate::db::metrics::Metrics>) -> Result<VectorIndexWal> {
         let (wal, report) = VectorIndexWal::open(
             &crate::db::layout::vector_index_wal_dir(db_path),
             crate::db::vector_index_wal::DEFAULT_SEGMENT_SIZE,
@@ -1006,6 +1007,11 @@ impl Database {
         )?;
         if report.torn_bytes_dropped > 0 {
             warn!("[STARTUP] vector index WAL: dropped a torn tail of {} bytes", report.torn_bytes_dropped);
+        }
+        for ns in wal.tracked_namespaces() {
+            if registry.get_name(ns).is_none() {
+                wal.forget_namespace(ns);
+            }
         }
         Ok(wal)
     }
@@ -3042,7 +3048,7 @@ impl Database {
 
         // The engine-wide counters, shared with the vector index WAL.
         let metrics = Arc::new(crate::db::metrics::Metrics::default());
-        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
