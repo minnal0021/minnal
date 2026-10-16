@@ -57,6 +57,18 @@ that log once: one sequential file, no memtable flush. The rule stays exactly th
 same — *an entry is completed only after its vectors are durable* — only the way
 they are made durable changes.
 
+There is **one** vector index WAL per database, shared by every vector namespace;
+each record carries its namespace id. One log because:
+
+- a completion batch can cover documents of several stores, and one log makes its
+  barrier one fsync however many namespaces the batch wrote;
+- one set of segments and one GC pass, however many stores have semantic search;
+- it mirrors the main WAL, which is also shared and namespace-tagged, so its
+  retirement rules carry over.
+
+The cost is that a namespace that writes a little and goes idle holds back the
+cut for every namespace; §5 flushes such namespaces on the GC tick.
+
 After a crash, the vector writes still in the log and not yet flushed are
 replayed into their memtables, with their original sequence numbers. A
 completed entry therefore always has its vectors, and nothing has to be
@@ -272,8 +284,7 @@ main WAL's tests untouched and passing.
    torn-tail reading. Unit tests, including corrupt and torn records.
 2. **Retirement and GC:** the observer (seal/flush, ceiling, version order), the
    cut marker, segment deletion, flushing idle namespaces, and the log's stats
-   (segments, bytes, retired cut) in the storage admin endpoints. Tests
-   mirroring the main WAL observer's.
+   (§9a) in the storage admin endpoints. Tests mirroring the main WAL observer's.
 3. **Recovery:** replay at open, seq counter raise, dropped namespaces; crash
    simulation truncating unsynced appends.
 4. **Switch the worker:** logged writes in `upsert_vectors`, `sync` in
@@ -283,6 +294,35 @@ main WAL's tests untouched and passing.
    @10–@100 must be identical), and a restart after a crash mid-ingest.
 6. **Later, separately:** partition maintenance's drain copies on the vector index WAL
    instead of their flush barrier.
+7. **minnal_ui**, after step 5: show the log where the main WAL already appears,
+   since it is system-wide. Admin → Storage gets a *Vector index WAL* card beside
+   the *WAL* card (the on-disk state of §9a, with its segment list); Admin → Ops
+   Metrics gets a *Vector index WAL* card in the engine-wide column (the counters
+   of §9a, plus appends per fsync, which is the batch size this design relies
+   on). Both cards are hidden when the server does not report them. Tested on a
+   scratch server: empty, during ingest, idle past a GC tick, after a SIGKILL
+   restart, in light and dark themes.
+
+### 9a. What the log reports
+
+On-disk state, which survives a restart: `GET /admin/storage/vector-index-wal`
+returns the segments (id and bytes, their count and total), the tail, the
+retired cut, the unretired bytes between them (what a restart would replay),
+the last seq appended, and the namespaces holding the cut back with their
+`safe_offset` (why the log is not shrinking). It is a separate endpoint because
+the main WAL's response counts entries and persisted entries, which this log
+does not have.
+
+Counters since startup, engine-wide only (as the main WAL's GC counters are; a
+per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
+
+| Counter | Counts | Step |
+|---|---|---|
+| `vector_wal_appends`, `vector_wal_bytes_appended` | records and bytes appended | 1 |
+| `vector_wal_fsyncs` | `sync` calls that fsynced | 1 |
+| `vector_wal_gc_runs`, `vector_wal_segments_deleted` | GC passes, segments deleted | 2 |
+| `vector_wal_pin_flushes` | flushes of an idle namespace holding the cut back | 2 |
+| `vector_wal_records_replayed` | records replayed at open | 3 |
 
 ## 10. Alternatives considered
 
@@ -310,5 +350,6 @@ main WAL's tests untouched and passing.
    `minnal_db/CLAUDE.md`'s WAL-ownership rule names both files.
 2. **Fsync policy:** one `sync` per completion batch; no time bound.
 3. **Segment size:** 64 MiB, as the main WAL.
-4. **Admin stats:** the vector index WAL's segments, bytes and retired cut are
-   reported from step 2, before the worker uses it.
+4. **Admin stats:** the vector index WAL's state and counters (§9a) are reported
+   from the step that creates them, before the worker uses the log, and shown in
+   minnal_ui's Storage and Ops Metrics tabs (step 7).
