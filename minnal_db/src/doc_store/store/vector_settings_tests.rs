@@ -903,4 +903,175 @@ mod with_service {
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
     }
+
+    // ── Review fixes (2026-10-17) ──
+
+    /// The partition of `namespace`, loaded as every user of it loads it.
+    async fn partition(store: &DocStore, namespace: &str) -> std::sync::Arc<crate::semantic_search::PartitionHandle> {
+        let (settings, ns_id) = load_vector_settings(&store.schema_dir, namespace).unwrap();
+        store
+            .semantic_ctx
+            .as_ref()
+            .unwrap()
+            .for_namespace(&store.db, namespace, ns_id, &settings)
+            .await
+            .unwrap()
+            .partition
+    }
+
+    /// Names of `namespace`'s companion namespaces that exist.
+    fn companions_left(store: &DocStore, namespace: &str) -> Vec<String> {
+        let prefix = format!("{namespace}_");
+        store
+            .db
+            .list_namespaces()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Dropping a vector index, or its whole store, while a maintenance
+    /// operation runs must wait for the operation and stop maintenance on that
+    /// partition. Maintenance resolves namespaces with get-or-create, so a write
+    /// it made after the drop recreated the dropped namespaces: orphans that
+    /// return at every restart, or stray postings in a re-enabled partition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_waits_for_running_maintenance_and_stops_it() {
+        for drop_store in [false, true] {
+            let (url, _seen) = spawn_service();
+            let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+            store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+            store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+            wait_for_empty_queue(&store).await;
+            let handle = partition(&store, "g").await;
+            let ops = load_vector_settings(&store.schema_dir, "g").unwrap().0.maintenance.ops();
+            let store = std::sync::Arc::new(store);
+
+            // An operation in progress: it holds the maintenance lock and writes.
+            let running = handle.lock_maintenance().await;
+            let dropping = tokio::spawn({
+                let store = std::sync::Arc::clone(&store);
+                async move {
+                    if drop_store {
+                        store.remove("g").await.unwrap();
+                    } else {
+                        store.disable_semantic_search("g").unwrap();
+                        store.drop_vector_index_data("g").await.unwrap();
+                    }
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            store
+                .db
+                .namespace(vector_kv::ivf_journal_ns("g"))
+                .await
+                .unwrap()
+                .put(b"op".to_vec(), b"record".to_vec())
+                .await
+                .unwrap();
+            drop(running);
+            dropping.await.unwrap();
+            // Maintenance on the partition it held, as a queued request would run it.
+            assert!(
+                crate::ivf_split::maintain_partition(&store.db, "g", &handle, &ops).await.is_err(),
+                "drop_store={drop_store}: maintenance went on after the drop"
+            );
+            let left = companions_left(&store, "g");
+            assert!(left.is_empty(), "drop_store={drop_store}: dropped namespaces are back: {left:?}");
+            store.shutdown_vec_index_worker().await;
+            store.shutdown().await.unwrap();
+        }
+    }
+
+    /// A document deleted while its namespace's partition is first loaded
+    /// (after the load counted the store, before it was installed) must not
+    /// leave the counts one too high: a delete's count change was dropped when
+    /// no partition was loaded, so the load's count, which saw the document,
+    /// stayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_during_the_first_load_keeps_the_counts_exact() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for id in 1..=3 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        // No worker from here: its own first load would install a partition
+        // counted after the delete and hide the foreground path under test.
+        store.shutdown_vec_index_worker().await;
+        let store = std::sync::Arc::new(store);
+        store.semantic_ctx.as_ref().unwrap().evict("g"); // the next use loads and counts
+
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
+        let loading = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { partition(&store, "g").await }
+        });
+        reached.notified().await; // counted, not yet installed
+        let deleting = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { store.delete("g", DocId::U64(2)).await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.notify_one();
+        deleting.await.unwrap();
+        let handle = loading.await.unwrap();
+
+        let truth: std::collections::HashMap<u32, (u64, u64)> = vector_kv::count_postings(&store.db, "g").await.unwrap();
+        let counted: std::collections::HashMap<u32, (u64, u64)> =
+            handle.snapshot().counts().snapshot().into_iter().filter(|(_, c)| c.0 > 0).collect();
+        assert_eq!(counted, truth, "the loaded counts differ from the store's");
+        store.shutdown().await.unwrap();
+    }
+
+    /// Every user of a partition gets it only after its journal is recovered:
+    /// a write before recovery could route to a split's children that recovery
+    /// then retires, chunks and all.
+    #[tokio::test]
+    async fn a_partition_is_handed_out_only_after_its_journal_is_recovered() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for id in 1..=5 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let handle = partition(&store, "g").await;
+        // A split cut short once it is published (the copy fails), as a crash
+        // would leave it.
+        crate::vector_kv::crash_point::arm(7);
+        let split = crate::ivf_split::split_posting(&store.db, "g", &handle, 0, &crate::ivf_split::MaintenanceOps::split_only(1)).await;
+        crate::vector_kv::crash_point::disarm();
+        assert!(split.is_err(), "set-up: the split was cut short");
+        let journal = || async {
+            store
+                .db
+                .namespace(vector_kv::ivf_journal_ns("g"))
+                .await
+                .unwrap()
+                .scan_prefix(Vec::new())
+                .await
+                .unwrap()
+                .len()
+        };
+        assert_eq!(journal().await, 1, "set-up: the split is in the journal");
+
+        // A restart: the partition is loaded again, by its next user.
+        store.semantic_ctx.as_ref().unwrap().evict("g");
+        let handle = partition(&store, "g").await;
+        assert_eq!(journal().await, 0, "the partition was handed out with its journal unfinished");
+        assert!(!handle.needs_recovery());
+        assert_eq!(
+            handle.snapshot().posting_infos()[&0].state,
+            crate::semantic_search::PostingState::Retired,
+            "the split was finished"
+        );
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
 }

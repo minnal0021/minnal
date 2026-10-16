@@ -28,9 +28,9 @@
 //! |---|---|---|---|
 //! | 1. Plan | split: recount P, 2-means; write the record | WAL | `Planned` |
 //! | 2. Prepare | split: append two centres, write P1, P2 `Active`; mark P `Draining` | WAL | `Planned` |
-//! | 3. Publish | under the routing epoch's write guard: record `Published`, then the new snapshot | WAL | `Published` |
-//! | 4. Copy | per document, under its vector lock: list each destination in its meta, write its chunks there | meta WAL, keys no-WAL | `Published` |
-//! | 5. Barrier | flush the sparse and meta namespaces | flush | `Copied` |
+//! | 3. Publish | record `Published`, then install the new snapshot and wait out every write and search that entered by the old one | WAL | `Published` |
+//! | 4. Copy | per document, under its vector lock: list each destination in its meta, write its chunks there | meta WAL, keys vector index WAL | `Published` |
+//! | 5. Barrier | one fsync of the vector index WAL | fsync | `Copied` |
 //! | 6. Delete | after an epoch barrier, per document under its lock: drop P from its meta, delete `P‖doc` | WAL | `Copied` |
 //! | 7. Retire | P `Retired`; publish; (a split) record its reassignment; delete the record | WAL | (gone) |
 //!
@@ -39,9 +39,10 @@
 //!
 //! Rules the steps depend on:
 //!
-//! 1. **Barrier before delete.** The copies are no-WAL; deletes and shrinks
-//!    are WAL-backed and durable at once. Without the flush, a crash after a
-//!    delete could lose the copy and the chunk would be gone for good.
+//! 1. **Barrier before delete.** The copies are durable only at the vector
+//!    index WAL's next fsync; deletes and shrinks are WAL-backed and durable at
+//!    once. Without the barrier, a crash after a delete could lose the copy and
+//!    the chunk would be gone for good.
 //! 2. **The meta is always a superset of the live postings.** A document's
 //!    meta (WAL-backed, as since M0-2) is the only record of which postings hold
 //!    its chunks; a destination is added to it before the copy. A source is the
@@ -58,7 +59,16 @@
 //! 5. **A source loses a chunk only if its destination holds it** (compared
 //!    code by code, counting duplicates), so a redo never deletes a chunk whose
 //!    copy did not land.
-//! 6. **Recovery comes first**: it runs before the vector worker's first pass.
+//! 6. **Recovery comes first.** Nothing uses a partition whose journal is
+//!    unfinished: a new handle needs recovery, and so does one after any
+//!    maintenance error; [`ensure_recovered`] runs it before the partition is
+//!    handed out, and every maintenance entry point before it starts
+//!    ([`prepare`]). An operation started on top of an unfinished one would
+//!    take ids the unfinished one already used.
+//! 7. **A dropped namespace is never written.** Maintenance resolves namespaces
+//!    with get-or-create, so a write after a drop brings them back; the drop
+//!    stops maintenance and waits for the operation in progress
+//!    ([`PartitionHandle::mark_dropped`]).
 //!
 //! Codes are never re-encoded: a moved code keeps its `centre_id` and only its
 //! key changes. While a chunk is in both places a search scores it twice, and
@@ -302,7 +312,13 @@ async fn delete_record(db: &AsyncDb, namespace: &str, op: u64) -> Result<(), cra
 /// Every unfinished operation in `namespace`'s journal, in `op_id` order.
 async fn records(db: &AsyncDb, namespace: &str) -> Result<Vec<(u64, Record)>, crate::KVError> {
     let mut out = Vec::new();
-    for (k, v) in db.namespace(ivf_journal_ns(namespace)).await?.scan_prefix(Vec::new()).await? {
+    let journal = ivf_journal_ns(namespace);
+    // Resolving a namespace creates it: a namespace that never maintained its
+    // partition has no journal, and reading must not make one.
+    if !db.list_namespaces().iter().any(|(name, _)| *name == journal) {
+        return Ok(out);
+    }
+    for (k, v) in db.namespace(journal).await?.scan_prefix(Vec::new()).await? {
         let op = u64::from_be_bytes(k.as_slice().try_into().map_err(|_| corrupt(namespace, "malformed journal key"))?);
         out.push((
             op,
@@ -546,17 +562,62 @@ const BATCH_DOCS: usize = 16;
 /// Run `work` on `items` in batches of [`BATCH_DOCS`], one batch at a time, in
 /// this task (never spawned, so a simulated crash in one stops every later
 /// write: the crash point is per thread and sticky). The first error ends the
-/// call. Returns each batch's result, in order.
-async fn in_batches<'a, T, R, F, Fut>(items: &'a [T], work: F) -> Result<Vec<R>, crate::KVError>
+/// call, and so does a drop of the namespace's vector index (checked before
+/// each batch, so a long operation stops soon after). Returns each batch's
+/// result, in order.
+async fn in_batches<'a, T, R, F, Fut>(namespace: &str, handle: &PartitionHandle, items: &'a [T], work: F) -> Result<Vec<R>, crate::KVError>
 where
     F: Fn(&'a [T]) -> Fut,
     Fut: std::future::Future<Output = Result<R, crate::KVError>>,
 {
     let mut out = Vec::with_capacity(items.len().div_ceil(BATCH_DOCS));
     for batch in items.chunks(BATCH_DOCS) {
+        check_live(namespace, handle)?;
         out.push(work(batch).await?);
     }
     Ok(out)
+}
+
+/// An error once `namespace`'s vector index is dropped: its maintenance must
+/// stop, since every write resolves its namespace with get-or-create and would
+/// bring the dropped namespaces back.
+fn check_live(namespace: &str, handle: &PartitionHandle) -> Result<(), crate::KVError> {
+    if handle.is_dropped() {
+        return Err(crate::KVError::Io(std::io::Error::other(format!(
+            "namespace '{namespace}': its vector index was dropped; maintenance stopped"
+        ))));
+    }
+    Ok(())
+}
+
+/// What every maintenance entry point does once it holds the maintenance lock:
+/// refuse a dropped namespace, and finish or abandon whatever the journal holds
+/// if the partition needs it (a new handle, or an earlier error). An operation
+/// must never start on top of an unfinished one: it would allocate ids from a
+/// snapshot that does not know the unfinished one's, and recovery would later
+/// retire postings the new operation made live.
+async fn prepare(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops: &MaintenanceOps) -> Result<(), crate::KVError> {
+    check_live(namespace, handle)?;
+    if handle.needs_recovery() {
+        recover_locked(db, namespace, handle, ops).await?;
+    }
+    Ok(())
+}
+
+/// Recover `namespace`'s journal if its partition needs it, before anything
+/// else uses the partition (the vector worker's writes, searches, deletes).
+/// Takes the maintenance lock only when there is something to do. Returns how
+/// many unfinished operations it found.
+pub async fn ensure_recovered(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops: &MaintenanceOps) -> Result<usize, crate::KVError> {
+    if !handle.needs_recovery() {
+        return Ok(0);
+    }
+    let _maintenance = handle.lock_maintenance().await;
+    if !handle.needs_recovery() {
+        return Ok(0);
+    }
+    check_live(namespace, handle)?;
+    recover_locked(db, namespace, handle, ops).await
 }
 
 /// One document's chunks to copy: `destination → codes`, each code already
@@ -565,7 +626,7 @@ type Moving = BTreeMap<u32, Vec<VectorIndex>>;
 
 /// Add each document's `moving` codes (`destination → codes`, each already
 /// filed under its destination) to its keys and meta: per document, the meta
-/// first (WAL), then the keys (no-WAL), each key gaining only the codes it does
+/// first (WAL), then the keys (vector index WAL), each key gaining only the codes it does
 /// not already hold. The caller holds every document's vector lock. A document
 /// with no meta is being deleted and is skipped (rule 2). Returns the count
 /// change and how many codes were newly written.
@@ -647,7 +708,10 @@ pub async fn split_posting(
     ops: &MaintenanceOps,
 ) -> Result<SplitOutcome, crate::KVError> {
     let _maintenance = handle.lock_maintenance().await;
-    split_locked(db, namespace, handle, posting, ops).await
+    prepare(db, namespace, handle, ops).await?;
+    split_locked(db, namespace, handle, posting, ops)
+        .await
+        .inspect_err(|_| handle.set_needs_recovery(true))
 }
 
 /// Split every active posting over the split limit and merge every one at or
@@ -676,8 +740,22 @@ pub async fn maintain_partition_until(
     ops: &MaintenanceOps,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<MaintenanceReport, crate::KVError> {
-    use std::sync::atomic::Ordering;
     let _maintenance = handle.lock_maintenance().await;
+    prepare(db, namespace, handle, ops).await?;
+    maintain_locked(db, namespace, handle, ops, stop)
+        .await
+        .inspect_err(|_| handle.set_needs_recovery(true))
+}
+
+async fn maintain_locked(
+    db: &AsyncDb,
+    namespace: &str,
+    handle: &PartitionHandle,
+    ops: &MaintenanceOps,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<MaintenanceReport, crate::KVError> {
+    use std::sync::atomic::Ordering;
+    let stopping = || stop.load(Ordering::Acquire) || handle.is_dropped();
     let mut report = MaintenanceReport::default();
     // A guard against splits and merges undoing each other for ever; far above
     // anything a real partition needs.
@@ -699,7 +777,7 @@ pub async fn maintain_partition_until(
         over.sort_unstable_by(|a, b| b.cmp(a)); // largest first
         let mut progressed = false;
         for (_, id) in over {
-            if stop.load(Ordering::Acquire) {
+            if stopping() {
                 return Ok(report);
             }
             if let SplitOutcome::Split { .. } = split_locked(db, namespace, handle, id, ops).await? {
@@ -718,7 +796,7 @@ pub async fn maintain_partition_until(
             .collect();
         under.sort_unstable(); // smallest first
         for (_, id) in under {
-            if stop.load(Ordering::Acquire) {
+            if stopping() {
                 return Ok(report);
             }
             if merge::merge_locked(db, namespace, handle, id, ops).await? {
@@ -834,7 +912,10 @@ async fn split_locked(
 }
 
 /// Step 3 of a drain: record `Published`, then install the snapshot with
-/// `new_centres` and `changed`, both under the routing epoch's write guard.
+/// `new_centres` and `changed` and wait out every write and search that
+/// entered by the old one ([`PartitionHandle::publish`]). Only maintenance
+/// publishes (under its lock), so the snapshot cannot change in between, and
+/// nothing is excluded while the record is written or the snapshot built.
 async fn publish_drain(
     db: &AsyncDb,
     namespace: &str,
@@ -844,10 +925,9 @@ async fn publish_drain(
     new_centres: &[(u32, Vec<f32>)],
     changed: &[Posting],
 ) -> Result<(), crate::KVError> {
-    let guard = handle.write_epoch().await;
     write_record(db, namespace, op, &record.with_state(JournalState::Published)).await?;
     let next = handle.snapshot().evolve(new_centres, changed).map_err(|e| corrupt(namespace, e))?;
-    handle.publish(&guard, next);
+    handle.publish(next).await;
     Ok(())
 }
 
@@ -881,20 +961,28 @@ async fn finish_drain(
         .ok_or_else(|| corrupt(namespace, format!("drained posting {drained} is missing")))?;
     posting.state = PostingState::Retired;
     write_posting(db, namespace, &posting).await?;
-    {
-        let guard = handle.write_epoch().await;
-        let next = handle.snapshot().evolve(&[], &[posting]).map_err(|e| corrupt(namespace, e))?;
-        handle.publish(&guard, next);
-    }
+    let next = handle.snapshot().evolve(&[], &[posting]).map_err(|e| corrupt(namespace, e))?;
+    handle.publish(next).await;
     match record.op {
         Op::Split { posting, children, .. } => {
             MaintenanceCounters::add(&handle.counters().splits, 1);
             // The reassignment is recorded before the split's record goes, so a
-            // crash between the two still reassigns.
-            let reassign = reassign::plan(&handle.snapshot(), ops, posting, children)
-                .ok_or_else(|| corrupt(namespace, format!("split of posting {posting}: its centre or a child's is missing")))?;
-            let next = op + 1;
-            write_record(db, namespace, next, &reassign).await?;
+            // crash between the two still reassigns. If that crash happened, it
+            // is recorded already: run that one, never a second.
+            let recorded = records(db, namespace)
+                .await?
+                .into_iter()
+                .find(|(_, r)| matches!(r.op, Op::Reassign { parent, .. } if parent == posting));
+            let (next, reassign) = match recorded {
+                Some(found) => found,
+                None => {
+                    let reassign = reassign::plan(&handle.snapshot(), ops, posting, children)
+                        .ok_or_else(|| corrupt(namespace, format!("split of posting {posting}: its centre or a child's is missing")))?;
+                    let next = next_op_id(db, namespace).await?;
+                    write_record(db, namespace, next, &reassign).await?;
+                    (next, reassign)
+                }
+            };
             delete_record(db, namespace, op).await?;
             reassign::run(db, namespace, handle, ops, next, reassign).await
         }
@@ -952,7 +1040,7 @@ async fn drain_copy(
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let docs: Vec<Vec<u8>> = posting_entries(db, namespace, drained).await?.into_iter().map(|(doc, _)| doc).collect();
     let sparse = &sparse;
-    let copied = in_batches(&docs, |batch| async move {
+    let copied = in_batches(namespace, handle, &docs, |batch| async move {
         let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
         // Re-read under the locks: an upsert or delete may have moved them on.
         let keys = batch.iter().map(|doc| composite_key::encode(drained, doc)).collect();
@@ -991,7 +1079,7 @@ async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, d
             .filter_map(|(key, _)| composite_key::decode(&key).map(|(_, doc)| doc.to_vec()))
             .collect();
         let (sparse, meta_ns) = (&sparse, &meta_ns);
-        in_batches(&docs, |batch| async move {
+        in_batches(namespace, handle, &docs, |batch| async move {
             let _docs = lock_docs_vectors(namespace, batch.iter().map(Vec::as_slice)).await;
             let metas = meta_ns.get_multiple(batch.to_vec()).await?;
             for (doc, meta) in batch.iter().zip(metas) {
@@ -1022,24 +1110,39 @@ async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, d
     Ok(())
 }
 
-/// Finish or abandon every operation a crash left in `namespace`'s journal.
-/// Runs before anything else writes the namespace's vectors. Returns how many
+/// Finish or abandon every operation a crash (or an error) left in
+/// `namespace`'s journal. Runs before anything else uses the partition
+/// ([`ensure_recovered`], and every maintenance entry point). Returns how many
 /// operations it found.
 pub async fn recover(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops: &MaintenanceOps) -> Result<usize, crate::KVError> {
     let _maintenance = handle.lock_maintenance().await;
-    let found = records(db, namespace).await?;
-    for (op, record) in &found {
-        // A split's record may already be gone if its reassignment, recorded
-        // after it, was found too; finishing a drain re-checks the store.
-        match (&record.op, record.state) {
-            (Op::Reassign { .. }, _) => reassign::run(db, namespace, handle, ops, *op, record.clone()).await?,
-            (Op::Rebuild { .. }, JournalState::Planned) => abandon(db, namespace, handle, *op, record).await?,
-            (Op::Rebuild { .. }, _) => rebuild::finish(db, namespace, handle, ops, *op, record.clone()).await?,
-            (_, JournalState::Planned) => abandon(db, namespace, handle, *op, record).await?,
-            (_, JournalState::Published | JournalState::Copied) => finish_drain(db, namespace, handle, ops, *op, record.clone()).await?,
+    recover_locked(db, namespace, handle, ops).await
+}
+
+/// [`recover`] for a caller holding the maintenance lock. Takes the oldest
+/// unfinished operation, finishes or abandons it (which deletes its record,
+/// and may record and finish a follow-up), and reads the journal again, until
+/// it is empty: a list read once would run a follow-up a finished operation
+/// already ran. Clears the partition's need for recovery on success.
+async fn recover_locked(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, ops: &MaintenanceOps) -> Result<usize, crate::KVError> {
+    let mut found = 0;
+    let mut last: Option<(u64, Record)> = None;
+    while let Some((op, record)) = records(db, namespace).await?.into_iter().next() {
+        if last.as_ref() == Some(&(op, record.clone())) {
+            return Err(corrupt(namespace, format!("recovery of operation {op} left its record unchanged")));
         }
+        found += 1;
+        match (&record.op, record.state) {
+            (Op::Reassign { .. }, _) => reassign::run(db, namespace, handle, ops, op, record.clone()).await?,
+            (Op::Rebuild { .. }, JournalState::Planned) => abandon(db, namespace, handle, op, &record).await?,
+            (Op::Rebuild { .. }, _) => rebuild::finish(db, namespace, handle, ops, op, record.clone()).await?,
+            (_, JournalState::Planned) => abandon(db, namespace, handle, op, &record).await?,
+            (_, JournalState::Published | JournalState::Copied) => finish_drain(db, namespace, handle, ops, op, record.clone()).await?,
+        }
+        last = Some((op, record));
     }
-    Ok(found.len())
+    handle.set_needs_recovery(false);
+    Ok(found)
 }
 
 /// A drain that never published: nothing was routed to new postings, so they
@@ -1090,9 +1193,8 @@ async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u6
         }
     }
     if !changed.is_empty() || !new_centres.is_empty() {
-        let guard = handle.write_epoch().await;
         let next = handle.snapshot().evolve(&new_centres, &changed).map_err(|e| corrupt(namespace, e))?;
-        handle.publish(&guard, next);
+        handle.publish(next).await;
     }
     delete_record(db, namespace, op).await
 }

@@ -17,9 +17,10 @@
 //! error allows (see `nearer`).
 //!
 //! The postings involved stay active, so a move copies the chunk to its
-//! destination (no-WAL, after listing the destination in the document's meta)
-//! and, after a barrier flush, shrinks the source key with a WAL-backed write.
-//! A lost no-WAL shrink would leave a duplicate and a wrong count for good. The
+//! destination (vector index WAL, after listing the destination in the
+//! document's meta) and, after a barrier (one fsync of that log), shrinks the
+//! source key with a WAL-backed write. A lost shrink would leave a duplicate
+//! and a wrong count for good. The
 //! journal record names the scope (the halves and the neighbours), and the rule
 //! is re-evaluated on a redo: under the maintenance lock nothing else changes
 //! the postings, so it decides the same way, and a source gives up a chunk only
@@ -278,7 +279,7 @@ pub(super) async fn run(
         let (selected, skipped) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
         let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
         let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
-        let counts = in_batches(&selected, |batch| async move {
+        let counts = in_batches(namespace, handle, &selected, |batch| async move {
             let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
             // Re-read under the locks: an upsert or delete may have moved them on.
             let keys = batch
@@ -328,7 +329,7 @@ pub(super) async fn run(
         None => select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?.0,
     };
     let (rule, ivf) = (&rule, &ivf);
-    in_batches(&selected, |batch| async move {
+    in_batches(namespace, handle, &selected, |batch| async move {
         let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
         shrink_sources(db, namespace, handle, ivf, rule, batch).await
     })

@@ -985,3 +985,227 @@ async fn a_search_during_a_rebuild_misses_nothing() {
     assert_eq!(report.postings_fitted, 4, "{report:?}");
     db.shutdown().await.unwrap();
 }
+
+// ── Review fixes (2026-10-17) ───────────────────────────────────────────────
+
+/// A transient error after a split's `Planned` record, then an in-process
+/// retry, then a restart. The retry must not run on top of the failed
+/// attempt's record: the failed attempt's children ids are free in memory, so
+/// the retry reused them, and recovery at the next start then "abandoned" the
+/// stale record by retiring the retry's live postings, chunks and all.
+#[tokio::test]
+async fn a_failed_split_retried_in_process_survives_a_restart() {
+    // Through both entry points: the maintenance loop and a single split.
+    for single in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let docs = 20; // 60 chunks over a limit of 40
+        let db = setup(&dir, docs).await;
+        let h = handle(&db).await;
+        let ops = settings(40);
+        let run = || async {
+            if single {
+                split_posting(&db, NS, &h, 0, &ops).await.map(|_| ())
+            } else {
+                maintain_partition(&db, NS, &h, &ops).await.map(|_| ())
+            }
+        };
+        // The record goes through, the next write (the first centre) fails.
+        crate::vector_kv::crash_point::arm(1);
+        assert!(run().await.is_err(), "the injected error");
+        crate::vector_kv::crash_point::disarm();
+        run().await.unwrap();
+        check(&db, &h, &expected(docs)).await.unwrap_or_else(|e| panic!("single={single}: {e}"));
+
+        db.shutdown().await.unwrap();
+        drop(db);
+        let db = open(&dir).await;
+        let h = handle(&db).await;
+        recover(&db, NS, &h, &ops).await.unwrap();
+        check(&db, &h, &expected(docs))
+            .await
+            .unwrap_or_else(|e| panic!("single={single}, after a restart: {e}"));
+        db.shutdown().await.unwrap();
+    }
+}
+
+/// A write that routed by the snapshot before a publish (to the posting being
+/// drained) and lands after it must still be drained: the publish waits for
+/// every write that entered the epoch before it, so the drain lists the
+/// posting's documents only once no such write is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_routed_before_a_publish_is_drained_with_the_rest() {
+    let dir = TempDir::new().unwrap();
+    let docs = 20;
+    let db = setup(&dir, docs).await;
+    let h = std::sync::Arc::new(handle(&db).await);
+    // A writer enters and routes by the current snapshot: everything to the root.
+    let entered = h.read_epoch().await;
+    let routed = h.snapshot();
+    let splitting = tokio::spawn({
+        let (db, h) = (db.clone(), std::sync::Arc::clone(&h));
+        async move { maintain_partition(&db, NS, &h, &settings(40)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // ... and only now writes.
+    let chunks = doc_chunks(docs, false);
+    let mut codes: Vec<VectorIndex> = chunks
+        .iter()
+        .map(|c| index_embedding_rotated(&*routed, c, QuantisationStyle::SingleBit).unwrap())
+        .collect();
+    codes.push(index_embedding_zero_centred(
+        &*routed,
+        &chunks[0],
+        QuantisationStyle::MultiBit { number_of_bits: 8 },
+    ));
+    let delta = upsert_vectors(&db, NS, &doc_id(docs), "text", &codes).await.unwrap();
+    routed.apply_delta(&delta);
+    drop(entered);
+    splitting.await.unwrap().unwrap();
+    check(&db, &h, &expected(docs + 1)).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
+/// A crash leaves a split `Published` (parent draining, children active and
+/// partly filled). A rebuild asked for before startup recovery has run must
+/// not lose chunks: it would drain and retire the children, and recovery would
+/// then finish the split by copying the parent's chunks into retired postings.
+#[tokio::test]
+async fn a_rebuild_before_recovery_loses_nothing() {
+    let dir = TempDir::new().unwrap();
+    let docs = 20;
+    let db = setup(&dir, docs).await;
+    let h = handle(&db).await;
+    let ops = settings(40);
+    // Planned record, two centres, two children, the parent draining, the
+    // Published record: seven writes; the eighth (the first copy) fails.
+    crate::vector_kv::crash_point::arm(7);
+    assert!(split_posting(&db, NS, &h, 0, &ops).await.is_err());
+    crate::vector_kv::crash_point::disarm();
+    let found = records(&db, NS).await.unwrap();
+    assert!(
+        matches!(
+            found.as_slice(),
+            [(
+                _,
+                Record {
+                    state: JournalState::Published,
+                    op: Op::Split { .. }
+                }
+            )]
+        ),
+        "set-up: a published split is pending: {found:?}"
+    );
+    db.crash().await;
+
+    let db = open(&dir).await;
+    let h = handle(&db).await;
+    let params = rebuild::RebuildParams {
+        postings: Some(2),
+        threads: 1,
+    };
+    rebuild::rebuild_partition(&db, NS, &h, &ops, &params).await.unwrap();
+    recover(&db, NS, &h, &ops).await.unwrap();
+    check(&db, &h, &expected(docs)).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
+/// A crash between recording a split's reassignment and deleting the split's
+/// record leaves both. Recovery must run that reassignment once.
+#[tokio::test]
+async fn recovery_runs_a_recorded_reassignment_once() {
+    let docs = 20;
+    let ops = settings(40);
+    for n in 8..400 {
+        let dir = TempDir::new().unwrap();
+        let db = setup(&dir, docs).await;
+        let h = handle(&db).await;
+        crate::vector_kv::crash_point::arm(n);
+        let result = split_posting(&db, NS, &h, 0, &ops).await;
+        crate::vector_kv::crash_point::disarm();
+        assert!(result.is_err(), "no crash point left a split and its reassignment recorded");
+        let kinds: Vec<u8> = records(&db, NS)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, r)| match r.op {
+                Op::Split { .. } => KIND_SPLIT,
+                Op::Reassign { .. } => KIND_REASSIGN,
+                _ => u8::MAX,
+            })
+            .collect();
+        if kinds != [KIND_SPLIT, KIND_REASSIGN] {
+            db.crash().await;
+            continue;
+        }
+        db.crash().await;
+        let db = open(&dir).await;
+        let h = handle(&db).await;
+        recover(&db, NS, &h, &ops).await.unwrap();
+        assert_eq!(
+            h.counters().read().reassigns,
+            1,
+            "crash after write {n}: the reassignment ran more than once"
+        );
+        check(&db, &h, &expected(docs)).await.unwrap();
+        db.shutdown().await.unwrap();
+        return;
+    }
+    panic!("no crash point left a split and its reassignment recorded");
+}
+
+/// A posting that was found unsplittable at some size and is later split
+/// (or merged away) leaves no mark behind: the marks would otherwise grow with
+/// every retired posting for the life of the process.
+#[tokio::test]
+async fn a_retired_postings_marks_are_dropped() {
+    let dir = TempDir::new().unwrap();
+    let db = setup(&dir, 20).await;
+    let h = handle(&db).await;
+    h.mark_unsplittable(0, 999);
+    h.mark_unmergeable(0, 999);
+    maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
+    assert_eq!(h.snapshot().posting_infos()[&0].state, PostingState::Retired, "set-up: the root split");
+    assert!(!h.is_unsplittable(0, 999), "a retired posting's unsplittable mark stayed");
+    assert!(!h.is_unmergeable(0, 999), "a retired posting's unmergeable mark stayed");
+    db.shutdown().await.unwrap();
+}
+
+/// A search builds Pass-1 estimators only for the centres its probed codes
+/// were encoded against, not for every centre the namespace ever had (splits
+/// and rebuilds add centres and never remove them).
+#[tokio::test]
+async fn a_search_builds_estimators_only_for_the_centres_its_codes_use() {
+    use crate::semantic_search::ProbeSettings;
+    use crate::semantic_search::service::{SemanticSearchConfig, search, test_hooks};
+    const SEARCH_NS: &str = "estimators_for_used_centres_only";
+    let dir = TempDir::new().unwrap();
+    let db = setup(&dir, 10).await; // every code in the root, against centre 0
+    let base = handle(&db).await.snapshot();
+    let unused: Vec<(u32, Vec<f32>)> = (1..=2000u32).map(|i| (i, chunk(1, 5000 + u64::from(i)))).collect();
+    let ivf = base.evolve(&unused, &[]).unwrap();
+    let config = SemanticSearchConfig {
+        embedding_dim: DIM,
+        number_of_bits_for_dense_quantisation: 8,
+        probe: ProbeSettings::fixed(4096),
+        first_pass_sparse_search_top_k: 1000,
+        top_k_results: 1000,
+        ..SemanticSearchConfig::default()
+    };
+    let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+    let q = chunk(0, 999);
+    let found = search(
+        &config,
+        SEARCH_NS,
+        &ivf,
+        std::slice::from_ref(&q),
+        &q,
+        &store,
+        None::<fn(&[u8]) -> bool>,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.len(), 10, "every document found");
+    assert_eq!(test_hooks::estimator_centres(SEARCH_NS), 1, "estimators built for unused centres");
+    db.shutdown().await.unwrap();
+}

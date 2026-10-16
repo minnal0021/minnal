@@ -85,11 +85,11 @@ impl DocStore {
             namespace: namespace.to_owned(),
         })?;
         let schema_path = self.schema_path(namespace);
-        cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path).await?;
-        #[cfg(feature = "semantic-search")]
-        if let Some(ctx) = &self.semantic_ctx {
-            ctx.evict(namespace);
-        }
+        self.without_partition_maintenance(
+            namespace,
+            cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path),
+        )
+        .await?;
         info!("namespace '{}' dropped", namespace);
         Ok(())
     }
@@ -151,11 +151,11 @@ impl DocStore {
             namespace: namespace.to_owned(),
         })?;
         let schema_path = self.schema_path(namespace);
-        cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path).await?;
-        #[cfg(feature = "semantic-search")]
-        if let Some(ctx) = &self.semantic_ctx {
-            ctx.evict(namespace);
-        }
+        self.without_partition_maintenance(
+            namespace,
+            cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path),
+        )
+        .await?;
         info!("KV namespace '{}' dropped", namespace);
         Ok(())
     }
@@ -439,6 +439,34 @@ impl DocStore {
     /// [`disable_semantic_search`]: DocStore::disable_semantic_search
     #[cfg(feature = "semantic-search")]
     pub async fn drop_vector_index_data(&self, namespace: &str) -> Result<(), DocStoreError> {
+        self.without_partition_maintenance(namespace, self.drop_vector_index_data_now(namespace))
+            .await
+    }
+
+    /// Run `drop`, which removes `namespace`'s vector namespaces, with its
+    /// partition's maintenance stopped and finished first and no partition of
+    /// it handed out meanwhile ([`SemanticSearchContext::begin_drop`]): a
+    /// maintenance write after the removal would recreate what was removed.
+    pub(super) async fn without_partition_maintenance<T>(
+        &self,
+        namespace: &str,
+        drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
+    ) -> Result<T, DocStoreError> {
+        #[cfg(feature = "semantic-search")]
+        if let Some(ctx) = &self.semantic_ctx {
+            ctx.begin_drop(namespace).await;
+            let result = drop.await;
+            ctx.evict(namespace);
+            ctx.end_drop(namespace);
+            return result;
+        }
+        #[cfg(not(feature = "semantic-search"))]
+        let _ = namespace; // no partitions without semantic search
+        drop.await
+    }
+
+    #[cfg(feature = "semantic-search")]
+    async fn drop_vector_index_data_now(&self, namespace: &str) -> Result<(), DocStoreError> {
         info!("drop_vector_index_data: clearing embedding queue for namespace='{namespace}'");
         self.delete_all_queue_entries(namespace).await?;
 

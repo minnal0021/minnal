@@ -216,13 +216,20 @@ impl ClusterIndex {
     /// order — arbitrary but irrelevant, since every row carries its own id in
     /// `centroid_ids` and results are ranked by distance.
     fn from_parts(clusters: HashMap<u32, Cluster>, dim: usize, seed: u64) -> Self {
+        Self::from_parts_with(clusters, dim, Some(seed))
+    }
+
+    /// [`from_parts`](Self::from_parts), unrotated when `seed` is `None`: for
+    /// indexes only ever searched in the original space (a partition's routing
+    /// and probing centroids), where rotating every centroid is wasted work.
+    fn from_parts_with(clusters: HashMap<u32, Cluster>, dim: usize, seed: Option<u64>) -> Self {
         let mut centroids = Vec::with_capacity(clusters.len() * dim);
         let mut centroid_ids = Vec::with_capacity(clusters.len());
         for cluster in clusters.values() {
             centroids.extend_from_slice(&cluster.centroid);
             centroid_ids.push(cluster.cluster_id);
         }
-        let rotation = (dim >= 8 && dim.is_multiple_of(2)).then(|| {
+        let rotation = seed.filter(|_| dim >= 8 && dim.is_multiple_of(2)).map(|seed| {
             let rotator = FhtKacRotator::new(dim, seed);
             let centroids = clusters
                 .values()
@@ -285,6 +292,14 @@ impl ClusterIndex {
     /// concern; in-memory callers are trusted to pass uniform centroids.
     pub fn from_clusters(clusters: HashMap<u32, Cluster>) -> Self {
         Self::from_clusters_with_seed(clusters, DEFAULT_ROTATION_SEED)
+    }
+
+    /// An index searched only in the original space: no rotation is built, so
+    /// [`rotate`](Self::rotate) is the identity and
+    /// [`rotated_centroid`](Self::rotated_centroid) the centroid itself.
+    pub(crate) fn from_clusters_unrotated(clusters: HashMap<u32, Cluster>) -> Self {
+        let dim = clusters.values().next().map(|c| c.centroid.len()).unwrap_or(0);
+        Self::from_parts_with(clusters, dim, None)
     }
 
     /// Like [`from_clusters`](Self::from_clusters), with the rotation drawn from

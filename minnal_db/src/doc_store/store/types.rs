@@ -294,6 +294,9 @@ pub struct SemanticSearchContext {
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
     ivfs: parking_lot::RwLock<std::collections::HashMap<(String, u32), Arc<PartitionHandle>>>,
+    /// Namespaces whose vector index is being dropped: no partition of theirs
+    /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
+    dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// What one namespace's semantic operations run with: the per-call config built
@@ -327,6 +330,7 @@ impl SemanticSearchContext {
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -431,6 +435,39 @@ impl SemanticSearchContext {
         self.ivfs.write().retain(|(name, _), _| name != namespace);
     }
 
+    /// Start dropping `namespace`'s vector index: refuse to load or hand out
+    /// its partition from now on, stop maintenance on every loaded one, and
+    /// wait for any maintenance operation in progress to finish. Only then may
+    /// the caller remove the namespaces: maintenance writes resolve them with
+    /// get-or-create and would bring them back. Call
+    /// [`end_drop`](Self::end_drop) once they are gone.
+    pub async fn begin_drop(&self, namespace: &str) {
+        self.dropping.lock().insert(namespace.to_owned());
+        let loaded: Vec<Arc<PartitionHandle>> = {
+            let mut ivfs = self.ivfs.write();
+            let mut out = Vec::new();
+            ivfs.retain(|(name, _), p| {
+                if name == namespace {
+                    out.push(Arc::clone(p));
+                    false
+                } else {
+                    true
+                }
+            });
+            out
+        };
+        for partition in loaded {
+            partition.mark_dropped();
+            drop(partition.lock_maintenance().await);
+        }
+    }
+
+    /// The drop [`begin_drop`](Self::begin_drop) started is done; the name may
+    /// hold a vector index again.
+    pub fn end_drop(&self, namespace: &str) {
+        self.dropping.lock().remove(namespace);
+    }
+
     /// Apply one document's [`PostingDelta`] to `namespace`'s entry counts, if
     /// its partition is loaded. When it is not, there is nothing to update: the
     /// load counts from the store.
@@ -484,6 +521,11 @@ impl SemanticSearchContext {
         ns_id: u32,
         settings: &VectorIndexSettings,
     ) -> Result<NamespaceSemantics, DocStoreError> {
+        if self.dropping.lock().contains(namespace) {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
         let key = (namespace.to_owned(), ns_id);
         let cached = self.ivfs.read().get(&key).cloned();
         let partition = match cached {
@@ -495,6 +537,8 @@ impl SemanticSearchContext {
                         .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
                             namespace: namespace.to_owned(),
                         })?;
+                #[cfg(test)]
+                load_pause::point(namespace).await;
                 // Two first uses can race to load; keep whichever landed first,
                 // so every count update goes to the one partition in use. Nothing
                 // writes this namespace's vectors before its partition is loaded
@@ -506,6 +550,14 @@ impl SemanticSearchContext {
             u64::from(settings.maintenance.split_limit()),
             u64::from(settings.maintenance.merge_limit()),
         );
+        // Nothing uses a partition whose journal is unfinished: a write could
+        // route to postings recovery then retires, and maintenance would start
+        // on top of the unfinished operation. A recovery failure is returned,
+        // so writes wait (their queue entries stay) rather than go ahead.
+        let found = crate::ivf_split::ensure_recovered(db, namespace, &partition, &settings.maintenance.ops()).await?;
+        if found > 0 {
+            log::info!("partition recovery: namespace='{namespace}' finished {found} interrupted operation(s)");
+        }
         let ivf = partition.snapshot();
         if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
             return Err(DocStoreError::EmbeddingDimMismatch {
@@ -682,5 +734,33 @@ mod tests {
         assert!(DocId::from_bytes(&[b'x'; crate::doc_store::key::MAX_STR_KEY_LEN + 1], KeyType::Str).is_err());
         assert!(DocId::from_bytes(&[], KeyType::Str).is_err());
         assert!(DocId::from_bytes(&[0xff, 0xfe], KeyType::Str).is_err());
+    }
+}
+
+/// Test-only: stop one partition load of a namespace after it has counted the
+/// store and before it is installed, so a test can act in between.
+#[cfg(all(test, feature = "semantic-search"))]
+pub(crate) mod load_pause {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Pause>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Pause the next load of `namespace`: returns `(reached, release)`.
+    pub(crate) fn arm(namespace: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PAUSES.lock().insert(namespace.to_owned(), pause.clone());
+        pause
+    }
+
+    pub(crate) async fn point(namespace: &str) {
+        let pause = PAUSES.lock().remove(namespace);
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
     }
 }

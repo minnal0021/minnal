@@ -128,27 +128,23 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::p
 }
 
 /// Finish or abandon every operation a crash left unfinished, in every
-/// namespace, then ask for maintenance of every namespace with a partition (a
-/// crash may have left postings to split or merge). Returns how many unfinished
-/// operations were found.
-pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path) -> usize {
+/// namespace with a journal, then ask for maintenance of every namespace with
+/// a partition (a crash may have left postings to split or merge). Loading a
+/// partition recovers its journal ([`SemanticSearchContext::for_namespace`]),
+/// so this only does it early; a namespace whose recovery fails here is tried
+/// again by its next user, and nothing uses it before that succeeds.
+pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path) {
     let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
-    let mut found = 0;
     for name in &names {
         let Some(namespace) = name.strip_suffix("_ivf_journal") else { continue };
         let result = async {
             let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
-            let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-            Ok::<usize, crate::doc_store::error::DocStoreError>(ivf_split::recover(db, namespace, &ns.partition, &settings.maintenance.ops()).await?)
+            ctx.for_namespace(db, namespace, ns_id, &settings).await?;
+            Ok::<(), crate::doc_store::error::DocStoreError>(())
         }
         .await;
-        match result {
-            Ok(0) => {}
-            Ok(n) => {
-                info!("partition recovery: namespace='{namespace}' finished {n} interrupted operation(s)");
-                found += n;
-            }
-            Err(e) => warn!("partition recovery: namespace='{namespace}' failed: {e}"),
+        if let Err(e) = result {
+            warn!("partition recovery: namespace='{namespace}' failed: {e}; retried by its next use");
         }
     }
     for name in &names {
@@ -158,5 +154,4 @@ pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schem
             ctx.request_maintenance(namespace);
         }
     }
-    found
 }

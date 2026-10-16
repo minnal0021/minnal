@@ -439,23 +439,29 @@ where
     // One estimator per (centre, query vector): query_to_centroid_dot_product and
     // scaled_query_sum are constant across every code encoded against that centre.
     // Codes are decoded through their own `centre_id`, never the posting they sit
-    // in (a posting can hold codes encoded against an older centre), so the table
-    // covers every centre: one dot product each, microseconds for hundreds. A code
-    // naming a centre the layout does not have is skipped (and counted).
+    // in (a posting can hold codes encoded against an older centre). A namespace
+    // keeps every centre it ever had (splits and rebuilds add them; codes keep
+    // theirs), so the table is filled lazily: a centre's estimators are built by
+    // the first scoring thread that meets one of its codes, and a search pays
+    // only for the centres its probed codes use. A code naming a centre the
+    // layout does not have is skipped (and counted).
     let query_sums: Vec<f32> = rotated_sparse.iter().map(|q| SingleBitQuanDotProductEstimator::query_sum(q)).collect();
-    let centre_estimators: HashMap<u32, Vec<SingleBitQuanDotProductEstimator>> = layout
-        .centre_ids()
-        .into_iter()
-        .filter_map(|centre_id| {
-            let centre = layout.centre(centre_id)?;
-            let estimators = query_sparse_embeddings
-                .iter()
-                .zip(&query_sums)
-                .map(|(q, &sum)| SingleBitQuanDotProductEstimator::with_query_sum(centre_id, q, centre, sum))
-                .collect();
-            Some((centre_id, estimators))
-        })
-        .collect();
+    let centre_estimators = CentreEstimators::new(layout);
+    let estimators_of = |centre_id: u32| -> Option<&[SingleBitQuanDotProductEstimator]> {
+        centre_estimators
+            .cell(centre_id)?
+            .get_or_init(|| {
+                let centre = layout.centre(centre_id)?;
+                Some(
+                    query_sparse_embeddings
+                        .iter()
+                        .zip(&query_sums)
+                        .map(|(q, &sum)| SingleBitQuanDotProductEstimator::with_query_sum(centre_id, q, centre, sum))
+                        .collect(),
+                )
+            })
+            .as_deref()
+    };
 
     // Flatten every probed entry into one list so rayon splits the *entries*, not the
     // clusters: IVF clusters are heavily skewed (one cluster can hold a third of a
@@ -524,7 +530,7 @@ where
                 let estimators = match last {
                     Some((id, estimators)) if id == centre_id => estimators,
                     _ => {
-                        let estimators = centre_estimators.get(&centre_id).map(Vec::as_slice);
+                        let estimators = estimators_of(centre_id);
                         last = Some((centre_id, estimators));
                         estimators
                     }
@@ -545,6 +551,9 @@ where
             }
             *kept = scored_any;
         });
+
+    #[cfg(test)]
+    test_hooks::note_estimator_centres(namespace, centre_estimators.built());
 
     // Group entries by document (a document's chunks can sit in several probed
     // clusters) by sorting entry indices on doc_id, then fold each group's rows
@@ -2759,5 +2768,63 @@ mod tests {
         for result in all {
             assert_eq!(result, expected);
         }
+    }
+}
+
+/// Pass-1 estimators per centre for one search, built on first use (see
+/// [`search`]). Indexed by centre id when the ids are dense enough, so a lookup
+/// is an index and creating the table costs one empty slot per id, not one
+/// estimator per centre.
+enum CentreEstimators {
+    Dense(Vec<std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>>),
+    Sparse(HashMap<u32, std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>>),
+}
+
+impl CentreEstimators {
+    /// Ids above this are kept in a map rather than a table indexed by id.
+    const DENSE_LIMIT: u32 = 1 << 22;
+
+    fn new<L: IvfLayout + ?Sized>(layout: &L) -> Self {
+        match layout.max_centre_id() {
+            Some(max) if max < Self::DENSE_LIMIT => Self::Dense((0..=max).map(|_| std::sync::OnceLock::new()).collect()),
+            Some(_) => Self::Sparse(layout.centre_ids().into_iter().map(|id| (id, std::sync::OnceLock::new())).collect()),
+            None => Self::Dense(Vec::new()),
+        }
+    }
+
+    fn cell(&self, centre_id: u32) -> Option<&std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>> {
+        match self {
+            Self::Dense(cells) => cells.get(centre_id as usize),
+            Self::Sparse(cells) => cells.get(&centre_id),
+        }
+    }
+
+    /// How many centres' estimators were built.
+    #[cfg(test)]
+    fn built(&self) -> usize {
+        let built = |c: &std::sync::OnceLock<Option<Vec<_>>>| c.get().is_some_and(Option::is_some);
+        match self {
+            Self::Dense(cells) => cells.iter().filter(|c| built(c)).count(),
+            Self::Sparse(cells) => cells.values().filter(|c| built(c)).count(),
+        }
+    }
+}
+
+/// Test-only instrumentation of [`search`].
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+
+    static ESTIMATOR_CENTRES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Record that a search of `namespace` built estimators for `n` centres.
+    pub(crate) fn note_estimator_centres(namespace: &str, n: usize) {
+        *ESTIMATOR_CENTRES.lock().entry(namespace.to_owned()).or_default() += n;
+    }
+
+    /// Centres whose estimators searches of `namespace` built so far.
+    pub(crate) fn estimator_centres(namespace: &str) -> usize {
+        ESTIMATOR_CENTRES.lock().get(namespace).copied().unwrap_or(0)
     }
 }

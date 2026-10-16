@@ -395,23 +395,24 @@ impl SparseMeta {
     }
 }
 
-/// `text_hash (8B) ‖ n (2B) ‖ n × (posting_id (4B) ‖ chunks (2B))`, all big-endian.
+/// `text_hash (8B) ‖ n (2B) ‖ n × (posting_id (4B) ‖ chunks (4B))`, all big-endian.
 /// The chunk counts make every posting's size exact (deletes have only the meta
-/// to go by), which the split trigger needs.
+/// to go by), which the split trigger needs. Four bytes, so a document with
+/// more than 65,535 chunks in one posting is counted exactly.
 pub(crate) fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + postings.len() * 6);
+    let mut out = Vec::with_capacity(10 + postings.len() * 8);
     out.extend_from_slice(&text_hash.to_be_bytes());
     out.extend_from_slice(&(postings.len() as u16).to_be_bytes());
     for &(id, chunks) in postings {
         out.extend_from_slice(&id.to_be_bytes());
-        out.extend_from_slice(&(chunks.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+        out.extend_from_slice(&chunks.to_be_bytes());
     }
     out
 }
 
-/// Decodes the current form, and the form written before chunk counts were
-/// recorded (`n × posting_id (4B)`; its counts read as 0). The two cannot be
-/// confused: `n` fixes the length of each.
+/// Decodes the current form and two earlier ones: two-byte chunk counts, and
+/// no counts at all (`n × posting_id (4B)`; its counts read as 0). They cannot
+/// be confused: `n` fixes the length of each.
 pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
     if bytes.len() < 10 {
         return None;
@@ -419,6 +420,7 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
     let text_hash = u64::from_be_bytes(bytes[..8].try_into().ok()?);
     let count = u16::from_be_bytes(bytes[8..10].try_into().ok()?) as usize;
     let width = match bytes.len() - 10 {
+        l if l == count * 8 => 8,
         l if l == count * 6 => 6,
         l if l == count * 4 => 4,
         _ => return None,
@@ -427,10 +429,10 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
     for i in 0..count {
         let off = 10 + i * width;
         let id = u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
-        let chunks = if width == 6 {
-            u32::from(u16::from_be_bytes(bytes[off + 4..off + 6].try_into().ok()?))
-        } else {
-            0
+        let chunks = match width {
+            8 => u32::from_be_bytes(bytes[off + 4..off + 8].try_into().ok()?),
+            6 => u32::from(u16::from_be_bytes(bytes[off + 4..off + 6].try_into().ok()?)),
+            _ => 0,
         };
         postings.push((id, chunks));
     }
@@ -1558,6 +1560,20 @@ pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<Hash
 mod ivf_store_tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A document can hold more than 65,535 chunks in one posting; its count
+    /// must come back exact, not saturated (the counts drive splits and merges).
+    #[test]
+    fn a_meta_keeps_chunk_counts_above_u16() {
+        let m = decode_sparse_meta(&encode_sparse_meta(7, &[(3, 70_000), (9, 2)])).unwrap();
+        assert_eq!(m.postings, vec![(3, 70_000), (9, 2)]);
+        // The narrower forms still decode.
+        let mut six = 7u64.to_be_bytes().to_vec();
+        six.extend_from_slice(&1u16.to_be_bytes());
+        six.extend_from_slice(&3u32.to_be_bytes());
+        six.extend_from_slice(&5u16.to_be_bytes());
+        assert_eq!(decode_sparse_meta(&six).unwrap().postings, vec![(3, 5)]);
+    }
 
     fn centroids() -> HashMap<u32, Vec<f32>> {
         (1..=4u32)

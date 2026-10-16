@@ -233,6 +233,12 @@ impl DocStore {
     /// flight, so the queue entry and the vectors are removed directly.
     #[cfg(feature = "semantic-search")]
     pub(super) async fn clear_doc_vectors(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
+        // The partition first, so the count change below always reaches it. A
+        // change made while no partition was loaded was dropped, which is right
+        // only if the next load counts after the delete; a load already
+        // counting (and not yet installed) would keep the deleted document for
+        // good. Loading here installs it before the delete.
+        let partition = self.loaded_partition(namespace).await;
         let delta = match &self.notify {
             Some(notify) => {
                 let delta = vector_kv::clear_vectors(&self.db, namespace, key).await?;
@@ -245,9 +251,26 @@ impl DocStore {
             }
         };
         if let Some(ctx) = &self.semantic_ctx {
-            ctx.apply_posting_delta(namespace, &delta);
+            match partition {
+                Some(p) => {
+                    p.snapshot().apply_delta(&delta);
+                    if p.needs_maintenance(&delta) {
+                        ctx.request_maintenance(namespace);
+                    }
+                }
+                None => ctx.apply_posting_delta(namespace, &delta),
+            }
         }
         Ok(())
+    }
+
+    /// `namespace`'s partition, loading it if needed; `None` when the namespace
+    /// has none to load (no semantic search, or it is being dropped).
+    #[cfg(feature = "semantic-search")]
+    async fn loaded_partition(&self, namespace: &str) -> Option<Arc<crate::semantic_search::PartitionHandle>> {
+        let ctx = self.semantic_ctx.as_ref()?;
+        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace).ok()?;
+        ctx.for_namespace(&self.db, namespace, ns_id, &settings).await.ok().map(|ns| ns.partition)
     }
 
     /// For an upsert whose embedding text is empty: clear the document's vectors

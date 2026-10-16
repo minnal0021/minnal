@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Cluster, ClusterIndex, find_closest_cluster_id};
+use crate::semantic_search::quantisation::rotation::FhtKacRotator;
 
 /// The centre whole-document (Pass-2) codes are encoded against: the origin.
 /// Reserved: no stored centre may use this id. A zero centre makes Pass 2
@@ -46,6 +47,11 @@ pub trait IvfLayout: Sync {
     fn rotated_centre(&self, centre_id: u32) -> Option<&[f32]>;
     /// Every centre id.
     fn centre_ids(&self) -> Vec<u32>;
+    /// The largest centre id (`None` without centres). Lets a search size a
+    /// table by id without listing every centre.
+    fn max_centre_id(&self) -> Option<u32> {
+        self.centre_ids().into_iter().max()
+    }
     /// How many entries `posting` holds, when the layout knows. Probing by entry
     /// budget ([`select_probes`]) counts an unknown size as 0.
     fn posting_entries(&self, _posting: u32) -> Option<u64> {
@@ -104,6 +110,9 @@ impl<T: IvfLayout + Send + ?Sized> IvfLayout for std::sync::Arc<T> {
     }
     fn centre_ids(&self) -> Vec<u32> {
         (**self).centre_ids()
+    }
+    fn max_centre_id(&self) -> Option<u32> {
+        (**self).max_centre_id()
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         (**self).posting_entries(posting)
@@ -198,6 +207,9 @@ impl<L: IvfLayout> IvfLayout for WithEntryCounts<L> {
     }
     fn centre_ids(&self) -> Vec<u32> {
         self.layout.centre_ids()
+    }
+    fn max_centre_id(&self) -> Option<u32> {
+        self.layout.max_centre_id()
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         self.entries.get(&posting).copied()
@@ -413,6 +425,88 @@ pub struct PostingInfo {
     pub origin: PostingOrigin,
 }
 
+/// One centre, in the original space and rotated.
+#[derive(Debug)]
+struct Centre {
+    original: Vec<f32>,
+    rotated: Vec<f32>,
+}
+
+/// A namespace's centres, each rotated once. Centres are append-only and never
+/// change, so the next snapshot shares every existing one (an `Arc` per centre)
+/// and rotates only the new: building a snapshot does not grow with the
+/// centres a namespace has accumulated (splits and rebuilds add them, nothing
+/// removes them, since codes keep their centre).
+#[derive(Debug, Clone)]
+struct CentreSet {
+    dim: usize,
+    rotator: Option<Arc<FhtKacRotator>>,
+    map: HashMap<u32, Arc<Centre>>,
+    max_id: Option<u32>,
+}
+
+impl CentreSet {
+    fn new(centres: HashMap<u32, Vec<f32>>, seed: u64) -> Self {
+        let dim = centres.values().next().map(Vec::len).unwrap_or(0);
+        let rotator = (dim >= 8 && dim.is_multiple_of(2)).then(|| Arc::new(FhtKacRotator::new(dim, seed)));
+        let mut set = Self {
+            dim,
+            rotator,
+            map: HashMap::with_capacity(centres.len()),
+            max_id: None,
+        };
+        for (id, c) in centres {
+            set.insert(id, c);
+        }
+        set
+    }
+
+    fn insert(&mut self, id: u32, original: Vec<f32>) {
+        let rotated = self.rotate(&original);
+        self.map.insert(id, Arc::new(Centre { original, rotated }));
+        self.max_id = Some(self.max_id.map_or(id, |m| m.max(id)));
+    }
+
+    /// These centres and `new` ones, which must be new ids of this dimension.
+    fn with_added(&self, new: &[(u32, Vec<f32>)]) -> Result<Self, String> {
+        let mut next = self.clone();
+        for (id, c) in new {
+            if next.map.contains_key(id) {
+                return Err(format!("centre {id} already exists; centres are append-only"));
+            }
+            if c.len() != self.dim {
+                return Err(format!("centre {id} has {} dimensions, expected {}", c.len(), self.dim));
+            }
+            next.insert(*id, c.clone());
+        }
+        Ok(next)
+    }
+
+    fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut out = v.to_vec();
+        if let Some(r) = &self.rotator {
+            r.rotate_inplace(&mut out);
+        }
+        out
+    }
+
+    fn unrotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut out = v.to_vec();
+        if let Some(r) = &self.rotator {
+            r.unrotate_inplace(&mut out);
+        }
+        out
+    }
+
+    fn original(&self, id: u32) -> Option<&[f32]> {
+        self.map.get(&id).map(|c| c.original.as_slice())
+    }
+
+    fn rotated(&self, id: u32) -> Option<&[f32]> {
+        self.map.get(&id).map(|c| c.rotated.as_slice())
+    }
+}
+
 /// A namespace's own partition at one moment: its postings, its centres, and its
 /// rotation. Immutable; a split publishes a new one through the namespace's
 /// [`PartitionHandle`]. Counts live in the shared [`CountTable`].
@@ -428,7 +522,7 @@ pub struct NamespaceIvf {
     /// next snapshot).
     centroids: HashMap<u32, Vec<f32>>,
     /// Centres keyed by centre id, rotated with the namespace's seed.
-    centres: ClusterIndex,
+    centres: CentreSet,
     /// Sizes, shared with every other snapshot of this namespace.
     counts: Arc<CountTable>,
     /// The namespace's rotation seed.
@@ -445,21 +539,26 @@ impl NamespaceIvf {
 
     /// [`new`](Self::new) sharing `counts`.
     pub fn with_counts(postings: Vec<Posting>, centres: HashMap<u32, Vec<f32>>, seed: u64, counts: Arc<CountTable>) -> Result<Self, String> {
-        if postings.is_empty() || centres.is_empty() {
-            return Err("a namespace index needs at least one posting and one centre".into());
-        }
         let dim = centres.values().next().map(Vec::len).unwrap_or(0);
-        if centres.contains_key(&ZERO_CENTRE) {
-            return Err(format!("centre id {ZERO_CENTRE} is reserved for the zero centre"));
-        }
         if let Some((id, c)) = centres.iter().find(|(_, c)| c.len() != dim) {
             return Err(format!("centre {id} has {} dimensions, expected {dim}", c.len()));
+        }
+        Self::from_parts(postings, CentreSet::new(centres, seed), seed, counts)
+    }
+
+    fn from_parts(postings: Vec<Posting>, centres: CentreSet, seed: u64, counts: Arc<CountTable>) -> Result<Self, String> {
+        if postings.is_empty() || centres.map.is_empty() {
+            return Err("a namespace index needs at least one posting and one centre".into());
+        }
+        let dim = centres.dim;
+        if centres.map.contains_key(&ZERO_CENTRE) {
+            return Err(format!("centre id {ZERO_CENTRE} is reserved for the zero centre"));
         }
         let mut infos = HashMap::with_capacity(postings.len());
         let mut centroids = HashMap::with_capacity(postings.len());
         let (mut routing, mut probing) = (HashMap::new(), HashMap::new());
         for p in postings {
-            if !centres.contains_key(&p.centre_id) {
+            if !centres.map.contains_key(&p.centre_id) {
                 return Err(format!("posting {} names centre {}, which does not exist", p.posting_id, p.centre_id));
             }
             if p.state != PostingState::Retired && p.routing_centroid.len() != dim {
@@ -489,12 +588,13 @@ impl NamespaceIvf {
         if probing.is_empty() {
             return Err("a namespace index needs at least one posting that is not retired".into());
         }
+        // Routing and probing compare in the original space: no rotation.
         Ok(Self {
-            routing: ClusterIndex::from_clusters_with_seed(routing, seed),
-            probing: ClusterIndex::from_clusters_with_seed(probing, seed),
+            routing: ClusterIndex::from_clusters_unrotated(routing),
+            probing: ClusterIndex::from_clusters_unrotated(probing),
             postings: infos,
             centroids,
-            centres: ClusterIndex::from_clusters_with_seed(centres.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect(), seed),
+            centres,
             counts,
             seed,
         })
@@ -510,13 +610,7 @@ impl NamespaceIvf {
     /// The partition after a change: `new_centres` appended and every posting in
     /// `changed` added or replaced; the counts stay shared.
     pub fn evolve(&self, new_centres: &[(u32, Vec<f32>)], changed: &[Posting]) -> Result<Self, String> {
-        let seed = self.seed;
-        let mut centres: HashMap<u32, Vec<f32>> = self.centres.clusters.iter().map(|(&id, c)| (id, c.centroid.clone())).collect();
-        for (id, c) in new_centres {
-            if centres.insert(*id, c.clone()).is_some() {
-                return Err(format!("centre {id} already exists; centres are append-only"));
-            }
-        }
+        let centres = self.centres.with_added(new_centres)?;
         let mut postings: HashMap<u32, Posting> = self
             .postings
             .iter()
@@ -537,7 +631,7 @@ impl NamespaceIvf {
         for p in changed {
             postings.insert(p.posting_id, p.clone());
         }
-        Self::with_counts(postings.into_values().collect(), centres, seed, Arc::clone(&self.counts))
+        Self::from_parts(postings.into_values().collect(), centres, self.seed, Arc::clone(&self.counts))
     }
 
     /// `v` from the space codes are computed in back to the original space.
@@ -547,7 +641,7 @@ impl NamespaceIvf {
 
     /// The rotation seed (`None` for dimensions too small to rotate).
     pub fn rotation_seed(&self) -> Option<u64> {
-        self.centres.rotation_seed()
+        self.centres.rotator.as_ref().map(|r| r.seed())
     }
 
     /// Number of postings that are not retired.
@@ -557,7 +651,7 @@ impl NamespaceIvf {
 
     /// Number of centres.
     pub fn centres(&self) -> usize {
-        self.centres.len()
+        self.centres.map.len()
     }
 
     /// Every stored posting, retired ones included.
@@ -572,10 +666,7 @@ impl NamespaceIvf {
 
     /// The largest posting id and centre id in use (new ids go above them).
     pub fn max_ids(&self) -> (u32, u32) {
-        (
-            self.postings.keys().copied().max().unwrap_or(0),
-            self.centres.clusters.keys().copied().max().unwrap_or(0),
-        )
+        (self.postings.keys().copied().max().unwrap_or(0), self.centres.max_id.unwrap_or(0))
     }
 
     /// The shared size table.
@@ -601,7 +692,7 @@ impl NamespaceIvf {
     /// The rotated centre of `posting` (what its codes and maintenance compare
     /// against; a posting's centre is its routing centroid).
     pub fn rotated_posting_centre(&self, posting: u32) -> Option<&[f32]> {
-        self.centres.rotated_centroid(self.postings.get(&posting)?.centre_id)
+        self.centres.rotated(self.postings.get(&posting)?.centre_id)
     }
 
     /// Every `Active` posting with its rotated centre, in posting-id order (so
@@ -611,7 +702,7 @@ impl NamespaceIvf {
             .postings
             .iter()
             .filter(|(_, info)| info.state == PostingState::Active)
-            .filter_map(|(&id, info)| Some((id, self.centres.rotated_centroid(info.centre_id)?)))
+            .filter_map(|(&id, info)| Some((id, self.centres.rotated(info.centre_id)?)))
             .collect();
         out.sort_unstable_by_key(|&(id, _)| id);
         out
@@ -694,7 +785,7 @@ impl MaintenanceTotals {
 
 impl IvfLayout for NamespaceIvf {
     fn dim(&self) -> usize {
-        self.centres.dim()
+        self.centres.dim
     }
     fn rotate(&self, v: &[f32]) -> Vec<f32> {
         self.centres.rotate(v)
@@ -709,34 +800,117 @@ impl IvfLayout for NamespaceIvf {
         self.postings.get(&posting).map(|p| p.centre_id)
     }
     fn centre(&self, centre_id: u32) -> Option<&[f32]> {
-        IvfLayout::centre(&self.centres, centre_id)
+        self.centres.original(centre_id)
     }
     fn rotated_centre(&self, centre_id: u32) -> Option<&[f32]> {
-        self.centres.rotated_centroid(centre_id)
+        self.centres.rotated(centre_id)
     }
     fn centre_ids(&self) -> Vec<u32> {
-        self.centres.clusters.keys().copied().collect()
+        self.centres.map.keys().copied().collect()
+    }
+    fn max_centre_id(&self) -> Option<u32> {
+        self.centres.max_id
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         self.postings.contains_key(&posting).then(|| self.counts.get(posting).0)
     }
 }
 
+/// Grace periods for the routing epoch (an RCU-style barrier): readers
+/// register in the current generation and never wait; a barrier starts a new
+/// generation and waits until no reader of an earlier one is left.
+#[derive(Debug, Default)]
+struct Grace {
+    state: parking_lot::Mutex<GraceState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct GraceState {
+    generation: u64,
+    /// Readers still running, by the generation they started in.
+    readers: std::collections::BTreeMap<u64, usize>,
+}
+
+/// A vector write or search inside the routing epoch. Dropping it leaves.
+#[derive(Debug)]
+pub struct EpochGuard<'a> {
+    grace: &'a Grace,
+    generation: u64,
+}
+
+impl Drop for EpochGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.grace.state.lock();
+            if let Some(n) = s.readers.get_mut(&self.generation) {
+                *n -= 1;
+                if *n == 0 {
+                    s.readers.remove(&self.generation);
+                }
+            }
+        }
+        self.grace.changed.notify_waiters();
+    }
+}
+
+impl Grace {
+    fn enter(&self) -> EpochGuard<'_> {
+        let mut s = self.state.lock();
+        let generation = s.generation;
+        *s.readers.entry(generation).or_default() += 1;
+        EpochGuard { grace: self, generation }
+    }
+
+    /// Wait until every reader that entered before this call has left.
+    async fn wait(&self) {
+        let last = {
+            let mut s = self.state.lock();
+            let last = s.generation;
+            s.generation += 1;
+            last
+        };
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a leave between the two is seen.
+            notified.as_mut().enable();
+            if self.state.lock().readers.range(..=last).next().is_none() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// A namespace's live partition: the current snapshot, the shared counts, and
-/// the two locks maintenance relies on.
+/// the locks maintenance relies on.
 ///
 /// - **Routing epoch.** Every vector write (route, encode, write, apply its
-///   delta) and every search (choose postings, scan them) holds a read guard;
-///   publishing a new snapshot takes the write guard. So once a publish returns,
-///   no write is still filing chunks under the old routing and no search is still
-///   scanning by it: a split can then delete the old posting's keys without a
-///   search missing them (design doc M3a, rule 4).
+///   delta) and every search (choose postings, scan them) runs inside it
+///   ([`read_epoch`](Self::read_epoch)). It is a grace period, not a lock:
+///   entering never waits. [`publish`](Self::publish) installs a snapshot and
+///   then waits until every write and search that entered before it has left,
+///   so once it returns nothing is still filing chunks by the old routing.
+///   [`epoch_barrier`](Self::epoch_barrier) waits the same way, so a split can
+///   delete a posting's old keys without a search that began before the copy
+///   missing them (design doc M3a, rule 4). Neither holds up a write or search
+///   that starts after it, so a slow search delays maintenance, never other
+///   searches.
 /// - **Maintenance lock.** One maintenance operation per namespace at a time.
+/// - **Recovery.** A handle starts out needing its journal recovered (a crash
+///   may have left an operation half done), and is marked so again after any
+///   maintenance error; [`crate::ivf_split::ensure_recovered`] runs recovery
+///   before anything else uses it.
+/// - **Dropped.** Set when its namespace's vector index is dropped: maintenance
+///   then stops, so it never writes (and so recreates) a dropped namespace.
 #[derive(Debug)]
 pub struct PartitionHandle {
     current: parking_lot::RwLock<Arc<NamespaceIvf>>,
-    epoch: tokio::sync::RwLock<()>,
+    epoch: Grace,
     maintenance: tokio::sync::Mutex<()>,
+    needs_recovery: std::sync::atomic::AtomicBool,
+    dropped: std::sync::atomic::AtomicBool,
     unsplittable: parking_lot::Mutex<HashMap<u32, u64>>,
     unmergeable: parking_lot::Mutex<HashMap<u32, u64>>,
     counters: MaintenanceCounters,
@@ -745,12 +919,14 @@ pub struct PartitionHandle {
 }
 
 impl PartitionHandle {
-    /// A handle starting at `ivf`.
+    /// A handle starting at `ivf`. It needs recovery before first use.
     pub fn new(ivf: NamespaceIvf) -> Self {
         Self {
             current: parking_lot::RwLock::new(Arc::new(ivf)),
-            epoch: tokio::sync::RwLock::new(()),
+            epoch: Grace::default(),
             maintenance: tokio::sync::Mutex::new(()),
+            needs_recovery: std::sync::atomic::AtomicBool::new(true),
+            dropped: std::sync::atomic::AtomicBool::new(false),
             unsplittable: parking_lot::Mutex::new(HashMap::new()),
             unmergeable: parking_lot::Mutex::new(HashMap::new()),
             counters: MaintenanceCounters::default(),
@@ -784,9 +960,10 @@ impl PartitionHandle {
     /// Wait until no vector write or search that started before this call is
     /// still running. Maintenance calls it between copying chunks and deleting
     /// their old keys, so a search that could have missed a copy has finished
-    /// before the original goes.
+    /// before the original goes. Writes and searches that start meanwhile do not
+    /// wait.
     pub async fn epoch_barrier(&self) {
-        drop(self.epoch.write().await);
+        self.epoch.wait().await;
     }
 
     /// Remember that `posting` found no neighbour with room to merge into at
@@ -805,25 +982,49 @@ impl PartitionHandle {
         Arc::clone(&self.current.read())
     }
 
-    /// Enter the routing epoch as a writer of vectors or a search.
-    pub async fn read_epoch(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.epoch.read().await
+    /// Enter the routing epoch as a writer of vectors or a search. Never waits.
+    pub async fn read_epoch(&self) -> EpochGuard<'_> {
+        self.epoch.enter()
     }
 
-    /// Exclude every vector write and search, to publish a snapshot.
-    pub async fn write_epoch(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-        self.epoch.write().await
-    }
-
-    /// Install `ivf` as the current snapshot. The caller holds the
-    /// [`write_epoch`](Self::write_epoch) guard (passed as proof).
-    pub fn publish(&self, _guard: &tokio::sync::RwLockWriteGuard<'_, ()>, ivf: NamespaceIvf) {
+    /// Install `ivf` as the current snapshot, then wait until every vector
+    /// write and search that entered the epoch before it has left: on return,
+    /// nothing routes or scans by an older snapshot. Only maintenance (holding
+    /// the maintenance lock) publishes. Marks of postings no longer active are
+    /// dropped.
+    pub async fn publish(&self, ivf: NamespaceIvf) {
+        let active = |id: &u32| ivf.posting_infos().get(id).map(|i| i.state) == Some(PostingState::Active);
+        self.unsplittable.lock().retain(|id, _| active(id));
+        self.unmergeable.lock().retain(|id, _| active(id));
         *self.current.write() = Arc::new(ivf);
+        self.epoch.wait().await;
     }
 
     /// Serialise maintenance on this namespace.
     pub async fn lock_maintenance(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.maintenance.lock().await
+    }
+
+    /// Whether the journal must be recovered before this partition is used.
+    pub fn needs_recovery(&self) -> bool {
+        self.needs_recovery.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark whether the journal must be recovered before further use.
+    pub fn set_needs_recovery(&self, needed: bool) {
+        self.needs_recovery.store(needed, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Stop maintenance for good: the namespace's vector index is being
+    /// dropped. Maintenance checks it after taking the maintenance lock and
+    /// between batches.
+    pub fn mark_dropped(&self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`mark_dropped`](Self::mark_dropped) was called.
+    pub fn is_dropped(&self) -> bool {
+        self.dropped.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The shared counts.
@@ -1028,5 +1229,58 @@ mod tests {
         assert!(Arc::ptr_eq(next.counts(), ivf.counts()));
         assert_eq!(next.max_ids(), (10, 10));
         assert!(ivf.evolve(&[(1, c[&1].clone())], &[]).unwrap_err().contains("append-only"));
+    }
+
+    /// A publish builds the next snapshot from the current one. Centres never
+    /// change, so it keeps the rotated ones it has instead of rotating every
+    /// centre again (measured 9.5 ms at FiQA's 1,957 centres, 144 ms at 50,000,
+    /// paid on every split's publishes).
+    #[test]
+    fn evolving_keeps_the_existing_rotated_centres() {
+        let c = centroids(16);
+        let ivf = NamespaceIvf::seeded(&c, DEFAULT_ROTATION_SEED).unwrap();
+        let added: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 10.0).collect();
+        let next = ivf.evolve(&[(9, added.clone())], &[]).unwrap();
+        for id in 0..4u32 {
+            let (a, b) = (ivf.rotated_centre(id).unwrap(), next.rotated_centre(id).unwrap());
+            assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()), "centre {id} was rotated again");
+        }
+        assert_eq!(next.rotated_centre(9).unwrap(), ivf.rotate(&added).as_slice(), "a new centre is rotated");
+        assert_eq!(next.centre(9).unwrap(), added.as_slice());
+        assert_eq!(next.unrotate(&next.rotate(&added)).len(), 16);
+    }
+
+    /// A barrier waits for the readers (searches, vector writes) that started
+    /// before it ...
+    #[tokio::test]
+    async fn a_barrier_waits_for_readers_that_started_before_it() {
+        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let old = h.read_epoch().await;
+        let barrier = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { h.epoch_barrier().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!barrier.is_finished(), "the barrier passed a reader that started before it");
+        drop(old);
+        tokio::time::timeout(std::time::Duration::from_secs(5), barrier).await.unwrap().unwrap();
+    }
+
+    /// ... but never holds up a reader that starts after it: a search must not
+    /// queue behind a split waiting for an older, slow search.
+    #[tokio::test]
+    async fn a_new_reader_does_not_wait_behind_a_barrier() {
+        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let old = h.read_epoch().await;
+        let barrier = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { h.epoch_barrier().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let new = tokio::time::timeout(std::time::Duration::from_secs(1), h.read_epoch()).await;
+        assert!(new.is_ok(), "a new reader waited behind a barrier");
+        drop(new);
+        drop(old);
+        tokio::time::timeout(std::time::Duration::from_secs(5), barrier).await.unwrap().unwrap();
     }
 }

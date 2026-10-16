@@ -14,9 +14,9 @@
 //! |---|---|---|
 //! | 1. Plan | read every active posting's codes, k-means; write the record | `Planned` |
 //! | 2. Prepare | append the centres; write the new postings `Active`; mark the old ones `Draining` | `Planned` |
-//! | 3. Publish | under the epoch write guard: record `Published`, then the snapshot | `Published` |
+//! | 3. Publish | record `Published`, then install the snapshot and wait out the writes and searches that entered by the old one | `Published` |
 //! | 4. Copy | each old posting's chunks to the nearest new posting | `Published` |
-//! | 5. Barrier | flush the sparse and meta namespaces | `Copied` |
+//! | 5. Barrier | one fsync of the vector index WAL | `Copied` |
 //! | 6. Delete | after an epoch barrier, each old posting's keys | `Copied` |
 //! | 7. Retire | the old postings `Retired`; publish; delete the record | (gone) |
 //!
@@ -118,7 +118,10 @@ pub async fn rebuild_partition(
 ) -> Result<RebuildReport, crate::KVError> {
     let mut report = {
         let _maintenance = handle.lock_maintenance().await;
-        rebuild_locked(db, namespace, handle, ops, params).await?
+        prepare(db, namespace, handle, ops).await?;
+        rebuild_locked(db, namespace, handle, ops, params)
+            .await
+            .inspect_err(|_| handle.set_needs_recovery(true))?
     };
     maintain_partition(db, namespace, handle, ops).await?;
     let ivf = handle.snapshot();
@@ -291,11 +294,8 @@ pub(super) async fn finish(
         }
         retired.push(posting);
     }
-    {
-        let guard = handle.write_epoch().await;
-        let next = handle.snapshot().evolve(&[], &retired).map_err(|e| corrupt(namespace, e))?;
-        handle.publish(&guard, next);
-    }
+    let next = handle.snapshot().evolve(&[], &retired).map_err(|e| corrupt(namespace, e))?;
+    handle.publish(next).await;
     MaintenanceCounters::add(&handle.counters().rebuilds, 1);
     delete_record(db, namespace, op).await
 }
