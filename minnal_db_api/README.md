@@ -1254,7 +1254,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `bytes_appended` | vector_index_wal | Bytes appended to it, frames included | **No** |
 | `fsyncs` | vector_index_wal | Its fsyncs: one per batch of vector writes made durable | **No** |
 | `appends_per_fsync` | vector_index_wal | `appends / fsyncs` (derived): records made durable per fsync. `null` before the first fsync | **No** |
-| `gc_runs` | vector_index_wal | Its GC passes (one per WAL GC tick) | **No** |
+| `gc_runs` | vector_index_wal | Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete | **No** |
 | `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
 | `pin_flushes` | vector_index_wal | Flushes of an idle namespace that held its retired cut back | **No** |
 | `records_replayed` | vector_index_wal | Records replayed into memtables when the server started | **No** |
