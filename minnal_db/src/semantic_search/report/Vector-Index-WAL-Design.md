@@ -185,6 +185,18 @@ WAL's rule, applied per vector namespace, and it reuses the same mechanism:
   until the files are registered nothing can read or merge them. A memtable
   with no seal record retires nothing: `n`'s first record may have landed in
   the next memtable after that seal.
+- **If that progress cannot be made durable** — the marker write fails, or
+  the value-log fsync before it — the event returns an error and the LSM undoes
+  the flush: it removes the files, keeps the memtable read-only, and flushes it
+  again later under the same version. The log's progress does not change
+  meanwhile, so no later marker (written for another namespace) carries the
+  failed flush. Registering the files anyway would make them mergeable while
+  the marker is behind, which is the hazard of §7.
+- **A seal never waits on the marker's I/O.** The seal callback runs under the
+  memtable's write lock, for every namespace of the database, vector or not; a
+  seal that waited for a marker fsync would stall that namespace's reads and
+  writes. Seal records and which namespaces are tracked sit under a lock held
+  only briefly; the marker is written under a separate one.
 - The marker file (tmp + rename + fsync) holds the **retired cut** — the minimum
   `safe_offset` over vector namespaces still holding un-flushed logged writes,
   capped by the ceiling of all namespaces — and **each namespace's own
@@ -193,9 +205,15 @@ WAL's rule, applied per vector namespace, and it reuses the same mechanism:
   marker says where each namespace's replay starts (§7).
 
 A namespace that writes a little and goes idle would hold the cut back, as in the
-main WAL. The vector index WAL's GC tick flushes vector namespaces that pin it, exactly
-as `flush_namespaces_pinning_wal` does for the main WAL. These flushes are rare
-(once per tick at most, per idle namespace), not per document.
+main WAL. The vector index WAL's GC tick flushes vector namespaces that pin it, as
+`flush_namespaces_pinning_wal` does for the main WAL, and **seals the memtable
+even when it is empty**: a namespace can hold the cut with nothing in its
+memtable (its last record was logged but its apply failed), and only a seal
+releases it. These flushes are rare (once per tick at most, per idle
+namespace), not per document.
+
+A **dropped namespace** is forgotten and never tracked again (namespace ids are
+not reused), so a write that raced the drop cannot hold the cut.
 
 ## 6. Garbage collection
 
@@ -212,6 +230,14 @@ index WAL growing, nor the reverse.
 Disk use is bounded by what the vector namespaces have not flushed: at most one
 memtable each (100,000 entries), plus the segment in progress.
 
+**A failed fsync stops the log.** After an `fsync` fails, the kernel may have
+dropped the pages it could not write, and a later `fsync` that succeeds says
+nothing about them. Carrying on would let later batches complete over that
+hole, and a crash would then read the hole as a torn tail and drop those
+batches' records. So the first failure stops the log: appends and syncs fail
+until the database is reopened, the vector worker's entries stay queued, and
+`GET /admin/storage/vector-index-wal` reports `stopped` with the error.
+
 ## 7. Recovery
 
 At open, after the registry and stores are loaded and **before** any worker
@@ -220,7 +246,8 @@ starts:
 1. Read the marker: the retired cut and each namespace's `safe_offset` (zero if
    absent).
 2. Read every vector-index-WAL record at or above the cut, stopping at the torn
-   tail. Keep only those at or above **their own namespace's** `safe_offset`
+   tail. Segments wholly below the cut are retired and are not read at all
+   (they only wait for GC). Keep only those at or above **their own namespace's** `safe_offset`
    (the cut, for a namespace the marker does not list).
 3. Skip records whose namespace is no longer in the registry (dropped store or
    dropped vector index), as main-WAL recovery does.
@@ -231,7 +258,14 @@ starts:
 5. Raise the global seq counter above the highest seq in the vector index WAL, as it
    is raised above the main WAL and every SSTable (`set_seq_counter`). Without
    this, a new write could draw a seq below a replayed one and lose to it.
-6. Main-WAL recovery runs as it does now. Both logs replay with original seqs
+6. Flush every namespace replayed into to L0, fsync its value log, and record it
+   in the marker as safe up to the log's tail. No flush observer is attached
+   during recovery, so nothing else records that these records are now on
+   disk — and the next step compacts every store into L1, which drops
+   tombstones. With the marker left behind, a second crash would replay a
+   record whose delete that compaction erased, and the key would come back
+   (`a_second_crash_does_not_bring_back_a_deleted_key`).
+7. Main-WAL recovery runs as it does now. Both logs replay with original seqs
    into memtables that resolve by seq, so their relative order does not matter.
 
 If the marker names a position past the log's durable end, a power loss took
@@ -252,7 +286,10 @@ A **clean shutdown** flushes every store while the flush observers are still
 attached, and only then detaches them and compacts. Compaction into L1 drops
 tombstones, so the log must have retired what those flushes covered first;
 otherwise the next open would replay records whose keys were deleted during
-the session.
+the session. A store whose flush fails there keeps its observers, so the
+flush its shutdown runs before compacting is still seen (and undone if the
+marker still cannot be written). Shutdown carries on with the other stores
+and reports the first error.
 
 Then the vector worker starts and finds the queue as the crash left it.
 
@@ -297,6 +334,7 @@ no meta.
 | flush, before the cut marker is written | records flushed but look unretired | replayed with original seqs: highest seq wins, so no change (the CLAUDE.md hazard cannot arise: nothing later to this key was flushed after them — §7) |
 | segment delete, before directory fsync | segment may reappear | wholly below the cut → skipped |
 | mid-replay | nothing new is retired until a flush | replay runs again from the same cut |
+| recovery, after its flush and marker | replayed records in L0 and retired | not replayed again; later compactions cannot bring a deleted key back |
 
 Power loss differs from a process kill: unsynced appends vanish. The crash
 simulation (`AsyncDb::crash`) must model that by truncating the vector index WAL to its
@@ -316,10 +354,21 @@ anything:
    and lost.
 5. Seq counter not raised above the vector index WAL → a write after restart loses to
    a replayed older one.
+6. Recovery does not record what it replayed → after two crashes a deleted
+   chunk key is back (`a_second_crash_does_not_bring_back_a_deleted_key`).
+7. A failed marker write is not undone, or the LSM registers the files anyway
+   → a later marker carries the failed flush, or its files are mergeable
+   (`a_failed_marker_write_changes_nothing_and_the_retry_retires`,
+   `a_flush_whose_marker_fails_registers_nothing_and_is_retried`).
+8. The GC tick's flush does not seal an empty memtable → a namespace holds the
+   cut for good (`a_pin_flush_releases_a_holder_whose_memtable_is_empty`).
+9. A forgotten namespace is tracked again by a late append → it holds the cut
+   until restart (`an_append_after_a_namespace_is_forgotten_does_not_hold_the_cut`).
+10. A seal takes the lock held across the marker write
+    (`a_seal_never_waits_for_a_marker_write`).
 
-The existing barrier tests (`crash_before_reembed_is_flushed_keeps_new_vectors`,
-`a_failed_flush_completes_nothing` and the crash audits) must keep passing,
-retargeted at the fsync.
+The barrier tests (`crash_before_reembed_is_synced_keeps_new_vectors`,
+`a_failed_sync_completes_nothing` and the crash audits) guard the fsync.
 
 ## 9. Plan
 
@@ -350,7 +399,7 @@ main WAL's tests untouched and passing.
    of §9a, plus appends per fsync, which is the batch size this design relies
    on). Both cards are hidden when the server does not report them. Tested on a
    scratch server: empty, during ingest, idle past a GC tick, after a SIGKILL
-   restart, in light and dark themes.
+   restart (minnal_ui has one, dark, theme).
 
 ### 9a. What the log reports
 
@@ -361,7 +410,8 @@ would replay), the last seq appended, and the namespaces holding the cut back
 with their `safe_offset` (why the log is not shrinking). Positions are shown as
 `{segment_id, byte}`. It is a separate endpoint because
 the main WAL's response counts entries and persisted entries, which this log
-does not have.
+does not have. After a failed fsync it also reports `stopped`, with the error
+(the log refuses appends until the database is reopened, §6).
 
 Counters since startup, engine-wide only (as the main WAL's GC counters are; a
 per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
@@ -373,6 +423,7 @@ per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
 | `vector_wal_gc_runs`, `vector_wal_segments_deleted` | GC passes, segments deleted | 2 |
 | `vector_wal_pin_flushes` | flushes of an idle namespace holding the cut back | 2 |
 | `vector_wal_records_replayed` | records replayed at open | 3 |
+| `vector_wal_records_skipped` | records of dropped namespaces skipped at open | 3 |
 
 ### 9b. Measured: the quick M5 check
 

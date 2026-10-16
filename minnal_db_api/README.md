@@ -1256,7 +1256,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `appends_per_fsync` | vector_index_wal | `appends / fsyncs` (derived): records made durable per fsync. `null` before the first fsync | **No** |
 | `gc_runs` | vector_index_wal | Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete | **No** |
 | `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
-| `pin_flushes` | vector_index_wal | Flushes of an idle namespace that held its retired cut back | **No** |
+| `pin_flushes` | vector_index_wal | WAL GC tick flushes (each a seal) of a namespace that held the retired cut back | **No** |
 | `records_replayed` | vector_index_wal | Records replayed into memtables when the server started | **No** |
 | `records_skipped` | vector_index_wal | Records not replayed at start because their namespace had been dropped | **No** |
 | `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
@@ -1343,8 +1343,9 @@ wholly below the **retired cut**. Each namespace's replay starts at its own
 | `durable_tail` | Everything below it is fsynced |
 | `retired_cut` | Records below it are retired |
 | `unretired_bytes` | Bytes at or above the retired cut (segment headers excluded): what a restart would replay |
-| `last_sequence` | Highest write sequence of any record in the log |
-| `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them |
+| `last_sequence` | Highest write sequence of a record appended since the server started, or found then at or above the retired cut (0 if none) |
+| `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them (sealing the memtable even when it is empty), which releases them |
+| `stopped` | `null` normally. After a failed fsync of the log, the error: the log then refuses appends and syncs until the server restarts, and vector indexing stops (documents stay queued) |
 
 On a database whose vector worker has written nothing:
 
@@ -1358,7 +1359,8 @@ On a database whose vector worker has written nothing:
   "retired_cut": {"segment_id": 0, "byte": 0},
   "unretired_bytes": 0,
   "last_sequence": 0,
-  "holding_cut": []
+  "holding_cut": [],
+  "stopped": null
 }
 ```
 
