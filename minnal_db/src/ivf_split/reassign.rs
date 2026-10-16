@@ -315,10 +315,10 @@ pub(super) async fn run(
         let (candidates, moved) = counts.into_iter().fold((skipped, 0), |(c, m), (dc, dm)| (c + dc, m + dm));
         MaintenanceCounters::add(&handle.counters().reassign_candidates, candidates);
         MaintenanceCounters::add(&handle.counters().reassign_moves, moved);
-        // Barrier: the copies are durable before any source shrinks.
+        // Barrier: the copies are durable before any source shrinks (one fsync
+        // of the vector index WAL, which holds them).
         crash_point!();
-        db.flush_namespaces(vec![sparse_vectors_ns(namespace), sparse_vectors_meta_ns(namespace)])
-            .await?;
+        db.sync_vector_index_wal().await?;
         write_record(db, namespace, op, &record.with_state(JournalState::Copied)).await?;
         reuse = Some(selected);
     }

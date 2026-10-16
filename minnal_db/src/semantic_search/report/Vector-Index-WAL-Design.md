@@ -94,9 +94,12 @@ Not logged, and unchanged:
   **main WAL**. The meta must be durable before any key it lists is written, and
   a lost delete would orphan an index entry (see `upsert_vectors`).
 - The query-embedding cache stays no-WAL: it is a cache.
-- The partition's centres and postings keep their own flush when seeded.
-- Partition maintenance's drain copies (`ivf_split.rs`) keep their barrier in the
-  first version; moving them to the vector index WAL is a follow-up (§9).
+- The partition's centres and postings keep their own flush when seeded (once,
+  when a namespace enables semantic search).
+
+Partition maintenance's copies (split, merge and rebuild drains, and
+reassignment, `ivf_split`) are logged the same way, and their barrier before
+the deletes is the same one fsync (§9, step 6).
 
 ### Why a separate log and not the main WAL
 
@@ -244,6 +247,12 @@ namespaces no longer in the registry are released. Otherwise the first flush of
 any namespace would find nobody holding the cut and retire the replayed
 records while they exist only in memtables.
 
+A **clean shutdown** flushes every store while the flush observers are still
+attached, and only then detaches them and compacts. Compaction into L1 drops
+tombstones, so the log must have retired what those flushes covered first;
+otherwise the next open would replay records whose keys were deleted during
+the session.
+
 Then the vector worker starts and finds the queue as the crash left it.
 
 ### Why replaying an old seq is safe here
@@ -328,8 +337,11 @@ main WAL's tests untouched and passing.
 5. **Measure:** the M5 quick check before and after (flushes/s, fsyncs/s, write
    p99, sustainable rate), the vector bench (indexing time, recall and nDCG at
    @10–@100 must be identical), and a restart after a crash mid-ingest.
-6. **Later, separately:** partition maintenance's drain copies on the vector index WAL
-   instead of their flush barrier.
+6. **Partition maintenance:** the drain and reassignment copies (`copy_into_batch`)
+   on the vector index WAL, and their three barriers (drain, rebuild,
+   reassignment) one fsync each instead of a flush of two namespaces. Built
+   with a fix it exposed: a clean shutdown must flush with the observers still
+   attached (§7).
 7. **minnal_ui**, after step 5: show the log where the main WAL already appears,
    since it is system-wide. Admin → Storage gets a *Vector index WAL* card beside
    the *WAL* card (the on-disk state of §9a, with its segment list); Admin → Ops
@@ -386,9 +398,9 @@ Memtable flushes fall by 96–98% and disk writes by 70–77%. The main WAL's
 fsyncs do not change (it never carried the payloads), and neither does CPU. At
 these rates the worker's batches are small, about 3 records per vector-WAL
 fsync; under a backlog they grow to hundreds (508 per fsync in one soak). The
-remaining ~1 flush/s and the no-WAL puts (36/s at 50 req/s, from 62) come from
-partition maintenance's drain copies, which keep their own flush barrier
-(step 6).
+remaining ~1 flush/s and the no-WAL puts (36/s at 50 req/s, from 62) came from
+partition maintenance's copies, which at the measured commit (df8cdc6) still
+had their own flush barrier; step 6 puts them on the log.
 
 **Latency and throughput.** Write p99 at 50 req/s: insert 25/34 → 19/20 ms,
 update 22/40 → 18/19 ms, delete 76/82 → 71/78 ms (before/after, both runs each).

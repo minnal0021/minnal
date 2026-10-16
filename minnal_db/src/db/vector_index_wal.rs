@@ -2252,4 +2252,33 @@ mod tests {
             assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)), "key {i}");
         }
     }
+
+    /// A clean shutdown compacts every store, which drops tombstones in L1.
+    /// The vector index WAL must have retired what those stores flushed by
+    /// then, or the next open replays records whose keys were deleted.
+    #[test]
+    fn a_clean_shutdown_does_not_bring_back_deleted_keys() {
+        let dir = TempDir::new().unwrap();
+        let ns = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let ns = db.create_namespace("v_sparse_vector").unwrap();
+            log_and_apply(&db, ns, b"moved-away", b"chunk code");
+            log_and_apply(&db, ns, b"kept", b"chunk code");
+            db.delete_ns(ns, b"moved-away").unwrap();
+            db.shutdown().unwrap(); // flushes, then compacts into L1
+            ns
+        };
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(
+            db.get_ns(ns, b"moved-away").unwrap(),
+            None,
+            "a deleted key came back after a clean shutdown"
+        );
+        assert_eq!(db.get_ns(ns, b"kept").unwrap(), Some(b"chunk code".to_vec()));
+        assert_eq!(
+            db.metrics_snapshot().vector_wal_records_replayed,
+            0,
+            "a clean shutdown retires everything"
+        );
+    }
 }

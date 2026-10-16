@@ -269,10 +269,10 @@ pub(super) async fn finish(
             copied += drain_copy(db, namespace, handle, &ivf, &rule, posting).await?;
         }
         MaintenanceCounters::add(&handle.counters().rebuild_moves, copied);
-        // 5. Barrier: the copies are durable before any delete.
+        // 5. Barrier: the copies are durable before any delete (one fsync of
+        // the vector index WAL, which holds them; the metas are WAL-backed).
         crash_point!();
-        db.flush_namespaces(vec![sparse_vectors_ns(namespace), sparse_vectors_meta_ns(namespace)])
-            .await?;
+        db.sync_vector_index_wal().await?;
         write_record(db, namespace, op, &record.with_state(JournalState::Copied)).await?;
     }
     handle.epoch_barrier().await;

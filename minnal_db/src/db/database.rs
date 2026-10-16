@@ -2999,6 +2999,16 @@ impl Database {
 
         // Shutdown all KVStores
         let stores = self.stores.read();
+        // Flush first, with the observers still attached, so the vector index
+        // WAL retires what reaches L0 — its marker is written before the files
+        // are registered. Each store's shutdown then compacts into L1, which
+        // drops tombstones; with the observers already detached, a stale marker
+        // would make the next open replay records whose keys were deleted
+        // (`a_clean_shutdown_does_not_bring_back_deleted_keys`). The main WAL
+        // sees these flushes too; it marks everything persisted below anyway.
+        for (_, kv_store) in stores.iter() {
+            kv_store.flush_memtable_to_level0()?;
+        }
         for (_, kv_store) in stores.iter() {
             kv_store.set_flush_observer(None);
             kv_store.shutdown()?;
