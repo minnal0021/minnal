@@ -29,7 +29,10 @@ import json, os, shutil, signal, subprocess, sys, time, urllib.request
 
 ROOT = "/home/sperumal/minnal_dev/minnal"
 M5 = f"{ROOT}/work/bench/m5"
-BIN = f"{M5}/bin"
+# Binaries and a results tag can be chosen per run, so a before/after pair
+# runs from two frozen builds into two result directories.
+BIN = os.environ.get("M5_BIN", f"{M5}/bin")
+TAG = os.environ.get("M5_TAG", "")
 DATA = f"{M5}/data"
 URL = "http://127.0.0.1:8095"
 NS = "fiqa"
@@ -57,7 +60,7 @@ SOAK_S = 120 if quick else 3600
 SWEEP_S = 30 if quick else 300
 SWEEP = [1, 4, 16] if quick else [1, 2, 4, 8, 16, 32, 64]
 FIRST_RATE = 50.0
-OUT = f"{ROOT}/work/bench/results/m5{'-quick' if quick else ''}/{mix}"
+OUT = f"{ROOT}/work/bench/results/m5{'-quick' if quick else ''}{'-' + TAG if TAG else ''}/{mix}"
 RUN = f"{M5}/run-{mix}{'-quick' if quick else ''}"
 
 

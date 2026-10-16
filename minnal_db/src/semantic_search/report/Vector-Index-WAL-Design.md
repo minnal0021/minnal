@@ -361,6 +361,61 @@ per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
 | `vector_wal_pin_flushes` | flushes of an idle namespace holding the cut back | 2 |
 | `vector_wal_records_replayed` | records replayed at open | 3 |
 
+### 9b. Measured: the quick M5 check
+
+**Setup.** The M5 harness (`minnal_db/docs/benchmarks/m5/run_m5.py balanced
+--quick`) on the settled FiQA snapshot (40,000 documents embedded with gemma),
+balanced mix, 1-minute steps from 50 req/s ×1.5 with two bisections, a 2-minute
+soak at the highest passing rate, closed-loop 1/4/16 clients, and a cold-query
+step (30% cache misses). **Before**: the build with the vector worker's flush
+barrier (2e88f1d). **After**: the vector index WAL (df8cdc6). Run before, after,
+before, after on one host, 2026-10-16; results in
+`work/bench/results/m5-quick-vwal-{before,after}-{1,2}/`.
+
+**Background work at the same offered rate.** This is what the log was built to
+remove, and it is not noise: both runs of each build agree.
+
+| Offered | Build | Memtable flushes/s | L0→L1 merges/s | Disk writes MB/s | Main-WAL fsyncs/s | Vector-WAL fsyncs/s | Server CPU (cores) |
+|---|---|---|---|---|---|---|---|
+| 50 req/s | before | 22.8, 21.6 | 7.1, 6.5 | 4.2, 3.9 | 149, 137 | — | 1.48, 1.46 |
+| 50 req/s | after | 0.9, 0.9 | 0.7, 0.7 | 1.3, 1.3 | 151, 150 | 8.5, 8.4 | 1.46, 1.45 |
+| 75 req/s | before | 31.5, 29.1 | 8.6, 8.5 | 5.0, 5.0 | 131, 144 | — | 2.14, 2.14 |
+| 75 req/s | after | 0.5, 0.5 | 0.4, 0.5 | 1.1, 1.2 | 131, 131 | 13.0, 13.1 | 2.11, 2.13 |
+
+Memtable flushes fall by 96–98% and disk writes by 70–77%. The main WAL's
+fsyncs do not change (it never carried the payloads), and neither does CPU. At
+these rates the worker's batches are small, about 3 records per vector-WAL
+fsync; under a backlog they grow to hundreds (508 per fsync in one soak). The
+remaining ~1 flush/s and the no-WAL puts (36/s at 50 req/s, from 62) come from
+partition maintenance's drain copies, which keep their own flush barrier
+(step 6).
+
+**Latency and throughput.** Write p99 at 50 req/s: insert 25/34 → 19/20 ms,
+update 22/40 → 18/19 ms, delete 76/82 → 71/78 ms (before/after, both runs each).
+At 75 req/s the runs overlap. Closed loop, completed req/s is unchanged (1
+client 114/113 → 111/118, 16 clients 464/463 → 453/422), and write p99 at 16
+clients is the same or lower (delete 380/298 → 305/272 ms).
+
+The **highest passing rate** does not settle the question with 1-minute steps.
+Before reached 69 and 103 req/s, after 232 and 103; both after-2 and before-2
+stopped at 112 req/s on a single class just over its target (update 51 ms,
+insert 56 ms). In after-1's soak at 232 req/s the vector queue grew by 1,501
+entries, so that rate is not sustainable: inserts and updates there ask for
+about 46 embeddings a second, past the embedding pipeline's rate, which is now
+the limit before storage is. The full M5 run, with 10-minute steps, measures
+the sustainable rate.
+
+**To check in the full run.** Search p99 at 16 closed-loop clients was higher
+after in both pairs (112/114 → 126/135 ms) while write p99 fell. One
+explanation to test: the vector namespaces' memtables now hold up to a
+memtable's worth of entries between flushes instead of a few dozen, so a
+search's prefix scans read more from memory. The cold-query step is not
+comparable across builds here: it runs at each build's highest passing rate,
+and after-1's ran with an embedding backlog.
+
+Still to run (step 5): the vector bench (indexing time, recall and nDCG at
+@10–@100, which must be identical).
+
 ## 10. Alternatives considered
 
 - **Group the barrier** (flush once per interval, complete entries afterwards).
