@@ -24,13 +24,27 @@
 //! (`LoggedWrite` registers an append while the append lock is held and
 //! clears it when dropped, after the apply). The seal callback runs under the
 //! memtable's write lock, so every one of the namespace's records below the
-//! ceiling is in `v` or an older memtable. When `v` is flushed — in version
-//! order — the namespace's `safe_offset` advances to that ceiling. The
-//! **retired cut** is the lowest `safe_offset` over namespaces with records
-//! above theirs, capped by the global ceiling (the oldest append of any
-//! namespace not yet applied). It only moves forward, and it is written to
-//! `retired_cut` before it is published, so GC never deletes past a durable
-//! cut.
+//! ceiling is in `v` or an older memtable. When `v`'s L0 files are written —
+//! in version order, and **before they are registered**
+//! (`LsmFlushObserver::on_ro_memtable_written`) — the namespace's
+//! `safe_offset` advances to that ceiling. The **retired cut** is the lowest
+//! `safe_offset` over namespaces with records above theirs, capped by the
+//! global ceiling (the oldest append of any namespace not yet applied). It
+//! only moves forward; GC deletes segments wholly below it.
+//!
+//! # Replay is per namespace, and progress is durable before files are mergeable
+//!
+//! Replay applies a record only if it lies at or above **its own namespace's**
+//! `safe_offset`, not merely the global cut. The vector writes' deletes live
+//! in the main WAL, so a record of a namespace that already flushed past it
+//! can have a later delete that reached L1, where the tombstone is dropped:
+//! replaying it from the global cut would bring the key back with nothing
+//! newer to beat it (`replay_does_not_bring_back_a_key_whose_delete_reached_l1`).
+//! So the marker `retired_cut` holds the cut and every tracked namespace's
+//! `safe_offset` above it, and it is written in the written event, before the
+//! memtable's L0 files are registered: by the time any merge could drop a
+//! tombstone in them, the namespace's progress past the records they cover is
+//! on disk.
 //!
 //! **After a restart** the in-memory state is gone, so `open` rebuilds it from
 //! the log: every namespace with a record at or above the durable cut starts
@@ -113,11 +127,30 @@ const END_MARKER_LEN: u32 = 4;
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
 const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
 
-/// The retired cut's marker file, in the log's directory.
+/// The progress marker file, in the log's directory.
 const RETIRED_CUT_FILE: &str = "retired_cut";
-/// Marker layout: magic, cut (u64), crc32 of the first 12 bytes.
+/// Marker layout: magic, version, cut (u64), count (u32), then `count` ×
+/// (namespace u32, safe offset u64), then crc32 of everything before it.
 const RETIRED_CUT_MAGIC: [u8; 4] = *b"MVIC";
-const RETIRED_CUT_LEN: usize = 16;
+const RETIRED_CUT_VERSION: u32 = 2;
+const RETIRED_CUT_HEADER_LEN: usize = 4 + 4 + 8 + 4;
+const RETIRED_CUT_ENTRY_LEN: usize = 4 + 8;
+
+/// What the progress marker records.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Progress {
+    /// Records below this are retired; GC deletes segments wholly below it.
+    cut: u64,
+    /// Namespaces whose `safe_offset` is above the cut, sorted by namespace.
+    safe: Vec<(u32, u64)>,
+}
+
+impl Progress {
+    /// Where replay starts for `ns`.
+    fn replay_from(&self, ns: u32) -> u64 {
+        self.safe.binary_search_by_key(&ns, |(n, _)| *n).map_or(self.cut, |i| self.safe[i].1)
+    }
+}
 
 /// Errors from the vector index WAL.
 #[derive(Error, Debug)]
@@ -288,6 +321,9 @@ pub(crate) struct VectorIndexWal {
     retirement: Mutex<Retirement>,
     /// Records below this position are retired. Durable in `retired_cut`.
     retired_cut: AtomicU64,
+    /// Where each namespace's replay starts, as of this open (the durable
+    /// marker read at open). Used by [`replay`](VectorIndexWal::replay).
+    opened_progress: Progress,
     /// The database's engine-wide counters.
     metrics: Arc<Metrics>,
 }
@@ -296,8 +332,11 @@ pub(crate) struct VectorIndexWal {
 struct Retirement {
     /// `(namespace, memtable version)` → the namespace's ceiling at the seal.
     pending: BTreeMap<(u32, u64), PendingFlush>,
-    /// Namespaces that have appended, from their first append.
+    /// Namespaces that have appended, from their first append (or that have a
+    /// record above their safe offset, or an entry in the marker, at open).
     progress: HashMap<u32, NsProgress>,
+    /// What the marker on disk says now.
+    written: Progress,
 }
 
 struct PendingFlush {
@@ -510,28 +549,53 @@ fn walk_segment<E: From<VectorIndexWalError>>(
     }
 }
 
-fn read_retired_cut(dir: &Path) -> Result<Option<u64>> {
+fn read_progress(dir: &Path) -> Result<Option<Progress>> {
     let bytes = match std::fs::read(dir.join(RETIRED_CUT_FILE)) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let bad = || VectorIndexWalError::Corruption("the retired-cut marker is damaged".to_owned());
-    if bytes.len() != RETIRED_CUT_LEN || bytes[0..4] != RETIRED_CUT_MAGIC {
-        return Err(bad());
+    let bad = |why: &str| VectorIndexWalError::Corruption(format!("the retired-cut marker is damaged: {why}"));
+    if bytes.len() < RETIRED_CUT_HEADER_LEN + 4 || bytes[0..4] != RETIRED_CUT_MAGIC {
+        return Err(bad("no header"));
     }
-    if crc32fast::hash(&bytes[0..12]) != u32::from_le_bytes(bytes[12..16].try_into().unwrap()) {
-        return Err(bad());
+    let (body, crc) = bytes.split_at(bytes.len() - 4);
+    if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+        return Err(bad("CRC mismatch"));
     }
-    Ok(Some(u64::from_le_bytes(bytes[4..12].try_into().unwrap())))
+    let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if version != RETIRED_CUT_VERSION {
+        return Err(bad(&format!("version {version}, expected {RETIRED_CUT_VERSION}")));
+    }
+    let cut = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    let count = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+    if body.len() != RETIRED_CUT_HEADER_LEN + count * RETIRED_CUT_ENTRY_LEN {
+        return Err(bad("length does not match its entry count"));
+    }
+    let safe = body[RETIRED_CUT_HEADER_LEN..]
+        .chunks_exact(RETIRED_CUT_ENTRY_LEN)
+        .map(|e| {
+            (
+                u32::from_le_bytes(e[0..4].try_into().unwrap()),
+                u64::from_le_bytes(e[4..12].try_into().unwrap()),
+            )
+        })
+        .collect();
+    Ok(Some(Progress { cut, safe }))
 }
 
-fn retired_cut_bytes(cut: u64) -> [u8; RETIRED_CUT_LEN] {
-    let mut b = [0u8; RETIRED_CUT_LEN];
-    b[0..4].copy_from_slice(&RETIRED_CUT_MAGIC);
-    b[4..12].copy_from_slice(&cut.to_le_bytes());
-    let crc = crc32fast::hash(&b[0..12]);
-    b[12..16].copy_from_slice(&crc.to_le_bytes());
+fn progress_bytes(p: &Progress) -> Vec<u8> {
+    let mut b = Vec::with_capacity(RETIRED_CUT_HEADER_LEN + p.safe.len() * RETIRED_CUT_ENTRY_LEN + 4);
+    b.extend_from_slice(&RETIRED_CUT_MAGIC);
+    b.extend_from_slice(&RETIRED_CUT_VERSION.to_le_bytes());
+    b.extend_from_slice(&p.cut.to_le_bytes());
+    b.extend_from_slice(&(p.safe.len() as u32).to_le_bytes());
+    for (ns, safe) in &p.safe {
+        b.extend_from_slice(&ns.to_le_bytes());
+        b.extend_from_slice(&safe.to_le_bytes());
+    }
+    let crc = crc32fast::hash(&b);
+    b.extend_from_slice(&crc.to_le_bytes());
     b
 }
 
@@ -606,7 +670,7 @@ impl VectorIndexWal {
 
         // The last segment: the active one, possibly torn.
         let mut torn_bytes_dropped = 0u64;
-        let (segment_id, file, pos) = match last {
+        let (mut segment_id, mut file, mut pos) = match last {
             None => (0, create_segment(dir, 0)?, SEGMENT_HEADER_LEN),
             Some(id) => {
                 let file = OpenOptions::new().read(true).write(true).open(segment_path(dir, id))?;
@@ -641,16 +705,42 @@ impl VectorIndexWal {
         };
         file.sync_all()?;
 
-        let tail = position(segment_id, pos);
         let oldest = ids.first().copied().unwrap_or(segment_id);
-        let retired_cut = match read_retired_cut(dir)? {
-            Some(cut) if cut > tail => {
+        let marker = read_progress(dir)?;
+        if let Some(p) = &marker {
+            if let Some((ns, safe)) = p.safe.iter().find(|(_, s)| *s < p.cut) {
                 return Err(VectorIndexWalError::Corruption(format!(
-                    "the retired cut {:?} is past the tail {:?}",
-                    VectorIndexWalPosition::of(cut),
-                    VectorIndexWalPosition::of(tail)
+                    "namespace {ns}'s safe offset {:?} is below the cut",
+                    VectorIndexWalPosition::of(*safe)
                 )));
             }
+            let furthest = p.safe.iter().map(|(_, s)| *s).chain([p.cut]).max().unwrap_or(0);
+            if split(furthest).0 > segment_id {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "the marker names {:?}, past the last segment {segment_id}",
+                    VectorIndexWalPosition::of(furthest)
+                )));
+            }
+            if furthest > position(segment_id, pos) {
+                // A power loss took records of a memtable that was already
+                // written to L0: the marker is durable, the appends were not.
+                // Their data is in SSTables, but new appends must land above
+                // every position the marker names, or replay would skip them.
+                log::warn!(
+                    "[vector index WAL] the marker names {:?}, past the durable tail {:?}; starting segment {}",
+                    VectorIndexWalPosition::of(furthest),
+                    VectorIndexWalPosition::of(position(segment_id, pos)),
+                    segment_id + 1
+                );
+                file.write_all_at(&0u32.to_le_bytes(), u64::from(pos))?;
+                file.sync_all()?;
+                segment_id += 1;
+                file = create_segment(dir, segment_id)?;
+                pos = SEGMENT_HEADER_LEN;
+            }
+        }
+        let tail = position(segment_id, pos);
+        let retired_cut = match marker.as_ref().map(|p| p.cut) {
             Some(cut) if split(cut).0 < oldest => {
                 return Err(VectorIndexWalError::Corruption(format!(
                     "the retired cut {:?} is below the oldest segment {oldest}",
@@ -665,21 +755,34 @@ impl VectorIndexWal {
             }
             None => 0,
         };
-        // Everything below the cut is in SSTables; a namespace with a record
-        // above it holds the cut until a flush covers that record.
-        let progress = last_write
-            .into_iter()
-            .filter(|&(_, end)| end > retired_cut)
-            .map(|(ns, end)| {
+        // Each namespace's records below its safe offset (the cut, if the
+        // marker does not list it) are in SSTables; one with a record above it
+        // holds the cut until a flush covers that record. Namespaces the marker
+        // lists stay tracked, so their safe offsets are written again.
+        let opened_progress = marker.unwrap_or_default();
+        let mut progress: HashMap<u32, NsProgress> = opened_progress
+            .safe
+            .iter()
+            .map(|&(ns, safe)| {
                 (
                     ns,
                     NsProgress {
-                        safe_offset: retired_cut,
-                        last_write: end,
+                        safe_offset: safe,
+                        last_write: 0,
                     },
                 )
             })
             .collect();
+        for (ns, end) in last_write {
+            let safe = opened_progress.replay_from(ns);
+            if end > safe {
+                let p = progress.entry(ns).or_insert(NsProgress {
+                    safe_offset: safe,
+                    last_write: 0,
+                });
+                p.last_write = end;
+            }
+        }
         let wal = Self {
             dir: dir.to_path_buf(),
             segment_size,
@@ -694,8 +797,10 @@ impl VectorIndexWal {
             retirement: Mutex::new(Retirement {
                 pending: BTreeMap::new(),
                 progress,
+                written: opened_progress.clone(),
             }),
             retired_cut: AtomicU64::new(retired_cut),
+            opened_progress,
             metrics,
         };
         Ok((
@@ -824,6 +929,11 @@ impl VectorIndexWal {
                 SEGMENT_HEADER_LEN
             };
             let limit = if id == end_id { end_pos } else { file_len(&file)? };
+            if id != end_id && from >= limit {
+                // A start past a sealed segment's end: a marker naming records a
+                // power loss took (`open` started a new segment after them).
+                continue;
+            }
             let end = walk_segment(&file, id, from, limit, &mut buf, &mut f)?;
             match end {
                 WalkEnd::Clean { .. } if id == end_id => {}
@@ -895,14 +1005,15 @@ impl VectorIndexWal {
         r.pending.entry((ns, version)).or_insert(PendingFlush { ceiling, flushed: false });
     }
 
-    /// `ns` flushed memtable `version` to L0, value log fsynced. Advances the
-    /// namespace's `safe_offset` over its flushed versions in order, then the
-    /// retired cut.
+    /// `ns`'s memtable `version` is written to L0 and fsynced, value log
+    /// fsynced, and its files are **not yet registered** (so no merge can have
+    /// dropped a tombstone in them). Advances the namespace's `safe_offset`
+    /// over its written versions in order, then writes the marker.
     ///
-    /// A flush with no seal record (the seal came before the namespace's
+    /// A version with no seal record (the seal came before the namespace's
     /// first append, or before this log observed it) retires nothing but
     /// lets later versions fold past it; a later flush covers its records.
-    pub(crate) fn on_memtable_flushed(&self, ns: u32, version: u64) {
+    pub(crate) fn on_memtable_written(&self, ns: u32, version: u64) {
         let mut r = self.retirement.lock();
         if !r.progress.contains_key(&ns) {
             r.pending.remove(&(ns, version));
@@ -923,7 +1034,7 @@ impl VectorIndexWal {
         if let Some(p) = r.progress.get_mut(&ns) {
             p.safe_offset = p.safe_offset.max(safe);
         }
-        self.advance_cut(&r);
+        self.persist_progress(&mut r);
     }
 
     /// Stop tracking a dropped namespace: it can never flush again, and replay
@@ -932,7 +1043,7 @@ impl VectorIndexWal {
         let mut r = self.retirement.lock();
         r.progress.remove(&ns);
         r.pending.retain(|(n, _), _| *n != ns);
-        self.advance_cut(&r);
+        self.persist_progress(&mut r);
     }
 
     /// Namespaces the log tracks (every one that has a record above the cut
@@ -951,10 +1062,14 @@ impl VectorIndexWal {
         ns
     }
 
-    /// Moves the retired cut forward if it can, writing the marker first. A
-    /// failed marker write leaves the cut where it was (retried on the next
-    /// flush).
-    fn advance_cut(&self, r: &Retirement) {
+    /// Writes the marker when the cut or any namespace's safe offset above it
+    /// changed, then publishes the cut. The cut only moves forward.
+    ///
+    /// A failed write leaves the marker as it was: replay then starts earlier
+    /// than it could, which is safe until a merge drops a tombstone over a
+    /// record the stale marker still replays. The write is retried on the next
+    /// flush; a disk that cannot write a 100-byte file is failing anyway.
+    fn persist_progress(&self, r: &mut Retirement) {
         let ceiling = self.ceiling(None);
         let cut = r
             .progress
@@ -962,14 +1077,49 @@ impl VectorIndexWal {
             .filter(|p| p.holds_cut())
             .map(|p| p.safe_offset)
             .min()
-            .map_or(ceiling, |s| s.min(ceiling));
-        if cut <= self.retired_cut() {
+            .map_or(ceiling, |s| s.min(ceiling))
+            .max(self.retired_cut());
+        let mut safe: Vec<(u32, u64)> = r
+            .progress
+            .iter()
+            .filter(|(_, p)| p.safe_offset > cut)
+            .map(|(n, p)| (*n, p.safe_offset))
+            .collect();
+        safe.sort_unstable();
+        let next = Progress { cut, safe };
+        if next == r.written {
             return;
         }
-        match crate::support::write_atomic_durable(&self.dir.join(RETIRED_CUT_FILE), &retired_cut_bytes(cut)) {
-            Ok(()) => self.retired_cut.store(cut, Ordering::Release),
-            Err(e) => log::warn!("[vector index WAL] could not write the retired-cut marker: {e}"),
+        match crate::support::write_atomic_durable(&self.dir.join(RETIRED_CUT_FILE), &progress_bytes(&next)) {
+            Ok(()) => {
+                self.retired_cut.store(next.cut, Ordering::Release);
+                r.written = next;
+            }
+            Err(e) => log::error!("[vector index WAL] could not write the progress marker: {e}"),
         }
+    }
+
+    /// Hands every record that replay must apply to `f`, in log order: those
+    /// at or above their namespace's durable safe offset (the cut, for a
+    /// namespace the marker does not list), as of this open. Run once at
+    /// open, before any write.
+    pub(crate) fn replay<E: From<VectorIndexWalError>>(
+        &self,
+        mut f: impl FnMut(RecordRef<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let progress = &self.opened_progress;
+        self.for_each_from(progress.cut, |at, r| if at >= progress.replay_from(r.ns_id) { f(r) } else { Ok(()) })
+    }
+
+    /// Test-only: drop every byte appended since the last `sync`, as a power
+    /// loss would. `AsyncDb::crash` calls it, so a crash test can see a
+    /// missing `sync`.
+    #[cfg(test)]
+    pub(crate) fn lose_unsynced(&self) {
+        let a = self.active.lock();
+        let (durable_id, durable_byte) = split(self.durable_tail());
+        let keep = if durable_id == a.segment_id { durable_byte } else { SEGMENT_HEADER_LEN };
+        a.file.set_len(u64::from(keep)).expect("truncate the active segment");
     }
 
     /// Deletes every segment wholly below the retired cut, oldest first, then
@@ -1451,7 +1601,7 @@ mod tests {
 
     fn seal_and_flush(wal: &VectorIndexWal, ns: u32, version: u64) {
         wal.on_memtable_sealed(ns, version);
-        wal.on_memtable_flushed(ns, version);
+        wal.on_memtable_written(ns, version);
     }
 
     #[test]
@@ -1479,9 +1629,9 @@ mod tests {
         wal.on_memtable_sealed(1, 0);
         applied(&wal, 1, 1);
         wal.on_memtable_sealed(1, 1);
-        wal.on_memtable_flushed(1, 1);
+        wal.on_memtable_written(1, 1);
         assert_eq!(wal.retired_cut(), 0, "version 0 is not flushed yet");
-        wal.on_memtable_flushed(1, 0);
+        wal.on_memtable_written(1, 0);
         assert_eq!(wal.retired_cut(), wal.tail());
     }
 
@@ -1539,7 +1689,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
         applied(&wal, 1, 2);
-        wal.on_memtable_flushed(1, 0);
+        wal.on_memtable_written(1, 0);
         assert_eq!(wal.retired_cut(), 0);
         assert_eq!(wal.namespaces_holding_cut(), vec![1]);
         seal_and_flush(&wal, 1, 1);
@@ -1613,11 +1763,37 @@ mod tests {
         let marker = |dir: &TempDir| dir.path().join(RETIRED_CUT_FILE);
 
         let dir = fresh();
-        std::fs::write(marker(&dir), retired_cut_bytes(position(9, 16))).unwrap();
-        assert!(corruption(reopen(dir.path(), 256)).contains("past the tail"));
+        std::fs::write(
+            marker(&dir),
+            progress_bytes(&Progress {
+                cut: position(9, 16),
+                safe: vec![],
+            }),
+        )
+        .unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("past the last segment"));
 
         let dir = fresh();
-        std::fs::write(marker(&dir), retired_cut_bytes(position(0, 16))).unwrap();
+        let cut = read_progress(dir.path()).unwrap().unwrap().cut;
+        std::fs::write(
+            marker(&dir),
+            progress_bytes(&Progress {
+                cut,
+                safe: vec![(1, cut - 1)],
+            }),
+        )
+        .unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("below the cut"));
+
+        let dir = fresh();
+        std::fs::write(
+            marker(&dir),
+            progress_bytes(&Progress {
+                cut: position(0, 16),
+                safe: vec![],
+            }),
+        )
+        .unwrap();
         assert!(corruption(reopen(dir.path(), 256)).contains("below the oldest segment"));
 
         let dir = fresh();
@@ -1709,6 +1885,74 @@ mod tests {
         assert_eq!(wal.retired_cut(), wal.tail());
     }
 
+    #[test]
+    fn the_marker_round_trips_with_per_namespace_offsets() {
+        let p = Progress {
+            cut: position(1, 40),
+            safe: vec![(2, position(1, 90)), (7, position(2, 16))],
+        };
+        let dir = TempDir::new().unwrap();
+        crate::support::write_atomic_durable(&dir.path().join(RETIRED_CUT_FILE), &progress_bytes(&p)).unwrap();
+        assert_eq!(read_progress(dir.path()).unwrap(), Some(p.clone()));
+        assert_eq!(p.replay_from(2), position(1, 90));
+        assert_eq!(p.replay_from(7), position(2, 16));
+        assert_eq!(p.replay_from(3), position(1, 40), "an unlisted namespace replays from the cut");
+        let mut bytes = progress_bytes(&p);
+        bytes.truncate(bytes.len() - 5);
+        std::fs::write(dir.path().join(RETIRED_CUT_FILE), &bytes).unwrap();
+        assert!(read_progress(dir.path()).is_err());
+    }
+
+    #[test]
+    fn replay_skips_each_namespaces_records_below_its_own_safe_offset() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let flushed = applied(&wal, 1, 2);
+        let held = applied(&wal, 2, 1);
+        let after = applied(&wal, 1, 1);
+        wal.on_memtable_sealed(1, 0); // covers all of namespace 1's records so far
+        wal.on_memtable_written(1, 0);
+        assert_eq!(wal.retired_cut(), 0, "namespace 2 holds the global cut");
+        drop(wal);
+
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let mut replayed = Vec::new();
+        wal.replay(|r| -> Result<()> {
+            replayed.push((r.ns_id, r.seq));
+            Ok(())
+        })
+        .unwrap();
+        // Only namespace 2's record: namespace 1's are below its own offset,
+        // although they are above the global cut.
+        assert_eq!(replayed, vec![(2, 1)]);
+        let _ = (flushed, held, after);
+    }
+
+    #[test]
+    fn a_marker_past_the_durable_tail_starts_a_new_segment() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 3); // never synced
+        seal_and_flush(&wal, 1, 0); // but written to L0: the marker names the tail
+        let marked = wal.retired_cut();
+        wal.lose_unsynced(); // power loss
+        drop(wal);
+
+        let (wal, report) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        assert_eq!(report.tail, position(1, SEGMENT_HEADER_LEN));
+        assert!(wal.tail() > marked, "new appends land above every position the marker names");
+        let fresh = wal.append(1, b"new", b"v", 9).unwrap().appended();
+        drop(wal);
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let mut replayed = Vec::new();
+        wal.replay(|r| -> Result<()> {
+            replayed.push(r.key.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, vec![b"new".to_vec()], "the new record at {:?} is replayed", fresh);
+    }
+
     // ── Wired into Database ─────────────────────────────────────────────
 
     use crate::db::database::Database;
@@ -1718,8 +1962,11 @@ mod tests {
     fn log_and_apply(db: &Database, ns: u32, key: &[u8], value: &[u8]) {
         let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
         let logged = db.vector_index_wal.append(ns, key, value, seq).unwrap();
-        db.put_ns_no_wal(ns, key, value).unwrap();
+        // Applied with the logged seq, and synced before the caller goes on,
+        // as step 4's worker will (it completes an entry only after a sync).
+        db.get_store(ns).unwrap().replay_upsert(key, value, seq).unwrap();
         drop(logged);
+        db.vector_index_wal.sync().unwrap();
     }
 
     #[test]
@@ -1800,17 +2047,167 @@ mod tests {
             log_and_apply(&db, v, b"k2", b"y");
             // A namespace that no longer exists after the restart.
             db.vector_index_wal.append(999, b"gone", b"z", 1).unwrap();
+            db.vector_index_wal.sync().unwrap();
             db.mark_crashed();
             (v, first)
         };
 
         let db = Database::open(dir.path(), create_db_config()).unwrap();
         assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![v], "999 was released at open");
+        assert_eq!(db.metrics_snapshot().vector_wal_records_skipped, 1, "999's record is not replayed");
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 2);
         let u = db.registry.read().get_id("u").unwrap();
         log_and_apply(&db, u, b"k", b"v");
         db.get_store(u).unwrap().flush_memtable_to_level0().unwrap();
         assert!(db.vector_index_wal.retired_cut() <= first, "u's flush must not retire v's records");
         let stats = db.vector_index_wal_stats().unwrap();
         assert_eq!(stats.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["v"]);
+    }
+
+    /// The timeline from the step 3 review: a chunk key whose delete reached
+    /// L1 (tombstone dropped) while another vector namespace held the global
+    /// cut below the key's record. Replaying from the global cut brings the
+    /// key back, with nothing newer left to beat it.
+    #[test]
+    fn replay_does_not_bring_back_a_key_whose_delete_reached_l1() {
+        let dir = TempDir::new().unwrap();
+        let (sparse, k) = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let sparse = db.create_namespace("docs_sparse_vector").unwrap();
+            let dense = db.create_namespace("docs_dense_vector").unwrap();
+            let k: &[u8] = b"posting-7|doc-42";
+
+            // 1-2. A chunk key in the sparse namespace, a dense code in the other.
+            log_and_apply(&db, sparse, k, b"chunk code");
+            let r_start = db.vector_index_wal.tail();
+            log_and_apply(&db, dense, b"doc-42", b"dense code");
+            // 3. Sparse flushes; dense still holds the global cut below R.
+            db.get_store(sparse).unwrap().flush_memtable_to_level0().unwrap();
+            assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![dense]);
+            assert!(db.vector_index_wal.retired_cut() < r_start, "the cut stays below R");
+            // 4-6. The chunk moves away: K is deleted (main WAL), flushed and
+            // merged into L1, which drops the tombstone.
+            db.delete_ns(sparse, k).unwrap();
+            let store = db.get_store(sparse).unwrap();
+            store.flush_memtable_to_level0().unwrap();
+            store.compact_lsm().unwrap();
+            assert_eq!(db.get_ns(sparse, k).unwrap(), None);
+            // The namespace keeps working: its next compaction pass also removes
+            // the L0 files the merge made obsolete, tombstone included.
+            log_and_apply(&db, sparse, b"posting-9|doc-42", b"chunk code");
+            store.flush_memtable_to_level0().unwrap();
+            store.compact_lsm().unwrap();
+            let m = db.wal_metadata();
+            assert_eq!(m.persisted_entries, m.total_entries, "main-WAL recovery has nothing to replay");
+            // 7. Crash.
+            db.mark_crashed();
+            (sparse, k.to_vec())
+        };
+
+        // 8. Restart: open replays the vector index WAL. R lies below the sparse
+        // namespace's own durable safe offset, so it is not replayed; the dense
+        // namespace's record is.
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(
+            db.get_ns(sparse, &k).unwrap(),
+            None,
+            "a deleted chunk key must stay deleted after recovery"
+        );
+        let dense = db.registry.read().get_id("docs_dense_vector").unwrap();
+        assert_eq!(db.get_ns(dense, b"doc-42").unwrap(), Some(b"dense code".to_vec()));
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 1);
+    }
+
+    fn reopen_db(dir: &TempDir) -> Database {
+        Database::open(dir.path(), create_db_config()).unwrap()
+    }
+
+    #[test]
+    fn records_are_replayed_after_a_crash_and_retire_once_flushed() {
+        let dir = TempDir::new().unwrap();
+        let ns = {
+            let db = reopen_db(&dir);
+            let ns = db.create_namespace("v_sparse_vector").unwrap();
+            for i in 0..20u64 {
+                log_and_apply(&db, ns, &key(i), &value(i));
+            }
+            db.mark_crashed(); // nothing flushed
+            ns
+        };
+        let db = reopen_db(&dir);
+        for i in 0..20u64 {
+            assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)), "key {i} replayed");
+        }
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 20);
+        assert_eq!(db.vector_index_wal.namespaces_holding_cut(), vec![ns]);
+        // The GC tick's flush retires them.
+        assert_eq!(db.flush_namespaces_pinning_vector_wal(), 1);
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+        db.mark_crashed();
+        drop(db);
+
+        let db = reopen_db(&dir);
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 0, "everything was retired");
+        for i in 0..20u64 {
+            assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)), "key {i} survives a second crash");
+        }
+    }
+
+    #[test]
+    fn a_write_after_restart_beats_a_replayed_record() {
+        let dir = TempDir::new().unwrap();
+        let (ns, seq) = {
+            let db = reopen_db(&dir);
+            let ns = db.create_namespace("v").unwrap();
+            db.put_ns(ns, b"main-wal", b"x").unwrap(); // the main WAL's last seq is below the record's
+            log_and_apply(&db, ns, b"k", b"old");
+            let seq = db.vector_index_wal.last_seq();
+            db.mark_crashed();
+            (ns, seq)
+        };
+        let db = reopen_db(&dir);
+        assert!(db.next_seq.load(Ordering::SeqCst) > seq, "the counter is raised above the log");
+        log_and_apply(&db, ns, b"k", b"new");
+        assert_eq!(db.get_ns(ns, b"k").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn a_crash_loses_appends_that_were_never_synced() {
+        let dir = TempDir::new().unwrap();
+        let ns = {
+            let db = reopen_db(&dir);
+            let ns = db.create_namespace("v").unwrap();
+            log_and_apply(&db, ns, b"synced", b"1"); // syncs
+            let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
+            let logged = db.vector_index_wal.append(ns, b"unsynced", b"2", seq).unwrap();
+            db.get_store(ns).unwrap().replay_upsert(b"unsynced", b"2", seq).unwrap();
+            drop(logged);
+            db.mark_crashed();
+            ns
+        };
+        let db = reopen_db(&dir);
+        assert_eq!(db.get_ns(ns, b"synced").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_ns(ns, b"unsynced").unwrap(), None, "a power loss takes what was never synced");
+    }
+
+    #[test]
+    fn a_crash_during_recovery_recovers_the_same() {
+        let dir = TempDir::new().unwrap();
+        let ns = {
+            let db = reopen_db(&dir);
+            let ns = db.create_namespace("v").unwrap();
+            for i in 0..5u64 {
+                log_and_apply(&db, ns, &key(i), &value(i));
+            }
+            db.mark_crashed();
+            ns
+        };
+        // Replays, then crashes before anything is flushed.
+        reopen_db(&dir).mark_crashed();
+        let db = reopen_db(&dir);
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 5);
+        for i in 0..5u64 {
+            assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)));
+        }
     }
 }

@@ -105,6 +105,10 @@ pub struct Metrics {
     pub vector_wal_segments_deleted: AtomicU64,
     /// Flushes of a namespace that held the vector index WAL's retired cut back.
     pub vector_wal_pin_flushes: AtomicU64,
+    /// Vector index WAL records replayed into memtables at open.
+    pub vector_wal_records_replayed: AtomicU64,
+    /// Vector index WAL records skipped at open: their namespace was dropped.
+    pub vector_wal_records_skipped: AtomicU64,
 }
 
 impl Metrics {
@@ -178,6 +182,8 @@ impl Metrics {
             vector_wal_gc_runs: g(&self.vector_wal_gc_runs),
             vector_wal_segments_deleted: g(&self.vector_wal_segments_deleted),
             vector_wal_pin_flushes: g(&self.vector_wal_pin_flushes),
+            vector_wal_records_replayed: g(&self.vector_wal_records_replayed),
+            vector_wal_records_skipped: g(&self.vector_wal_records_skipped),
         }
     }
 
@@ -225,6 +231,8 @@ impl Metrics {
         a(&self.vector_wal_gc_runs, o.vector_wal_gc_runs);
         a(&self.vector_wal_segments_deleted, o.vector_wal_segments_deleted);
         a(&self.vector_wal_pin_flushes, o.vector_wal_pin_flushes);
+        a(&self.vector_wal_records_replayed, o.vector_wal_records_replayed);
+        a(&self.vector_wal_records_skipped, o.vector_wal_records_skipped);
     }
 }
 
@@ -270,6 +278,8 @@ pub struct MetricsSnapshot {
     pub vector_wal_gc_runs: u64,
     pub vector_wal_segments_deleted: u64,
     pub vector_wal_pin_flushes: u64,
+    pub vector_wal_records_replayed: u64,
+    pub vector_wal_records_skipped: u64,
 }
 
 impl MetricsSnapshot {
@@ -314,5 +324,7 @@ impl MetricsSnapshot {
         self.vector_wal_gc_runs += o.vector_wal_gc_runs;
         self.vector_wal_segments_deleted += o.vector_wal_segments_deleted;
         self.vector_wal_pin_flushes += o.vector_wal_pin_flushes;
+        self.vector_wal_records_replayed += o.vector_wal_records_replayed;
+        self.vector_wal_records_skipped += o.vector_wal_records_skipped;
     }
 }

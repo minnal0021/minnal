@@ -174,15 +174,19 @@ WAL's rule, applied per vector namespace, and it reuses the same mechanism:
   another namespace's write in flight says nothing about `n`'s memtable; with a
   global ceiling, `n` could flush everything it wrote and still hold the cut,
   with an empty memtable that no later flush would seal.
-- **On flush** of `(n, v)`, the observer advances `n`'s `safe_offset`, strictly
-  in version order (an out-of-order flush cannot skip an older pending memtable).
-  A flush with no seal record retires nothing: `n`'s first record may have
-  landed in the next memtable after that seal.
-- The vector index WAL's **retired cut** is the minimum `safe_offset` over vector
-  namespaces still holding un-flushed logged writes, capped by the ceiling of
-  all namespaces. It only moves forward, and it is written to a small marker
-  file (tmp + rename + fsync) before it is used; at open it says where replay
-  starts.
+- **When `(n, v)`'s L0 files are written and fsynced, before they are
+  registered**, the observer advances `n`'s `safe_offset`, strictly in version
+  order (an out-of-order flush cannot skip an older pending memtable). The LSM
+  reports this moment separately (`LsmFlushObserver::on_ro_memtable_written`);
+  until the files are registered nothing can read or merge them. A memtable
+  with no seal record retires nothing: `n`'s first record may have landed in
+  the next memtable after that seal.
+- The marker file (tmp + rename + fsync) holds the **retired cut** — the minimum
+  `safe_offset` over vector namespaces still holding un-flushed logged writes,
+  capped by the ceiling of all namespaces — and **each namespace's own
+  `safe_offset`** above it. It is written in that same event, so it is durable
+  before the files are registered. The cut only moves forward. At open the
+  marker says where each namespace's replay starts (§7).
 
 A namespace that writes a little and goes idle would hold the cut back, as in the
 main WAL. The vector index WAL's GC tick flushes vector namespaces that pin it, exactly
@@ -209,8 +213,11 @@ memtable each (100,000 entries), plus the segment in progress.
 At open, after the registry and stores are loaded and **before** any worker
 starts:
 
-1. Read the retired cut from the marker file (zero if absent).
-2. Read every vector-index-WAL record at or above it, stopping at the torn tail.
+1. Read the marker: the retired cut and each namespace's `safe_offset` (zero if
+   absent).
+2. Read every vector-index-WAL record at or above the cut, stopping at the torn
+   tail. Keep only those at or above **their own namespace's** `safe_offset`
+   (the cut, for a namespace the marker does not list).
 3. Skip records whose namespace is no longer in the registry (dropped store or
    dropped vector index), as main-WAL recovery does.
 4. Replay each remaining record with its original seq (`replay_upsert`), which
@@ -222,6 +229,13 @@ starts:
    this, a new write could draw a seq below a replayed one and lose to it.
 6. Main-WAL recovery runs as it does now. Both logs replay with original seqs
    into memtables that resolve by seq, so their relative order does not matter.
+
+If the marker names a position past the log's durable end, a power loss took
+records of a memtable that had already been written to L0: their data is safe
+in SSTables, but the log lost them. The open then seals the last segment and
+starts the next, so every new record lies above every position the marker
+names; otherwise replay would skip new records below a namespace's
+`safe_offset`.
 
 Before any of this, opening the log rebuilds which namespaces hold the cut: the
 in-memory seal records and per-namespace progress are lost in a crash, so every
@@ -236,17 +250,24 @@ Then the vector worker starts and finds the queue as the crash left it.
 
 `minnal_db/CLAUDE.md` warns that re-applying an old seq can bring back a deleted
 key: L1 drops tombstones, so if the key's later delete already reached L1, the
-old write wins again. Replay avoids this the same way main-WAL replay does — it
-only replays **unretired** records:
+old write wins again. The main WAL avoids this because its deletes are in the
+same log and replay alongside its puts. The vector writes' deletes are in the
+**main** WAL, so the vector index WAL has to avoid it by itself:
 
 - A later write to the same key (a delete of a stale chunk key, a re-embed)
   holds the key's stripe from seq allocation to apply, so it is applied after
-  the replayed record, into the same memtable or a later one.
-- Memtables flush in version order, so if that later write has been flushed (let
-  alone merged into L1 with its tombstone dropped), the replayed record's
-  memtable was flushed first, and the record is retired.
-- So an unretired record has no flushed later write to override. The test for
-  this is the first mutation in §8.
+  the replayed record, into the same memtable of that namespace or a later one.
+- Memtables are written to L0 in version order, so if that later write has been
+  written (let alone merged into L1 with its tombstone dropped), the replayed
+  record's memtable was written first.
+- That memtable's write moved the namespace's `safe_offset` past the record,
+  durably, before its files could be merged.
+- So replay, which starts each namespace at its own `safe_offset`, never applies
+  a record that has a written later write. The global cut alone would not do:
+  another namespace can hold it below a record whose namespace flushed long
+  ago, and that record's key can be deleted and merged into L1 meanwhile.
+  `replay_does_not_bring_back_a_key_whose_delete_reached_l1` reproduces exactly
+  that, and fails when replay starts every namespace at the cut.
 
 ## 8. Crash points and tests
 
@@ -275,8 +296,8 @@ no-WAL writes until 2026-10-11.)
 **Mutation checks** — each must make a test fail, or the test is not guarding
 anything:
 
-1. Replay ignores the retired cut (replays every record) → a key deleted and
-   compacted to L1 comes back.
+1. Replay starts every namespace at the global cut (or ignores it) → a key
+   deleted and compacted to L1 comes back.
 2. `sync` skipped before completion (with the crash simulation truncating
    unsynced appends) → a completed document has no vectors.
 3. Retire on seal instead of on flush → a crash between seal and flush loses a

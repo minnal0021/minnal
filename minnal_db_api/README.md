@@ -1257,6 +1257,8 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `gc_runs` | vector_index_wal | Its GC passes (one per WAL GC tick) | **No** |
 | `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
 | `pin_flushes` | vector_index_wal | Flushes of an idle namespace that held its retired cut back | **No** |
+| `records_replayed` | vector_index_wal | Records replayed into memtables when the server started | **No** |
+| `records_skipped` | vector_index_wal | Records not replayed at start because their namespace had been dropped | **No** |
 | `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
 | `peak_bytes` | index_overlay | Highest `used_bytes` since startup | **No** |
 | `soft_limit_bytes` / `hard_limit_bytes` | index_overlay | `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` | n/a (config) |
@@ -1330,7 +1332,8 @@ vector worker writes its chunk and whole-document codes to so that one fsync per
 batch makes them durable. One log per database, shared by every namespace. A
 record is **retired** once the memtable holding its write has been flushed to
 disk; restart replays only unretired records, and GC deletes segments that lie
-wholly below the **retired cut**. Positions are `{segment_id, byte}`.
+wholly below the **retired cut**. Each namespace's replay starts at its own
+`safe_offset`, which may be above the cut. Positions are `{segment_id, byte}`.
 
 | Field | Meaning |
 |-------|---------|

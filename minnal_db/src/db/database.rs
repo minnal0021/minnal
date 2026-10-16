@@ -564,11 +564,15 @@ impl LsmFlushObserver for LsmFlushObserverHub {
         self.trigger_compaction();
     }
 
-    // Arrives through `SyncValueLogBeforePersist`, so the values the retired
-    // records point at are fsynced first.
+    // Before the memtable's L0 files are registered, and through
+    // `SyncValueLogBeforePersist`, so the values the retired records point at
+    // are fsynced first. See `LsmFlushObserver` for the order of events.
+    fn on_ro_memtable_written(&self, version: u64) {
+        self.vector_index_wal.on_memtable_written(self.namespace_id, version);
+    }
+
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
         self.wal_observer.on_ro_memtable_flushed_to_level0_ns(self.namespace_id, version);
-        self.vector_index_wal.on_memtable_flushed(self.namespace_id, version);
     }
 }
 
@@ -986,6 +990,7 @@ impl Database {
         db.record_no_wal_gaps_after_unclean_shutdown();
 
         // Recover from WAL
+        db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
 
         // Rebuild WAL persisted state and wire up observers
@@ -2469,6 +2474,66 @@ impl Database {
 
     // ── Recovery ───────────────────────────────────────────────────────
 
+    /// Replay the vector index WAL's unretired records into their memtables,
+    /// with their original seqs, then raise the seq counter above every record.
+    ///
+    /// Runs at open, before main-WAL recovery and before the flush observers
+    /// are wired: both logs replay with original seqs into memtables that
+    /// resolve by seq, so their order does not matter, and a seal made while
+    /// replaying is unobserved, so that memtable retires nothing when flushed
+    /// (its namespace holds the cut until the GC tick's flush seals it again).
+    /// Each record is applied only if it lies at or above its namespace's
+    /// durable safe offset (`VectorIndexWal::replay`); records of a namespace
+    /// no longer in the registry are skipped. A record that fails twice goes
+    /// to the fail log, as in main-WAL recovery.
+    fn recover_from_vector_index_wal(&self) -> Result<()> {
+        // A new write must never draw a seq below a replayed record's, or it
+        // would lose to it.
+        self.next_seq
+            .fetch_max(self.vector_index_wal.last_seq().saturating_add(1), Ordering::SeqCst);
+
+        let stores = self.stores.read().clone();
+        let (mut replayed, mut skipped) = (0u64, 0u64);
+        let mut failed: Vec<(WalEntry, String)> = Vec::new();
+        self.vector_index_wal.replay(|r| -> Result<()> {
+            let Some(store) = stores.get(&r.ns_id) else {
+                skipped += 1;
+                return Ok(());
+            };
+            match store
+                .replay_upsert(r.key, r.value, r.seq)
+                .or_else(|_| store.replay_upsert(r.key, r.value, r.seq))
+            {
+                Ok(()) => replayed += 1,
+                Err(e) => {
+                    let entry = WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), r.value.to_vec())
+                        .with_sequence(r.seq)
+                        .with_op_name("vector_index_wal_replay");
+                    failed.push((entry, e.to_string()));
+                }
+            }
+            Ok(())
+        })?;
+
+        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_replayed, replayed);
+        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_skipped, skipped);
+        if replayed + skipped > 0 || !failed.is_empty() {
+            info!(
+                "[RECOVERY] vector index WAL: replayed {replayed} record(s), skipped {skipped} of dropped namespaces, {} failed",
+                failed.len()
+            );
+        }
+        if !failed.is_empty() {
+            error!(
+                "[RECOVERY] vector index WAL: {} record(s) failed to replay twice; see the fail log",
+                failed.len()
+            );
+            let failures: Vec<(&WalEntry, String)> = failed.iter().map(|(e, msg)| (e, msg.clone())).collect();
+            crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
+        }
+        Ok(())
+    }
+
     fn recover_from_wal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let head = wal_metadata.head;
@@ -2927,6 +2992,8 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn mark_crashed(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A crash test must see a missing `sync`: drop what a power loss would.
+        self.vector_index_wal.lose_unsynced();
         // Each store flushes itself when dropped; a crash must not.
         for store in self.stores.read().values() {
             store.mark_crashed();
@@ -3108,6 +3175,7 @@ impl Database {
         // Report field indices left incomplete by no-WAL writes that an unclean
         // shutdown caught before any checkpoint covered them.
         db.record_no_wal_gaps_after_unclean_shutdown();
+        db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
         let last_persisted = db.rebuild_wal_persisted_state()?;
         *db.last_persisted_wal_offset.write() = last_persisted;

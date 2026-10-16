@@ -29,9 +29,30 @@ use thiserror::Error;
 
 use crate::db::metrics::Metrics;
 
+/// An L0 file written and fsynced by a flush, not yet registered.
+struct WrittenLevel0File {
+    path: PathBuf,
+    created_at_ms: u128,
+    summary: Option<L0Summary>,
+}
+
 /// Observer interface for memtable flush lifecycle events.
+///
+/// For one read-only memtable the events arrive in this order, and a flusher
+/// handles memtables in version order (it waits on each one's `flush_lock`):
+///
+/// 1. `on_memtable_sealed` — under the active memtable's write lock, so no
+///    write can be applied into the next memtable meanwhile;
+/// 2. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
+///    and **none is registered yet**: nothing can read or merge them, so no
+///    merge can have dropped a tombstone they hold. The vector index WAL makes
+///    its progress durable here (`db/vector_index_wal.rs`);
+/// 3. `on_ro_memtable_flushed_to_level0` — the files are registered and the
+///    memtable is marked flushed. The main WAL marks entries persisted here.
 pub(crate) trait LsmFlushObserver: Send + Sync {
     fn on_memtable_sealed(&self, version: u64);
+    /// The memtable's L0 files are durable but not yet registered. Default: no-op.
+    fn on_ro_memtable_written(&self, _version: u64) {}
     fn on_ro_memtable_flushed_to_level0(&self, version: u64);
 }
 
@@ -1229,6 +1250,12 @@ impl LSMTree {
         }
     }
 
+    fn notify_ro_memtable_written(&self, version: u64) {
+        if let Some(observer) = self.flush_observer.read().as_ref() {
+            observer.on_ro_memtable_written(version);
+        }
+    }
+
     fn notify_ro_memtable_flushed_to_level0(&self, version: u64) {
         if let Some(observer) = self.flush_observer.read().as_ref() {
             observer.on_ro_memtable_flushed_to_level0(version);
@@ -1277,7 +1304,7 @@ impl LSMTree {
     ///
     /// Naming note:
     /// - Level 1 uses a fixed file per bucket (level1_<bucket>.dat).
-    /// - Level 0 uses timestamp-based filenames per flush (see create_level0_file_for_records).
+    /// - Level 0 uses timestamp-based filenames per flush (see write_level0_file_for_records).
     ///   This is why you can see gaps in L0 and the same bucket id in both levels.
     fn level1_path_from(base_path: &Path, bucket: u32) -> PathBuf {
         Self::level1_dir_from(base_path).join(format!("level1_{}.dat", bucket))
@@ -1397,7 +1424,7 @@ impl LSMTree {
     /// One of the two points that establish "a registered L0 file has a valid
     /// header" — the invariant [`open_registered_l0`] relies on to skip
     /// re-validation on every read. Here it holds by construction: the only caller
-    /// is `create_level0_file_for_records`, which just wrote the header and
+    /// is `flush_ro_memtable_to_level0`, whose `write_level0_file_for_records` just wrote the header and
     /// fsynced. The other point is `load_existing_level0_files` at open, which
     /// validates what it finds on disk. **Do not register a file from anywhere
     /// else without validating its header first.**
@@ -1479,8 +1506,31 @@ impl LSMTree {
             .as_millis();
         let timestamp = self.next_l0_stamp(now_ms.saturating_mul(1_000_000).saturating_add(ro_memtable.version() as u128));
 
+        // Write and fsync every bucket's file first, register them after. Between
+        // the two, observers learn the files are durable while nothing can yet
+        // read or merge them (`on_ro_memtable_written`): the vector index WAL
+        // relies on that to make its progress durable before a merge could drop
+        // a tombstone these files hold. Reads stay correct meanwhile, since the
+        // read-only memtable is searched until it is marked flushed below.
+        let mut written: Vec<(u32, WrittenLevel0File)> = Vec::new();
         for bucket in 0u32..self.config.num_buckets as u32 {
-            self.create_level0_file_for_records(bucket, &records, timestamp)?;
+            match self.write_level0_file_for_records(bucket, &records, timestamp) {
+                Ok(Some(file)) => written.push((bucket, file)),
+                Ok(None) => {}
+                Err(e) => {
+                    // Unregistered files are not live; remove them so a retry
+                    // (with a new stamp) does not leave duplicates on disk.
+                    for (_, file) in &written {
+                        let _ = std::fs::remove_file(&file.path);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        self.notify_ro_memtable_written(ro_memtable.version());
+        for (bucket, file) in written {
+            self.register_level0_file(bucket, file.path, file.created_at_ms, file.summary);
         }
 
         ro_memtable.mark_flushed_to_level0();
@@ -1488,7 +1538,9 @@ impl LSMTree {
         Ok(())
     }
 
-    fn create_level0_file_for_records(&self, bucket: u32, records: &[KeyValueRecord], timestamp_ms: u128) -> Result<()> {
+    /// Writes and fsyncs (file and directory) one bucket's L0 file for
+    /// `records`, without registering it. `None` when the bucket has no records.
+    fn write_level0_file_for_records(&self, bucket: u32, records: &[KeyValueRecord], timestamp_ms: u128) -> Result<Option<WrittenLevel0File>> {
         let mut bucket_records = Vec::new();
         for record in records {
             let record_bucket = get_bucket_for_key(&record.key, self.config.num_buckets);
@@ -1498,7 +1550,7 @@ impl LSMTree {
         }
 
         if bucket_records.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         bucket_records.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1550,8 +1602,11 @@ impl LSMTree {
             summary.index = (!index.is_empty()).then_some(index);
         }
 
-        self.register_level0_file(bucket, level0_path, timestamp_ms, summary);
-        Ok(())
+        Ok(Some(WrittenLevel0File {
+            path: level0_path,
+            created_at_ms: timestamp_ms,
+            summary,
+        }))
     }
 
     /// Read all entries from an existing SSTable file
@@ -5873,6 +5928,83 @@ mod tests {
     // and both must return only once it is durable. Without the per-memtable flush
     // lock both wrote it (a duplicate file; in the same millisecond, one file name
     // with the second `File::create` truncating the first).
+    /// Records each flush event with the number of L0 files registered at that
+    /// moment, reading the tree through a weak handle set after it is built.
+    struct EventLog {
+        tree: std::sync::OnceLock<std::sync::Weak<LSMTree>>,
+        events: parking_lot::Mutex<Vec<(&'static str, u64, usize)>>,
+    }
+
+    impl EventLog {
+        fn registered(&self) -> usize {
+            let tree = self.tree.get().and_then(|t| t.upgrade()).expect("tree alive");
+            (0..tree.config.num_buckets as u32).map(|b| tree.level0_entries_snapshot(b).len()).sum()
+        }
+    }
+
+    impl LsmFlushObserver for EventLog {
+        fn on_memtable_sealed(&self, _version: u64) {}
+        fn on_ro_memtable_written(&self, version: u64) {
+            let n = self.registered();
+            self.events.lock().push(("written", version, n));
+        }
+        fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
+            let n = self.registered();
+            self.events.lock().push(("flushed", version, n));
+        }
+    }
+
+    // The vector index WAL makes its progress durable in `on_ro_memtable_written`
+    // and relies on two things: none of the memtable's L0 files is registered
+    // (mergeable) yet, and memtables arrive in version order even when several
+    // threads flush at once. Both are pinned here.
+    #[test]
+    fn the_written_event_comes_before_registration_and_in_version_order() -> Result<()> {
+        for round in 0..50 {
+            let temp_dir = TempDir::new()?;
+            let lsm = Arc::new(LSMTree::open(
+                temp_dir.path(),
+                LSMConfig {
+                    num_buckets: 2,
+                    ..LSMConfig::default()
+                },
+            )?);
+            let log = Arc::new(EventLog {
+                tree: std::sync::OnceLock::new(),
+                events: parking_lot::Mutex::new(Vec::new()),
+            });
+            log.tree.set(Arc::downgrade(&lsm)).ok();
+            lsm.set_flush_observer(Some(Arc::clone(&log) as Arc<dyn LsmFlushObserver>));
+            let mut seq = 0u64;
+            for _ in 0..3 {
+                for i in 0..50u64 {
+                    seq += 1;
+                    lsm.insert_with_seq(format!("k{i:03}").as_bytes(), u128::from(seq), seq)?;
+                }
+                lsm.flush_memtable()?; // three read-only memtables, none on disk
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let flushers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (lsm, barrier) = (Arc::clone(&lsm), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        lsm.flush_memtable_to_level0()
+                    })
+                })
+                .collect();
+            for flusher in flushers {
+                flusher.join().expect("flusher panicked")?;
+            }
+            // 50 keys over 2 buckets: each memtable registers one file per bucket.
+            let want: Vec<(&str, u64, usize)> = (0..3u64)
+                .flat_map(|v| [("written", v, 2 * v as usize), ("flushed", v, 2 * (v as usize + 1))])
+                .collect();
+            assert_eq!(*log.events.lock(), want, "round {round}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_concurrent_flushes_of_one_memtable_write_it_once() -> Result<()> {
         for round in 0..100 {

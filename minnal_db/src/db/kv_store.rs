@@ -1892,6 +1892,19 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
         self.inner.on_memtable_sealed(version);
     }
 
+    // The vector index WAL retires records here, so the values they point at
+    // must be on stable storage first, exactly as for the persisted event below.
+    // The second fsync, before that event, then finds little or nothing to write.
+    fn on_ro_memtable_written(&self, version: u64) {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before memtable {version}'s L0 files were registered; nothing is retired: {e:?}");
+                return;
+            }
+        }
+        self.inner.on_ro_memtable_written(version);
+    }
+
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
         for log in &self.logs {
             if let Err(e) = log.sync() {

@@ -200,6 +200,10 @@ pub struct VectorIndexWalMetrics {
     segments_deleted: u64,
     /// Flushes of a namespace that held the retired cut back.
     pin_flushes: u64,
+    /// Records replayed into memtables at the last open.
+    records_replayed: u64,
+    /// Records skipped at the last open because their namespace was dropped.
+    records_skipped: u64,
 }
 
 /// The grouped operational-metrics body (without the engine-level `uptime_s`),
@@ -292,6 +296,8 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             gc_runs: m.vector_wal_gc_runs,
             segments_deleted: m.vector_wal_segments_deleted,
             pin_flushes: m.vector_wal_pin_flushes,
+            records_replayed: m.vector_wal_records_replayed,
+            records_skipped: m.vector_wal_records_skipped,
         },
     }
 }
