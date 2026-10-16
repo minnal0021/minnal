@@ -91,6 +91,14 @@ pub struct Metrics {
     pub vlog_gc_bytes_rewritten: AtomicU64,
     pub wal_gc_runs: AtomicU64,
     pub wal_segments_deleted: AtomicU64,
+
+    // ── Vector index WAL (engine-global: only the database's own instance) ──
+    /// Records appended to the vector index WAL.
+    pub vector_wal_appends: AtomicU64,
+    /// Bytes appended to the vector index WAL (frames included).
+    pub vector_wal_bytes_appended: AtomicU64,
+    /// Vector index WAL fsyncs — one per `sync` that had anything to make durable.
+    pub vector_wal_fsyncs: AtomicU64,
 }
 
 impl Metrics {
@@ -158,6 +166,9 @@ impl Metrics {
             vlog_gc_bytes_rewritten: g(&self.vlog_gc_bytes_rewritten),
             wal_gc_runs: g(&self.wal_gc_runs),
             wal_segments_deleted: g(&self.wal_segments_deleted),
+            vector_wal_appends: g(&self.vector_wal_appends),
+            vector_wal_bytes_appended: g(&self.vector_wal_bytes_appended),
+            vector_wal_fsyncs: g(&self.vector_wal_fsyncs),
         }
     }
 
@@ -199,6 +210,9 @@ impl Metrics {
         a(&self.vlog_gc_duration_ms, o.vlog_gc_duration_ms);
         a(&self.wal_gc_runs, o.wal_gc_runs);
         a(&self.wal_segments_deleted, o.wal_segments_deleted);
+        a(&self.vector_wal_appends, o.vector_wal_appends);
+        a(&self.vector_wal_bytes_appended, o.vector_wal_bytes_appended);
+        a(&self.vector_wal_fsyncs, o.vector_wal_fsyncs);
     }
 }
 
@@ -238,6 +252,9 @@ pub struct MetricsSnapshot {
     pub vlog_gc_bytes_rewritten: u64,
     pub wal_gc_runs: u64,
     pub wal_segments_deleted: u64,
+    pub vector_wal_appends: u64,
+    pub vector_wal_bytes_appended: u64,
+    pub vector_wal_fsyncs: u64,
 }
 
 impl MetricsSnapshot {
@@ -276,5 +293,8 @@ impl MetricsSnapshot {
         self.vlog_gc_bytes_rewritten += o.vlog_gc_bytes_rewritten;
         self.wal_gc_runs += o.wal_gc_runs;
         self.wal_segments_deleted += o.wal_segments_deleted;
+        self.vector_wal_appends += o.vector_wal_appends;
+        self.vector_wal_bytes_appended += o.vector_wal_bytes_appended;
+        self.vector_wal_fsyncs += o.vector_wal_fsyncs;
     }
 }
