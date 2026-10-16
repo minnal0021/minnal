@@ -426,8 +426,38 @@ search's prefix scans read more from memory. The cold-query step is not
 comparable across builds here: it runs at each build's highest passing rate,
 and after-1's ran with an embedding backlog.
 
-Still to run (step 5): the vector bench (indexing time, recall and nDCG at
-@10–@100, which must be identical).
+### 9c. Measured: the vector bench
+
+**Setup.** The vector bench (`semantic_search::vector_bench`) indexes a frozen
+set of gemma embeddings with background workers running, growing the partition
+from one posting (target 128), then searches. SciFact (5,183 documents) and
+FiQA (57,600), corpus order, three latency passes. **Before**: a test binary
+built at 2e88f1d (the worker's flush barrier). **After**: one built at 9f91bc7
+(the vector index WAL, steps 1–6). Run before, after, before, after on one
+idle host, 2026-10-17; results in
+`work/bench/results/vwal-bench-{before,after}-r{1,2}/`. (The `git` field in
+those files names the checkout the bench ran from, not the binary's commit.)
+
+**Results are identical.** In all four before/after pairs, every probe setting
+(fixed 4–128 postings and every entry budget) scans the same entries and gives
+the same nDCG@10, ANN recall@10 and Pass-1 recall, with no query won or lost;
+at 64 postings nDCG is identical at @10, @20, @30, @40, @50 and @100. The
+partition is the same too (SciFact 133 postings and 132 splits, FiQA 979 and
+978; the same reassignment and drain moves), as are the index size and the
+estimator errors.
+
+**Indexing is faster**, because the barrier after each batch is one fsync of
+the log instead of a flush of three namespaces:
+
+| Dataset | Before (s) | After (s) | Change |
+|---|---|---|---|
+| SciFact | 4.14, 4.11 | 3.32, 3.32 | −20% |
+| FiQA | 53.4, 52.8 | 46.0, 44.9 | −14% |
+
+Search p50, averaged over every probe setting, is +1.8% and +2.6% on SciFact
+and +1.7% and −0.1% on FiQA (a few hundredths of a millisecond). That is close
+to run-to-run noise, but it points the same way as the search p99 question
+above, so the full M5 run checks both.
 
 ## 10. Alternatives considered
 
