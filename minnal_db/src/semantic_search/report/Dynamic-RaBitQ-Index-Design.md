@@ -1567,9 +1567,9 @@ record.
 |---|---|---|---|
 | 1. Plan | Read P, reconstruct `x̂ = c + scaling_factor · P(2b − 1)` (unrotated), run balanced 2-means. Write the record | WAL | `Planned` |
 | 2. Prepare | Append the two centres; write postings P1, P2 (`Active`); mark P `Draining` | WAL | `Planned` |
-| 3. Publish | Take the routing-epoch write guard (below), publish a snapshot where inserts never choose P but search still probes it | WAL | `Published` |
-| 4. Copy | Per doc, under `lock_doc_vectors`: add P1/P2 to the doc's meta (WAL), then write its chunks under `P1‖doc` / `P2‖doc` (**no-WAL**) | WAL + no-WAL | `Published` |
-| 5. Barrier | Flush the sparse and meta namespaces to L0 (the flush fsyncs the value log first) | flush | `Copied` |
+| 3. Publish | Publish a snapshot where inserts never choose P but search still probes it, then wait out the inserts and searches that entered the routing epoch (below) before it | WAL | `Published` |
+| 4. Copy | Per doc, under `lock_doc_vectors`: add P1/P2 to the doc's meta (WAL), then write its chunks under `P1‖doc` / `P2‖doc` (vector index WAL) | WAL + vector index WAL | `Published` |
+| 5. Barrier | One fsync of the vector index WAL | fsync | `Copied` |
 | 6. Delete | Per doc, under the lock: remove P from the doc's meta, then delete `P‖doc`. Rescan P; it must be empty | WAL | `Copied` |
 | 7. Retire | Mark P `Retired`; publish the snapshot | WAL | `Done` |
 
@@ -1615,10 +1615,11 @@ moves the entries the plan selects from neighbouring postings.
    lock and skips it if an upsert or delete already changed it. A repeated move
    must not append a chunk that is already there: chunk codes carry no id, so
    de-duplicate by comparing bytes.
-4. **Routing epoch.** Inserts route and write while holding a per-namespace
-   tokio `RwLock` read guard, inside `lock_doc_vectors`. Step 3 takes the write
-   guard only to publish, so once it returns no insert that routed with the old
-   snapshot is still writing to P.
+4. **Routing epoch.** Inserts route and write inside a per-namespace routing
+   epoch, a grace period: entering never waits. Step 3 installs the new
+   snapshot and then waits until every insert (and search) that entered before
+   it has left, so once it returns no insert that routed with the old snapshot
+   is still writing to P, and no new insert or search ever waits for it.
 5. **Recovery comes first.** Reconciliation treats `Draining` and `Retired`
    postings as part of the journal's work: an entry under a retired prefix is
    moved, not reported as an orphan.
