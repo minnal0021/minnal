@@ -1427,7 +1427,10 @@ pub async fn ivf_exists(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KV
 
 /// Write `namespace`'s starting partition: centre 0 is the zero vector of `dim`
 /// dimensions and posting 0, the root, encodes against it. Replaces whatever a
-/// cut-short earlier attempt left. Durable on return.
+/// cut-short earlier attempt left. Durable on return: WAL-backed puts, as every
+/// other partition record (a split's postings and centres, the journal), so the
+/// partition is on disk before the caller saves the schema that enables
+/// semantic search.
 pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), crate::KVError> {
     use crate::semantic_search::{Posting, PostingOrigin, PostingState};
     let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
@@ -1438,7 +1441,7 @@ pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), c
         }
     }
     let zero = vec![0.0f32; dim];
-    centres_ns.put_no_wal(0u32.to_be_bytes().to_vec(), f32s_to_bytes(&zero)).await?;
+    centres_ns.put(0u32.to_be_bytes().to_vec(), f32s_to_bytes(&zero)).await?;
     let root = Posting {
         posting_id: 0,
         routing_centroid: zero,
@@ -1447,13 +1450,13 @@ pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), c
         parent_id: None,
         origin: PostingOrigin::Root,
     };
-    postings_ns.put_no_wal(0u32.to_be_bytes().to_vec(), encode_posting(&root)).await?;
-    db.flush_namespaces(vec![ivf_centres_ns(namespace), ivf_postings_ns(namespace)]).await
+    postings_ns.put(0u32.to_be_bytes().to_vec(), encode_posting(&root)).await
 }
 
 /// Write `namespace`'s partition from a centroid set, replacing whatever an
 /// earlier, incomplete seed left: one posting per centroid, encoding against
-/// itself (posting id = centre id = cluster id). Durable on return. Tests and
+/// itself (posting id = centre id = cluster id). Durable on return (WAL-backed
+/// puts, as [`init_ivf`]). Tests and
 /// benches only (a static baseline, or a pre-M3 partition to rebuild): a
 /// namespace never starts from a centroid file.
 #[cfg(test)]
@@ -1468,13 +1471,13 @@ pub(crate) async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<
     let mut ids: Vec<u32> = centroids.keys().copied().collect();
     ids.sort_unstable();
     for &id in &ids {
-        centres_ns.put_no_wal(id.to_be_bytes().to_vec(), f32s_to_bytes(&centroids[&id])).await?;
+        centres_ns.put(id.to_be_bytes().to_vec(), f32s_to_bytes(&centroids[&id])).await?;
     }
     for &id in &ids {
         let p = crate::semantic_search::Posting::seeded(id, centroids[&id].clone(), id);
-        postings_ns.put_no_wal(id.to_be_bytes().to_vec(), encode_posting(&p)).await?;
+        postings_ns.put(id.to_be_bytes().to_vec(), encode_posting(&p)).await?;
     }
-    db.flush_namespaces(vec![ivf_centres_ns(namespace), ivf_postings_ns(namespace)]).await
+    Ok(())
 }
 
 /// Load `namespace`'s partition with rotation `seed`, counting every posting's
@@ -1610,6 +1613,25 @@ mod ivf_store_tests {
         init_ivf(&db, "ns", 16).await.unwrap();
         let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
         assert_eq!((ivf.postings(), ivf.centres()), (1, 1), "the stray centre was wiped");
+        db.shutdown().await.unwrap();
+    }
+
+    /// `init_ivf` is durable on return without any flush: a crash right after
+    /// it (memtables lost) still finds the root partition.
+    #[tokio::test]
+    async fn a_new_partition_survives_a_crash_right_after_it_is_written() {
+        let dir = TempDir::new().unwrap();
+        let open = || AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default());
+        let db = open().await.unwrap();
+        let before = db.ops_metrics();
+        init_ivf(&db, "ns", 16).await.unwrap();
+        let after = db.ops_metrics();
+        assert_eq!(after.no_wal_puts, before.no_wal_puts, "the partition is written WAL-backed");
+        assert_eq!(after.memtable_flushes, before.memtable_flushes, "and needs no flush");
+        db.crash().await;
+        let db = open().await.unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().expect("the root partition survived the crash");
+        assert_eq!((ivf.postings(), ivf.centres()), (1, 1));
         db.shutdown().await.unwrap();
     }
 

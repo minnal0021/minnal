@@ -94,8 +94,9 @@ Not logged, and unchanged:
   **main WAL**. The meta must be durable before any key it lists is written, and
   a lost delete would orphan an index entry (see `upsert_vectors`).
 - The query-embedding cache stays no-WAL: it is a cache.
-- The partition's centres and postings keep their own flush when seeded (once,
-  when a namespace enables semantic search).
+- The partition's centres and postings stay in the main WAL, the root posting
+  written when a namespace enables semantic search included: they are small
+  records, each durable on return.
 
 Partition maintenance's copies (split, merge and rebuild drains, and
 reassignment, `ivf_split`) are logged the same way, and their barrier before

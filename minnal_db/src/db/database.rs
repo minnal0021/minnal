@@ -2403,16 +2403,14 @@ impl Database {
     /// writes included, by flushing each one's memtables to level 0. Names that
     /// are not registered are skipped (a dropped namespace must not be recreated).
     ///
-    /// This is a barrier for callers that must not acknowledge work until its
-    /// no-WAL writes are on disk: the vector worker completes a queue entry only
-    /// after this returns. Unlike [`flush_no_wal_memtables`] it flushes whether or
-    /// not the no-WAL flag is set, because the flag is cleared *before* a
-    /// concurrent flush runs: a clear flag does not mean that flush has finished.
-    /// Flushing again is cheap when there is nothing new, and a read-only memtable
-    /// another thread is already flushing is waited for, not skipped.
+    /// Test-only: the crash audits use it to choose which namespaces reach disk
+    /// before a simulated crash. (Production barriers are the vector index WAL's
+    /// `sync`.) Unlike [`flush_no_wal_memtables`] it flushes whether or not the
+    /// no-WAL flag is set, and a read-only memtable another thread is already
+    /// flushing is waited for, not skipped.
     ///
     /// [`flush_no_wal_memtables`]: Self::flush_no_wal_memtables
-    #[cfg(any(test, feature = "semantic-search"))]
+    #[cfg(test)]
     pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
         for name in names {
             let Some(ns_id) = self.registry.read().get_id(name) else {

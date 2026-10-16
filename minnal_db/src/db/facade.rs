@@ -476,9 +476,9 @@ impl Db {
         self.inner.compact_lsm()
     }
 
-    /// Make every write already applied to the named namespaces durable, no-WAL
-    /// writes included. See `Database::flush_namespaces`.
-    #[cfg(any(test, feature = "semantic-search"))]
+    /// Test-only: flush the named namespaces' memtables to level 0. See
+    /// `Database::flush_namespaces`.
+    #[cfg(test)]
     pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
         self.inner.flush_namespaces(names)
     }
@@ -1584,8 +1584,8 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Async [`Db::flush_namespaces`].
-    #[cfg(any(test, feature = "semantic-search"))]
+    /// Async [`Db::flush_namespaces`] (test-only).
+    #[cfg(test)]
     pub(crate) async fn flush_namespaces(&self, names: Vec<String>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.flush_namespaces(&names))
