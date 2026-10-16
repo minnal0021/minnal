@@ -164,17 +164,25 @@ WAL's rule, applied per vector namespace, and it reuses the same mechanism:
 - Each vector namespace's flush observer (`LsmFlushObserverHub`) also reports to
   a **vector-index-WAL observer**, alongside the main WAL observer.
 - **On seal** of namespace `n`'s memtable version `v`, the observer records
-  `(n, v) → ceiling`, where `ceiling` is the vector index WAL's tail lowered to its
-  oldest in-flight offset. Every record of `n` below the ceiling is in that
-  memtable or an older one. (The ceiling matters: a write appended but not yet
-  applied goes into the *next* memtable while its offset sits below the tail —
-  the bug the main WAL's `wal_cut_ceiling` closes.)
+  `(n, v) → ceiling`, where `ceiling` is the vector index WAL's tail lowered to the
+  oldest of **`n`'s** records appended but not yet applied. Every record of `n`
+  below the ceiling is in that memtable or an older one: the seal runs under the
+  memtable's write lock, so nothing is applied into the next memtable meanwhile.
+  (The ceiling matters: a write appended but not yet applied goes into the
+  *next* memtable while its offset sits below the tail — the bug the main WAL's
+  `wal_cut_ceiling` closes.) It is per namespace, unlike the main WAL's, because
+  another namespace's write in flight says nothing about `n`'s memtable; with a
+  global ceiling, `n` could flush everything it wrote and still hold the cut,
+  with an empty memtable that no later flush would seal.
 - **On flush** of `(n, v)`, the observer advances `n`'s `safe_offset`, strictly
   in version order (an out-of-order flush cannot skip an older pending memtable).
+  A flush with no seal record retires nothing: `n`'s first record may have
+  landed in the next memtable after that seal.
 - The vector index WAL's **retired cut** is the minimum `safe_offset` over vector
-  namespaces still holding un-flushed logged writes, capped by the ceiling. It is
-  kept in memory and written to a small marker file (tmp + rename + fsync) when
-  it advances; at open it says where replay starts.
+  namespaces still holding un-flushed logged writes, capped by the ceiling of
+  all namespaces. It only moves forward, and it is written to a small marker
+  file (tmp + rename + fsync) before it is used; at open it says where replay
+  starts.
 
 A namespace that writes a little and goes idle would hold the cut back, as in the
 main WAL. The vector index WAL's GC tick flushes vector namespaces that pin it, exactly
@@ -307,9 +315,10 @@ main WAL's tests untouched and passing.
 
 On-disk state, which survives a restart: `GET /admin/storage/vector-index-wal`
 returns the segments (id and bytes, their count and total), the tail, the
-retired cut, the unretired bytes between them (what a restart would replay),
-the last seq appended, and the namespaces holding the cut back with their
-`safe_offset` (why the log is not shrinking). It is a separate endpoint because
+durable tail, the retired cut, the unretired bytes between them (what a restart
+would replay), the last seq appended, and the namespaces holding the cut back
+with their `safe_offset` (why the log is not shrinking). Positions are shown as
+`{segment_id, byte}`. It is a separate endpoint because
 the main WAL's response counts entries and persisted entries, which this log
 does not have.
 

@@ -65,7 +65,6 @@ const VECTOR_INDEX_WAL_DIR: &str = "vector_index_wal";
 ///
 /// One per database, shared by every vector namespace (see
 /// `semantic_search/report/Vector-Index-WAL-Design.md`).
-#[cfg_attr(not(test), expect(dead_code, reason = "opened by Database from step 3 of the vector index WAL design"))]
 pub(crate) fn vector_index_wal_dir(db_path: &Path) -> PathBuf {
     db_path.join(VECTOR_INDEX_WAL_DIR)
 }

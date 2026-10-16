@@ -13,6 +13,7 @@ use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReinde
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
+use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalEntryStatus, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
 use crate::index::{DynFieldIndex, IndexValueType};
@@ -520,14 +521,17 @@ impl WalPersistObserver {
     }
 }
 
-/// Hub that fans out LSM flush events to the WAL observer and compaction trigger.
+/// Hub that fans out LSM flush events to the WAL observer, the vector index
+/// WAL and the compaction trigger.
 ///
 /// One hub per KVStore, which is what supplies the namespace id the shared
-/// [`WalPersistObserver`] needs: the LSM itself only knows memtable versions, and
-/// those are allocated per store.
+/// [`WalPersistObserver`] and [`VectorIndexWal`] need: the LSM itself only knows
+/// memtable versions, and those are allocated per store. Every namespace's hub
+/// reports to the vector index WAL; it ignores namespaces that never appended.
 struct LsmFlushObserverHub {
     namespace_id: u32,
     wal_observer: Arc<WalPersistObserver>,
+    vector_index_wal: Arc<VectorIndexWal>,
     compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 }
 
@@ -535,11 +539,13 @@ impl LsmFlushObserverHub {
     fn new(
         namespace_id: u32,
         wal_observer: Arc<WalPersistObserver>,
+        vector_index_wal: Arc<VectorIndexWal>,
         compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
     ) -> Self {
         Self {
             namespace_id,
             wal_observer,
+            vector_index_wal,
             compaction_trigger,
         }
     }
@@ -554,11 +560,15 @@ impl LsmFlushObserverHub {
 impl LsmFlushObserver for LsmFlushObserverHub {
     fn on_memtable_sealed(&self, version: u64) {
         self.wal_observer.on_memtable_sealed_ns(self.namespace_id, version);
+        self.vector_index_wal.on_memtable_sealed(self.namespace_id, version);
         self.trigger_compaction();
     }
 
+    // Arrives through `SyncValueLogBeforePersist`, so the values the retired
+    // records point at are fsynced first.
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
         self.wal_observer.on_ro_memtable_flushed_to_level0_ns(self.namespace_id, version);
+        self.vector_index_wal.on_memtable_flushed(self.namespace_id, version);
     }
 }
 
@@ -614,6 +624,10 @@ pub struct Database {
     pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
     last_persisted_wal_offset: Arc<RwLock<u64>>,
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
+
+    /// The vector index WAL: the vector worker's payload writes, one per
+    /// database, shared by every namespace (`db/vector_index_wal.rs`).
+    pub(crate) vector_index_wal: Arc<VectorIndexWal>,
 
     // Namespace registry
     pub(crate) registry: RwLock<NamespaceRegistry>,
@@ -904,6 +918,10 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // The engine-wide counters, shared with the vector index WAL.
+        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
+
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
@@ -920,6 +938,7 @@ impl Database {
             pending_wal_flushes,
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
+            vector_index_wal,
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
@@ -939,7 +958,7 @@ impl Database {
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
             key_locks: KeyLocks::new(),
             fail_log_dir,
-            metrics: Arc::new(crate::db::metrics::Metrics::default()),
+            metrics,
         };
 
         // Share the global WAL sequence counter with every store so that all
@@ -977,6 +996,20 @@ impl Database {
         Ok(db)
     }
 
+    /// Open the vector index WAL in its directory, sharing the engine-wide
+    /// counters.
+    fn open_vector_index_wal(db_path: &Path, metrics: &Arc<crate::db::metrics::Metrics>) -> Result<VectorIndexWal> {
+        let (wal, report) = VectorIndexWal::open(
+            &crate::db::layout::vector_index_wal_dir(db_path),
+            crate::db::vector_index_wal::DEFAULT_SEGMENT_SIZE,
+            Arc::clone(metrics),
+        )?;
+        if report.torn_bytes_dropped > 0 {
+            warn!("[STARTUP] vector index WAL: dropped a torn tail of {} bytes", report.torn_bytes_dropped);
+        }
+        Ok(wal)
+    }
+
     /// Detect an existing database's bucket count from its value-log filenames.
     ///
     /// Both the segment files (`value_log_{bucket}.seg000123`) and the per-bucket
@@ -1008,6 +1041,7 @@ impl Database {
             let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
                 *ns_id,
                 Arc::clone(&self.wal_flush_observer),
+                Arc::clone(&self.vector_index_wal),
                 Arc::clone(&kv_store.lsm_compaction_trigger),
             ));
             kv_store.set_flush_observer(Some(observer));
@@ -1476,6 +1510,7 @@ impl Database {
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
             ns_id,
             Arc::clone(&self.wal_flush_observer),
+            Arc::clone(&self.vector_index_wal),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
         kv_store.set_flush_observer(Some(observer));
@@ -1530,6 +1565,7 @@ impl Database {
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
             ns_id,
             Arc::clone(&self.wal_flush_observer),
+            Arc::clone(&self.vector_index_wal),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
         kv_store.set_flush_observer(Some(observer));
@@ -1616,6 +1652,9 @@ impl Database {
         // forever, pinning the global persisted watermark (and therefore WAL GC)
         // at a stale offset that nothing can ever advance.
         self.wal_flush_observer.forget_namespace(ns_id);
+        // Likewise for the vector index WAL, whose replay skips the dropped
+        // namespace's records.
+        self.vector_index_wal.forget_namespace(ns_id);
 
         // (4) Reclaim disk. Best-effort and independent of the WAL.
         self.remove_namespace_storage(ns_id, name);
@@ -2366,6 +2405,55 @@ impl Database {
         flushed
     }
 
+    /// Flush every namespace holding the vector index WAL's retired cut back,
+    /// as [`Self::flush_namespaces_pinning_wal`] does for the main WAL. A vector
+    /// namespace that writes a little and goes idle would otherwise keep every
+    /// later segment on disk. Returns how many were flushed.
+    pub(crate) fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        let holding = self.vector_index_wal.namespaces_holding_cut();
+        if holding.is_empty() {
+            return 0;
+        }
+        let stores = self.stores.read();
+        let mut flushed = 0;
+        for ns_id in holding {
+            let Some(kv_store) = stores.get(&ns_id) else {
+                continue;
+            };
+            match kv_store.flush_memtable_to_level0() {
+                Ok(()) => {
+                    flushed += 1;
+                    crate::db::metrics::Metrics::bump(&self.metrics.vector_wal_pin_flushes);
+                }
+                Err(e) => warn!("[vector index WAL] failed to flush ns={ns_id} holding the retired cut: {e:?}"),
+            }
+        }
+        flushed
+    }
+
+    /// Whether any vector index WAL segment lies wholly below the retired cut.
+    pub(crate) fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.vector_index_wal.has_deletable_segments().unwrap_or_else(|e| {
+            warn!("[vector index WAL] could not list segments: {e}");
+            false
+        })
+    }
+
+    /// Delete vector index WAL segments wholly below the retired cut. Returns
+    /// `(segments, bytes)` deleted.
+    pub(crate) fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        Ok(self.vector_index_wal.garbage_collect()?)
+    }
+
+    /// The vector index WAL's state: segments, tail, retired cut, and the
+    /// namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<VectorIndexWalStats> {
+        let registry = self.registry.read();
+        Ok(self
+            .vector_index_wal
+            .stats(|ns| registry.get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned))?)
+    }
+
     pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
@@ -2735,9 +2823,10 @@ impl Database {
 
     /// Operational counters for a single namespace, by name.
     ///
-    /// Note: the WAL-GC counters (`wal_gc_runs`, `wal_segments_deleted`) belong
-    /// to the shared WAL and are not attributed to any namespace — they are
-    /// always `0` here and only populated in [`Self::metrics_snapshot`].
+    /// Note: the WAL-GC counters (`wal_gc_runs`, `wal_segments_deleted`) and
+    /// the `vector_wal_*` counters belong to the two shared logs and are not
+    /// attributed to any namespace — they are always `0` here and only
+    /// populated in [`Self::metrics_snapshot`].
     pub fn metrics_snapshot_for(&self, name: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
         let ns_id = self
             .registry
@@ -2951,6 +3040,10 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // The engine-wide counters, shared with the vector index WAL.
+        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
+
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
@@ -2967,6 +3060,7 @@ impl Database {
             pending_wal_flushes,
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
+            vector_index_wal,
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
@@ -2986,7 +3080,7 @@ impl Database {
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
             key_locks: KeyLocks::new(),
             fail_log_dir,
-            metrics: Arc::new(crate::db::metrics::Metrics::default()),
+            metrics,
         };
 
         // Share the global WAL sequence counter with every store (see the other
@@ -3205,6 +3299,18 @@ impl WalGcTarget for Database {
 
     fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.garbage_collect_wal()
+    }
+
+    fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        self.flush_namespaces_pinning_vector_wal()
+    }
+
+    fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.has_deletable_vector_wal_segments()
+    }
+
+    fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        self.garbage_collect_vector_wal()
     }
 }
 

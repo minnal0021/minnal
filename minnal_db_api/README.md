@@ -1200,6 +1200,7 @@ value. There are two distinct kinds:
 | `GET /admin/storage/health` | Liveness / uptime | `uptime_s` **No**; `status` n/a |
 | `GET /admin/storage/stats` | Value-log aggregate | **Yes** |
 | `GET /admin/storage/wal` | WAL metadata | **Yes** |
+| `GET /admin/storage/vector-index-wal` | Vector index WAL state | **Yes** |
 | `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
 | `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
 | `GET /admin/storage/value-log/{ns}/segments` | Value-log per segment | **Yes** |
@@ -1213,8 +1214,8 @@ value. There are two distinct kinds:
 #### Operational metrics — `GET /admin/storage/ops-metrics`
 
 All counters below are **in-memory and reset to zero on restart**. They are grouped
-in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
-`index_overlay`, plus a top-level `uptime_s`.
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
+`vector_index_wal` and `index_overlay`, plus a top-level `uptime_s`.
 
 | Field | Group | Meaning | Survives restart? |
 |-------|-------|---------|-------------------|
@@ -1249,6 +1250,13 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
 | `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
 | `wal_gc_runs` | gc | WAL GC passes run | **No** |
 | `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+| `appends` | vector_index_wal | Records appended to the vector index WAL | **No** |
+| `bytes_appended` | vector_index_wal | Bytes appended to it, frames included | **No** |
+| `fsyncs` | vector_index_wal | Its fsyncs: one per batch of vector writes made durable | **No** |
+| `appends_per_fsync` | vector_index_wal | `appends / fsyncs` (derived): records made durable per fsync. `null` before the first fsync | **No** |
+| `gc_runs` | vector_index_wal | Its GC passes (one per WAL GC tick) | **No** |
+| `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
+| `pin_flushes` | vector_index_wal | Flushes of an idle namespace that held its retired cut back | **No** |
 | `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
 | `peak_bytes` | index_overlay | Highest `used_bytes` since startup | **No** |
 | `soft_limit_bytes` / `hard_limit_bytes` | index_overlay | `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` | n/a (config) |
@@ -1269,16 +1277,17 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
 > follow the same in-memory, reset-on-restart model.
 
 **Per-namespace breakdown.** Every counter is recorded per namespace; the engine
-view above is their sum plus a small global instance (the WAL-GC counters, which
-belong to the shared WAL, and a fold of every dropped namespace's final totals so
-the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
+view above is their sum plus a small global instance (the WAL-GC and
+`vector_index_wal` counters, which belong to the two shared logs, and a fold of
+every dropped namespace's final totals so the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
 returning the same grouped shape as the engine endpoint:
 
 - `GET /admin/storage/stores/{ns}/ops-metrics` — one namespace's counters (`404`
   if the namespace does not exist). Its `gc.wal_gc_runs` / `gc.wal_segments_deleted`
-  are always `0` — WAL GC is engine-global and reported only by the engine endpoint.
+  and `vector_index_wal` counters are always `0` — both logs are engine-global and
+  reported only by the engine endpoint.
 - `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
-  lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
+  lsm_lookups, writes, compaction, gc, vector_index_wal}` objects, one per live namespace (no
   `uptime_s`).
 
 Neither per-namespace view has `index_overlay`: the write-buffer budget is shared
@@ -1315,6 +1324,40 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `live_segments` | Tracked segments still carrying entries |
 | `last_sequence` | Highest write sequence the WAL has observed |
 | `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+
+**`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
+vector worker writes its chunk and whole-document codes to so that one fsync per
+batch makes them durable. One log per database, shared by every namespace. A
+record is **retired** once the memtable holding its write has been flushed to
+disk; restart replays only unretired records, and GC deletes segments that lie
+wholly below the **retired cut**. Positions are `{segment_id, byte}`.
+
+| Field | Meaning |
+|-------|---------|
+| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first |
+| `segment_count`, `disk_bytes` | Number of segment files and their total size |
+| `tail` | Where the next record goes |
+| `durable_tail` | Everything below it is fsynced |
+| `retired_cut` | Records below it are retired |
+| `unretired_bytes` | Bytes at or above the retired cut (segment headers excluded): what a restart would replay |
+| `last_sequence` | Highest write sequence of any record in the log |
+| `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them |
+
+On a database whose vector worker has written nothing:
+
+```json
+{
+  "segments": [{"segment_id": 0, "bytes": 16}],
+  "segment_count": 1,
+  "disk_bytes": 16,
+  "tail": {"segment_id": 0, "byte": 16},
+  "durable_tail": {"segment_id": 0, "byte": 16},
+  "retired_cut": {"segment_id": 0, "byte": 0},
+  "unretired_bytes": 0,
+  "last_sequence": 0,
+  "holding_cut": []
+}
+```
 
 **`GET /admin/storage/lsm`** — per-namespace LSM manifest:
 
@@ -1397,6 +1440,7 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/ops-metrics/by-namespace` | `200` | The same counters broken out per namespace |
 | `GET` | `/admin/storage/stores/{ns}/ops-metrics` | `200` | Operational counters for one namespace |
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
+| `GET` | `/admin/storage/vector-index-wal` | `200` | Vector index WAL: segments, tail, retired cut, namespaces holding it |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
 | `GET` | `/admin/storage/value-log/{ns}/segments` | `200` | Per-segment garbage breakdown for one namespace |

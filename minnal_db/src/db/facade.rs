@@ -420,6 +420,12 @@ impl Db {
         self.inner.wal_metadata()
     }
 
+    /// Returns the vector index WAL's state: segments, tail, retired cut and
+    /// the namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats> {
+        self.inner.vector_index_wal_stats()
+    }
+
     /// Returns a live LSM manifest snapshot for every active namespace.
     pub fn lsm_manifests(&self) -> Vec<(String, crate::store::lsm::lsm_manifest::LsmManifest)> {
         self.inner.lsm_manifests()
@@ -790,6 +796,15 @@ impl WalGcTarget for Db {
     }
     fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.inner.garbage_collect_wal()
+    }
+    fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        self.inner.flush_namespaces_pinning_vector_wal()
+    }
+    fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.inner.has_deletable_vector_wal_segments()
+    }
+    fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        self.inner.garbage_collect_vector_wal()
     }
 }
 
@@ -1616,6 +1631,12 @@ impl AsyncDb {
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
+    }
+
+    /// Returns the vector index WAL's state: segments, tail, retired cut and
+    /// the namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats> {
+        self.inner.vector_index_wal_stats()
     }
 
     /// Returns a live LSM manifest snapshot for every active namespace.

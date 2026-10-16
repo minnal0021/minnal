@@ -59,6 +59,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/storage/ops-metrics/by-namespace", get(admin_storage::ops_metrics_by_namespace))
         .route("/admin/storage/stores/{ns}/ops-metrics", get(admin_storage::ops_metrics_ns))
         .route("/admin/storage/wal", get(admin_storage::wal))
+        .route("/admin/storage/vector-index-wal", get(admin_storage::vector_index_wal))
         .route("/admin/storage/lsm", get(admin_storage::lsm))
         .route("/admin/storage/value-log", get(admin_storage::value_log))
         .route("/admin/storage/value-log/{ns}/segments", get(admin_storage::value_log_segments))

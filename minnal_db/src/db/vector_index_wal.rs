@@ -9,9 +9,38 @@
 //! retired are replayed with their original seqs. Design:
 //! `semantic_search/report/Vector-Index-WAL-Design.md`.
 //!
-//! This module is the log only: segments, record format, append, `sync` and
-//! reading. Retirement and GC, recovery and the worker's use of it are built on
-//! top (steps 2–4 of the design's plan).
+//! Segments, record format, append, `sync` and reading, plus **retirement**:
+//! a record is retired once the memtable holding its write is flushed to L0,
+//! the retired cut is kept durable in a marker, and GC deletes segments wholly
+//! below it. Recovery and the worker's use of the log are built on top (steps
+//! 3–4 of the design's plan).
+//!
+//! # Retirement
+//!
+//! Every namespace's flush observer reports seals and flushes here. A
+//! namespace is tracked from its first append. On a seal of its memtable
+//! version `v`, the log records the namespace's **ceiling**: the tail lowered
+//! to the oldest of *that namespace's* appends not yet applied to a memtable
+//! (`LoggedWrite` registers an append while the append lock is held and
+//! clears it when dropped, after the apply). The seal callback runs under the
+//! memtable's write lock, so every one of the namespace's records below the
+//! ceiling is in `v` or an older memtable. When `v` is flushed — in version
+//! order — the namespace's `safe_offset` advances to that ceiling. The
+//! **retired cut** is the lowest `safe_offset` over namespaces with records
+//! above theirs, capped by the global ceiling (the oldest append of any
+//! namespace not yet applied). It only moves forward, and it is written to
+//! `retired_cut` before it is published, so GC never deletes past a durable
+//! cut.
+//!
+//! The ceiling is per namespace, not global as in the main WAL, so that a
+//! namespace sealed while *another* namespace's write is in flight still
+//! retires everything it flushed; otherwise an idle namespace could hold the
+//! cut back with an empty memtable that no flush ever seals again.
+//!
+//! **Lock order:** memtable (seal callback) → `retirement` → `active` →
+//! `in_flight`. The write path takes `active` (and `in_flight` inside it),
+//! releases both, then `retirement`, and never holds any of them while
+//! applying to a memtable.
 //!
 //! # Format
 //!
@@ -49,6 +78,8 @@
 
 use crate::db::metrics::Metrics;
 use parking_lot::Mutex;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -73,6 +104,12 @@ const FRAME_HEADER_LEN: u32 = 8;
 const END_MARKER_LEN: u32 = 4;
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
 const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
+
+/// The retired cut's marker file, in the log's directory.
+const RETIRED_CUT_FILE: &str = "retired_cut";
+/// Marker layout: magic, cut (u64), crc32 of the first 12 bytes.
+const RETIRED_CUT_MAGIC: [u8; 4] = *b"MVIC";
+const RETIRED_CUT_LEN: usize = 16;
 
 /// Errors from the vector index WAL.
 #[derive(Error, Debug)]
@@ -122,6 +159,102 @@ pub(crate) struct Appended {
     pub end: u64,
 }
 
+/// An appended record that is not yet applied to its memtable.
+///
+/// Holds the record's namespace ceiling (and the global one) at or below its
+/// start until dropped. Keep it alive until the memtable apply is done. RAII
+/// because a leaked registration would pin the retired cut, and with it GC,
+/// for good — the failure the main WAL's `InFlightWrite` guards against.
+pub(crate) struct LoggedWrite<'a> {
+    wal: &'a VectorIndexWal,
+    /// Where the record landed.
+    pub start: u64,
+    /// Just past the record.
+    pub end: u64,
+}
+
+impl LoggedWrite<'_> {
+    /// Where the record landed, without the registration.
+    pub(crate) fn appended(&self) -> Appended {
+        Appended {
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+impl std::fmt::Debug for LoggedWrite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoggedWrite").field("start", &self.start).field("end", &self.end).finish()
+    }
+}
+
+impl Drop for LoggedWrite<'_> {
+    fn drop(&mut self) {
+        self.wal.in_flight.lock().remove(&self.start);
+    }
+}
+
+/// A position in the vector index WAL, as the admin API shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VectorIndexWalPosition {
+    /// The segment file.
+    pub segment_id: u64,
+    /// The byte within it.
+    pub byte: u32,
+}
+
+impl VectorIndexWalPosition {
+    fn of(pos: u64) -> Self {
+        let (segment_id, byte) = split(pos);
+        Self { segment_id, byte }
+    }
+}
+
+/// One segment file of the vector index WAL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VectorIndexWalSegment {
+    /// Segment id (its file is `{segment_id:010}.log`).
+    pub segment_id: u64,
+    /// Bytes on disk.
+    pub bytes: u64,
+}
+
+/// A namespace holding the retired cut back: it has records above its
+/// `safe_offset` that no flush has covered yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VectorIndexWalHolder {
+    /// The namespace's name.
+    pub namespace: String,
+    /// Everything of this namespace below here is in an SSTable.
+    pub safe_offset: VectorIndexWalPosition,
+}
+
+/// The vector index WAL's state, read from the log and its files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VectorIndexWalStats {
+    /// Every segment file, oldest first.
+    pub segments: Vec<VectorIndexWalSegment>,
+    /// Number of segment files.
+    pub segment_count: usize,
+    /// Total bytes of the segment files.
+    pub disk_bytes: u64,
+    /// Where the next record goes.
+    pub tail: VectorIndexWalPosition,
+    /// Everything below here is fsynced.
+    pub durable_tail: VectorIndexWalPosition,
+    /// Records below here are retired: in SSTables, skipped by replay, and
+    /// their segments are deleted by GC once wholly below it.
+    pub retired_cut: VectorIndexWalPosition,
+    /// Bytes of the log at or above the retired cut (segment headers
+    /// excluded): what a restart would replay.
+    pub unretired_bytes: u64,
+    /// Highest seq of any record in the log.
+    pub last_sequence: u64,
+    /// Namespaces holding the retired cut back.
+    pub holding_cut: Vec<VectorIndexWalHolder>,
+}
+
 /// What [`VectorIndexWal::open`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenReport {
@@ -141,8 +274,41 @@ pub(crate) struct VectorIndexWal {
     active: Mutex<Active>,
     /// Every byte below this position is on stable storage.
     durable_tail: AtomicU64,
+    /// Appends not yet applied to a memtable: start → namespace.
+    in_flight: Mutex<BTreeMap<u64, u32>>,
+    /// Seal records and per-namespace progress.
+    retirement: Mutex<Retirement>,
+    /// Records below this position are retired. Durable in `retired_cut`.
+    retired_cut: AtomicU64,
     /// The database's engine-wide counters.
     metrics: Arc<Metrics>,
+}
+
+#[derive(Default)]
+struct Retirement {
+    /// `(namespace, memtable version)` → the namespace's ceiling at the seal.
+    pending: BTreeMap<(u32, u64), PendingFlush>,
+    /// Namespaces that have appended, from their first append.
+    progress: HashMap<u32, NsProgress>,
+}
+
+struct PendingFlush {
+    ceiling: u64,
+    flushed: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+struct NsProgress {
+    /// Every record of this namespace below here is in an SSTable.
+    safe_offset: u64,
+    /// The end of this namespace's latest record.
+    last_write: u64,
+}
+
+impl NsProgress {
+    fn holds_cut(&self) -> bool {
+        self.last_write > self.safe_offset
+    }
 }
 
 struct Active {
@@ -336,6 +502,31 @@ fn walk_segment<E: From<VectorIndexWalError>>(
     }
 }
 
+fn read_retired_cut(dir: &Path) -> Result<Option<u64>> {
+    let bytes = match std::fs::read(dir.join(RETIRED_CUT_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bad = || VectorIndexWalError::Corruption("the retired-cut marker is damaged".to_owned());
+    if bytes.len() != RETIRED_CUT_LEN || bytes[0..4] != RETIRED_CUT_MAGIC {
+        return Err(bad());
+    }
+    if crc32fast::hash(&bytes[0..12]) != u32::from_le_bytes(bytes[12..16].try_into().unwrap()) {
+        return Err(bad());
+    }
+    Ok(Some(u64::from_le_bytes(bytes[4..12].try_into().unwrap())))
+}
+
+fn retired_cut_bytes(cut: u64) -> [u8; RETIRED_CUT_LEN] {
+    let mut b = [0u8; RETIRED_CUT_LEN];
+    b[0..4].copy_from_slice(&RETIRED_CUT_MAGIC);
+    b[4..12].copy_from_slice(&cut.to_le_bytes());
+    let crc = crc32fast::hash(&b[0..12]);
+    b[12..16].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
 fn file_len(file: &File) -> Result<u32> {
     let len = file.metadata()?.len();
     u32::try_from(len).map_err(|_| VectorIndexWalError::Corruption(format!("segment of {len} bytes")))
@@ -438,6 +629,29 @@ impl VectorIndexWal {
         file.sync_all()?;
 
         let tail = position(segment_id, pos);
+        let oldest = ids.first().copied().unwrap_or(segment_id);
+        let retired_cut = match read_retired_cut(dir)? {
+            Some(cut) if cut > tail => {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "the retired cut {:?} is past the tail {:?}",
+                    VectorIndexWalPosition::of(cut),
+                    VectorIndexWalPosition::of(tail)
+                )));
+            }
+            Some(cut) if split(cut).0 < oldest => {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "the retired cut {:?} is below the oldest segment {oldest}",
+                    VectorIndexWalPosition::of(cut)
+                )));
+            }
+            Some(cut) => cut,
+            None if oldest > 0 => {
+                return Err(VectorIndexWalError::Corruption(format!(
+                    "the retired-cut marker is missing but segments start at {oldest}"
+                )));
+            }
+            None => 0,
+        };
         let wal = Self {
             dir: dir.to_path_buf(),
             segment_size,
@@ -448,6 +662,9 @@ impl VectorIndexWal {
                 last_seq,
             }),
             durable_tail: AtomicU64::new(tail),
+            in_flight: Mutex::new(BTreeMap::new()),
+            retirement: Mutex::new(Retirement::default()),
+            retired_cut: AtomicU64::new(retired_cut),
             metrics,
         };
         Ok((
@@ -466,11 +683,12 @@ impl VectorIndexWal {
     }
 
     /// Appends one record. Not durable until a later [`sync`](Self::sync)
-    /// returns.
+    /// returns. Keep the returned [`LoggedWrite`] until the record's memtable
+    /// apply is done.
     ///
     /// Records are in append order, which is not necessarily seq order: seqs
     /// are allocated before the append lock is taken.
-    pub(crate) fn append(&self, ns_id: u32, key: &[u8], value: &[u8], seq: u64) -> Result<Appended> {
+    pub(crate) fn append(&self, ns_id: u32, key: &[u8], value: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
         let frame_len = FRAME_HEADER_LEN as u64 + (BODY_FIXED_LEN + key.len() + value.len()) as u64;
         if frame_len > self.max_frame_len() {
             return Err(VectorIndexWalError::RecordTooLarge {
@@ -492,11 +710,23 @@ impl VectorIndexWal {
         a.pos += frame_len;
         a.last_seq = a.last_seq.max(seq);
         let end = position(a.segment_id, a.pos);
+        // Registered under the append lock: no ceiling can see a tail that
+        // includes this record without also seeing it in flight.
+        self.in_flight.lock().insert(start, ns_id);
         drop(a);
+        let write = LoggedWrite { wal: self, start, end };
+
+        // Before the caller can apply (and drop `write`), so a seal never
+        // misses a namespace with a record in its memtable.
+        {
+            let mut r = self.retirement.lock();
+            let p = r.progress.entry(ns_id).or_default();
+            p.last_write = p.last_write.max(end);
+        }
 
         Metrics::bump(&self.metrics.vector_wal_appends);
         Metrics::add(&self.metrics.vector_wal_bytes_appended, u64::from(frame_len));
-        Ok(Appended { start, end })
+        Ok(write)
     }
 
     /// Seals the active segment and starts the next. The sealed segment is
@@ -601,6 +831,189 @@ impl VectorIndexWal {
             .map(|id| Ok((id, std::fs::metadata(segment_path(&self.dir, id))?.len())))
             .collect()
     }
+
+    // ── Retirement ──────────────────────────────────────────────────────
+
+    /// The tail lowered to the oldest append not yet applied — of `ns` only,
+    /// or of any namespace when `ns` is `None`.
+    fn ceiling(&self, ns: Option<u32>) -> u64 {
+        let a = self.active.lock();
+        let tail = position(a.segment_id, a.pos);
+        let in_flight = self.in_flight.lock();
+        let oldest = match ns {
+            None => in_flight.keys().next().copied(),
+            Some(ns) => in_flight.iter().find(|(_, n)| **n == ns).map(|(s, _)| *s),
+        };
+        oldest.map_or(tail, |s| tail.min(s))
+    }
+
+    /// Records below this position are retired (in SSTables); replay starts
+    /// here.
+    pub(crate) fn retired_cut(&self) -> u64 {
+        self.retired_cut.load(Ordering::Acquire)
+    }
+
+    /// `ns` sealed memtable `version`. Called under that memtable's write
+    /// lock, so no record can be applied into the next memtable meanwhile.
+    pub(crate) fn on_memtable_sealed(&self, ns: u32, version: u64) {
+        let mut r = self.retirement.lock();
+        if !r.progress.contains_key(&ns) {
+            return;
+        }
+        let ceiling = self.ceiling(Some(ns));
+        r.pending.entry((ns, version)).or_insert(PendingFlush { ceiling, flushed: false });
+    }
+
+    /// `ns` flushed memtable `version` to L0, value log fsynced. Advances the
+    /// namespace's `safe_offset` over its flushed versions in order, then the
+    /// retired cut.
+    ///
+    /// A flush with no seal record (the seal came before the namespace's
+    /// first append, or before this log observed it) retires nothing but
+    /// lets later versions fold past it; a later flush covers its records.
+    pub(crate) fn on_memtable_flushed(&self, ns: u32, version: u64) {
+        let mut r = self.retirement.lock();
+        if !r.progress.contains_key(&ns) {
+            r.pending.remove(&(ns, version));
+            return;
+        }
+        r.pending
+            .entry((ns, version))
+            .or_insert(PendingFlush { ceiling: 0, flushed: false })
+            .flushed = true;
+        let mut safe = 0u64;
+        while let Some((&key, p)) = r.pending.range((ns, 0)..=(ns, u64::MAX)).next() {
+            if !p.flushed {
+                break;
+            }
+            safe = safe.max(p.ceiling);
+            r.pending.remove(&key);
+        }
+        if let Some(p) = r.progress.get_mut(&ns) {
+            p.safe_offset = p.safe_offset.max(safe);
+        }
+        self.advance_cut(&r);
+    }
+
+    /// Stop tracking a dropped namespace: it can never flush again, and replay
+    /// skips its records.
+    pub(crate) fn forget_namespace(&self, ns: u32) {
+        let mut r = self.retirement.lock();
+        r.progress.remove(&ns);
+        r.pending.retain(|(n, _), _| *n != ns);
+        self.advance_cut(&r);
+    }
+
+    /// Namespaces with records no flush has covered yet.
+    pub(crate) fn namespaces_holding_cut(&self) -> Vec<u32> {
+        let r = self.retirement.lock();
+        let mut ns: Vec<u32> = r.progress.iter().filter(|(_, p)| p.holds_cut()).map(|(n, _)| *n).collect();
+        ns.sort_unstable();
+        ns
+    }
+
+    /// Moves the retired cut forward if it can, writing the marker first. A
+    /// failed marker write leaves the cut where it was (retried on the next
+    /// flush).
+    fn advance_cut(&self, r: &Retirement) {
+        let ceiling = self.ceiling(None);
+        let cut = r
+            .progress
+            .values()
+            .filter(|p| p.holds_cut())
+            .map(|p| p.safe_offset)
+            .min()
+            .map_or(ceiling, |s| s.min(ceiling));
+        if cut <= self.retired_cut() {
+            return;
+        }
+        match crate::support::write_atomic_durable(&self.dir.join(RETIRED_CUT_FILE), &retired_cut_bytes(cut)) {
+            Ok(()) => self.retired_cut.store(cut, Ordering::Release),
+            Err(e) => log::warn!("[vector index WAL] could not write the retired-cut marker: {e}"),
+        }
+    }
+
+    /// Deletes every segment wholly below the retired cut, oldest first, then
+    /// fsyncs the directory. Returns `(segments, bytes)` deleted.
+    pub(crate) fn garbage_collect(&self) -> Result<(u64, u64)> {
+        Metrics::bump(&self.metrics.vector_wal_gc_runs);
+        let below = split(self.retired_cut()).0;
+        let (mut segments, mut bytes) = (0u64, 0u64);
+        for id in list_segments(&self.dir)?.into_iter().filter(|&id| id < below) {
+            let path = segment_path(&self.dir, id);
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    segments += 1;
+                    bytes += len;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if segments > 0 {
+            sync_dir(&self.dir)?;
+            Metrics::add(&self.metrics.vector_wal_segments_deleted, segments);
+        }
+        Ok((segments, bytes))
+    }
+
+    /// Whether any segment lies wholly below the retired cut.
+    pub(crate) fn has_deletable_segments(&self) -> Result<bool> {
+        let below = split(self.retired_cut()).0;
+        Ok(list_segments(&self.dir)?.first().is_some_and(|&id| id < below))
+    }
+
+    /// The log's state, naming namespaces with `name_of`.
+    pub(crate) fn stats(&self, name_of: impl Fn(u32) -> String) -> Result<VectorIndexWalStats> {
+        let holders: Vec<(u32, u64)> = {
+            let r = self.retirement.lock();
+            let mut h: Vec<(u32, u64)> = r
+                .progress
+                .iter()
+                .filter(|(_, p)| p.holds_cut())
+                .map(|(n, p)| (*n, p.safe_offset))
+                .collect();
+            h.sort_unstable();
+            h
+        };
+        let (tail, last_sequence) = {
+            let a = self.active.lock();
+            (position(a.segment_id, a.pos), a.last_seq)
+        };
+        let cut = self.retired_cut();
+        let (cut_id, cut_byte) = split(cut);
+        let segments: Vec<VectorIndexWalSegment> = self
+            .segments()?
+            .into_iter()
+            .map(|(segment_id, bytes)| VectorIndexWalSegment { segment_id, bytes })
+            .collect();
+        let unretired_bytes = segments
+            .iter()
+            .map(|s| match s.segment_id.cmp(&cut_id) {
+                std::cmp::Ordering::Less => 0,
+                std::cmp::Ordering::Equal => s.bytes.saturating_sub(u64::from(cut_byte.max(SEGMENT_HEADER_LEN))),
+                std::cmp::Ordering::Greater => s.bytes.saturating_sub(u64::from(SEGMENT_HEADER_LEN)),
+            })
+            .sum();
+        Ok(VectorIndexWalStats {
+            segment_count: segments.len(),
+            disk_bytes: segments.iter().map(|s| s.bytes).sum(),
+            segments,
+            tail: VectorIndexWalPosition::of(tail),
+            durable_tail: VectorIndexWalPosition::of(self.durable_tail()),
+            retired_cut: VectorIndexWalPosition::of(cut),
+            unretired_bytes,
+            last_sequence,
+            holding_cut: holders
+                .into_iter()
+                .map(|(ns, safe)| VectorIndexWalHolder {
+                    namespace: name_of(ns),
+                    safe_offset: VectorIndexWalPosition::of(safe),
+                })
+                .collect(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -635,7 +1048,9 @@ mod tests {
 
     /// Appends records 0..n (ns `i % 3`, seq `i + 1`) and returns where each landed.
     fn append_n(wal: &VectorIndexWal, n: u64) -> Vec<Appended> {
-        (0..n).map(|i| wal.append((i % 3) as u32, &key(i), &value(i), i + 1).unwrap()).collect()
+        (0..n)
+            .map(|i| wal.append((i % 3) as u32, &key(i), &value(i), i + 1).unwrap().appended())
+            .collect()
     }
 
     fn expected(appended: &[Appended], range: std::ops::Range<u64>) -> Vec<Row> {
@@ -691,7 +1106,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
         wal.append(1, b"a", b"x", 10).unwrap();
-        let last = wal.append(1, b"b", b"y", 5).unwrap(); // seqs are not in log order
+        let last = wal.append(1, b"b", b"y", 5).unwrap().appended(); // seqs are not in log order
         wal.sync().unwrap();
         drop(wal);
 
@@ -760,7 +1175,7 @@ mod tests {
             assert_eq!(report.tail, appended[4].start, "cut {cut}");
             assert_eq!(report.torn_bytes_dropped, cut);
             assert_eq!(report.last_seq, 4);
-            let fresh = wal.append(9, b"new", b"v", 99).unwrap();
+            let fresh = wal.append(9, b"new", b"v", 99).unwrap().appended();
             assert_eq!(fresh.start, appended[4].start);
             let mut want = expected(&appended, 0..4);
             want.push((fresh.start, 9, 99, b"new".to_vec(), b"v".to_vec()));
@@ -982,9 +1397,331 @@ mod tests {
         assert_eq!(wal.segments().unwrap(), vec![(0, u64::from(SEGMENT_HEADER_LEN))]);
         assert_eq!(rows_from(&wal, 0), vec![]);
         drop(wal);
-        std::fs::write(path.join("retired_cut"), b"not a segment").unwrap();
+        std::fs::write(path.join("notes.txt"), b"not a segment").unwrap();
         let (wal, report) = open_at(&path, DEFAULT_SEGMENT_SIZE);
         assert_eq!(report, empty);
         assert_eq!(wal.segments().unwrap().len(), 1);
+    }
+
+    // ── Retirement and GC ───────────────────────────────────────────────
+
+    /// Appends `n` records for `ns` and lets them count as applied.
+    fn applied(wal: &VectorIndexWal, ns: u32, n: u64) -> Vec<Appended> {
+        (0..n).map(|i| wal.append(ns, &key(i), &value(i), i + 1).unwrap().appended()).collect()
+    }
+
+    fn seal_and_flush(wal: &VectorIndexWal, ns: u32, version: u64) {
+        wal.on_memtable_sealed(ns, version);
+        wal.on_memtable_flushed(ns, version);
+    }
+
+    #[test]
+    fn a_flush_retires_its_memtables_records_and_the_cut_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 3);
+        assert_eq!(wal.retired_cut(), 0);
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(wal.retired_cut(), wal.tail());
+        assert!(wal.namespaces_holding_cut().is_empty());
+        let cut = wal.retired_cut();
+        drop(wal);
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        assert_eq!(wal.retired_cut(), cut);
+        assert_eq!(rows_from(&wal, wal.retired_cut()), vec![]);
+    }
+
+    #[test]
+    fn memtables_retire_in_version_order_only() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 1);
+        wal.on_memtable_sealed(1, 0);
+        applied(&wal, 1, 1);
+        wal.on_memtable_sealed(1, 1);
+        wal.on_memtable_flushed(1, 1);
+        assert_eq!(wal.retired_cut(), 0, "version 0 is not flushed yet");
+        wal.on_memtable_flushed(1, 0);
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
+    #[test]
+    fn a_record_not_yet_applied_holds_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 2);
+        let in_flight = wal.append(1, b"late", b"v", 9).unwrap();
+        // Its apply will land in the next memtable, so this seal must not claim it.
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(wal.retired_cut(), in_flight.start);
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+        drop(in_flight);
+        seal_and_flush(&wal, 1, 1);
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
+    #[test]
+    fn another_namespaces_record_in_flight_does_not_hold_a_flushed_namespace() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 2);
+        let other = wal.append(2, b"k", b"v", 9).unwrap();
+        applied(&wal, 1, 1);
+        seal_and_flush(&wal, 1, 0);
+        // Namespace 1 flushed everything it wrote; only 2 holds the cut.
+        assert_eq!(wal.namespaces_holding_cut(), vec![2]);
+        assert_eq!(wal.retired_cut(), 0);
+        drop(other);
+        seal_and_flush(&wal, 2, 0);
+        assert_eq!(wal.retired_cut(), wal.tail());
+        assert!(wal.namespaces_holding_cut().is_empty());
+    }
+
+    #[test]
+    fn the_cut_is_the_slowest_unflushed_namespace() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 2, 0);
+        let after_two = wal.retired_cut();
+        assert_eq!(after_two, wal.tail());
+        applied(&wal, 1, 2);
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(wal.namespaces_holding_cut(), vec![2]);
+        assert_eq!(wal.retired_cut(), after_two, "namespace 2's safe offset");
+        seal_and_flush(&wal, 2, 1);
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
+    #[test]
+    fn a_flush_without_a_seal_record_retires_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 2);
+        wal.on_memtable_flushed(1, 0);
+        assert_eq!(wal.retired_cut(), 0);
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+        seal_and_flush(&wal, 1, 1);
+        assert_eq!(wal.retired_cut(), wal.tail());
+    }
+
+    #[test]
+    fn events_for_a_namespace_that_never_appended_are_ignored() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        seal_and_flush(&wal, 7, 0);
+        applied(&wal, 1, 1);
+        seal_and_flush(&wal, 7, 1);
+        assert_eq!(wal.retired_cut(), 0);
+        assert_eq!(wal.namespaces_holding_cut(), vec![1]);
+    }
+
+    #[test]
+    fn forgetting_a_namespace_releases_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 1);
+        applied(&wal, 2, 1);
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(wal.retired_cut(), 0);
+        wal.forget_namespace(2);
+        assert_eq!(wal.retired_cut(), wal.tail());
+        assert!(wal.namespaces_holding_cut().is_empty());
+    }
+
+    #[test]
+    fn gc_deletes_only_segments_wholly_below_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let (wal, _) = VectorIndexWal::open(dir.path(), 256, Arc::clone(&metrics)).unwrap();
+        applied(&wal, 1, 8); // segments 0, 1, 2
+        assert!(!wal.has_deletable_segments().unwrap());
+        assert_eq!(wal.garbage_collect().unwrap(), (0, 0));
+        seal_and_flush(&wal, 1, 0);
+        assert_eq!(split(wal.retired_cut()).0, 2);
+        assert!(wal.has_deletable_segments().unwrap());
+        let sealed = u64::from(SEGMENT_HEADER_LEN + 3 * FRAME + END_MARKER_LEN);
+        assert_eq!(wal.garbage_collect().unwrap(), (2, 2 * sealed));
+        assert_eq!(wal.segments().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), vec![2]);
+        assert!(!wal.has_deletable_segments().unwrap());
+        let s = metrics.snapshot();
+        assert_eq!((s.vector_wal_gc_runs, s.vector_wal_segments_deleted), (2, 2));
+
+        let more = applied(&wal, 1, 2);
+        let cut = wal.retired_cut();
+        drop(wal);
+        let (wal, _) = open_at(dir.path(), 256);
+        assert_eq!(wal.retired_cut(), cut);
+        let rows = rows_from(&wal, cut);
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            more.iter().map(|a| a.start).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_bad_retired_cut_marker_fails_the_open() {
+        let fresh = || {
+            let dir = TempDir::new().unwrap();
+            let (wal, _) = open_at(dir.path(), 256);
+            applied(&wal, 1, 8);
+            seal_and_flush(&wal, 1, 0);
+            wal.garbage_collect().unwrap();
+            dir
+        };
+        let marker = |dir: &TempDir| dir.path().join(RETIRED_CUT_FILE);
+
+        let dir = fresh();
+        std::fs::write(marker(&dir), retired_cut_bytes(position(9, 16))).unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("past the tail"));
+
+        let dir = fresh();
+        std::fs::write(marker(&dir), retired_cut_bytes(position(0, 16))).unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("below the oldest segment"));
+
+        let dir = fresh();
+        std::fs::remove_file(marker(&dir)).unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("marker is missing"));
+
+        let dir = fresh();
+        let mut bytes = std::fs::read(marker(&dir)).unwrap();
+        bytes[5] ^= 0xff;
+        std::fs::write(marker(&dir), bytes).unwrap();
+        assert!(corruption(reopen(dir.path(), 256)).contains("damaged"));
+    }
+
+    #[test]
+    fn the_cut_never_moves_back() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        applied(&wal, 1, 2);
+        seal_and_flush(&wal, 1, 0);
+        let cut = wal.retired_cut();
+        // A namespace that starts writing now has a safe offset of 0 until it
+        // flushes; that must not drag the cut back.
+        applied(&wal, 2, 1);
+        wal.forget_namespace(3);
+        assert_eq!(wal.retired_cut(), cut);
+        drop(wal);
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        assert_eq!(wal.retired_cut(), cut);
+    }
+
+    #[test]
+    fn stats_report_positions_unretired_bytes_and_holders() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        applied(&wal, 1, 4); // segment 0 sealed with 3, segment 1 holds 1
+        applied(&wal, 2, 1);
+        let name = |ns: u32| format!("ns{ns}");
+        let s = wal.stats(name).unwrap();
+        assert_eq!(s.segment_count, 2);
+        assert_eq!(
+            s.tail,
+            VectorIndexWalPosition {
+                segment_id: 1,
+                byte: SEGMENT_HEADER_LEN + 2 * FRAME
+            }
+        );
+        assert_eq!(s.retired_cut, VectorIndexWalPosition { segment_id: 0, byte: 0 });
+        assert_eq!(s.unretired_bytes, u64::from(3 * FRAME + END_MARKER_LEN + 2 * FRAME));
+        assert_eq!(s.last_sequence, 4);
+        assert_eq!(s.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["ns1", "ns2"]);
+
+        seal_and_flush(&wal, 1, 0);
+        seal_and_flush(&wal, 2, 0);
+        let s = wal.stats(name).unwrap();
+        assert_eq!(s.retired_cut, s.tail);
+        assert_eq!(s.unretired_bytes, 0);
+        assert!(s.holding_cut.is_empty());
+        // Sealing segment 0 fsynced it; nothing has synced segment 1 yet.
+        assert_eq!(
+            s.durable_tail,
+            VectorIndexWalPosition {
+                segment_id: 0,
+                byte: SEGMENT_HEADER_LEN + 3 * FRAME
+            }
+        );
+    }
+
+    // ── Wired into Database ─────────────────────────────────────────────
+
+    use crate::db::database::Database;
+    use crate::db::test_support::create_db_config;
+
+    /// Logs and applies one write to `ns`, as step 4's worker will.
+    fn log_and_apply(db: &Database, ns: u32, key: &[u8], value: &[u8]) {
+        let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
+        let logged = db.vector_index_wal.append(ns, key, value, seq).unwrap();
+        db.put_ns_no_wal(ns, key, value).unwrap();
+        drop(logged);
+    }
+
+    #[test]
+    fn a_namespace_flush_retires_its_logged_writes() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("v_sparse_vector").unwrap();
+        for i in 0..5u64 {
+            log_and_apply(&db, ns, &key(i), &value(i));
+        }
+        assert_eq!(db.vector_index_wal.retired_cut(), 0);
+        db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+        let stats = db.vector_index_wal_stats().unwrap();
+        assert_eq!(stats.unretired_bytes, 0);
+        assert!(stats.holding_cut.is_empty());
+    }
+
+    #[test]
+    fn the_gc_pass_flushes_an_idle_namespace_holding_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let busy = db.create_namespace("busy").unwrap();
+        let idle = db.create_namespace("idle").unwrap();
+        log_and_apply(&db, idle, b"k", b"v");
+        log_and_apply(&db, busy, b"k", b"v");
+        db.get_store(busy).unwrap().flush_memtable_to_level0().unwrap();
+        let stats = db.vector_index_wal_stats().unwrap();
+        assert_eq!(stats.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["idle"]);
+        assert_eq!(db.vector_index_wal.retired_cut(), 0);
+
+        assert_eq!(db.flush_namespaces_pinning_vector_wal(), 1);
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+        assert_eq!(db.flush_namespaces_pinning_vector_wal(), 0, "nothing holds the cut now");
+        assert_eq!(db.metrics_snapshot().vector_wal_pin_flushes, 1);
+    }
+
+    #[test]
+    fn dropping_a_namespace_releases_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let kept = db.create_namespace("kept").unwrap();
+        let dropped = db.create_namespace("dropped").unwrap();
+        log_and_apply(&db, dropped, b"k", b"v");
+        log_and_apply(&db, kept, b"k", b"v");
+        db.get_store(kept).unwrap().flush_memtable_to_level0().unwrap();
+        assert_eq!(db.vector_index_wal.retired_cut(), 0);
+        db.remove_namespace("dropped").unwrap();
+        assert_eq!(db.vector_index_wal.retired_cut(), db.vector_index_wal.tail());
+    }
+
+    #[test]
+    fn a_database_reopens_with_its_retired_cut() {
+        let dir = TempDir::new().unwrap();
+        let cut = {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let ns = db.create_namespace("v").unwrap();
+            log_and_apply(&db, ns, b"k", b"v");
+            db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+            let cut = db.vector_index_wal.retired_cut();
+            db.shutdown().unwrap();
+            cut
+        };
+        assert!(cut > 0);
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(db.vector_index_wal.retired_cut(), cut);
     }
 }

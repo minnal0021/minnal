@@ -245,6 +245,7 @@ pub use db::stats::GCStats;
 pub use db::metrics::{Metrics, MetricsSnapshot};
 
 /// Snapshot of WAL state returned by [`Db::wal_metadata`].
+pub use db::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
 pub use db::wal::WalMetadata;
 
 /// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].

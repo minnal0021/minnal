@@ -84,6 +84,11 @@ impl DocStore {
         self.db.wal_metadata()
     }
 
+    /// Returns the vector index WAL's state.
+    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats, crate::KVError> {
+        self.db.vector_index_wal_stats()
+    }
+
     /// Returns a live LSM manifest snapshot for every active namespace.
     pub fn lsm_manifests(&self) -> Vec<(String, crate::LsmManifest)> {
         self.db.lsm_manifests()
