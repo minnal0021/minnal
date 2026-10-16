@@ -96,8 +96,6 @@
 //! new appends land behind them. The same in an **earlier** segment, a gap in
 //! the segment ids, or a bad header fails the open.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "wired into Database in steps 2-4 of the vector index WAL design"))]
-
 use crate::db::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -193,7 +191,8 @@ pub(crate) struct RecordRef<'a> {
     pub value: &'a [u8],
 }
 
-/// Where an append landed: `[start, end)`.
+/// Where an append landed: `[start, end)` (tests keep it past the registration).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Appended {
     pub start: u64,
@@ -216,6 +215,7 @@ pub(crate) struct LoggedWrite<'a> {
 
 impl LoggedWrite<'_> {
     /// Where the record landed, without the registration.
+    #[cfg(test)]
     pub(crate) fn appended(&self) -> Appended {
         Appended {
             start: self.start,
@@ -326,6 +326,9 @@ pub(crate) struct VectorIndexWal {
     opened_progress: Progress,
     /// The database's engine-wide counters.
     metrics: Arc<Metrics>,
+    /// Test-only fault: the next `sync` fails.
+    #[cfg(test)]
+    fail_next_sync: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -802,6 +805,8 @@ impl VectorIndexWal {
             retired_cut: AtomicU64::new(retired_cut),
             opened_progress,
             metrics,
+            #[cfg(test)]
+            fail_next_sync: std::sync::atomic::AtomicBool::new(false),
         };
         Ok((
             wal,
@@ -883,6 +888,10 @@ impl VectorIndexWal {
     /// The fsync runs outside the append lock, so appends carry on meanwhile.
     /// Does no I/O when nothing was appended since the last sync.
     pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected sync failure").into());
+        }
         let (file, tail) = {
             let a = self.active.lock();
             (Arc::clone(&a.file), position(a.segment_id, a.pos))
@@ -950,6 +959,7 @@ impl VectorIndexWal {
     }
 
     /// Position of the next append.
+    #[cfg(test)]
     pub(crate) fn tail(&self) -> u64 {
         let a = self.active.lock();
         position(a.segment_id, a.pos)
@@ -1109,6 +1119,12 @@ impl VectorIndexWal {
     ) -> std::result::Result<(), E> {
         let progress = &self.opened_progress;
         self.for_each_from(progress.cut, |at, r| if at >= progress.replay_from(r.ns_id) { f(r) } else { Ok(()) })
+    }
+
+    /// Test-only: make the next `sync` fail.
+    #[cfg(all(test, feature = "semantic-search"))]
+    pub(crate) fn fail_next_sync(&self) {
+        self.fail_next_sync.store(true, Ordering::SeqCst);
     }
 
     /// Test-only: drop every byte appended since the last `sync`, as a power
@@ -2208,6 +2224,32 @@ mod tests {
         assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 5);
         for i in 0..5u64 {
             assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)));
+        }
+    }
+
+    /// A sealed memtable is not on disk until its L0 files are written; its
+    /// records must still replay. Retiring at the seal would skip them.
+    #[test]
+    fn records_of_a_sealed_but_unwritten_memtable_replay_after_a_crash() {
+        let dir = TempDir::new().unwrap();
+        let config = || {
+            let mut c = create_db_config();
+            c.skip_list_capacity = 8; // seals every few writes; no worker writes them to L0
+            c
+        };
+        let ns = {
+            let db = Database::open(dir.path(), config()).unwrap();
+            let ns = db.create_namespace("v").unwrap();
+            for i in 0..30u64 {
+                log_and_apply(&db, ns, &key(i), &value(i));
+            }
+            assert!(db.metrics_snapshot().memtable_flushes > 0, "the memtable sealed");
+            db.mark_crashed();
+            ns
+        };
+        let db = Database::open(dir.path(), config()).unwrap();
+        for i in 0..30u64 {
+            assert_eq!(db.get_ns(ns, &key(i)).unwrap(), Some(value(i)), "key {i}");
         }
     }
 }

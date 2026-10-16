@@ -483,6 +483,13 @@ impl Db {
         self.inner.flush_namespaces(names)
     }
 
+    /// Make every logged write (`put_logged`) already returned durable: one
+    /// fsync of the vector index WAL. See `Database::sync_vector_index_wal`.
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn sync_vector_index_wal(&self) -> Result<()> {
+        self.inner.sync_vector_index_wal()
+    }
+
     /// The current value-log waste ratio for the default namespace.
     pub fn waste_ratio(&self) -> f64 {
         self.inner.get_waste_ratio()
@@ -1586,6 +1593,15 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Async [`Db::sync_vector_index_wal`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn sync_vector_index_wal(&self) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.sync_vector_index_wal())
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     /// Force an index checkpoint across all namespaces: flush each namespace's
     /// dense row map and all active field indexes to disk, compacting any
     /// field-index bitmap store whose waste exceeds the configured
@@ -1988,6 +2004,18 @@ impl AsyncNamespace {
         let db = self.db.clone();
         let ns_id = self.ns_id;
         tokio::task::spawn_blocking(move || db.inner.put_ns_no_wal(ns_id, &key, &value))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Write a key-value pair logged in the vector index WAL instead of the
+    /// main WAL — durable after the next `AsyncDb::sync_vector_index_wal`. See
+    /// [`Database::put_ns_logged`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn put_logged(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.put_ns_logged(ns_id, &key, &value))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }

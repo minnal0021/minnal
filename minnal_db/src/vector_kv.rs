@@ -449,9 +449,9 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// which clusters hold the document's chunks, so it must list every key that can be
 /// on disk, at every moment. The writes therefore go: (1) delete the stale cluster
 /// keys (WAL), (2) write the new meta (**WAL-backed**, durable on return), (3) write
-/// the new chunk keys and the dense entry (no-WAL). Each namespace's memtable
-/// flushes on its own schedule, so a no-WAL meta could be lost while a no-WAL key
-/// written after it was flushed: the key would then be listed nowhere, and a later
+/// the new chunk keys and the dense entry (vector index WAL). Each namespace's
+/// memtable flushes on its own schedule, so a meta outside the main WAL could be
+/// lost while a key written after it was flushed: the key would then be listed nowhere, and a later
 /// delete would leave it behind for good (crash-audit test
 /// `delete_racing_a_reembed_survives_a_crash_anywhere`). The meta is one small
 /// record per document, so its fsync is negligible beside the embedding call.
@@ -464,18 +464,15 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// structure that the [`VecIndexWorker`] (re)builds idempotently from the queue,
 /// so it needs no cross-namespace atomicity with the document write.
 ///
-/// The quantised payloads are written **without** the WAL (`put_no_wal`): they
-/// are bulky and reconstructable by re-running the embed/re-index, so paying a
-/// per-chunk WAL fsync (and storing a second copy of every quantised payload in
-/// the WAL) is pure overhead.  A crash before the memtable flushes loses these
-/// entries — possibly flushing the sparse side but losing the dense write (or
-/// vice versa), leaving a partially committed index; the affected docs are
-/// re-enqueued by vector-index reconciliation, which treats a partial index as
-/// not-indexed (see [`has_complete_vector_index`]) and runs automatically as a
-/// background task on startup (and on demand via
-/// `POST /admin/indices/vector/reconcile`).  The stale-cluster `delete`s remain
-/// WAL-backed — they are tiny key-only tombstones and do not fire during a fresh
-/// bulk load.
+/// The quantised payloads skip the main WAL: they are bulky and reconstructable
+/// by re-running the embed, so a per-chunk main-WAL fsync (and a second copy of
+/// every payload there) is pure overhead. They are logged in the vector index
+/// WAL instead (`put_logged`, no fsync), and are durable once the caller's
+/// [`make_vector_writes_durable`] returns; the worker completes an entry only
+/// after that. A crash before it can lose them, but the entry is then still
+/// queued and redone, and vector-index reconciliation treats a partial index as
+/// not-indexed (see [`has_complete_vector_index`]). The stale-cluster `delete`s
+/// remain WAL-backed — they are tiny key-only tombstones.
 ///
 /// Returns how the document's entries moved between postings, for the
 /// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
@@ -545,11 +542,11 @@ pub async fn upsert_vectors(
     sparse_meta_ns
         .put(doc_id_bytes.to_vec(), encode_sparse_meta(text_hash(text), &new_postings))
         .await?;
-    // (3) The new chunk keys (no-WAL).
+    // (3) The new chunk keys (vector index WAL; durable at the batch's sync).
     for (&cluster_id, chunks) in &new_cluster_groups {
         let key = composite_key::encode(cluster_id, doc_id_bytes);
         crash_point!();
-        sparse_ns.put_no_wal(key, VectorIndex::list_to_bytes(chunks)).await?;
+        sparse_ns.put_logged(key, VectorIndex::list_to_bytes(chunks)).await?;
     }
 
     // ── Dense (MultiBit) ─────────────────────────────────────────────────────
@@ -561,7 +558,7 @@ pub async fn upsert_vectors(
         let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
         let owned: Vec<VectorIndex> = dense_vis.into_iter().cloned().collect();
         crash_point!();
-        dense_ns.put_no_wal(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
+        dense_ns.put_logged(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
     }
 
     Ok(delta)
@@ -1186,30 +1183,29 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
 pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<PostingDelta, crate::KVError> {
     let mut delta = upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, &entry.text, vector_indexes).await?;
     crash_point!();
-    make_vector_writes_durable(db, std::slice::from_ref(&entry.namespace)).await?;
+    make_vector_writes_durable(db).await?;
     delta.extend(complete_embed(db, entry).await?);
     Ok(delta)
 }
 
-/// Make every vector write already done for the given (parent) namespaces durable,
-/// by flushing their three vector namespaces. A barrier: see below.
+/// Make every vector write already done durable: one fsync of the vector index
+/// WAL, which holds the chunk keys and dense entries [`upsert_vectors`] wrote
+/// (`put_logged`). A barrier: see below. It covers every namespace at once, so
+/// a batch spanning several stores costs one fsync.
 ///
 /// **Why completion waits for this.** [`upsert_vectors`] deletes stale cluster keys
-/// WAL-backed (durable at once) and writes the new keys, meta and dense entry
-/// no-WAL (durable only after a memtable flush), and [`complete_embed`] removes the
-/// queue entry WAL-backed. Completing before the flush let a crash keep the
-/// completion and the deletes but lose the new vectors. A re-embedded document then
-/// kept its *old* meta and dense entry, which `has_complete_vector_index` accepts,
-/// so nothing re-enqueued it: it stayed indexed under its old text, minus the
-/// chunks whose clusters changed. With completion after this barrier, a crash
-/// before it leaves the queue entry in place and the restarted worker redoes it.
-/// Regression test: `crash_before_reembed_is_flushed_keeps_new_vectors`.
-pub async fn make_vector_writes_durable(db: &AsyncDb, namespaces: &[String]) -> Result<(), crate::KVError> {
-    let names = namespaces
-        .iter()
-        .flat_map(|ns| [sparse_vectors_ns(ns), sparse_vectors_meta_ns(ns), dense_vectors_ns(ns)])
-        .collect();
-    db.flush_namespaces(names).await
+/// and writes the meta WAL-backed (durable at once), and writes the new keys and
+/// dense entry to the vector index WAL (durable only after this sync), and
+/// [`complete_embed`] removes the queue entry WAL-backed. Completing before the
+/// sync would let a crash keep the completion and the deletes but lose the new
+/// vectors. A re-embedded document would then keep its *old* dense entry, which
+/// `has_complete_vector_index` accepts, so nothing would re-enqueue it: it would
+/// stay indexed under its old text, minus the chunks whose clusters changed. With
+/// completion after this barrier, a crash before it leaves the queue entry in
+/// place and the restarted worker redoes it. Regression test:
+/// `crash_before_reembed_is_synced_keeps_new_vectors`.
+pub async fn make_vector_writes_durable(db: &AsyncDb) -> Result<(), crate::KVError> {
+    db.sync_vector_index_wal().await
 }
 
 /// Complete an embed entry whose vectors are written **and durable** (see
@@ -2195,7 +2191,7 @@ mod queue_race_tests {
     /// deletes but lost the new vectors: the document kept its old dense entry,
     /// lost its moved chunk, and looked complete to reconciliation.
     #[tokio::test]
-    async fn crash_before_reembed_is_flushed_keeps_new_vectors() {
+    async fn crash_before_reembed_is_synced_keeps_new_vectors() {
         let dir = TempDir::new().unwrap();
         {
             let db = open_db(&dir).await;
@@ -2203,7 +2199,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
             let first = snapshot(&db, b"x").await;
             finish_embed(&db, &first, &vectors_for(1.0)).await.unwrap();
-            make_vector_writes_durable(&db, &["docs".to_string()]).await.unwrap(); // old index on disk
+            make_vector_writes_durable(&db).await.unwrap(); // old index on disk
             enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
             let second = snapshot(&db, b"x").await;
             finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
@@ -2230,7 +2226,7 @@ mod queue_race_tests {
             put_doc(&db, b"x").await;
             enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
             upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap(); // the worker's write
-            make_vector_writes_durable(&db, &["docs".to_string()]).await.unwrap(); // the batch flush
+            make_vector_writes_durable(&db).await.unwrap(); // the batch flush
             db.crash().await; // crash before the completions
         }
         let db = open_db(&dir).await;
@@ -2244,47 +2240,19 @@ mod queue_race_tests {
 
     /// If the vectors cannot be made durable, the entry is not completed.
     #[tokio::test]
-    async fn a_failed_flush_completes_nothing() {
+    async fn a_failed_sync_completes_nothing() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         put_doc(&db, b"x").await;
         enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
         let entry = snapshot(&db, b"x").await;
-        upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap();
-
-        // A level-0 file cannot be created in a read-only namespace directory.
-        let dense_dir = crate::db::layout::namespace_data_dir(dir.path(), &dense_vectors_ns("docs"));
-        let set_mode = |mode: u32| {
-            use std::os::unix::fs::PermissionsExt;
-            for entry in walk_dirs(&dense_dir) {
-                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
-            }
-        };
-        set_mode(0o555);
+        db.coordinator_for_test().vector_index_wal.fail_next_sync();
         let result = finish_embed(&db, &entry, &vectors_for(1.0)).await;
-        set_mode(0o755);
-        assert!(result.is_err(), "the flush should have failed");
+        assert!(result.is_err(), "the sync should have failed");
         assert!(
             get_queue_entry(&db, "docs", b"x").await.unwrap().is_some(),
             "an entry whose vectors are not durable was completed"
         );
-    }
-
-    /// Every directory under `root`, `root` included.
-    fn walk_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = vec![root.to_path_buf()];
-        let mut i = 0;
-        while i < out.len() {
-            if let Ok(rd) = std::fs::read_dir(&out[i]) {
-                for e in rd.flatten() {
-                    if e.file_type().is_ok_and(|t| t.is_dir()) {
-                        out.push(e.path());
-                    }
-                }
-            }
-            i += 1;
-        }
-        out
     }
 }
 
@@ -2482,42 +2450,28 @@ mod vector_upsert_tests {
 
     // ── Durability of the vector write path ───────────────────────────────────
 
-    /// The vector index must genuinely use the no-WAL write path — and so be
-    /// covered by the periodic flush that bounds what a crash destroys.
+    /// The vector payloads go to the vector index WAL: no main-WAL entry and no
+    /// fsync per write, not flagged as no-WAL (they are recoverable, so the
+    /// compaction worker's no-WAL flush tick must not flush them), and one
+    /// fsync makes the whole write durable. The meta is the one WAL-backed
+    /// write (it must be durable before any key it lists).
     ///
-    /// `f08108a` proves the *engine* half on a plain namespace: a namespace
-    /// holding no-WAL writes is flagged and flushed on the compaction tick.
-    /// Nothing connected the vector write path to it, so the only evidence that
-    /// the vector index actually benefits was one live stress run — which is
-    /// exactly how the whole index came to be discarded by a `SIGKILL`
-    /// (`stress_docs_sparse_vector`: 4 entries on disk against 6020 in memory,
-    /// ~18 000 documents re-enqueued, semantic search returning nothing for
-    /// hours). This pins both halves together.
-    ///
-    /// Deliberately service-free: it asserts on the durability flag, never on an
-    /// embedding, so it needs the `semantic-search` feature compiled but no
-    /// embedding service running.
+    /// Deliberately service-free: it needs the `semantic-search` feature
+    /// compiled but no embedding service running.
     #[tokio::test]
-    async fn test_vector_writes_use_the_no_wal_path_and_are_periodically_flushed() {
+    async fn test_vector_writes_go_to_the_vector_index_wal() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let ns = "docs";
         let doc_id = b"doc-durability";
 
         let vector_namespaces = [sparse_vectors_ns(ns), sparse_vectors_meta_ns(ns), dense_vectors_ns(ns)];
-
         // Create the namespaces up front so the baseline below measures the
         // vector writes alone, not namespace setup.
         for name in &vector_namespaces {
             db.namespace(name.clone()).await.unwrap();
         }
         let coordinator = db.coordinator_for_test();
-        for name in &vector_namespaces {
-            assert!(
-                !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} should start with nothing unflushed"
-            );
-        }
 
         let before = db.ops_metrics();
         let vi_sparse = VectorIndex::new(3, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
@@ -2525,39 +2479,26 @@ mod vector_upsert_tests {
         upsert_vectors(&db, ns, doc_id, "text", &[vi_sparse, vi_dense]).await.unwrap();
         let after = db.ops_metrics();
 
-        // The sparse chunk and the dense entry go off the WAL; the meta is the one
-        // WAL-backed write (it must be durable before any key it lists).
         assert_eq!(
-            after.no_wal_puts - before.no_wal_puts,
+            after.vector_wal_appends - before.vector_wal_appends,
             2,
-            "the sparse chunk and the dense entry should be written with put_no_wal"
+            "the sparse chunk and the dense entry are logged"
         );
+        assert_eq!(after.no_wal_puts - before.no_wal_puts, 0, "nothing takes the unlogged no-WAL path");
         assert_eq!(after.puts - before.puts, 1, "only the meta takes the WAL-backed put path");
-        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 1, "only the meta may add a WAL fsync");
-
-        // Being off the WAL means there is nothing to replay, so each payload
-        // namespace must now be flagged for the periodic flush — otherwise these
-        // writes exist only in memory until the memtable happens to fill.
-        let payload_namespaces = [sparse_vectors_ns(ns), dense_vectors_ns(ns)];
-        for name in &payload_namespaces {
-            assert!(
-                coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} took a no-WAL write but is not flagged for the periodic flush — \
-                 a crash would discard it with nothing to replay"
-            );
-        }
-
-        // The compaction worker's tick is what bounds the loss.
-        assert!(
-            coordinator.flush_no_wal_memtables() >= payload_namespaces.len(),
-            "the periodic flush should have covered both vector payload namespaces"
-        );
-        for name in &payload_namespaces {
+        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 1, "only the meta may add a main-WAL fsync");
+        assert_eq!(after.vector_wal_fsyncs - before.vector_wal_fsyncs, 0, "logging does not fsync");
+        for name in &vector_namespaces {
             assert!(
                 !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} should be clear once flushed"
+                "{name} is flagged as holding unrecoverable no-WAL writes"
             );
         }
+
+        make_vector_writes_durable(&db).await.unwrap();
+        let synced = db.ops_metrics();
+        assert_eq!(synced.vector_wal_fsyncs - after.vector_wal_fsyncs, 1, "the barrier is one fsync");
+        assert_eq!(synced.memtable_flushes, after.memtable_flushes, "and no memtable flush");
     }
 
     // ── delete_vector ─────────────────────────────────────────────────────────
@@ -3834,7 +3775,7 @@ mod crash_audit_tests {
                 let dir = TempDir::new().unwrap();
                 let db = open(&dir).await;
                 setup(&db).await.unwrap();
-                make_vector_writes_durable(&db, &[NS.to_string()]).await.unwrap();
+                make_vector_writes_durable(&db).await.unwrap();
                 crash_point::arm(n);
                 let result = scenario(&db).await;
                 let crashed = crash_point::disarm();

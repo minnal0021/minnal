@@ -10,13 +10,13 @@
 //!
 //! # Completion waits for durability
 //!
-//! The vector writes are no-WAL (durable only after a memtable flush) while the
-//! queue removal is WAL-backed (durable at once), so an entry is completed only
-//! after its vectors are flushed. Written entries collect in a batch of up to
-//! [`COMPLETION_BATCH`]; each batch, and whatever is pending at the end of a pass,
-//! is made durable with one flush of the affected vector namespaces
+//! The vector payloads go to the vector index WAL (durable only after its next
+//! sync) while the queue removal is WAL-backed (durable at once), so an entry is
+//! completed only after its vectors are synced. Written entries collect in a
+//! batch of up to [`COMPLETION_BATCH`]; each batch, and whatever is pending at the
+//! end of a pass, is made durable with one fsync of the vector index WAL
 //! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
-//! that flush leaves the entries queued, and the next pass re-embeds them; writing
+//! that sync leaves the entries queued, and the next pass re-embeds them; writing
 //! the same text's vectors again is harmless. See
 //! `vector_kv::make_vector_writes_durable` for what completing first used to lose.
 //!
@@ -535,17 +535,14 @@ impl VecIndexWorker {
     /// Make a batch of written embed entries durable, then complete each one.
     /// Returns `(completed, failed)`.
     ///
-    /// If the flush fails, nothing is completed: every entry stays queued and the
+    /// If the sync fails, nothing is completed: every entry stays queued and the
     /// next pass redoes it. Each completion is conditional — the entry comes from
     /// this pass's snapshot, and the document may have been upserted or deleted
     /// since (see `vector_kv`'s conditional queue updates).
     async fn complete_written(&self, written: Vec<QueueEntry>) -> (usize, usize) {
-        let mut namespaces: Vec<String> = written.iter().map(|e| e.namespace.clone()).collect();
-        namespaces.sort_unstable();
-        namespaces.dedup();
-        if let Err(e) = vector_kv::make_vector_writes_durable(&self.db, &namespaces).await {
+        if let Err(e) = vector_kv::make_vector_writes_durable(&self.db).await {
             warn!(
-                "vec index worker: could not flush the vectors of {} written entr(y/ies); \
+                "vec index worker: could not sync the vectors of {} written entr(y/ies); \
                  leaving them queued for the next pass: {e}",
                 written.len(),
             );

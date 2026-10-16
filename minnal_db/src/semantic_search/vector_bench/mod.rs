@@ -1102,7 +1102,7 @@ async fn vector_bench_worker_completion() {
             if flush_first {
                 pending.push(entry);
                 if pending.len() >= BATCH || d + 1 == frozen.n_docs() {
-                    make_vector_writes_durable(&db, std::slice::from_ref(&ns)).await.unwrap();
+                    make_vector_writes_durable(&db).await.unwrap();
                     for e in pending.drain(..) {
                         complete_embed(&db, &e).await.unwrap();
                     }

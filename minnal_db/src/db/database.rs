@@ -1297,6 +1297,43 @@ impl Database {
         kv_store.put_to_storage(key, value)
     }
 
+    /// Write a key-value pair logged in the **vector index WAL** instead of the
+    /// main WAL: no main-WAL append, no per-write fsync. The write is durable
+    /// once a later [`Self::sync_vector_index_wal`] returns; after a crash,
+    /// recovery replays it with its original seq unless the memtable holding it
+    /// was already written to L0.
+    ///
+    /// For the vector worker's payloads (chunk codes, whole-document codes):
+    /// bulky, one durability barrier per batch rather than per write. Deletes
+    /// stay in the main WAL. Order, as on every write path: key stripe, seq,
+    /// append (registered as not yet applied), memtable apply, release.
+    pub fn put_ns_logged(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_closed()?;
+        self.check_write_size(key, value)?;
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        let kv_store = self.get_store(namespace_id)?;
+        let seq = kv_store.alloc_seq();
+        let logged = self.vector_index_wal.append(namespace_id, key, value, seq)?;
+        // The main WAL never sees this write, so a field index on the namespace
+        // could not replay it from there (FR-001's no-WAL marker).
+        self.note_no_wal_index_exposure(namespace_id);
+        // Applied with the logged seq; one retry, as the WAL path's apply. On a
+        // second failure the record stays in the log and replays at the next
+        // open, and the caller does not complete its work.
+        kv_store
+            .put_to_storage_seq(key, value, seq)
+            .or_else(|_| kv_store.put_to_storage_seq(key, value, seq))?;
+        drop(logged);
+        Ok(())
+    }
+
+    /// Make every write [`Self::put_ns_logged`] returned from before this call
+    /// durable: one fsync of the vector index WAL (none if nothing was appended
+    /// since the last).
+    pub fn sync_vector_index_wal(&self) -> Result<()> {
+        Ok(self.vector_index_wal.sync()?)
+    }
+
     /// Delete a key **without** appending to the WAL.
     ///
     /// The no-WAL counterpart of [`Self::delete_ns`]: it skips the WAL append

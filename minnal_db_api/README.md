@@ -1237,7 +1237,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
-| `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads, query-embedding cache) | **No** |
+| `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache, partition-maintenance copies). Vector payloads are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
 | `no_wal_deletes` | writes | Deletes written bypassing the WAL (`delete_no_wal` callers) | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
 | `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
