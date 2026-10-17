@@ -88,10 +88,12 @@ impl WalGcWorker {
                         // Two independent passes on one tick: a stuck main-WAL
                         // GC must not leave the vector index WAL growing, nor the
                         // reverse, so neither pass can skip the other.
-                        Some(t) => {
+                        // The passes flush memtables and delete files: see
+                        // `run_blocking_pass`.
+                        Some(t) => crate::support::run_blocking_pass(|| {
                             Self::perform_wal_gc_check(&t);
                             Self::perform_vector_wal_gc_check(&t);
-                        }
+                        }),
                         None => break,
                     }
                 }
@@ -193,6 +195,49 @@ mod tests {
     use crate::db::database::Database;
     use crate::store::lsm::lsm_tree::LSMConfig;
     use tempfile::TempDir;
+
+    struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);
+
+    impl WalGcTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn flush_namespaces_pinning_wal(&self) -> usize {
+            self.0.block();
+            0
+        }
+        fn get_wal_gc_stats(&self) -> (u64, u64) {
+            (0, 0)
+        }
+        fn has_deletable_wal_segments(&self) -> bool {
+            false
+        }
+        fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+        fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+            0
+        }
+        fn has_deletable_vector_wal_segments(&self) -> bool {
+            false
+        }
+        fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+    }
+
+    /// A GC tick flushes memtables and deletes segments; on a runtime thread it
+    /// holds up the tasks scheduled behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_wal_gc_pass_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = WalGcWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        assert_runtime_free_during_pass(&busy).await;
+        worker.shutdown().await;
+    }
 
     fn create_db_config() -> DbConfig {
         let gc_interval = Duration::from_secs(5);

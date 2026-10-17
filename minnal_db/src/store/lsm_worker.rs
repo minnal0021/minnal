@@ -206,7 +206,13 @@ impl LsmCompactionWorker {
         shutdown
     }
 
+    /// Flushes and merges are file I/O: see
+    /// [`run_blocking_pass`](crate::support::run_blocking_pass).
     fn perform_compaction_check<T: LsmCompactionTarget>(target: &Arc<T>, tally: &mut CompactionTally) {
+        crate::support::run_blocking_pass(|| Self::compaction_pass(target, tally));
+    }
+
+    fn compaction_pass<T: LsmCompactionTarget>(target: &Arc<T>, tally: &mut CompactionTally) {
         if target.is_closed() {
             return;
         }
@@ -255,6 +261,37 @@ mod tests {
     use crate::db::facade::Db;
     use crate::store::lsm::lsm_tree::LSMConfig;
     use tempfile::TempDir;
+
+    struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);
+
+    impl LsmCompactionTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn has_due_compaction_work(&self) -> bool {
+            false
+        }
+        fn compact_due(&self) -> crate::db::error::Result<()> {
+            Ok(())
+        }
+        fn flush_no_wal_memtables(&self) -> usize {
+            self.0.block();
+            0
+        }
+    }
+
+    /// Flushes and merges are file I/O; on a runtime thread they hold up the
+    /// tasks scheduled behind them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_compaction_pass_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = LsmCompactionWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        assert_runtime_free_during_pass(&busy).await;
+        worker.shutdown().await;
+    }
 
     fn create_db_config() -> DbConfig {
         let gc_interval = Duration::from_secs(5);

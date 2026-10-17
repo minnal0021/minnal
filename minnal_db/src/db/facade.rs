@@ -117,6 +117,12 @@ where
 /// durability guarantee in exchange for speed.
 pub struct Db {
     inner: Database,
+    /// The doc store's directory lock. Fields drop in declaration order, so it
+    /// is released only after `inner` has finished dropping (its final flush
+    /// and compaction), however long a worker's pass keeps this `Db` alive past
+    /// the last user handle. Keep it last.
+    #[cfg(feature = "doc-store")]
+    dir_lock: parking_lot::Mutex<Option<crate::support::file_lock::DirLock>>,
 }
 
 // Gated on `semantic-search` as well as `test` because that is the only feature
@@ -160,7 +166,11 @@ impl Db {
     /// Open a database at `path` with the given configuration.
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DbConfig) -> Result<Self> {
         let db = Database::open(path.as_ref(), config)?;
-        Ok(Self { inner: db })
+        Ok(Self {
+            inner: db,
+            #[cfg(feature = "doc-store")]
+            dir_lock: parking_lot::Mutex::new(None),
+        })
     }
 
     /// Shut down the database, flushing all data to disk.
@@ -1159,6 +1169,13 @@ impl AsyncDb {
 }
 
 impl AsyncDb {
+    /// Hold the doc store's directory lock until this database is dropped, not
+    /// just the handle that opened it (see `Db::dir_lock`).
+    #[cfg(feature = "doc-store")]
+    pub(crate) fn hold_dir_lock(&self, lock: crate::support::file_lock::DirLock) {
+        *self.inner.dir_lock.lock() = Some(lock);
+    }
+
     // ── Open / Close ──────────────────────────────────────────────────
 
     /// Open a database with default config.

@@ -116,11 +116,13 @@ impl GCWorker {
         shutdown_notify.notify_one();
     }
 
+    /// A GC pass rewrites segments: see
+    /// [`run_blocking_pass`](crate::support::run_blocking_pass).
     fn perform_gc_check<T: ValueLogGcTarget>(target: &Arc<T>, waste_threshold: f64) {
         if target.is_closed() {
             return;
         }
-        target.run_gc_if_needed(waste_threshold);
+        crate::support::run_blocking_pass(|| target.run_gc_if_needed(waste_threshold));
     }
 }
 
@@ -132,6 +134,30 @@ mod tests {
     use crate::store::lsm::lsm_tree::LSMConfig;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct SlowTarget(std::sync::Arc<crate::support::runtime_probe::Busy>);
+
+    impl ValueLogGcTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn run_gc_if_needed(&self, _waste_threshold: f64) {
+            self.0.block();
+        }
+    }
+
+    /// A GC pass rewrites segments; on a runtime thread it holds up the tasks
+    /// scheduled behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_gc_pass_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = GCWorker::new(Arc::clone(&target), Duration::from_secs(3600), 30.0);
+        assert_runtime_free_during_pass(&busy).await;
+        worker.shutdown().await;
+    }
 
     fn create_db_config() -> DbConfig {
         let gc_interval = Duration::from_secs(5);

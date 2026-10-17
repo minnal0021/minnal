@@ -78,9 +78,6 @@ pub struct DocStore {
     db: Arc<AsyncDb>,
     db_path: PathBuf,
     schema_dir: PathBuf,
-    /// Exclusive single-writer lock on `db_path`, released when this store is
-    /// dropped — or by the kernel if the process dies without unwinding.
-    _lock: DirLock,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -126,8 +123,10 @@ impl DocStore {
         std::fs::create_dir_all(&db_path)?;
         std::fs::create_dir_all(&schema_dir)?;
 
-        // Held for the lifetime of this DocStore. Kept as a local until it is
-        // moved into the struct, so every early return below releases it.
+        // Handed to the database once it is open, which releases it only when
+        // the database itself is dropped (`AsyncDb::hold_dir_lock`): a worker's
+        // pass can keep the database alive after this DocStore is gone. Kept as
+        // a local until then, so a failed open releases it.
         let lock = match DirLock::acquire(&db_path) {
             Ok(lock) => lock,
             Err(LockError::Held { pid }) => {
@@ -140,11 +139,11 @@ impl DocStore {
         };
 
         let db = Arc::new(AsyncDb::open_with_config(db_path.clone(), config.clone()).await?);
+        db.hold_dir_lock(lock);
         let store = Self {
             db,
             db_path,
             schema_dir,
-            _lock: lock,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
             #[cfg(feature = "semantic-search")]
@@ -469,9 +468,9 @@ fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, Doc
     Ok(schemas)
 }
 
-// There is deliberately no `Drop` impl: the database lock is released by
-// dropping the `DirLock` field's file descriptor, and the lock file itself must
-// NOT be unlinked. Removing the path while another process holds it open would
+// There is deliberately no `Drop` impl: the database lock is released when the
+// `Db` holding the `DirLock` drops its file descriptor, and the lock file itself
+// must NOT be unlinked. Removing the path while another process holds it open would
 // leave that process locking an orphaned inode while a third process creates
 // and locks a fresh file at the same path — two owners at once. See
 // `support::file_lock`.
@@ -488,6 +487,29 @@ mod tests {
     /// still be reachable: the previous existence-check scheme refused to open
     /// here, so every `SIGKILL` needed a manual `rm db/.lock` before the WAL
     /// could be replayed.
+    /// The lock lives as long as the database, not the `DocStore` handle. A
+    /// background worker's pass holds the database (an `Arc<Db>`), so it can
+    /// outlive a `DocStore` dropped without `shutdown`; while it does, its final
+    /// flush and compaction are still to run. Releasing the lock with the handle
+    /// let a reopen use the same files meanwhile.
+    #[tokio::test]
+    async fn the_lock_is_held_while_anything_still_holds_the_database() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let pass = Arc::clone(&store.db); // what a worker's running pass holds
+        drop(store);
+        match DocStore::open_with_config(db_dir.path(), schema_dir.path(), crate::doc_store::test_db_config()).await {
+            Err(DocStoreError::StoreLocked { .. }) => {}
+            Err(e) => panic!("expected StoreLocked, got {e:?}"),
+            Ok(_) => panic!("a second instance opened the files while the first was still alive"),
+        }
+
+        drop(pass);
+        let _reopened = open_fresh(db_dir.path(), schema_dir.path()).await;
+    }
+
     #[tokio::test]
     async fn test_stale_lock_file_from_a_crash_does_not_block_open() {
         let db_dir = TempDir::new().unwrap();
