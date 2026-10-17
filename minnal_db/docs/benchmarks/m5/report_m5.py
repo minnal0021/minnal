@@ -16,6 +16,7 @@ partition split at least once (or no posting was over its split limit). The
 TTL worker has no counter and is not checked.
 """
 import glob, json, math, os, sys
+from m5_rules import queue_grew, timeline, validity
 
 R = sys.argv[1] if len(sys.argv) > 1 else "/home/sperumal/minnal_dev/minnal/work/bench/results/m5"
 QRELS = "/home/sperumal/minnal_dev/minnal/work/bench/m5/data/qrels.tsv"
@@ -46,39 +47,6 @@ def ndcg(trec_path, only=None):
             vals.append(dcg / idcg)
         out[k] = (sum(vals) / len(vals), len(vals)) if vals else (float("nan"), 0)
     return out
-
-
-def timeline(path):
-    rows = [json.loads(l) for l in open(path)]
-    return [r for r in rows if "ops" in r], rows
-
-
-def validity(snaps):
-    if len(snaps) < 2:
-        return {"too short": False}
-    a, b = snaps[0], snaps[-1]
-    ops = lambda s, *k: (lambda v: v)(s["ops"][k[0]][k[1]]) if s.get("ops") else 0
-    checks = {}
-    checks["lsm compaction"] = ops(b, "compaction", "l0_l1_compactions") > ops(a, "compaction", "l0_l1_compactions")
-    waste = max((ns.get("waste_ratio_pct", 0) for ns in (b.get("value_log") or [])), default=0)
-    checks["value-log gc"] = ops(b, "gc", "vlog_gc_runs") > ops(a, "gc", "vlog_gc_runs") or waste < 30
-    fa = {f["field_name"]: f["checkpoint_offset"] for f in (a.get("index_health") or {}).get("fields", [])}
-    fb = {f["field_name"]: f["checkpoint_offset"] for f in (b.get("index_health") or {}).get("fields", [])}
-    checks["index checkpoints"] = bool(fb) and all(fb[k] > fa.get(k, -1) for k in fb)
-    checks["wal gc"] = ops(b, "gc", "wal_segments_deleted") > ops(a, "gc", "wal_segments_deleted") or (b.get("wal") or {}).get("live_segments", 99) <= 2
-    qa = [s["queue"]["total_pending"] for s in snaps if s.get("queue")]
-    worked = any(y < x for x, y in zip(qa, qa[1:])) or (qa and max(qa) == 0)
-    checks["vector worker"] = bool(worked)
-    pa, pb = a.get("partition") or {}, b.get("partition") or {}
-    split_limit = pb.get("split_limit", 1 << 62)
-    over = pb.get("size_p10_p50_p90_max", [0, 0, 0, 0])[3] > split_limit
-    checks["partition splits"] = (pb.get("maintenance", {}).get("splits", 0) > pa.get("maintenance", {}).get("splits", 0)) or not over
-    return checks
-
-
-def queue_grew(snaps):
-    q = [s["queue"]["total_pending"] for s in snaps if s.get("queue")]
-    return bool(q) and q[-1] > q[0] + 500
 
 
 def resources(rows):
