@@ -213,6 +213,8 @@ Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the ge
 
 Deletes do not wear the partition down. Deleting half the documents at random, or whole topics, left FiQA within ±0.8 points of what the partition reached before the deletes. **Known limitation:** SciFact with qwen, after half of its topics were deleted, lost 2.5 points; a small store (87 postings left) is the worst case.
 
+**Known limitation: centres are never removed.** Because codes keep their centre, a centre stays in use as long as any code encoded against it exists, and minnal does not yet remove centres that no code uses any more. Every split adds two and every rebuild adds one per posting. Searches and partition updates do not get slower as they accumulate (a search prepares only the centres its codes use), but each costs about 6 KB of memory at 768 dimensions: about 12 MB for a FiQA-sized store, more for a long-lived store under heavy update or delete churn. Removing unused centres during a rebuild is designed but not built (design doc, *Known limitation: centres are never collected*).
+
 ### 3.6 Where minnal differs from SPFresh
 
 | SPFresh | minnal | Why |

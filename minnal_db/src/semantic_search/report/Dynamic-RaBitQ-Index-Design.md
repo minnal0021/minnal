@@ -2641,6 +2641,49 @@ a second dataset (SciFact, which splits far less) is worth its run time.
 | Write amplification from reassignment | M3b | Measured 1.89–2.20 chunk moves per inserted chunk in shuffled and corpus order (the simulation: 2.0), 2.06–2.78 in drifting order; `reassign_range` (0 = halves only) and the error-bound gate are knobs |
 | Early-life quality before the first splits | M3 | A small namespace is scanned in full under the default budget; seeding was measured not to pay (M3c dropped) |
 | Two models in one process | M2a | Per-namespace probe and cache key; test with gemma + qwen |
+| Centres accumulate for good | M3, M4 | Costs made independent of the centre count; collecting unused centres deferred (*Known limitation: centres are never collected*, below) |
+
+### Known limitation: centres are never collected
+
+Centres are append-only. A split adds two, a rebuild adds one per posting it
+fits, and nothing removes one, because a moved code keeps the `centre_id` it was
+encoded against: the chunks a split moves to its halves still decode through
+the parent's centre, and so do the chunks a rebuild moves. A centre is truly
+unused only once every code encoded against it has been deleted or re-embedded,
+which in a store that is loaded once and rarely updated almost never happens.
+
+**What it costs.** Nothing per search or per publish any more: a search builds
+Pass-1 estimators only for the centres its probed codes use, and a new snapshot
+shares the already-rotated centres instead of rotating every one again
+(`evolve` 2.2 ms at FiQA's 1,957 centres, 3.8 ms at 50,000). What remains is
+memory and disk: two vectors per centre (original and rotated), about 6 KB at
+768 dimensions, so about 12 MB at FiQA's size and 300 MB at 50,000 centres, and
+one stored row each.
+
+**When it would matter.** Long-lived stores with heavy update or delete churn,
+where whole groups of codes are deleted or re-embedded and their centres are
+left with no code at all.
+
+**If it is built: collect during a rebuild.** A rebuild reads every code, so as
+its last step it can delete every centre that no code and no non-retired
+posting references. The risks, and what keeps each safe:
+
+| Risk | Consequence | Mitigation |
+|---|---|---|
+| A centre judged unused that a code still uses | That code's chunks are skipped by Pass 1 (counted in `sparse_corrupt_skipped`), silently missing from search | Run under the maintenance lock, after the rebuild's final publish has waited out older writes; keep every centre of a posting that is not retired (new writes encode only against those) and anything created since the scan; scan afresh after the rebuild rather than reuse its plan-time read, since codes written between plan and publish use postings retired by then |
+| Retired postings name a deleted centre | `NamespaceIvf::new` rejects the partition at the next load: the namespace is unusable | Validate the centre only for postings that are not retired; audit every reader of a retired posting's centre (health, drift, history, `abandon`) |
+| The highest centre id is deleted and handed out again | A retired posting names a different centre | Take new ids above the highest id any posting names too, or persist a counter |
+| A crash part-way through the deletes | None: each deleted centre is unused, the deletes are WAL-backed and idempotent | Reload from the store; no journal record needed |
+
+Tests it would need: a restart after collection (retired postings whose
+centres are gone), a write racing the collection against a posting that is
+still active, no id reuse, and a mutation check that removing "keep the centres
+of non-retired postings" fails the racing-write test.
+
+Re-encoding codes onto their current posting's centre would make most centres
+collectable, but it needs the original vectors or a re-encode from 1-bit
+reconstructions, which M3-pre measured to lose accuracy (0.861 against 0.918),
+so it is not planned.
 
 ## Decisions (2026-10-03)
 
@@ -2659,3 +2702,4 @@ a second dataset (SciFact, which splits far less) is worth its run time.
 | 11 | How M3 grows a partition (2026-10-10) | Option C built as SPFresh's LIRE: balanced 2-means splits, reassignment over the 64 nearest postings, merges at SPFresh's 10/118 ratio. One deviation: split centres are the means of the code reconstructions, not medoids. 1-bit codes, no replicas, error-bound gate off by default. M3c dropped (*M3 split algorithm (LIRE)*) |
 | 12 | Where M3's levers live (2026-10-10) | Defaults in the server TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`), written into a namespace's schema when it enables semantic search and owned by the namespace from then on; `threads` is engine-only (*Levers and configuration*) |
 | 13 | Default probe budget (2026-10-10) | 70,000 entries, absolute, as M2d. The scaled form `clamp(fraction · E, floor, ceiling)` is available but unset by default, and reviewed after M3a measures probe cost |
+| 14 | Collecting unused centres (2026-10-17) | Deferred: costs no longer depend on the centre count, and in a rarely updated store almost every centre stays in use. Build it (during a rebuild, *Known limitation: centres are never collected*) when a long-lived store with heavy update or delete churn needs it |
