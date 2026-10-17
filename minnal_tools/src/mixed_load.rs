@@ -18,10 +18,7 @@
 //! | `mix` | Share of each class: `get`, `insert`, `update`, `delete`, `scan`, `field_query`, `search`, `filtered_search` |
 //! | `rate` | Offered requests per second (open loop) |
 //! | `closed` | Optional: run N clients in closed loop instead of a rate |
-//! | `duration_s` | Length of the step (its longest, with `min_samples_per_class`) |
-//! | `min_samples_per_class` | Optional: end the step as soon as every class with a share has this many completed requests (and `min_duration_s` has passed). A p99 from n samples is known to within a rank range of `±1.96·√(0.0099·n)`: at 1,000 samples, the 98.4th to 99.6th percentile. So a step stops once its rarest class is measured that well, instead of running a fixed time that leaves rare classes short at low rates and over-samples every class at high ones. Rates in the summary are over the time the step actually ran |
-//! | `min_duration_s` | Optional: the shortest a step with `min_samples_per_class` runs (default 0), so periodic background work (WAL GC ticks, flushes, maintenance) falls inside it |
-//! | `slo_p99_ms` | Optional, with `min_samples_per_class`: `class → p99 target (ms)`. The step then ends early only on a clear pass, every class's p99 so far within its target; a step showing a miss runs its full `duration_s`, so a fail is always judged on the full step. (Near the saturation point the first minutes of a step run slower than the rest, so an early stop is pessimistic: it could fail a step that passes over the full length, never pass one that fails.) |
+//! | `duration_s` | Length of the step |
 //! | `seed` | Seeds the schedule: the same seed sends the same requests at the same times |
 //! | `state_file` | Insert and delete cursors, carried from step to step |
 //! | `server_pid` | Optional: sample the server's CPU, memory, I/O and open files |
@@ -597,25 +594,6 @@ fn histogram(sorted: &[u64]) -> BTreeMap<u64, u64> {
     h
 }
 
-/// Whether the step may end early: every class in `required` has at least
-/// `target` completed requests and, where it has a p99 target, is within it.
-fn has_samples(ctx: &Ctx, required: &[(usize, Option<f64>)], target: u64) -> bool {
-    required.iter().all(|&(k, slo)| {
-        let mut latencies = {
-            let s = ctx.shared.classes[k].0.lock().unwrap();
-            if (s.latencies_us.len() as u64) < target {
-                return false;
-            }
-            if slo.is_none() {
-                return true;
-            }
-            s.latencies_us.clone()
-        };
-        latencies.sort_unstable();
-        slo.is_none_or(|slo| percentile(&latencies, 0.99) <= slo)
-    })
-}
-
 pub async fn run(args: &[String]) -> Result<(), String> {
     let [path] = args else { usage() };
     let step: Value =
@@ -623,12 +601,6 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let s = |k: &str| step[k].as_str().map(str::to_string).ok_or_else(|| format!("step.{k} is required"));
     let (url, ns, data_dir, out_dir, state_file) = (s("url")?, s("namespace")?, s("data_dir")?, s("out_dir")?, s("state_file")?);
     let duration = Duration::from_secs_f64(step["duration_s"].as_f64().ok_or("step.duration_s is required")?);
-    let min_samples = step["min_samples_per_class"].as_u64();
-    let min_duration = Duration::from_secs_f64(step["min_duration_s"].as_f64().unwrap_or(0.0));
-    let slo: BTreeMap<String, f64> = match step.get("slo_p99_ms") {
-        Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| format!("step.slo_p99_ms: {e}"))?,
-        _ => BTreeMap::new(),
-    };
     let seed = step["seed"].as_u64().ok_or("step.seed is required")?;
     let closed = step["closed"].as_u64().map(|n| n as usize);
     let rate = step["rate"].as_f64().unwrap_or(0.0);
@@ -636,13 +608,6 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         return Err("step.rate or step.closed is required".into());
     }
     let mix: BTreeMap<String, f64> = serde_json::from_value(step["mix"].clone()).map_err(|e| format!("step.mix: {e}"))?;
-    // The classes a sample-based stop waits for: every one with a share.
-    let required: Vec<(usize, Option<f64>)> = CLASSES
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| mix.get(**c).copied().unwrap_or(0.0) > 0.0)
-        .map(|(k, c)| (k, slo.get(*c).copied()))
-        .collect();
     let pid = step["server_pid"].as_u64();
     let poll_every = Duration::from_secs_f64(step["poll_interval_s"].as_f64().unwrap_or(5.0));
     let cold_share = step["search_cold_share"].as_f64().unwrap_or(0.3);
@@ -697,38 +662,19 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let mut late_sum = 0.0f64;
     let mut sent = 0u64;
     let mut tasks = tokio::task::JoinSet::new();
-    // How long the step ran: its full duration, or until the samples were in.
-    let mut ran = duration;
-    let mut stopped_by = "duration";
     if let Some(n) = closed {
         // Closed loop: n clients, each sending its next request when the last
         // returns; latency from the send.
         let ops = Arc::new(Mutex::new(generator));
         let deadline = start + duration;
-        let enough = Arc::new(std::sync::atomic::AtomicBool::new(false));
         for _ in 0..n {
-            let (ctx, ops, enough) = (Arc::clone(&ctx), Arc::clone(&ops), Arc::clone(&enough));
+            let (ctx, ops) = (Arc::clone(&ctx), Arc::clone(&ops));
             tasks.spawn(async move {
-                while Instant::now() < deadline && !enough.load(Ordering::Acquire) {
+                while Instant::now() < deadline {
                     let op = ops.lock().await.next();
                     run_op(Arc::clone(&ctx), op, Instant::now()).await;
                 }
             });
-        }
-        if let Some(target) = min_samples {
-            // Checked once a second: the clients stop at their next request.
-            while !tasks.is_empty() {
-                tokio::select! {
-                    _ = tasks.join_next() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if !enough.load(Ordering::Acquire) && start.elapsed() >= min_duration && has_samples(&ctx, &required, target) {
-                            ran = start.elapsed();
-                            stopped_by = "samples";
-                            enough.store(true, Ordering::Release);
-                        }
-                    }
-                }
-            }
         }
         while tasks.join_next().await.is_some() {}
         let generator = Arc::try_unwrap(ops).ok().expect("clients finished").into_inner();
@@ -737,22 +683,11 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     } else {
         // Open loop: Poisson arrivals at `rate`.
         let mut t = 0.0f64;
-        let mut next_check = 1.0f64;
         let mut arrivals = Rng(seed ^ 0xa11);
         loop {
             t += -(1.0 - arrivals.unit()).ln() / rate;
             if t >= duration.as_secs_f64() {
                 break;
-            }
-            if let Some(target) = min_samples
-                && t >= next_check
-            {
-                next_check = t + 1.0;
-                if t >= min_duration.as_secs_f64() && has_samples(&ctx, &required, target) {
-                    ran = Duration::from_secs_f64(t);
-                    stopped_by = "samples";
-                    break;
-                }
             }
             let op = generator.next();
             let scheduled = start + Duration::from_secs_f64(t);
@@ -801,7 +736,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             name.to_string(),
             json!({
                 "count": n,
-                "rate": n as f64 / ran.as_secs_f64(),
+                "rate": n as f64 / duration.as_secs_f64(),
                 "errors": s.errors,
                 "not_found": s.not_found,
                 "statuses": s.statuses,
@@ -828,13 +763,11 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         "mode": if closed.is_some() { "closed" } else { "open" },
         "offered_rate": rate,
         "clients": closed,
-        "duration_s": ran.as_secs_f64(),
-        "max_duration_s": duration.as_secs_f64(),
-        "stopped_by": stopped_by,
+        "duration_s": duration.as_secs_f64(),
         "wall_s": wall,
         "sent": sent,
         "completed": total_done,
-        "completed_rate": total_done as f64 / ran.as_secs_f64(),
+        "completed_rate": total_done as f64 / duration.as_secs_f64(),
         "errors": total_errors,
         "error_rate": total_errors as f64 / total_done.max(1) as f64,
         "dropped": dropped,

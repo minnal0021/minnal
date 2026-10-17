@@ -6,7 +6,7 @@
    directory and start the release server on cores 4-31; the load generator
    runs on cores 0-3.
 2. Prime the query-embedding cache (every test query once, which also records
-   quality at the start), then warm up: 2 minutes at 25% of the first rate (not
+   quality at the start), then warm up: 5 minutes at 25% of the first rate (not
    measured). Searches in the steps use cached queries only, so they measure
    minnal, not the embedding service (user decision, 2026-10-11): a query that
    misses the cache is embedded by the same service as the ingested documents
@@ -15,13 +15,10 @@
    errors pass 0.1%, or the vector queue grows (the report's sustainability
    rule, `m5_rules.queue_grew`, so the soak always runs at a sustainable rate);
    then two bisection steps between the last passing and the first failing
-   rate. A step ends once every class has 1,000 completed requests and is
-   within its target, after at least 3 and at most 10 minutes (MIN_SAMPLES); a
-   step showing a miss runs the full 10 minutes. Before each step the vector
-   queue is allowed to drain (up to 20 minutes; how long it took is recorded).
+   rate. Every step runs 10 minutes. Before each step the vector queue is
+   allowed to drain (up to 20 minutes; how long it took is recorded).
 4. Soak: 60 minutes at the best passing rate.
-5. Concurrency sweep (closed loop): 1, 2, 4, ..., 64 clients, each step ending
-   as the ramp's do (at most 5 minutes).
+5. Concurrency sweep (closed loop): 1, 2, 4, ..., 64 clients, 5 minutes each.
 6. Cold-query penalty: 10 minutes at the sustainable rate with 30% of searches
    missing the cache.
 7. Quality at rest: every test query once, alone, against the final state.
@@ -62,21 +59,7 @@ MAX_ERROR_RATE = 0.001
 mix = sys.argv[1]
 quick = "--quick" in sys.argv
 STEP_S = 60 if quick else 600
-# Ramp, bisection and sweep steps end once every class has this many completed
-# requests (its p99 then lies between the 98.4th and 99.6th percentile, 95%
-# confidence), after at least MIN_STEP_S (three WAL GC ticks, so periodic
-# background work falls inside) and at most STEP_S / SWEEP_S. A fixed length
-# left a rare class short at low rates (300 deletes in a read_heavy step at
-# 50 req/s: a "p99" near the slowest one) and over-sampled every class at high
-# rates. A step ends early only on a clear pass (every class within its target
-# so far); one showing a miss runs in full and is judged on the whole step,
-# because near the knee the first minutes run slower than the rest (paired
-# check 2026-10-17, balanced 140 req/s: insert/delete p99 35/94 ms over the
-# first 237 s, 32/83 ms over 600 s), so an early fail could be wrong but an
-# early pass could not. The soak and the cold-query step keep fixed lengths.
-MIN_SAMPLES = 200 if quick else 1000
-MIN_STEP_S = 20 if quick else 180
-WARM_S = 30 if quick else 120
+WARM_S = 30 if quick else 300
 SOAK_S = 120 if quick else 3600
 SWEEP_S = 30 if quick else 300
 SWEEP = [1, 4, 16] if quick else [1, 2, 4, 8, 16, 32, 64]
@@ -127,15 +110,12 @@ def drain(limit_s=1200):
 seed_counter = [1000]
 
 
-def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0, by_samples=True):
+def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0):
     seed_counter[0] += 1
     out = f"{OUT}/{name}"
     spec = dict(url=URL, namespace=NS, data_dir=DATA, out_dir=out, mix=MIXES[mix], duration_s=duration,
                 seed=seed_counter[0], state_file=f"{OUT}/state.json", server_pid=server.pid,
                 poll_interval_s=5, lag_sample_every=20, search_cold_share=cold)
-    if by_samples:
-        # Ends early only on a clear pass; a step showing a miss runs in full.
-        spec.update(min_samples_per_class=MIN_SAMPLES, min_duration_s=MIN_STEP_S, slo_p99_ms=SLO)
     if closed:
         spec["closed"] = closed
     else:
@@ -157,7 +137,7 @@ def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0, by_samples=Tru
     grew = queue_grew(timeline(f"{out}/timeline.jsonl")[0])
     ok = not misses and not grew and s["error_rate"] <= MAX_ERROR_RATE and s["dropped"] == 0
     why = dict(misses, **({"queue": "grew"} if grew else {}))
-    log(f"done  {name}: {s['duration_s']:.0f} s ({s.get('stopped_by', 'duration')}), completed {s['completed_rate']:.1f}/s, "
+    log(f"done  {name}: completed {s['completed_rate']:.1f}/s, "
         f"errors {s['error_rate']:.4%}, dropped {s['dropped']}, "
         f"late max {s['dispatcher_late_max_ms']:.1f} ms, lag p50 {s['ingestion_lag']['p50_ms']:.0f} ms, "
         f"queue end {queue_depth()}; {'PASS' if ok else 'FAIL ' + json.dumps(why)}")
@@ -175,8 +155,7 @@ for d in ("db", "schemas", "log"):
         shutil.copytree(f"{M5}/base/{d}", f"{RUN}/{d}")
 server = start_server()
 json.dump(dict(mix=mix, weights=MIXES[mix], slo_p99_ms=SLO, commit=open(f"{BIN}/COMMIT").read().strip(),
-               step_s=STEP_S, min_samples_per_class=MIN_SAMPLES, min_step_s=MIN_STEP_S, warm_s=WARM_S,
-               quick=quick, host_cores=os.cpu_count()), open(f"{OUT}/run.json", "w"), indent=1)
+               step_s=STEP_S, warm_s=WARM_S, quick=quick, host_cores=os.cpu_count()), open(f"{OUT}/run.json", "w"), indent=1)
 def quality_pass(name):
     subprocess.run(["taskset", "-c", "0-3", f"{BIN}/minnal_tools", "search_load", "-c", "1", "--top-k", "100",
                     "--record", f"{OUT}/{name}.trec", URL, NS, f"{DATA}/queries.jsonl"], check=True,
@@ -187,7 +166,7 @@ try:
     log("drain after start:", drain())
     quality_pass("start")
     log("query cache primed; quality at start recorded")
-    step("warmup", rate=FIRST_RATE * 0.25, duration=WARM_S, by_samples=False)
+    step("warmup", rate=FIRST_RATE * 0.25, duration=WARM_S)
     rate, passing, failing, k = FIRST_RATE, None, None, 0
     while True:
         k += 1
@@ -209,11 +188,11 @@ try:
     log(f"best passing rate {passing}, first failing {failing}")
     json.dump(dict(passing=passing, failing=failing), open(f"{OUT}/rates.json", "w"))
     if passing:
-        step(f"soak-{passing:.0f}", rate=passing, duration=SOAK_S, by_samples=False)
+        step(f"soak-{passing:.0f}", rate=passing, duration=SOAK_S)
     for n in SWEEP:
         step(f"closed-{n:02d}", closed=n, duration=SWEEP_S)
     if passing:
-        step(f"cold-penalty-{passing:.0f}", rate=passing, cold=0.3, by_samples=False)
+        step(f"cold-penalty-{passing:.0f}", rate=passing, cold=0.3)
     # Quality at rest: every query once, one client, nothing else running.
     log("drain before quality at rest:", drain(3600))
     quality_pass("rest")
