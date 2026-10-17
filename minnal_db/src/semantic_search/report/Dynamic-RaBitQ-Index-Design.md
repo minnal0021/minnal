@@ -2515,12 +2515,12 @@ merges) happen *during* the measured run, not only before it.
 | Class | Request | Notes |
 |---|---|---|
 | `get` | `GET /stores/{ns}/docs/{id}` | Ids drawn Zipf (s = 1.0) over loaded documents, so a hot set exists |
-| `insert` | `PUT /stores/{ns}/docs/{id}` (new id) | From the ingestion stream; each triggers an embed (real service) and Pass-1 chunk routing |
-| `update` | `PUT /stores/{ns}/docs/{id}` (existing id) | Half change only a field (no re-embed), half change the text (re-embed, re-route chunks, stale-key deletes) |
+| `insert` | `PUT /stores/{ns}/docs/{id}` (new id) | From the ingestion stream, then the stream's texts again with `" (copy)"` appended under new ids; each is embedded (replayed, below) and its chunks routed |
+| `update` | `PUT /stores/{ns}/docs/{id}` (existing id) | Half change only a field, half append `" Revised."` to the text; both are re-embedded (every write is), with chunks re-routed and stale keys deleted |
 | `delete` | `DELETE /stores/{ns}/docs/{id}` | Deletes shrink postings, which is what drives merges |
 | `scan` | `GET /stores/{ns}/docs?cursor=…&limit=50` | Cursor-paginated; a scan session reads 1–20 pages |
 | `field_query` | `POST /stores/{ns}/query` | Predicates over `category`, `year`, `score`, 1–3 terms |
-| `search` | `POST /stores/{ns}/semantic-search` | FiQA's 648 test queries plus generated paraphrases, so the query-embedding cache sees both hits and misses (target 70% hit rate) |
+| `search` | `POST /stores/{ns}/semantic-search` | FiQA's 648 test queries, embeddings cached before the run (every search is a cache hit) |
 | `filtered_search` | `POST /stores/{ns}/semantic-search/filtered` | `search` with a field predicate (selectivity 5–50%) |
 
 **Mixes.** A run uses one mix; each mix is run on its own:
@@ -2531,27 +2531,38 @@ merges) happen *during* the measured run, not only before it.
 | `balanced` | 25% | 10% | 10% | 3% | 5% | 15% | 25% | 7% |
 | `ingest_heavy` | 15% | 30% | 15% | 5% | 5% | 10% | 15% | 5% |
 
-**Ingestion is limited by the embedding service, not by minnal**, and the two
-run on the same host. The service (a gateway in front of one llama.cpp server
-per model, ROCm on the host's AMD GPU) embeds on the GPU, so it takes little
-CPU from minnal, but it caps ingestion: about 10 documents per second through
-the vector worker for gemma. Its batching settings (`EMBEDDING_MAX_BATCH_TEXTS`,
-`EMBEDDING_BATCH_WAIT_MS`, `LLAMA_PARALLEL`) are recorded with the run. Writes enter minnal at their arrival rate, but the vector
-worker embeds them only as fast as the service answers. So inserts are not
-just a share of a rate: the run also reports *ingestion lag*, the time from a
-write's acknowledgement to its document being searchable (polled through the
-vector queue), and the queue depth over time. A mix whose embed demand exceeds
-the service's throughput has a growing queue, and the run reports it as
-unsustainable whatever the latencies say.
+**The embedding service is not measured: embeddings are replayed** (user
+decision, 2026-10-17). The service's throughput on the GPU depends on its
+batching and on everything else the GPU does, it is not minnal, and it made
+runs unrepeatable. So no service runs during M5. `embed_replay.py` answers the
+service's API from a table recorded once from the real service
+(`build_replay_table.py`, which makes the real engine embed every text a run
+can send, so the payloads match byte for byte), on the load generator's
+cores. The engine still does everything it does with an embedding:
+quantisation, the vector index WAL, routing, splits and merges.
+
+That needs a **finite set of texts**: inserts past the end of the stream reuse
+its texts with one fixed suffix, `" (copy)"`, and text-changing updates append
+one fixed `" Revised."`, where they used to carry a counter. So texts repeat
+exactly from the second pass over the stream, and an update of an
+already-revised document resends the same text; the engine embeds and indexes
+each one regardless. A payload missing from the table stops the run.
+
+Writes are acknowledged when stored and embedded afterwards by the vector
+worker, now limited only by the engine (`[vector_index] concurrency`, 4
+documents at a time). The run reports *ingestion lag*, the time from a write's
+acknowledgement to its document being searchable, and the vector queue's depth
+over time, as engine measurements. They do **not** decide the sustainable rate
+(user decision, 2026-10-17): at a rate whose queue grows, new documents become
+searchable later and later, and the report says so beside the rate.
 
 ### Procedure
 
-1. **Host.** This machine (32 cores, 89 GB, AMD GPU with 32 GB for the embedding models), idle apart from the run. Release
-   binary, production TOML defaults, the real embedding service. The load
-   generator runs on the same host, pinned with `taskset` to 4 cores that the
-   server is kept off (the server and the embedding service's gateway share the
-   other 28; the models run on the GPU), and the run records the host's CPU,
-   memory, disk I/O and GPU use.
+1. **Host.** This machine (32 cores, 89 GB), idle apart from the run. Release
+   binary, production TOML defaults, embeddings replayed (above). The load
+   generator and the replay run on the same host, pinned with `taskset` to 4
+   cores that the server is kept off (the server has the other 28), and the run
+   records the host's CPU, memory and disk I/O.
 2. **Warm-up.** Load the base set, wait for the vector queue to empty and for
    compaction to settle, then run the mix at 25% of the first step's rate for 5
    minutes. Warm-up is not measured.
@@ -2613,11 +2624,16 @@ rate curve per class (the main chart) and the background-work timeline.
 ### Report and gate
 
 The report gives, per mix: the **sustainable rate** (the highest offered rate at
-which every class meets its p99 target, errors stay below 0.1% and the vector
-queue does not grow), the latency of each class at that rate, ingestion lag,
+which every class meets its p99 target and errors stay below 0.1%), the latency
+of each class at that rate, the vector queue and ingestion lag at each step,
 quality under load against quality at rest, and write amplification over the
-soak. It states the host, binary commit and TOML, and its caveats (one host,
-client on the same machine, one dataset, synthetic fields).
+soak. It opens with its **assumptions and constraints**, filled from what the
+run recorded: what is measured (the engine only), that embeddings are replayed
+and from what table, the finite texts and the repeats they cause, cached query
+embeddings (what a cache miss costs is not measured), that the sustainable rate
+leaves indexing out, the vector worker's concurrency, the data, the host and
+its core split, step lengths and p99 targets, and that the run had no replay
+misses. It also states the binary commit.
 
 **Gate:** the run is valid (every background task did work in every step);
 quality under load is within 0.005 of quality at rest at every nDCG cutoff

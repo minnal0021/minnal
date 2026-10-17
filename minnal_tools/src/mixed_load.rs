@@ -37,10 +37,15 @@
 //! **Classes.**
 //!
 //! - `get`: ids drawn Zipf (s = 1.0) over the stable base documents.
-//! - `insert`: the ingestion stream in order, then new ids reusing its texts.
+//! - `insert`: the ingestion stream in order, then new ids reusing its texts
+//!   with a fixed `" (copy)"` appended: one variant per stream document, so
+//!   the texts the engine can embed stay a finite set (see `update`).
 //! - `update`: a stable document rewritten whole, half with a new `score`
 //!   only, half with changed text (text changes avoid documents a test query
-//!   judges relevant, so quality stays comparable).
+//!   judges relevant, so quality stays comparable). A text change appends a
+//!   fixed `" Revised."`: one revision per document, so the set of texts the
+//!   engine can embed is finite and a replay table of their embeddings covers
+//!   it (M5 replays embeddings instead of calling the embedding service).
 //! - `delete`: the deletable base documents in order, then inserted ones.
 //! - `scan`: one page of 50 from a random starting key.
 //! - `field_query`: 1–3 terms over `category`, `year`, `score`.
@@ -271,9 +276,11 @@ impl Generator {
         let s = &self.data.stream;
         let mut d = s[(n % s.len() as u64) as usize].clone();
         if n >= s.len() as u64 {
-            // Past the stream: new ids, the stream's texts again.
+            // Past the stream: new ids, the stream's texts again, with one
+            // fixed suffix (a per-pass counter would make every pass new
+            // text, which no replay table of embeddings can cover).
             d.id = 10_000_000_000 + n;
-            d.text = format!("{} (copy {})", d.text, n / s.len() as u64);
+            d.text = format!("{} (copy)", d.text);
         }
         d
     }
@@ -296,7 +303,7 @@ impl Generator {
                 let id = pool[self.rng.below(pool.len())];
                 let mut d = self.data.base[&id].clone();
                 if text_change {
-                    d.text = format!("{} Revised {}.", d.text, self.seq);
+                    d.text = format!("{} Revised.", d.text);
                 } else {
                     d.score = self.rng.below(1001) as i64;
                 }

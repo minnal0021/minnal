@@ -2,26 +2,29 @@
 
     python3 run_m5.py MIX [--quick]
 
+The benchmark measures the engine only (user decision, 2026-10-17): no
+embedding service runs. `embed_replay.py` answers every embedding request from a
+table recorded once (`build_replay_table.py`; `M5_REPLAY_TABLE`), on cores 0-3
+with the load generator. The first payload missing from it stops the run.
+
 1. Copy the base snapshot (40,000 FiQA documents, indexed) to a fresh run
-   directory and start the release server on cores 4-31; the load generator
-   runs on cores 0-3.
+   directory, start the replay, and start the release server on cores 4-31
+   pointed at it; the load generator runs on cores 0-3.
 2. Prime the query-embedding cache (every test query once, which also records
    quality at the start), then warm up: 5 minutes at 25% of the first rate (not
-   measured). Searches in the steps use cached queries only, so they measure
-   minnal, not the embedding service (user decision, 2026-10-11): a query that
-   misses the cache is embedded by the same service as the ingested documents
-   and waits behind them.
-3. Steps from 50 req/s, x1.5 per step, until a class misses its p99 target,
-   errors pass 0.1%, or the vector queue grows (the report's sustainability
-   rule, `m5_rules.queue_grew`, so the soak always runs at a sustainable rate);
-   then two bisection steps between the last passing and the first failing
-   rate. Every step runs 10 minutes. Before each step the vector queue is
-   allowed to drain (up to 20 minutes; how long it took is recorded).
+   measured). Searches in the steps use cached queries only (user decision,
+   2026-10-11).
+3. Steps from 50 req/s, x1.5 per step, until a class misses its p99 target or
+   errors pass 0.1%; then two bisection steps between the last passing and the
+   first failing rate. Every step runs 10 minutes. The vector queue and
+   ingestion lag are recorded but do not decide a step (user decision,
+   2026-10-17). Before each step the vector queue is allowed to drain (up to
+   20 minutes; how long it took is recorded).
 4. Soak: 60 minutes at the best passing rate.
 5. Concurrency sweep (closed loop): 1, 2, 4, ..., 64 clients, 5 minutes each.
-6. Cold-query penalty: 10 minutes at the sustainable rate with 30% of searches
-   missing the cache.
-7. Quality at rest: every test query once, alone, against the final state.
+6. Quality at rest: every test query once, alone, against the final state.
+
+(No cold-query step: what a cache miss costs is the embedding service's.)
 
 Every step writes work/bench/results/m5/{mix}/{name}/ (summary.json,
 timeline.jsonl, search.trec, lag.json). `report_m5.py` turns them into tables.
@@ -40,6 +43,11 @@ TAG = os.environ.get("M5_TAG", "")
 DATA = f"{M5}/data"
 URL = "http://127.0.0.1:8095"
 NS = "fiqa"
+REPLAY_TABLE = os.environ.get("M5_REPLAY_TABLE", f"{M5}/embed-replay.table")
+REPLAY_PORT = 8096
+REPLAY_URL = f"http://127.0.0.1:{REPLAY_PORT}"
+SERVER_CORES, CLIENT_CORES = "4-31", "0-3"
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 MIXES = {
     "read_heavy": dict(get=40, insert=3, update=4, delete=1, scan=5, field_query=15, search=25, filtered_search=7),
@@ -84,11 +92,33 @@ def queue_depth():
     return get("/admin/indices/vector/queue/summary")["total_pending"]
 
 
+def replay_stats():
+    with urllib.request.urlopen(f"{REPLAY_URL}/stats", timeout=60) as r:
+        return json.loads(r.read())
+
+
+def start_replay():
+    if not os.path.exists(REPLAY_TABLE):
+        raise SystemExit(f"no replay table at {REPLAY_TABLE}: run build_replay_table.py first")
+    p = subprocess.Popen(["taskset", "-c", CLIENT_CORES, sys.executable, f"{HERE}/embed_replay.py", "replay", REPLAY_TABLE, str(REPLAY_PORT)],
+                         stdout=open(f"{RUN}/replay.out", "w"), stderr=subprocess.STDOUT)
+    for _ in range(600):
+        try:
+            replay_stats()
+            return p
+        except Exception:
+            time.sleep(0.5)
+    raise SystemExit("replay did not start")
+
+
 def start_server():
     cfg = open(f"{M5}/server-base.toml").read().replace(f"{M5}/base/", f"{RUN}/")
+    cfg = cfg.replace('embedding_service_url = "http://localhost:8001"', f'embedding_service_url = "{REPLAY_URL}"')
+    if REPLAY_URL not in cfg:
+        raise SystemExit("server-base.toml: embedding_service_url not found; the server would call the real service")
     open(f"{RUN}/server.toml", "w").write(cfg)
     out = open(f"{RUN}/server.out", "a")
-    p = subprocess.Popen(["taskset", "-c", "4-31", f"{BIN}/minnal_db_api", f"{RUN}/server.toml"], stdout=out, stderr=subprocess.STDOUT)
+    p = subprocess.Popen(["taskset", "-c", SERVER_CORES, f"{BIN}/minnal_db_api", f"{RUN}/server.toml"], stdout=out, stderr=subprocess.STDOUT)
     for _ in range(600):
         try:
             get("/stores")
@@ -110,6 +140,16 @@ def drain(limit_s=1200):
 seed_counter = [1000]
 
 
+def check_replay(where, before):
+    """The replay counters since `before`; stops the run on any miss."""
+    after = replay_stats()
+    d = {k: after[k] - before[k] for k in after}
+    if d["misses"]:
+        log(f"REPLAY MISS during {where}: {d}; the run is not a valid engine measurement, stopping")
+        raise SystemExit(2)
+    return d
+
+
 def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0):
     seed_counter[0] += 1
     out = f"{OUT}/{name}"
@@ -124,6 +164,7 @@ def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0):
     json.dump(spec, open(f"{out}/step.json", "w"), indent=1)
     waited = drain()
     log(f"start {name}: rate {rate} clients {closed}; queue drained in {waited if waited is None else round(waited)} s")
+    before = replay_stats()
     r = subprocess.run(["taskset", "-c", "0-3", f"{BIN}/minnal_tools", "mixed_load", f"{out}/step.json"],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -131,16 +172,18 @@ def step(name, rate=None, closed=None, duration=STEP_S, cold=0.0):
         raise SystemExit(1)
     s = json.load(open(f"{out}/summary.json"))
     s["queue_drain_s"] = waited
+    s["replay"] = check_replay(name, before)
     json.dump(s, open(f"{out}/summary.json", "w"), indent=1)
     misses = {c: s["classes"][c]["p99_ms"] for c in SLO
               if s["classes"][c]["count"] and s["classes"][c]["p99_ms"] > SLO[c]}
+    # Reported, not a criterion (user decision, 2026-10-17).
     grew = queue_grew(timeline(f"{out}/timeline.jsonl")[0])
-    ok = not misses and not grew and s["error_rate"] <= MAX_ERROR_RATE and s["dropped"] == 0
-    why = dict(misses, **({"queue": "grew"} if grew else {}))
+    ok = not misses and s["error_rate"] <= MAX_ERROR_RATE and s["dropped"] == 0
     log(f"done  {name}: completed {s['completed_rate']:.1f}/s, "
         f"errors {s['error_rate']:.4%}, dropped {s['dropped']}, "
         f"late max {s['dispatcher_late_max_ms']:.1f} ms, lag p50 {s['ingestion_lag']['p50_ms']:.0f} ms, "
-        f"queue end {queue_depth()}; {'PASS' if ok else 'FAIL ' + json.dumps(why)}")
+        f"queue end {queue_depth()} ({'grew' if grew else 'steady'}), replay {s['replay']['payloads']} payloads; "
+        f"{'PASS' if ok else 'FAIL ' + json.dumps(misses)}")
     return ok
 
 
@@ -153,17 +196,33 @@ log(f"copy base snapshot -> {RUN}")
 for d in ("db", "schemas", "log"):
     if os.path.exists(f"{M5}/base/{d}"):
         shutil.copytree(f"{M5}/base/{d}", f"{RUN}/{d}")
+replay = start_replay()
+replay_at_start = replay_stats()
 server = start_server()
+server_cfg = open(f"{RUN}/server.toml").read()
+concurrency = next((l.split("=")[1].strip() for l in server_cfg.splitlines() if l.startswith("concurrency")), "?")
+with open(f"{RUN}/replay.out") as f:
+    loaded = f.readline()  # "embed_replay replay: N vectors loaded, models [...], port P"
 json.dump(dict(mix=mix, weights=MIXES[mix], slo_p99_ms=SLO, commit=open(f"{BIN}/COMMIT").read().strip(),
-               step_s=STEP_S, warm_s=WARM_S, quick=quick, host_cores=os.cpu_count()), open(f"{OUT}/run.json", "w"), indent=1)
+               step_s=STEP_S, warm_s=WARM_S, soak_s=SOAK_S, sweep_s=SWEEP_S, quick=quick, host_cores=os.cpu_count(),
+               server_cores=SERVER_CORES, client_cores=CLIENT_CORES, vector_worker_concurrency=concurrency,
+               stream_docs=sum(1 for _ in open(f"{DATA}/stream.jsonl")), queries=sum(1 for _ in open(f"{DATA}/queries.jsonl")),
+               replay=dict(table=REPLAY_TABLE, table_mib=os.path.getsize(REPLAY_TABLE) / 2**20,
+                           vectors=int(loaded.split(":")[1].split()[0]), model=loaded.split("models")[1].split("]")[0] + "]")),
+          open(f"{OUT}/run.json", "w"), indent=1)
+
+
 def quality_pass(name):
-    subprocess.run(["taskset", "-c", "0-3", f"{BIN}/minnal_tools", "search_load", "-c", "1", "--top-k", "100",
+    before = replay_stats()
+    subprocess.run(["taskset", "-c", CLIENT_CORES, f"{BIN}/minnal_tools", "search_load", "-c", "1", "--top-k", "100",
                     "--record", f"{OUT}/{name}.trec", URL, NS, f"{DATA}/queries.jsonl"], check=True,
                    stdout=open(f"{OUT}/{name}.out", "w"), stderr=subprocess.STDOUT)
+    check_replay(f"quality pass {name}", before)
 
 
 try:
     log("drain after start:", drain())
+    check_replay("server start", replay_at_start)
     quality_pass("start")
     log("query cache primed; quality at start recorded")
     step("warmup", rate=FIRST_RATE * 0.25, duration=WARM_S)
@@ -191,8 +250,6 @@ try:
         step(f"soak-{passing:.0f}", rate=passing, duration=SOAK_S)
     for n in SWEEP:
         step(f"closed-{n:02d}", closed=n, duration=SWEEP_S)
-    if passing:
-        step(f"cold-penalty-{passing:.0f}", rate=passing, cold=0.3)
     # Quality at rest: every query once, one client, nothing else running.
     log("drain before quality at rest:", drain(3600))
     quality_pass("rest")
@@ -200,4 +257,6 @@ try:
 finally:
     server.send_signal(signal.SIGTERM)
     server.wait(timeout=300)
-    log("server stopped")
+    replay.send_signal(signal.SIGTERM)
+    replay.wait(timeout=30)
+    log("server and replay stopped")
