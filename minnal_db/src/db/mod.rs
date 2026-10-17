@@ -16,6 +16,7 @@ pub(crate) mod query;
 pub mod stats;
 pub mod toml_config;
 pub(crate) mod ttl_worker;
+pub(crate) mod vector_index_wal;
 pub mod wal;
 pub(crate) mod wal_gc;
 pub(crate) mod wal_worker;

@@ -1,3 +1,4 @@
+use crate::db::vector_index_wal::VectorIndexWalError;
 use crate::db::wal::WalError;
 use crate::store::lsm::lsm_tree::LSMError;
 use crate::store::value_log::ValueLogError;
@@ -20,6 +21,8 @@ pub enum KVError {
     ShardedValueLogError(#[from] ShardedValueLogError),
     #[error("WAL error: {0}")]
     WalError(#[from] WalError),
+    #[error("vector index WAL error: {0}")]
+    VectorIndexWal(#[from] VectorIndexWalError),
     #[error("Database is closed")]
     DatabaseClosed,
     #[error("write too large: {0}")]

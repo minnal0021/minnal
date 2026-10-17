@@ -7,7 +7,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "doc-store")]
 pub(crate) mod file_lock;
 pub mod hex;
+#[cfg(test)]
+pub(crate) mod runtime_probe;
 pub(crate) mod simd_support;
+
+/// Run a background worker's blocking pass (fsyncs, flushes, compaction, GC)
+/// without holding up the async runtime.
+///
+/// On a multi-thread runtime, `block_in_place` hands this thread's queued tasks
+/// to another thread for the duration. Run plainly, the pass held up every task
+/// scheduled behind it: M5 traced every get over 15 ms to an index checkpoint
+/// (~55 ms of fsyncs every 1.75 s; get p99 4-10 ms against a 1.3 ms median).
+/// The pass still runs inside the worker's own task, so nothing it uses lives
+/// longer than before (`spawn_blocking` would keep the database alive past its
+/// last handle while a pass ran). A current-thread runtime cannot hand its tasks
+/// off, so there the pass runs inline.
+pub(crate) fn run_blocking_pass<R>(pass: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(pass),
+        _ => pass(),
+    }
+}
 
 /// fsync a directory so that a create/rename/unlink of one of its entries is
 /// durable. A file's own `sync_all` only persists its *contents*, not the

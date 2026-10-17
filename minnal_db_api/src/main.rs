@@ -12,11 +12,10 @@ use std::{
 };
 
 use config::DocStoreApiConfig;
-use minnal_db::semantic_search::ClusterIndex;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
 use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Shared application state passed to every handler via axum's `State` extractor.
 #[derive(Clone)]
@@ -39,12 +38,12 @@ pub struct AppState {
     ///   - await every in-progress build on graceful shutdown.
     ///   - serve live progress snapshots via the progress endpoints.
     pub index_manager: Arc<IndexBuildManager>,
-    /// Pre-built IVF cluster index for semantic search.
+    /// Embedding-service settings for semantic search (URL, timeouts, cache
+    /// TTL), used to probe a namespace's model when it enables semantic search.
     ///
-    /// `None` when the cluster file does not exist yet (semantic search
-    /// unavailable until the index is built).  Once set at startup it is
-    /// never mutated, so no lock is needed.
-    pub cluster_index: Option<Arc<ClusterIndex>>,
+    /// `None` only where a server is built without semantic search (tests).
+    /// Set once at startup and never mutated.
+    pub embedding_service: Option<EmbeddingServiceConfig>,
     /// Monotonic timestamp recorded when the server process started.
     ///
     /// Used by the `GET /admin/storage/health` endpoint to report uptime.
@@ -134,80 +133,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => error!("failed to resume pending index builds: {e}"),
     }
 
-    let semantic_cfg = cfg.semantic_search.resolve(cfg.db_path().as_path());
-    let cluster_index_opt = {
-        let path = semantic_cfg.cluster_path.to_string_lossy();
-        info!(path = %path, "loading cluster index");
-        match ClusterIndex::load_with_dim(&path, semantic_cfg.embedding_dim) {
-            Ok(idx) => {
-                info!(
-                    clusters = idx.clusters.len(),
-                    n_probes = semantic_cfg.n_probes,
-                    "loaded cluster index for semantic search"
-                );
-                if let Some(bundled) = semantic_cfg.centroid_mismatch() {
-                    warn!(
-                        cluster_path = %path,
-                        model = %semantic_cfg.model_name,
-                        bundled = %bundled.display(),
-                        "cluster_path holds different centroids from the bundled set for the configured model; \
-                         unless they were fitted on that model, vectors are filed into the wrong clusters and \
-                         search is slower and less accurate, with no error",
-                    );
-                }
-                Some(Arc::new(idx))
-            }
-            Err(e) => {
-                warn!(
-                    path = %path,
-                    "cluster index not loaded — semantic search unavailable: {e}",
-                );
-                None
+    let semantic_cfg = cfg.semantic_search.resolve();
+    let embedding_service = Some(semantic_cfg.service_config());
+
+    // Attach a SemanticSearchContext so put/delete on semantic-search-enabled
+    // namespaces maintain their vector index. Each namespace picks its model
+    // and grows its own partition; the server only lists the allowed models,
+    // if any.
+    let store = if let Some(service) = embedding_service.clone() {
+        let supported = semantic_cfg.supported_models();
+        info!(
+            models = %if supported.is_empty() {
+                "any the embedding service serves".to_string()
+            } else {
+                supported.iter().map(|(m, d)| format!("{m} ({d}-d)")).collect::<Vec<_>>().join(", ")
+            },
+            "semantic search enabled",
+        );
+
+        // Probe the embedding service for each (model, dimension) an existing
+        // semantic namespace uses, so operators get an early warning if it is
+        // unreachable or misconfigured. Non-fatal: semantic requests surface the
+        // error at call time.
+        let mut in_use: std::collections::BTreeSet<(String, u32)> = std::collections::BTreeSet::new();
+        for settings in schemas
+            .values()
+            .filter(|s| s.semantic_search_enabled)
+            .filter_map(|s| s.vector_settings().ok())
+            .chain(
+                kv_schemas
+                    .values()
+                    .filter(|s| s.is_semantic_search_enabled())
+                    .filter_map(|s| s.vector_settings().ok()),
+            )
+        {
+            in_use.insert((settings.embedding_model, settings.embedding_dim));
+        }
+        for (model, dim) in in_use {
+            let probe = EmbeddingServiceConfig {
+                model_name: model.clone(),
+                embedding_dim: dim as usize,
+                ..service.clone()
+            };
+            match minnal_db::semantic_search::service::check_embedding_service(&probe).await {
+                Ok(()) => info!(url = %probe.embedding_service_url, model = %model, dim, "embedding service reachable"),
+                Err(e) => error!(
+                    url = %probe.embedding_service_url, model = %model, dim,
+                    "embedding service check failed — semantic search for this model will be unavailable: {e}",
+                ),
             }
         }
-    };
 
-    // If the cluster index loaded successfully, attach a SemanticSearchContext
-    // to the store so that put/delete on semantic-search-enabled namespaces
-    // automatically maintain the companion vector KV store.
-    let store = if let Some(cluster_index) = cluster_index_opt.clone() {
-        let embedding_cfg = EmbeddingServiceConfig {
-            embedding_service_url: semantic_cfg.embedding_service_url.clone(),
-            model_name: semantic_cfg.model_name.clone(),
-            embedding_dim: semantic_cfg.embedding_dim,
-            top_k_results: semantic_cfg.top_k_results,
-            number_of_bits_for_dense_quantisation: semantic_cfg.number_of_bits_for_dense_quantisation,
-            n_probes: semantic_cfg.n_probes,
-            window_size: semantic_cfg.window_size,
-            sliding_size: semantic_cfg.sliding_size,
-            first_pass_sparse_search_top_k: semantic_cfg.first_pass_sparse_search_top_k,
-            query_embedding_cache_ttl: semantic_cfg.query_embedding_cache_ttl,
-            embedding_request_timeout: semantic_cfg.embedding_request_timeout,
-            embedding_connect_timeout: semantic_cfg.embedding_connect_timeout,
-        };
-
-        // Probe the embedding service so operators get an early warning if it
-        // is unreachable or misconfigured.  Failure is non-fatal: the server
-        // starts anyway and semantic search requests will surface the error at
-        // call time.
-        match minnal_db::semantic_search::service::check_embedding_service(&embedding_cfg).await {
-            Ok(()) => info!(
-                url = %embedding_cfg.embedding_service_url,
-                dim = embedding_cfg.embedding_dim,
-                "embedding service reachable",
-            ),
-            Err(e) => error!(
-                url = %embedding_cfg.embedding_service_url,
-                "embedding service health check failed — semantic search will be unavailable: {e}",
-            ),
-        }
-
-        store
-            .with_vector_index_config(cfg.to_vector_index_config())
-            .with_semantic_search(SemanticSearchContext {
-                config: embedding_cfg,
-                cluster_index,
-            })
+        store.with_vector_index_config(cfg.to_vector_index_config()).with_semantic_search(
+            SemanticSearchContext::new(service)
+                .with_supported_models(supported)
+                // Validated when the config was loaded.
+                .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load"))
+                .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load"))
+                .with_rebuild_threads(cfg.semantic_search.maintenance.rebuild_threads().expect("validated at load")),
+        )
     } else {
         store
     };
@@ -217,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schemas: Arc::new(RwLock::new(schemas)),
         kv_schemas: Arc::new(RwLock::new(kv_schemas)),
         index_manager: Arc::clone(&index_manager),
-        cluster_index: cluster_index_opt,
+        embedding_service,
         started_at: Instant::now(),
         attr_index_ops: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         vec_index_cleanup: Arc::new(parking_lot::Mutex::new(HashSet::new())),
@@ -263,7 +247,18 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
 
-    info!("shutdown signal received — draining connections");
+    info!("shutdown signal received — draining connections (Ctrl-C again to force exit)");
+
+    // The handler stays installed, so without this a second Ctrl-C would be
+    // swallowed while a slow shutdown runs. Forcing exit is crash-equivalent:
+    // WAL-backed writes replay at the next start; no-WAL vector payloads not
+    // yet flushed are re-embedded by reconciliation.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            error!("second Ctrl-C — exiting without a clean shutdown");
+            std::process::exit(130);
+        }
+    });
 }
 
 /// Resolve and load configuration.

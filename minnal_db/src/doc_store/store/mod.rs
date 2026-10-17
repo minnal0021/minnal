@@ -36,6 +36,8 @@ use crate::doc_store::pagination::{CursorPage, Page, Pagination, clamp_cursor, p
 use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema, SchemaAmendment, StoreType};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
+#[cfg(feature = "semantic-search")]
+use crate::doc_store::vector_settings::SearchSpec;
 use crate::support::file_lock::{DirLock, LockError};
 #[cfg(feature = "semantic-search")]
 use crate::vector_kv;
@@ -54,6 +56,8 @@ mod str_keys_tests;
 mod test_support;
 mod types;
 mod vector;
+#[cfg(test)]
+mod vector_settings_tests;
 
 pub use types::*;
 
@@ -74,9 +78,6 @@ pub struct DocStore {
     db: Arc<AsyncDb>,
     db_path: PathBuf,
     schema_dir: PathBuf,
-    /// Exclusive single-writer lock on `db_path`, released when this store is
-    /// dropped — or by the kernel if the process dies without unwinding.
-    _lock: DirLock,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -97,6 +98,11 @@ pub struct DocStore {
     /// [`DocStore::with_semantic_search`]; defaults are used otherwise.
     #[cfg(feature = "semantic-search")]
     vector_index_config: VectorIndexConfig,
+    /// Namespaces whose `index_all` / `kv_index_all` is still enqueueing in this
+    /// process. A second reindex of one of them is refused; the on-disk record
+    /// only reports progress (see [`DocStore::vec_reindex_progress`]).
+    #[cfg(feature = "semantic-search")]
+    vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl DocStore {
@@ -117,8 +123,10 @@ impl DocStore {
         std::fs::create_dir_all(&db_path)?;
         std::fs::create_dir_all(&schema_dir)?;
 
-        // Held for the lifetime of this DocStore. Kept as a local until it is
-        // moved into the struct, so every early return below releases it.
+        // Handed to the database once it is open, which releases it only when
+        // the database itself is dropped (`AsyncDb::hold_dir_lock`): a worker's
+        // pass can keep the database alive after this DocStore is gone. Kept as
+        // a local until then, so a failed open releases it.
         let lock = match DirLock::acquire(&db_path) {
             Ok(lock) => lock,
             Err(LockError::Held { pid }) => {
@@ -131,17 +139,19 @@ impl DocStore {
         };
 
         let db = Arc::new(AsyncDb::open_with_config(db_path.clone(), config.clone()).await?);
+        db.hold_dir_lock(lock);
         let store = Self {
             db,
             db_path,
             schema_dir,
-            _lock: lock,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
             #[cfg(feature = "semantic-search")]
             notify: None,
             #[cfg(feature = "semantic-search")]
             worker_handle: std::sync::Mutex::new(None),
+            #[cfg(feature = "semantic-search")]
+            vec_reindexing: Arc::default(),
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
         };
@@ -163,6 +173,11 @@ impl DocStore {
                 store.db.namespace(schema.namespace.clone()).await?;
             }
         }
+
+        // Before any vector worker can start (`with_semantic_search` comes after
+        // this): finish vector-index drops a crash interrupted.
+        #[cfg(feature = "semantic-search")]
+        store.finish_interrupted_vector_index_drops().await?;
 
         // Start background workers after all indices are activated so the
         // index checkpoint worker's first immediate tick captures a complete
@@ -226,6 +241,7 @@ impl DocStore {
         let handle = VecIndexWorker::start(
             Arc::clone(&self.db),
             Arc::clone(&ctx),
+            self.schema_dir.clone(),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
@@ -239,7 +255,12 @@ impl DocStore {
             let db = Arc::clone(&self.db);
             let schema_dir = self.schema_dir.clone();
             let notify = Arc::clone(&notify);
+            let mut startup_pass = handle.startup_pass();
             tokio::spawn(async move {
+                // After the worker's first pass over what a crash left queued: see
+                // `VecIndexWorkerHandle::startup_pass`. (A worker gone before then
+                // drops the sender; reconcile anyway.)
+                let _ = startup_pass.wait_for(|done| *done).await;
                 info!("startup vector-index reconciliation: scanning for documents missing a vector index");
                 let outcome = reconcile_all_vector_indexes(&db, &schema_dir, false).await;
                 if outcome.failed > 0 {
@@ -346,6 +367,60 @@ impl DocStore {
 }
 
 /// Load every persisted document-store schema from `schema_dir`.
+/// The resolved vector-index settings and `ns_id` of `namespace`, whichever kind
+/// of store it is, read from its schema file.
+#[cfg(feature = "semantic-search")]
+/// `Err(SemanticSearchNotEnabled)` unless `namespace` (document or KV store)
+/// has semantic search enabled; `Err(NotFound)` for an unknown namespace.
+#[cfg(feature = "semantic-search")]
+pub(crate) fn require_semantic_search(schema_dir: &Path, namespace: &str) -> Result<(), DocStoreError> {
+    let json = std::fs::read_to_string(schema_dir.join(format!("{namespace}.json"))).map_err(|_| DocStoreError::NotFound {
+        namespace: namespace.to_owned(),
+    })?;
+    let enabled = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => serde_json::from_str::<KvStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .is_semantic_search_enabled(),
+        _ => serde_json::from_str::<DocStoreSchema>(&json)
+            .map_err(SchemaError::Serialize)?
+            .is_semantic_search_enabled(),
+    };
+    if enabled {
+        Ok(())
+    } else {
+        Err(DocStoreError::SemanticSearchNotEnabled {
+            namespace: namespace.to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+pub(crate) fn load_vector_settings(
+    schema_dir: &Path,
+    namespace: &str,
+) -> Result<(crate::doc_store::vector_settings::VectorIndexSettings, u32), DocStoreError> {
+    let path = schema_dir.join(format!("{namespace}.json"));
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        DocStoreError::Schema(SchemaError::NotFound {
+            namespace: namespace.to_owned(),
+        })
+    })?;
+    let (settings, ns_id) = match crate::doc_store::schema::peek_store_type(&json) {
+        Some(StoreType::Kv) => {
+            let s = serde_json::from_str::<KvStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
+        _ => {
+            let s = serde_json::from_str::<DocStoreSchema>(&json).map_err(SchemaError::Serialize)?;
+            (s.vector_settings()?, s.ns_id)
+        }
+    };
+    let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+        namespace: namespace.to_owned(),
+    })?;
+    Ok((settings, ns_id))
+}
+
 fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocStoreError> {
     let mut schemas = Vec::new();
     let entries = match std::fs::read_dir(schema_dir) {
@@ -393,9 +468,9 @@ fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, Doc
     Ok(schemas)
 }
 
-// There is deliberately no `Drop` impl: the database lock is released by
-// dropping the `DirLock` field's file descriptor, and the lock file itself must
-// NOT be unlinked. Removing the path while another process holds it open would
+// There is deliberately no `Drop` impl: the database lock is released when the
+// `Db` holding the `DirLock` drops its file descriptor, and the lock file itself
+// must NOT be unlinked. Removing the path while another process holds it open would
 // leave that process locking an orphaned inode while a third process creates
 // and locks a fresh file at the same path — two owners at once. See
 // `support::file_lock`.
@@ -412,6 +487,29 @@ mod tests {
     /// still be reachable: the previous existence-check scheme refused to open
     /// here, so every `SIGKILL` needed a manual `rm db/.lock` before the WAL
     /// could be replayed.
+    /// The lock lives as long as the database, not the `DocStore` handle. A
+    /// background worker's pass holds the database (an `Arc<Db>`), so it can
+    /// outlive a `DocStore` dropped without `shutdown`; while it does, its final
+    /// flush and compaction are still to run. Releasing the lock with the handle
+    /// let a reopen use the same files meanwhile.
+    #[tokio::test]
+    async fn the_lock_is_held_while_anything_still_holds_the_database() {
+        let db_dir = TempDir::new().unwrap();
+        let schema_dir = TempDir::new().unwrap();
+
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let pass = Arc::clone(&store.db); // what a worker's running pass holds
+        drop(store);
+        match DocStore::open_with_config(db_dir.path(), schema_dir.path(), crate::doc_store::test_db_config()).await {
+            Err(DocStoreError::StoreLocked { .. }) => {}
+            Err(e) => panic!("expected StoreLocked, got {e:?}"),
+            Ok(_) => panic!("a second instance opened the files while the first was still alive"),
+        }
+
+        drop(pass);
+        let _reopened = open_fresh(db_dir.path(), schema_dir.path()).await;
+    }
+
     #[tokio::test]
     async fn test_stale_lock_file_from_a_crash_does_not_block_open() {
         let db_dir = TempDir::new().unwrap();

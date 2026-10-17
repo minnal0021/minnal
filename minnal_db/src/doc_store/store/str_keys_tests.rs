@@ -26,6 +26,7 @@ fn str_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreSchema {
         indices,
         semantic_search_enabled: false,
         embedding_fields: vec![],
+        vector_index: None,
     }
 }
 
@@ -327,6 +328,7 @@ async fn semantic_search_delete_path_handles_string_ids() {
         indices: vec![],
         semantic_search_enabled: true,
         embedding_fields: vec!["title".to_owned()],
+        vector_index: None,
     };
     store.create(schema).await.unwrap();
 

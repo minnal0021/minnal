@@ -17,6 +17,7 @@ re-check them before starting work.
 | [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
+| [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 
 ---
 
@@ -1007,3 +1008,120 @@ document ID, so they are unaffected.
   10.5 MB → 0.79 MB, `reindex-all` about 1 s; a `kill -9` mid-run was finished
   at restart; every query matched the ground truth before and after.
 
+---
+
+## FR-007 — A recall check that says when a rebuild helps
+
+**Filed:** 2026-10-12
+**Area:** `minnal_db` (`src/ivf_split/recall_check.rs`, `src/ivf_split/history.rs`,
+`src/doc_store/store/vector.rs`), `minnal_db_api`
+(`GET /admin/indices/{ns}/vector/recall-check`, `GET /admin/indices/{ns}/vector/history`)
+**Severity:** Low — operators had no measured way to decide on a rebuild
+**Source:** design-doc review of M4: "the product has no cutoff that starts a
+rebuild"
+
+### Summary
+
+`POST /admin/indices/{ns}/vector/rebuild` re-clusters a namespace's partition,
+and nothing told an operator when to call it. The partition endpoint reports
+centre drift and posting sizes, but neither measures what a rebuild changes:
+
+- **Centre drift** is how far codes have moved from the centre they were encoded
+  against. A rebuild re-encodes nothing and moves every code, so it *raises*
+  drift (SciFact and FiQA: mean 0.28–0.40 before, 0.45–0.51 after; every code
+  foreign).
+  Drift is a re-encode signal, and re-encoding is not built.
+- **Posting-size spread** is one of three signals the M4 plan named for an
+  automatic trigger. None was given a threshold, and none predicts recall.
+
+What a rebuild changes is which postings hold which chunks, and so how much of
+what a full read would find a search reaches within its probe budget.
+
+### What was built
+
+**The recall check.** It samples real queries' embeddings from the
+query-embedding cache (`system_qemb_cache`, the namespace's model and dimension
+only, one bounded page read). With fewer than 20 cached it samples stored chunks
+instead, each chunk's 1-bit reconstruction back in the original space and
+normalised; `query_source` says which. Either way it needs no embedding
+service. Each query runs through the production search
+twice: with the namespace's settings, and with every posting probed. The source
+document is left out of both lists. **Overlap@k** at 10, 20, 30, 40, 50 and 100
+is the share of the full read's top k the normal search also returns. The
+verdict is `read_in_full` (every search already reads every posting, so no
+partition can change its results), `ok`, `below_target` (overlap@10 under
+`min_overlap`, default 0.95) or `empty`. The same `seed` samples the same queries,
+so a check before and after a rebuild compares like with like.
+
+**Server settings.** `GET /admin/indices/vector/settings` returns the server's
+`[semantic_search]` values (embedding service, allowed models, timeouts, both
+TTLs, maintenance and rebuild threads, the recall check's limits, and the
+defaults new stores get), so a console can show them beside a store's own
+`vector_index`. Each recall check also returns its `seed`, so checks around a
+rebuild can be matched. minnal_ui shows all of it in a per-store **Vector Index
+Ops** tab (branch `dynamic-rabitq-index` of minnal_ui).
+
+**The history.** Every recall check, `partition?codes=true` read and finished
+rebuild is written to the system TTL namespace `system_partition_history`
+(`partition_history_ttl_secs`, default 30 days; one WAL-backed put each). `GET .../vector/history` reads them back,
+and the partition endpoint shows the latest recall check as `last_recall_check`.
+Nothing is collected in the background: a record exists only because someone
+ran the operation.
+
+### Calibration
+
+Each run grew a namespace from one posting at target 128, ran the check
+(300 queries) at entry budgets of 1%, 5% and 20% of the namespace and at the
+default 70,000, rebuilt it, and ran the check again with the same seed, once with
+real (judged) queries and once with stored-chunk queries. Overlap@10, before →
+after the rebuild:
+
+| Run | Real queries, 1% read | Real, 5% | Real, 20% | Chunk queries, 1% | Chunks, 5% | Gate recall@10 gain at 1% (M4) |
+|---|---|---|---|---|---|---|
+| SciFact gemma, drifting | 0.588 → 0.629 | 0.847 → 0.853 | 0.966 → 0.969 | 0.600 → 0.641 | 0.840 → 0.858 | +2.8 |
+| SciFact gemma, shuffled | 0.559 → 0.600 | 0.824 → 0.850 | 0.966 → 0.964 | 0.577 → 0.660 | 0.836 → 0.868 | +4.4 |
+| SciFact qwen, drifting | 0.631 → 0.675 | 0.858 → 0.883 | 0.978 → 0.981 | 0.617 → 0.669 | 0.833 → 0.852 | +4.3 |
+| SciFact qwen, shuffled | 0.597 → 0.651 | 0.864 → 0.870 | 0.971 → 0.977 | 0.608 → 0.660 | 0.822 → 0.842 | +3.2 |
+| FiQA gemma, drifting | 0.852 → 0.883 | 0.961 → 0.974 | 0.996 → 0.994 | 0.805 → 0.804 | 0.944 → 0.938 | +3.2 |
+| FiQA gemma, shuffled | 0.861 → 0.885 | 0.964 → 0.974 | 0.995 → 0.995 | 0.814 → 0.843 | 0.946 → 0.957 | +1.8 |
+| FiQA qwen, drifting | 0.902 → 0.925 | 0.981 → 0.987 | 0.997 → 0.999 | 0.854 → 0.867 | 0.954 → 0.961 | +2.0 |
+| FiQA qwen, shuffled | 0.909 → 0.927 | 0.986 → 0.987 | 0.997 → 0.998 | 0.835 → 0.875 | 0.953 → 0.967 | +1.1 |
+
+At the default 70,000-entry budget overlap@10 was 1.000 before and after in every run, for both kinds of query (SciFact is read in full there: verdict `read_in_full`).
+
+- **Real queries track what a rebuild gains.** At a 1% read real-query overlap
+  rose 1.8–5.4 points against a gate recall gain of 1.1–4.4 in the same runs
+  (FiQA gemma drifting: +3.1 against +3.2), 0.1–2.6 at 5%, and nothing at 20% or
+  the default budget: the same pattern as recall@10 in the gate runs.
+- **Chunk queries can miss it**, which is why they are only the fallback: on FiQA
+  gemma drifting they did not move (0.805 → 0.804), and on FiQA qwen shuffled
+  they overstated it (+4.0 against +1.1).
+- **The level differs by dataset** (at a 1% read before the rebuild, real-query
+  overlap was 0.56–0.63 on SciFact and 0.85–0.91 on FiQA). That is why the verdict is
+  `below_target`, with the advice to rebuild and compare, rather than a promise
+  that a rebuild will help: a fixed bar cannot separate a budget that is too small
+  from a partition that is badly fitted.
+- **At the default budget** both datasets read `read_in_full` (SciFact) or
+  overlap@10 of 1.000 (FiQA, 62% of entries read), and the M4 runs measured no
+  nDCG change from a rebuild at that budget.
+
+### Cost
+
+One normal search and one reference search per sampled query, run one at a
+time, each through the scoring gate a client search takes, so a check adds about
+one client's load. With 300 queries: SciFact (23k chunks, full read 3–4 ms)
+1.2–2.1 s; FiQA (173k chunks, full read 21–24 ms) 7.5–12.7 s. A search holds every
+entry it scans in memory until it returns, so the reference search is capped at
+`MAX_REFERENCE_ENTRIES` (500,000 entries, about 150 MB and 0.1 s per query);
+above it the reference reads the nearest postings up to the cap
+(`reference_is_full_read: false`).
+
+### Left open
+
+- **An automatic trigger.** The check could run on a schedule and start a
+  rebuild below a bar, but the bar would have to be set per namespace (see the
+  calibration), and the gain at default budgets is nil on the datasets measured.
+- **Query texts.** A variant taking query texts (through the embedding service)
+  would let an operator check queries that are not cached.
+- **Re-encoding**, the remedy for centre drift (design doc, *Re-encode
+  strategies*).

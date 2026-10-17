@@ -172,29 +172,52 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     r.add("value_log", "verify_checksums_on_read", cfg.value_log.verify_checksums_on_read);
 
     let ss = &cfg.semantic_search;
-    r.add(
-        "semantic_search",
-        "number_of_bits_for_dense_quantisation",
-        ss.number_of_bits_for_dense_quantisation,
-    );
-    r.add("semantic_search", "n_probes", ss.n_probes);
-    r.add("semantic_search", "embedding_dim", ss.embedding_dim);
-    r.add("semantic_search", "first_pass_sparse_search_top_k", ss.first_pass_sparse_search_top_k);
-    r.add("semantic_search", "window_size", ss.window_size);
-    r.add("semantic_search", "sliding_size", ss.sliding_size);
-    r.add("semantic_search", "top_k_results", ss.top_k_results);
     r.add("semantic_search", "embedding_service_url", &ss.embedding_service_url);
-    r.add("semantic_search", "model", &ss.model);
-    let cluster = ss
-        .cluster_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "none (bundled default)".to_string());
-    r.add("semantic_search", "cluster_path", cluster);
-    r.add("semantic_search", "supported_models", format!("{} entry(ies)", ss.supported_models.len()));
+    let models = if ss.supported_models.is_empty() {
+        "any the embedding service serves".to_string()
+    } else {
+        ss.supported_models
+            .iter()
+            .map(|m| format!("{} ({}-d)", m.name, m.dimension))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    r.add("semantic_search", "supported_models", models);
     r.add("semantic_search", "query_embedding_cache_ttl_secs", ss.query_embedding_cache_ttl_secs);
+    r.add("semantic_search", "partition_history_ttl_secs", ss.partition_history_ttl_secs);
     r.add("semantic_search", "embedding_request_timeout_secs", ss.embedding_request_timeout_secs);
     r.add("semantic_search", "embedding_connect_timeout_secs", ss.embedding_connect_timeout_secs);
+    // The values a namespace is filled with when it enables semantic search
+    // (validated when the config was loaded; a bad table never gets here).
+    if let Ok(d) = ss.index_defaults() {
+        let m = d.maintenance;
+        r.add("semantic_search.maintenance", "target_posting_size", m.target_posting_size);
+        r.add("semantic_search.maintenance", "reassign_range", m.reassign_range);
+        r.add("semantic_search.maintenance", "merge_ratio", format!("{:.4}", m.merge_ratio.0));
+        r.add("semantic_search.maintenance", "skip_uncertain_moves", m.skip_uncertain_moves);
+        r.add("semantic_search.maintenance", "split_samples", m.split_samples);
+        r.add("semantic_search.maintenance", "split_init_trials", m.split_init_trials);
+        r.add("semantic_search.maintenance", "split_max_iters", m.split_max_iters);
+        r.add("semantic_search.maintenance", "split_lambda_factor", m.split_lambda_factor.0);
+        r.add("semantic_search.maintenance", "threads", ss.maintenance.threads().unwrap_or_default());
+        r.add(
+            "semantic_search.maintenance",
+            "rebuild_threads",
+            ss.maintenance.rebuild_threads().unwrap_or_default(),
+        );
+        let q = d.search;
+        r.add("semantic_search.search_defaults", "probe_budget_entries", q.probe_budget_entries);
+        r.add("semantic_search.search_defaults", "min_probes", q.min_probes);
+        r.add("semantic_search.search_defaults", "max_probes", q.max_probes);
+        r.add("semantic_search.search_defaults", "first_pass_top_k", q.first_pass_top_k);
+        r.add("semantic_search.search_defaults", "top_k", q.top_k);
+        r.add(
+            "semantic_search.search_defaults",
+            "probe_budget_fraction",
+            q.probe_budget_fraction.map_or("off".to_string(), |f| f.0.to_string()),
+        );
+        r.add("semantic_search.search_defaults", "probe_budget_floor", q.probe_budget_floor);
+    }
 
     let v = &cfg.vector_index;
     r.add("vector_index", "retry_wait_secs", v.retry_wait_secs);

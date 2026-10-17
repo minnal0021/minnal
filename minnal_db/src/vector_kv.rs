@@ -8,6 +8,8 @@
 //! | `{ns}_sparse_vector`      | `cluster_id (4B BE) ‖ doc_id`  | rkyv `Vec<VectorIndex>` (SingleBit only) |
 //! | `{ns}_sparse_vector_meta` | `doc_id`                       | `count (2B BE u16) ‖ [cluster_id (4B BE)]×N` |
 //! | `{ns}_dense_vector`       | `doc_id`                       | rkyv `Vec<VectorIndex>` (MultiBit only)  |
+//! | `{ns}_ivf_centres`        | `centre_id (4B BE)`            | `f32 LE × D` (seeded once, append-only)  |
+//! | `{ns}_ivf_postings`       | `posting_id (4B BE)`           | `centre_id ‖ state (1B) ‖ routing f32 LE × D` |
 //!
 //! The sparse namespace stores chunked single-bit embeddings keyed by IVF cluster, enabling
 //! fast first-pass scans by cluster prefix.  The meta namespace tracks which clusters each
@@ -39,11 +41,58 @@
 //!    a. Reads cluster IDs from `_sparse_vector_meta`, deletes all sparse composite keys.
 //!    b. Deletes `doc_id` from `_dense_vector`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorKvStore};
-use crate::semantic_search::{VectorIndex, composite_key};
+use crate::semantic_search::{PostingDelta, VectorIndex, composite_key};
 use crate::{AsyncDb, AsyncNamespace};
+
+/// Test-only crash injection for the crash audit (design doc M0-2).
+///
+/// [`crash_point!`] sits before every vector-index write in this module. A test
+/// arms a countdown of N writes; the next check after N fails with a simulated
+/// crash, and so does every check after it, as if the process had died. The
+/// test then drops the database without shutting it down (losing every unflushed
+/// no-WAL write, as a real crash does), reopens it and checks what survived.
+/// Thread-local, so it only affects the (current-thread) test that armed it.
+#[cfg(test)]
+pub(crate) mod crash_point {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REMAINING: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let `writes` more writes through, then fail every later one.
+    pub(crate) fn arm(writes: usize) {
+        REMAINING.with(|r| r.set(Some(writes)));
+    }
+
+    /// Stop injecting; returns whether the crash fired.
+    pub(crate) fn disarm() -> bool {
+        REMAINING.with(|r| r.replace(None) == Some(0))
+    }
+
+    pub(crate) fn check() -> Result<(), crate::KVError> {
+        REMAINING.with(|r| match r.get() {
+            Some(0) => Err(crate::KVError::Io(std::io::Error::other("simulated crash"))),
+            Some(n) => {
+                r.set(Some(n - 1));
+                Ok(())
+            }
+            None => Ok(()),
+        })
+    }
+}
+
+/// A point where the crash audit can stop the process: before a write.
+macro_rules! crash_point {
+    () => {
+        #[cfg(test)]
+        crash_point::check()?;
+    };
+}
 
 // ── Namespace name helpers ────────────────────────────────────────────────────
 
@@ -63,11 +112,54 @@ pub fn dense_vectors_ns(namespace: &str) -> String {
     format!("{}_dense_vector", namespace)
 }
 
-/// The suffixes that mark a namespace as a vector companion of another.
+/// Internal namespace for a namespace's centres: `centre_id (4B BE) → f32 LE × D`.
+/// What codes are encoded against; append-only, and kept when the vector index
+/// is dropped (the model is fixed, so re-enabling reuses it).
+pub fn ivf_centres_ns(namespace: &str) -> String {
+    format!("{}_ivf_centres", namespace)
+}
+
+/// Internal namespace for a namespace's postings:
+/// `posting_id (4B BE) → centre_id (4B BE) ‖ state (1B) ‖ routing centroid f32 LE × D`.
+pub fn ivf_postings_ns(namespace: &str) -> String {
+    format!("{}_ivf_postings", namespace)
+}
+
+/// Internal namespace for a namespace's maintenance journal (design doc M3a):
+/// `op_id (8B BE) → record`, WAL-backed.
+pub fn ivf_journal_ns(namespace: &str) -> String {
+    format!("{}_ivf_journal", namespace)
+}
+
+/// The suffixes that mark a namespace as a companion of another: its vector data
+/// and its partition (centres, postings and maintenance journal).
 ///
 /// Listed longest-first so [`companion_base`] cannot mistake
 /// `x_sparse_vector_meta` for `x_sparse_vector`.
-pub const COMPANION_SUFFIXES: [&str; 3] = ["_sparse_vector_meta", "_sparse_vector", "_dense_vector"];
+pub const COMPANION_SUFFIXES: [&str; 6] = [
+    "_sparse_vector_meta",
+    "_sparse_vector",
+    "_dense_vector",
+    "_ivf_centres",
+    "_ivf_postings",
+    "_ivf_journal",
+];
+
+/// The companions removed when the vector index is dropped: all of them. The
+/// partition is derived from the data since M3 (a namespace grows it by
+/// splitting), so it goes with the data and re-enabling starts from the root.
+pub const VECTOR_DATA_SUFFIXES: [&str; 6] = COMPANION_SUFFIXES;
+
+/// Every companion namespace name of `namespace`.
+pub fn companion_namespaces(namespace: &str) -> Vec<String> {
+    COMPANION_SUFFIXES.iter().map(|suffix| format!("{namespace}{suffix}")).collect()
+}
+
+/// If `name` holds vector-index data of another namespace (see
+/// [`VECTOR_DATA_SUFFIXES`]), the base namespace it belongs to.
+pub fn vector_data_base(name: &str) -> Option<&str> {
+    VECTOR_DATA_SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix))
+}
 
 /// If `name` is a vector companion namespace, the base namespace it belongs to.
 ///
@@ -114,24 +206,27 @@ pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_4
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
 
-/// The cache key for `query_text` embedded by `model`: `model ‖ 0x00 ‖ query`.
+/// The cache key for `query_text` embedded by `model` at `dim` dimensions:
+/// `model ‖ 0x00 ‖ dim (u32 BE) ‖ query`.
 ///
 /// The model is part of the key because one embedding service can serve
-/// several models, and the same text embeds to unrelated vectors in each.
-/// Without it, switching `model_name` would keep serving the previous model's
-/// cached query vectors until the TTL expired. The NUL separator keeps
-/// `("ab", "c")` and `("a", "bc")` apart.
-fn query_cache_key(model: &str, query_text: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(model.len() + 1 + query_text.len());
+/// several models, and the same text embeds to unrelated vectors in each; the
+/// dimension because each namespace picks its own, and the same model at two
+/// dimensions returns different vectors. Without them, namespaces with
+/// different models or dimensions would share cached query vectors. The NUL
+/// separator keeps `("ab", "c")` and `("a", "bc")` apart.
+fn query_cache_key(model: &str, dim: usize, query_text: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(model.len() + 5 + query_text.len());
     key.extend_from_slice(model.as_bytes());
     key.push(0);
+    key.extend_from_slice(&(dim as u32).to_be_bytes());
     key.extend_from_slice(query_text.as_bytes());
     key
 }
 
 /// Look up a cached query embedding in the system-wide TTL cache.
 ///
-/// Keyed by embedding model and query text. Returns the whole-query embedding, which serves both
+/// Keyed by embedding model, dimension and query text. Returns the whole-query embedding, which serves both
 /// search passes (queries are not chunked; see
 /// [`embed_query`](crate::semantic_search::service::embed_query)).
 ///
@@ -143,7 +238,7 @@ pub async fn get_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
         .await
         .ok()?;
 
-    let bytes = cache_ns.get(query_cache_key(model, query_text)).await.ok()??;
+    let bytes = cache_ns.get(query_cache_key(model, expected_dim, query_text)).await.ok()??;
     bytes_to_f32_vec_list(&bytes, expected_dim)?.into_iter().next()
 }
 
@@ -163,8 +258,48 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
     // would be pure query-path latency with no durability benefit. A crash that
     // drops the entry simply turns into a future cache miss.
     let _ = cache_ns
-        .put_no_wal(query_cache_key(model, query_text), f32_vec_list_to_bytes(&[dense.to_vec()]))
+        .put_no_wal(query_cache_key(model, dense.len(), query_text), f32_vec_list_to_bytes(&[dense.to_vec()]))
         .await;
+}
+
+/// Up to `limit` cached whole-query embeddings of `model` at `dim` dimensions:
+/// real queries recently searched, which the recall check (FR-007) prefers to
+/// queries made from stored chunks. One bounded page read, starting at a point
+/// in the key space chosen by `seed` and wrapping once, so a large cache is not
+/// read in full and the page does not always begin at the same query text.
+pub async fn sample_cached_query_embeddings(
+    db: &AsyncDb,
+    model: &str,
+    dim: usize,
+    ttl: Duration,
+    limit: usize,
+    seed: u64,
+) -> Result<Vec<Vec<f32>>, crate::KVError> {
+    let cache_ns = db
+        .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
+        .await?;
+    let prefix = query_cache_key(model, dim, "");
+    // The key just past every key with this prefix: the prefix ends in the
+    // dimension's last byte, so add one to it with carry.
+    let mut end = prefix.clone();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            break;
+        }
+    }
+    let end = (!end.is_empty()).then_some(end);
+    let mut start = prefix.clone();
+    start.push((seed % 256) as u8);
+    let mut out = Vec::new();
+    for (from, to) in [(start.clone(), end.clone()), (prefix, Some(start))] {
+        if out.len() >= limit {
+            break;
+        }
+        let (rows, _) = cache_ns.scan(Some(from), to, limit - out.len()).await?;
+        out.extend(rows.into_iter().filter_map(|(_, v)| bytes_to_f32_vec_list(&v, dim)?.into_iter().next()));
+    }
+    Ok(out)
 }
 
 /// Delete every entry from the system-wide query-embedding cache.
@@ -228,31 +363,80 @@ fn bytes_to_f32_vec_list(bytes: &[u8], expected_dim: usize) -> Option<Vec<Vec<f3
 
 // ── Sparse-meta encoding ──────────────────────────────────────────────────────
 //
-// Format: `count (2B BE u16) ‖ [cluster_id (4B BE)] × count`
+// Format: `text_hash (8B BE u64) ‖ count (2B BE u16) ‖ [cluster_id (4B BE)] × count`
+//
+// The meta is a document's index record: which clusters hold its chunks (the only
+// way to find them again for a delete) and which text its vectors were embedded
+// from (so reconciliation can tell stale vectors from current ones).
 
-fn encode_sparse_meta(cluster_ids: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + cluster_ids.len() * 4);
-    out.extend_from_slice(&(cluster_ids.len() as u16).to_be_bytes());
-    for &id in cluster_ids {
+/// Stable 64-bit FNV-1a hash of the text a document's vectors were embedded from.
+/// Stored in the meta; never `std`'s `DefaultHasher`, whose output may change
+/// between Rust releases and would make every stored index look stale.
+pub fn text_hash(text: &str) -> u64 {
+    text.bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// A decoded `{ns}_sparse_vector_meta` record: the hash of the text the vectors
+/// came from, and each posting holding the document's chunks with how many.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SparseMeta {
+    pub(crate) text_hash: u64,
+    pub(crate) postings: Vec<(u32, u32)>,
+}
+
+impl SparseMeta {
+    fn posting_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.postings.iter().map(|&(id, _)| id)
+    }
+
+    fn cluster_ids(&self) -> Vec<u32> {
+        self.posting_ids().collect()
+    }
+}
+
+/// `text_hash (8B) ‖ n (2B) ‖ n × (posting_id (4B) ‖ chunks (4B))`, all big-endian.
+/// The chunk counts make every posting's size exact (deletes have only the meta
+/// to go by), which the split trigger needs. Four bytes, so a document with
+/// more than 65,535 chunks in one posting is counted exactly.
+pub(crate) fn encode_sparse_meta(text_hash: u64, postings: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + postings.len() * 8);
+    out.extend_from_slice(&text_hash.to_be_bytes());
+    out.extend_from_slice(&(postings.len() as u16).to_be_bytes());
+    for &(id, chunks) in postings {
         out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&chunks.to_be_bytes());
     }
     out
 }
 
-fn decode_sparse_meta(bytes: &[u8]) -> Option<Vec<u32>> {
-    if bytes.len() < 2 {
+/// Decodes the current form and two earlier ones: two-byte chunk counts, and
+/// no counts at all (`n × posting_id (4B)`; its counts read as 0). They cannot
+/// be confused: `n` fixes the length of each.
+pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
+    if bytes.len() < 10 {
         return None;
     }
-    let count = u16::from_be_bytes(bytes[..2].try_into().ok()?) as usize;
-    if bytes.len() != 2 + count * 4 {
-        return None;
-    }
-    let mut ids = Vec::with_capacity(count);
+    let text_hash = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    let count = u16::from_be_bytes(bytes[8..10].try_into().ok()?) as usize;
+    let width = match bytes.len() - 10 {
+        l if l == count * 8 => 8,
+        l if l == count * 6 => 6,
+        l if l == count * 4 => 4,
+        _ => return None,
+    };
+    let mut postings = Vec::with_capacity(count);
     for i in 0..count {
-        let off = 2 + i * 4;
-        ids.push(u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?));
+        let off = 10 + i * width;
+        let id = u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        let chunks = match width {
+            8 => u32::from_be_bytes(bytes[off + 4..off + 8].try_into().ok()?),
+            6 => u32::from(u16::from_be_bytes(bytes[off + 4..off + 6].try_into().ok()?)),
+            _ => 0,
+        };
+        postings.push((id, chunks));
     }
-    Some(ids)
+    Some(SparseMeta { text_hash, postings })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -260,7 +444,19 @@ fn decode_sparse_meta(bytes: &[u8]) -> Option<Vec<u32>> {
 /// Write the quantised vector index for a document to the vector KV store.
 ///
 /// `vector_indexes` is the combined list of SingleBit and MultiBit quantised entries
-/// for the document, as returned by `embed_document`.
+/// for the document, as returned by `embed_document`, and `text` is the text they
+/// were embedded from (its hash goes in the meta; see [`has_complete_vector_index`]).
+///
+/// **Write order is load-bearing (crash safety).** The meta is the only record of
+/// which clusters hold the document's chunks, so it must list every key that can be
+/// on disk, at every moment. The writes therefore go: (1) delete the stale cluster
+/// keys (WAL), (2) write the new meta (**WAL-backed**, durable on return), (3) write
+/// the new chunk keys and the dense entry (vector index WAL). Each namespace's
+/// memtable flushes on its own schedule, so a meta outside the main WAL could be
+/// lost while a key written after it was flushed: the key would then be listed nowhere, and a later
+/// delete would leave it behind for good (crash-audit test
+/// `delete_racing_a_reembed_survives_a_crash_anywhere`). The meta is one small
+/// record per document, so its fsync is negligible beside the embedding call.
 ///
 /// SingleBit entries are written to `{ns}_sparse_vector` (keyed by cluster prefix),
 /// with stale cluster keys cleaned up via `{ns}_sparse_vector_meta`.
@@ -270,23 +466,29 @@ fn decode_sparse_meta(bytes: &[u8]) -> Option<Vec<u32>> {
 /// structure that the [`VecIndexWorker`] (re)builds idempotently from the queue,
 /// so it needs no cross-namespace atomicity with the document write.
 ///
-/// The quantised payloads are written **without** the WAL (`put_no_wal`): they
-/// are bulky and reconstructable by re-running the embed/re-index, so paying a
-/// per-chunk WAL fsync (and storing a second copy of every quantised payload in
-/// the WAL) is pure overhead.  A crash before the memtable flushes loses these
-/// entries — possibly flushing the sparse side but losing the dense write (or
-/// vice versa), leaving a partially committed index; the affected docs are
-/// re-enqueued by vector-index reconciliation, which treats a partial index as
-/// not-indexed (see [`has_complete_vector_index`]) and runs automatically as a
-/// background task on startup (and on demand via
-/// `POST /admin/indices/vector/reconcile`).  The stale-cluster `delete`s remain
-/// WAL-backed — they are tiny key-only tombstones and do not fire during a fresh
-/// bulk load.
+/// The quantised payloads skip the main WAL: they are bulky and reconstructable
+/// by re-running the embed, so a per-chunk main-WAL fsync (and a second copy of
+/// every payload there) is pure overhead. They are logged in the vector index
+/// WAL instead (`put_logged`, no fsync), and are durable once the caller's
+/// [`make_vector_writes_durable`] returns; the worker completes an entry only
+/// after that. A crash before it can lose them, but the entry is then still
+/// queued and redone, and vector-index reconciliation treats a partial index as
+/// not-indexed (see [`has_complete_vector_index`]). The stale-cluster `delete`s
+/// remain WAL-backed — they are tiny key-only tombstones.
+///
+/// Returns how the document's entries moved between postings, for the
+/// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
 ///
 /// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
-pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
+pub async fn upsert_vectors(
+    db: &AsyncDb,
+    namespace: &str,
+    doc_id_bytes: &[u8],
+    text: &str,
+    vector_indexes: &[VectorIndex],
+) -> Result<PostingDelta, crate::KVError> {
     if vector_indexes.is_empty() {
-        return Ok(());
+        return Ok(PostingDelta::default());
     }
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
 
@@ -304,42 +506,49 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     // Dropping the work is right — the store it belongs to is gone.
     if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
         log::debug!("upsert_vectors: skipping '{namespace}' — the namespace no longer exists");
-        return Ok(());
+        return Ok(PostingDelta::default());
     }
 
-    // ── Sparse (SingleBit) ────────────────────────────────────────────────────
-    let sparse_vis: Vec<&VectorIndex> = vector_indexes
-        .iter()
-        .filter(|vi| vi.quantisation_style == QuantisationStyle::SingleBit)
-        .collect();
-    if !sparse_vis.is_empty() {
-        let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-        let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    // ── Sparse (SingleBit) and the meta ──────────────────────────────────────
+    // The meta is written even when there are no chunks: it also records which
+    // text the vectors came from.
+    let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
+    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    let mut new_cluster_groups: std::collections::BTreeMap<u32, Vec<VectorIndex>> = std::collections::BTreeMap::new();
+    for vi in vector_indexes.iter().filter(|vi| vi.quantisation_style == QuantisationStyle::SingleBit) {
+        new_cluster_groups.entry(vi.cluster_id).or_default().push(vi.clone());
+    }
+    let new_postings: Vec<(u32, u32)> = new_cluster_groups.iter().map(|(&id, v)| (id, v.len() as u32)).collect();
 
-        let mut new_cluster_groups: std::collections::HashMap<u32, Vec<VectorIndex>> = std::collections::HashMap::new();
-        for vi in &sparse_vis {
-            new_cluster_groups.entry(vi.cluster_id).or_default().push((*vi).clone());
-        }
-        let new_cluster_ids: Vec<u32> = new_cluster_groups.keys().copied().collect();
-
-        // Delete stale cluster keys no longer present.
-        if let Some(old_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
-            && let Some(old_ids) = decode_sparse_meta(&old_bytes)
-        {
-            for old_id in old_ids {
-                if !new_cluster_ids.contains(&old_id) {
-                    sparse_ns.delete(composite_key::encode(old_id, doc_id_bytes)).await?;
-                }
+    // (1) Delete stale cluster keys no longer present (WAL).
+    let mut old_postings = Vec::new();
+    if let Some(old_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
+        && let Some(old) = decode_sparse_meta(&old_bytes)
+    {
+        for old_id in old.posting_ids() {
+            if !new_cluster_groups.contains_key(&old_id) {
+                crash_point!();
+                sparse_ns.delete(composite_key::encode(old_id, doc_id_bytes)).await?;
             }
         }
-
-        for (&cluster_id, chunks) in &new_cluster_groups {
-            let key = composite_key::encode(cluster_id, doc_id_bytes);
-            sparse_ns.put_no_wal(key, VectorIndex::list_to_bytes(chunks)).await?;
-        }
-        sparse_meta_ns
-            .put_no_wal(doc_id_bytes.to_vec(), encode_sparse_meta(&new_cluster_ids))
-            .await?;
+        old_postings = old.postings;
+    }
+    // Every old entry is replaced or deleted, every new one written: exact counts
+    // even where a posting keeps the document with a different number of chunks.
+    let delta = PostingDelta {
+        added: new_postings.clone(),
+        removed: old_postings,
+    };
+    // (2) The new meta, durable before any key it lists is written (WAL).
+    crash_point!();
+    sparse_meta_ns
+        .put(doc_id_bytes.to_vec(), encode_sparse_meta(text_hash(text), &new_postings))
+        .await?;
+    // (3) The new chunk keys (vector index WAL; durable at the batch's sync).
+    for (&cluster_id, chunks) in &new_cluster_groups {
+        let key = composite_key::encode(cluster_id, doc_id_bytes);
+        crash_point!();
+        sparse_ns.put_logged(key, VectorIndex::list_to_bytes(chunks)).await?;
     }
 
     // ── Dense (MultiBit) ─────────────────────────────────────────────────────
@@ -350,14 +559,19 @@ pub async fn upsert_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], 
     if !dense_vis.is_empty() {
         let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
         let owned: Vec<VectorIndex> = dense_vis.into_iter().cloned().collect();
-        dense_ns.put_no_wal(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
+        crash_point!();
+        dense_ns.put_logged(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
     }
 
-    Ok(())
+    Ok(delta)
 }
 
-/// Number of stripes in [`lock_doc_vectors`]; a power of two.
-const DOC_VECTOR_LOCK_STRIPES: usize = 256;
+/// Number of stripes in [`lock_doc_vectors`]; a power of two. Partition
+/// maintenance locks a batch of documents at once ([`lock_docs_vectors`]), and
+/// every foreground write or delete whose document shares a stripe with the
+/// batch waits for it: with 256 stripes a batch covered a large share of them.
+/// At 4,096 a batch of 16 covers under 0.4%. A stripe is one small mutex.
+const DOC_VECTOR_LOCK_STRIPES: usize = 4096;
 
 /// Serialise every write to one document's vectors: [`upsert_vectors`] and
 /// [`delete_vector`] each hold this across their whole body.
@@ -373,43 +587,78 @@ const DOC_VECTOR_LOCK_STRIPES: usize = 256;
 /// has a single owning process (the directory lock), so an in-process lock
 /// suffices; the stripes are shared across namespaces and databases, which only
 /// costs an occasional false conflict.
-async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
-    static STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
-        std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+pub(crate) async fn lock_doc_vectors(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
+    DOC_VECTOR_STRIPES[doc_vector_stripe(namespace, doc_id_bytes)].lock().await
+}
+
+static DOC_VECTOR_STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
+
+fn doc_vector_stripe(namespace: &str, doc_id_bytes: &[u8]) -> usize {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     namespace.hash(&mut hasher);
     doc_id_bytes.hash(&mut hasher);
-    STRIPES[(hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)].lock().await
+    (hasher.finish() as usize) & (DOC_VECTOR_LOCK_STRIPES - 1)
+}
+
+/// [`lock_doc_vectors`] for several documents at once (partition maintenance
+/// works in batches). Two documents can share a stripe, so the stripes are
+/// deduplicated, and they are taken in ascending order: two batches locking at
+/// once then cannot deadlock, and a writer holding one stripe never waits on a
+/// stripe while holding another. Don't take a document's lock again while
+/// holding these: the stripes are not reentrant.
+pub(crate) async fn lock_docs_vectors<'d>(namespace: &str, docs: impl IntoIterator<Item = &'d [u8]>) -> Vec<tokio::sync::MutexGuard<'static, ()>> {
+    let mut stripes: Vec<usize> = docs.into_iter().map(|d| doc_vector_stripe(namespace, d)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+    let mut guards = Vec::with_capacity(stripes.len());
+    for s in stripes {
+        guards.push(DOC_VECTOR_STRIPES[s].lock().await);
+    }
+    guards
 }
 
 /// Delete the quantised vector for a document from the vector KV store.
 ///
 /// No-op if no vector entry exists for `doc_id_bytes` (the document was never
-/// indexed, or was already cleaned up).
-pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+/// indexed, or was already cleaned up). Returns the postings that lost an entry.
+pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
+    let mut delta = PostingDelta::default();
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
-        if let Some(cluster_ids) = decode_sparse_meta(&meta_bytes) {
+        if let Some(meta) = decode_sparse_meta(&meta_bytes) {
             let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-            for cluster_id in cluster_ids {
+            for cluster_id in meta.posting_ids() {
+                crash_point!();
                 sparse_ns.delete(composite_key::encode(cluster_id, doc_id_bytes)).await?;
             }
+            delta.removed = meta.postings;
         }
+        crash_point!();
         sparse_meta_ns.delete(doc_id_bytes.to_vec()).await?;
     }
 
     // Dense: delete by doc_id directly (no meta needed).
     let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
+    crash_point!();
     dense_ns.delete(doc_id_bytes.to_vec()).await?;
 
-    Ok(())
+    Ok(delta)
 }
 
-/// Return `true` only if a document has a **complete** committed vector index —
-/// both the sparse meta record **and** the dense entry.
+/// Return `true` only if a document has a **complete, current** committed vector
+/// index: the sparse meta record **and** the dense entry, embedded from `text` (the
+/// document's current embedding text).
+///
+/// The text check catches stale vectors. A document write and its embed enqueue
+/// are separate writes, so a crash between them saves the new text with no queue
+/// entry for it; the old vectors would otherwise look complete forever. The meta
+/// records the hash of the text its vectors came from, and a mismatch reads as
+/// incomplete, so reconciliation re-embeds (crash-audit test
+/// `reembed_survives_a_crash_anywhere`).
 ///
 /// A normally-indexed document always has both: the embed pipeline emits chunked
 /// SingleBit entries (sparse) *and* a whole-doc MultiBit entry (dense). Requiring
@@ -419,9 +668,14 @@ pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
 /// "indexed". The re-embed regenerates the missing half idempotently.
 ///
 /// Used by startup reconciliation to skip documents that are already fully indexed.
-pub async fn has_complete_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<bool, crate::KVError> {
+pub async fn has_complete_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    if sparse_meta_ns.get(doc_id_bytes.to_vec()).await?.is_none() {
+    let current = sparse_meta_ns
+        .get(doc_id_bytes.to_vec())
+        .await?
+        .and_then(|b| decode_sparse_meta(&b))
+        .is_some_and(|meta| meta.text_hash == text_hash(text));
+    if !current {
         return Ok(false);
     }
     let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
@@ -459,15 +713,19 @@ pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &
 /// and deserializes per entry rather than checking key presence — so only the
 /// on-demand validating reconcile (`reconcile_all_vector_indexes(.., check_bytes=true)`)
 /// uses it; the cheap startup pass keeps the presence check.
-pub async fn has_valid_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<bool, crate::KVError> {
-    // Sparse meta: present and decodable into cluster IDs.
+pub async fn has_valid_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
+    // Sparse meta: present, decodable, and embedded from the current text.
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? else {
         return Ok(false);
     };
-    let Some(cluster_ids) = decode_sparse_meta(&meta_bytes) else {
+    let Some(meta) = decode_sparse_meta(&meta_bytes) else {
         return Ok(false);
     };
+    if meta.text_hash != text_hash(text) {
+        return Ok(false);
+    }
+    let cluster_ids = meta.cluster_ids();
 
     // Each sparse composite entry: present and deserializes.
     let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
@@ -747,6 +1005,7 @@ fn decode_queue_key(key: &[u8]) -> Option<(&str, &[u8])> {
 /// a crash on every path.
 pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<(), crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    crash_point!();
     queue_ns
         .put(
             queue_key(namespace, doc_id_bytes),
@@ -766,6 +1025,7 @@ pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], t
 pub async fn enqueue_embed_if_absent(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     let entry = encode_queue_value(QueueEntryKind::Embed, text, 0, None);
+    crash_point!();
     let result = queue_ns
         .merge(queue_key(namespace, doc_id_bytes), Vec::new(), move |existing, _| match existing {
             Some(_) => Err(crate::KVError::MergeAborted("a queue entry already exists".into())),
@@ -835,6 +1095,20 @@ pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::
     Ok(result)
 }
 
+/// The namespaces that have entries in the embedding queue, read from the keys
+/// alone. The queue key carries the namespace and the value carries the text, so
+/// this never reads a value: after a crash mid bulk-load the queue can hold every
+/// document's text, and the startup drop sweep needs only the namespaces.
+pub async fn queued_namespaces(db: &AsyncDb) -> Result<std::collections::BTreeSet<String>, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    Ok(queue_ns
+        .keys()
+        .await?
+        .iter()
+        .filter_map(|key| decode_queue_key(key).map(|(namespace, _)| namespace.to_owned()))
+        .collect())
+}
+
 /// Look up a single pending embedding queue entry by namespace and document ID.
 ///
 /// Returns `None` when no entry exists for the given `(namespace, doc_id_bytes)` pair.
@@ -882,6 +1156,7 @@ enum Completion {
 /// Remove `entry` from the queue only if the stored entry is still `entry`.
 async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    crash_point!();
     let expected = entry.clone();
     let result = queue_ns
         .merge(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
@@ -903,41 +1178,87 @@ async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, 
     }
 }
 
-/// The worker's step after embedding an [`QueueEntryKind::Embed`] entry: write the
-/// document's vectors, then complete the entry — conditionally (see the section
-/// comment). If the document was cleared while it was being embedded, the vectors
-/// just written are removed again.
-pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<(), crate::KVError> {
-    upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, vector_indexes).await?;
-    match complete_entry(db, entry).await? {
-        Completion::Done | Completion::Superseded => {}
-        Completion::Cleared => return process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
-    }
+/// The worker's step after embedding an [`QueueEntryKind::Embed`] entry, for one
+/// entry: write the document's vectors, make them durable, then complete the
+/// entry. The worker does the same over a batch, with one
+/// [`make_vector_writes_durable`] for the whole batch.
+pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[VectorIndex]) -> Result<PostingDelta, crate::KVError> {
+    let mut delta = upsert_vectors(db, &entry.namespace, &entry.doc_id_bytes, &entry.text, vector_indexes).await?;
+    crash_point!();
+    make_vector_writes_durable(db).await?;
+    delta.extend(complete_embed(db, entry).await?);
+    Ok(delta)
+}
+
+/// Make every vector write already done durable: one fsync of the vector index
+/// WAL, which holds the chunk keys and dense entries [`upsert_vectors`] wrote
+/// (`put_logged`). A barrier: see below. It covers every namespace at once, so
+/// a batch spanning several stores costs one fsync.
+///
+/// **Why completion waits for this.** [`upsert_vectors`] deletes stale cluster keys
+/// and writes the meta WAL-backed (durable at once), and writes the new keys and
+/// dense entry to the vector index WAL (durable only after this sync), and
+/// [`complete_embed`] removes the queue entry WAL-backed. Completing before the
+/// sync would let a crash keep the completion and the deletes but lose the new
+/// vectors. A re-embedded document would then keep its *old* dense entry, which
+/// `has_complete_vector_index` accepts, so nothing would re-enqueue it: it would
+/// stay indexed under its old text, minus the chunks whose clusters changed. With
+/// completion after this barrier, a crash before it leaves the queue entry in
+/// place and the restarted worker redoes it. Regression test:
+/// `crash_before_reembed_is_synced_keeps_new_vectors`.
+pub async fn make_vector_writes_durable(db: &AsyncDb) -> Result<(), crate::KVError> {
+    db.sync_vector_index_wal().await
+}
+
+/// Complete an embed entry whose vectors are written **and durable** (see
+/// [`make_vector_writes_durable`]) — conditionally (see the section comment). If
+/// the document was cleared while it was being embedded, the vectors just written
+/// are removed again.
+pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<PostingDelta, crate::KVError> {
     // The vectors just written must belong to a document that still exists. A
-    // delete normally leaves a `Clear` tombstone that the completion above sees,
+    // delete normally leaves a `Clear` tombstone that the completion below sees,
     // but an entry written from a snapshot (reconciliation) can land after that
     // tombstone was already processed, and would otherwise index a deleted
-    // document for good. A delete landing after this check leaves a tombstone
-    // for the next pass, so the two together leave no orphan. (`list_namespaces`
+    // document for good. The cleanup runs **before** the completion: the other
+    // way round, a crash between the two kept the completion and the vectors,
+    // with nothing left to remove them (crash-audit test
+    // `embedding_a_vanished_document_survives_a_crash_anywhere`). A delete landing
+    // after this check leaves a tombstone for the next pass. (`list_namespaces`
     // first: resolving a dropped namespace would recreate it.)
-    if db.list_namespaces().iter().any(|(name, _)| *name == entry.namespace)
-        && db
-            .namespace(entry.namespace.clone())
-            .await?
-            .get(entry.doc_id_bytes.clone())
-            .await?
-            .is_none()
-    {
-        delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
+    let doc_exists = |db: &AsyncDb| {
+        let (ns, doc) = (entry.namespace.clone(), entry.doc_id_bytes.clone());
+        let db = db.clone();
+        async move {
+            if !db.list_namespaces().iter().any(|(name, _)| *name == ns) {
+                return Ok::<_, crate::KVError>(None);
+            }
+            Ok(Some(db.namespace(ns).await?.get(doc).await?.is_some()))
+        }
+    };
+    let vanished = doc_exists(db).await? == Some(false);
+    let mut delta = PostingDelta::default();
+    if vanished {
+        delta = delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
     }
-    Ok(())
+    match complete_entry(db, entry).await? {
+        Completion::Superseded => {}
+        Completion::Cleared => delta.extend(process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?),
+        // Re-created with the same text between the check and the completion: its
+        // vectors were just removed, so queue it again.
+        Completion::Done => {
+            if vanished && doc_exists(db).await? == Some(true) {
+                enqueue_embed_if_absent(db, &entry.namespace, &entry.doc_id_bytes, &entry.text).await?;
+            }
+        }
+    }
+    Ok(delta)
 }
 
 /// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
 /// then remove the tombstone unless a newer upsert has replaced it (in which case
 /// the next pass embeds that).
-pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
-    delete_vector(db, namespace, doc_id_bytes).await?;
+pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
+    let delta = delete_vector(db, namespace, doc_id_bytes).await?;
     let tombstone = QueueEntry {
         namespace: namespace.to_owned(),
         doc_id_bytes: doc_id_bytes.to_vec(),
@@ -946,7 +1267,7 @@ pub async fn process_clear(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
         retry_count: 0,
         last_error: None,
     };
-    complete_entry(db, &tombstone).await.map(|_| ())
+    complete_entry(db, &tombstone).await.map(|_| delta)
 }
 
 /// Record a failed attempt at `entry`: bump its retry count and store `error` —
@@ -987,8 +1308,9 @@ pub async fn record_queue_failure(db: &AsyncDb, entry: &QueueEntry, error: &str)
 /// vectors are also deleted here, synchronously, so they stop matching
 /// immediately; the worker's later [`process_clear`] is an idempotent repeat that
 /// also removes the tombstone. Both writes are WAL-backed (see [`delete_vector`]).
-pub async fn clear_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<(), crate::KVError> {
+pub async fn clear_vectors(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    crash_point!();
     queue_ns
         .put(queue_key(namespace, doc_id_bytes), encode_queue_value(QueueEntryKind::Clear, "", 0, None))
         .await?;
@@ -1024,6 +1346,445 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
         Ok(_) => Ok(before.lock().take().map(|v| v.into_entry(namespace, doc_id_bytes))),
         Err(crate::KVError::MergeAborted(_)) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+// ── A namespace's partition: centres and postings (design doc M2b, M3a) ──────
+//
+// A namespace that enables semantic search starts with one root posting at the
+// zero centre (`init_ivf`) and grows by splitting (M3). Namespaces enabled
+// before M3 were seeded from a centroid file and keep that partition until a
+// rebuild (M4) replaces it. Either way the partition is read only from here. Unlike
+// codes it cannot be regenerated by re-embedding, so it is made durable before
+// the schema says the namespace is semantic (written no-WAL, then flushed).
+
+/// Posting rows written since M3 start with this byte, so they are told apart
+/// from the seed-only rows written before (`centre_id ‖ state ‖ centroid`).
+const POSTING_ROW_V2: u8 = 0xB2;
+
+pub(crate) fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+pub(crate) fn bytes_to_f32s(b: &[u8]) -> Option<Vec<f32>> {
+    (b.len().is_multiple_of(4)).then(|| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+pub(crate) fn id_from_key(k: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(k.try_into().ok()?))
+}
+
+/// `0xB2 ‖ centre_id (4B BE) ‖ state (1B) ‖ parent_id (4B BE, u32::MAX = none)
+/// ‖ origin (1B) ‖ routing centroid (f32 LE × D)`.
+pub(crate) fn encode_posting(p: &crate::semantic_search::Posting) -> Vec<u8> {
+    let mut v = Vec::with_capacity(11 + p.routing_centroid.len() * 4);
+    v.push(POSTING_ROW_V2);
+    v.extend_from_slice(&p.centre_id.to_be_bytes());
+    v.push(p.state as u8);
+    v.extend_from_slice(&p.parent_id.unwrap_or(u32::MAX).to_be_bytes());
+    v.push(p.origin as u8);
+    v.extend(f32s_to_bytes(&p.routing_centroid));
+    v
+}
+
+/// Decodes the current row and the pre-M3 seed row (`centre_id (4B) ‖ state (1B)
+/// ‖ centroid`). An old row is `1 + 4·D` bytes after its centre id, a new one
+/// starts with the marker byte and is `11 + 4·D` bytes long; their lengths
+/// differ modulo 4, so the marker can never be an old centre id's first byte by
+/// accident.
+pub(crate) fn decode_posting(posting_id: u32, v: &[u8]) -> Option<crate::semantic_search::Posting> {
+    use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+    if v.len() >= 11 && v[0] == POSTING_ROW_V2 && (v.len() - 11).is_multiple_of(4) {
+        let parent = u32::from_be_bytes(v[6..10].try_into().ok()?);
+        return Some(Posting {
+            posting_id,
+            centre_id: u32::from_be_bytes(v[1..5].try_into().ok()?),
+            state: PostingState::from_byte(v[5])?,
+            parent_id: (parent != u32::MAX).then_some(parent),
+            origin: PostingOrigin::from_byte(v[10])?,
+            routing_centroid: bytes_to_f32s(&v[11..])?,
+        });
+    }
+    if v.len() >= 5 && (v.len() - 5).is_multiple_of(4) {
+        let mut p = Posting::seeded(posting_id, bytes_to_f32s(&v[5..])?, u32::from_be_bytes(v[..4].try_into().ok()?));
+        p.state = PostingState::from_byte(v[4])?;
+        return Some(p);
+    }
+    None
+}
+
+async fn ivf_rows(db: &AsyncDb, namespace: &str) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>), crate::KVError> {
+    let centres = db.namespace(ivf_centres_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
+    let postings = db.namespace(ivf_postings_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
+    Ok((centres, postings))
+}
+
+/// Whether `namespace` holds a partition: at least one posting. (A crash between
+/// writing a root's centre and its posting leaves none, and `init_ivf` simply
+/// runs again.)
+pub async fn ivf_exists(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KVError> {
+    let postings = db.namespace(ivf_postings_ns(namespace)).await?;
+    Ok(!postings.scan(None, None, 1).await?.0.is_empty())
+}
+
+/// Write `namespace`'s starting partition: centre 0 is the zero vector of `dim`
+/// dimensions and posting 0, the root, encodes against it. Replaces whatever a
+/// cut-short earlier attempt left. Durable on return: WAL-backed puts, as every
+/// other partition record (a split's postings and centres, the journal), so the
+/// partition is on disk before the caller saves the schema that enables
+/// semantic search.
+pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), crate::KVError> {
+    use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+    let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
+    let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
+    for ns in [&centres_ns, &postings_ns] {
+        for (k, _) in ns.scan_prefix(Vec::new()).await? {
+            ns.delete(k).await?;
+        }
+    }
+    let zero = vec![0.0f32; dim];
+    centres_ns.put(0u32.to_be_bytes().to_vec(), f32s_to_bytes(&zero)).await?;
+    let root = Posting {
+        posting_id: 0,
+        routing_centroid: zero,
+        centre_id: 0,
+        state: PostingState::Active,
+        parent_id: None,
+        origin: PostingOrigin::Root,
+    };
+    postings_ns.put(0u32.to_be_bytes().to_vec(), encode_posting(&root)).await
+}
+
+/// Write `namespace`'s partition from a centroid set, replacing whatever an
+/// earlier, incomplete seed left: one posting per centroid, encoding against
+/// itself (posting id = centre id = cluster id). Durable on return (WAL-backed
+/// puts, as [`init_ivf`]). Tests and
+/// benches only (a static baseline, or a pre-M3 partition to rebuild): a
+/// namespace never starts from a centroid file.
+#[cfg(test)]
+pub(crate) async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<u32, Vec<f32>>) -> Result<(), crate::KVError> {
+    let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
+    let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
+    for ns in [&centres_ns, &postings_ns] {
+        for (k, _) in ns.scan_prefix(Vec::new()).await? {
+            ns.delete(k).await?;
+        }
+    }
+    let mut ids: Vec<u32> = centroids.keys().copied().collect();
+    ids.sort_unstable();
+    for &id in &ids {
+        centres_ns.put(id.to_be_bytes().to_vec(), f32s_to_bytes(&centroids[&id])).await?;
+    }
+    for &id in &ids {
+        let p = crate::semantic_search::Posting::seeded(id, centroids[&id].clone(), id);
+        postings_ns.put(id.to_be_bytes().to_vec(), encode_posting(&p)).await?;
+    }
+    Ok(())
+}
+
+/// Load `namespace`'s partition with rotation `seed`, counting every posting's
+/// entries and chunks from the document records. `None` when it holds no
+/// posting.
+pub async fn load_ivf(db: &AsyncDb, namespace: &str, seed: u64) -> Result<Option<crate::semantic_search::NamespaceIvf>, crate::KVError> {
+    use crate::semantic_search::{CountTable, NamespaceIvf};
+    let (centre_rows, posting_rows) = ivf_rows(db, namespace).await?;
+    if posting_rows.is_empty() {
+        return Ok(None);
+    }
+    let bad = |what: String| crate::KVError::Serialization(format!("namespace '{namespace}': {what}"));
+    let mut centres = HashMap::with_capacity(centre_rows.len());
+    for (k, v) in centre_rows {
+        let id = id_from_key(&k).ok_or_else(|| bad("malformed centre key".into()))?;
+        centres.insert(id, bytes_to_f32s(&v).ok_or_else(|| bad(format!("malformed centre {id}")))?);
+    }
+    let mut postings = Vec::with_capacity(posting_rows.len());
+    for (k, v) in posting_rows {
+        let id = id_from_key(&k).ok_or_else(|| bad("malformed posting key".into()))?;
+        postings.push(decode_posting(id, &v).ok_or_else(|| bad(format!("malformed posting {id}")))?);
+    }
+    let counts = std::sync::Arc::new(CountTable::from_counts(&count_postings(db, namespace).await?));
+    NamespaceIvf::with_counts(postings, centres, seed, counts).map(Some).map_err(bad)
+}
+
+/// Every posting's `(entries, chunks)` in `namespace`, from its document records
+/// (`{ns}_sparse_vector_meta`, one small record per document, read a page at a
+/// time). Exact as far as the records go: a record lists every key its document
+/// has. Records written before chunk counts existed count 0 chunks.
+pub async fn count_postings(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, (u64, u64)>, crate::KVError> {
+    const PAGE: usize = 4096;
+    let mut counts: HashMap<u32, (u64, u64)> = HashMap::new();
+    let meta = sparse_vectors_meta_ns(namespace);
+    // Resolving a namespace creates it: count nothing rather than create one.
+    if !db.list_namespaces().iter().any(|(name, _)| *name == meta) {
+        return Ok(counts);
+    }
+    let ns = db.namespace(meta).await?;
+    let mut cursor = None;
+    loop {
+        let (page, next) = ns.scan(cursor, None, PAGE).await?;
+        for (_, v) in page {
+            if let Some(m) = decode_sparse_meta(&v) {
+                for (id, chunks) in m.postings {
+                    let c = counts.entry(id).or_default();
+                    c.0 += 1;
+                    c.1 += u64::from(chunks);
+                }
+            }
+        }
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return Ok(counts),
+        }
+    }
+}
+
+/// Entries per posting in `namespace`'s Pass-1 store, counted from its keys
+/// (`posting_id ‖ doc_id`) alone: the value log is never read. A check against
+/// the document records' counts ([`count_postings`]).
+pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
+    let mut counts = HashMap::new();
+    let sparse = sparse_vectors_ns(namespace);
+    // Resolving a namespace creates it: count nothing rather than create one.
+    if !db.list_namespaces().iter().any(|(name, _)| *name == sparse) {
+        return Ok(counts);
+    }
+    for key in db.namespace(sparse).await?.keys().await? {
+        if let Some((posting, _)) = composite_key::decode(&key) {
+            *counts.entry(posting).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+#[cfg(test)]
+mod ivf_store_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A document can hold more than 65,535 chunks in one posting; its count
+    /// must come back exact, not saturated (the counts drive splits and merges).
+    #[test]
+    fn a_meta_keeps_chunk_counts_above_u16() {
+        let m = decode_sparse_meta(&encode_sparse_meta(7, &[(3, 70_000), (9, 2)])).unwrap();
+        assert_eq!(m.postings, vec![(3, 70_000), (9, 2)]);
+        // The narrower forms still decode.
+        let mut six = 7u64.to_be_bytes().to_vec();
+        six.extend_from_slice(&1u16.to_be_bytes());
+        six.extend_from_slice(&3u32.to_be_bytes());
+        six.extend_from_slice(&5u16.to_be_bytes());
+        assert_eq!(decode_sparse_meta(&six).unwrap().postings, vec![(3, 5)]);
+    }
+
+    fn centroids() -> HashMap<u32, Vec<f32>> {
+        (1..=4u32)
+            .map(|id| {
+                let mut v = vec![0.0f32; 16];
+                v[id as usize] = 1.0;
+                (id, v)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn seed_then_load_round_trips_and_survives_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        assert!(!ivf_exists(&db, "ns").await.unwrap());
+        assert!(load_ivf(&db, "ns", 7).await.unwrap().is_none());
+        seed_ivf(&db, "ns", &centroids()).await.unwrap();
+        assert!(ivf_exists(&db, "ns").await.unwrap());
+        db.shutdown().await.unwrap();
+        drop(db);
+
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        let expected = crate::semantic_search::NamespaceIvf::seeded(&centroids(), 7).unwrap();
+        use crate::semantic_search::IvfLayout;
+        // Distinct distances to every centroid, so no tie is broken by map order.
+        let q: Vec<f32> = (0..16).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+        assert_eq!(ivf.probe(std::slice::from_ref(&q), 4), expected.probe(std::slice::from_ref(&q), 4));
+        assert_eq!(ivf.rotate(&q), expected.rotate(&q));
+        for id in 1..=4 {
+            assert_eq!(ivf.centre_of(id), Some(id));
+            assert_eq!(ivf.centre(id), expected.centre(id));
+        }
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_init_is_not_loaded_and_is_redone() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        // A crash after a centre, before any posting.
+        let centres_ns = db.namespace(ivf_centres_ns("ns")).await.unwrap();
+        centres_ns.put(9u32.to_be_bytes().to_vec(), f32s_to_bytes(&[1.0; 16])).await.unwrap();
+        assert!(!ivf_exists(&db, "ns").await.unwrap());
+        assert!(load_ivf(&db, "ns", 7).await.unwrap().is_none());
+        init_ivf(&db, "ns", 16).await.unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        assert_eq!((ivf.postings(), ivf.centres()), (1, 1), "the stray centre was wiped");
+        db.shutdown().await.unwrap();
+    }
+
+    /// `init_ivf` is durable on return without any flush: a crash right after
+    /// it (memtables lost) still finds the root partition.
+    #[tokio::test]
+    async fn a_new_partition_survives_a_crash_right_after_it_is_written() {
+        let dir = TempDir::new().unwrap();
+        let open = || AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default());
+        let db = open().await.unwrap();
+        let before = db.ops_metrics();
+        init_ivf(&db, "ns", 16).await.unwrap();
+        let after = db.ops_metrics();
+        assert_eq!(after.no_wal_puts, before.no_wal_puts, "the partition is written WAL-backed");
+        assert_eq!(after.memtable_flushes, before.memtable_flushes, "and needs no flush");
+        db.crash().await;
+        let db = open().await.unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().expect("the root partition survived the crash");
+        assert_eq!((ivf.postings(), ivf.centres()), (1, 1));
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_partition_is_one_root_posting_at_the_zero_centre() {
+        use crate::semantic_search::{IvfLayout, PostingOrigin, PostingState};
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        init_ivf(&db, "ns", 16).await.unwrap();
+        db.shutdown().await.unwrap();
+        drop(db);
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        let root = ivf.posting_infos()[&0];
+        assert_eq!(
+            (root.state, root.origin, root.parent_id, root.centre_id),
+            (PostingState::Active, PostingOrigin::Root, None, 0)
+        );
+        assert_eq!(ivf.centre(0), Some(&[0.0f32; 16][..]));
+        let v: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        assert_eq!(IvfLayout::route(&ivf, &v), Some(0), "everything routes to the root");
+        db.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn posting_rows_round_trip_and_pre_m3_rows_still_decode() {
+        use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+        let p = Posting {
+            posting_id: 5,
+            routing_centroid: vec![0.5, -1.0, 2.0, 0.0],
+            centre_id: 9,
+            state: PostingState::Draining,
+            parent_id: Some(2),
+            origin: PostingOrigin::Split,
+        };
+        assert_eq!(decode_posting(5, &encode_posting(&p)), Some(p.clone()));
+        let root = Posting {
+            parent_id: None,
+            ..p.clone()
+        };
+        assert_eq!(decode_posting(5, &encode_posting(&root)), Some(root));
+        // centre_id ‖ state ‖ centroid, as seeded before M3.
+        let mut old = 9u32.to_be_bytes().to_vec();
+        old.push(0);
+        old.extend(f32s_to_bytes(&[0.5, -1.0, 2.0, 0.0]));
+        let o = decode_posting(5, &old).unwrap();
+        assert_eq!(
+            (o.centre_id, o.state, o.origin, o.parent_id),
+            (9, PostingState::Active, PostingOrigin::Seed, None)
+        );
+        assert_eq!(o.routing_centroid, vec![0.5, -1.0, 2.0, 0.0]);
+    }
+
+    /// The entry counts a search budgets by: counted from the keys at load, and
+    /// kept equal to a fresh recount by the deltas every vector write returns.
+    #[tokio::test]
+    async fn entry_counts_follow_writes_and_are_recounted_at_load() {
+        use crate::semantic_search::IvfLayout;
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let chunks = |postings: &[u32]| -> Vec<VectorIndex> {
+            postings
+                .iter()
+                .map(|&p| VectorIndex::new(p, QuantisationStyle::SingleBit, 0.5, 0.0, 0.01, vec![]))
+                .chain([VectorIndex::new(
+                    u32::MAX,
+                    QuantisationStyle::MultiBit { number_of_bits: 8 },
+                    0.5,
+                    0.0,
+                    0.01,
+                    vec![],
+                )])
+                .collect()
+        };
+        let counts = |ivf: &crate::semantic_search::NamespaceIvf| (1..=4).map(|p| ivf.posting_entries(p).unwrap()).collect::<Vec<_>>();
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        db.namespace("ns".to_string()).await.unwrap();
+        seed_ivf(&db, "ns", &centroids()).await.unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        assert_eq!(counts(&ivf), [0, 0, 0, 0]);
+        let recount = |db: AsyncDb| async move {
+            let c = count_posting_entries(&db, "ns").await.unwrap();
+            (1..=4).map(|p| c.get(&p).copied().unwrap_or(0)).collect::<Vec<_>>()
+        };
+
+        // Two chunks in one posting are one entry.
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "t", &chunks(&[1, 1, 2])).await.unwrap());
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"b", "t", &chunks(&[2, 3])).await.unwrap());
+        assert_eq!(counts(&ivf), [1, 2, 1, 0]);
+        assert_eq!([1, 2, 3].map(|p| ivf.posting_chunks(p)), [2, 2, 1]);
+        // A re-embed moves "a" out of 1 and into 4; posting 2 keeps it with
+        // two chunks instead of one.
+        ivf.apply_delta(&upsert_vectors(&db, "ns", b"a", "u", &chunks(&[2, 2, 4])).await.unwrap());
+        assert_eq!(counts(&ivf), [0, 2, 1, 1]);
+        assert_eq!([1, 2, 3, 4].map(|p| ivf.posting_chunks(p)), [0, 3, 1, 1]);
+        assert_eq!(counts(&ivf), recount(db.clone()).await);
+        let from_meta = count_postings(&db, "ns").await.unwrap();
+        assert_eq!(
+            ivf.counts().snapshot().into_iter().filter(|(_, c)| c.0 > 0).collect::<HashMap<_, _>>(),
+            from_meta
+        );
+        // Deletes, including of a document that has no vectors.
+        ivf.apply_delta(&delete_vector(&db, "ns", b"b").await.unwrap());
+        ivf.apply_delta(&delete_vector(&db, "ns", b"ghost").await.unwrap());
+        ivf.apply_delta(&clear_vectors(&db, "ns", b"a").await.unwrap());
+        assert_eq!(counts(&ivf), [0, 0, 0, 0]);
+        assert_eq!(counts(&ivf), recount(db.clone()).await);
+
+        // Counted afresh at load, including after a reopen.
+        upsert_vectors(&db, "ns", b"c", "t", &chunks(&[3, 4])).await.unwrap();
+        upsert_vectors(&db, "ns", b"d", "t", &chunks(&[4])).await.unwrap();
+        db.shutdown().await.unwrap();
+        drop(db);
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default())
+            .await
+            .unwrap();
+        let ivf = load_ivf(&db, "ns", 7).await.unwrap().unwrap();
+        assert_eq!(counts(&ivf), [0, 0, 1, 2]);
+        assert_eq!(ivf.total_entries(), 3);
+        db.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn partition_namespaces_are_companions_and_go_with_the_data() {
+        assert_eq!(companion_base("x_ivf_centres"), Some("x"));
+        assert_eq!(companion_base("x_ivf_postings"), Some("x"));
+        assert_eq!(companion_base("x_ivf_journal"), Some("x"));
+        assert_eq!(vector_data_base("x_ivf_centres"), Some("x"));
+        assert_eq!(vector_data_base("x_sparse_vector_meta"), Some("x"));
+        assert_eq!(vector_data_base("x_dense_vector"), Some("x"));
+        assert_eq!(companion_namespaces("x").len(), COMPANION_SUFFIXES.len());
     }
 }
 
@@ -1065,9 +1826,9 @@ mod doc_vector_race_tests {
         let sparse_ns = db.namespace(sparse_vectors_ns("docs")).await.unwrap();
         for round in 0..150 {
             let doc = format!("d{round}").into_bytes();
-            upsert_vectors(&db, "docs", &doc, &vectors(&[3])).await.unwrap();
+            upsert_vectors(&db, "docs", &doc, "text", &vectors(&[3])).await.unwrap();
             let (db_a, db_b, doc_a, doc_b) = (db.clone(), db.clone(), doc.clone(), doc.clone());
-            let upsert = tokio::spawn(async move { upsert_vectors(&db_a, "docs", &doc_a, &vectors(&[5, 7])).await.unwrap() });
+            let upsert = tokio::spawn(async move { upsert_vectors(&db_a, "docs", &doc_a, "text", &vectors(&[5, 7])).await.unwrap() });
             let delete = tokio::spawn(async move { delete_vector(&db_b, "docs", &doc_b).await.unwrap() });
             upsert.await.unwrap();
             delete.await.unwrap();
@@ -1077,6 +1838,7 @@ mod doc_vector_race_tests {
                 .await
                 .unwrap()
                 .and_then(|b| decode_sparse_meta(&b))
+                .map(|m| m.cluster_ids())
                 .unwrap_or_default();
             for cluster in [3u32, 5, 7] {
                 let present = sparse_ns.get(composite_key::encode(cluster, &doc)).await.unwrap().is_some();
@@ -1178,7 +1940,7 @@ mod queue_race_tests {
         finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
 
         assert!(
-            !has_complete_vector_index(&db, "docs", b"x").await.unwrap() && dense_tag(&db, b"x").await.is_none(),
+            !has_complete_vector_index(&db, "docs", b"x", "text").await.unwrap() && dense_tag(&db, b"x").await.is_none(),
             "a deleted doc must not keep vectors written by an embed that was in flight"
         );
     }
@@ -1200,7 +1962,7 @@ mod queue_race_tests {
     async fn clear_tombstone_removes_vectors_and_itself() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
-        upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap();
+        upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap();
         clear_vectors(&db, "docs", b"x").await.unwrap();
         let tombstone = snapshot(&db, b"x").await;
         assert_eq!(tombstone.kind, QueueEntryKind::Clear);
@@ -1284,8 +2046,8 @@ mod queue_race_tests {
     //
     // Queue writes (enqueues, tombstones, and every conditional update, which the
     // WAL records as its resulting Upsert/Delete) are WAL-backed; vector writes
-    // are no-WAL. A crash is `std::mem::forget(db)` (no shutdown, no Drop-time
-    // flush), so reopening replays the WAL.
+    // are no-WAL. A crash is `db.crash()` (no shutdown, no Drop-time flush, but
+    // every file closed), so reopening replays the WAL.
 
     /// The worst case for R3: a delete races an embed, the worker's no-WAL vector
     /// writes reach disk, and the process dies before the worker can clean up.
@@ -1302,7 +2064,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
             let _in_flight = snapshot(&db, b"x").await;
             clear_vectors(&db, "docs", b"x").await.unwrap(); // racing delete
-            upsert_vectors(&db, "docs", b"x", &vectors_for(1.0)).await.unwrap(); // worker's write lands after it
+            upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap(); // worker's write lands after it
             for ns in [sparse_vectors_ns("docs"), sparse_vectors_meta_ns("docs"), dense_vectors_ns("docs")] {
                 db.coordinator_for_test()
                     .get_store_by_name(&ns)
@@ -1310,7 +2072,7 @@ mod queue_race_tests {
                     .flush_memtable_to_level0()
                     .unwrap();
             }
-            std::mem::forget(db); // crash before the worker completes
+            db.crash().await; // crash before the worker completes
         }
         let db = open_db(&dir).await;
         let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("tombstone survives replay");
@@ -1335,7 +2097,7 @@ mod queue_race_tests {
             let in_flight = snapshot(&db, b"x").await;
             enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
             finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("newer entry survives replay");
@@ -1356,7 +2118,7 @@ mod queue_race_tests {
             enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
             let f = snapshot(&db, b"failed").await;
             record_queue_failure(&db, &f, "timeout").await.unwrap();
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         assert!(
@@ -1421,6 +2183,115 @@ mod queue_race_tests {
         assert!(enqueue_embed_if_absent(&db, "docs", b"c", "text").await.unwrap(), "absent: enqueue");
         assert_eq!(snapshot(&db, b"c").await.text, "text");
     }
+
+    // ── Completion waits for durability (design doc M0-1) ──
+
+    /// Like [`vectors_for`], but the sparse chunk lands in cluster 4 instead of 3,
+    /// as a re-embedded document's chunks can.
+    fn moved_vectors_for(tag: f32) -> Vec<VectorIndex> {
+        vec![
+            VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, tag, 0.0, 0.01, vec![]),
+            VectorIndex::new(4, QuantisationStyle::SingleBit, tag, 0.0, 0.01, vec![]),
+        ]
+    }
+
+    async fn put_doc(db: &AsyncDb, doc: &[u8]) {
+        db.namespace("docs".to_string())
+            .await
+            .unwrap()
+            .put(doc.to_vec(), b"{}".to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// The doc's sparse cluster keys actually present, and the clusters its meta lists.
+    async fn sparse_state(db: &AsyncDb, doc: &[u8]) -> (Vec<u32>, Option<Vec<u32>>) {
+        let sparse = db.namespace(sparse_vectors_ns("docs")).await.unwrap();
+        let mut present = Vec::new();
+        for cluster in [3u32, 4] {
+            if sparse.get(composite_key::encode(cluster, doc)).await.unwrap().is_some() {
+                present.push(cluster);
+            }
+        }
+        let meta = db
+            .namespace(sparse_vectors_meta_ns("docs"))
+            .await
+            .unwrap()
+            .get(doc.to_vec())
+            .await
+            .unwrap();
+        (present, meta.as_deref().and_then(decode_sparse_meta).map(|m| m.cluster_ids()))
+    }
+
+    /// A re-embed must be durable before its queue entry is completed. The worker
+    /// used to complete it (WAL-backed, durable at once) while the new vectors were
+    /// still no-WAL in memory, so a crash kept the completion and the stale-key
+    /// deletes but lost the new vectors: the document kept its old dense entry,
+    /// lost its moved chunk, and looked complete to reconciliation.
+    #[tokio::test]
+    async fn crash_before_reembed_is_synced_keeps_new_vectors() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            put_doc(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+            let first = snapshot(&db, b"x").await;
+            finish_embed(&db, &first, &vectors_for(1.0)).await.unwrap();
+            make_vector_writes_durable(&db).await.unwrap(); // old index on disk
+            enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+            let second = snapshot(&db, b"x").await;
+            finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
+            db.crash().await; // crash: nothing flushed after finish_embed returned
+        }
+        let db = open_db(&dir).await;
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(), "the re-embed was completed");
+        assert_eq!(dense_tag(&db, b"x").await, Some(2.0), "the completed re-embed's dense vector was lost");
+        assert_eq!(
+            sparse_state(&db, b"x").await,
+            (vec![4], Some(vec![4])),
+            "the moved chunk must be present and listed"
+        );
+    }
+
+    /// The worker writes a batch, flushes, then completes. A crash after the flush
+    /// but before the completions leaves the entry queued; redoing it writes the
+    /// same vectors and completes it.
+    #[tokio::test]
+    async fn crash_after_flush_before_completion_redoes_the_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = open_db(&dir).await;
+            put_doc(&db, b"x").await;
+            enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+            upsert_vectors(&db, "docs", b"x", "text", &vectors_for(1.0)).await.unwrap(); // the worker's write
+            make_vector_writes_durable(&db).await.unwrap(); // the batch flush
+            db.crash().await; // crash before the completions
+        }
+        let db = open_db(&dir).await;
+        let pending = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("entry still queued");
+        assert_eq!(dense_tag(&db, b"x").await, Some(1.0), "flushed vectors survive");
+        finish_embed(&db, &pending, &vectors_for(1.0)).await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
+        assert_eq!(dense_tag(&db, b"x").await, Some(1.0));
+        assert_eq!(sparse_state(&db, b"x").await, (vec![3], Some(vec![3])));
+    }
+
+    /// If the vectors cannot be made durable, the entry is not completed.
+    #[tokio::test]
+    async fn a_failed_sync_completes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        put_doc(&db, b"x").await;
+        enqueue_embed(&db, "docs", b"x", "text").await.unwrap();
+        let entry = snapshot(&db, b"x").await;
+        db.coordinator_for_test().vector_index_wal.fail_next_sync();
+        let result = finish_embed(&db, &entry, &vectors_for(1.0)).await;
+        assert!(result.is_err(), "the sync should have failed");
+        assert!(
+            get_queue_entry(&db, "docs", b"x").await.unwrap().is_some(),
+            "an entry whose vectors are not durable was completed"
+        );
+    }
 }
 
 // ── Vector upsert tests ───────────────────────────────────────────────────────
@@ -1465,7 +2336,7 @@ mod vector_upsert_tests {
         let doc_id = b"doc1";
 
         let vi = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         let entries = store.scan_sparse_cluster(1).await.unwrap();
@@ -1482,7 +2353,7 @@ mod vector_upsert_tests {
         let doc_id = b"doc2";
 
         let vi = VectorIndex::new(1, MULTI8, 0.3, 0.0, 0.05, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         let bytes = store.get_dense_entry(doc_id).await.unwrap().unwrap();
@@ -1508,7 +2379,7 @@ mod vector_upsert_tests {
             VectorIndex::new(1, MULTI8, 0.5, 0.0, 0.02, vec![]), // 1 - 0.5 = 0.5
         ];
 
-        upsert_vectors(&db, ns, doc_id, &chunks).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &chunks).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         let bytes = store.get_dense_entry(doc_id).await.unwrap().unwrap();
@@ -1524,7 +2395,7 @@ mod vector_upsert_tests {
         let db = open_db(&dir).await;
         let ns = "docs";
 
-        upsert_vectors(&db, ns, b"doc4", &[]).await.unwrap();
+        upsert_vectors(&db, ns, b"doc4", "text", &[]).await.unwrap();
 
         // An empty list must write nothing to either vector namespace.
         let store = DbVectorStore::new(&db, ns).await.unwrap();
@@ -1540,14 +2411,14 @@ mod vector_upsert_tests {
         let doc_id = b"doc5";
 
         let vi1 = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.01, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi1]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi1]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1);
         assert_eq!(store.scan_sparse_cluster(2).await.unwrap().len(), 0);
 
         let vi2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.02, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi2]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi2]).await.unwrap();
 
         assert_eq!(
             store.scan_sparse_cluster(1).await.unwrap().len(),
@@ -1561,110 +2432,111 @@ mod vector_upsert_tests {
 
     #[test]
     fn test_encode_decode_sparse_meta_roundtrip() {
-        let ids = vec![10u32, 20u32, 30u32];
-        let encoded = encode_sparse_meta(&ids);
+        let postings = vec![(10u32, 3u32), (20, 1), (30, 7)];
+        let encoded = encode_sparse_meta(0xdead_beef, &postings);
         let decoded = decode_sparse_meta(&encoded).unwrap();
-        assert_eq!(decoded, ids);
+        assert_eq!(
+            decoded,
+            SparseMeta {
+                text_hash: 0xdead_beef,
+                postings
+            }
+        );
+    }
+
+    #[test]
+    fn a_meta_written_before_chunk_counts_still_decodes() {
+        let mut old = 9u64.to_be_bytes().to_vec();
+        old.extend_from_slice(&2u16.to_be_bytes());
+        old.extend_from_slice(&5u32.to_be_bytes());
+        old.extend_from_slice(&8u32.to_be_bytes());
+        let m = decode_sparse_meta(&old).unwrap();
+        assert_eq!((m.text_hash, m.postings), (9, vec![(5, 0), (8, 0)]));
     }
 
     #[test]
     fn test_encode_decode_sparse_meta_empty() {
-        let ids: Vec<u32> = vec![];
-        let encoded = encode_sparse_meta(&ids);
+        let encoded = encode_sparse_meta(7, &[]);
         let decoded = decode_sparse_meta(&encoded).unwrap();
-        assert!(decoded.is_empty());
+        assert!(decoded.postings.is_empty());
+        assert_eq!(decoded.text_hash, 7);
     }
 
     #[test]
     fn test_decode_sparse_meta_rejects_truncated() {
-        // 3 bytes is shorter than the minimum 2-byte header + 4 bytes per entry.
+        // Shorter than the 8-byte text hash + 2-byte count header.
         assert!(decode_sparse_meta(&[0x00, 0x01, 0x02]).is_none());
+        assert!(decode_sparse_meta(&[0u8; 9]).is_none());
     }
 
     #[test]
     fn test_decode_sparse_meta_rejects_wrong_length() {
         // Header claims count=1 but only 3 bytes of payload instead of 4.
-        let mut bad = vec![0x00u8, 0x01]; // count = 1
+        let mut bad = vec![0u8; 8]; // text hash
+        bad.extend_from_slice(&[0x00, 0x01]); // count = 1
         bad.extend_from_slice(&[0x01, 0x00, 0x00]); // only 3 bytes instead of 4
         assert!(decode_sparse_meta(&bad).is_none());
     }
 
+    /// The text hash is part of the stored format: pin it, so a change to the
+    /// hash function (which would make every stored index look stale) fails here.
+    #[test]
+    fn text_hash_is_stable() {
+        assert_eq!(text_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(text_hash("a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
     // ── Durability of the vector write path ───────────────────────────────────
 
-    /// The vector index must genuinely use the no-WAL write path — and so be
-    /// covered by the periodic flush that bounds what a crash destroys.
+    /// The vector payloads go to the vector index WAL: no main-WAL entry and no
+    /// fsync per write, not flagged as no-WAL (they are recoverable, so the
+    /// compaction worker's no-WAL flush tick must not flush them), and one
+    /// fsync makes the whole write durable. The meta is the one WAL-backed
+    /// write (it must be durable before any key it lists).
     ///
-    /// `f08108a` proves the *engine* half on a plain namespace: a namespace
-    /// holding no-WAL writes is flagged and flushed on the compaction tick.
-    /// Nothing connected the vector write path to it, so the only evidence that
-    /// the vector index actually benefits was one live stress run — which is
-    /// exactly how the whole index came to be discarded by a `SIGKILL`
-    /// (`stress_docs_sparse_vector`: 4 entries on disk against 6020 in memory,
-    /// ~18 000 documents re-enqueued, semantic search returning nothing for
-    /// hours). This pins both halves together.
-    ///
-    /// Deliberately service-free: it asserts on the durability flag, never on an
-    /// embedding, so it needs the `semantic-search` feature compiled but no
-    /// embedding service running.
+    /// Deliberately service-free: it needs the `semantic-search` feature
+    /// compiled but no embedding service running.
     #[tokio::test]
-    async fn test_vector_writes_use_the_no_wal_path_and_are_periodically_flushed() {
+    async fn test_vector_writes_go_to_the_vector_index_wal() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
         let ns = "docs";
         let doc_id = b"doc-durability";
 
         let vector_namespaces = [sparse_vectors_ns(ns), sparse_vectors_meta_ns(ns), dense_vectors_ns(ns)];
-
         // Create the namespaces up front so the baseline below measures the
         // vector writes alone, not namespace setup.
         for name in &vector_namespaces {
             db.namespace(name.clone()).await.unwrap();
         }
         let coordinator = db.coordinator_for_test();
-        for name in &vector_namespaces {
-            assert!(
-                !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} should start with nothing unflushed"
-            );
-        }
 
         let before = db.ops_metrics();
         let vi_sparse = VectorIndex::new(3, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_dense = VectorIndex::new(3, MULTI8, 0.3, 0.0, 0.01, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi_sparse, vi_dense]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_sparse, vi_dense]).await.unwrap();
         let after = db.ops_metrics();
 
-        // One sparse chunk + the sparse meta + the dense entry, all off the WAL.
         assert_eq!(
-            after.no_wal_puts - before.no_wal_puts,
-            3,
-            "sparse chunk, sparse meta and dense entry should all be written with put_no_wal"
+            after.vector_wal_appends - before.vector_wal_appends,
+            2,
+            "the sparse chunk and the dense entry are logged"
         );
-        assert_eq!(after.puts - before.puts, 0, "no vector payload may take the WAL-backed put path");
-        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 0, "vector payload writes must add no WAL fsync");
-
-        // Being off the WAL means there is nothing to replay, so each namespace
-        // must now be flagged for the periodic flush — otherwise these writes
-        // exist only in memory until the memtable happens to fill.
-        for name in &vector_namespaces {
-            assert!(
-                coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} took a no-WAL write but is not flagged for the periodic flush — \
-                 a crash would discard it with nothing to replay"
-            );
-        }
-
-        // The compaction worker's tick is what bounds the loss.
-        assert!(
-            coordinator.flush_no_wal_memtables() >= vector_namespaces.len(),
-            "the periodic flush should have covered all three vector namespaces"
-        );
+        assert_eq!(after.no_wal_puts - before.no_wal_puts, 0, "nothing takes the unlogged no-WAL path");
+        assert_eq!(after.puts - before.puts, 1, "only the meta takes the WAL-backed put path");
+        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 1, "only the meta may add a main-WAL fsync");
+        assert_eq!(after.vector_wal_fsyncs - before.vector_wal_fsyncs, 0, "logging does not fsync");
         for name in &vector_namespaces {
             assert!(
                 !coordinator.get_store_by_name(name).unwrap().has_unflushed_no_wal_writes(),
-                "{name} should be clear once flushed"
+                "{name} is flagged as holding unrecoverable no-WAL writes"
             );
         }
+
+        make_vector_writes_durable(&db).await.unwrap();
+        let synced = db.ops_metrics();
+        assert_eq!(synced.vector_wal_fsyncs - after.vector_wal_fsyncs, 1, "the barrier is one fsync");
+        assert_eq!(synced.memtable_flushes, after.memtable_flushes, "and no memtable flush");
     }
 
     // ── delete_vector ─────────────────────────────────────────────────────────
@@ -1678,7 +2550,7 @@ mod vector_upsert_tests {
 
         let vi_sb = VectorIndex::new(5, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_mb = VectorIndex::new(5, MULTI8, 0.3, 0.0, 0.01, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi_sb, vi_mb]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_sb, vi_mb]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert_eq!(store.scan_sparse_cluster(5).await.unwrap().len(), 1, "sparse must exist before delete");
@@ -1712,15 +2584,17 @@ mod vector_upsert_tests {
         let doc_id = b"dense_only_doc";
 
         let vi = VectorIndex::new(3, MULTI8, 0.3, 0.0, 0.01, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert!(store.get_dense_entry(doc_id).await.unwrap().is_some(), "dense entry must exist");
         assert!(store.scan_sparse_cluster(3).await.unwrap().is_empty(), "no sparse entry must be written");
 
-        // Sparse meta must also be absent.
+        // The meta is still written (it records the text), listing no clusters.
         let meta_ns = db.namespace(sparse_vectors_meta_ns(ns)).await.unwrap();
-        assert!(meta_ns.get(doc_id.to_vec()).await.unwrap().is_none(), "sparse meta must not be written");
+        let meta = decode_sparse_meta(&meta_ns.get(doc_id.to_vec()).await.unwrap().expect("meta written")).unwrap();
+        assert!(meta.postings.is_empty(), "a dense-only document lists no clusters");
+        assert_eq!(meta.text_hash, text_hash("text"));
     }
 
     // SingleBit-only upsert must not write to the dense namespace.
@@ -1732,7 +2606,7 @@ mod vector_upsert_tests {
         let doc_id = b"sparse_only_doc";
 
         let vi = VectorIndex::new(7, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
-        upsert_vectors(&db, ns, doc_id, &[vi]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert_eq!(store.scan_sparse_cluster(7).await.unwrap().len(), 1, "sparse entry must exist");
@@ -1751,7 +2625,7 @@ mod vector_upsert_tests {
         let vi_sb1 = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_sb2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.03, vec![]);
 
-        upsert_vectors(&db, ns, doc_id, &[vi_sb1, vi_sb2]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert_eq!(store.scan_sparse_cluster(1).await.unwrap().len(), 1);
@@ -2110,7 +2984,7 @@ mod dual_style_tests {
         let vi_sb1 = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_sb2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.03, vec![]);
 
-        upsert_vectors(&db, ns, doc_id, &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
 
@@ -2141,7 +3015,7 @@ mod dual_style_tests {
         let vi_sb1 = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_sb2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.03, vec![]);
 
-        upsert_vectors(&db, ns, doc_id, &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert!(store.get_dense_entry(doc_id).await.unwrap().is_some(), "MB entry exists before delete");
@@ -2171,7 +3045,7 @@ mod dual_style_tests {
         let vi_sb1 = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
         let vi_sb2 = VectorIndex::new(2, QuantisationStyle::SingleBit, 0.35, 0.0, 0.03, vec![]);
 
-        upsert_vectors(&db, ns, doc_id, &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_mb, vi_sb1, vi_sb2]).await.unwrap();
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
         assert!(store.get_dense_entry(doc_id).await.unwrap().is_some());
@@ -2181,7 +3055,7 @@ mod dual_style_tests {
         let vi_mb2 = VectorIndex::new(1, MULTI8, 0.25, 0.0, 0.01, vec![]);
         let vi_sb3 = VectorIndex::new(3, QuantisationStyle::SingleBit, 0.5, 0.0, 0.04, vec![]);
 
-        upsert_vectors(&db, ns, doc_id, &[vi_mb2, vi_sb3]).await.unwrap();
+        upsert_vectors(&db, ns, doc_id, "text", &[vi_mb2, vi_sb3]).await.unwrap();
 
         let dense = store.get_dense_entry(doc_id).await.unwrap().unwrap();
         let vis = VectorIndex::list_from_bytes(&dense).unwrap();
@@ -2204,7 +3078,7 @@ mod dual_style_tests {
         for doc in [&doc_a[..], &doc_b[..]] {
             let vi_mb = VectorIndex::new(1, MULTI8, 0.3, 0.0, 0.01, vec![]);
             let vi_sb = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
-            upsert_vectors(&db, ns, doc, &[vi_mb, vi_sb]).await.unwrap();
+            upsert_vectors(&db, ns, doc, "text", &[vi_mb, vi_sb]).await.unwrap();
         }
 
         let store = DbVectorStore::new(&db, ns).await.unwrap();
@@ -2334,6 +3208,28 @@ mod query_embedding_cache_tests {
         assert!((cached_b[1] - 1.0f32).abs() < 1e-6);
     }
 
+    /// The recall check's sample of cached queries holds only the asked model at
+    /// the asked dimension, at most `limit`, and every one of them whatever the
+    /// seed's starting point (the read wraps).
+    #[tokio::test]
+    async fn sampled_cached_queries_are_the_models_own_and_bounded() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        for (i, q) in ["alpha", "beta", "gamma", "zeta", "~tilde"].iter().enumerate() {
+            put_cached_query_embedding(&db, MODEL, q, &[i as f32, 1.0], TEST_TTL).await;
+        }
+        put_cached_query_embedding(&db, "other", "alpha", &[9.0, 9.0], TEST_TTL).await;
+        put_cached_query_embedding(&db, MODEL, "three", &[9.0, 9.0, 9.0], TEST_TTL).await;
+        for seed in [0u64, 0x62, 0x7a, 255] {
+            let mut got = sample_cached_query_embeddings(&db, MODEL, 2, TEST_TTL, 100, seed).await.unwrap();
+            got.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let firsts: Vec<f32> = got.iter().map(|v| v[0]).collect();
+            assert_eq!(firsts, [0.0, 1.0, 2.0, 3.0, 4.0], "seed {seed}");
+            assert_eq!(sample_cached_query_embeddings(&db, MODEL, 2, TEST_TTL, 2, seed).await.unwrap().len(), 2);
+        }
+        assert!(sample_cached_query_embeddings(&db, "none", 2, TEST_TTL, 10, 0).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_clear_removes_all_entries() {
         let dir = TempDir::new().unwrap();
@@ -2408,7 +3304,7 @@ mod query_embedding_cache_tests {
             populate_and_flush(&db).await;
             assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 2);
             // Crash: skip shutdown and every Drop-time flush.
-            std::mem::forget(db);
+            db.crash().await;
         }
         let db = open_db(&dir).await;
         assert!(get_cached_query_embedding(&db, MODEL, "q1", 2, TEST_TTL).await.is_none());
@@ -2432,7 +3328,24 @@ mod query_embedding_cache_tests {
             get_cached_query_embedding(&db, "qwen", "q", 2, TEST_TTL).await.unwrap(),
             vec![0.0f32, 1.0]
         );
-        assert_ne!(query_cache_key("ab", "c"), query_cache_key("a", "bc"));
+        assert_ne!(query_cache_key("ab", 2, "c"), query_cache_key("a", 2, "bc"));
+    }
+
+    /// The same model at two dimensions never shares an entry: each namespace
+    /// picks its own dimension.
+    #[tokio::test]
+    async fn test_cache_is_keyed_by_dimension() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        put_cached_query_embedding(&db, MODEL, "q", &[1.0f32, 0.0], TEST_TTL).await;
+        assert!(get_cached_query_embedding(&db, MODEL, "q", 4, TEST_TTL).await.is_none());
+        put_cached_query_embedding(&db, MODEL, "q", &[0.0f32, 0.0, 1.0, 0.0], TEST_TTL).await;
+        assert_eq!(get_cached_query_embedding(&db, MODEL, "q", 2, TEST_TTL).await.unwrap(), vec![1.0f32, 0.0]);
+        assert_eq!(
+            get_cached_query_embedding(&db, MODEL, "q", 4, TEST_TTL).await.unwrap(),
+            vec![0.0f32, 0.0, 1.0, 0.0]
+        );
+        assert_ne!(query_cache_key(MODEL, 2, "q"), query_cache_key(MODEL, 4, "q"));
     }
 
     /// Re-embedding the same query overwrites its entry.
@@ -2464,7 +3377,7 @@ mod query_embedding_cache_tests {
 mod real_kv_profile {
     use super::*;
     use crate::AsyncDb;
-    use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
+    use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id};
     use crate::semantic_search::index::vector_index::VectorKvStore;
     use crate::semantic_search::service::{SemanticSearchConfig, search};
     use crate::semantic_search::{ClusterIndex, QuantisationStyle, index_embedding_to_cluster};
@@ -2472,7 +3385,6 @@ mod real_kv_profile {
     use std::time::Instant;
     use tempfile::TempDir;
 
-    const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
     const DIM: usize = 768;
     const N_BITS_MULTI: usize = 8;
 
@@ -2510,8 +3422,12 @@ mod real_kv_profile {
         // once per cpd and every n_probes value is profiled against the same on-disk data.
         const N_PROBES_SWEEP: [usize; 4] = [10, 32, 64, 128];
 
-        let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
-        let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
+        // 256 synthetic centres, like the store's synthetic chunks.
+        let cluster_map: HashMap<u32, Cluster> = synthetic_chunks(256, 0xc0ff_ee00_d15c_0de5)
+            .into_iter()
+            .enumerate()
+            .map(|(id, c)| (id as u32, Cluster::new(id as u32, c)))
+            .collect();
         let index = ClusterIndex::from_clusters(cluster_map.clone());
         let base_config = SemanticSearchConfig::default(); // first_pass top_k 1000
         let ns = "profile";
@@ -2552,7 +3468,7 @@ mod real_kv_profile {
                     let cid = find_closest_cluster_id(&cluster_map, &e);
                     vis.push(index_embedding_to_cluster(&e, &cluster_map[&cid], QuantisationStyle::SingleBit));
                 }
-                upsert_vectors(&db, ns, &doc_id, &vis).await.unwrap();
+                upsert_vectors(&db, ns, &doc_id, "text", &vis).await.unwrap();
             }
 
             let store = DbVectorStore::new(&db, ns).await.unwrap();
@@ -2577,7 +3493,7 @@ mod real_kv_profile {
 
             for &n_probes in &N_PROBES_SWEEP {
                 let config = SemanticSearchConfig {
-                    n_probes,
+                    probe: crate::semantic_search::ProbeSettings::fixed(n_probes),
                     ..base_config.clone()
                 };
 
@@ -2586,7 +3502,7 @@ mod real_kv_profile {
                 let probe_clusters: Vec<u32> = {
                     let mut seen = std::collections::HashSet::new();
                     let mut ids = Vec::new();
-                    for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes) {
+                    for chunk_ids in index.find_top_n_cluster_ids_batch(&sparse_query, n_probes) {
                         for id in chunk_ids {
                             if seen.insert(id) {
                                 ids.push(id);
@@ -2613,7 +3529,7 @@ mod real_kv_profile {
                 let mut scanned_entries = 0usize;
                 for _ in 0..ITERS {
                     let t = Instant::now();
-                    let probes = index.find_top_n_cluster_ids_batch(&sparse_query, config.n_probes);
+                    let probes = index.find_top_n_cluster_ids_batch(&sparse_query, n_probes);
                     let mut seen = std::collections::HashSet::new();
                     let mut pc = Vec::new();
                     for chunk_ids in probes {
@@ -2667,7 +3583,7 @@ mod real_kv_profile {
 
 // ── Shared corpus indexing for the real-embedding harnesses ───────────────────
 //
-// Used by `real_recall` below and `semantic_search::beir_eval`: embeds each text
+// Used by `semantic_search::metrics::beir_eval`: embeds each text
 // through the real embedding service and upserts its vectors under a `u64` BE doc id.
 #[cfg(test)]
 pub(crate) mod eval_indexing {
@@ -2703,7 +3619,7 @@ pub(crate) mod eval_indexing {
                 let _permit = permit;
                 let doc_id = id.to_be_bytes().to_vec();
                 match embed_document(&cfg, &idx, &text).await {
-                    Ok(vis) => upsert_vectors(&db, &ns, &doc_id, &vis).await.map_err(|e| e.to_string()),
+                    Ok(vis) => upsert_vectors(&db, &ns, &doc_id, "text", &vis).await.map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 }
             });
@@ -2712,7 +3628,7 @@ pub(crate) mod eval_indexing {
         let mut first_err: Option<String> = None;
         while let Some(res) = set.join_next().await {
             match res.unwrap() {
-                Ok(()) => ok += 1,
+                Ok(_) => ok += 1,
                 Err(e) => {
                     fail += 1;
                     first_err.get_or_insert(e);
@@ -2723,228 +3639,290 @@ pub(crate) mod eval_indexing {
     }
 }
 
-// ── Real-embedding recall vs n_probes ──────────────────────────────────────────
+// ── Crash audit of the vector write paths (design doc M0-2) ───────────────────
 //
-// The `real_kv_search_profile` above measures *latency* per n_probes over synthetic
-// random vectors. Random vectors cluster uniformly, so they cannot answer the recall
-// question — probing fewer clusters looks artificially cheap because no cluster is
-// preferentially relevant. This harness closes that gap: it indexes a **real** text
-// corpus through the **real** embedding service (so the IVF cluster structure reflects
-// genuine semantic content) and measures how much recall degrades as n_probes drops.
-//
-// Ground truth is the pipeline's own top-k at **exhaustive probing** (n_probes = every
-// cluster, 256 for the bundled qwen centroids). `recall@k(np) = |top_k(np) ∩ top_k(all)| / k`,
-// averaged over queries. This isolates the recall lost by *reducing n_probes* while
-// holding quantisation and re-ranking fixed — exactly the "is n_probes=10 safe?" question.
-//
-// Requires the external embedding service AND a JSONL corpus of real text (defaults to the
-// HuffPost news dump under work/, which is gitignored — override with MINNAL_RECALL_CORPUS).
-// `#[ignore]`d; run on demand from the crate root (minnal_doc_store/):
-//
-//   MINNAL_EMBED_URL=http://192.168.10.155:8001 \
-//     cargo test -p minnal_doc_store --lib real_recall_vs_nprobes --release -- --ignored --nocapture
-//
-// Env knobs (all optional): MINNAL_RECALL_CORPUS (path), MINNAL_EMBED_URL (service base),
-// MINNAL_RECALL_DOCS (corpus size, default 2000), MINNAL_RECALL_QUERIES (default 50).
+// Each scenario runs a sequence of vector-index operations with a crash injected
+// before its Nth write (`crash_point`), for every N, and under several flush
+// patterns: before the crash, some vector namespaces may already have been
+// flushed by their own memtable filling up, independently of the others. The
+// database is then dropped without shutting down, reopened, and put through what
+// production runs after a restart (reconciliation, then the worker draining the
+// queue), and every invariant is checked.
+
 #[cfg(test)]
-mod real_recall {
+mod crash_audit_tests {
     use super::*;
-    use crate::semantic_search::ClusterIndex;
-    use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
-    use crate::semantic_search::service::{SemanticSearchConfig, embed_query, search};
-    use std::collections::{HashMap, HashSet};
-    use std::io::BufRead;
-    use std::sync::Arc;
-    use std::time::Instant;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::future::Future;
+    use std::pin::Pin;
     use tempfile::TempDir;
 
-    const CLUSTER_PATH: &str = "../service/embedding_support/qwen/clusters.json";
-    const DEFAULT_CORPUS: &str = "../work/sample_data/sample_data_news.jsonl";
-    const NS: &str = "recall";
-    const SEARCH_TOPK: usize = 100;
-    /// n_probes to sweep, descending; the first (== cluster count) is the exhaustive ground truth.
-    const NPROBES: [usize; 5] = [256, 128, 64, 32, 10];
-    const RECALL_KS: [usize; 2] = [10, 100];
-    /// In-flight embedding requests during corpus indexing (network/GPU-bound).
-    const INDEX_CONCURRENCY: usize = 8;
+    const NS: &str = "docs";
+    type Step = for<'a> fn(&'a AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + 'a>>;
 
-    fn env_usize(key: &str, default: usize) -> usize {
-        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    /// Which vector namespaces had flushed (by their own memtable filling)
+    /// before the crash.
+    #[derive(Clone, Copy, Debug)]
+    enum Flushed {
+        None,
+        SparseOnly,
+        MetaOnly,
+        DenseOnly,
+        All,
     }
 
-    /// Build one document/query text from a news record: `headline. short_description`.
-    fn record_text(v: &serde_json::Value) -> String {
-        let headline = v.get("headline").and_then(|x| x.as_str()).unwrap_or("").trim();
-        let desc = v.get("short_description").and_then(|x| x.as_str()).unwrap_or("").trim();
-        match (headline.is_empty(), desc.is_empty()) {
-            (false, false) => format!("{headline}. {desc}"),
-            (false, true) => headline.to_string(),
-            (true, false) => desc.to_string(),
-            (true, true) => String::new(),
-        }
+    fn hash(text: &str) -> u64 {
+        text.bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
-    async fn real_recall_vs_nprobes() {
-        let corpus_path = std::env::var("MINNAL_RECALL_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string());
-        let embed_url = std::env::var("MINNAL_EMBED_URL").unwrap_or_else(|_| SemanticSearchConfig::default().embedding_service_url);
-        let n_docs = env_usize("MINNAL_RECALL_DOCS", 2000);
-        let n_queries = env_usize("MINNAL_RECALL_QUERIES", 50);
+    /// The vectors a text embeds to, deterministically: a dense entry tagged with
+    /// the text, and two chunks whose clusters depend on the text, so a re-embed
+    /// with new text moves them.
+    fn vectors_for_text(text: &str) -> Vec<VectorIndex> {
+        let h = hash(text);
+        let tag = (h % 997) as f32;
+        vec![
+            VectorIndex::new(0, QuantisationStyle::MultiBit { number_of_bits: 8 }, tag, 0.0, 0.01, vec![]),
+            VectorIndex::new(10 + (h % 5) as u32, QuantisationStyle::SingleBit, tag, 0.0, 0.01, vec![]),
+            VectorIndex::new(20 + ((h >> 8) % 5) as u32, QuantisationStyle::SingleBit, tag, 0.0, 0.01, vec![]),
+        ]
+    }
 
-        // ── Load corpus (soft-skip if absent — this is an on-demand, env-gated harness) ──
-        let file = match std::fs::File::open(&corpus_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!(
-                    "SKIP real_recall_vs_nprobes: cannot open corpus {corpus_path}: {e}\n  set MINNAL_RECALL_CORPUS to a JSONL file with headline/short_description fields."
-                );
-                return;
-            }
-        };
-        let mut texts: Vec<String> = std::io::BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-            .map(|v| record_text(&v))
-            .filter(|t| !t.is_empty())
-            .take(n_docs + n_queries)
-            .collect();
-        if texts.len() < n_docs + n_queries {
-            eprintln!(
-                "SKIP real_recall_vs_nprobes: corpus has {} usable records, need {} docs + {} queries",
-                texts.len(),
-                n_docs,
-                n_queries
-            );
-            return;
-        }
-        // Hold the last n_queries records out of the indexed set to use as queries.
-        let query_texts: Vec<String> = texts.split_off(n_docs);
-        let doc_texts = texts; // exactly n_docs
+    fn clusters_for_text(text: &str) -> BTreeSet<u32> {
+        vectors_for_text(text).iter().skip(1).map(|v| v.cluster_id).collect()
+    }
 
-        let raw = read_clusters_from_file(CLUSTER_PATH).expect("load clusters — run from crate root");
-        let n_clusters = raw.len();
-        assert_eq!(
-            NPROBES[0], n_clusters,
-            "NPROBES[0] must equal the cluster count ({n_clusters}) to be exhaustive ground truth"
-        );
-        let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
-        let index = Arc::new(ClusterIndex::from_clusters(cluster_map));
+    async fn open(dir: &TempDir) -> AsyncDb {
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        db.namespace(NS.to_string()).await.unwrap();
+        db
+    }
 
-        let base_config = Arc::new(SemanticSearchConfig {
-            embedding_service_url: embed_url.clone(),
-            ..SemanticSearchConfig::default()
-        });
+    // ── What the document store does ──
 
-        eprintln!("\n=== real-embedding recall vs n_probes ===");
-        eprintln!("  service {embed_url}  |  corpus {corpus_path}");
-        eprintln!("  {n_docs} docs, {n_queries} queries, {n_clusters} clusters, top_k {SEARCH_TOPK}");
+    /// A document write: the document (WAL), then its embed entry.
+    async fn put_doc(db: &AsyncDb, doc: &[u8], text: &str) -> Result<(), crate::KVError> {
+        crash_point!();
+        db.namespace(NS.to_string()).await?.put(doc.to_vec(), text.as_bytes().to_vec()).await?;
+        enqueue_embed(db, NS, doc, text).await
+    }
 
-        // ── Index the corpus through the real embedding service (bounded concurrency) ──
-        let dir = TempDir::new().unwrap();
-        let db = Arc::new(
-            AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
-                .await
-                .unwrap(),
-        );
-        let t_index = Instant::now();
-        let docs = doc_texts.into_iter().enumerate().map(|(i, t)| (i as u64, t)).collect();
-        let (ok, fail, first_err) = super::eval_indexing::index_texts(&db, NS, &base_config, &index, docs, INDEX_CONCURRENCY).await;
-        eprintln!("  indexed {ok} docs ({fail} failed) in {:.1}s", t_index.elapsed().as_secs_f64());
-        if ok == 0 {
-            eprintln!(
-                "SKIP real_recall_vs_nprobes: every document embed failed — is the service up at {embed_url}?  first error: {:?}",
-                first_err
-            );
-            db.shutdown().await.unwrap();
-            return;
-        }
+    /// A document delete, in `DocStore::delete`'s order: the tombstone and the
+    /// vectors first (`clear_vectors`), then the document (WAL).
+    async fn delete_doc(db: &AsyncDb, doc: &[u8]) -> Result<(), crate::KVError> {
+        clear_vectors(db, NS, doc).await?;
+        crash_point!();
+        db.namespace(NS.to_string()).await?.delete(doc.to_vec()).await
+    }
 
-        let store = DbVectorStore::new(&db, NS).await.unwrap();
-        let no_filter: Option<fn(&[u8]) -> bool> = None;
-
-        // ── Embed queries once; reused across every n_probes value ──
-        let mut q_embs = Vec::with_capacity(n_queries);
-        for qt in &query_texts {
-            match embed_query(&base_config, qt).await {
-                Ok(qe) if !qe.sparse.is_empty() && !qe.dense.is_empty() => q_embs.push(qe),
-                Ok(_) => {} // whitespace-only query produced no chunks; drop it
-                Err(e) => eprintln!("  query embed failed (skipping): {e}"),
-            }
-        }
-        assert!(!q_embs.is_empty(), "no queries could be embedded");
-
-        // Helper: run search for a given n_probes and return each query's ranked doc-id list.
-        async fn run_all(
-            config: &SemanticSearchConfig,
-            index: &ClusterIndex,
-            store: &DbVectorStore,
-            q_embs: &[crate::semantic_search::service::QueryEmbeddings],
-            no_filter: Option<fn(&[u8]) -> bool>,
-        ) -> (Vec<Vec<Vec<u8>>>, Vec<f64>) {
-            let mut ranked = Vec::with_capacity(q_embs.len());
-            let mut lat_us = Vec::with_capacity(q_embs.len());
-            for qe in q_embs {
-                let t = Instant::now();
-                let r = search(config, NS, index, &qe.sparse, &qe.dense, store, no_filter, Some(SEARCH_TOPK))
-                    .await
-                    .unwrap();
-                lat_us.push(t.elapsed().as_nanos() as f64 / 1e3);
-                ranked.push(r.into_iter().map(|q| q.document_id).collect());
-            }
-            (ranked, lat_us)
-        }
-
-        // ── Ground truth: exhaustive-probe top-k per query ──
-        let gt_config = SemanticSearchConfig {
-            n_probes: NPROBES[0],
-            ..(*base_config).clone()
-        };
-        let (ground_truth, _) = run_all(&gt_config, &index, &store, &q_embs, no_filter).await;
-        // Pre-hash each query's GT prefix set for every reported k.
-        let gt_sets: Vec<[HashSet<Vec<u8>>; RECALL_KS.len()]> = ground_truth
-            .iter()
-            .map(|gt| std::array::from_fn(|ki| gt.iter().take(RECALL_KS[ki]).cloned().collect()))
-            .collect();
-
-        // ── Sweep ──
-        eprintln!("\n  n_probes | recall@10 | recall@100 | mean cand | median search");
-        eprintln!("  ---------+-----------+------------+-----------+---------------");
-        for &np in &NPROBES {
-            let config = SemanticSearchConfig {
-                n_probes: np,
-                ..(*base_config).clone()
+    /// One worker pass over the whole queue, as the vector worker runs it.
+    async fn worker_pass(db: &AsyncDb) -> Result<(), crate::KVError> {
+        for entry in list_queue_entries(db).await? {
+            match entry.kind {
+                QueueEntryKind::Embed => finish_embed(db, &entry, &vectors_for_text(&entry.text)).await?,
+                QueueEntryKind::Clear => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?,
             };
-            let (ranked, mut lat_us) = run_all(&config, &index, &store, &q_embs, no_filter).await;
+        }
+        Ok(())
+    }
 
-            let mut recall_sums = [0.0f64; RECALL_KS.len()];
-            let mut cand_total = 0usize;
-            for (qi, got) in ranked.iter().enumerate() {
-                cand_total += got.len();
-                for (ki, &k) in RECALL_KS.iter().enumerate() {
-                    let denom = gt_sets[qi][ki].len(); // min(k, gt_len)
-                    if denom == 0 {
-                        continue;
+    /// Startup reconciliation: enqueue (if absent) every document whose vector
+    /// index is not complete.
+    async fn reconcile(db: &AsyncDb) -> Result<(), crate::KVError> {
+        for (doc, text) in db.namespace(NS.to_string()).await?.iter().await? {
+            if !has_complete_vector_index(db, NS, &doc, "text").await? {
+                enqueue_embed_if_absent(db, NS, &doc, std::str::from_utf8(&text).unwrap()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Invariants ──
+
+    /// Everything that must hold after recovery: the vector index matches what
+    /// the store holds. A document present has exactly its current text's
+    /// vectors; one absent has none; no queue work is left; no sparse key exists
+    /// that its document's meta does not list.
+    async fn check(db: &AsyncDb, docs: &[&[u8]]) -> Result<(), String> {
+        let parent = db.namespace(NS.to_string()).await.unwrap();
+        let mut texts: BTreeMap<Vec<u8>, Option<String>> = BTreeMap::new();
+        for doc in docs {
+            let text = parent.get(doc.to_vec()).await.unwrap().map(|b| String::from_utf8(b).unwrap());
+            texts.insert(doc.to_vec(), text);
+        }
+        let expected = &texts;
+        let queue = list_queue_entries(db).await.unwrap();
+        if !queue.is_empty() {
+            return Err(format!("queue not drained: {} entr(y/ies)", queue.len()));
+        }
+        let mut keys: BTreeMap<Vec<u8>, BTreeSet<u32>> = BTreeMap::new();
+        for (key, _) in db.namespace(sparse_vectors_ns(NS)).await.unwrap().iter().await.unwrap() {
+            let (cluster, doc) = composite_key::decode(&key).unwrap();
+            keys.entry(doc.to_vec()).or_default().insert(cluster);
+        }
+        let meta_ns = db.namespace(sparse_vectors_meta_ns(NS)).await.unwrap();
+        for (doc, text) in expected {
+            let meta: Option<BTreeSet<u32>> = meta_ns
+                .get(doc.clone())
+                .await
+                .unwrap()
+                .and_then(|b| decode_sparse_meta(&b))
+                .map(|m| m.cluster_ids().into_iter().collect());
+            let present = keys.remove(doc).unwrap_or_default();
+            let dense = DbVectorStore::new(db, NS).await.unwrap().get_dense_entry(doc).await.unwrap();
+            let dense_tag = dense.map(|raw| VectorIndex::access_list(&raw).unwrap().iter().next().unwrap().addition_factor());
+            match text.as_deref() {
+                Some(t) => {
+                    let want = clusters_for_text(t);
+                    let tag = vectors_for_text(t)[0].addition_factor;
+                    if present != want {
+                        return Err(format!("sparse keys {present:?}, expected {want:?} for text {t:?}"));
                     }
-                    let hits = got.iter().take(k).filter(|id| gt_sets[qi][ki].contains(*id)).count();
-                    recall_sums[ki] += hits as f64 / denom as f64;
+                    if meta.as_ref() != Some(&want) {
+                        return Err(format!("meta {meta:?}, expected {want:?}"));
+                    }
+                    if dense_tag != Some(tag) {
+                        return Err(format!("dense tag {dense_tag:?}, expected {tag} (stale or missing vectors)"));
+                    }
+                }
+                None => {
+                    if !present.is_empty() || meta.is_some() || dense_tag.is_some() {
+                        return Err(format!(
+                            "vectors of a deleted document remain: keys {present:?}, meta {meta:?}, dense {dense_tag:?}"
+                        ));
+                    }
                 }
             }
-            let nq = ranked.len() as f64;
-            lat_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = lat_us[lat_us.len() / 2];
-            let tag = if np == NPROBES[0] { " (GT)" } else { "" };
-            eprintln!(
-                "  {np:>4}{tag:<5}|   {:.3}   |   {:.3}    |  {:>6.1}   |  {:>8.1} µs",
-                recall_sums[0] / nq,
-                recall_sums[1] / nq,
-                cand_total as f64 / nq,
-                median,
-            );
         }
-        eprintln!("\n  (recall = overlap with exhaustive-probe top-k; GT row is 1.000 by construction)");
+        if let Some((doc, clusters)) = keys.into_iter().next() {
+            return Err(format!("sparse keys {clusters:?} for unknown document {doc:?}"));
+        }
+        Ok(())
+    }
 
-        db.shutdown().await.unwrap();
+    /// Run `scenario` after `setup` with a crash before every one of its writes
+    /// in turn, under every flush pattern, and check `expected` after recovery.
+    /// Returns the failures, one line each.
+    async fn audit(setup: Step, scenario: Step, docs: &[&[u8]]) -> Vec<String> {
+        let mut failures = Vec::new();
+        for flushed in [Flushed::None, Flushed::SparseOnly, Flushed::MetaOnly, Flushed::DenseOnly, Flushed::All] {
+            for n in 0.. {
+                let dir = TempDir::new().unwrap();
+                let db = open(&dir).await;
+                setup(&db).await.unwrap();
+                make_vector_writes_durable(&db).await.unwrap();
+                crash_point::arm(n);
+                let result = scenario(&db).await;
+                let crashed = crash_point::disarm();
+                if !crashed {
+                    result.unwrap();
+                }
+                let names: Vec<String> = match flushed {
+                    Flushed::None => vec![],
+                    Flushed::SparseOnly => vec![sparse_vectors_ns(NS)],
+                    Flushed::MetaOnly => vec![sparse_vectors_meta_ns(NS)],
+                    Flushed::DenseOnly => vec![dense_vectors_ns(NS)],
+                    Flushed::All => vec![sparse_vectors_ns(NS), sparse_vectors_meta_ns(NS), dense_vectors_ns(NS)],
+                };
+                db.flush_namespaces(names).await.unwrap();
+                db.crash().await; // crash: unflushed no-WAL writes are lost
+                // Restart, in production's order: drain the queue left by the
+                // crash, then reconcile, then process what reconciliation queued.
+                let db = open(&dir).await;
+                worker_pass(&db).await.unwrap();
+                reconcile(&db).await.unwrap();
+                worker_pass(&db).await.unwrap();
+                if let Err(e) = check(&db, docs).await {
+                    failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
+                }
+                db.shutdown().await.unwrap();
+                if !crashed {
+                    break;
+                }
+            }
+        }
+        failures
+    }
+
+    fn assert_clean(name: &str, failures: Vec<String>) {
+        assert!(failures.is_empty(), "{name}: {} failure(s):\n  {}", failures.len(), failures.join("\n  "));
+    }
+
+    fn nothing(_: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn index_old(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+        Box::pin(async move {
+            put_doc(db, b"x", "old text").await?;
+            worker_pass(db).await
+        })
+    }
+
+    #[tokio::test]
+    async fn first_index_survives_a_crash_anywhere() {
+        let failures = audit(nothing, index_old, &[b"x"]).await;
+        assert_clean("first index", failures);
+    }
+
+    #[tokio::test]
+    async fn reembed_survives_a_crash_anywhere() {
+        fn reembed(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+            Box::pin(async move {
+                put_doc(db, b"x", "new text").await?;
+                worker_pass(db).await
+            })
+        }
+        let failures = audit(index_old, reembed, &[b"x"]).await;
+        assert_clean("re-embed", failures);
+    }
+
+    #[tokio::test]
+    async fn delete_survives_a_crash_anywhere() {
+        fn delete(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+            Box::pin(async move {
+                delete_doc(db, b"x").await?;
+                worker_pass(db).await
+            })
+        }
+        let failures = audit(index_old, delete, &[b"x"]).await;
+        assert_clean("delete", failures);
+    }
+
+    /// A re-embed in flight when the document is deleted: the worker's write
+    /// lands after the delete.
+    #[tokio::test]
+    async fn delete_racing_a_reembed_survives_a_crash_anywhere() {
+        fn race(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+            Box::pin(async move {
+                put_doc(db, b"x", "new text").await?;
+                let in_flight = get_queue_entry(db, NS, b"x").await?.expect("queued");
+                delete_doc(db, b"x").await?;
+                finish_embed(db, &in_flight, &vectors_for_text("new text")).await?;
+                worker_pass(db).await
+            })
+        }
+        let failures = audit(index_old, race, &[b"x"]).await;
+        assert_clean("delete racing a re-embed", failures);
+    }
+
+    /// Reconciliation enqueues from a snapshot; its entry can land after the
+    /// document's delete was fully processed, so the worker embeds a document
+    /// that no longer exists and must remove what it wrote.
+    #[tokio::test]
+    async fn embedding_a_vanished_document_survives_a_crash_anywhere() {
+        fn stale(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+            Box::pin(async move {
+                delete_doc(db, b"x").await?;
+                worker_pass(db).await?;
+                enqueue_embed_if_absent(db, NS, b"x", "old text").await?; // reconciliation's stale snapshot
+                worker_pass(db).await
+            })
+        }
+        let failures = audit(index_old, stale, &[b"x"]).await;
+        assert_clean("embedding a vanished document", failures);
     }
 }

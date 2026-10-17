@@ -839,4 +839,67 @@ mod iterator_tests {
         assert_eq!(db.scan_prefix(b"x")?.len(), 0);
         Ok(())
     }
+
+    /// A no-WAL write takes a sequence the WAL never records. After a crash the
+    /// counter recovered from the WAL alone restarted below a no-WAL value
+    /// already flushed to an SSTable, so every later write to that key lost to
+    /// the stale value under highest-sequence-wins. `KVStore::set_seq_counter`
+    /// now raises the counter above every stored sequence at open.
+    #[tokio::test]
+    async fn a_write_after_a_crash_beats_a_flushed_no_wal_value() {
+        let dir = TempDir::new().unwrap();
+        let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        ns.put(b"k".to_vec(), b"wal".to_vec()).await.unwrap();
+        // Push the sequence well past what the WAL has seen, without the WAL.
+        for i in 0..100u32 {
+            ns.put_no_wal(i.to_be_bytes().to_vec(), b"x".to_vec()).await.unwrap();
+        }
+        ns.put_no_wal(b"k".to_vec(), b"no-wal".to_vec()).await.unwrap();
+        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
+        drop(ns);
+        db.crash().await;
+
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"no-wal"[..]));
+        ns.put(b"k".to_vec(), b"after".to_vec()).await.unwrap();
+        assert_eq!(
+            ns.get(b"k".to_vec()).await.unwrap().as_deref(),
+            Some(&b"after"[..]),
+            "a WAL put lost to the stale value"
+        );
+        ns.put_no_wal(b"k".to_vec(), b"after2".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"after2"[..]));
+        ns.delete(b"k".to_vec()).await.unwrap();
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap(), None, "a delete lost to the stale value");
+        db.shutdown().await.unwrap();
+    }
+
+    /// The crash tests' simulated crash loses what a process kill loses: a
+    /// no-WAL write still in the memtable is gone, a WAL-backed one replays, and
+    /// a flushed no-WAL one stays. `KVStore`'s `Drop` used to flush every
+    /// memtable even after `crash()`, so no-WAL writes always survived and no
+    /// crash test could catch a missing barrier flush.
+    #[tokio::test]
+    async fn a_simulated_crash_loses_unflushed_no_wal_writes() {
+        let dir = TempDir::new().unwrap();
+        let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        ns.put_no_wal(b"flushed".to_vec(), b"1".to_vec()).await.unwrap();
+        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
+        ns.put(b"wal".to_vec(), b"1".to_vec()).await.unwrap();
+        ns.put_no_wal(b"memtable".to_vec(), b"1".to_vec()).await.unwrap();
+        drop(ns);
+        db.crash().await;
+
+        let db = open().await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        assert!(ns.get(b"flushed".to_vec()).await.unwrap().is_some());
+        assert!(ns.get(b"wal".to_vec()).await.unwrap().is_some());
+        assert_eq!(ns.get(b"memtable".to_vec()).await.unwrap(), None, "an unflushed no-WAL write survived");
+        db.shutdown().await.unwrap();
+    }
 }

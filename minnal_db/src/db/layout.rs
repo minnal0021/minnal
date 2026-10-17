@@ -21,6 +21,7 @@
 //!       rowmap/           ← dense row-ID map sidecar
 //!       no_wal_pending    ← marker: uncheckpointed no-WAL writes (FR-001)
 //!   wal.log, wal.log.seg* ← shared write-ahead log segments, plus wal_metadata
+//!   vector_index_wal/     ← the vector index WAL's segments ({segment_id}.log)
 //!   fail_logs/            ← recovery failures
 //! ```
 
@@ -57,6 +58,17 @@ pub(crate) fn namespace_index_dir(index_root: &Path, ns_id: u32) -> PathBuf {
     index_root.join(ns_id.to_string())
 }
 
+/// Name of the vector index WAL's directory at the database root.
+const VECTOR_INDEX_WAL_DIR: &str = "vector_index_wal";
+
+/// The vector index WAL's directory: `{db_path}/vector_index_wal`.
+///
+/// One per database, shared by every vector namespace (see
+/// `semantic_search/report/Vector-Index-WAL-Design.md`).
+pub(crate) fn vector_index_wal_dir(db_path: &Path) -> PathBuf {
+    db_path.join(VECTOR_INDEX_WAL_DIR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +79,7 @@ mod tests {
         assert_eq!(namespace_data_dir(root, "users"), Path::new("/db/ns_users"));
         assert_eq!(index_root(root), Path::new("/db/index"));
         assert_eq!(namespace_index_dir(&index_root(root), 7), Path::new("/db/index/7"));
+        assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }
 
     /// The namespace data directory is keyed by name and the index subtree by

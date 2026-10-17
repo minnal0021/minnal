@@ -341,7 +341,7 @@ starts again from the first row on every page.
 A semantic search runs in two passes. Pass 1 picks the clusters nearest to the
 query and scores every document chunk stored in them with compact 1-bit
 vectors. Pass 2 re-scores the best candidates with more precise vectors. (See
-[Semantic-Search-Architecture.md](src/semantic_search/Semantic-Search-Architecture.md).)
+[Semantic-Search-Architecture.md](src/semantic_search/report/Semantic-Search-Architecture.md).)
 This benchmark runs the full search over an in-memory store of 5,000
 documents. It uses the project's bundled 256 cluster centroids, synthetic
 768-dimension vectors, the default settings (64 clusters probed), and a query
@@ -370,28 +370,3 @@ How these numbers relate to a real query:
 The steps inside a search are small by comparison. Choosing the 64 nearest of
 256 clusters takes about 9 µs. Scoring 1,000 candidates takes 16 µs in Pass 1
 and 16 µs in Pass 2, so the more precise pass costs no more per candidate.
-
----
-
-## Checked against the README
-
-The [README's Performance section](README.md#performance) quotes ballpark
-single-writer throughput. This run agrees:
-
-| Operation | README ballpark | Measured here |
-|---|---|---|
-| Write, small values | 400–500 ops/s | 438 ops/s |
-| `merge`, small values | 400–500 ops/s | 442 ops/s |
-| Read from memory | 1M–2.5M ops/s | 2.5M ops/s |
-| Read from disk | 100k–300k ops/s | 302k ops/s (at the top end) |
-
-Two separate benchmarks measure a small-value read from disk, with different
-setups, and agree within 1% (302k and 305k reads per second).
-
-The write figure is the fsync limit, and no setting raises it: the WAL is
-always fsynced per write, and only the value log's sync cadence is configurable.
-It is also the limit for the whole database, not per writer. Each write holds
-the one WAL lock while it fsyncs, so writes from any number of threads or
-namespaces reach the disk one at a time. This report measures single-threaded
-latency only, so it does not measure how latency behaves when writers queue for
-that lock.

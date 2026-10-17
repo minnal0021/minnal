@@ -97,6 +97,13 @@ pub struct KVStore {
     // data a crash would destroy outright rather than merely delay.
     pub(crate) unflushed_no_wal_writes: Arc<AtomicBool>,
 
+    // Test-only: set by a simulated crash (`AsyncDb::crash`) so that dropping
+    // the store skips the flush below, as a process kill would. Without it the
+    // flush made every unflushed memtable durable, no-WAL writes included, and
+    // no crash test could see a write that a real crash loses.
+    #[cfg(test)]
+    crashed: AtomicBool,
+
     // Flag to prevent concurrent value log GC operations
     pub(crate) value_log_gc_in_progress: Arc<AtomicBool>,
 
@@ -237,6 +244,8 @@ impl KVStore {
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            crashed: AtomicBool::new(false),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
@@ -307,7 +316,20 @@ impl KVStore {
     /// Share a global write-sequence counter with this store (called by the
     /// `Database` coordinator with its WAL sequence counter, so all writes —
     /// WAL-backed and non-WAL — draw from one monotonic sequence space).
+    /// Share the database's write-sequence counter, first raising it above
+    /// every sequence this store already holds.
+    ///
+    /// **Load-bearing for no-WAL writes.** The counter is recovered from the WAL
+    /// at open, but a no-WAL write takes a sequence the WAL never sees. After a
+    /// crash the counter could restart below a no-WAL value already flushed to an
+    /// SSTable, and every later write to that key — WAL-backed or not — would
+    /// lose to the stale value under highest-sequence-wins: a delete silently
+    /// undone, an update silently reverted. Found by the M3a split crash audit
+    /// while trying no-WAL meta writes (a meta rewritten after a restart never
+    /// became visible). Regression
+    /// test: `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
     pub(crate) fn set_seq_counter(&self, counter: Arc<AtomicU64>) {
+        counter.fetch_max(self.lsm.max_stored_seq().saturating_add(1), Ordering::SeqCst);
         *self.seq_counter.write() = counter;
     }
 
@@ -1409,6 +1431,20 @@ impl KVStore {
         result
     }
 
+    /// As [`Self::flush_memtable_to_level0`], but seals the memtable even when
+    /// it is empty, so the flush observers always see a seal and a flush. The
+    /// vector index WAL's GC pass uses it: a namespace holding that log's
+    /// retired cut is released only by a seal, and its memtable can be empty.
+    pub(crate) fn seal_and_flush_to_level0(&self) -> Result<()> {
+        // Same flag handling as `flush_memtable_to_level0`.
+        let was_set = self.unflushed_no_wal_writes.swap(false, Ordering::AcqRel);
+        let result = self.lsm.seal_and_flush_to_level0().map_err(KVError::from);
+        if result.is_err() && was_set {
+            self.unflushed_no_wal_writes.store(true, Ordering::Release);
+        }
+        result
+    }
+
     /// Record that a no-WAL write landed in this namespace's memtable.
     pub(crate) fn note_no_wal_write(&self) {
         self.unflushed_no_wal_writes.store(true, Ordering::Release);
@@ -1821,6 +1857,17 @@ impl KVStore {
         self.lsm.has_compaction_work()
     }
 
+    /// The background worker's compaction: flush read-only memtables and merge
+    /// only the buckets whose merge is due (`LSMTree::compaction_due`).
+    pub(crate) fn compact_lsm_due(&self) -> Result<()> {
+        self.lsm.compact_due().map_err(KVError::from)
+    }
+
+    /// Whether [`compact_lsm_due`](Self::compact_lsm_due) has anything to do.
+    pub(crate) fn has_due_lsm_compaction_work(&self) -> bool {
+        self.lsm.has_due_compaction_work()
+    }
+
     // ── Shutdown ──────────────────────────────────────────────────────────
 
     /// Flush and sync all data for this namespace.
@@ -1859,6 +1906,21 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
         self.inner.on_memtable_sealed(version);
     }
 
+    // The vector index WAL retires records here, so the values they point at
+    // must be on stable storage first, exactly as for the persisted event below.
+    // The second fsync, before that event, then finds little or nothing to write.
+    // A failed fsync vetoes the flush: the files are not registered and the
+    // memtable is flushed again later.
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before memtable {version}'s L0 files were registered; the flush is undone: {e:?}");
+                return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
+            }
+        }
+        self.inner.on_ro_memtable_written(version)
+    }
+
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
         for log in &self.logs {
             if let Err(e) = log.sync() {
@@ -1870,8 +1932,20 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     }
 }
 
+impl KVStore {
+    /// Test-only: make dropping this store skip its flush, as a crash would.
+    #[cfg(test)]
+    pub(crate) fn mark_crashed(&self) {
+        self.crashed.store(true, Ordering::SeqCst);
+    }
+}
+
 impl Drop for KVStore {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.crashed.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = self.value_log.sync_all();
         let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.flush_all_metadata();

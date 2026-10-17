@@ -12,6 +12,7 @@
 //! |-------------|----------------------------------------------------------------------|
 //! | `bulk_load` | Load a JSONL file into a doc store (default) or KV store (`--kv`), optionally importing its schema first |
 //! | `search_load` | Closed-loop concurrent load against a semantic-search endpoint; reports throughput and latency percentiles |
+//! | `mixed_load` | One step of the M5 system benchmark: a mixed REST workload at a fixed offered rate (open loop) or N clients |
 //!
 //! # Example
 //!
@@ -30,6 +31,7 @@
 //! ```
 
 mod bulk_load;
+mod mixed_load;
 mod search_load;
 
 fn usage() -> ! {
@@ -40,6 +42,7 @@ fn usage() -> ! {
         "  bulk_load    load a JSONL file into a doc store (default) or KV store (--kv),\n",
         "               optionally importing its schema first\n",
         "  search_load  concurrent load against a semantic-search endpoint\n",
+        "  mixed_load   one step of a mixed open- or closed-loop workload (M5 benchmark)\n",
         "\n",
         "run 'minnal_tools <tool>' with no further arguments for tool-specific help",
     ));
@@ -57,6 +60,7 @@ async fn main() {
     let result = match args[1].as_str() {
         "bulk_load" => bulk_load::run(&args[2..]).await,
         "search_load" => search_load::run(&args[2..]).await,
+        "mixed_load" => mixed_load::run(&args[2..]).await.map_err(Into::into),
         other => {
             eprintln!("unknown tool: {other}");
             usage();

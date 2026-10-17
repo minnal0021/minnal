@@ -28,6 +28,7 @@ use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use crate::semantic_search::cluster::IvfLayout;
 use crate::semantic_search::index::vector_index::VectorIndex;
 use crate::semantic_search::quantisation::rabitq::quantisation_support::{IndexCalculationData, Quantisation, calculate_error_bound};
 use crate::semantic_search::vector_math::binary_quantize;
@@ -135,6 +136,83 @@ pub fn index_embedding(
     Ok(index_embedding_to_cluster(embeddings, cluster, style))
 }
 
+/// Quantise `embedding` for `layout`: file it under its nearest posting (routing,
+/// in the original space) and encode it against that posting's centre in the
+/// layout's rotated space (`quantise(Pᵀx, Pᵀc)`; see
+/// [`ClusterIndex`](crate::semantic_search::ClusterIndex)). The returned entry's
+/// `cluster_id` is the posting and its `centre_id` the centre. The production
+/// indexing path; its codes are scored by `search()`, which rotates the query to
+/// match.
+pub fn index_embedding_rotated<L: IvfLayout + ?Sized>(
+    layout: &L,
+    embedding: &[f32],
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> Result<VectorIndex, ClusterIndexError> {
+    let posting = layout.route(embedding).ok_or(ClusterIndexError::EmptyClusterMap)?;
+    index_embedding_in_cluster(layout, embedding, posting, style).ok_or(ClusterIndexError::EmptyClusterMap)
+}
+
+/// Like [`index_embedding_rotated`], but filed under a given posting; `None` for
+/// an unknown posting.
+pub fn index_embedding_in_cluster<L: IvfLayout + ?Sized>(
+    layout: &L,
+    embedding: &[f32],
+    posting: u32,
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> Option<VectorIndex> {
+    let centre_id = layout.centre_of(posting)?;
+    let centre = Cluster::new(centre_id, layout.rotated_centre(centre_id)?.to_vec());
+    let mut vi = index_embedding_to_cluster(&layout.rotate(embedding), &centre, style);
+    vi.cluster_id = posting;
+    Some(vi)
+}
+
+/// Quantise `embedding` against the zero centre (the origin), in `layout`'s
+/// rotated space: the production encoding of whole-document (Pass-2) codes. The
+/// entry's `cluster_id` and `centre_id` are both
+/// [`ZERO_CENTRE`](crate::semantic_search::ZERO_CENTRE); it is fetched by document
+/// id and never routed, so it depends on no centre of the partition.
+pub fn index_embedding_zero_centred<L: IvfLayout + ?Sized>(
+    layout: &L,
+    embedding: &[f32],
+    style: crate::semantic_search::index::vector_index::QuantisationStyle,
+) -> VectorIndex {
+    use crate::semantic_search::ZERO_CENTRE;
+    let origin = Cluster::new(ZERO_CENTRE, vec![0.0; embedding.len()]);
+    index_embedding_to_cluster(&layout.rotate(embedding), &origin, style)
+}
+
+/// The unbiased reconstruction of a 1-bit chunk code, in the rotated space codes
+/// are computed in: `Pᵀc + scaling_factor · (2b − 1)`, where `rotated_centre` is
+/// the code's own centre (its `centre_id`) rotated, and `b` its sign bits
+/// (dimension `i` is bit `i % 64` of word `i / 64`). Its inner product with any
+/// rotated query is exactly the estimate Pass 1 scores with, so maintenance
+/// (splits, reassignment) sees each chunk as search does. `None` for a code that
+/// is not 1-bit or does not match the centre's dimension.
+pub fn reconstruct_single_bit(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<f32>> {
+    let mut out = Vec::new();
+    reconstruct_single_bit_into(vi, rotated_centre, &mut out).then_some(out)
+}
+
+/// [`reconstruct_single_bit`] into `out` (cleared first), so a caller
+/// reconstructing many codes reuses one buffer. `false` where that returns
+/// `None`.
+pub fn reconstruct_single_bit_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut Vec<f32>) -> bool {
+    use crate::semantic_search::index::vector_index::QuantisationStyle;
+    out.clear();
+    if vi.quantisation_style != QuantisationStyle::SingleBit || vi.packed_vector.len() < rotated_centre.len().div_ceil(64) {
+        return false;
+    }
+    let s = vi.scaling_factor;
+    out.extend(
+        rotated_centre
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s }),
+    );
+    true
+}
+
 pub fn index_embedding_to_cluster(
     embedding: &[f32],
     cluster: &Cluster,
@@ -159,14 +237,16 @@ pub fn index_embedding_to_cluster(
 }
 
 #[inline]
-fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_factor_start: f32) -> (Vec<i32>, f32, f32) {
+fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_factor_start: f32, max_code: i32) -> (Vec<i32>, f32, f32) {
     let dimension = normalised_residual_vector.len();
     let mut normalised_residual_vector_bar: Vec<i32> = Vec::with_capacity(dimension);
     let mut denominator: f32 = dimension as f32 * 0.25;
     let mut numerator: f32 = 0.0;
 
     for (index, &value) in normalised_residual_vector.iter().enumerate() {
-        let current_rescale_factor = ((rescale_factor_start * value) + EPS) as i32;
+        // Clamped like the final quantisation: for 1 and 3 magnitude bits the start
+        // scale can put the largest coordinate above the top code.
+        let current_rescale_factor = (((rescale_factor_start * value) + EPS) as i32).min(max_code);
         normalised_residual_vector_bar.insert(index, current_rescale_factor);
         denominator += (current_rescale_factor * current_rescale_factor + current_rescale_factor) as f32;
         numerator += (current_rescale_factor as f32 + 0.5) * value;
@@ -187,19 +267,27 @@ fn best_rescale_factor(normalised_residual_vector: &[f32], number_of_bits_for_qu
     let rescale_factor_end = ((1 << number_of_bits_for_quantisation) - 1 + NO_ENUMERATIONS) as f32 / max_value;
     let rescale_factor_start = rescale_factor_end * START[number_of_bits_for_quantisation];
 
+    let max_normalised_residual_vector_bar = (1 << number_of_bits_for_quantisation) - 1;
     let (mut normalised_residual_vector_bar, mut sqr_of_denominator, mut numerator) =
-        setup_initial_computation_values(normalised_residual_vector, rescale_factor_start);
+        setup_initial_computation_values(normalised_residual_vector, rescale_factor_start, max_normalised_residual_vector_bar);
 
     let mut rescaling_factor_binary_heap = BinaryHeap::with_capacity(dimension);
 
+    // Same guards as the push inside the loop: never step a coordinate past the
+    // top code, and never past the end of the search range.
     for (index, &value) in normalised_residual_vector.iter().enumerate() {
+        if normalised_residual_vector_bar[index] >= max_normalised_residual_vector_bar {
+            continue;
+        }
         let next_value = (normalised_residual_vector_bar[index] + 1) as f32 / value;
-        rescaling_factor_binary_heap.push(QueueItem { value: next_value, index });
+        if next_value < rescale_factor_end {
+            rescaling_factor_binary_heap.push(QueueItem { value: next_value, index });
+        }
     }
 
-    let mut max_inner_product = 0.0;
-    let mut best_rescaling_factor = 0.0;
-    let max_normalised_residual_vector_bar = (1 << number_of_bits_for_quantisation) - 1;
+    // The starting scale is a candidate too.
+    let mut max_inner_product = numerator / sqr_of_denominator.sqrt();
+    let mut best_rescaling_factor = rescale_factor_start;
 
     while let Some(item) = rescaling_factor_binary_heap.pop() {
         let current_t = item.value;
@@ -553,7 +641,57 @@ mod tests {
         let number_of_bits = 6;
 
         let best_rescale_factor = best_rescale_factor(&residual_vector_data_to_centroid, number_of_bits);
-        assert_relative_eq!(best_rescale_factor, 47.632656, epsilon = 0.0001);
+        // The starting scale (0.75 · 73 / max) is itself the best candidate here.
+        assert_relative_eq!(best_rescale_factor, 51.814213, epsilon = 0.0001);
+    }
+
+    /// The rescale factor the search picks must be as good as an exhaustive sweep
+    /// over every critical scale in its range, scored on the codes the quantiser can
+    /// actually emit (clamped to `2^bits − 1`). For 2 and 4 total bits (1 and 3
+    /// magnitude bits) the search's starting codes can exceed that maximum, so it
+    /// scored states the quantiser can never produce and could pick a worse scale.
+    #[test]
+    fn best_rescale_factor_matches_an_exhaustive_sweep_on_clamped_codes() {
+        fn objective(o: &[f32], t: f32, bits: usize) -> f32 {
+            let max = (1i32 << bits) - 1;
+            let (mut num, mut den) = (0f32, 0f32);
+            for &v in o {
+                let k = (((t * v) + EPS) as i32).min(max) as f32 + 0.5;
+                num += k * v;
+                den += k * k;
+            }
+            num / den.sqrt()
+        }
+        let mut state = 0x1234_5678_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (1u64 << 31) as f32
+        };
+        for (bits, &start) in START.iter().enumerate().take(8).skip(1) {
+            let mut worst = 0f32;
+            for _ in 0..50 {
+                // A normalised residual's magnitudes, as `quantise_multi_bits` passes them.
+                let raw: Vec<f32> = (0..64).map(|_| next() - 0.5).collect();
+                let n = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let o: Vec<f32> = raw.iter().map(|v| (v / n).abs()).collect();
+                let max_o = o.iter().copied().fold(0f32, f32::max);
+                let t_end = ((1 << bits) - 1 + NO_ENUMERATIONS) as f32 / max_o;
+                let t_start = t_end * start;
+                let mut ts = vec![t_start];
+                for &v in &o {
+                    for k in 0..(1 << bits) {
+                        let t = (k + 1) as f32 / v;
+                        if t > t_start && t < t_end {
+                            ts.push(t);
+                        }
+                    }
+                }
+                let best = ts.iter().map(|&t| objective(&o, t, bits)).fold(0f32, f32::max);
+                let got = objective(&o, best_rescale_factor(&o, bits), bits);
+                worst = worst.max(best - got);
+            }
+            assert!(worst <= 1e-4, "{bits} magnitude bits: search is {worst} below the best clamped scale");
+        }
     }
 
     #[test]
@@ -564,8 +702,8 @@ mod tests {
         let number_of_bits = 6;
 
         let extra_bits_quantisation = quantise_extra_bits(&residual_vector_data_to_centroid, number_of_bits);
-        assert_relative_eq!(extra_bits_quantisation.inverse_of_inner_product, 0.009810816, epsilon = 0.0001);
-        assert_eq!(extra_bits_quantisation.extra_bits_quantised_embedding, [50, -18, 0, -19, -26, 14, 26, 5]);
+        assert_relative_eq!(extra_bits_quantisation.inverse_of_inner_product, 0.009065732, epsilon = 0.0001);
+        assert_eq!(extra_bits_quantisation.extra_bits_quantised_embedding, [54, -20, 0, -21, -28, 15, 28, 5]);
     }
 
     #[test]
@@ -863,5 +1001,40 @@ mod tests {
         let embedding = vec![0.5f32; 16];
         let result = index_embedding(&cluster_map, &embedding, QuantisationStyle::MultiBit { number_of_bits: 8 });
         assert!(matches!(result, Err(ClusterIndexError::EmptyClusterMap)));
+    }
+
+    #[test]
+    fn a_one_bit_reconstruction_is_unbiased_and_keeps_most_of_the_direction() {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let dim = 64;
+        let mut state = 0x5eed_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (1u64 << 31) as f32 - 0.5
+        };
+        let centre = Cluster::new(1, (0..dim).map(|_| next()).collect());
+        let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+        let (mut errs, mut cos) = (Vec::new(), Vec::new());
+        for _ in 0..3000 {
+            let x: Vec<f32> = centre.centroid.iter().map(|&c| c + next()).collect();
+            let vi = index_embedding_to_cluster(&x, &centre, QuantisationStyle::SingleBit);
+            let xh = reconstruct_single_bit(&vi, &centre.centroid).unwrap();
+            errs.push(dot(&xh, &q) - dot(&x, &q));
+            let r: Vec<f32> = x.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+            let rh: Vec<f32> = xh.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+            cos.push(dot(&r, &rh) / (dot(&r, &r).sqrt() * dot(&rh, &rh).sqrt()));
+        }
+        let n = errs.len() as f64;
+        let mean = errs.iter().sum::<f64>() / n;
+        let sd = (errs.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / n).sqrt();
+        assert!(mean.abs() < 4.0 * sd / n.sqrt(), "bias {mean} vs sd {sd}");
+        let mean_cos = cos.iter().sum::<f64>() / n;
+        assert!((0.7..0.9).contains(&mean_cos), "direction kept {mean_cos}");
+        // Not a 1-bit code, or a centre of the wrong size: no reconstruction.
+        let multi = index_embedding_to_cluster(&q, &centre, QuantisationStyle::MultiBit { number_of_bits: 8 });
+        assert!(reconstruct_single_bit(&multi, &centre.centroid).is_none());
+        let vi = index_embedding_to_cluster(&q, &centre, QuantisationStyle::SingleBit);
+        assert!(reconstruct_single_bit(&vi, &[0.0; 128]).is_none());
     }
 }
