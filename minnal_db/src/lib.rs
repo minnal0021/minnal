@@ -125,6 +125,10 @@ pub use db::facade::Namespace;
 /// Scoped handle to a single namespace (async).
 pub use db::facade::AsyncNamespace;
 
+/// A prefix-batch scan's entries, packed into a few buffers
+/// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
+pub use db::kv_store::PrefixScan;
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Top-level database configuration.

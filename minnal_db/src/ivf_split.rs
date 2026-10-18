@@ -385,15 +385,11 @@ async fn postings_entries(db: &AsyncDb, namespace: &str, postings: &[u32]) -> Re
         .await?
         .scan_prefixes_batch(postings.to_vec())
         .await?;
-    let mut out = HashMap::with_capacity(rows.len());
-    for (posting, rows) in rows {
-        let mut entries = Vec::with_capacity(rows.len());
-        for (k, v) in rows {
-            let Some((_, doc)) = composite_key::decode(&k) else { continue };
-            let codes = VectorIndex::list_from_bytes(&v).map_err(|e| corrupt(namespace, format!("posting {posting}: {e}")))?;
-            entries.push((doc.to_vec(), codes));
-        }
-        out.insert(posting, entries);
+    let mut out = HashMap::<u32, Vec<_>>::with_capacity(postings.len());
+    for (posting, k, v) in rows.iter() {
+        let Some((_, doc)) = composite_key::decode(k) else { continue };
+        let codes = VectorIndex::list_from_bytes(v).map_err(|e| corrupt(namespace, format!("posting {posting}: {e}")))?;
+        out.entry(posting).or_default().push((doc.to_vec(), codes));
     }
     Ok(out)
 }

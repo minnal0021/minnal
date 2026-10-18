@@ -466,15 +466,8 @@ where
     // Flatten every probed entry into one list so rayon splits the *entries*, not the
     // clusters: IVF clusters are heavily skewed (one cluster can hold a third of a
     // corpus), and splitting by cluster left that cluster's scan on a single thread.
-    // Entries are borrowed from `sparse_by_cluster`; nothing is copied.
-    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster
-        .iter()
-        .flat_map(|(cluster_id, cluster_entries)| {
-            cluster_entries
-                .iter()
-                .map(move |(doc_id, raw_bytes)| (*cluster_id, doc_id.as_slice(), raw_bytes.as_slice()))
-        })
-        .collect();
+    // Entries are borrowed from `sparse_by_cluster`'s buffers; nothing is copied.
+    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster.iter().collect();
 
     // Score each entry into its own row of a flat `n_query`-wide matrix: row[i] is
     // max_j ⟨q_i, d_j⟩ over that entry's chunks. Rows start at NEG_INFINITY so an
@@ -598,15 +591,11 @@ where
     // Fetch all dense entries in one batch operation (single blocking task in production).
     let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.to_vec()).collect();
 
-    // Pass 1 is done with the scanned entries: free them off the request path. They
-    // are two heap buffers per entry (doc_id + rkyv bytes), and dropping ~90k entries
-    // on a 57k-doc corpus took ~6 ms single-threaded — the same order as all of
-    // Pass 1's scoring. The total work is unchanged; it just no longer delays the reply.
-    // Not `rayon::spawn`: a 6 ms job queued on the rayon pool gets stolen by workers
-    // waiting inside another search's `join` and stalls that search (see SCORING_GATE).
+    // Pass 1 is done with the scanned entries. They sit in a few large buffers
+    // (`SparseScan`), so freeing them is a few frees, not two per entry.
     drop(entries);
     drop(pass1_permit);
-    tokio::task::spawn_blocking(move || drop(sparse_by_cluster));
+    drop(sparse_by_cluster);
 
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await?;
 
@@ -804,7 +793,7 @@ pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::index::vector_index::{ClusterBatchResult, ClusterEntries};
+    use crate::semantic_search::index::vector_index::{ClusterEntries, SparseScan};
 
     /// Sixteen 768-d unit centroids for the fixture embeddings: eight leaning
     /// towards the fixture document (as a fitted centre near it would), eight
@@ -1488,11 +1477,8 @@ mod tests {
         async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
             Ok(vec![None; doc_ids.len()])
         }
-        async fn scan_sparse_clusters_batch(
-            &self,
-            _cluster_ids: &[u32],
-        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
-            Ok(std::collections::HashMap::new())
+        async fn scan_sparse_clusters_batch(&self, _cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
+            Ok(SparseScan::default())
         }
     }
 
@@ -1576,7 +1562,7 @@ mod tests {
     /// - `sparse_data`: SingleBit scan results keyed by cluster_id.
     /// - `dense_data`: MultiBit entries keyed by doc_id.
     struct MockVectorKvStore {
-        sparse_data: ClusterBatchResult,
+        sparse_data: std::collections::HashMap<u32, ClusterEntries>,
         dense_data: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     }
 
@@ -1669,14 +1655,10 @@ mod tests {
         async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
             Ok(doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect())
         }
-        async fn scan_sparse_clusters_batch(
-            &self,
-            cluster_ids: &[u32],
-        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
-            Ok(cluster_ids
-                .iter()
-                .filter_map(|id| self.sparse_data.get(id).map(|entries| (*id, entries.clone())))
-                .collect())
+        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
+            Ok(SparseScan::from_clusters(
+                cluster_ids.iter().filter_map(|id| self.sparse_data.get(id).map(|entries| (*id, entries))),
+            ))
         }
     }
 
@@ -1710,7 +1692,7 @@ mod tests {
                 Err(crate::KVError::Io(std::io::Error::other("dense read failed")))
             }
         }
-        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<ClusterBatchResult, crate::KVError> {
+        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
             if self.fail_sparse {
                 Err(crate::KVError::Io(std::io::Error::other("sparse scan failed")))
             } else {

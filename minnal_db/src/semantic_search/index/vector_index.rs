@@ -8,10 +8,51 @@ use serde::{Deserialize, Serialize};
 /// Returned by [`VectorKvStore::scan_sparse_cluster`].
 pub type ClusterEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// Map from cluster ID to `(doc_id_bytes, raw_rkyv_bytes)` pairs.
+/// The sparse entries of several clusters, as
+/// [`VectorKvStore::scan_sparse_clusters_batch`] returns them: one
+/// `(cluster_id, doc_id_bytes, raw_rkyv_bytes)` per entry, in key order.
 ///
-/// Returned by [`VectorKvStore::scan_sparse_clusters_batch`].
-pub type ClusterBatchResult = std::collections::HashMap<u32, ClusterEntries>;
+/// The entries stay packed as the store read them (a few large buffers, not two
+/// allocations per entry), so a search's first pass, which reads tens of
+/// thousands, allocates and frees little.
+#[derive(Debug, Default)]
+pub struct SparseScan(crate::PrefixScan);
+
+impl SparseScan {
+    /// Wrap a scan of the sparse namespace, whose keys are
+    /// [`composite_key`](crate::semantic_search::composite_key)s.
+    pub fn new(scan: crate::PrefixScan) -> Self {
+        Self(scan)
+    }
+
+    /// Pack each cluster's `(doc_id_bytes, raw_rkyv_bytes)` pairs, for stores that
+    /// hold their entries in memory (test doubles, benchmarks).
+    pub fn from_clusters<'a>(clusters: impl IntoIterator<Item = (u32, &'a ClusterEntries)>) -> Self {
+        Self(crate::PrefixScan::from_pairs(clusters.into_iter().flat_map(|(cluster_id, entries)| {
+            entries
+                .iter()
+                .map(move |(doc_id, raw)| (crate::semantic_search::composite_key::encode(cluster_id, doc_id), raw.clone()))
+        })))
+    }
+
+    /// `(cluster_id, doc_id_bytes, raw_rkyv_bytes)` for every entry, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &[u8], &[u8])> + '_ {
+        self.0.iter().filter_map(|(_, key, raw)| {
+            let (cluster_id, doc_id) = crate::semantic_search::composite_key::decode(key)?;
+            Some((cluster_id, doc_id, raw))
+        })
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no entry was found.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 // ── QuantisationStyle ─────────────────────────────────────────────────────────
 
@@ -84,13 +125,12 @@ pub trait VectorKvStore {
 
     /// Scan multiple IVF cluster prefixes in a single operation.
     ///
-    /// Returns a map from `cluster_id` to `(doc_id_bytes, raw_rkyv_bytes)` pairs.
+    /// Returns every probed entry as `(cluster_id, doc_id_bytes, raw_rkyv_bytes)`.
     /// Prefer this over repeated `scan_sparse_cluster` calls when probing many clusters;
     /// implementations backed by a real KV store do one blocking task with `num_buckets`
     /// value-log reader threads instead of one blocking task × `num_buckets` threads
     /// per cluster.
-    fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32])
-    -> impl std::future::Future<Output = Result<ClusterBatchResult, crate::KVError>> + Send;
+    fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> impl std::future::Future<Output = Result<SparseScan, crate::KVError>> + Send;
 }
 
 /// Deserialize a list of `VectorIndex` entries from raw rkyv bytes and return

@@ -366,8 +366,8 @@ mod tests {
             vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
         );
         let by_prefix = ns.scan_prefixes_batch(&[7, 8])?;
-        assert_eq!(by_prefix.get(&7).map(Vec::len), Some(2));
-        assert!(!by_prefix.contains_key(&9) && by_prefix.get(&8).is_none_or(Vec::is_empty));
+        assert_eq!(by_prefix.iter().filter(|(p, _, _)| *p == 7).count(), 2);
+        assert!(by_prefix.iter().all(|(p, _, _)| p == 7));
         ns.delete_no_wal(&key(7, 1))?;
         assert_eq!(ns.get(&key(7, 1))?, None);
         db.shutdown()?;

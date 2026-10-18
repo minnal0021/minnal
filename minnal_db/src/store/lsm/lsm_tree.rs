@@ -371,49 +371,53 @@ impl<'a> FrameReader<'a> {
 /// Resolve a prefix scan's layers into live `(key, pointer)` pairs in ascending key order.
 ///
 /// `l1` is the oldest layer, in the order its entries were read: bucket by bucket,
-/// each bucket's run key-sorted. `newer` holds every newer layer (L0, read-only and
-/// active memtables) already folded by [`fold_newest`]. The result is what folding
-/// `l1` in order and then `newer` into one map by [`fold_newest`] would yield,
-/// minus tombstones — without paying a map insert per L1 entry:
+/// each bucket's run key-sorted, each key a range of its bucket's buffer in
+/// `l1_keys`. `newer` holds every newer layer (L0, read-only and active memtables)
+/// already folded by [`fold_newest`]. The result is what folding `l1` in order and
+/// then `newer` into one map by [`fold_newest`] would yield, minus tombstones —
+/// without paying a map insert, or an allocation, per L1 entry:
 ///
 /// * a **stable** sort puts equal keys in read order, so keeping the highest seq
 ///   of each run (the later one on a tie) matches the fold (and costs little: the
 ///   input is a handful of pre-sorted runs, which the sort merges);
 /// * a sorted two-way merge then resolves a key present in both by seq, `newer`
 ///   winning a tie.
-fn merge_scan_layers(mut l1: Vec<ScanEntry>, newer: ScanMap) -> Vec<(Vec<u8>, u128)> {
-    l1.sort_by(|a, b| a.0.cmp(&b.0));
+fn merge_scan_layers(l1_keys: &[Vec<u8>], mut l1: Vec<PackedScanEntry>, newer: ScanMap) -> PrefixScanKeys {
+    let key = |e: &PackedScanEntry| &l1_keys[e.0][e.1..e.2];
+    l1.sort_by(|a, b| key(a).cmp(key(b)));
     // `later` is removed when it repeats `kept`'s key; keep whichever is newer.
     l1.dedup_by(|later, kept| {
-        let same = later.0 == kept.0;
-        if same && seq_newer_or_eq(later.2, kept.2) {
-            kept.1 = later.1;
-            kept.2 = later.2;
+        let same = key(later) == key(kept);
+        if same && seq_newer_or_eq(later.4, kept.4) {
+            kept.3 = later.3;
+            kept.4 = later.4;
         }
         same
     });
-    if newer.is_empty() {
-        return l1.into_iter().filter_map(|(key, val, _)| val.map(|v| (key, v))).collect();
-    }
 
-    let mut out = Vec::with_capacity(l1.len() + newer.len());
+    let key_bytes = l1.iter().map(|e| e.2 - e.1).sum::<usize>() + newer.keys().map(Vec::len).sum::<usize>();
+    let mut out = PrefixScanKeys::with_capacity(l1.len() + newer.len(), key_bytes);
     let mut older = l1.into_iter().peekable();
-    for (key, (val, seq)) in newer {
-        while let Some((older_key, older_val, _)) = older.next_if(|(k, _, _)| *k < key) {
-            if let Some(v) = older_val {
-                out.push((older_key, v));
+    for (newer_key, (val, seq)) in newer {
+        while let Some(e) = older.next_if(|e| key(e) < newer_key.as_slice()) {
+            if let Some(v) = e.3 {
+                out.push(key(&e), v);
             }
         }
         // Same key in both: the higher seq wins, `newer` on a tie.
-        let winner = match older.next_if(|(k, _, _)| *k == key) {
-            Some((_, older_val, older_seq)) if seq_newer(older_seq, seq) => older_val,
+        let winner = match older.next_if(|e| key(e) == newer_key.as_slice()) {
+            Some(e) if seq_newer(e.4, seq) => e.3,
             _ => val,
         };
         if let Some(v) = winner {
-            out.push((key, v));
+            out.push(&newer_key, v);
         }
     }
-    out.extend(older.filter_map(|(key, val, _)| val.map(|v| (key, v))));
+    for e in older {
+        if let Some(v) = e.3 {
+            out.push(key(&e), v);
+        }
+    }
     out
 }
 
@@ -505,6 +509,66 @@ type LoadedSstable = (SStableMetadata, Option<BloomFilter>, Option<SparseIndex>,
 /// tombstone, seq)`. Tombstones keep their seq so they can be resolved against
 /// other layers' copies by [`fold_newest`], never by layer order.
 type ScanEntry = (Vec<u8>, Option<u128>, u64);
+
+/// One L1 entry of a prefix scan, its key a range of its bucket's key buffer:
+/// `(buffer, start, end, Some(pointer) | None for a tombstone, seq)`. A large scan
+/// reads tens of thousands of entries; packing their keys saves an allocation
+/// (and a free) each.
+type PackedScanEntry = (usize, usize, usize, Option<u128>, u64);
+
+/// What [`LSMTree::scan_prefixes`] returns: every live key under the requested
+/// prefixes in ascending order, each with its value pointer. The keys are packed
+/// into one buffer rather than one allocation each.
+#[derive(Debug, Default)]
+pub(crate) struct PrefixScanKeys {
+    keys: Vec<u8>,
+    /// Where each key ends in `keys`; key `i` starts where key `i - 1` ends.
+    ends: Vec<usize>,
+    pointers: Vec<u128>,
+}
+
+impl PrefixScanKeys {
+    pub(crate) fn with_capacity(entries: usize, key_bytes: usize) -> Self {
+        Self {
+            keys: Vec::with_capacity(key_bytes),
+            ends: Vec::with_capacity(entries),
+            pointers: Vec::with_capacity(entries),
+        }
+    }
+
+    pub(crate) fn push(&mut self, key: &[u8], pointer: u128) {
+        self.keys.extend_from_slice(key);
+        self.ends.push(self.keys.len());
+        self.pointers.push(pointer);
+    }
+
+    /// The number of keys.
+    pub(crate) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Whether no key matched.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Key `i`.
+    pub(crate) fn key(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        &self.keys[start..self.ends[i]]
+    }
+
+    /// Key `i`'s value pointer.
+    pub(crate) fn pointer(&self, i: usize) -> u128 {
+        self.pointers[i]
+    }
+
+    /// The `(key, pointer)` pairs as owned values, for comparing in tests.
+    #[cfg(test)]
+    pub(crate) fn to_pairs(&self) -> Vec<(Vec<u8>, u128)> {
+        (0..self.len()).map(|i| (self.key(i).to_vec(), self.pointer(i))).collect()
+    }
+}
 
 /// A scan's running view of each key: the newest copy seen so far,
 /// `(Some(pointer) | None for a tombstone, seq)`.
@@ -2989,9 +3053,9 @@ impl LSMTree {
     /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
     /// returned pointers are LSM-complete but must be resolved against the value log
     /// only inside the value-log generation bracket / GC bucket lock.
-    pub(crate) fn scan_prefixes(&self, prefix_ids: &std::collections::HashSet<u32>) -> Result<Vec<(Vec<u8>, u128)>> {
+    pub(crate) fn scan_prefixes(&self, prefix_ids: &std::collections::HashSet<u32>) -> Result<PrefixScanKeys> {
         if prefix_ids.is_empty() {
-            return Ok(vec![]);
+            return Ok(PrefixScanKeys::default());
         }
 
         // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 →
@@ -3002,8 +3066,10 @@ impl LSMTree {
         // `merge_scan_layers`, not inserted into the map: a per-entry BTreeMap insert
         // of an owned key was ~8 ms of a ~10 ms scan over 87k entries, while the
         // parallel L1 reads were ~1 ms. The newer layers (usually small) still merge
-        // through `newer` by `fold_newest`.
-        let mut l1_entries: Vec<ScanEntry> = Vec::new();
+        // through `newer` by `fold_newest`. Each bucket packs its L1 keys into one
+        // buffer (`l1_keys`) instead of allocating one per entry.
+        let mut l1_keys: Vec<Vec<u8>> = Vec::new();
+        let mut l1_entries: Vec<PackedScanEntry> = Vec::new();
         let mut newer = ScanMap::new();
 
         // Memtable layers (newest) captured first, under one `memtable.read()`
@@ -3051,17 +3117,20 @@ impl LSMTree {
                     .enumerate()
                     .filter(|(bucket, _)| self.l1_overlaps(*bucket, &span_start, span_end))
                     .map(|(bucket, file)| {
-                        s.spawn(move || -> Result<Vec<ScanEntry>> {
+                        s.spawn(move || -> Result<(Vec<u8>, Vec<PackedScanEntry>)> {
+                            let mut keys = Vec::new();
                             let mut entries = Vec::new();
                             for &prefix_id in sorted_ids {
                                 let start = prefix_id.to_be_bytes();
                                 let end = prefix_id.checked_add(1).map(u32::to_be_bytes);
                                 self.for_each_l1_entry_in_range(bucket, file, &start, end.as_ref().map(|e| e.as_slice()), None, |archived| {
                                     let val = (!archived.tombstone).then(|| archived.value.to_native());
-                                    entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
+                                    let key_start = keys.len();
+                                    keys.extend_from_slice(archived.key.as_slice());
+                                    entries.push((0, key_start, keys.len(), val, archived.seq.to_native()));
                                 })?;
                             }
-                            Ok(entries)
+                            Ok((keys, entries))
                         })
                     })
                     .collect();
@@ -3070,7 +3139,11 @@ impl LSMTree {
                         .join()
                         .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
                     {
-                        Ok(entries) => l1_entries.extend(entries),
+                        Ok((keys, entries)) => {
+                            let buffer = l1_keys.len();
+                            l1_keys.push(keys);
+                            l1_entries.extend(entries.into_iter().map(|(_, start, end, val, seq)| (buffer, start, end, val, seq)));
+                        }
                         Err(e) => {
                             if first_err.is_none() {
                                 first_err = Some(e);
@@ -3168,7 +3241,7 @@ impl LSMTree {
             fold_newest(&mut newer, key, value, seq);
         }
 
-        Ok(merge_scan_layers(l1_entries, newer))
+        Ok(merge_scan_layers(&l1_keys, l1_entries, newer))
     }
 
     /// Fetch multiple keys in a **single pass per bucket**.
@@ -4408,8 +4481,17 @@ mod tests {
             }
             let expected: Vec<(Vec<u8>, u128)> = reference.into_iter().filter_map(|(k, (v, _))| v.map(|v| (k, v))).collect();
 
+            let l1_keys = vec![l1.iter().flat_map(|(k, _, _)| k.iter().copied()).collect::<Vec<u8>>()];
+            let mut at = 0;
+            let packed: Vec<PackedScanEntry> = l1
+                .iter()
+                .map(|(k, v, seq)| {
+                    at += k.len();
+                    (0, at - k.len(), at, *v, *seq)
+                })
+                .collect();
             assert_eq!(
-                merge_scan_layers(l1.clone(), newer.clone()),
+                merge_scan_layers(&l1_keys, packed, newer.clone()).to_pairs(),
                 expected,
                 "case {case}: l1={l1:?} newer={newer:?}"
             );
@@ -5909,7 +5991,7 @@ mod tests {
                 assert_eq!(lsm.scan_prefix(b"key1")?, with_prefix(b"key1"), "{label}: scan_prefix");
                 let ids: std::collections::HashSet<u32> = [u32::from_be_bytes(*b"key0"), u32::from_be_bytes(*b"key1")].into_iter().collect();
                 let pairs = |v: Vec<(Vec<u8>, u128, u64)>| v.into_iter().map(|(k, p, _)| (k, p)).collect::<Vec<_>>();
-                assert_eq!(lsm.scan_prefixes(&ids)?, pairs(truth.clone()), "{label}: scan_prefixes");
+                assert_eq!(lsm.scan_prefixes(&ids)?.to_pairs(), pairs(truth.clone()), "{label}: scan_prefixes");
                 assert_eq!(lsm.key_pointer_pairs(None)?, pairs(truth.clone()), "{label}: key_pointer_pairs");
                 assert_eq!(
                     lsm.range_pointers_bounded(b"", None, usize::MAX)?,
@@ -6428,7 +6510,7 @@ mod tests {
 
         // Probe three scattered clusters out of 200.
         let ids: std::collections::HashSet<u32> = [3u32, 100, 199].into_iter().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
         assert_eq!(results.len(), (ids.len() as u32 * per) as usize);
         for (k, v) in &results {
             let cid = u32::from_be_bytes(k[..4].try_into().unwrap());
@@ -6478,7 +6560,7 @@ mod tests {
         }
 
         let ids: std::collections::HashSet<u32> = [1, 2].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
 
         // Should return all keys for clusters 1 and 2, not cluster 3
         assert_eq!(results.len(), 4);
@@ -6505,7 +6587,7 @@ mod tests {
         lsm.insert(&u32_prefixed_key(6, 1), 601)?;
 
         let ids: std::collections::HashSet<u32> = [5].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
 
         assert_eq!(results.len(), 3);
         assert!(results.iter().any(|(k, v)| k == &u32_prefixed_key(5, 1) && *v == 501));
@@ -6522,7 +6604,7 @@ mod tests {
         lsm.insert(&u32_prefixed_key(1, 1), 10)?;
 
         let ids: std::collections::HashSet<u32> = [99].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
         assert!(results.is_empty());
         Ok(())
     }
@@ -6657,7 +6739,7 @@ mod tests {
         lsm.delete(&u32_prefixed_key(1, 11))?; // tombstone in active memtable
 
         let ids: std::collections::HashSet<u32> = [1].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
 
         assert_eq!(results.len(), 1, "deleted key must not appear");
         assert!(results.iter().any(|(k, v)| k == &u32_prefixed_key(1, 10) && *v == 100));
@@ -6675,7 +6757,7 @@ mod tests {
         lsm.flush_memtable()?; // tombstone now in ro_memtable
 
         let ids: std::collections::HashSet<u32> = [2].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
         assert!(results.is_empty(), "key deleted in ro_memtable must not appear");
         Ok(())
     }
@@ -6692,7 +6774,7 @@ mod tests {
         lsm.insert(&u32_prefixed_key(3, 5), 999)?; // re-insert in active memtable
 
         let ids: std::collections::HashSet<u32> = [3].iter().copied().collect();
-        let results = lsm.scan_prefixes(&ids)?;
+        let results = lsm.scan_prefixes(&ids)?.to_pairs();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, 999, "re-inserted value must win");

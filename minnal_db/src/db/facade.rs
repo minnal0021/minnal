@@ -932,10 +932,10 @@ impl<'db> Namespace<'db> {
         self.store.get_multiple(keys)
     }
 
-    /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning each
-    /// prefix id's `(key, value)` pairs. Mirrors
+    /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning every
+    /// `(prefix_id, key, value)` in key order. Mirrors
     /// [`AsyncNamespace::scan_prefixes_batch`].
-    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<KeyValue>>> {
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::db::kv_store::PrefixScan> {
         self.store.scan_prefixes_batch(prefix_ids)
     }
 
@@ -2051,10 +2051,11 @@ impl AsyncNamespace {
     /// all value-log entries in exactly `num_buckets` threads —
     /// dramatically cheaper than one `spawn_blocking` per prefix.
     ///
-    /// Returns a map from `prefix_id` to `(raw_key_bytes, value_bytes)` pairs.
-    /// A storage error is returned as such — it used to become an empty map,
-    /// indistinguishable from "no entries under these prefixes".
-    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>> {
+    /// Returns every `(prefix_id, raw_key_bytes, value_bytes)` in key order, packed
+    /// into a few buffers (see [`PrefixScan`](crate::PrefixScan)). A storage error is
+    /// returned as such — it used to become an empty map, indistinguishable from
+    /// "no entries under these prefixes".
+    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::db::kv_store::PrefixScan> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
             .await

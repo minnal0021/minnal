@@ -17,7 +17,7 @@ use minnal_db::semantic_search::{
     ClusterIndex, ProbeSettings,
     cluster::{Cluster, find_closest_cluster_id, find_top_n_cluster_ids},
     index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator},
-    index::vector_index::{ClusterBatchResult, QuantisationStyle, VectorIndex, VectorKvStore},
+    index::vector_index::{ClusterEntries, QuantisationStyle, SparseScan, VectorIndex, VectorKvStore},
     index_embedding_to_cluster,
     service::{SemanticSearchConfig, search},
 };
@@ -331,7 +331,7 @@ fn bench_coarse_assignment(c: &mut Criterion) {
 /// `search()` bench pays realistic Pass-1 (sparse scan + MaxSim) and Pass-2 (dense
 /// re-rank) cost — not the empty-payload cost of the unit-test mock.
 struct BenchKvStore {
-    sparse_data: ClusterBatchResult,
+    sparse_data: HashMap<u32, ClusterEntries>,
     dense_data: HashMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -345,11 +345,10 @@ impl VectorKvStore for BenchKvStore {
     async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, minnal_db::KVError> {
         Ok(doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect())
     }
-    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<ClusterBatchResult, minnal_db::KVError> {
-        Ok(cluster_ids
-            .iter()
-            .filter_map(|id| self.sparse_data.get(id).map(|e| (*id, e.clone())))
-            .collect())
+    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, minnal_db::KVError> {
+        Ok(SparseScan::from_clusters(
+            cluster_ids.iter().filter_map(|id| self.sparse_data.get(id).map(|e| (*id, e))),
+        ))
     }
 }
 
@@ -370,7 +369,7 @@ fn build_bench_store(cluster_map: &HashMap<u32, Cluster>, n_docs: usize, chunks_
         (s as i64 as f32) / (i64::MAX as f32)
     };
 
-    let mut sparse_data: ClusterBatchResult = HashMap::new();
+    let mut sparse_data: HashMap<u32, ClusterEntries> = HashMap::new();
     let mut dense_data: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     for d in 0..n_docs {
         let doc_id = (d as u64).to_be_bytes().to_vec();

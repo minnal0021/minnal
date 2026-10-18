@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorKvStore};
+use crate::semantic_search::index::vector_index::{QuantisationStyle, SparseScan, VectorKvStore};
 use crate::semantic_search::{PostingDelta, VectorIndex, composite_key};
 use crate::{AsyncDb, AsyncNamespace};
 
@@ -792,25 +792,8 @@ impl VectorKvStore for DbVectorStore {
         self.dense_ns.get_multiple(doc_ids.to_vec()).await
     }
 
-    async fn scan_sparse_clusters_batch(
-        &self,
-        cluster_ids: &[u32],
-    ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
-        let raw = self.sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await?;
-        // Decode composite keys: strip the 4-byte cluster_id prefix, keep only doc_id.
-        Ok(raw
-            .into_iter()
-            .map(|(cluster_id, entries)| {
-                let decoded = entries
-                    .into_iter()
-                    .filter_map(|(key, value)| {
-                        let (_, doc_id_bytes) = composite_key::decode(&key)?;
-                        Some((doc_id_bytes.to_vec(), value))
-                    })
-                    .collect();
-                (cluster_id, decoded)
-            })
-            .collect())
+    async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
+        Ok(SparseScan::new(self.sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await?))
     }
 }
 
@@ -3475,13 +3458,7 @@ mod real_kv_profile {
             // Refuse to profile an empty index: a silent no-op upsert once made this
             // harness report microsecond "searches" over nothing.
             let all_clusters: Vec<u32> = cluster_map.keys().copied().collect();
-            let stored: usize = store
-                .scan_sparse_clusters_batch(&all_clusters)
-                .await
-                .unwrap()
-                .values()
-                .map(Vec::len)
-                .sum();
+            let stored: usize = store.scan_sparse_clusters_batch(&all_clusters).await.unwrap().len();
             assert!(stored > 0, "profile store is empty — upsert_vectors wrote nothing");
 
             // Pass-2 fetch set is n_probes-independent: first_pass top_k doc ids (bounded by N_DOCS).
@@ -3544,7 +3521,7 @@ mod real_kv_profile {
                     let t = Instant::now();
                     let scanned = store.scan_sparse_clusters_batch(&pc).await.unwrap();
                     scan.push(t.elapsed().as_nanos() as f64 / 1e3);
-                    scanned_entries = scanned.values().map(|v| v.len()).sum();
+                    scanned_entries = scanned.len();
 
                     let t = Instant::now();
                     let _ = store.get_dense_entries_batch(&dense_ids).await.unwrap();
