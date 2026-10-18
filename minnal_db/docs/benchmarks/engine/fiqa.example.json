@@ -1,0 +1,21 @@
+{
+  "server_toml": "../work/bench/m5/server-base.toml",
+  "snapshot": "../work/bench/m5/base",
+  "data": "../work/bench/m5/data",
+  "table": "../work/bench/engine/embed-replay.table",
+  "out": "../work/bench/results/engine/fiqa",
+  "namespace": "fiqa",
+  "mix": {"get": 25, "insert": 6.5, "update": 10, "delete": 6.5, "scan": 5, "field_query": 15, "search": 25, "filtered_search": 7},
+  "trickle_rate": 10,
+  "trickle_mix": {"insert": 2, "update": 4, "delete": 2},
+  "repeats": 3,
+  "single_s": 120,
+  "concurrent_s": 180,
+  "clients": [1, 4, 6, 8, 16],
+  "soak_s": 3600,
+  "soak_clients": 4,
+  "warm_s": 15,
+  "drain_max_s": 1200,
+  "min_samples": 50,
+  "lag_every": 20
+}

@@ -1,4 +1,4 @@
-"""M5 data: FiQA (57,638 documents, gemma) with three synthetic indexed fields,
+"""Engine benchmark data (minnal_db/benches/engine_bench): FiQA (57,638 documents, gemma) with three synthetic indexed fields,
 split so that quality under load stays comparable with quality at rest.
 
   base.jsonl    40,000 documents loaded and indexed before a run. Every document
@@ -12,6 +12,9 @@ Fields, seeded per document id: category c0..c11 (Zipf s = 1.1), year
 2010-2025 (uniform), score 0-1000 (uniform).
 
     python3 prepare.py [OUT_DIR]   (default work/bench/m5/data)
+
+The starting database is base.jsonl loaded into a store created from
+schema.json (gemma, three indexed fields), with the vector queue drained.
 """
 import json, os, random, sys
 

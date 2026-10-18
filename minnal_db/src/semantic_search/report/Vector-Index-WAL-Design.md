@@ -427,8 +427,8 @@ per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
 
 ### 9b. Measured: the quick M5 check
 
-**Setup.** The M5 harness (`minnal_db/docs/benchmarks/m5/run_m5.py balanced
---quick`) on the settled FiQA snapshot (40,000 documents embedded with gemma),
+**Setup.** The M5 REST harness (`minnal_db/docs/benchmarks/m5/run_m5.py balanced
+--quick`, at commit `d7434ce`) on the settled FiQA snapshot (40,000 documents embedded with gemma),
 balanced mix, 1-minute steps from 50 req/s ×1.5 with two bisections, a 2-minute
 soak at the highest passing rate, closed-loop 1/4/16 clients, and a cold-query
 step (30% cache misses). **Before**: the build with the vector worker's flush

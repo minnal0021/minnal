@@ -2,8 +2,11 @@
 
 How fast the `minnal_db` engine is at the things an application does with it:
 writing, reading, scanning, querying a field index, and running a semantic
-search. Every number is a single-threaded latency measured on one machine
-(below), so read the absolute values as specific to that machine. The
+search. Every number up to the last section is a single-threaded latency on an
+otherwise idle engine; [The engine at work](#the-engine-at-work) measures the
+same operations while the engine's background work runs, alone and with up to
+16 concurrent clients. All of it is measured on one machine (below), so read
+the absolute values as specific to that machine. The
 comparisons — memory against disk, small values against large ones — carry over
 to other hardware much better than the raw microseconds do.
 
@@ -370,3 +373,173 @@ How these numbers relate to a real query:
 The steps inside a search are small by comparison. Choosing the 64 nearest of
 256 clusters takes about 9 µs. Scoring 1,000 candidates takes 16 µs in Pass 1
 and 16 µs in Pass 2, so the more precise pass costs no more per candidate.
+
+---
+
+## The engine at work
+
+The sections above measure one operation at a time with the background workers
+switched off, which isolates each operation's own cost. A running database is
+never like that: memtables are flushing, compaction is merging, garbage
+collection is reclaiming space, field indexes are being checkpointed, new
+documents are being embedded and indexed, and the vector partition is being
+split and merged. This benchmark measures what each operation costs **while all
+of that is happening**, first one operation at a time and then with several
+clients at once, with nothing outside the engine involved.
+
+It is `minnal_db/benches/engine_bench` (not Criterion), reported by
+`docs/benchmarks/engine/report.py`.
+
+### How it runs
+
+- **The engine, in process.** The document store is opened inside the
+  benchmark's own process, from the same configuration file the API server
+  uses, and every operation calls the library directly: the same calls the REST
+  handlers make (`get`, `put`, `delete`, `scan_range`, `query_resolved`,
+  `search_semantic`, `search_semantic_filtered`). There is no HTTP, no JSON
+  encoding of replies and no network.
+- **Every background worker runs**: memtable flushes, LSM compaction, value-log
+  GC, WAL GC, the vector index WAL's GC, field-index checkpoints (every
+  1.75 s), the vector-index worker (4 documents at a time) and partition
+  maintenance (2 threads).
+- **No external call: embeddings are replayed.** A document store with semantic
+  search sends every new or changed document's text to an embedding service
+  (a separate process; here, models on a GPU). That service's speed depends on
+  its own batching and hardware, not on minnal, so it is left out. Instead, a
+  small embedding server inside the benchmark process answers from a **replay
+  table**: every embedding the run can ask for, recorded once from the real
+  service. The engine's embedding client talks to it over localhost exactly as
+  it would to the service, and then does all its own work with each embedding:
+  chunking, quantisation, writing to the vector index WAL, routing chunks to
+  partitions, splitting and merging.
+- **How the table is recorded** (`engine_bench record`). A scratch copy of the
+  starting database is opened with the embedding server in record mode in
+  front of the real service, and the engine is made to embed every text the run
+  can send: each test query once, every document it may rewrite (with its own
+  text, and with the text an update produces), every document in the ingestion
+  stream, and every text an insert past the end of the stream produces. The
+  engine itself turns each text into what it sends (the whole text plus
+  overlapping sentence windows), so the table holds exactly the requests a run
+  makes. At the end, a sample of the table is read back through the embedding
+  server and compared with what was recorded, bit for bit.
+- **The set of texts is finite**, so that the table can cover it: an update
+  that changes text appends one fixed sentence (`" Revised."`), and inserts
+  past the end of the stream reuse its texts with one fixed suffix
+  (`" (copy)"`). The engine embeds and indexes each one regardless. A request
+  missing from the table fails, is counted, and makes the measurement invalid.
+- **The store keeps its size.** Inserts and deletes are equally likely, and
+  deletes take the oldest documents first, so a long measurement does not grow
+  the store and no text is in it twice. A single-operation measurement of
+  inserts or deletes still moves it by thousands, so before each measurement
+  unmeasured writes bring it back to the 40,000 documents it started with.
+  Otherwise a long run grows the store several times over, mostly with
+  repeated texts, and search quality falls for a reason that has nothing to do
+  with the engine: one non-relevant text takes several of the top places at
+  once.
+- **Searches use cached query embeddings.** Every test query is embedded once
+  before measuring starts, so a search's latency is the search, not a call to
+  the embedding service.
+- **A search's latency is the search alone**: the ranked ids and scores of the
+  top 100. The REST route then reads each result's document, which is not
+  included.
+
+### The workload
+
+The data is FiQA, a financial question-answering set: 40,000 documents loaded
+and indexed before the run, a stream of 17,638 more to insert, and 648 test
+queries with relevance judgements. Each document carries three synthetic fields
+for field queries and filters: `category` (12 values, skewed), `year`
+(2010–2025) and `score` (0–1000), all indexed.
+
+| Operation | What it does |
+|---|---|
+| `get` | Read one document; ids drawn from a skewed (Zipf) distribution, so a hot set exists |
+| `insert` | Write a new document from the stream |
+| `update` | Rewrite a document: half change only `score`, half change its text |
+| `delete` | Delete a document |
+| `scan` | Read one page of 50 documents from a random starting id |
+| `field_query` | 1–3 conditions over `category`, `year`, `score`; first page of 20 |
+| `search` | Semantic search for a test query, top 100 |
+| `filtered_search` | The same, restricted to `score < S` (5–50% of documents) |
+
+Every write is durable when it returns (its WAL fsync), and is embedded and
+indexed afterwards by the vector-index worker.
+
+### What is measured
+
+1. **One operation at a time.** One client sends one kind of operation back to
+   back for 2 minutes, while a steady trickle of 10 writes per second (inserts,
+   updates and deletes) keeps indexing, flushing and maintenance busy. Reported
+   per operation: p50, p75, p90, p95, p99, p99.9 and maximum latency.
+2. **Concurrent clients.** 1, 4, 6, 8 and 16 clients, each sending its next
+   operation as soon as the previous one returns (a *closed loop*), for
+   3 minutes each, drawing from one mix: `get` 25%, `search` 25%,
+   `field_query` 15%, `update` 10%, `filtered_search` 7%, `insert` 6.5%,
+   `delete` 6.5%, `scan` 5%. Reported: operations per second, and the same
+   percentiles per operation. Nothing is extrapolated beyond 16 clients:
+   throughput stops growing wherever a shared resource saturates (writes, for
+   example, fsync one at a time), so a line through the measured points does
+   not predict higher ones. In a closed loop a client never has more than one
+   request outstanding, so latency here is the operation's own time with that
+   many in flight, not including time a request would wait to be sent.
+3. **Soak.** 4 clients for 60 minutes, sampled every 10 seconds, to show
+   whether anything grows without bound: disk use, memory, the indexing
+   backlog. Four clients is the highest load at which indexing keeps up with
+   the writes; above it the backlog grows for as long as the load lasts, which
+   the 3-minute concurrent measurements already show.
+4. **Search quality** (nDCG at 10, 20, 30, 40, 50 and 100, and recall at 100):
+   before the run, under load, and at rest after it, to show that the
+   background work does not cost search quality.
+
+Each measurement (a *cell*) also records the background work done during it
+(flushes, compactions, garbage collection, checkpoints, splits and merges) and
+the **ingestion lag**: how long after a write is acknowledged its document
+becomes searchable.
+
+### How a number is made trustworthy
+
+- **Every cell is checked before the next starts.** It waits for the indexing
+  backlog to drain, runs 15 seconds unmeasured, measures, and waits for the
+  backlog to drain again. It is valid only if no operation failed, no
+  embedding was missing from the replay table, every measured operation ran at
+  least 50 times, and, if documents were written, the vector-index worker
+  indexed them and a field-index checkpoint advanced. An invalid cell is saved
+  with its reasons and **stops the run**, so a problem costs one cell, not
+  hours. The run resumes at that cell once the cause is fixed.
+- **Every cell runs three times**: all cells once, then all again, then a third
+  time, so drift over the run shows up as a difference between repeats. Tables
+  give the median of the three with the lowest and highest beside it.
+- **Results are saved as each cell finishes** (`cells/<cell>.json`, plus a
+  per-second timeline and the search results), with a manifest of what is
+  done, so an interrupted run loses nothing.
+- **A smoke run first.** `--smoke` runs every cell for a few seconds and
+  produces the full report, to check the whole harness before a run of several
+  hours.
+
+### What it does not measure
+
+The REST layer (HTTP, JSON, the per-result document reads of a search), the
+embedding service, query-embedding cache misses, other datasets, and other
+machines. The clients run in the same process and on the same cores as the
+engine; they do almost no work of their own. The whole run uses one engine, so
+later cells run on a store that has grown and been maintained by the earlier
+ones.
+
+### Reproducing it
+
+```sh
+# Once: record the replay table (needs the embedding service on :8001).
+cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- \
+    record CONFIG.json --upstream http://127.0.0.1:8001
+
+# Check the harness end to end (a few minutes), then the real run (several hours).
+cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- run CONFIG.json --smoke
+cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- run CONFIG.json
+python3 minnal_db/docs/benchmarks/engine/report.py OUT_DIR
+```
+
+`CONFIG.json` names the server configuration, the starting database, the data,
+the replay table and the output directory, and sets the mix, durations and
+repeats; `docs/benchmarks/engine/fiqa.example.json` is the configuration used
+here (relative paths resolve from `minnal_db/`, where `cargo bench` runs). `cargo bench` without a command skips this benchmark, so the Criterion
+report above does not run it.
