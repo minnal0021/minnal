@@ -545,21 +545,20 @@ store.shutdown().await?; // stops the embed-worker cleanly
 ## 7. Choosing a memory allocator
 
 **Use jemalloc in the program that embeds `minnal_db`.** Every request
-allocates and frees many short-lived buffers, and a semantic search frees tens
-of thousands at once. The system allocator on Linux, glibc `malloc`, holds on
-to freed memory and spends more CPU per allocation. Under 16 concurrent clients,
-measured in the engine benchmark, switching the same binary to jemalloc gave:
+allocates and frees short-lived buffers, from many threads at once. The system
+allocator on Linux, glibc `malloc`, holds on to much of what it frees, and the
+same work ran slower with it. Under 16 concurrent clients, measured in the
+engine benchmark, switching the same binary to jemalloc gave:
 
 | | glibc `malloc` | jemalloc |
 |---|---:|---:|
-| Operations per second | 388–391 | 431 |
-| Semantic search, median / p99 | 51–53 / 113–119 ms | 30 / 77 ms |
-| CPU time spent in the allocator | 14–16% | 5% |
-| Resident memory after the load | 6.3–6.4 GiB | 1.3 GiB |
+| Operations per second | 412 | 444 |
+| Semantic search, median / p99 | 33 / 91 ms | 23 / 61 ms |
+| Resident memory after the load | 5.2 GiB | 1.3 GiB |
+| Highest resident memory over the whole run | 5.7 GiB | 2.7 GiB |
 
-Search quality was unchanged. Writes waited about 10% longer at the median,
-because faster reads put more writes in the fsync queue at once. The full
-comparison, including mimalloc and glibc's tuning options, is in
+Search quality and write latency were unchanged. The full comparison,
+including glibc's tuning options, is in
 [benchmark.md → Choosing the memory allocator](benchmark.md#choosing-the-memory-allocator).
 The `minnal_db_api` server already uses jemalloc.
 

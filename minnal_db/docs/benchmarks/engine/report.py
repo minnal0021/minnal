@@ -138,8 +138,9 @@ w(f"- **Every cell**: waits for the vector queue to drain (up to {cfg['drain_max
   f"failed operation, no replay miss, at least {cfg['min_samples']} operations per measured class, the queue drained, "
   "and if documents were written, the vector worker indexed and a field-index checkpoint advanced. An invalid cell "
   "stops the run.")
-w(f"- **Repeats**: each cell runs {cfg['repeats']} times (all cells once, then again); tables give the median of the "
-  "repeats with the lowest and highest beside it.")
+w("- **Repeats**: each cell runs once." if cfg['repeats'] == 1 else
+  f"- **Repeats**: each cell runs {cfg['repeats']} times (all cells once, then all again); tables give the median of "
+  "the repeats with the lowest and highest beside it.")
 w(f"- **Data**: FiQA; {d['base']:,} base documents loaded and indexed in the snapshot ({d['stable']:,} never deleted), "
   f"an ingestion stream of {d['stream']:,}, {d['queries']} test queries. One dataset, synthetic `category`/`year`/`score` "
   "fields, one host.")

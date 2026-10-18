@@ -18,14 +18,15 @@ to other hardware much better than the raw microseconds do.
 | Reading one key from memory | 0.3–0.6 µs | [Reads](#reads) |
 | Reading one key from disk | 3.3–3.5 µs, barely growing with store size | [Reads](#reads) |
 | Scanning 1,000 keys with their values | 0.3–0.5 ms | [Scans](#scans) |
-| A field-index equality query over 100,000 rows | 0.5–2.4 µs | [Field-index queries](#field-index-queries) |
-| A field-index range query over 100,000 rows | 61–144 µs | [Field-index queries](#field-index-queries) |
-| A semantic search over 5,000 documents | 1.3–3.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
-| jemalloc instead of glibc `malloc`, 16 clients | 10% more operations, searches 42% faster, a fifth of the resident memory | [Choosing the memory allocator](#choosing-the-memory-allocator) |
+| A field-index equality query over 100,000 rows | 0.4–2.0 µs | [Field-index queries](#field-index-queries) |
+| A field-index range query over 100,000 rows | 61–139 µs | [Field-index queries](#field-index-queries) |
+| A semantic search over 5,000 documents | 2.0–5.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
+| The whole engine under load, 1 to 16 clients | 129 to 460 operations per second; searches 15 to 24 ms at the median | [Latency by number of clients](#latency-by-number-of-clients) |
+| jemalloc instead of glibc `malloc`, 16 clients | 8% more operations, searches 28% faster at the median, a quarter of the resident memory | [Choosing the memory allocator](#choosing-the-memory-allocator) |
 
 The one number that shapes everything else: **a write costs 2.3 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
-itself, without the fsync, takes 0.7 µs. That is a deliberate choice — a write that
+itself, without the fsync, takes 0.55 µs. That is a deliberate choice — a write that
 returns has survived a power cut — and it caps the database at about 440 writes
 per second on this drive. Adding writer threads does not raise that ceiling,
 because writes fsync one at a time.
@@ -56,8 +57,8 @@ because writes fsync one at a time.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-38 |
 | Rust | 1.96.0 |
-| Code | commit `0aeca7c` |
-| Date | 2026-10-08 |
+| Code | commit `1007dbd` |
+| Date | 2026-10-18 |
 
 To reproduce everything, including the charts:
 
@@ -91,36 +92,36 @@ value size hardly matters:
 
 ![Durable write latency by value size](docs/benchmarks/write.png)
 
-A 64 KiB value is 512 times the data of a 128-byte one and costs 3.2% more
-(2.354 ms against 2.282 ms).
+A 64 KiB value is 512 times the data of a 128-byte one and costs 3.6% more
+(2.382 ms against 2.299 ms).
 
 The chart below shows what the fsync costs on its own. It times a single WAL
 append with and without the sync. Synced, an append takes 2.3 ms. Without the
-sync it takes 0.75 µs — the fsync is about 3,000 times everything else the
-append does. Only in the unsynced case does value size show up at all: 0.75 µs
-at 128 bytes, 1.3 µs at 4 KiB, 8.5 µs at 64 KiB. Both cases append to a WAL
+sync it takes 0.55 µs — the fsync is about 4,000 times everything else the
+append does. Only in the unsynced case does value size show up at all: 0.55 µs
+at 128 bytes, 1.4 µs at 4 KiB, 9.9 µs at 64 KiB. Both cases append to a WAL
 file that already exists, as production does; creating the file is not timed.
 
 ![A WAL append with and without the fsync](docs/benchmarks/wal_fsync.png)
 
-*Log scale: the synced bars are 270 to 3,000 times taller than the unsynced
+*Log scale: the synced bars are 240 to 4,200 times taller than the unsynced
 ones. Production writes always sync; the unsynced case exists only to measure
 the rest of the path.*
 
 Other write-path measurements:
 
-- **The full `put`** (WAL, value log and memtable together) measures 2.273 ms.
+- **The full `put`** (WAL, value log and memtable together) measures 2.299 ms.
   That is within noise of the WAL append alone, so the value-log write and
   memtable insert are too small to see next to the fsync.
 - **Namespaces cost nothing.** Writing to the default namespace and to a named
-  one measure 2.26 and 2.31 ms, within noise.
+  one measure 2.28 and 2.29 ms, within noise.
 - **Mixed read/write workloads cost the same as pure writes.** With 80% or 50%
-  reads, from memory or from disk, every case lands between 2.27 and 2.34 ms per
+  reads, from memory or from disk, every case lands between 2.26 and 2.31 ms per
   operation. A read costs a few microseconds against a write's 2.3 ms, so the
   writes set the average.
-- **Encoding a WAL entry** takes 43 ns (128 B) to 1.1 µs (64 KiB), and decoding
-  it 15 ns to 0.54 µs.
-- **Replaying the WAL after a crash** reads about 3.5 million small entries per
+- **Encoding a WAL entry** takes 46 ns (128 B) to 1.1 µs (64 KiB), and decoding
+  it 14 ns to 0.54 µs.
+- **Replaying the WAL after a crash** reads about 3.4 million small entries per
   second (1,000 entries of 128 bytes in 0.29 ms), and 2.6 million per second at
   4 KiB.
 
@@ -135,26 +136,27 @@ write latency:
 
 | Extra work `merge` does | Mean |
 |---|---:|
-| Reading the current value (a 2 KiB `get` from memory) | 440 ns |
+| Reading the current value (a 2 KiB `get` from memory) | 437 ns |
 | Taking the per-key lock (hash plus uncontended lock) | 51 ns |
-| The closure: increment a counter | 9.8 ns |
-| The closure: insert into a 2 KiB sorted set | 174 ns |
+| The closure: increment a counter | 10 ns |
+| The closure: insert into a 2 KiB sorted set | 180 ns |
 
 That adds up to 0.5–0.7 µs, about 0.03% of the fsync. The full operations,
 measured directly, cannot tell merge and put apart:
 
 | Operation | Mean |
 |---|---:|
-| `put`, 2 KiB | 2.285 ms |
-| `delete`, 2 KiB | 2.274 ms |
-| `get` then `put` by hand, 2 KiB sorted set (no atomicity) | 2.297 ms |
-| `merge`, 2 KiB sorted set | 2.284 ms |
-| `put`, 8 B | 2.276 ms |
-| `merge`, 8 B counter | 2.263 ms |
+| `put`, 2 KiB | 2.311 ms |
+| `delete`, 2 KiB | 2.368 ms |
+| `get` then `put` by hand, 2 KiB sorted set (no atomicity) | 2.298 ms |
+| `merge`, 2 KiB sorted set | 2.332 ms |
+| `put`, 8 B | 2.294 ms |
+| `merge`, 8 B counter | 2.302 ms |
 
-In this table `merge` measures slightly *faster* than `put`, which cannot be
-real: a merge is a put plus extra work. That tells you the 1.5% spread between
-these rows is noise, and it is why the extra work is timed separately above.
+The rows differ by up to 3% (about 70 µs), a hundred times the extra work
+`merge` does. So that spread is the drive's fsync time varying from run to
+run, not a cost of `merge`, and it is why the extra work is timed separately
+above.
 The practical conclusion: the atomicity of `merge` is free. It stays as cheap as
 a `put` unless your closure does something expensive.
 
@@ -180,50 +182,50 @@ disk.
 
 ![Reading a key that exists, as the store grows](docs/benchmarks/lookup_hits.png)
 
-A read from disk barely slows as the store grows: 3.28 µs at 1,000 keys and
-3.48 µs at 100,000, 6% more for 100 times the keys. The on-disk lookup
+A read from disk barely slows as the store grows: 3.27 µs at 1,000 keys and
+3.51 µs at 100,000, 7% more for 100 times the keys. The on-disk lookup
 first rules files out by key range and bloom filter, then searches only a small
 bounded section of the file, so its work does not grow with file size. A read
-from memory rises 64% over the same range (0.38 to 0.61 µs), because the
+from memory rises 61% over the same range (0.36 to 0.58 µs), because the
 in-memory table is a skip list whose search deepens as it grows. Memory is
 still 6–9 times faster.
 
-The alternating workload costs 7–12% more than the average of the two tiers
+The alternating workload costs 4–11% more than the average of the two tiers
 would predict, with no clear trend as the store grows. We have not measured why.
 The two tiers use different code paths, and switching between them on every call
 may cost cache locality.
 
 ![Reading a key that does not exist, as the store grows](docs/benchmarks/lookup_misses.png)
 
-For a missing key the order flips: **disk is 2.3 to 3.1 times faster than
+For a missing key the order flips: **disk is 2.5 to 3.2 times faster than
 memory**. On disk, a bloom filter usually proves a key is absent without reading
 anything else, so a miss stays at about 0.2 µs at any store size. The in-memory
 table has no such filter. To prove a key is absent it walks the skip list just as
 far as it would to find one. So an in-memory miss costs about what an in-memory
-hit does, and grows the same way (0.50 to 0.70 µs).
+hit does, and grows the same way (0.50 to 0.69 µs).
 
 ## Scans
 
 Four ways to read many keys at once, each measured in memory and on disk. On
-disk, a scan costs 1.1 to 1.6 times the in-memory scan. The ratio shrinks as
+disk, a scan costs 1.1 to 1.7 times the in-memory scan. The ratio shrinks as
 the result grows, because most of the on-disk extra is a fixed setup cost per
 scan.
 
 ![Prefix scan by number of matching keys](docs/benchmarks/scan_prefix.png)
 
 *Prefix scan: all keys starting with a given prefix, returned with their
-values. On disk costs 1.55x memory at 100 keys and 1.19x at 5,000. Keys are 128
-bytes here; 32-byte keys measure within 7% of these.*
+values. On disk costs 1.69x memory at 100 keys and 1.11x at 5,000. Keys are 128
+bytes here; 32-byte keys measure within 5% of these.*
 
 ![Range scan by number of results](docs/benchmarks/scan_range.png)
 
 *Range scan: all keys between a start and end key, from a store of 2,000. On
-disk costs 1.61x memory at 100 results and 1.29x at 1,000.*
+disk costs 1.61x memory at 100 results and 1.30x at 1,000.*
 
 ![Reading all keys with their values](docs/benchmarks/scan_iter.png)
 
-*Reading all 2,000 keys with their values. On disk costs 1.30x memory with
-128-byte values and 1.10x with 4 KiB values. The larger the values, the more of
+*Reading all 2,000 keys with their values. On disk costs 1.35x memory with
+128-byte values and 1.08x with 4 KiB values. The larger the values, the more of
 the time goes into reading them from the value log. That cost is the same on
 both tiers.*
 
@@ -233,7 +235,7 @@ both tiers.*
 256-byte values. This is how the REST API's list endpoints read.*
 
 Cursor pagination is the one scan where the tiers swap. At 100 keys per page,
-disk (75 µs) is almost twice as fast as memory (144 µs). At 500 per page they are close (268 µs on disk, 251 µs in memory), and at
+disk (75 µs) is almost twice as fast as memory (144 µs). At 500 per page they are close (265 µs on disk, 250 µs in memory), and at
 1,000 (the whole store) disk is slower, as expected. We have not established why
 small pages favour disk.
 
@@ -251,32 +253,33 @@ it adds nothing measurable:
 
 | Operation | Raw bytes | Typed |
 |---|---:|---:|
-| `put`, 128 B | 2.282 ms | 2.283 ms |
-| `put`, 4 KiB | 2.283 ms | 2.312 ms |
-| `get` from memory, 128 B | 0.40 µs | 0.34 µs |
-| `get` from disk, 128 B | 3.31 µs | 3.20 µs |
-| `get` from disk, 4 KiB | 3.47 µs | 3.49 µs |
+| `put`, 128 B | 2.299 ms | 2.300 ms |
+| `put`, 4 KiB | 2.308 ms | 2.302 ms |
+| `get` from memory, 128 B | 0.39 µs | 0.35 µs |
+| `get` from disk, 128 B | 3.30 µs | 3.21 µs |
+| `get` from disk, 4 KiB | 3.48 µs | 3.43 µs |
 
 The differences between the two columns, in either direction, are within the
 noise.
 
-Scans cost more typed, because every returned pair is deserialised:
+Prefix scans cost more typed, because every returned pair is deserialised.
+Range scans differ by 5% or less either way, within the noise:
 
 | Scan | Raw bytes | Typed | Extra |
 |---|---:|---:|---:|
-| range, 100 results, in memory | 53 µs | 57 µs | +8% |
-| range, 1,000 results, in memory | 357 µs | 383 µs | +7% |
-| range, 100 results, on disk | 86 µs | 88 µs | +2% |
-| range, 1,000 results, on disk | 459 µs | 469 µs | +2% |
-| prefix, 100 keys, in memory | 49 µs | 57 µs | +15% |
-| prefix, 1,000 keys, in memory | 292 µs | 365 µs | +25% |
-| prefix, 100 keys, on disk | 76 µs | 86 µs | +13% |
-| prefix, 1,000 keys, on disk | 384 µs | 462 µs | +21% |
+| range, 100 results, in memory | 53 µs | 56 µs | +5% |
+| range, 1,000 results, in memory | 362 µs | 365 µs | +1% |
+| range, 100 results, on disk | 86 µs | 89 µs | +4% |
+| range, 1,000 results, on disk | 471 µs | 462 µs | −2% |
+| prefix, 100 keys, in memory | 50 µs | 56 µs | +13% |
+| prefix, 1,000 keys, in memory | 304 µs | 378 µs | +25% |
+| prefix, 100 keys, on disk | 83 µs | 86 µs | +3% |
+| prefix, 1,000 keys, on disk | 401 µs | 460 µs | +15% |
 
 One typed operation is slow for a structural reason. `keys_typed`, which lists
-keys without values, takes about 260 µs even for 100 keys, in memory or on disk.
-That is about four and a half times as long as reading the same 100 keys *with*
-their values (56 µs). Key listing goes through the same full-store merge that value-log
+keys without values, takes about 270 µs even for 100 keys, in memory or on disk.
+That is nearly five times as long as reading the same 100 keys *with*
+their values from memory (58 µs). Key listing goes through the same full-store merge that value-log
 garbage collection uses. Reading with values uses the faster range scan. Until
 that changes, a range or prefix scan is the cheaper way to list keys.
 
@@ -303,21 +306,21 @@ until the next index checkpoint, every 1.75 seconds by default.
 The cost depends on **how many bitmaps the query has to load**, not on how many
 rows it matches:
 
-- **An equality test loads one bitmap.** `status = 'active'` takes 0.54 µs.
-  Combining two equality tests with AND or OR takes 2.3–2.4 µs.
+- **An equality test loads one bitmap.** `status = 'active'` takes 0.37 µs.
+  Combining two equality tests with AND or OR takes 2.0 µs.
 - **A range loads one bitmap per distinct value in the range.** `age >= 50` covers
   31 ages, so it merges 31 bitmaps. `age >= 30 AND age <= 50` is evaluated as
   two ranges, one over 51 values and one over 33, and then intersected. At
-  144 µs it is the most expensive query here, about 270 times an equality test.
+  139 µs it is the most expensive query here, about 370 times an equality test.
 
 So adding a range to a query makes it slower even when it narrows the result:
-`status = 'active' AND active = true` matches 12% of rows in 2.3 µs, and adding
+`status = 'active' AND active = true` matches 12% of rows in 2.0 µs, and adding
 `AND age >= 50` halves that to 6% but takes 61 µs. For a field queried by
 range, fewer distinct values (bucketing ages into decades, say) make the query
 cheaper.
 
-Parsing the query text is negligible. A three-condition query takes 87 µs
-parsed from text and 85 µs pre-parsed.
+Parsing the query text is negligible. A three-condition query takes 83 µs
+parsed from text and 84 µs pre-parsed: the difference is noise.
 
 ## Paging through query results
 
@@ -331,17 +334,17 @@ result of 200,000:
 
 | Page starts at row | Stepping through rows | Skipping containers (used) |
 |---|---:|---:|
-| 0 | 69 µs | 0.32 µs |
-| 1,000 | 67 µs | 0.67 µs |
-| 50,000 | 71 µs | 17.9 µs |
-| 199,000 | 217 µs | 0.24 µs |
+| 0 | 79 µs | 0.32 µs |
+| 1,000 | 79 µs | 0.67 µs |
+| 50,000 | 82 µs | 17.7 µs |
+| 199,000 | 249 µs | 0.24 µs |
 
 Container skipping still steps through the rows *inside* the container where the
 page starts. Row 50,000 is 50,000 rows into its container, which is why that page
 costs more than the others.
 
 Paging through a whole 20,000-row result, 200 rows at a time (100 pages), takes
-0.45 ms with container skipping and 2.18 ms by stepping through rows, which
+0.46 ms with container skipping and 2.52 ms by stepping through rows, which
 starts again from the first row on every page.
 
 ## Semantic search
@@ -351,15 +354,19 @@ query and scores every document chunk stored in them with compact 1-bit
 vectors. Pass 2 re-scores the best candidates with more precise vectors. (See
 [Semantic-Search-Architecture.md](src/semantic_search/report/Semantic-Search-Architecture.md).)
 This benchmark runs the full search over an in-memory store of 5,000
-documents. It uses the project's bundled 256 cluster centroids, synthetic
-768-dimension vectors, the default settings (64 clusters probed), and a query
-shaped like production's: one vector for the whole query.
+documents with synthetic 768-dimension vectors, and a query shaped like
+production's: one vector for the whole query. The store is partitioned into 64
+clusters, their centres fitted by k-means on synthetic documents, and every
+search probes all 64. That is what production does with a store this small:
+Pass 1 keeps probing the nearest clusters until they hold 70,000 entries in
+all (the default budget; an entry is one document's chunks in one cluster), and
+5,000 documents hold fewer than that.
 
 ![Semantic search latency by chunks per document](docs/benchmarks/semantic_search.png)
 
 A document is split into overlapping chunks, and Pass 1 scores every chunk in
-the clusters it probes. So search time grows with chunks per document: 1.3 ms
-with one chunk, 2.0 ms with four, 3.8 ms with eight. Pass 2 re-scores a fixed
+the clusters it probes. So search time grows with chunks per document: 2.0 ms
+with one chunk, 4.0 ms with four, 5.8 ms with eight. Pass 2 re-scores a fixed
 number of candidates, so its cost does not grow.
 
 How these numbers relate to a real query:
@@ -369,15 +376,19 @@ How these numbers relate to a real query:
   everything measured here. Repeated queries are served from a cache.
 - **Multi-vector queries cost more.** `search()` also accepts several query
   vectors (production sends one). At one chunk per document, a 1-vector query
-  takes 1.29 ms, 4 vectors 1.89 ms and 40 vectors 3.3 ms.
-- **Real data is clumpier.** Synthetic vectors spread evenly across clusters.
-  Real embeddings pile into a few, and a query probing those clusters scans far
-  more chunks. Latency on real data depends mostly on how many chunks the probed
-  clusters hold. The architecture doc's *Where a query's time goes* covers this.
+  takes 1.9 ms (the one-chunk bar above, measured separately), 4 vectors
+  2.1 ms and 40 vectors 2.7 ms.
+- **Real stores are larger and clumpier.** Here every chunk is scored. In a
+  larger store, Pass 1 stops once the clusters it has probed hold 70,000
+  entries, so its cost follows the budget rather than the store size. Real
+  embeddings also pile into a few clusters, unlike these synthetic ones. The architecture doc's *Where a query's time goes* covers this, and
+  [The engine at work](#the-engine-at-work) measures search on a real
+  40,000-document store.
 
-The steps inside a search are small by comparison. Choosing the 64 nearest of
-256 clusters takes about 9 µs. Scoring 1,000 candidates takes 16 µs in Pass 1
-and 16 µs in Pass 2, so the more precise pass costs no more per candidate.
+The steps inside a search are small by comparison. Ranking the 64 clusters by
+distance to the query takes about 2 µs. Scoring 1,000 candidates takes 16 µs in
+Pass 1 and 14 µs in Pass 2, so the more precise pass costs no more per
+candidate.
 
 ---
 
@@ -393,7 +404,72 @@ of that is happening**, first one operation at a time and then with several
 clients at once, with nothing outside the engine involved.
 
 It is `minnal_db/benches/engine_bench` (not Criterion), reported by
-`docs/benchmarks/engine/report.py`.
+`docs/benchmarks/engine/report.py`. The results come first. How the benchmark
+works, and what it leaves out, follows them.
+
+### Latency by number of clients
+
+Code at commit `1007dbd`, on 2026-10-18, on the machine under [Setup](#setup),
+with jemalloc as the allocator. Each cell ran once, and the soak lasted
+10 minutes ([What is measured](#what-is-measured) explains both). Every cell
+was valid.
+
+![Operations per second, by number of clients](docs/benchmarks/engine_throughput.png)
+
+Throughput rises from 129 operations per second with one client to 460 with
+16, 3.6 times as many.
+
+![Latency of each operation, by number of clients](docs/benchmarks/engine_latency.png)
+
+*One panel per operation, each with its own scale. The numbers at the right of
+a panel are its p50 and p99 with 16 clients. Every figure behind the charts,
+p99.9 included, is in [engine_latency.md](docs/benchmarks/engine_latency.md).*
+
+What the charts show:
+
+- **Reads stay fast.** `get` has a median of 0.04 ms at every client count; its
+  p99 rises from 0.06 to 0.88 ms. `scan`'s median stays between 1.1 and
+  2.1 ms, and `field_query`'s between 2.5 and 3.7 ms, with a p99 of 14–18 ms.
+- **Searches slow gradually.** The median `search` takes 15 ms with one client
+  and 24 ms with 16; its p99 goes from 18 to 59 ms. At most two searches score
+  their candidates at once, each spread over every core, and the others wait
+  their turn in order, so a search's time grows with the searches ahead of it.
+  `filtered_search` costs a little more than `search`: up to 1.3 ms more at
+  the median.
+- **Writes queue for the fsync.** The median `insert` and `update` take 5.6 ms
+  with one client and 69 ms with 16; `delete` takes 16 ms and 200 ms. Writes
+  fsync the WAL one at a time, and a document write is at least two of them:
+  the document, then its entry in the embedding queue. A delete first removes
+  the document's vector-index entries, each a durable delete of its own, which
+  is why it costs about three inserts.
+- **Indexing keeps up to 4 clients.** The time from a write's acknowledgement
+  until its document is searchable has a median of 22 ms with one client and
+  67 ms with four. With six it is 10 s, and with 16 almost two minutes, because
+  the vector-index worker falls behind for as long as that load lasts. In the
+  10-minute soak at 4 clients (300 operations per second) the median stayed at
+  79 ms and the indexing backlog at 5–6 documents. Neither disk use (250 MiB
+  in the first quarter, 190 MiB in the last) nor resident memory (about
+  2.5 GiB, 0.9 GiB of it the benchmark's replay table) grew.
+- **Alone against in the mix.** Reads sent alone are faster than the same
+  reads in the 1-client mix (`get` 0.01 against 0.04 ms, `scan` 0.34 against
+  1.1 ms), where they share the machine with searches and indexing. We have not
+  measured which part of that work slows them. Writes sent alone are *slower*
+  (`insert` 16 against 5.6 ms): a client sending only inserts made the engine
+  do 37,000 key-value puts and 16,000 deletes in 2 minutes 15 seconds, its
+  inserts' indexing included, against 14,000 and 15,000 in 3 minutes
+  15 seconds for the 1-client mix. All of them queue for the same fsync.
+
+Search quality held through the run (nDCG, FiQA test queries):
+
+| | @10 | @20 | @30 | @40 | @50 | @100 |
+|---|---:|---:|---:|---:|---:|---:|
+| Before the run | 0.501 | 0.528 | 0.538 | 0.545 | 0.551 | 0.565 |
+| Under load, concurrent cells | 0.502 | 0.530 | 0.539 | 0.547 | 0.552 | 0.566 |
+| At rest after the run | 0.510 | 0.539 | 0.548 | 0.555 | 0.561 | 0.575 |
+
+The store changes during the run (documents are deleted, rewritten and
+inserted), so the rows measure slightly different stores, not only a busier
+index.
 
 ### How it runs
 
@@ -488,11 +564,12 @@ indexed afterwards by the vector-index worker.
    not predict higher ones. In a closed loop a client never has more than one
    request outstanding, so latency here is the operation's own time with that
    many in flight, not including time a request would wait to be sent.
-3. **Soak.** 4 clients for 60 minutes, sampled every 10 seconds, to show
-   whether anything grows without bound: disk use, memory, the indexing
-   backlog. Four clients is the highest load at which indexing keeps up with
-   the writes; above it the backlog grows for as long as the load lasts, which
-   the 3-minute concurrent measurements already show.
+3. **Soak.** 4 clients for an hour (10 minutes in the run reported above),
+   sampled every 10 seconds, to show whether anything grows without bound:
+   disk use, memory, the indexing backlog. Four clients is the highest load at
+   which indexing keeps up with the writes; above it the backlog grows for as
+   long as the load lasts, which the 3-minute concurrent measurements already
+   show.
 4. **Search quality** (nDCG at 10, 20, 30, 40, 50 and 100, and recall at 100):
    before the run, under load, and at rest after it, to show that the
    background work does not cost search quality.
@@ -512,9 +589,10 @@ becomes searchable.
   indexed them and a field-index checkpoint advanced. An invalid cell is saved
   with its reasons and **stops the run**, so a problem costs one cell, not
   hours. The run resumes at that cell once the cause is fixed.
-- **Every cell runs three times**: all cells once, then all again, then a third
-  time, so drift over the run shows up as a difference between repeats. Tables
-  give the median of the three with the lowest and highest beside it.
+- **Cells can be repeated**: with three repeats, all cells run once, then all
+  again, then a third time, so drift over the run shows up as a difference
+  between repeats, and tables give the median with the lowest and highest
+  beside it. The run reported above ran each cell once.
 - **Results are saved as each cell finishes** (`cells/<cell>.json`, plus a
   per-second timeline and the search results), with a manifest of what is
   done, so an interrupted run loses nothing.
@@ -575,17 +653,23 @@ python3 minnal_db/docs/benchmarks/engine/report.py OUT_DIR
 
 `CONFIG.json` names the server configuration, the starting database, the data,
 the replay table and the output directory, and sets the mix, durations and
-repeats; `docs/benchmarks/engine/fiqa.example.json` is the configuration used
-here (relative paths resolve from `minnal_db/`, where `cargo bench` runs).
-`cargo bench` without a command skips this benchmark, so the Criterion report
+repeats; `docs/benchmarks/engine/fiqa.example.json` is the full plan (relative
+paths resolve from `minnal_db/`, where `cargo bench` runs). The run reported
+above used it with `"repeats": 1` and `"soak_s": 600`, and takes about an hour;
+the full plan takes several hours. To redraw the charts and tables of
+[Latency by number of clients](#latency-by-number-of-clients) from a run:
+
+```sh
+python3 minnal_db/docs/benchmarks/engine/plot.py OUT_DIR minnal_db/docs/benchmarks
+```
+
+It needs gnuplot. `cargo bench` without a command skips this benchmark, so the Criterion report
 above does not run it.
 
 ### Choosing the memory allocator
 
-Every request allocates and frees many short-lived buffers. A semantic search
-is the extreme case: its first pass reads tens of thousands of index entries,
-each one copied into its own small allocations, and frees them all when it
-returns. So the *memory allocator*, the code behind every allocation and free,
+Every request allocates and frees short-lived buffers, from many threads at
+once. So the *memory allocator*, the code behind every allocation and free,
 matters to both speed and memory use. A Rust program uses the system allocator
 (glibc `malloc` on Linux) unless the binary names another one. `minnal_db` is a
 library and leaves that choice to the program that embeds it. The API server
@@ -593,72 +677,75 @@ library and leaves that choice to the program that embeds it. The API server
 [Embedded Quickstart](QUICKSTART.md#7-choosing-a-memory-allocator) shows how to
 switch an application.
 
-Three builds of `engine_bench` were compared on the same starting database and
+Two builds of `engine_bench` were compared on the same starting database and
 the same operations. The only difference was the allocator: glibc `malloc` 2.43
-(run twice), jemalloc 5.3 (`tikv-jemallocator` 0.7) and mimalloc
-(`mimalloc` 0.1.52).
+or jemalloc 5.3 (`tikv-jemallocator` 0.7).
 
-| | glibc `malloc` (two runs) | **jemalloc** | mimalloc |
-|---|---:|---:|---:|
-| Operations per second, 16 clients | 388 / 391 | **431** | 409 |
-| Operations per second, soak (4 clients) | 254 / 258 | **285** | 274 |
-| `search` p50 / p99, 16 clients (ms) | 51–53 / 113–119 | **30 / 77** | 38 / 95 |
-| `filtered_search` p50 / p99, 16 clients (ms) | 50–51 / 114–119 | **30 / 78** | 38 / 98 |
-| `field_query` p99, 16 clients (ms) | 27–28 | **23** | 28 |
-| `insert` p50, 16 clients (ms) | 62 | 70 | 68 |
-| Share of CPU time spent in the allocator | 14–16% | **5%** | 14% |
-| Resident memory after the 16-client cell (GiB) | 6.3–6.4 | **1.3** | 2.8 |
-| Resident memory at the end of the soak (GiB) | 6.4–6.7 | 3.0 | 2.9 |
-| Highest resident memory during the run (GiB) | 6.7 | **3.5** | 4.0 |
+| | glibc `malloc` | **jemalloc** |
+|---|---:|---:|
+| Operations per second, 16 clients | 412 | **444** |
+| Operations per second, soak (4 clients) | 280 | **292** |
+| `search` p50 / p99, 16 clients (ms) | 33 / 91 | **23 / 61** |
+| `filtered_search` p50 / p99, 16 clients (ms) | 34 / 96 | **25 / 63** |
+| `field_query` p99, 16 clients (ms) | 28 | **23** |
+| `get` p99, 16 clients (ms) | 1.8 | **0.8** |
+| `insert` p50, 16 clients (ms) | 72 | 73 |
+| Share of CPU time in the allocator's own code | 1.7% | 1.1% |
+| Share of CPU time in the kernel | 45% | **20%** |
+| Resident memory after the 16-client cell (GiB) | 5.2 | **1.3** |
+| Resident memory at the end of the soak (GiB) | 5.7 | **2.4** |
+| Highest resident memory during the run (GiB) | 5.7 | **2.7** |
 
-Search quality at rest after the run (nDCG; glibc is the second run):
+Search quality at rest after the run (nDCG):
 
 | | @10 | @20 | @30 | @40 | @50 | @100 |
 |---|---:|---:|---:|---:|---:|---:|
-| glibc `malloc` | 0.504 | 0.531 | 0.540 | 0.548 | 0.553 | 0.567 |
-| jemalloc | 0.506 | 0.533 | 0.542 | 0.549 | 0.555 | 0.569 |
-| mimalloc | 0.506 | 0.533 | 0.541 | 0.549 | 0.554 | 0.568 |
+| glibc `malloc` | 0.506 | 0.533 | 0.542 | 0.549 | 0.554 | 0.569 |
+| jemalloc | 0.506 | 0.534 | 0.542 | 0.550 | 0.555 | 0.569 |
 
 What the numbers show:
 
 - **glibc keeps what it frees.** It spreads threads over many memory regions
   (*arenas*; up to eight per core), and memory freed into an arena mostly stays
-  there, resident, for the next allocation from that arena. With 16 clients,
-  glibc's own account showed about 1.1 GiB in use and 6 GiB freed but still
-  held. jemalloc hands unused pages back to the
-  operating system over about ten seconds, so resident memory follows what is
-  actually in use.
-- **glibc also spends the most CPU.** The share of CPU time spent in the
-  allocator, sampled with `perf`, drops from 14–16% to 5% with jemalloc. Search
-  gains the most: 42% faster at the median with 16 clients, and 33% faster at
-  p99. Throughput rises 10% at 16 clients and 11% in the soak.
-- **mimalloc falls in between.** It uses less memory than glibc, but its
-  allocator share stays at 14%. Most of that is spent on memory that one thread
-  allocates and another frees, which is how a search's first-pass entries are
-  released (on a separate thread, so the reply is not delayed).
-- **Writes wait slightly longer.** `insert`, `update` and `delete` medians at
-  16 clients rise by 9–13% with either alternative. Writes fsync one at a
-  time, so when reads finish sooner, more writes queue for the fsync at once.
-  Total operations still rise.
-- **Search quality is unchanged** at every cutoff: both alternatives fall
-  within the spread of the five glibc runs made with and without tuning
-  (nDCG@10 0.504–0.506, nDCG@100 0.567–0.571).
+  there, resident, for the next allocation from that arena. After the
+  16-client cell, glibc's own account showed 1.1 GiB in use and 4.7 GiB freed
+  but still held. jemalloc hands unused pages back to the operating system over
+  about ten seconds, so resident memory follows what is actually in use.
+- **Reads are faster with jemalloc.** With 16 clients the median search is 28%
+  faster and its p99 33% faster; `get`'s p99 halves. Throughput rises 8% at
+  16 clients and 4% in the soak.
+- **The difference is not in the allocator's own code.** Both spend under 2% of
+  their CPU time there. With glibc, 45% of the CPU samples were in the kernel,
+  against 20% with jemalloc. The kernel's symbols were not readable on this
+  machine, so where that kernel time goes has not been established.
+- **Writes are unchanged.** The `insert`, `update` and `delete` medians at
+  16 clients differ by less than 3% between the two allocators. Writes fsync
+  one at a time, so the allocator does not set their pace.
+- **Search quality is unchanged** at every cutoff.
 
-Tuning glibc does not close the gap. Limiting it to 8 arenas
-(`GLIBC_TUNABLES=glibc.malloc.arena_max=8`) cut resident memory to 2 GiB but
-**halved** throughput (153 operations per second at 16 clients), because
-threads then queue for the shared arenas' locks. A larger per-thread cache
-(`glibc.malloc.tcache_count=1024`) used more memory (8–8.5 GiB) and was slower
-(361 operations per second).
+mimalloc (`mimalloc` 0.1.52) was also tried, at commit `7ebb872` with the same
+plan. It landed between the two on every measure (409 operations per second at
+16 clients, `search` p50 38 ms, highest resident memory 4.0 GiB), so it was not
+measured further.
 
-How these numbers were made. Code at commit `7ebb872`, on 2026-10-18, with the
+Tuning glibc does not close the gap. Measured at commit `4537a9b` with the same
+plan, limiting it to 8 arenas (`GLIBC_TUNABLES=glibc.malloc.arena_max=8`) cut
+resident memory to 2 GiB but **halved** throughput (153 operations per second
+at 16 clients), because threads then queue for the shared arenas' locks. A
+larger per-thread cache (`glibc.malloc.tcache_count=1024`) used more memory
+(8–8.5 GiB) and was slower (361 operations per second).
+
+How these numbers were made. Code at commit `01ea124`, on 2026-10-18, with the
 machine under [Setup](#setup). Each allocator ran a shortened plan once:
 single-operation cells of 5 seconds, 8 and 16 clients for 3 minutes each, and a
-10-minute soak with 4 clients. Every cell was valid. All arms ran under
-`perf record` (499 samples per second, frame pointers on), which costs every
-arm the same. The two glibc runs agree within 1%, and jemalloc's differences
-are far larger than that. Resident memory includes about 0.9 GiB held by the
-benchmark's replay table, which an application does not have.
+10-minute soak with 4 clients. Every cell was valid. Both ran under
+`perf record` (499 samples per second, frame pointers on), which costs each the
+same; it is one reason the throughput here is a little below that in
+[Latency by number of clients](#latency-by-number-of-clients). The CPU shares
+are weighted by sample period. Repeated runs of one build have agreed within
+1% on this machine, far less than the differences above. Resident memory
+includes about 0.9 GiB held by the benchmark's replay table, which an
+application does not have.
 
 The benchmark uses jemalloc, as the API server does. To repeat a comparison,
 build it with another allocator:

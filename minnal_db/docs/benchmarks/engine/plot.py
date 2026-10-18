@@ -132,7 +132,13 @@ set key top left horizontal reverse Left font ",9"
 
 def tables(closed, single, ops, out):
     clients = sorted(closed)
-    w = []
+    repeats = max(len(v) for v in closed.values())
+    w = ["# Engine latency by number of clients", "",
+         "The figures behind the charts in `benchmark.md` → *Latency by number of clients*, "
+         "drawn by `docs/benchmarks/engine/plot.py`. Milliseconds; \"alone\" is the operation sent "
+         "back to back by one client, the other rows the closed-loop mix. "
+         + ("Each cell ran once." if repeats == 1 else
+            f"Median of {repeats} repeats, lowest–highest in brackets."), ""]
     w.append("| Clients | " + " | ".join(str(n) for n in clients) + " |")
     w.append("|---|" + "---:|" * len(clients))
     w.append("| Operations per second | " + " | ".join(cell_fmt([c["total_ops_per_s"] for c in closed[n]]) for n in clients) + " |")
@@ -148,7 +154,7 @@ def tables(closed, single, ops, out):
             w.append(f"| {n} | " + " | ".join(cell_fmt([c["classes"][op][key] for c in closed[n]]) for key, _ in TABLE_PCTS) + " |")
         w.append("")
     with open(f"{out}/engine_latency.md", "w") as f:
-        f.write("\n".join(w))
+        f.write("\n".join(w).rstrip() + "\n")
 
 
 def main():
