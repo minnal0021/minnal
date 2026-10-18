@@ -27,13 +27,11 @@
 //! lsm_compaction_interval_secs  = 30
 //!
 //! [semantic_search]
-//! number_of_bits_for_dense_quantisation = 8
-//! # cluster_path = "service/embedding_support/qwen/clusters.json"   # {model}/clusters.json — must match `model` below
-//! embedding_dim = 768
-//! n_probes = 64
 //! embedding_service_url = "http://192.168.1.155:8001"
-//! model = "qwen"
 //! ```
+//!
+//! A namespace's model, dimension, chunking, code widths and search defaults
+//! are not server settings: they live in its schema (`vector_index`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,73 +42,36 @@ use serde::Deserialize;
 
 // ── Supported embedding models ────────────────────────────────────────────────
 
-/// Directory under which each model's cluster centroid file lives, one
-/// sub-directory per model: `service/embedding_support/{name}/clusters.json`.
-const EMBEDDING_SUPPORT_DIR: &str = "service/embedding_support";
-
-/// One entry in the `[[semantic_search.supported_models]]` TOML array.
+/// One entry in the optional `[[semantic_search.supported_models]]` TOML array.
 ///
-/// Each entry declares that a particular embedding model is available to this
-/// instance and records the dimensionality it produces. The model set is fully
-/// **data-driven**: any `name` is accepted as long as its cluster centroid file
-/// is present at `service/embedding_support/{name}/clusters.json` and the
-/// centroids match the declared `dimension` — there is no hard-coded list of
-/// recognised models.
+/// When the array is given, a namespace may use only the models it lists, each
+/// at its dimension. When it is empty (the default), any model the embedding
+/// service serves is allowed: the server probes the service when a namespace
+/// enables semantic search and rejects a model it does not serve, or serves at
+/// another dimension (422).
 ///
-/// The name is also the model key the embedding service is asked for: the
-/// active `semantic_search.model` is sent, lower-cased, as the `{model}` path
+/// The name is also the model key the embedding service is asked for: a
+/// namespace naming this model sends it, lower-cased, as the `{model}` path
 /// segment of every request (`{url}/embedding/{model}/document` and
-/// `.../query`), so a declared name must be one the service serves (the
+/// `.../query`), so a listed name must be one the service serves (the
 /// companion service serves `gemma` and `qwen`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportedModelEntry {
-    /// Model identifier. The corresponding cluster file is expected at
-    /// `service/embedding_support/{name}/clusters.json` (the name is lower-cased
-    /// to form the directory, so the lookup is case-insensitive).
+    /// Model identifier (matched case-insensitively).
     pub name: String,
-    /// Embedding dimensionality produced by this model. Must be non-zero and
-    /// must equal the dimension of the centroids in the cluster file (validated
-    /// at startup).
+    /// Embedding dimensionality produced by this model. Must be non-zero.
     pub dimension: u16,
 }
 
 impl SupportedModelEntry {
-    /// Lower-cased identifier used as the sub-directory name under
-    /// `service/embedding_support/`.
-    pub fn dir_name(&self) -> String {
-        self.name.to_lowercase()
-    }
-
-    /// Path to this model's cluster centroid file, rooted at `support_dir`
-    /// (`{support_dir}/{name}/clusters.json`).
-    pub fn cluster_file_path(&self, support_dir: &Path) -> PathBuf {
-        support_dir.join(self.dir_name()).join("clusters.json")
-    }
-
-    /// Validate this entry against cluster files rooted at `support_dir`.
-    ///
-    /// Checks the name is non-empty and the dimension is non-zero, then loads
-    /// the cluster file — which confirms it exists, is well-formed, and that its
-    /// centroids match the declared `dimension`.
-    fn validate(&self, support_dir: &Path) -> Result<(), String> {
+    /// Check the name is non-empty and the dimension non-zero.
+    fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("supported_models: an entry has an empty name".to_string());
         }
         if self.dimension == 0 {
             return Err(format!("supported_models: '{}' declares a zero dimension", self.name));
         }
-
-        let cluster_file = self.cluster_file_path(support_dir);
-        let cluster_path = cluster_file
-            .to_str()
-            .ok_or_else(|| format!("supported_models: cluster file path for '{}' is not valid UTF-8", self.name))?;
-
-        minnal_db::semantic_search::ClusterIndex::load_with_dim(cluster_path, self.dimension as usize).map_err(|e| {
-            format!(
-                "supported_models: cluster file for '{}' (expected at '{}') is unusable: {e}",
-                self.name, cluster_path
-            )
-        })?;
         Ok(())
     }
 }
@@ -150,77 +111,28 @@ pub struct DocStoreApiConfig {
 impl DocStoreApiConfig {
     /// Load and validate a `DocStoreApiConfig` from a TOML file.
     ///
-    /// Returns an error if the file cannot be read, fails to parse, or if any
-    /// supported model is missing its cluster file on disk.
+    /// Returns an error if the file cannot be read, fails to parse, or holds an
+    /// invalid setting.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
         let config: Self = toml::from_str(&content).map_err(|e| format!("cannot parse '{}': {e}", path.display()))?;
         config.validate_supported_models()?;
-        config.validate_semantic_search()?;
+        config
+            .semantic_search
+            .index_defaults()
+            .map_err(|e| format!("invalid [semantic_search] defaults in '{}': {e}", path.display()))?;
         Ok(config)
     }
 
-    /// Validate the `[semantic_search]` knobs that have hard implementation limits.
-    ///
-    /// `number_of_bits_for_dense_quantisation` feeds RaBitQ multi-bit quantisation,
-    /// which only supports a bounded range: each quantised code is packed into a
-    /// `u8` and an out-of-range width panics (or silently truncates) deep in the
-    /// indexing path. Reject it at startup instead.
-    fn validate_semantic_search(&self) -> Result<(), String> {
-        use minnal_db::semantic_search::quantisation::rabitq::{MAX_MULTI_BIT_QUANTISATION_BITS, MIN_MULTI_BIT_QUANTISATION_BITS};
-        let bits = self.semantic_search.number_of_bits_for_dense_quantisation;
-        if !(MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS).contains(&bits) {
-            return Err(format!(
-                "semantic_search.number_of_bits_for_dense_quantisation must be in \
-                 {MIN_MULTI_BIT_QUANTISATION_BITS}..={MAX_MULTI_BIT_QUANTISATION_BITS}, got {bits}"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Check that every entry in `semantic_search.supported_models`:
-    /// - has a non-empty `name`,
-    /// - declares a non-zero `dimension`, and
-    /// - has a usable cluster file at
-    ///   `service/embedding_support/{name}/clusters.json` (relative to the
-    ///   current working directory) whose centroids match the declared
-    ///   `dimension`.
-    ///
-    /// The model set is **data-driven**: any name is accepted provided its
-    /// cluster file exists and is consistent. Loading the file via
-    /// [`ClusterIndex::load_with_dim`](minnal_db::semantic_search::ClusterIndex::load_with_dim)
-    /// validates existence, well-formedness, and centroid dimension in one step
-    /// — the replacement for the old hard-coded canonical-dimension check.
-    ///
-    /// Finally, when the list is non-empty, the active `semantic_search.model`
-    /// must name one of the declared entries (case-insensitive). An empty list
-    /// disables that cross-check.
+    /// Check every `semantic_search.supported_models` entry: a non-empty name
+    /// and a non-zero dimension, each name listed once.
     fn validate_supported_models(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
         for entry in &self.semantic_search.supported_models {
-            entry.validate(Path::new(EMBEDDING_SUPPORT_DIR))?;
-        }
-        self.validate_active_model_listed()
-    }
-
-    /// When `supported_models` is non-empty, the active `semantic_search.model`
-    /// must name one of the declared entries (matched case-insensitively,
-    /// mirroring the lower-cased cluster-file directory).
-    ///
-    /// An empty list disables the check — there is nothing declared to match
-    /// against, which keeps configs that omit the list (including the built-in
-    /// default) valid.
-    fn validate_active_model_listed(&self) -> Result<(), String> {
-        let models = &self.semantic_search.supported_models;
-        if models.is_empty() {
-            return Ok(());
-        }
-        let active = self.semantic_search.model.to_lowercase();
-        if !models.iter().any(|m| m.name.to_lowercase() == active) {
-            return Err(format!(
-                "semantic_search.model '{}' is not listed in supported_models (declared: {})",
-                self.semantic_search.model,
-                models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "),
-            ));
+            entry.validate()?;
+            if !seen.insert(entry.name.to_lowercase()) {
+                return Err(format!("supported_models: '{}' is listed twice", entry.name));
+            }
         }
         Ok(())
     }
@@ -634,90 +546,47 @@ fn default_concurrency() -> usize {
     4
 }
 
-/// Semantic search / vector quantisation settings.
+/// Semantic-search settings that belong to the server: how to reach the
+/// embedding service, and optionally which models namespaces may use.
+///
+/// Everything that shapes one namespace's index lives in that namespace's
+/// schema (`vector_index`). The `maintenance` and `search_defaults` tables here
+/// only give the values a namespace's schema is filled with when it first
+/// enables semantic search; from then on the namespace owns them. Unknown keys
+/// are rejected, so a misplaced key (`model`, `embedding_dim`,
+/// `probe_budget_entries` at this level, ...) fails at startup instead of being
+/// silently ignored.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchSection {
-    /// Number of bits used to quantise each embedding dimension.
-    ///
-    /// Higher values give better recall at the cost of more memory and CPU.
-    /// Must be in `2..=8` (validated at startup); each quantised code is packed
-    /// into a `u8`, so wider widths cannot be represented.  Default: 8.
-    #[serde(default = "default_number_of_bits_for_dense_quantisation")]
-    pub number_of_bits_for_dense_quantisation: usize,
-
-    /// Path to the cluster centroids file used by the IVF index.
-    ///
-    /// Accepts any absolute or relative path.  When `None` (the default), the
-    /// path is resolved at runtime as `{db_path}/semantic_search/clusters.json`.
-    #[serde(default)]
-    pub cluster_path: Option<PathBuf>,
-
-    /// Dimensionality of the embedding vectors.  Default: 768.
-    #[serde(default = "default_embedding_dim")]
-    pub embedding_dim: usize,
-
-    /// Number of IVF clusters to probe during the first-pass sparse (single-bit) search.
-    ///
-    /// Higher values increase recall at the cost of query latency.  Default: 32.
-    #[serde(default = "default_n_probes")]
-    pub n_probes: usize,
-
-    /// Number of candidates retained after the first-pass sparse (single-bit) search
-    /// before re-scoring with the dense multi-bit index.  Default: 1000.
-    #[serde(default = "default_first_pass_sparse_search_top_k")]
-    pub first_pass_sparse_search_top_k: usize,
-
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     ///
     /// Requests are a batch POST to `{url}/embedding/{model}/document` and
     /// `{url}/embedding/{model}/query` with body
     /// `{"payloads": [str, ...], "dimensions": N}`, returning
-    /// `{"embeddings": [[f32], ...]}`, where `{model}` is [`model`](Self::model).
-    /// Chunking happens in minnal.
+    /// `{"embeddings": [[f32], ...]}`; `{model}` and `N` come from the
+    /// namespace. Chunking happens in minnal.
     #[serde(default = "default_embedding_service_url")]
     pub embedding_service_url: String,
 
-    /// Embedding model to use, e.g. `"gemma"` or `"qwen"`.  Sent (lower-cased)
-    /// to the embedding service as the `{model}` path segment of every request,
-    /// so it chooses which of the service's loaded models embeds the text; the
-    /// startup probe checks the service loads it.  When
-    /// [`supported_models`](Self::supported_models) is non-empty it must name
-    /// one of the entries.  It must match the model `cluster_path`'s centroids
-    /// were fitted on, and changing it requires a corpus re-index.
-    /// Default: `"qwen"`.
-    #[serde(default = "default_model")]
-    pub model: String,
-
-    /// Maximum number of results returned by a semantic search query.  Default: 100.
-    #[serde(default = "default_top_k_results")]
-    pub top_k_results: usize,
-
-    /// Embedding models this instance is configured to serve.
-    ///
-    /// Each entry declares a `name` and the `dimension` it produces.  The set is
-    /// data-driven — any name is accepted.  On startup the server validates that
-    /// the corresponding cluster file
-    /// (`service/embedding_support/{name}/clusters.json`) exists and that its
-    /// centroids match the declared `dimension`.
+    /// Embedding models namespaces may use, each with the dimension it
+    /// produces. When empty (the default), any model the embedding service
+    /// serves.
     #[serde(default)]
     pub supported_models: Vec<SupportedModelEntry>,
-
-    /// Sentences per sliding-window chunk for document single-bit (Pass-1)
-    /// embeddings. Queries are not chunked. Changing this requires a corpus
-    /// re-index. Default: 4.
-    #[serde(default = "default_window_size")]
-    pub window_size: usize,
-
-    /// How far the window advances between chunks for single-bit embeddings.
-    /// Default: 2.
-    #[serde(default = "default_sliding_size")]
-    pub sliding_size: usize,
 
     /// Time-to-live, in seconds, for cached query embeddings in the system-wide
     /// `system_qemb_cache` namespace. After this duration a cached entry is
     /// evicted by the TTL worker. Default: 86400 (1 day).
     #[serde(default = "default_query_embedding_cache_ttl_secs")]
     pub query_embedding_cache_ttl_secs: u64,
+
+    /// Time-to-live, in seconds, for the partition history in the system-wide
+    /// `system_partition_history` namespace: each namespace's recorded
+    /// code-health reads (`partition?codes=true`), recall checks and rebuilds.
+    /// Default: 2592000 (30 days).
+    #[serde(default = "default_partition_history_ttl_secs")]
+    pub partition_history_ttl_secs: u64,
 
     /// Overall timeout, in seconds, for a single embedding-service HTTP request
     /// (connect + send + receive). Caps how long indexing/search can block on a
@@ -730,58 +599,111 @@ pub struct SemanticSearchSection {
     /// `embedding_request_timeout_secs` (the overall cap). Default: 10.
     #[serde(default = "default_embedding_connect_timeout_secs")]
     pub embedding_connect_timeout_secs: u64,
+
+    /// Partition maintenance: defaults copied into a namespace's schema
+    /// (`vector_index.maintenance`) when it enables semantic search, plus the
+    /// engine-only `threads`.
+    #[serde(default)]
+    pub maintenance: MaintenanceSection,
+
+    /// Search defaults copied into a namespace's schema (`vector_index.search`)
+    /// when it enables semantic search.
+    #[serde(default)]
+    pub search_defaults: minnal_db::doc_store::vector_settings::SearchSpec,
+}
+
+/// `[semantic_search.maintenance]`: how each namespace's partition is split,
+/// reassigned and merged (design doc M3). All but `threads` are defaults for a
+/// namespace's schema; unset keys keep the built-in values.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceSection {
+    /// Target posting size in chunks; a posting splits above twice this.
+    pub target_posting_size: Option<u32>,
+    /// Nearest postings re-checked after a split (0 = none).
+    pub reassign_range: Option<u32>,
+    /// Merge limit as a share of the split limit (SPFresh: 10/118).
+    pub merge_ratio: Option<f64>,
+    /// Move a chunk only when its code shows it is clearly closer to the new
+    /// posting (the gain exceeds the code's error bound).
+    pub skip_uncertain_moves: Option<bool>,
+    /// Balanced 2-means: members sampled per iteration.
+    pub split_samples: Option<u32>,
+    /// Balanced 2-means: random starting pairs tried.
+    pub split_init_trials: Option<u32>,
+    /// Balanced 2-means: iteration cap.
+    pub split_max_iters: Option<u32>,
+    /// Balanced 2-means: balance factor.
+    pub split_lambda_factor: Option<f64>,
+    /// Engine-only: maintenance threads per process. Default 2.
+    pub threads: Option<usize>,
+    /// Engine-only: threads a partition rebuild's k-means uses, 1 or 2.
+    /// Default 2.
+    pub rebuild_threads: Option<usize>,
+}
+
+/// Default maintenance threads per process.
+pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
+
+impl MaintenanceSection {
+    fn spec(&self) -> minnal_db::doc_store::vector_settings::MaintenanceSpec {
+        use minnal_db::doc_store::vector_settings::{MaintenanceSpec, Ratio};
+        MaintenanceSpec {
+            target_posting_size: self.target_posting_size,
+            reassign_range: self.reassign_range,
+            merge_ratio: self.merge_ratio.map(Ratio),
+            skip_uncertain_moves: self.skip_uncertain_moves,
+            split_samples: self.split_samples,
+            split_init_trials: self.split_init_trials,
+            split_max_iters: self.split_max_iters,
+            split_lambda_factor: self.split_lambda_factor.map(Ratio),
+        }
+    }
+
+    /// Maintenance threads, defaulted and checked (1–64).
+    pub fn threads(&self) -> Result<usize, String> {
+        let t = self.threads.unwrap_or(DEFAULT_MAINTENANCE_THREADS);
+        if !(1..=64).contains(&t) {
+            return Err(format!("maintenance.threads must be between 1 and 64, got {t}"));
+        }
+        Ok(t)
+    }
+
+    /// Rebuild threads, defaulted and checked (1 to
+    /// [`MAX_REBUILD_THREADS`](minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub fn rebuild_threads(&self) -> Result<usize, String> {
+        let max = minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS;
+        let t = self.rebuild_threads.unwrap_or(max);
+        if !(1..=max).contains(&t) {
+            return Err(format!("maintenance.rebuild_threads must be between 1 and {max}, got {t}"));
+        }
+        Ok(t)
+    }
 }
 
 impl Default for SemanticSearchSection {
     fn default() -> Self {
         Self {
-            number_of_bits_for_dense_quantisation: default_number_of_bits_for_dense_quantisation(),
-            cluster_path: None,
-            embedding_dim: default_embedding_dim(),
-            n_probes: default_n_probes(),
-            first_pass_sparse_search_top_k: default_first_pass_sparse_search_top_k(),
             embedding_service_url: default_embedding_service_url(),
-            model: default_model(),
-            top_k_results: default_top_k_results(),
             supported_models: Vec::new(),
-            window_size: default_window_size(),
-            sliding_size: default_sliding_size(),
             query_embedding_cache_ttl_secs: default_query_embedding_cache_ttl_secs(),
+            partition_history_ttl_secs: default_partition_history_ttl_secs(),
             embedding_request_timeout_secs: default_embedding_request_timeout_secs(),
             embedding_connect_timeout_secs: default_embedding_connect_timeout_secs(),
+            maintenance: MaintenanceSection::default(),
+            search_defaults: Default::default(),
         }
     }
 }
 
-fn default_number_of_bits_for_dense_quantisation() -> usize {
-    8
-}
-fn default_embedding_dim() -> usize {
-    768
-}
-fn default_n_probes() -> usize {
-    64
-}
-fn default_first_pass_sparse_search_top_k() -> usize {
-    1000
-}
 fn default_embedding_service_url() -> String {
     "http://localhost:8001".into()
 }
-fn default_model() -> String {
-    "qwen".into()
-}
-fn default_top_k_results() -> usize {
-    100
-}
-fn default_window_size() -> usize {
-    4
-}
-fn default_sliding_size() -> usize {
-    2
-}
 fn default_query_embedding_cache_ttl_secs() -> u64 {
     86_400
+}
+fn default_partition_history_ttl_secs() -> u64 {
+    30 * 86_400
 }
 fn default_embedding_request_timeout_secs() -> u64 {
     30
@@ -792,45 +714,20 @@ fn default_embedding_connect_timeout_secs() -> u64 {
 
 // ── Resolved semantic-search config ──────────────────────────────────────────
 
-/// Resolved semantic search configuration, with all paths made absolute.
-///
-/// Build this from [`SemanticSearchSection`] via
-/// [`SemanticSearchSection::resolve`], which fills in the `cluster_path`
-/// default relative to the doc-store data directory.
+/// Resolved semantic-search server settings (see [`SemanticSearchSection`]).
 #[derive(Debug, Clone)]
 pub struct ResolvedSemanticSearchConfig {
-    /// Absolute path to the cluster centroids file.
-    pub cluster_path: PathBuf,
-
-    /// Dimensionality of the embedding vectors.
-    pub embedding_dim: usize,
-
-    /// Number of IVF clusters to probe per query.
-    pub n_probes: usize,
-
-    /// Number of bits used to quantise each embedding dimension.
-    pub number_of_bits_for_dense_quantisation: usize,
-
     /// Base URL of the embedding service, e.g. `http://192.168.1.155:8001`.
     pub embedding_service_url: String,
 
-    /// Embedding model requested from the service, lower-cased, e.g. `"qwen"`.
-    pub model_name: String,
-
-    /// Maximum number of results returned by a semantic search query.
-    pub top_k_results: usize,
-
-    /// Sentences per chunk for document single-bit (Pass-1) embeddings.
-    pub window_size: usize,
-
-    /// How far the window advances between chunks for single-bit embeddings.
-    pub sliding_size: usize,
-
-    /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
-    pub first_pass_sparse_search_top_k: usize,
+    /// Allowed models; empty means any the embedding service serves.
+    pub supported_models: Vec<SupportedModelEntry>,
 
     /// Time-to-live for cached query embeddings in the system-wide cache.
     pub query_embedding_cache_ttl: std::time::Duration,
+
+    /// Time-to-live for the partition history.
+    pub partition_history_ttl: std::time::Duration,
 
     /// Overall timeout for a single embedding-service HTTP request.
     pub embedding_request_timeout: std::time::Duration,
@@ -839,69 +736,55 @@ pub struct ResolvedSemanticSearchConfig {
     pub embedding_connect_timeout: std::time::Duration,
 }
 
-impl ResolvedSemanticSearchConfig {
-    /// If `cluster_path` holds different centroids from the bundled set for the
-    /// configured model (`service/embedding_support/{model}/clusters.json`),
-    /// return that bundled file's path, so startup can warn.
-    ///
-    /// Nothing else catches this pairing: both bundled sets are 768-dimensional,
-    /// so the other model's centroids load and pass the embedding probe, then
-    /// file vectors into the wrong clusters — search slows down and loses
-    /// recall without any error. It stays a warning rather than an error
-    /// because centroids fitted on your own corpus legitimately differ.
-    ///
-    /// Returns `None` when the files match (byte-identical, or the same
-    /// centroids formatted differently), or when there is no readable bundled
-    /// set to compare against: a model without one, a working directory other
-    /// than the workspace root, or a clone missing its Git LFS files.
-    pub fn centroid_mismatch(&self) -> Option<PathBuf> {
-        self.centroid_mismatch_in(Path::new(EMBEDDING_SUPPORT_DIR))
-    }
-
-    fn centroid_mismatch_in(&self, support_dir: &Path) -> Option<PathBuf> {
-        use minnal_db::semantic_search::cluster::read_clusters_from_file;
-
-        let bundled = support_dir.join(&self.model_name).join("clusters.json");
-        // Fast path: a copy of the bundled file (what release.sh stages).
-        match (std::fs::read(&bundled), std::fs::read(&self.cluster_path)) {
-            (Ok(a), Ok(b)) if a == b => return None,
-            (Ok(_), Ok(_)) => {}
-            _ => return None,
-        }
-        // Different bytes; compare what they parse to, so reformatting is not a
-        // mismatch. A bundled file that does not parse (an LFS pointer stub) is
-        // no reference at all.
-        let reference = read_clusters_from_file(bundled.to_str()?).ok()?;
-        let configured = read_clusters_from_file(self.cluster_path.to_str()?).ok()?;
-        (reference != configured).then_some(bundled)
-    }
-}
-
 impl SemanticSearchSection {
-    /// Resolve this section into a [`ResolvedSemanticSearchConfig`], filling in
-    /// the `cluster_path` default (`{db_path}/semantic_search/clusters.json`)
-    /// when no explicit path was provided.
-    pub fn resolve(&self, db_path: &Path) -> ResolvedSemanticSearchConfig {
+    /// The defaults a namespace's vector-index settings are filled with, built
+    /// from `search_defaults` and `maintenance` over the built-in values and
+    /// validated (also checks `maintenance.threads`).
+    pub fn index_defaults(&self) -> Result<minnal_db::doc_store::vector_settings::IndexDefaults, String> {
+        use minnal_db::doc_store::vector_settings::IndexDefaults;
+        let builtin = IndexDefaults::default();
+        self.maintenance.threads()?;
+        self.maintenance.rebuild_threads()?;
+        Ok(IndexDefaults {
+            search: self.search_defaults.apply(builtin.search).map_err(|e| e.to_string())?,
+            maintenance: self.maintenance.spec().apply(builtin.maintenance).map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Resolve this section into a [`ResolvedSemanticSearchConfig`].
+    pub fn resolve(&self) -> ResolvedSemanticSearchConfig {
         ResolvedSemanticSearchConfig {
-            cluster_path: self
-                .cluster_path
-                .clone()
-                .unwrap_or_else(|| db_path.join("semantic_search").join("clusters.json")),
-            embedding_dim: self.embedding_dim,
-            n_probes: self.n_probes,
-            number_of_bits_for_dense_quantisation: self.number_of_bits_for_dense_quantisation,
             embedding_service_url: self.embedding_service_url.clone(),
-            // The service's model keys are lower-case, and the supported-models
-            // check and cluster-file lookup already match case-insensitively.
-            model_name: self.model.to_lowercase(),
-            top_k_results: self.top_k_results,
-            window_size: self.window_size,
-            sliding_size: self.sliding_size,
-            first_pass_sparse_search_top_k: self.first_pass_sparse_search_top_k,
+            supported_models: self.supported_models.clone(),
             query_embedding_cache_ttl: std::time::Duration::from_secs(self.query_embedding_cache_ttl_secs),
+            partition_history_ttl: std::time::Duration::from_secs(self.partition_history_ttl_secs),
             embedding_request_timeout: std::time::Duration::from_secs(self.embedding_request_timeout_secs),
             embedding_connect_timeout: std::time::Duration::from_secs(self.embedding_connect_timeout_secs),
         }
+    }
+}
+
+impl ResolvedSemanticSearchConfig {
+    /// The service settings as the library's per-call config. Its
+    /// per-namespace fields stay at their defaults: each namespace's settings
+    /// overwrite them (`SemanticSearchContext::for_namespace`).
+    pub fn service_config(&self) -> minnal_db::semantic_search::service::SemanticSearchConfig {
+        minnal_db::semantic_search::service::SemanticSearchConfig {
+            embedding_service_url: self.embedding_service_url.clone(),
+            query_embedding_cache_ttl: self.query_embedding_cache_ttl,
+            partition_history_ttl: self.partition_history_ttl,
+            embedding_request_timeout: self.embedding_request_timeout,
+            embedding_connect_timeout: self.embedding_connect_timeout,
+            ..Default::default()
+        }
+    }
+
+    /// The allowed models as (lower-cased name, dimension); empty: any.
+    pub fn supported_models(&self) -> Vec<(String, u32)> {
+        self.supported_models
+            .iter()
+            .map(|m| (m.name.to_lowercase(), u32::from(m.dimension)))
+            .collect()
     }
 }
 
@@ -909,244 +792,33 @@ impl SemanticSearchSection {
 mod tests {
     use super::*;
 
-    fn config_with_bits(bits: usize) -> DocStoreApiConfig {
-        let mut cfg = DocStoreApiConfig::default();
-        cfg.semantic_search.number_of_bits_for_dense_quantisation = bits;
-        cfg
-    }
-
     #[test]
-    fn validate_semantic_search_accepts_supported_bit_widths() {
-        for bits in 2..=8 {
-            assert!(config_with_bits(bits).validate_semantic_search().is_ok(), "bits={bits} should be valid");
-        }
-    }
-
-    #[test]
-    fn validate_semantic_search_rejects_out_of_range_bit_widths() {
-        // 0/1 are below the multi-bit range (1 is the single-bit path); 9 silently
-        // truncates the u8 code; 10+ would index the START table out of bounds.
-        for bits in [0usize, 1, 9, 10, 64] {
-            let err = config_with_bits(bits).validate_semantic_search().unwrap_err();
-            assert!(
-                err.contains("number_of_bits_for_dense_quantisation"),
-                "bits={bits} should be rejected, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn default_config_bit_width_is_valid() {
-        let cfg = DocStoreApiConfig::default();
-        assert_eq!(cfg.semantic_search.number_of_bits_for_dense_quantisation, 8);
-        assert!(cfg.validate_semantic_search().is_ok());
-    }
-
-    /// Create a unique temp directory and write a `{model}/clusters.json` with
-    /// `n` centroids of dimension `dim` (JSONL, one object per line). Returns the
-    /// support-dir root the entry validates against.
-    fn write_cluster_file(model: &str, dim: usize, n: usize) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let unique = format!("minnal_cfg_test_{}_{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-        let support_dir = std::env::temp_dir().join(unique);
-        let model_dir = support_dir.join(model.to_lowercase());
-        std::fs::create_dir_all(&model_dir).unwrap();
-        let mut body = String::new();
-        for id in 0..n {
-            let centroid: Vec<f32> = (0..dim).map(|j| (id + j) as f32).collect();
-            body.push_str(&serde_json::json!({ "cluster_id": id, "centroid": centroid }).to_string());
-            body.push('\n');
-        }
-        std::fs::write(model_dir.join("clusters.json"), body).unwrap();
-        support_dir
-    }
-
-    #[test]
-    fn validate_accepts_any_model_name_with_a_matching_cluster_file() {
-        // Data-driven: a name that is NOT "qwen" is accepted as long as its
-        // cluster file exists and the centroid dimension matches.
-        let support_dir = write_cluster_file("brandnew", 1024, 3);
-        let entry = SupportedModelEntry {
-            name: "BrandNew".to_string(),
-            dimension: 1024,
-        };
-        assert!(entry.validate(&support_dir).is_ok());
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn validate_rejects_dimension_mismatch() {
-        let support_dir = write_cluster_file("modelx", 768, 2);
-        let err = SupportedModelEntry {
-            name: "modelx".to_string(),
-            dimension: 512,
-        }
-        .validate(&support_dir)
-        .unwrap_err();
-        assert!(err.contains("modelx"), "got: {err}");
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn validate_rejects_missing_cluster_file() {
-        let support_dir = std::env::temp_dir().join(format!("minnal_cfg_missing_{}", std::process::id()));
-        let err = SupportedModelEntry {
-            name: "ghost".to_string(),
-            dimension: 768,
-        }
-        .validate(&support_dir)
-        .unwrap_err();
-        assert!(err.contains("ghost"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_rejects_empty_name_and_zero_dimension() {
-        let support_dir = std::env::temp_dir();
-        assert!(
-            SupportedModelEntry {
-                name: "  ".to_string(),
-                dimension: 768
-            }
-            .validate(&support_dir)
-            .is_err()
+    fn supported_models_are_checked_and_optional() {
+        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
+        cfg.validate_supported_models().unwrap();
+        assert!(cfg.semantic_search.resolve().supported_models().is_empty(), "any model by default");
+        let listed = format!(
+            "{base}[[semantic_search.supported_models]]\nname = \"Gemma\"\ndimension = 768\n\
+             [[semantic_search.supported_models]]\nname = \"e5\"\ndimension = 1024\n"
         );
-        assert!(
-            SupportedModelEntry {
-                name: "ok".to_string(),
-                dimension: 0
-            }
-            .validate(&support_dir)
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn active_model_check_skipped_when_list_empty() {
-        // The built-in default: model = "qwen", supported_models = []. The
-        // cross-check is disabled, so this stays valid (no break).
-        let cfg = DocStoreApiConfig::default();
-        assert!(cfg.semantic_search.supported_models.is_empty());
-        assert!(cfg.validate_active_model_listed().is_ok());
-    }
-
-    #[test]
-    fn active_model_check_passes_when_listed_case_insensitively() {
-        let mut cfg = DocStoreApiConfig::default();
-        cfg.semantic_search.model = "Qwen".to_string();
-        cfg.semantic_search.supported_models = vec![SupportedModelEntry {
-            name: "qwen".to_string(),
-            dimension: 768,
-        }];
-        assert!(cfg.validate_active_model_listed().is_ok());
-    }
-
-    #[test]
-    fn active_model_check_rejects_unlisted_model() {
-        let mut cfg = DocStoreApiConfig::default();
-        cfg.semantic_search.model = "qwen".to_string();
-        cfg.semantic_search.supported_models = vec![SupportedModelEntry {
-            name: "other".to_string(),
-            dimension: 768,
-        }];
-        let err = cfg.validate_active_model_listed().unwrap_err();
-        assert!(err.contains("qwen") && err.contains("supported_models"), "got: {err}");
-    }
-
-    /// A resolved config for `model` whose `cluster_path` is `cluster_path`.
-    fn resolved_with(model: &str, cluster_path: PathBuf) -> ResolvedSemanticSearchConfig {
-        let mut resolved = SemanticSearchSection {
-            model: model.to_string(),
-            ..SemanticSearchSection::default()
-        }
-        .resolve(Path::new("/tmp/db"));
-        resolved.cluster_path = cluster_path;
-        resolved
-    }
-
-    #[test]
-    fn centroid_check_accepts_a_copy_of_the_bundled_set() {
-        let support_dir = write_cluster_file("gemma", 4, 3);
-        let bundled = support_dir.join("gemma").join("clusters.json");
-        let copy = support_dir.join("staged.bin");
-        std::fs::copy(&bundled, &copy).unwrap();
-        assert_eq!(resolved_with("gemma", copy).centroid_mismatch_in(&support_dir), None);
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn centroid_check_ignores_formatting_differences() {
-        let support_dir = write_cluster_file("gemma", 4, 3);
-        let bundled = support_dir.join("gemma").join("clusters.json");
-        // Same centroids, different whitespace and line order.
-        let mut lines: Vec<String> = std::fs::read_to_string(&bundled)
-            .unwrap()
-            .lines()
-            .map(|l| {
-                serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(l).unwrap())
-                    .unwrap()
-                    .replace('\n', "")
-            })
-            .collect();
-        lines.reverse();
-        let reformatted = support_dir.join("reformatted.json");
-        std::fs::write(&reformatted, lines.join("\n")).unwrap();
-        assert_ne!(std::fs::read(&bundled).unwrap(), std::fs::read(&reformatted).unwrap());
-        assert_eq!(resolved_with("gemma", reformatted).centroid_mismatch_in(&support_dir), None);
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn centroid_check_flags_the_other_models_centroids() {
-        let support_dir = write_cluster_file("gemma", 4, 3);
-        // write_cluster_file derives values from the id, so shift qwen's.
-        let qwen_dir = support_dir.join("qwen");
-        std::fs::create_dir_all(&qwen_dir).unwrap();
-        let body: String = (0..3)
-            .map(|id| {
-                format!(
-                    "{}\n",
-                    serde_json::json!({ "cluster_id": id, "centroid": [0.5f32, 0.25, 0.125, id as f32] })
-                )
-            })
-            .collect();
-        std::fs::write(qwen_dir.join("clusters.json"), body).unwrap();
-
-        let gemma = support_dir.join("gemma").join("clusters.json");
-        let qwen = qwen_dir.join("clusters.json");
+        let cfg: DocStoreApiConfig = toml::from_str(&listed).unwrap();
+        cfg.validate_supported_models().unwrap();
         assert_eq!(
-            resolved_with("gemma", qwen.clone()).centroid_mismatch_in(&support_dir),
-            Some(gemma.clone())
+            cfg.semantic_search.resolve().supported_models(),
+            vec![("gemma".to_string(), 768), ("e5".to_string(), 1024)]
         );
-        assert_eq!(resolved_with("qwen", gemma).centroid_mismatch_in(&support_dir), Some(qwen));
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn centroid_check_skips_when_there_is_nothing_to_compare_against() {
-        let support_dir = write_cluster_file("gemma", 4, 3);
-        let custom = support_dir.join("gemma").join("clusters.json");
-        // A model with no bundled set (custom model, or wrong working directory).
-        assert_eq!(resolved_with("e5", custom.clone()).centroid_mismatch_in(&support_dir), None);
-        // A clone without Git LFS: the bundled file is a pointer stub.
-        let stub_dir = support_dir.join("qwen");
-        std::fs::create_dir_all(&stub_dir).unwrap();
-        std::fs::write(
-            stub_dir.join("clusters.json"),
-            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 4400000\n",
-        )
-        .unwrap();
-        assert_eq!(resolved_with("qwen", custom).centroid_mismatch_in(&support_dir), None);
-        std::fs::remove_dir_all(&support_dir).ok();
-    }
-
-    #[test]
-    fn resolve_lower_cases_the_model_name() {
-        let section = SemanticSearchSection {
-            model: "Gemma".to_string(),
-            ..SemanticSearchSection::default()
-        };
-        assert_eq!(section.resolve(Path::new("/tmp/db")).model_name, "gemma");
+        for bad in ["name = \" \"\ndimension = 768", "name = \"x\"\ndimension = 0"] {
+            let toml = format!("{base}[[semantic_search.supported_models]]\n{bad}\n");
+            let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+            assert!(cfg.validate_supported_models().is_err(), "{bad}");
+        }
+        let twice = format!(
+            "{base}[[semantic_search.supported_models]]\nname = \"qwen\"\ndimension = 768\n\
+             [[semantic_search.supported_models]]\nname = \"QWEN\"\ndimension = 768\n"
+        );
+        let cfg: DocStoreApiConfig = toml::from_str(&twice).unwrap();
+        assert!(cfg.validate_supported_models().is_err());
     }
 
     #[test]
@@ -1156,9 +828,111 @@ mod tests {
         let section = SemanticSearchSection::default();
         assert_eq!(section.embedding_request_timeout_secs, 30);
         assert_eq!(section.embedding_connect_timeout_secs, 10);
-        let resolved = section.resolve(Path::new("/tmp/db"));
+        let resolved = section.resolve();
         assert_eq!(resolved.embedding_request_timeout, std::time::Duration::from_secs(30));
         assert_eq!(resolved.embedding_connect_timeout, std::time::Duration::from_secs(10));
         assert!(resolved.embedding_connect_timeout < resolved.embedding_request_timeout);
+    }
+
+    #[test]
+    fn a_namespace_setting_left_in_the_server_config_is_rejected() {
+        for key in [
+            "model = \"qwen\"",
+            "embedding_dim = 768",
+            "n_probes = 64",
+            "probe_budget_entries = 70000",
+            "max_probes = 1024",
+            "window_size = 4",
+            "cluster_path = \"x\"",
+            "centroid_dir = \"x\"",
+        ] {
+            let toml = format!("[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\n{key}\n");
+            let err = toml::from_str::<DocStoreApiConfig>(&toml).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{key}: {err}");
+        }
+        let ok = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\n";
+        let cfg: DocStoreApiConfig = toml::from_str(ok).unwrap();
+        assert_eq!(cfg.semantic_search.embedding_service_url, "http://h:1");
+    }
+
+    #[test]
+    fn maintenance_and_search_defaults_are_read_and_validated() {
+        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        assert_eq!(d, minnal_db::doc_store::vector_settings::IndexDefaults::default());
+        assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), DEFAULT_MAINTENANCE_THREADS);
+
+        let toml = format!(
+            "{base}[semantic_search.maintenance]\ntarget_posting_size = 256\nskip_uncertain_moves = true\nthreads = 4\n\
+             [semantic_search.search_defaults]\nprobe_budget_entries = 40000\nprobe_budget_fraction = 0.3\n"
+        );
+        let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        assert_eq!((d.maintenance.target_posting_size, d.maintenance.skip_uncertain_moves), (256, true));
+        assert_eq!(d.maintenance.reassign_range, 64, "unset keys keep the built-in value");
+        assert_eq!(d.search.probe_budget_entries, 40_000);
+        assert_eq!(d.search.probe_budget_fraction.map(|r| r.0), Some(0.3));
+        assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), 4);
+        assert_eq!(cfg.semantic_search.maintenance.rebuild_threads().unwrap(), 2);
+
+        for (table, key) in [
+            ("maintenance", "target_posting_size = 4"),
+            ("maintenance", "merge_ratio = 0.7"),
+            ("maintenance", "threads = 0"),
+            ("maintenance", "rebuild_threads = 3"),
+            ("search_defaults", "probe_budget_fraction = 2.0"),
+        ] {
+            let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
+            let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
+            assert!(cfg.semantic_search.index_defaults().is_err(), "{key}");
+        }
+        for (table, key) in [("maintenance", "error_bound_gate = true"), ("search_defaults", "n_probes = 64")] {
+            let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
+            assert!(toml::from_str::<DocStoreApiConfig>(&toml).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_sample_config_parses_with_every_commented_default_switched_on() {
+        let sample = include_str!("../../config/sample.toml");
+        let cfg: DocStoreApiConfig = toml::from_str(sample).unwrap();
+        cfg.semantic_search.index_defaults().unwrap();
+        // Uncomment the documented defaults of the two semantic-search tables:
+        // they must parse and equal the built-in values.
+        let mut table = "";
+        let uncommented: String = sample
+            .lines()
+            .map(|l| {
+                if l.starts_with('[') {
+                    table = l;
+                }
+                match l.strip_prefix("# ") {
+                    Some(kv) if table.starts_with("[semantic_search.") && kv.contains(" = ") && !kv.contains("fraction") && !kv.contains("floor") => {
+                        kv.to_string()
+                    }
+                    _ => l.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg: DocStoreApiConfig = toml::from_str(&uncommented).unwrap();
+        let d = cfg.semantic_search.index_defaults().unwrap();
+        let builtin = minnal_db::doc_store::vector_settings::IndexDefaults::default();
+        assert_eq!(d.search, builtin.search);
+        assert_eq!(d.maintenance.target_posting_size, builtin.maintenance.target_posting_size);
+        assert!((d.maintenance.merge_ratio.0 - builtin.maintenance.merge_ratio.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn service_config_carries_only_service_settings() {
+        let section = SemanticSearchSection {
+            embedding_service_url: "http://h:1".into(),
+            embedding_request_timeout_secs: 7,
+            ..SemanticSearchSection::default()
+        };
+        let c = section.resolve().service_config();
+        assert_eq!(c.embedding_service_url, "http://h:1");
+        assert_eq!(c.embedding_request_timeout, std::time::Duration::from_secs(7));
     }
 }

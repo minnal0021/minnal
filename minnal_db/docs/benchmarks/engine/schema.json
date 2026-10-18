@@ -1,0 +1,4 @@
+{"namespace": "fiqa", "store_type": "doc", "key_type": "u64",
+ "attributes": [{"name": "text", "attr_type": "str"}],
+ "indices": [{"field": "category", "index_type": "str"}, {"field": "year", "index_type": "int"}, {"field": "score", "index_type": "int"}],
+ "semantic_search_enabled": true, "embedding_fields": ["text"]}

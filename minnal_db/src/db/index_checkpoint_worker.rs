@@ -202,7 +202,13 @@ impl IndexCheckpointWorker {
         shutdown_notify.notify_one();
     }
 
+    /// A checkpoint is a pass of fsyncs (~55 ms with three fields): see
+    /// [`run_blocking_pass`](crate::support::run_blocking_pass).
     fn perform_checkpoint<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool) {
+        crate::support::run_blocking_pass(|| Self::checkpoint_pass(target, pending));
+    }
+
+    fn checkpoint_pass<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool) {
         // Clear the debounce flag as we commit to running: any backpressure
         // request arriving *during* this checkpoint re-arms the valve and queues a
         // follow-up, so writes made while we run are not missed.
@@ -276,6 +282,31 @@ mod tests {
     async fn test_worker_starts_and_shuts_down() {
         let target = FakeTarget::new();
         let worker = IndexCheckpointWorker::new(target, Duration::from_secs(3600));
+        worker.shutdown().await;
+    }
+
+    struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);
+
+    impl IndexCheckpointTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn run_index_checkpoint(&self) -> Result<usize> {
+            self.0.block();
+            Ok(0)
+        }
+    }
+
+    /// The checkpoint is a pass of fsyncs; on a runtime thread it held up the
+    /// requests scheduled behind it (M5: get p99 4-10 ms, every 1.75 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_checkpoint_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        assert_runtime_free_during_pass(&busy).await;
         worker.shutdown().await;
     }
 

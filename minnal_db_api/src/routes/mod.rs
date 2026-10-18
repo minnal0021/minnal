@@ -59,6 +59,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/storage/ops-metrics/by-namespace", get(admin_storage::ops_metrics_by_namespace))
         .route("/admin/storage/stores/{ns}/ops-metrics", get(admin_storage::ops_metrics_ns))
         .route("/admin/storage/wal", get(admin_storage::wal))
+        .route("/admin/storage/vector-index-wal", get(admin_storage::vector_index_wal))
         .route("/admin/storage/lsm", get(admin_storage::lsm))
         .route("/admin/storage/value-log", get(admin_storage::value_log))
         .route("/admin/storage/value-log/{ns}/segments", get(admin_storage::value_log_segments))
@@ -82,6 +83,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/vector/query-cache", delete(admin_indices::vector_query_cache_clear))
         .route("/admin/indices/vector/corruption-metrics", get(admin_indices::vector_corruption_metrics))
         .route("/admin/indices/vector/reconcile", post(admin_indices::vector_reconcile))
+        .route("/admin/indices/vector/settings", get(admin_indices::vector_server_settings))
         // Admin / indices — per-namespace monitoring & operations
         .route("/admin/indices/{ns}/progress", get(admin_indices::progress_ns))
         .route(
@@ -103,6 +105,12 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/{ns}/vector/reindex/{doc_id}", post(admin_indices::vector_reindex_doc))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))
         .route("/admin/indices/{ns}/vector/drop-all", delete(admin_indices::vector_drop_all))
+        // Admin / indices — vector partition (design doc M3a, partition health)
+        .route("/admin/indices/{ns}/vector/partition", get(admin_indices::vector_partition))
+        .route("/admin/indices/{ns}/vector/postings", get(admin_indices::vector_postings))
+        .route("/admin/indices/{ns}/vector/rebuild", post(admin_indices::vector_rebuild))
+        .route("/admin/indices/{ns}/vector/recall-check", get(admin_indices::vector_recall_check))
+        .route("/admin/indices/{ns}/vector/history", get(admin_indices::vector_history))
         // Admin / indices — vector queue inspection
         .route("/admin/indices/{ns}/vector/queue", get(admin_indices::vector_queue_by_namespace))
         .route(

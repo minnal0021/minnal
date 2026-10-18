@@ -1,0 +1,1077 @@
+//! A namespace's vector-index settings through the store: defaults written on
+//! create, fixed fields kept across a vector-index drop, search updates, model
+//! checks, per-request overrides, and two namespaces with different models in
+//! one process (design doc M2a).
+
+use super::test_support::*;
+use super::*;
+#[cfg(feature = "semantic-search")]
+use crate::doc_store::vector_settings::SearchSpec;
+use crate::doc_store::vector_settings::VectorIndexSpec;
+
+fn spec(json: &str) -> VectorIndexSpec {
+    serde_json::from_str(json).unwrap()
+}
+
+/// A doc store schema with semantic search on over one `text` field.
+fn semantic_schema(namespace: &str, vector_index: Option<VectorIndexSpec>) -> DocStoreSchema {
+    let mut s = make_schema(namespace, vec![]);
+    s.attributes = vec![crate::doc_store::schema::AttributeDef {
+        name: "text".into(),
+        attr_type: AttributeType::Str,
+        description: None,
+    }];
+    s.semantic_search_enabled = true;
+    s.embedding_fields = vec!["text".into()];
+    s.vector_index = vector_index;
+    s
+}
+
+/// The `vector_index` object as saved on disk.
+#[cfg(feature = "semantic-search")]
+fn saved_vector_index(schema_dir: &Path, namespace: &str) -> serde_json::Value {
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(schema_dir.join(format!("{namespace}.json"))).unwrap()).unwrap();
+    json["vector_index"].clone()
+}
+
+// Creates semantic stores, which need the feature compiled in.
+#[cfg(feature = "semantic-search")]
+#[tokio::test]
+async fn create_writes_every_default_into_the_saved_schema() {
+    let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    store.create(semantic_schema("docs", None)).await.unwrap();
+    let mut kv = make_kv_schema("kvs", KvKeyType::Str, KvValueType::Str);
+    kv.semantic_search_enabled = true;
+    kv.vector_index = Some(spec(r#"{"embedding_model":"Qwen","chunking":{"window_size":6}}"#));
+    store.create_kv(kv).await.unwrap();
+
+    let expected = serde_json::json!({
+        "embedding_model": "gemma", "embedding_dim": 768,
+        "chunking": {"window_size": 4, "sliding_size": 2},
+        "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001", "pass2_centre": "zero"},
+        "search": {"probe_budget_entries": 42_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100,
+                   "probe_budget_fraction": 0.0, "probe_budget_floor": 20_000},
+        "maintenance": {"target_posting_size": 128, "reassign_range": 64, "merge_ratio": 10.0 / 118.0,
+                        "skip_uncertain_moves": false, "split_samples": 1000, "split_init_trials": 3,
+                        "split_max_iters": 100, "split_lambda_factor": 100.0}
+    });
+    assert_eq!(saved_vector_index(schema_dir.path(), "docs"), expected);
+    let kv_saved = saved_vector_index(schema_dir.path(), "kvs");
+    assert_eq!(kv_saved["embedding_model"], "qwen", "lower-cased on save");
+    assert_eq!(kv_saved["chunking"], serde_json::json!({"window_size": 6, "sliding_size": 2}));
+    assert_eq!(kv_saved["search"]["top_k"], 100);
+
+    // A store without semantic search keeps no settings.
+    store.create(make_schema("plain", vec![])).await.unwrap();
+    assert!(saved_vector_index(schema_dir.path(), "plain").is_null());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_settings_and_saves_nothing() {
+    let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    for (json, field) in [
+        (r#"{"embedding_dim":7}"#, "embedding_dim"),
+        (r#"{"embedding_model":"bad model"}"#, "embedding_model"),
+        (r#"{"chunking":{"window_size":4,"sliding_size":5}}"#, "chunking.sliding_size"),
+        (r#"{"quantisation":{"pass2_bits":4}}"#, "quantisation.pass2_bits"),
+        (r#"{"search":{"first_pass_top_k":10,"top_k":20}}"#, "search.top_k"),
+    ] {
+        let err = store.create(semantic_schema("bad", Some(spec(json)))).await.unwrap_err();
+        assert!(
+            matches!(&err, DocStoreError::Schema(SchemaError::InvalidVectorSetting { field: f, .. }) if *f == field),
+            "{json}: {err:?}"
+        );
+        assert!(!schema_dir.path().join("bad.json").exists(), "{json}: nothing saved");
+    }
+    store.shutdown().await.unwrap();
+}
+
+// Creates semantic stores, which need the feature compiled in.
+#[cfg(feature = "semantic-search")]
+#[tokio::test]
+async fn fixed_settings_survive_a_vector_index_drop_and_re_enable() {
+    let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    store
+        .create(semantic_schema(
+            "docs",
+            Some(spec(r#"{"embedding_model":"qwen","chunking":{"window_size":6,"sliding_size":3}}"#)),
+        ))
+        .await
+        .unwrap();
+    store.disable_semantic_search("docs").unwrap();
+    let after_drop = store.get_schema("docs").unwrap();
+    assert!(!after_drop.semantic_search_enabled);
+    assert_eq!(after_drop.vector_settings().unwrap().embedding_model, "qwen", "settings are kept on drop");
+
+    // Re-enabling with another model, dimension or chunking is rejected...
+    for json in [
+        r#"{"embedding_model":"gemma"}"#,
+        r#"{"embedding_dim":1024}"#,
+        r#"{"chunking":{"window_size":4}}"#,
+        r#"{"quantisation":{"pass1_bits":2}}"#,
+    ] {
+        let err = store
+            .amend(
+                "docs",
+                SchemaAmendment::EnableVectorIndex {
+                    fields: vec!["body".into()],
+                    vector_index: Some(spec(json)),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DocStoreError::Schema(SchemaError::VectorSettingFixed { .. }) | DocStoreError::Schema(SchemaError::InvalidVectorSetting { .. })
+            ),
+            "{json}: {err:?}"
+        );
+        assert!(!store.get_schema("docs").unwrap().semantic_search_enabled, "{json}: schema untouched");
+    }
+    // ...and with them omitted or repeated it keeps the original ones, while
+    // search settings may change.
+    store
+        .amend(
+            "docs",
+            SchemaAmendment::AddEmbeddingAttribute {
+                name: "body".into(),
+                description: None,
+                vector_index: Some(spec(r#"{"embedding_model":"QWEN","search":{"max_probes":8}}"#)),
+            },
+        )
+        .await
+        .unwrap();
+    let s = store.get_schema("docs").unwrap().vector_settings().unwrap();
+    assert_eq!(
+        (s.embedding_model.as_str(), s.window_size, s.sliding_size, s.search.max_probes),
+        ("qwen", 6, 3, 8)
+    );
+    store.shutdown().await.unwrap();
+}
+
+// Creates semantic stores, which need the feature compiled in.
+#[cfg(feature = "semantic-search")]
+#[tokio::test]
+async fn update_vector_search_changes_only_search_settings() {
+    let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    store.create(semantic_schema("docs", None)).await.unwrap();
+    let mut kv = make_kv_schema("kvs", KvKeyType::Str, KvValueType::Str);
+    kv.semantic_search_enabled = true;
+    store.create_kv(kv).await.unwrap();
+    store
+        .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))
+        .await
+        .unwrap();
+
+    let update = SearchSpec {
+        probe_budget_entries: Some(16_000),
+        top_k: Some(10),
+        ..Default::default()
+    };
+    store.update_vector_search("docs", &update, None).await.unwrap();
+    store.update_vector_search("kvs", &update, None).await.unwrap();
+    for ns in ["docs", "kvs"] {
+        let saved = saved_vector_index(schema_dir.path(), ns);
+        assert_eq!(
+            saved["search"],
+            serde_json::json!({
+                "probe_budget_entries": 16_000,
+                "min_probes": 1,
+                "max_probes": 1024,
+                "first_pass_top_k": 1000,
+                "top_k": 10,
+                "probe_budget_fraction": 0.0,
+                "probe_budget_floor": 20_000
+            }),
+            "{ns}"
+        );
+        assert_eq!(saved["embedding_model"], "gemma", "{ns}");
+    }
+
+    let bad = SearchSpec {
+        probe_budget_entries: Some(0),
+        ..Default::default()
+    };
+    assert!(matches!(
+        store.update_vector_search("docs", &bad, None).await.unwrap_err(),
+        DocStoreError::Schema(SchemaError::InvalidVectorSetting {
+            field: "search.probe_budget_entries",
+            ..
+        })
+    ));
+    assert!(matches!(
+        store.update_vector_search("plain_kv", &update, None).await.unwrap_err(),
+        DocStoreError::Schema(SchemaError::VectorIndexNotConfigured { .. })
+    ));
+    assert!(matches!(
+        store.update_vector_search("docs", &SearchSpec::default(), None).await.unwrap_err(),
+        DocStoreError::Schema(SchemaError::InvalidVectorSetting { field: "search", .. })
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "semantic-search")]
+mod with_service {
+    use super::*;
+    use crate::semantic_search::chunk_document;
+    use crate::semantic_search::service::SemanticSearchConfig;
+
+    const DIM: usize = 8;
+
+    /// One embedding request the mock saw.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        model: String,
+        kind: String,
+        dimensions: usize,
+        payloads: usize,
+    }
+
+    /// A mock embedding service serving `gemma` and `qwen` at any dimension:
+    /// one vector per payload, a different one per model, and every request
+    /// recorded.
+    fn spawn_service() -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h == "\r\n" || h.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                let parts: Vec<&str> = path.split('/').collect(); // ["", "embedding", model, kind]
+                let (status, out) = if parts.len() == 4 && matches!(parts[2], "gemma" | "qwen") {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let n = req["payloads"].as_array().map_or(0, |a| a.len());
+                    let dims = req["dimensions"].as_u64().unwrap_or(0) as usize;
+                    log.lock().push(Seen {
+                        model: parts[2].into(),
+                        kind: parts[3].into(),
+                        dimensions: dims,
+                        payloads: n,
+                    });
+                    // gemma points along +x, qwen along +y; each payload slightly different.
+                    let axis = if parts[2] == "gemma" { 0 } else { 1 };
+                    let embs: Vec<Vec<f32>> = (0..n)
+                        .map(|i| {
+                            let mut v = vec![0.01f32 * (i as f32 + 1.0); dims];
+                            v[axis] = 1.0;
+                            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            v.iter().map(|x| x / norm).collect()
+                        })
+                        .collect();
+                    ("200 OK", serde_json::json!({ "embeddings": embs }).to_string())
+                } else {
+                    ("404 Not Found", serde_json::json!({ "detail": "Unknown model" }).to_string())
+                };
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                let _ = stream.flush();
+            }
+        });
+        (url, seen)
+    }
+
+    fn context(url: &str) -> SemanticSearchContext {
+        SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: url.to_string(),
+            ..SemanticSearchConfig::default()
+        })
+        .with_supported_models([("gemma".to_string(), 8), ("qwen".to_string(), 8)])
+    }
+
+    async fn wait_for_empty_queue(store: &DocStore) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !vector_kv::list_queue_entries(&store.db).await.unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the vector queue never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The cluster ids of a namespace's stored chunk keys.
+    async fn sparse_clusters(store: &DocStore, namespace: &str) -> Vec<u32> {
+        let rows = store
+            .db
+            .namespace(vector_kv::sparse_vectors_ns(namespace))
+            .await
+            .unwrap()
+            .scan_prefix(Vec::new())
+            .await
+            .unwrap();
+        let mut ids: Vec<u32> = rows.iter().map(|(k, _)| u32::from_be_bytes(k[..4].try_into().unwrap())).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    const TEXT: &str = "One sentence here. Two sentences now. Three of them. Four in a row. Five so far. Six at last.";
+
+    /// A namespace grows from its root by itself: the worker wakes maintenance
+    /// when a posting passes its split limit, and the splits keep every key in
+    /// an active posting with exact counts, also across a reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postings_split_by_themselves_as_a_namespace_grows() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while partition.snapshot().posting_infos()[&0].state != crate::semantic_search::PostingState::Retired {
+            assert!(std::time::Instant::now() < deadline, "the root was never split");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let check = |partition: Arc<crate::semantic_search::PartitionHandle>| {
+            let db = Arc::clone(&store.db);
+            async move {
+                let ivf = partition.snapshot();
+                let keys = crate::ivf_split::recount_chunks(&db, "g").await.unwrap();
+                for (p, n) in &keys {
+                    assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+                    assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+                }
+                assert_eq!(keys.values().sum::<u64>(), ivf.counts().snapshot().values().map(|c| c.1).sum::<u64>());
+                ivf.postings()
+            }
+        };
+        // Let any further splits settle, then check.
+        let _ = partition.lock_maintenance().await;
+        let postings = check(Arc::clone(&partition)).await;
+        assert!(postings > 1, "{postings} posting(s)");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+        drop((store, ctx, partition));
+
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let ivf = partition.snapshot();
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p} after reopen");
+        }
+        assert_eq!(ivf.postings(), postings);
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is still found");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    /// Deleting most of a grown namespace's documents merges its emptied
+    /// postings by themselves: the deletes wake maintenance, and the merges keep
+    /// every key in an active posting with exact counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postings_merge_by_themselves_as_documents_are_deleted() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16,"merge_ratio":0.3}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..60u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("{TEXT} Number {i}.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let settle = |partition: Arc<crate::semantic_search::PartitionHandle>| async move {
+            // Maintenance is woken asynchronously; wait until it has nothing left.
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _idle = partition.lock_maintenance().await;
+            }
+        };
+        settle(Arc::clone(&partition)).await;
+        let grown = partition.snapshot().postings();
+        assert!(grown > 2, "{grown} posting(s)");
+        for i in 0..54u64 {
+            store.delete("g", DocId::U64(i)).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        settle(Arc::clone(&partition)).await;
+        let ivf = partition.snapshot();
+        assert!(partition.counters().read().merges > 0, "{:?}", partition.counters().read());
+        assert!(ivf.postings() < grown, "{} posting(s), grown to {grown}", ivf.postings());
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+        }
+        assert_eq!(keys.values().sum::<u64>(), ivf.counts().snapshot().values().map(|c| c.1).sum::<u64>());
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 6, "every remaining document is found");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    /// A rebuild started through the store re-clusters a grown namespace from
+    /// its codes in the background: no embedding request, every key in an
+    /// active posting with exact counts, every document still found; a second
+    /// rebuild is refused while one runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_runs_in_the_background_without_the_embedding_service() {
+        use crate::ivf_split::rebuild::RebuildState;
+        let (url, seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("{TEXT} Number {i}.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
+        let _ = partition.lock_maintenance().await;
+        let calls = seen.lock().len();
+
+        assert_eq!(store.vector_rebuild_status("g"), None);
+        store
+            .create(semantic_schema("plain", Some(spec(r#"{"embedding_dim":8}"#))))
+            .await
+            .unwrap();
+        store.disable_semantic_search("plain").unwrap();
+        assert!(matches!(
+            store.start_vector_rebuild("plain", None),
+            Err(DocStoreError::SemanticSearchNotEnabled { .. })
+        ));
+        assert!(matches!(store.start_vector_rebuild("missing", None), Err(DocStoreError::NotFound { .. })));
+        let busy = partition.lock_maintenance().await; // holds the rebuild back
+        store.start_vector_rebuild("g", Some(2)).unwrap();
+        assert!(matches!(
+            store.start_vector_rebuild("g", None),
+            Err(DocStoreError::VecRebuildInProgress { .. })
+        ));
+        drop(busy);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            let s = store.vector_rebuild_status("g").unwrap();
+            if s.state != RebuildState::Running {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "the rebuild never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(status.state, RebuildState::Done, "{status:?}");
+        let report = status.report.unwrap();
+        assert_eq!(report.postings_fitted, 2, "{report:?}");
+        assert_eq!(report.chunks_moved, report.chunks);
+        assert_eq!(seen.lock().len(), calls, "a rebuild makes no embedding request");
+
+        // A recall check makes none either; it and the rebuild are in the history.
+        let params = crate::ivf_split::recall_check::RecallCheckParams {
+            sample: 10,
+            ..Default::default()
+        };
+        let check = store.vector_recall_check("g", &params, &SearchSpec::default()).await.unwrap();
+        assert_eq!(check.sampled, 10, "{check:?}");
+        assert_eq!(seen.lock().len(), calls, "a recall check makes no embedding request");
+        use crate::ivf_split::history::RecordKind;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let kinds = loop {
+            let kinds: Vec<RecordKind> = store
+                .vector_partition_history("g", None, 10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.kind)
+                .collect();
+            if kinds.contains(&RecordKind::Rebuild) || std::time::Instant::now() > deadline {
+                break kinds;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            kinds.contains(&RecordKind::Rebuild) && kinds.contains(&RecordKind::RecallCheck),
+            "{kinds:?}"
+        );
+        let last = store.vector_partition_history("g", Some(RecordKind::RecallCheck), 1).await.unwrap();
+        assert_eq!(last[0].data["sampled"], 10);
+
+        let ivf = partition.snapshot();
+        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        for (p, n) in &keys {
+            assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
+            assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
+        }
+        assert_eq!(keys.values().sum::<u64>(), report.chunks);
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is still found");
+
+        // The escape hatch still works after a rebuild: `reindex-all` enqueues
+        // every document, re-embeds each through the service, and every
+        // document is found afterwards.
+        let before = seen.lock().len();
+        let stats = store.index_all("g").await.unwrap();
+        assert_eq!(stats.enqueued, 40, "{stats:?}");
+        wait_for_empty_queue(&store).await;
+        assert!(seen.lock().len() > before, "reindex-all calls the embedding service");
+        let all = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.results.len(), 40, "every document is found after reindex-all");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    /// The loaded partition's entry counts track the worker's writes and the
+    /// doc store's deletes, matching a fresh count of the stored keys.
+    #[tokio::test]
+    async fn entry_counts_track_indexing_updates_and_deletes() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"chunking":{"window_size":1,"sliding_size":1}}"#)),
+            ))
+            .await
+            .unwrap();
+        let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        let (settings, ns_id) = load_vector_settings(schema_dir.path(), "g").unwrap();
+        let check = || async {
+            let ivf = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition.snapshot();
+            let stored = vector_kv::count_posting_entries(&store.db, "g").await.unwrap();
+            let loaded: std::collections::HashMap<u32, u64> = ivf
+                .counts()
+                .snapshot()
+                .into_iter()
+                .filter(|&(_, (e, _))| e > 0)
+                .map(|(p, (e, _))| (p, e))
+                .collect();
+            assert_eq!(loaded, stored);
+            // The chunk counts agree with the document records too.
+            let from_meta = vector_kv::count_postings(&store.db, "g").await.unwrap();
+            assert_eq!(
+                ivf.counts()
+                    .snapshot()
+                    .into_iter()
+                    .filter(|&(_, (e, _))| e > 0)
+                    .collect::<std::collections::HashMap<_, _>>(),
+                from_meta
+            );
+            ivf.total_entries()
+        };
+
+        for i in 0..6u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        assert!(check().await > 0, "the documents were indexed");
+        // Re-embed with other text, then delete some (doc-store path) and blank one.
+        for i in 0..3u64 {
+            store
+                .put("g", DocId::U64(i), serde_json::json!({"text": format!("Other words {i}. And more.")}))
+                .await
+                .unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        check().await;
+        store.delete("g", DocId::U64(4)).await.unwrap();
+        store.delete("g", DocId::U64(5)).await.unwrap();
+        store.put("g", DocId::U64(3), serde_json::json!({"text": ""})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        check().await;
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_namespaces_with_different_models_each_use_their_own() {
+        let (url, seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(
+                    r#"{"embedding_model":"gemma","embedding_dim":8,"chunking":{"window_size":2,"sliding_size":1}}"#,
+                )),
+            ))
+            .await
+            .unwrap();
+        store
+            .create(semantic_schema("q", Some(spec(r#"{"embedding_model":"qwen","embedding_dim":8}"#))))
+            .await
+            .unwrap();
+
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        store.put("q", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+
+        // Each document was embedded by its namespace's model, at its dimension,
+        // chunked by its namespace's window (one whole-text payload + chunks).
+        let text = format!("text: {TEXT}");
+        let docs: Vec<Seen> = seen.lock().iter().filter(|s| s.kind == "document").cloned().collect();
+        let expect = |model: &str, w: usize, s: usize| Seen {
+            model: model.into(),
+            kind: "document".into(),
+            dimensions: DIM,
+            payloads: 1 + chunk_document(&text, w, s).len(),
+        };
+        assert!(docs.contains(&expect("gemma", 2, 1)), "{docs:?}");
+        assert!(docs.contains(&expect("qwen", 4, 2)), "{docs:?}");
+        assert_ne!(
+            expect("gemma", 2, 1).payloads,
+            expect("qwen", 4, 2).payloads,
+            "the test must tell the chunkings apart"
+        );
+
+        // Each namespace's chunks sit in its own partition (each still its root).
+        assert_eq!(sparse_clusters(&store, "g").await, vec![0]);
+        assert_eq!(sparse_clusters(&store, "q").await, vec![0]);
+
+        // Searches embed with the namespace's model and cache per model.
+        let none = SearchSpec::default();
+        let queries = |seen: &parking_lot::Mutex<Vec<Seen>>| {
+            seen.lock()
+                .iter()
+                .filter(|s| s.kind == "query")
+                .map(|s| s.model.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            store
+                .search_semantic("g", "hello", &none, Pagination::default())
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_semantic("g", "hello", &none, Pagination::default())
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+        assert_eq!(queries(&seen), vec!["gemma"], "the second gemma search is a cache hit");
+        assert_eq!(
+            store
+                .search_semantic("q", "hello", &none, Pagination::default())
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+        assert_eq!(queries(&seen), vec!["gemma", "qwen"], "qwen never reuses gemma's cached vector");
+
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_request_overrides_are_validated_and_applied() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for i in 1..=3u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+
+        let page = Pagination::default();
+        let all = store.search_semantic("g", "q", &SearchSpec::default(), page).await.unwrap();
+        assert_eq!(all.results.len(), 3);
+        let one = SearchSpec {
+            top_k: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(store.search_semantic("g", "q", &one, page).await.unwrap().results.len(), 1);
+        assert!(
+            store.kv_search_semantic("g", "q", &one, page).await.is_err(),
+            "g is a doc store, not a KV store"
+        );
+
+        for (bad, field) in [
+            (
+                SearchSpec {
+                    min_probes: Some(0),
+                    ..Default::default()
+                },
+                "search.min_probes",
+            ),
+            (
+                SearchSpec {
+                    top_k: Some(1001),
+                    ..Default::default()
+                },
+                "search.top_k",
+            ),
+            (
+                SearchSpec {
+                    first_pass_top_k: Some(5),
+                    ..Default::default()
+                },
+                "search.top_k",
+            ),
+        ] {
+            let err = store.search_semantic("g", "q", &bad, page).await.unwrap_err();
+            assert!(
+                matches!(&err, DocStoreError::Schema(SchemaError::InvalidVectorSetting { field: f, .. }) if *f == field),
+                "{bad:?}: {err:?}"
+            );
+            let err = store.search_semantic_filtered("g", "q", "text = 'x'", &bad, page).await.unwrap_err();
+            assert!(matches!(err, DocStoreError::Schema(SchemaError::InvalidVectorSetting { .. })), "{err:?}");
+        }
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_or_dimension_the_server_lacks_is_rejected_on_create_and_enable() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+
+        let err = store
+            .create(semantic_schema("e5", Some(spec(r#"{"embedding_model":"e5","embedding_dim":8}"#))))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DocStoreError::UnsupportedEmbeddingModel { model, supported } if model == "e5" && supported == "gemma, qwen"),
+            "{err:?}"
+        );
+        let err = store
+            .create(semantic_schema("wide", Some(spec(r#"{"embedding_dim":16}"#))))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DocStoreError::EmbeddingDimMismatch { dim: 16, expected: 8, .. }), "{err:?}");
+        assert!(!schema_dir.path().join("e5.json").exists() && !schema_dir.path().join("wide.json").exists());
+
+        store.create(make_schema("later", vec![])).await.unwrap();
+        let err = store
+            .amend(
+                "later",
+                SchemaAmendment::EnableVectorIndex {
+                    fields: vec!["text".into()],
+                    vector_index: Some(spec(r#"{"embedding_model":"e5","embedding_dim":8}"#)),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DocStoreError::UnsupportedEmbeddingModel { .. }), "{err:?}");
+        assert!(!store.get_schema("later").unwrap().semantic_search_enabled, "nothing saved");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    // ── M2b: the namespace's own partition ──
+
+    async fn results(store: &DocStore, ns: &str) -> Vec<(Vec<u8>, u32)> {
+        let page = store
+            .search_semantic(ns, "hello", &SearchSpec::default(), Pagination::default())
+            .await
+            .unwrap();
+        page.results.iter().map(|r| (r.document_id.clone(), r.dot_product.to_bits())).collect()
+    }
+
+    #[tokio::test]
+    async fn a_new_namespace_starts_from_one_root_posting_and_a_drop_resets_it() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        let vi = store.get_schema("g").unwrap().vector_index.unwrap();
+        assert_eq!(vi.quantisation.unwrap().rotation_seed.as_deref(), Some("0x6d696e6e616c0001"));
+        let root = vector_kv::load_ivf(&store.db, "g", 1).await.unwrap().expect("a root posting");
+        assert_eq!((root.postings(), root.centres()), (1, 1));
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(sparse_clusters(&store, "g").await, vec![0], "every chunk is in the root");
+
+        // Dropping the vector index drops the partition with the data, also
+        // across a reopen.
+        store.disable_semantic_search("g").unwrap();
+        store.drop_vector_index_data("g").await.unwrap();
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+        drop(store);
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        assert!(!vector_kv::ivf_exists(&store.db, "g").await.unwrap(), "gone with the data");
+
+        // Re-enabling starts again from a root.
+        store
+            .amend(
+                "g",
+                SchemaAmendment::EnableVectorIndex {
+                    fields: vec!["body".into()],
+                    vector_index: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(vector_kv::ivf_exists(&store.db, "g").await.unwrap());
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_store_removes_its_partition_and_a_recreated_store_gets_its_own() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("s", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.put("s", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(results(&store, "s").await.len(), 1, "loads gemma's partition into the registry");
+        store.remove("s").await.unwrap();
+        let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n.starts_with("s_ivf")), "{names:?}");
+
+        // Same name, other model: its own partition, not the evicted one.
+        store
+            .create(semantic_schema("s", Some(spec(r#"{"embedding_model":"qwen","embedding_dim":8}"#))))
+            .await
+            .unwrap();
+        store.put("s", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(sparse_clusters(&store, "s").await, vec![0], "a fresh root");
+        assert_eq!(results(&store, "s").await.len(), 1);
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    // ── Review fixes (2026-10-17) ──
+
+    /// The partition of `namespace`, loaded as every user of it loads it.
+    async fn partition(store: &DocStore, namespace: &str) -> std::sync::Arc<crate::semantic_search::PartitionHandle> {
+        let (settings, ns_id) = load_vector_settings(&store.schema_dir, namespace).unwrap();
+        store
+            .semantic_ctx
+            .as_ref()
+            .unwrap()
+            .for_namespace(&store.db, namespace, ns_id, &settings)
+            .await
+            .unwrap()
+            .partition
+    }
+
+    /// Names of `namespace`'s companion namespaces that exist.
+    fn companions_left(store: &DocStore, namespace: &str) -> Vec<String> {
+        let prefix = format!("{namespace}_");
+        store
+            .db
+            .list_namespaces()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Dropping a vector index, or its whole store, while a maintenance
+    /// operation runs must wait for the operation and stop maintenance on that
+    /// partition. Maintenance resolves namespaces with get-or-create, so a write
+    /// it made after the drop recreated the dropped namespaces: orphans that
+    /// return at every restart, or stray postings in a re-enabled partition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_waits_for_running_maintenance_and_stops_it() {
+        for drop_store in [false, true] {
+            let (url, _seen) = spawn_service();
+            let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+            store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+            store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+            wait_for_empty_queue(&store).await;
+            let handle = partition(&store, "g").await;
+            let ops = load_vector_settings(&store.schema_dir, "g").unwrap().0.maintenance.ops();
+            let store = std::sync::Arc::new(store);
+
+            // An operation in progress: it holds the maintenance lock and writes.
+            let running = handle.lock_maintenance().await;
+            let dropping = tokio::spawn({
+                let store = std::sync::Arc::clone(&store);
+                async move {
+                    if drop_store {
+                        store.remove("g").await.unwrap();
+                    } else {
+                        store.disable_semantic_search("g").unwrap();
+                        store.drop_vector_index_data("g").await.unwrap();
+                    }
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            store
+                .db
+                .namespace(vector_kv::ivf_journal_ns("g"))
+                .await
+                .unwrap()
+                .put(b"op".to_vec(), b"record".to_vec())
+                .await
+                .unwrap();
+            drop(running);
+            dropping.await.unwrap();
+            // Maintenance on the partition it held, as a queued request would run it.
+            assert!(
+                crate::ivf_split::maintain_partition(&store.db, "g", &handle, &ops).await.is_err(),
+                "drop_store={drop_store}: maintenance went on after the drop"
+            );
+            let left = companions_left(&store, "g");
+            assert!(left.is_empty(), "drop_store={drop_store}: dropped namespaces are back: {left:?}");
+            store.shutdown_vec_index_worker().await;
+            store.shutdown().await.unwrap();
+        }
+    }
+
+    /// A document deleted while its namespace's partition is first loaded
+    /// (after the load counted the store, before it was installed) must not
+    /// leave the counts one too high: a delete's count change was dropped when
+    /// no partition was loaded, so the load's count, which saw the document,
+    /// stayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_during_the_first_load_keeps_the_counts_exact() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for id in 1..=3 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        // No worker from here: its own first load would install a partition
+        // counted after the delete and hide the foreground path under test.
+        store.shutdown_vec_index_worker().await;
+        let store = std::sync::Arc::new(store);
+        store.semantic_ctx.as_ref().unwrap().evict("g"); // the next use loads and counts
+
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
+        let loading = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { partition(&store, "g").await }
+        });
+        reached.notified().await; // counted, not yet installed
+        let deleting = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { store.delete("g", DocId::U64(2)).await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.notify_one();
+        deleting.await.unwrap();
+        let handle = loading.await.unwrap();
+
+        let truth: std::collections::HashMap<u32, (u64, u64)> = vector_kv::count_postings(&store.db, "g").await.unwrap();
+        let counted: std::collections::HashMap<u32, (u64, u64)> =
+            handle.snapshot().counts().snapshot().into_iter().filter(|(_, c)| c.0 > 0).collect();
+        assert_eq!(counted, truth, "the loaded counts differ from the store's");
+        store.shutdown().await.unwrap();
+    }
+
+    /// Every user of a partition gets it only after its journal is recovered:
+    /// a write before recovery could route to a split's children that recovery
+    /// then retires, chunks and all.
+    #[tokio::test]
+    async fn a_partition_is_handed_out_only_after_its_journal_is_recovered() {
+        let (url, _seen) = spawn_service();
+        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let store = open_fresh(db_dir.path(), schema_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for id in 1..=5 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let handle = partition(&store, "g").await;
+        // A split cut short once it is published (the copy fails), as a crash
+        // would leave it.
+        crate::vector_kv::crash_point::arm(7);
+        let split = crate::ivf_split::split_posting(&store.db, "g", &handle, 0, &crate::ivf_split::MaintenanceOps::split_only(1)).await;
+        crate::vector_kv::crash_point::disarm();
+        assert!(split.is_err(), "set-up: the split was cut short");
+        let journal = || async {
+            store
+                .db
+                .namespace(vector_kv::ivf_journal_ns("g"))
+                .await
+                .unwrap()
+                .scan_prefix(Vec::new())
+                .await
+                .unwrap()
+                .len()
+        };
+        assert_eq!(journal().await, 1, "set-up: the split is in the journal");
+
+        // A restart: the partition is loaded again, by its next user.
+        store.semantic_ctx.as_ref().unwrap().evict("g");
+        let handle = partition(&store, "g").await;
+        assert_eq!(journal().await, 0, "the partition was handed out with its journal unfinished");
+        assert!(!handle.needs_recovery());
+        assert_eq!(
+            handle.snapshot().posting_infos()[&0].state,
+            crate::semantic_search::PostingState::Retired,
+            "the split was finished"
+        );
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+}

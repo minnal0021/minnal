@@ -99,6 +99,10 @@ pub mod semantic_search;
 // cache) over raw namespaces — usable with `kv-store` alone, no `doc-store`.
 #[cfg(feature = "semantic-search")]
 pub mod vector_kv;
+// Splitting a namespace's postings: the maintenance journal, the split
+// executor and its crash recovery (design doc M3a).
+#[cfg(feature = "semantic-search")]
+pub mod ivf_split;
 
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 
@@ -120,6 +124,10 @@ pub use db::facade::Namespace;
 
 /// Scoped handle to a single namespace (async).
 pub use db::facade::AsyncNamespace;
+
+/// A prefix-batch scan's entries, packed into a few buffers
+/// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
+pub use db::kv_store::PrefixScan;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -241,6 +249,7 @@ pub use db::stats::GCStats;
 pub use db::metrics::{Metrics, MetricsSnapshot};
 
 /// Snapshot of WAL state returned by [`Db::wal_metadata`].
+pub use db::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
 pub use db::wal::WalMetadata;
 
 /// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].

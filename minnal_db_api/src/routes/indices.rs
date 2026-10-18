@@ -27,7 +27,7 @@ use crate::{AppState, error::AppError, routes::stores::reload_schema};
 pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>) -> impl IntoResponse {
     let mut snaps: Vec<IndexBuildSnapshot> = state.index_manager.list().into_iter().filter(|s| s.id.namespace() == ns).collect();
 
-    if let Some(c) = state.store.vec_reindex_progress(&ns) {
+    if let Some(c) = state.store.vec_reindex_progress(&ns).await {
         use minnal_db::doc_store::index_progress::now_ms;
         let status = match c.status.as_str() {
             "complete" => BuildStatus::Complete,

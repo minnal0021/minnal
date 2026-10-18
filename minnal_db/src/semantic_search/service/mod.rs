@@ -4,20 +4,20 @@
 //! This module contains only higher-level logic: quantisation, cluster
 //! probing, and result ranking.  Raw text is forwarded to the service as-is.
 
-mod embedding_service;
+pub(crate) mod embedding_service;
 
 pub use crate::semantic_search::index::vector_index::QuantisationStyle;
 
 use crate::semantic_search::chunking;
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use rayon::prelude::*;
 
-use crate::semantic_search::cluster::ClusterIndex;
+use crate::semantic_search::cluster::{IvfLayout, ProbeSettings, ZERO_CENTRE, select_probes};
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QueryResult, VectorIndex, VectorKvStore};
 use crate::semantic_search::quantisation::rabitq;
@@ -43,9 +43,22 @@ static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 
 /// One fetched Pass-1 entry, borrowed from the scan result:
 /// `(cluster_id, per-query-vector estimators for that cluster, doc_id, raw rkyv bytes)`.
-type SparseEntryRef<'a> = (u32, &'a [SingleBitQuanDotProductEstimator], &'a [u8], &'a [u8]);
+/// One probed Pass-1 entry: its posting, document id and archived chunk codes.
+type SparseEntryRef<'a> = (u32, &'a [u8], &'a [u8]);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
+
+/// The default probe settings: read about 42,000 entries per query, probing 1
+/// to 1,024 postings. On FiQA (173k chunks, the largest corpus measured) nDCG
+/// stops rising at every cutoff from 10 to 100 at about 35,000 entries; 42,000
+/// is that plus 20%. It reads 37% of FiQA in 7.8 ms warm, within 0.0007 nDCG of
+/// a full read at every cutoff (vector bench, 2026-10-18; 70,000 read 62% in
+/// 12.2 ms for the same nDCG). SciFact (23k chunks) is still read in full.
+pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
+    budget_entries: 42_000,
+    min_probes: 1,
+    max_probes: 1024,
+};
 
 /// Configuration required to call the embedding service.
 #[derive(Debug, Clone)]
@@ -59,8 +72,7 @@ pub struct SemanticSearchConfig {
     /// `{embedding_service_url}/embedding/{model_name}/document` and
     /// `.../query` — so it picks which of the service's loaded models embeds
     /// the text; a model the service does not serve fails with a 404. It must
-    /// match the model the cluster centroids (`cluster_path`) were fitted on
-    /// and the model every stored vector was embedded with: vectors from
+    /// match the model every stored vector was embedded with: vectors from
     /// different models live in different spaces, so switching models means
     /// re-indexing the corpus. The startup probe
     /// ([`check_embedding_service`]) checks the service loads it.
@@ -83,9 +95,10 @@ pub struct SemanticSearchConfig {
     /// How far the document chunk window advances, in sentences. Default: 2.
     pub sliding_size: usize,
 
-    /// Number of IVF clusters to probe in the first-pass sparse (single-bit) search.
-    /// Default: 32.
-    pub n_probes: usize,
+    /// How many postings the first-pass sparse (single-bit) search probes: an
+    /// entry budget bounded by a minimum and maximum posting count
+    /// ([`ProbeSettings`]). Default: 42,000 entries, 1 to 1,024 postings.
+    pub probe: ProbeSettings,
 
     /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
     /// Default: 1000.
@@ -95,6 +108,10 @@ pub struct SemanticSearchConfig {
     /// `system_qemb_cache` namespace. Stale entries are evicted automatically by
     /// the TTL worker once this duration elapses. Default: 1 day.
     pub query_embedding_cache_ttl: std::time::Duration,
+
+    /// Time-to-live for the partition history (`system_partition_history`):
+    /// recorded code-health reads, recall checks and rebuilds. Default: 30 days.
+    pub partition_history_ttl: std::time::Duration,
 
     /// Overall timeout for a single embedding-service HTTP request (connect +
     /// send + receive). Caps how long an indexing or search call can block on a
@@ -117,11 +134,12 @@ impl Default for SemanticSearchConfig {
             embedding_dim: 768,
             top_k_results: 100,
             number_of_bits_for_dense_quantisation: 8,
-            n_probes: 64,
+            probe: DEFAULT_PROBE,
             window_size: 4,
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
             query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
+            partition_history_ttl: crate::ivf_split::history::DEFAULT_HISTORY_TTL,
             embedding_request_timeout: std::time::Duration::from_secs(30),
             embedding_connect_timeout: std::time::Duration::from_secs(10),
         }
@@ -158,11 +176,20 @@ pub struct QueryEmbeddings {
 /// Returns the multi-bit entry first, followed by the single-bit entries. The
 /// combined list can be passed directly to `upsert_vectors`; the storage
 /// layer groups by `(style, cluster_id)`.
-pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &ClusterIndex, text: &str) -> Result<Vec<VectorIndex>, EmbeddingError> {
-    let multi_bit_style = QuantisationStyle::MultiBit {
-        number_of_bits: config.number_of_bits_for_dense_quantisation,
-    };
+pub async fn embed_document<L: IvfLayout + ?Sized>(
+    config: &SemanticSearchConfig,
+    layout: &L,
+    text: &str,
+) -> Result<Vec<VectorIndex>, EmbeddingError> {
+    let (dense, chunks) = embed_document_floats(config, text).await?;
+    index_embeddings(config, layout, &dense, &chunks)
+}
 
+/// The embedding-service half of [`embed_document`]: the whole-document vector
+/// and one vector per chunk, not yet routed or quantised. Kept apart so a
+/// caller can route under its partition's routing epoch without holding it
+/// across the network call.
+pub async fn embed_document_floats(config: &SemanticSearchConfig, text: &str) -> Result<(Vec<f32>, Vec<Vec<f32>>), EmbeddingError> {
     // payload[0] = whole document (dense); payload[1..] = sliding-window chunks (sparse).
     let mut payloads = Vec::with_capacity(1);
     payloads.push(text.to_string());
@@ -181,14 +208,35 @@ pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &Clust
     .await?;
 
     // Split the ordered response: first = dense (MultiBit), rest = sparse chunks (SingleBit).
-    let mut it = embeddings.iter();
-    let dense = it.next().ok_or(EmbeddingError::EmptyResponse)?;
-    let mut indexes = Vec::with_capacity(embeddings.len());
-    indexes.push(rabitq::index_embedding(&cluster_index.clusters, dense, multi_bit_style)?);
-    for e in it {
-        indexes.push(rabitq::index_embedding(&cluster_index.clusters, e, QuantisationStyle::SingleBit)?);
-    }
+    let mut embeddings = embeddings.into_iter();
+    let dense = embeddings.next().ok_or(EmbeddingError::EmptyResponse)?;
+    Ok((dense, embeddings.collect()))
+}
 
+/// Quantise a document's already-fetched embeddings into its vector-index entries:
+/// `dense` (the whole-text embedding) as one `MultiBit` entry, then each of `chunks`
+/// (the sliding-window embeddings) as a `SingleBit` entry assigned to its nearest
+/// IVF cluster.
+///
+/// This is everything [`embed_document`] does after the embedding-service call.
+/// It is separate so the vector benchmark can index saved embeddings through the
+/// exact production path without calling the service.
+pub fn index_embeddings<L: IvfLayout + ?Sized>(
+    config: &SemanticSearchConfig,
+    layout: &L,
+    dense: &[f32],
+    chunks: &[Vec<f32>],
+) -> Result<Vec<VectorIndex>, EmbeddingError> {
+    let multi_bit_style = QuantisationStyle::MultiBit {
+        number_of_bits: config.number_of_bits_for_dense_quantisation,
+    };
+    let mut indexes = Vec::with_capacity(1 + chunks.len());
+    // Whole-document codes against the zero centre (design doc M2c); chunks against
+    // their posting's centre.
+    indexes.push(rabitq::index_embedding_zero_centred(layout, dense, multi_bit_style));
+    for e in chunks {
+        indexes.push(rabitq::index_embedding_rotated(layout, e, QuantisationStyle::SingleBit)?);
+    }
     Ok(indexes)
 }
 
@@ -200,11 +248,11 @@ pub async fn embed_document(config: &SemanticSearchConfig, cluster_index: &Clust
 ///
 /// Queries used to be split into 4-word sliding windows, each embedded on its
 /// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
-/// `semantic_search/query-embedding-report.md`) found the whole-query vector
+/// `semantic_search/report/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
-/// It is also much cheaper: one embedding instead of 1 + N, and `n_probes`
-/// clusters probed instead of the union over every fragment (search up to 74%
+/// It is also much cheaper: one embedding instead of 1 + N, and one vector's
+/// postings probed instead of the union over every fragment (search up to 74%
 /// faster). Document-style sentence windows for long queries gained nothing
 /// either.
 pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<QueryEmbeddings, EmbeddingError> {
@@ -233,8 +281,10 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 /// # Algorithm
 ///
 /// **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
-/// 1. For each query vector `q_i` in `query_sparse_embeddings`, find the `n_probes`
-///    closest clusters by Euclidean distance.
+/// 1. For each query vector `q_i` in `query_sparse_embeddings`, walk the clusters
+///    nearest first (Euclidean distance) until their entries reach the probe
+///    budget, within the minimum and maximum probe counts (`config.probe`,
+///    [`ProbeSettings`]).
 /// 2. Scan all SingleBit (document-chunk) entries in the union of those clusters in parallel.
 /// 3. For each document `d` and each query vector `q_i`, estimate `max_j ⟨q_i, d_j⟩`
 ///    over all chunks `d_j` of `d` found in the probed clusters.
@@ -243,8 +293,8 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 /// 5. Retain the top `first_pass_sparse_search_top_k` candidates.
 ///
 /// In production the query is **not chunked**: [`embed_query`] passes a single
-/// vector (the whole-query embedding), so Pass 1 probes exactly `n_probes`
-/// clusters and `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
+/// vector (the whole-query embedding), so Pass 1 probes one vector's clusters
+/// and `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
 /// The multi-vector form is kept general.
 ///
 /// **Pass 2 — dense (MultiBit):**
@@ -319,10 +369,10 @@ fn doc_id_hex(doc_id: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn search<K, F>(
+pub async fn search<K, F, L>(
     config: &SemanticSearchConfig,
     namespace: &str,
-    cluster_index: &ClusterIndex,
+    layout: &L,
     query_sparse_embeddings: &[Vec<f32>],
     query_dense_embedding: &[f32],
     kv_store: &K,
@@ -332,6 +382,7 @@ pub async fn search<K, F>(
 where
     K: VectorKvStore,
     F: Fn(&[u8]) -> bool + Sync,
+    L: IvfLayout + ?Sized,
 {
     if query_sparse_embeddings.is_empty() || query_dense_embedding.is_empty() {
         return Ok(vec![]);
@@ -342,7 +393,7 @@ where
     // which panic on a length mismatch — a wrong-dimension query is a misconfiguration
     // (or a stale cluster file), not data, so return no results with a warning rather
     // than crashing the search worker deep in a parallel loop.
-    let expected_dim = cluster_index.dim();
+    let expected_dim = layout.dim();
     if query_dense_embedding.len() != expected_dim || query_sparse_embeddings.iter().any(|q| q.len() != expected_dim) {
         warn!("semantic search query embedding dimension does not match centroid dimension {expected_dim}; returning no results");
         return Ok(vec![]);
@@ -350,26 +401,24 @@ where
 
     let top_k_limit = top_k.unwrap_or(config.top_k_results);
 
+    // The codes live in the index's rotated space, so every term a query meets them
+    // in (its sum and its dot product with the code bits) uses the rotated query;
+    // probing and ⟨q, c⟩ keep the original (rotation preserves both). Rotated once
+    // here, not per cluster or per entry. See `ClusterIndex`.
+    let rotated_sparse: Vec<Vec<f32>> = query_sparse_embeddings.iter().map(|q| layout.rotate(q)).collect();
+    let rotated_dense = layout.rotate(query_dense_embedding);
+
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
-    // Union of top-n_probes clusters across all Pass-1 query vectors (in production
-    // there is one, so this is just its n_probes nearest). The per-vector top-n scans
-    // are batched over a contiguous centroid matrix; the union/dedup below preserves
-    // first-seen order over the batched results.
-    let probe_clusters: Vec<u32> = {
-        let mut seen = std::collections::HashSet::new();
-        let mut ids = Vec::new();
-        for chunk_ids in cluster_index.find_top_n_cluster_ids_batch(query_sparse_embeddings, config.n_probes) {
-            for id in chunk_ids {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
-            }
-        }
-        ids
-    };
+    // Each Pass-1 query vector's nearest clusters within the probe budget, then
+    // their union (in production there is one vector). The per-vector rankings
+    // are batched over a contiguous centroid matrix.
+    let (probe_clusters, planned_entries) = select_probes(layout, query_sparse_embeddings, &config.probe);
 
-    debug!("ANN search: probing {} cluster(s) (sparse pass)", probe_clusters.len());
+    debug!(
+        "ANN search: probing {} cluster(s), about {planned_entries} entries (sparse pass)",
+        probe_clusters.len()
+    );
 
     // Fetch all probed clusters in a single batch operation: one blocking task, which
     // spawns a scoped thread per overlapping L1 bucket and then one per value-log bucket.
@@ -390,39 +439,38 @@ where
     // Query vectors for which no chunk of `d` falls in a probed cluster contribute 0.
     let n_query = query_sparse_embeddings.len();
 
-    // One estimator per (probed cluster, query vector): query_to_centroid_dot_product
-    // and scaled_query_sum are constant across a cluster's entries. A probed id with
-    // no centroid in the index contributes no candidates.
-    let query_sums: Vec<f32> = query_sparse_embeddings
-        .iter()
-        .map(|q| SingleBitQuanDotProductEstimator::query_sum(q))
-        .collect();
-    let cluster_estimators: HashMap<u32, Vec<SingleBitQuanDotProductEstimator>> = sparse_by_cluster
-        .keys()
-        .filter_map(|&cluster_id| {
-            let cluster = cluster_index.clusters.get(&cluster_id)?;
-            let estimators = query_sparse_embeddings
-                .iter()
-                .zip(&query_sums)
-                .map(|(q, &sum)| SingleBitQuanDotProductEstimator::with_query_sum(cluster_id, q, &cluster.centroid, sum))
-                .collect();
-            Some((cluster_id, estimators))
-        })
-        .collect();
+    // One estimator per (centre, query vector): query_to_centroid_dot_product and
+    // scaled_query_sum are constant across every code encoded against that centre.
+    // Codes are decoded through their own `centre_id`, never the posting they sit
+    // in (a posting can hold codes encoded against an older centre). A namespace
+    // keeps every centre it ever had (splits and rebuilds add them; codes keep
+    // theirs), so the table is filled lazily: a centre's estimators are built by
+    // the first scoring thread that meets one of its codes, and a search pays
+    // only for the centres its probed codes use. A code naming a centre the
+    // layout does not have is skipped (and counted).
+    let query_sums: Vec<f32> = rotated_sparse.iter().map(|q| SingleBitQuanDotProductEstimator::query_sum(q)).collect();
+    let centre_estimators = CentreEstimators::new(layout);
+    let estimators_of = |centre_id: u32| -> Option<&[SingleBitQuanDotProductEstimator]> {
+        centre_estimators
+            .cell(centre_id)?
+            .get_or_init(|| {
+                let centre = layout.centre(centre_id)?;
+                Some(
+                    query_sparse_embeddings
+                        .iter()
+                        .zip(&query_sums)
+                        .map(|(q, &sum)| SingleBitQuanDotProductEstimator::with_query_sum(centre_id, q, centre, sum))
+                        .collect(),
+                )
+            })
+            .as_deref()
+    };
 
     // Flatten every probed entry into one list so rayon splits the *entries*, not the
     // clusters: IVF clusters are heavily skewed (one cluster can hold a third of a
     // corpus), and splitting by cluster left that cluster's scan on a single thread.
-    // Entries are borrowed from `sparse_by_cluster`; nothing is copied.
-    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster
-        .iter()
-        .filter_map(|(cluster_id, cluster_entries)| Some((*cluster_id, cluster_estimators.get(cluster_id)?.as_slice(), cluster_entries)))
-        .flat_map(|(cluster_id, estimators, cluster_entries)| {
-            cluster_entries
-                .iter()
-                .map(move |(doc_id, raw_bytes)| (cluster_id, estimators, doc_id.as_slice(), raw_bytes.as_slice()))
-        })
-        .collect();
+    // Entries are borrowed from `sparse_by_cluster`'s buffers; nothing is copied.
+    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster.iter().collect();
 
     // Score each entry into its own row of a flat `n_query`-wide matrix: row[i] is
     // max_j ⟨q_i, d_j⟩ over that entry's chunks. Rows start at NEG_INFINITY so an
@@ -436,7 +484,7 @@ where
         .par_chunks_mut(n_query)
         .zip(kept.par_iter_mut())
         .zip(entries.par_iter())
-        .for_each_init(Vec::<u64>::new, |words_buf, ((row, kept), &(cluster_id, estimators, doc_id, raw_bytes))| {
+        .for_each_init(Vec::<u64>::new, |words_buf, ((row, kept), &(cluster_id, doc_id, raw_bytes))| {
             if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) {
                 return;
             }
@@ -468,20 +516,40 @@ where
                 );
                 return;
             }
-            // Per chunk: copy its packed words once, then update every query token's
-            // running max.
+            // Per chunk: find its centre's estimators (a document's chunks in one
+            // posting almost always share a centre, so the last lookup is reused),
+            // copy its packed words once, then update every query token's running max.
+            let mut last: Option<(u32, Option<&[SingleBitQuanDotProductEstimator]>)> = None;
+            let mut scored_any = false;
             for vi in vi_list.iter() {
+                let centre_id = vi.centre_id();
+                let estimators = match last {
+                    Some((id, estimators)) if id == centre_id => estimators,
+                    _ => {
+                        let estimators = estimators_of(centre_id);
+                        last = Some((centre_id, estimators));
+                        estimators
+                    }
+                };
+                let Some(estimators) = estimators else {
+                    crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
+                    continue;
+                };
                 vi.copy_packed_into(words_buf);
                 let scaling_factor = vi.scaling_factor();
-                for ((q, estimator), row_max) in query_sparse_embeddings.iter().zip(estimators).zip(row.iter_mut()) {
+                for ((q, estimator), row_max) in rotated_sparse.iter().zip(estimators).zip(row.iter_mut()) {
                     let score = estimator.estimate_from_parts(q, words_buf, scaling_factor);
                     if score > *row_max {
                         *row_max = score;
                     }
                 }
+                scored_any = true;
             }
-            *kept = true;
+            *kept = scored_any;
         });
+
+    #[cfg(test)]
+    test_hooks::note_estimator_centres(namespace, centre_estimators.built());
 
     // Group entries by document (a document's chunks can sit in several probed
     // clusters) by sorting entry indices on doc_id, then fold each group's rows
@@ -489,10 +557,10 @@ where
     // replaces a per-document HashMap entry — and its key/row allocations — per
     // worker, plus the cross-worker merge of those maps.
     let mut order: Vec<usize> = (0..entries.len()).filter(|&i| kept[i]).collect();
-    order.par_sort_unstable_by(|&a, &b| entries[a].2.cmp(entries[b].2));
+    order.par_sort_unstable_by(|&a, &b| entries[a].1.cmp(entries[b].1));
     let mut doc_maxes = vec![f32::NEG_INFINITY; n_query];
     let mut sparse_ranked: Vec<(&[u8], f32)> = order
-        .chunk_by(|&a, &b| entries[a].2 == entries[b].2)
+        .chunk_by(|&a, &b| entries[a].1 == entries[b].1)
         .map(|group| {
             doc_maxes.fill(f32::NEG_INFINITY);
             for &i in group {
@@ -502,7 +570,7 @@ where
                     }
                 }
             }
-            (entries[group[0]].2, maxsim_score(&doc_maxes))
+            (entries[group[0]].1, maxsim_score(&doc_maxes))
         })
         .collect();
 
@@ -526,15 +594,11 @@ where
     // Fetch all dense entries in one batch operation (single blocking task in production).
     let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.to_vec()).collect();
 
-    // Pass 1 is done with the scanned entries: free them off the request path. They
-    // are two heap buffers per entry (doc_id + rkyv bytes), and dropping ~90k entries
-    // on a 57k-doc corpus took ~6 ms single-threaded — the same order as all of
-    // Pass 1's scoring. The total work is unchanged; it just no longer delays the reply.
-    // Not `rayon::spawn`: a 6 ms job queued on the rayon pool gets stolen by workers
-    // waiting inside another search's `join` and stalls that search (see SCORING_GATE).
+    // Pass 1 is done with the scanned entries. They sit in a few large buffers
+    // (`SparseScan`), so freeing them is a few frees, not two per entry.
     drop(entries);
     drop(pass1_permit);
-    tokio::task::spawn_blocking(move || drop(sparse_by_cluster));
+    drop(sparse_by_cluster);
 
     let dense_raw = kv_store.get_dense_entries_batch(&dense_doc_ids).await?;
 
@@ -542,7 +606,7 @@ where
 
     // scaled_query_sum is constant for the whole-query dense embedding + bit-width
     // across all clusters, so compute it once.
-    let scaled_query_sum = MultiBitQuanDotProductEstimator::scaled_query_sum(query_dense_embedding, config.number_of_bits_for_dense_quantisation);
+    let scaled_query_sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rotated_dense, config.number_of_bits_for_dense_quantisation);
 
     // The dense namespace must hold MultiBit entries at exactly the configured
     // bit-width — the estimator and scaled_query_sum are built for that width, so a
@@ -551,76 +615,76 @@ where
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
 
-    // Each VectorIndex carries its own cluster_id for centroid lookup, so we
-    // score each document directly against the single whole-query embedding.
+    // Whole-document codes are encoded against the zero centre (design doc M2c), so
+    // `⟨q, c⟩ = 0` and one estimator serves every candidate. A code encoded
+    // against anything else is a write-path bug or corruption: skipped, counted
+    // and logged, never silently scored against the wrong centre.
     //
     // Entries are read zero-copy from their rkyv archive (packed words copied into a
-    // reused buffer). The dense estimator's per-cluster scalar (query·centroid) is
-    // constant for every candidate in the same cluster, so it is cached per cluster in
-    // the per-worker `est_cache` — with ~1000 candidates over ~n_probes clusters this
-    // builds ~n_probes estimators instead of one per candidate. Both pieces of reused
-    // state are per rayon worker via `map_init`; doc_ids are moved (not cloned) into the
+    // per-worker buffer via `map_init`); doc_ids are moved (not cloned) into the
     // heap entries.
     let _pass2_permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
+    let origin = vec![0.0f32; query_dense_embedding.len()];
+    let estimator = MultiBitQuanDotProductEstimator::with_scaled_query_sum(ZERO_CENTRE, query_dense_embedding, &origin, scaled_query_sum);
     let scored: Vec<HeapEntry> = dense_doc_ids
         .into_par_iter()
         .zip(dense_raw.into_par_iter())
-        .map_init(
-            || (HashMap::<u32, MultiBitQuanDotProductEstimator>::new(), Vec::<u64>::new()),
-            |(est_cache, words_buf), (doc_id, opt_bytes)| {
-                let raw_bytes = opt_bytes?;
-                let list = match VectorIndex::access_list(&raw_bytes) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        // Corrupt dense entry: skip it, but log it so index corruption is
-                        // not mistaken for a candidate simply scoring poorly in pass 2.
-                        crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
-                        warn!(
-                            "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
-                            doc_id_hex(&doc_id),
-                            raw_bytes.len(),
-                        );
-                        return None;
-                    }
-                };
-                // The dense namespace stores exactly one MultiBit entry per document
-                // (embed_document emits a single whole-doc dense vector; upsert only
-                // writes a dense value when at least one MultiBit entry is present). A
-                // count other than 1 means a write-path bug, a duplicate, or corruption —
-                // skip rather than silently scoring an arbitrary `first()` and letting a
-                // stale entry shadow the correct one.
-                if list.len() != 1 {
+        .map_init(Vec::<u64>::new, |words_buf, (doc_id, opt_bytes)| {
+            let raw_bytes = opt_bytes?;
+            let list = match VectorIndex::access_list(&raw_bytes) {
+                Ok(list) => list,
+                Err(e) => {
+                    // Corrupt dense entry: skip it, but log it so index corruption is
+                    // not mistaken for a candidate simply scoring poorly in pass 2.
+                    crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
                     warn!(
-                        "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
-                        list.len(),
+                        "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
                         doc_id_hex(&doc_id),
+                        raw_bytes.len(),
                     );
                     return None;
                 }
-                let vi = &list[0];
-                let style = vi.style();
-                if style != expected_dense_style {
-                    warn!(
-                        "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
-                        doc_id_hex(&doc_id),
-                    );
-                    return None;
-                }
-                let cluster_id = vi.cluster_id();
-                let cluster = cluster_index.clusters.get(&cluster_id)?;
-
-                let estimator = est_cache.entry(cluster_id).or_insert_with(|| {
-                    MultiBitQuanDotProductEstimator::with_scaled_query_sum(cluster_id, query_dense_embedding, &cluster.centroid, scaled_query_sum)
-                });
-                vi.copy_packed_into(words_buf);
-                let dot_product = estimator.estimate_from_parts(query_dense_embedding, words_buf, vi.addition_factor(), vi.scaling_factor());
-                Some(HeapEntry {
-                    dot_product,
-                    error_bound: vi.error_bound(),
-                    document_id: doc_id,
-                })
-            },
-        )
+            };
+            // The dense namespace stores exactly one MultiBit entry per document
+            // (embed_document emits a single whole-doc dense vector; upsert only
+            // writes a dense value when at least one MultiBit entry is present). A
+            // count other than 1 means a write-path bug, a duplicate, or corruption —
+            // skip rather than silently scoring an arbitrary `first()` and letting a
+            // stale entry shadow the correct one.
+            if list.len() != 1 {
+                warn!(
+                    "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
+                    list.len(),
+                    doc_id_hex(&doc_id),
+                );
+                return None;
+            }
+            let vi = &list[0];
+            let style = vi.style();
+            if style != expected_dense_style {
+                warn!(
+                    "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
+                    doc_id_hex(&doc_id),
+                );
+                return None;
+            }
+            if vi.centre_id() != ZERO_CENTRE {
+                crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
+                error!(
+                    "skipping dense vector entry not encoded against the zero centre: doc_id={} centre_id={}",
+                    doc_id_hex(&doc_id),
+                    vi.centre_id(),
+                );
+                return None;
+            }
+            vi.copy_packed_into(words_buf);
+            let dot_product = estimator.estimate_from_parts(&rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
+            Some(HeapEntry {
+                dot_product,
+                error_bound: vi.error_bound(),
+                document_id: doc_id,
+            })
+        })
         .flatten()
         .collect();
 
@@ -660,7 +724,7 @@ const PROBE_NORM_TOLERANCE: f32 = 0.05;
 /// Probe the embedding service to verify it is reachable **and** speaks the
 /// expected contract.
 ///
-/// Intended to run once at startup, after the cluster index loads. It:
+/// It:
 /// 1. GETs `{url}/healthcheck` and checks the service lists `model_name` among
 ///    its loaded models with status `ok`.
 /// 2. Embeds a known payload through **both** of that model's document and
@@ -671,14 +735,12 @@ const PROBE_NORM_TOLERANCE: f32 = 0.05;
 ///    search later, and both endpoints are confirmed to agree.
 /// 3. Soft-checks that the probe embedding is unit-norm and warns otherwise.
 ///
-/// **Limitation:** this checks that the service serves the *named* model, not
-/// that the cluster centroids were fitted on it — `model_name` and
-/// `cluster_path` are configured separately, and centroids from another model
-/// with the same dimension load without error (see `semantic_search/CLAUDE.md`).
-///
-/// A failure is non-fatal at the call site (the server starts anyway and semantic
-/// search surfaces the error at request time); returning `Err` just makes startup
-/// log it loudly.
+/// The API server runs it at startup for each (model, dimension) an existing
+/// semantic namespace uses (non-fatal: semantic requests surface the error at
+/// call time), and when a store enables semantic search, where
+/// [`EmbeddingError::is_configuration_error`] decides whether a failure rejects
+/// the request or only warns. Centroids are not its concern: they are chosen
+/// by the namespace's model (`SemanticSearchContext::for_namespace`).
 pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<(), EmbeddingError> {
     info!(
         "checking embedding service health at {}/healthcheck (model '{}')",
@@ -734,7 +796,38 @@ pub async fn check_embedding_service(config: &SemanticSearchConfig) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::index::vector_index::{ClusterBatchResult, ClusterEntries};
+    use crate::semantic_search::index::vector_index::{ClusterEntries, SparseScan};
+
+    /// Sixteen 768-d unit centroids for the fixture embeddings: eight leaning
+    /// towards the fixture document (as a fitted centre near it would), eight
+    /// random. Deterministic.
+    fn fixture_clusters() -> crate::semantic_search::cluster::ClusterIndex {
+        use crate::semantic_search::cluster::{Cluster, ClusterIndex};
+        #[derive(serde::Deserialize)]
+        struct EmbeddingFile {
+            embeddings: Vec<Vec<f32>>,
+        }
+        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_data/doc_embedding.json");
+        let doc: Vec<f32> = serde_json::from_str::<EmbeddingFile>(&std::fs::read_to_string(doc_path).unwrap())
+            .unwrap()
+            .embeddings
+            .remove(0);
+        let mut state = 0x5eed_u64;
+        let mut noise = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let clusters = (0..16u32)
+            .map(|id| {
+                let lean = if id < 8 { 0.6 } else { 0.0 };
+                let mut c: Vec<f32> = doc.iter().map(|&x| lean * x + 0.05 * noise()).collect();
+                let n = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+                c.iter_mut().for_each(|v| *v /= n);
+                (id, Cluster::new(id, c))
+            })
+            .collect();
+        ClusterIndex::from_clusters(clusters)
+    }
 
     #[test]
     fn test_default_config() {
@@ -941,15 +1034,14 @@ mod tests {
     /// 5. The **relative** difference between the two must be < 0.1% (1e-3).
     #[test]
     fn test_quantised_dot_product_accuracy() {
-        use crate::semantic_search::cluster::{ClusterIndex, find_closest_cluster_id};
+        use crate::semantic_search::cluster::find_closest_cluster_id;
         use crate::semantic_search::index::distance_estimator::MultiBitQuanDotProductEstimator;
         use crate::semantic_search::quantisation::rabitq;
         use simsimd::SpatialSimilarity;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let n_bits = 8;
 
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found — run from the workspace root");
+        let cluster_index = fixture_clusters();
 
         // ── Load pre-saved real embeddings from fixture files ─────────────────
         #[derive(serde::Deserialize)]
@@ -1022,6 +1114,121 @@ mod tests {
 
     // ── QuantisationStyle ─────────────────────────────────────────────────────
 
+    // ── Rotation (design doc M1) ──────────────────────────────────────────────
+
+    fn unit_vec(dim: usize, seed: u64) -> Vec<f32> {
+        let mut st = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut v: Vec<f32> = (0..dim)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    fn rotated_cluster_index(dim: usize, clusters: u32) -> crate::semantic_search::ClusterIndex {
+        use crate::semantic_search::cluster::{Cluster, ClusterIndex};
+        let index = ClusterIndex::from_clusters((0..clusters).map(|id| (id, Cluster::new(id, unit_vec(dim, 1000 + id as u64)))).collect());
+        assert!(index.is_rotated(), "a {dim}-d index must be rotated");
+        index
+    }
+
+    /// `search()` scores a code with ⟨q, c⟩ on the original query and centroid and
+    /// everything else on the rotated query. That must equal the estimator applied
+    /// to explicitly rotated inputs throughout (rotation preserves ⟨q, c⟩); a query
+    /// term left unrotated breaks the equality.
+    #[test]
+    fn rotated_scoring_matches_scoring_fully_rotated_inputs() {
+        use crate::semantic_search::index::distance_estimator::{
+            DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator,
+        };
+        let index = rotated_cluster_index(768, 8);
+        for seed in 0..20 {
+            let (x, q) = (unit_vec(768, seed), unit_vec(768, 500 + seed));
+            let rq = index.rotate(&q);
+
+            let vi = rabitq::index_embedding_rotated(&index, &x, QuantisationStyle::SingleBit).unwrap();
+            let c = &index.clusters[&vi.cluster_id].centroid;
+            let rc = index.rotated_centroid(vi.cluster_id).unwrap();
+            let as_search = SingleBitQuanDotProductEstimator::with_query_sum(vi.cluster_id, &q, c, SingleBitQuanDotProductEstimator::query_sum(&rq))
+                .estimate_distance(&rq, &vi);
+            let all_rotated = SingleBitQuanDotProductEstimator::new(vi.cluster_id, &rq, rc).estimate_distance(&rq, &vi);
+            assert!((as_search - all_rotated).abs() < 1e-4, "1-bit, seed {seed}: {as_search} vs {all_rotated}");
+
+            let style = QuantisationStyle::MultiBit { number_of_bits: 8 };
+            let vi = rabitq::index_embedding_rotated(&index, &x, style).unwrap();
+            let c = &index.clusters[&vi.cluster_id].centroid;
+            let rc = index.rotated_centroid(vi.cluster_id).unwrap();
+            let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, 8);
+            let as_search = MultiBitQuanDotProductEstimator::with_scaled_query_sum(vi.cluster_id, &q, c, sum).estimate_distance(&rq, &vi);
+            let all_rotated = MultiBitQuanDotProductEstimator::new(vi.cluster_id, &rq, rc, 8).estimate_distance(&rq, &vi);
+            assert!((as_search - all_rotated).abs() < 1e-4, "8-bit, seed {seed}: {as_search} vs {all_rotated}");
+            let exact: f32 = x.iter().zip(&q).map(|(a, b)| a * b).sum();
+            assert!(
+                (as_search - exact).abs() < 0.01,
+                "8-bit, seed {seed}: estimate {as_search} vs exact {exact}"
+            );
+        }
+    }
+
+    /// Through the production write path (`index_embeddings`, `upsert_vectors`) and
+    /// the real `search()`, a rotated 768-d index finds the document a query was
+    /// drawn from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotated_index_finds_the_source_document_end_to_end() {
+        let index = rotated_cluster_index(768, 16);
+        // A tight first-pass cut, so Pass 1's own ranking must be right too (with
+        // the default 1,000 candidates Pass 2 would rescue any Pass-1 mistake).
+        let config = SemanticSearchConfig {
+            probe: ProbeSettings::fixed(16),
+            first_pass_sparse_search_top_k: 3,
+            ..SemanticSearchConfig::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        db.namespace("docs".to_string()).await.unwrap();
+        let docs: Vec<Vec<f32>> = (0..300).map(|d| unit_vec(768, d)).collect();
+        for (d, v) in docs.iter().enumerate() {
+            let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
+            crate::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
+                .await
+                .unwrap();
+        }
+        let store = crate::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
+        for d in (0..300u64).step_by(15) {
+            // The source document plus a little noise.
+            let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
+            let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            q.iter_mut().for_each(|x| *x /= n);
+            let results = search(
+                &config,
+                "docs",
+                &index,
+                std::slice::from_ref(&q),
+                &q,
+                &store,
+                None::<fn(&[u8]) -> bool>,
+                Some(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                results[0].document_id,
+                d.to_be_bytes().to_vec(),
+                "query from doc {d} ranked {:?} first",
+                results[0].document_id
+            );
+        }
+        db.shutdown().await.unwrap();
+    }
+
     #[test]
     fn test_quantisation_style_default_is_multi_bit_8() {
         assert_eq!(QuantisationStyle::default(), QuantisationStyle::MultiBit { number_of_bits: 8 });
@@ -1061,11 +1268,9 @@ mod tests {
     /// Single-bit packs 64 dimensions per u64 word; multi-bit packs 8 bytes per word.
     #[test]
     fn test_single_bit_and_multi_bit_produce_different_packed_layouts() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1092,12 +1297,10 @@ mod tests {
     /// This exercises the `iter().map(quantise)` loop without needing HTTP.
     #[test]
     fn test_multi_embedding_quantisation_produces_n_vector_indexes() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1120,12 +1323,10 @@ mod tests {
 
     #[test]
     fn test_single_embedding_quantisation_produces_one_vector_index() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
         let style = QuantisationStyle::MultiBit { number_of_bits: 4 };
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1153,11 +1354,9 @@ mod tests {
     /// correct KV key discriminant.
     #[test]
     fn test_dual_quantisation_produces_both_styles() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1197,11 +1396,9 @@ mod tests {
     /// path carry the correct packed-vector sizes for the fixture embedding (768 dims).
     #[test]
     fn test_dual_quantisation_packed_vector_sizes() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1231,11 +1428,9 @@ mod tests {
     /// this test documents the invariant that cluster_id is independently computed.
     #[test]
     fn test_dual_quantisation_single_bit_cluster_is_independently_assigned() {
-        use crate::semantic_search::cluster::ClusterIndex;
         use crate::semantic_search::quantisation::rabitq;
 
-        let cluster_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/embedding_support/qwen/clusters.json");
-        let cluster_index = ClusterIndex::load(cluster_path).expect("cluster index not found");
+        let cluster_index = fixture_clusters();
 
         #[derive(serde::Deserialize)]
         struct EmbeddingFile {
@@ -1285,11 +1480,8 @@ mod tests {
         async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
             Ok(vec![None; doc_ids.len()])
         }
-        async fn scan_sparse_clusters_batch(
-            &self,
-            _cluster_ids: &[u32],
-        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
-            Ok(std::collections::HashMap::new())
+        async fn scan_sparse_clusters_batch(&self, _cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
+            Ok(SparseScan::default())
         }
     }
 
@@ -1322,7 +1514,7 @@ mod tests {
         store.add_sparse_entry(1, b"doc", 0.0);
         store.add_dense_entry(1, b"doc", 0.1);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1373,7 +1565,7 @@ mod tests {
     /// - `sparse_data`: SingleBit scan results keyed by cluster_id.
     /// - `dense_data`: MultiBit entries keyed by doc_id.
     struct MockVectorKvStore {
-        sparse_data: ClusterBatchResult,
+        sparse_data: std::collections::HashMap<u32, ClusterEntries>,
         dense_data: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     }
 
@@ -1401,9 +1593,11 @@ mod tests {
             self.sparse_data.entry(cluster_id).or_default().push((doc_id.to_vec(), raw));
         }
 
-        fn add_dense_entry(&mut self, cluster_id: u32, doc_id: &[u8], addition_factor: f32) {
+        /// A whole-document entry as production writes it: encoded against the
+        /// zero centre (`cluster_id` is kept only so callers read as before).
+        fn add_dense_entry(&mut self, _cluster_id: u32, doc_id: &[u8], addition_factor: f32) {
             let vi = VectorIndex::new(
-                cluster_id,
+                ZERO_CENTRE,
                 QuantisationStyle::MultiBit { number_of_bits: 8 },
                 addition_factor,
                 0.0,
@@ -1439,7 +1633,7 @@ mod tests {
         /// Store a dense entry for `doc_id` with an explicit quantisation `style`,
         /// to exercise the dense-pass style check.
         fn add_dense_entry_with_style(&mut self, doc_id: &[u8], style: QuantisationStyle) {
-            let vi = VectorIndex::new(1, style, 0.0, 0.0, 0.01, vec![]);
+            let vi = VectorIndex::new(ZERO_CENTRE, style, 0.0, 0.0, 0.01, vec![]);
             let raw = VectorIndex::list_to_bytes(&[vi]);
             self.dense_data.insert(doc_id.to_vec(), raw);
         }
@@ -1448,7 +1642,7 @@ mod tests {
         /// "exactly one dense entry per doc" invariant.
         fn add_dense_entry_multi(&mut self, doc_id: &[u8], count: usize) {
             let vis: Vec<VectorIndex> = (0..count)
-                .map(|_| VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.0, 0.0, 0.01, vec![]))
+                .map(|_| VectorIndex::new(ZERO_CENTRE, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.0, 0.0, 0.01, vec![]))
                 .collect();
             self.dense_data.insert(doc_id.to_vec(), VectorIndex::list_to_bytes(&vis));
         }
@@ -1464,14 +1658,10 @@ mod tests {
         async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
             Ok(doc_ids.iter().map(|id| self.dense_data.get(id).cloned()).collect())
         }
-        async fn scan_sparse_clusters_batch(
-            &self,
-            cluster_ids: &[u32],
-        ) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>, crate::KVError> {
-            Ok(cluster_ids
-                .iter()
-                .filter_map(|id| self.sparse_data.get(id).map(|entries| (*id, entries.clone())))
-                .collect())
+        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
+            Ok(SparseScan::from_clusters(
+                cluster_ids.iter().filter_map(|id| self.sparse_data.get(id).map(|entries| (*id, entries))),
+            ))
         }
     }
 
@@ -1505,7 +1695,7 @@ mod tests {
                 Err(crate::KVError::Io(std::io::Error::other("dense read failed")))
             }
         }
-        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<ClusterBatchResult, crate::KVError> {
+        async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
             if self.fail_sparse {
                 Err(crate::KVError::Io(std::io::Error::other("sparse scan failed")))
             } else {
@@ -1521,7 +1711,7 @@ mod tests {
     async fn test_search_surfaces_storage_errors_from_either_pass() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         for fail_sparse in [true, false] {
@@ -1557,7 +1747,7 @@ mod tests {
         store.add_sparse_entry(1, b"doc_a", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1593,7 +1783,7 @@ mod tests {
         store.add_corrupt_dense_entry(b"doc_dense_corrupt");
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1646,7 +1836,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_bad", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1689,7 +1879,7 @@ mod tests {
 
         // Default config dense bit-width is 8.
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1731,7 +1921,7 @@ mod tests {
         store.add_dense_entry_multi(b"doc_dup", 2); // two dense entries — invalid
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         let results = search(
@@ -1770,7 +1960,7 @@ mod tests {
         // doc_low deliberately has no dense entry to prove it is not reached.
 
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
@@ -1807,7 +1997,7 @@ mod tests {
         store.add_dense_entry(2, b"doc_b", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1, // each query probes only 1 cluster → union = {1, 2}
+            probe: ProbeSettings::fixed(1), // each query probes only 1 cluster → union = {1, 2}
             first_pass_sparse_search_top_k: 10,
             ..Default::default()
         };
@@ -1841,7 +2031,7 @@ mod tests {
         // Deliberately no dense entry.
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
 
@@ -1878,7 +2068,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_high_score", 0.1); // score = C - 0.1 (higher)
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             ..Default::default()
         };
@@ -1917,7 +2107,7 @@ mod tests {
         }
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             top_k_results: 2,
             ..Default::default()
@@ -1951,7 +2141,7 @@ mod tests {
         }
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 10,
             top_k_results: 100, // would return all 3 without override
             ..Default::default()
@@ -2031,7 +2221,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_q", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the sparse winner reaches dense
             ..Default::default()
         };
@@ -2080,6 +2270,127 @@ mod tests {
     ///
     /// Therefore only the MaxSim aggregation guarantees that doc_a outranks doc_b.
     /// Setting first_pass_sparse_search_top_k=1 lets us verify the correct winner.
+    /// Chunk codes are decoded through their own `centre_id`, never through the
+    /// posting they are filed under: a code encoded against centre 2 but sitting in
+    /// posting 1 (what a split leaves behind) scores with centre 2's `⟨q, c⟩`.
+    #[tokio::test]
+    async fn codes_are_scored_against_their_own_centre_not_their_posting() {
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        // Both filed under posting 1; "home" encoded against centre 1, "moved" against 2.
+        store.add_sparse_entry(1, b"home", 0.0);
+        let mut moved = VectorIndex::new(1, QuantisationStyle::SingleBit, 0.0, 0.0, 0.01, vec![]);
+        moved.centre_id = 2;
+        store
+            .sparse_data
+            .entry(1)
+            .or_default()
+            .push((b"moved".to_vec(), VectorIndex::list_to_bytes(&[moved])));
+        store.add_dense_entry(1, b"home", 0.1);
+        store.add_dense_entry(1, b"moved", 0.1);
+
+        // With empty codes the Pass-1 score is ⟨q, c⟩: for q = e₂, centre 2 gives 1
+        // and centre 1 gives 0, so only "moved" survives a cut of one. Decoded
+        // through the posting, both would score 0 and tie.
+        let config = SemanticSearchConfig {
+            probe: ProbeSettings::fixed(2),
+            first_pass_sparse_search_top_k: 1,
+            ..Default::default()
+        };
+        let q = vec![0.0f32, 1.0, 0.0, 0.0];
+        let results = search(
+            &config,
+            "test_ns",
+            &cluster_index,
+            std::slice::from_ref(&q),
+            &q,
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
+        assert_eq!(ids, vec![b"moved".as_slice()], "{results:?}");
+    }
+
+    /// Whole-document codes must be encoded against the zero centre: one encoded
+    /// against anything else is skipped and counted, never scored against the
+    /// wrong centre.
+    #[tokio::test]
+    async fn a_dense_code_not_encoded_against_the_zero_centre_is_skipped_and_counted() {
+        let ns = "dense_centre_ns";
+        let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
+        let mut store = MockVectorKvStore::new();
+        store.add_sparse_entry(1, b"good", 0.0);
+        store.add_dense_entry(1, b"good", 0.1);
+        store.add_sparse_entry(1, b"stale", 0.0);
+        let stale = VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.1, 0.0, 0.01, vec![]);
+        store.dense_data.insert(b"stale".to_vec(), VectorIndex::list_to_bytes(&[stale]));
+
+        let before = crate::semantic_search::metrics::snapshot(ns).dense_corrupt_skipped;
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let results = search(
+            &SemanticSearchConfig::default(),
+            ns,
+            &cluster_index,
+            std::slice::from_ref(&q),
+            &q,
+            &store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
+        assert_eq!(ids, vec![b"good".as_slice()]);
+        // Zero centre: the Pass-2 score is 1 − addition_factor, with no ⟨q, c⟩ term.
+        assert!((results[0].dot_product - 0.9).abs() < 1e-5, "{results:?}");
+        assert_eq!(crate::semantic_search::metrics::snapshot(ns).dense_corrupt_skipped, before + 1);
+    }
+
+    /// `index_embeddings` encodes the whole-document vector against the zero
+    /// centre and the chunks against their posting's centre, all in the layout's
+    /// rotated space, and the zero-centred estimate tracks the exact inner product.
+    #[test]
+    fn index_embeddings_encodes_the_dense_vector_against_the_zero_centre() {
+        let dim = 16;
+        let centroids: HashMap<u32, Vec<f32>> = (0..4u32)
+            .map(|id| {
+                let mut v = vec![0.0f32; dim];
+                v[id as usize] = 1.0;
+                (id, v)
+            })
+            .collect();
+        let ivf = crate::semantic_search::NamespaceIvf::seeded(&centroids, 99).unwrap();
+        let unit = |v: Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let dense = unit((0..dim).map(|i| ((i * 7) % 5) as f32 + 0.5).collect());
+        let chunk = unit((0..dim).map(|i| if i == 2 { 3.0 } else { 0.2 }).collect());
+        let vis = index_embeddings(&SemanticSearchConfig::default(), &ivf, &dense, std::slice::from_ref(&chunk)).unwrap();
+        assert_eq!((vis[0].cluster_id, vis[0].centre_id), (ZERO_CENTRE, ZERO_CENTRE));
+        assert_eq!((vis[1].cluster_id, vis[1].centre_id), (2, 2), "chunk: its posting's centre");
+
+        let q = unit((0..dim).map(|i| (i % 3) as f32 + 0.1).collect());
+        let rq = IvfLayout::rotate(&ivf, &q);
+        let origin = vec![0.0f32; dim];
+        let sum = MultiBitQuanDotProductEstimator::scaled_query_sum(&rq, 8);
+        let est = MultiBitQuanDotProductEstimator::with_scaled_query_sum(ZERO_CENTRE, &q, &origin, sum).estimate_from_parts(
+            &rq,
+            &vis[0].packed_vector,
+            vis[0].addition_factor,
+            vis[0].scaling_factor,
+        );
+        let exact: f32 = q.iter().zip(&dense).map(|(a, b)| a * b).sum();
+        assert!(
+            (est - exact).abs() <= vis[0].error_bound.max(1e-3),
+            "est {est} exact {exact} bound {}",
+            vis[0].error_bound
+        );
+    }
+
     #[tokio::test]
     async fn test_pass1_maxsim_sums_query_token_scores() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])]);
@@ -2093,7 +2404,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_b", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,                       // q1 → cluster 1, q2 → cluster 2
+            probe: ProbeSettings::fixed(1),    // q1 → cluster 1, q2 → cluster 2
             first_pass_sparse_search_top_k: 1, // only the top-scored doc enters dense
             ..Default::default()
         };
@@ -2135,7 +2446,7 @@ mod tests {
         store.add_dense_entry(2, b"doc_low", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the better sparse candidate passes
             ..Default::default()
         };
@@ -2206,7 +2517,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_solo", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 1, // only the top sparse score passes
             ..Default::default()
         };
@@ -2273,7 +2584,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_rival", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 1,
             ..Default::default()
         };
@@ -2320,7 +2631,7 @@ mod tests {
         store.add_dense_entry(1, b"doc_one_token", 0.1);
 
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             first_pass_sparse_search_top_k: 2, // let both through sparse
             ..Default::default()
         };
@@ -2350,7 +2661,11 @@ mod tests {
     }
 
     /// Runs one search over `store` and returns `(doc_id, score)` pairs.
-    async fn run_search(config: &SemanticSearchConfig, index: &ClusterIndex, store: &MockVectorKvStore) -> Vec<(Vec<u8>, f32)> {
+    async fn run_search(
+        config: &SemanticSearchConfig,
+        index: &crate::semantic_search::ClusterIndex,
+        store: &MockVectorKvStore,
+    ) -> Vec<(Vec<u8>, f32)> {
         search(
             config,
             "test_ns",
@@ -2376,7 +2691,7 @@ mod tests {
     async fn test_search_early_return_releases_the_scoring_gate() {
         let index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
         let config = SemanticSearchConfig {
-            n_probes: 1,
+            probe: ProbeSettings::fixed(1),
             ..Default::default()
         };
         // Every sparse entry is corrupt, so Pass 1 keeps no candidate and `search`
@@ -2412,7 +2727,7 @@ mod tests {
             store.add_dense_entry(cluster, &doc_id, (d % 89) as f32 * 0.01);
         }
         let config = SemanticSearchConfig {
-            n_probes: 2,
+            probe: ProbeSettings::fixed(2),
             first_pass_sparse_search_top_k: 500,
             ..Default::default()
         };
@@ -2438,5 +2753,63 @@ mod tests {
         for result in all {
             assert_eq!(result, expected);
         }
+    }
+}
+
+/// Pass-1 estimators per centre for one search, built on first use (see
+/// [`search`]). Indexed by centre id when the ids are dense enough, so a lookup
+/// is an index and creating the table costs one empty slot per id, not one
+/// estimator per centre.
+enum CentreEstimators {
+    Dense(Vec<std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>>),
+    Sparse(HashMap<u32, std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>>),
+}
+
+impl CentreEstimators {
+    /// Ids above this are kept in a map rather than a table indexed by id.
+    const DENSE_LIMIT: u32 = 1 << 22;
+
+    fn new<L: IvfLayout + ?Sized>(layout: &L) -> Self {
+        match layout.max_centre_id() {
+            Some(max) if max < Self::DENSE_LIMIT => Self::Dense((0..=max).map(|_| std::sync::OnceLock::new()).collect()),
+            Some(_) => Self::Sparse(layout.centre_ids().into_iter().map(|id| (id, std::sync::OnceLock::new())).collect()),
+            None => Self::Dense(Vec::new()),
+        }
+    }
+
+    fn cell(&self, centre_id: u32) -> Option<&std::sync::OnceLock<Option<Vec<SingleBitQuanDotProductEstimator>>>> {
+        match self {
+            Self::Dense(cells) => cells.get(centre_id as usize),
+            Self::Sparse(cells) => cells.get(&centre_id),
+        }
+    }
+
+    /// How many centres' estimators were built.
+    #[cfg(test)]
+    fn built(&self) -> usize {
+        let built = |c: &std::sync::OnceLock<Option<Vec<_>>>| c.get().is_some_and(Option::is_some);
+        match self {
+            Self::Dense(cells) => cells.iter().filter(|c| built(c)).count(),
+            Self::Sparse(cells) => cells.values().filter(|c| built(c)).count(),
+        }
+    }
+}
+
+/// Test-only instrumentation of [`search`].
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+
+    static ESTIMATOR_CENTRES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Record that a search of `namespace` built estimators for `n` centres.
+    pub(crate) fn note_estimator_centres(namespace: &str, n: usize) {
+        *ESTIMATOR_CENTRES.lock().entry(namespace.to_owned()).or_default() += n;
+    }
+
+    /// Centres whose estimators searches of `namespace` built so far.
+    pub(crate) fn estimator_centres(namespace: &str) -> usize {
+        ESTIMATOR_CENTRES.lock().get(namespace).copied().unwrap_or(0)
     }
 }

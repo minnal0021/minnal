@@ -226,6 +226,20 @@ impl ShardedValueLog {
         }
     }
 
+    /// [`read_values_batch`](Self::read_values_batch) into one buffer; see
+    /// [`ValueLog::read_values_batch_into`].
+    pub fn read_values_batch_into(
+        &self,
+        bucket: u32,
+        entries: &[(usize, ValueLocation)],
+        out: &mut Vec<u8>,
+    ) -> Vec<(usize, Option<std::ops::Range<usize>>)> {
+        match self.get_bucket_log(bucket) {
+            Ok(log) => log.read_values_batch_into(entries, out),
+            Err(_) => entries.iter().map(|(idx, _)| (*idx, None)).collect(),
+        }
+    }
+
     // ── Durability & stats ────────────────────────────────────────────────
 
     /// Bytes appended across all buckets that are not yet on stable storage.

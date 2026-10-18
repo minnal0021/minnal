@@ -7,6 +7,7 @@
 //! GET  /admin/storage/ops-metrics/by-namespace         → the same counters, broken out per namespace
 //! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
 //! GET  /admin/storage/wal                             → WAL metadata snapshot
+//! GET  /admin/storage/vector-index-wal                → vector index WAL: segments, tail, retired cut, namespaces holding it
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
 //! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization + every segment file (like /wal)
 //! GET  /admin/storage/value-log/{ns}/segments         → per-segment garbage breakdown for one namespace (deep dive)
@@ -181,6 +182,30 @@ pub struct GcMetrics {
     wal_segments_deleted: u64,
 }
 
+/// The vector index WAL's counters. Engine-global: `0` on per-namespace views.
+#[derive(Serialize)]
+pub struct VectorIndexWalMetrics {
+    /// Records appended.
+    appends: u64,
+    /// Bytes appended, frames included.
+    bytes_appended: u64,
+    /// Fsyncs (one per completion batch that wrote anything).
+    fsyncs: u64,
+    /// `appends / fsyncs`: the records each fsync made durable. `null` before
+    /// the first fsync.
+    appends_per_fsync: Option<f64>,
+    /// GC passes.
+    gc_runs: u64,
+    /// Segments deleted by GC.
+    segments_deleted: u64,
+    /// Flushes of a namespace that held the retired cut back.
+    pin_flushes: u64,
+    /// Records replayed into memtables at the last open.
+    records_replayed: u64,
+    /// Records skipped at the last open because their namespace was dropped.
+    records_skipped: u64,
+}
+
 /// The grouped operational-metrics body (without the engine-level `uptime_s`),
 /// reused by the engine, per-namespace, and by-namespace endpoints.
 #[derive(Serialize)]
@@ -190,6 +215,7 @@ pub struct OpsMetricsBody {
     writes: WriteMetrics,
     compaction: CompactionMetrics,
     gc: GcMetrics,
+    vector_index_wal: VectorIndexWalMetrics,
 }
 
 #[derive(Serialize)]
@@ -261,6 +287,17 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             vlog_gc_write_amplification: (m.vlog_gc_bytes_reclaimed > 0).then(|| m.vlog_gc_bytes_rewritten as f64 / m.vlog_gc_bytes_reclaimed as f64),
             wal_gc_runs: m.wal_gc_runs,
             wal_segments_deleted: m.wal_segments_deleted,
+        },
+        vector_index_wal: VectorIndexWalMetrics {
+            appends: m.vector_wal_appends,
+            bytes_appended: m.vector_wal_bytes_appended,
+            fsyncs: m.vector_wal_fsyncs,
+            appends_per_fsync: (m.vector_wal_fsyncs > 0).then(|| m.vector_wal_appends as f64 / m.vector_wal_fsyncs as f64),
+            gc_runs: m.vector_wal_gc_runs,
+            segments_deleted: m.vector_wal_segments_deleted,
+            pin_flushes: m.vector_wal_pin_flushes,
+            records_replayed: m.vector_wal_records_replayed,
+            records_skipped: m.vector_wal_records_skipped,
         },
     }
 }
@@ -364,6 +401,18 @@ pub async fn wal(State(state): State<AppState>) -> impl IntoResponse {
         last_sequence: m.last_sequence,
         segments,
     })
+}
+
+/// `GET /admin/storage/vector-index-wal` — the vector index WAL's state, read
+/// from the log and its files (survives a restart): segments, tail, durable
+/// tail, retired cut (each `{segment_id, byte}`), the unretired bytes a restart
+/// would replay, and the namespaces holding the retired cut back.
+pub async fn vector_index_wal(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .store
+        .vector_index_wal_stats()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))
 }
 
 // ── LSM ───────────────────────────────────────────────────────────────────────
@@ -1216,6 +1265,9 @@ fn system_ns_purpose(name: &str) -> &'static str {
     match name {
         "system" => "system namespace root (reserved; never stores user data)",
         "system_qemb_cache" => "query-embedding cache shared across all semantic-search namespaces (TTL configurable; default 1 day)",
+        "system_partition_history" => {
+            "vector-partition history: code health, recall checks and rebuilds per namespace (TTL configurable; default 30 days)"
+        }
         _ => "internal system namespace",
     }
 }

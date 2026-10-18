@@ -3,6 +3,8 @@ pub mod hex;
 pub mod index_manager;
 pub mod index_observer;
 pub mod index_progress;
+#[cfg(feature = "semantic-search")]
+pub(crate) mod ivf_maintenance;
 pub mod key;
 pub mod kv_schema;
 pub mod pagination;
@@ -10,6 +12,7 @@ pub mod schema;
 pub mod store;
 #[cfg(feature = "semantic-search")]
 pub(crate) mod vec_index_worker;
+pub mod vector_settings;
 
 // ── Error types ────────────────────────────────────────────────────────────
 pub use self::error::{DocStoreError, SchemaError};

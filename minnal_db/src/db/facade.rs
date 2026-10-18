@@ -117,6 +117,12 @@ where
 /// durability guarantee in exchange for speed.
 pub struct Db {
     inner: Database,
+    /// The doc store's directory lock. Fields drop in declaration order, so it
+    /// is released only after `inner` has finished dropping (its final flush
+    /// and compaction), however long a worker's pass keeps this `Db` alive past
+    /// the last user handle. Keep it last.
+    #[cfg(feature = "doc-store")]
+    dir_lock: parking_lot::Mutex<Option<crate::support::file_lock::DirLock>>,
 }
 
 // Gated on `semantic-search` as well as `test` because that is the only feature
@@ -160,7 +166,11 @@ impl Db {
     /// Open a database at `path` with the given configuration.
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DbConfig) -> Result<Self> {
         let db = Database::open(path.as_ref(), config)?;
-        Ok(Self { inner: db })
+        Ok(Self {
+            inner: db,
+            #[cfg(feature = "doc-store")]
+            dir_lock: parking_lot::Mutex::new(None),
+        })
     }
 
     /// Shut down the database, flushing all data to disk.
@@ -420,6 +430,12 @@ impl Db {
         self.inner.wal_metadata()
     }
 
+    /// Returns the vector index WAL's state: segments, tail, retired cut and
+    /// the namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats> {
+        self.inner.vector_index_wal_stats()
+    }
+
     /// Returns a live LSM manifest snapshot for every active namespace.
     pub fn lsm_manifests(&self) -> Vec<(String, crate::store::lsm::lsm_manifest::LsmManifest)> {
         self.inner.lsm_manifests()
@@ -468,6 +484,20 @@ impl Db {
     /// Trigger LSM compaction across all namespaces.
     pub fn compact(&self) -> Result<()> {
         self.inner.compact_lsm()
+    }
+
+    /// Test-only: flush the named namespaces' memtables to level 0. See
+    /// `Database::flush_namespaces`.
+    #[cfg(test)]
+    pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
+        self.inner.flush_namespaces(names)
+    }
+
+    /// Make every logged write (`put_logged`) already returned durable: one
+    /// fsync of the vector index WAL. See `Database::sync_vector_index_wal`.
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn sync_vector_index_wal(&self) -> Result<()> {
+        self.inner.sync_vector_index_wal()
     }
 
     /// The current value-log waste ratio for the default namespace.
@@ -784,6 +814,15 @@ impl WalGcTarget for Db {
     fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.inner.garbage_collect_wal()
     }
+    fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        self.inner.flush_namespaces_pinning_vector_wal()
+    }
+    fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.inner.has_deletable_vector_wal_segments()
+    }
+    fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        self.inner.garbage_collect_vector_wal()
+    }
 }
 
 impl LsmCompactionTarget for Db {
@@ -793,11 +832,11 @@ impl LsmCompactionTarget for Db {
     fn flush_no_wal_memtables(&self) -> usize {
         self.inner.flush_no_wal_memtables()
     }
-    fn has_lsm_compaction_work(&self) -> bool {
-        self.inner.has_lsm_compaction_work()
+    fn has_due_compaction_work(&self) -> bool {
+        self.inner.has_due_lsm_compaction_work()
     }
-    fn compact_lsm(&self) -> Result<()> {
-        self.inner.compact_lsm()
+    fn compact_due(&self) -> Result<()> {
+        self.inner.compact_lsm_due()
     }
 }
 
@@ -893,10 +932,10 @@ impl<'db> Namespace<'db> {
         self.store.get_multiple(keys)
     }
 
-    /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning each
-    /// prefix id's `(key, value)` pairs. Mirrors
+    /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning every
+    /// `(prefix_id, key, value)` in key order. Mirrors
     /// [`AsyncNamespace::scan_prefixes_batch`].
-    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<KeyValue>>> {
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::db::kv_store::PrefixScan> {
         self.store.scan_prefixes_batch(prefix_ids)
     }
 
@@ -1130,6 +1169,13 @@ impl AsyncDb {
 }
 
 impl AsyncDb {
+    /// Hold the doc store's directory lock until this database is dropped, not
+    /// just the handle that opened it (see `Db::dir_lock`).
+    #[cfg(feature = "doc-store")]
+    pub(crate) fn hold_dir_lock(&self, lock: crate::support::file_lock::DirLock) {
+        *self.inner.dir_lock.lock() = Some(lock);
+    }
+
     // ── Open / Close ──────────────────────────────────────────────────
 
     /// Open a database with default config.
@@ -1158,6 +1204,44 @@ impl AsyncDb {
 
     /// Close the database, flushing all data to disk.
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_workers().await;
+
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Flush index state on clean shutdown, now that no worker can race
+            // with it. This is also what clears the no-WAL markers, so a clean
+            // shutdown reports no gap on the next open (FR-001).
+            if let Err(e) = db.inner.run_index_checkpoint() {
+                log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
+            }
+            db.shutdown()
+        })
+        .await
+        .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Test-only: simulate a crash. Stops the background workers, then drops
+    /// the database **without** the flushes `shutdown` and `Drop` would run,
+    /// so unflushed memtables and no-WAL writes are lost exactly as in a
+    /// process kill, while every file it had open is closed.
+    ///
+    /// Use this instead of `std::mem::forget(db)`, which also skips the flushes
+    /// but leaks every file descriptor and leaves the workers running against a
+    /// directory the test then reopens: a loop of forgotten databases runs a
+    /// test process out of descriptors (the vector crash audit hit 1,024).
+    ///
+    /// `self` must be the last handle to the database; a clone kept elsewhere
+    /// keeps it, and its files, alive.
+    #[cfg(test)]
+    pub(crate) async fn crash(self) {
+        self.stop_workers().await;
+        self.inner.inner.mark_crashed();
+        debug_assert_eq!(Arc::strong_count(&self.inner), 1, "crash(): another handle still holds the database");
+    }
+
+    /// Stop every background worker (TTL, WAL GC, LSM compaction, value-log GC,
+    /// index checkpoint), waiting for each to finish its current pass.
+    async fn stop_workers(&self) {
         // Shutdown the global TTL worker first. The TTL config stays persisted in
         // the registry so it is restored on the next open.
         if let Some(worker) = self.inner.inner.ttl_worker.write().await.take() {
@@ -1199,19 +1283,6 @@ impl AsyncDb {
                 w.shutdown().await;
             }
         }
-
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            // Flush index state on clean shutdown, now that no worker can race
-            // with it. This is also what clears the no-WAL markers, so a clean
-            // shutdown reports no gap on the next open (FR-001).
-            if let Err(e) = db.inner.run_index_checkpoint() {
-                log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
-            }
-            db.shutdown()
-        })
-        .await
-        .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
     /// Test-only: whether the index checkpoint worker is currently installed.
@@ -1530,6 +1601,24 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Async [`Db::flush_namespaces`] (test-only).
+    #[cfg(test)]
+    pub(crate) async fn flush_namespaces(&self, names: Vec<String>) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.flush_namespaces(&names))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Async [`Db::sync_vector_index_wal`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn sync_vector_index_wal(&self) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.sync_vector_index_wal())
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     /// Force an index checkpoint across all namespaces: flush each namespace's
     /// dense row map and all active field indexes to disk, compacting any
     /// field-index bitmap store whose waste exceeds the configured
@@ -1575,6 +1664,12 @@ impl AsyncDb {
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
+    }
+
+    /// Returns the vector index WAL's state: segments, tail, retired cut and
+    /// the namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats> {
+        self.inner.vector_index_wal_stats()
     }
 
     /// Returns a live LSM manifest snapshot for every active namespace.
@@ -1930,6 +2025,18 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Write a key-value pair logged in the vector index WAL instead of the
+    /// main WAL — durable after the next `AsyncDb::sync_vector_index_wal`. See
+    /// [`Database::put_ns_logged`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn put_logged(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.put_ns_logged(ns_id, &key, &value))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let db = self.db.clone();
         let ns_id = self.ns_id;
@@ -1944,10 +2051,11 @@ impl AsyncNamespace {
     /// all value-log entries in exactly `num_buckets` threads —
     /// dramatically cheaper than one `spawn_blocking` per prefix.
     ///
-    /// Returns a map from `prefix_id` to `(raw_key_bytes, value_bytes)` pairs.
-    /// A storage error is returned as such — it used to become an empty map,
-    /// indistinguishable from "no entries under these prefixes".
-    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<std::collections::HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>> {
+    /// Returns every `(prefix_id, raw_key_bytes, value_bytes)` in key order, packed
+    /// into a few buffers (see [`PrefixScan`](crate::PrefixScan)). A storage error is
+    /// returned as such — it used to become an empty map, indistinguishable from
+    /// "no entries under these prefixes".
+    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::db::kv_store::PrefixScan> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
             .await

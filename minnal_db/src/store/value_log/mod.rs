@@ -897,6 +897,13 @@ impl ValueLog {
     // ── Reads ─────────────────────────────────────────────────────────────
 
     fn parse_record(&self, buf: &[u8], location: ValueLocation) -> Result<(Vec<u8>, ValueRecordMeta)> {
+        let (value, meta) = self.check_record(buf, location)?;
+        Ok((buf[value].to_vec(), meta))
+    }
+
+    /// Check a record read into `buf` (header first) against the pointer that named
+    /// it, and return where its value lies in `buf`.
+    fn check_record(&self, buf: &[u8], location: ValueLocation) -> Result<(std::ops::Range<usize>, ValueRecordMeta)> {
         let header = ValueRecordHeader::from_bytes(buf).ok_or(ValueLogError::CorruptedLog)?;
         // The pointer's value_len decides how much we read; a record that disagrees
         // is not the record this pointer names.
@@ -908,11 +915,10 @@ impl ValueLog {
         if buf.len() < end {
             return Err(ValueLogError::CorruptedLog);
         }
-        let value = buf[start..end].to_vec();
-        if self.verify_checksums_on_read() && value_checksum(&value) != header.checksum {
+        if self.verify_checksums_on_read() && value_checksum(&buf[start..end]) != header.checksum {
             return Err(ValueLogError::CorruptedLog);
         }
-        Ok((value, header.meta()))
+        Ok((start..end, header.meta()))
     }
 
     /// Read a value: **one `pread`** of exactly `header + value_len` bytes.
@@ -977,6 +983,46 @@ impl ValueLog {
             }
         }
         out
+    }
+
+    /// [`read_values_batch`](Self::read_values_batch), reading every value into one
+    /// buffer, `out`, instead of allocating each: returns each entry's value as a
+    /// range of `out` (`None` where the read failed). Each record's header stays in
+    /// `out` in front of its value. A large prefix scan reads tens of thousands of
+    /// small values, so this saves an allocation, a copy and a free per value.
+    pub fn read_values_batch_into(&self, entries: &[(usize, ValueLocation)], out: &mut Vec<u8>) -> Vec<(usize, Option<std::ops::Range<usize>>)> {
+        out.reserve(entries.iter().map(|(_, loc)| ValueRecordHeader::SIZE + loc.value_len as usize).sum());
+        let mut ranges = Vec::with_capacity(entries.len());
+        let mut by_segment: HashMap<u32, Vec<(usize, ValueLocation)>> = HashMap::new();
+        for &(idx, loc) in entries {
+            if loc.segment_id == 0 {
+                ranges.push((idx, None));
+                continue;
+            }
+            by_segment.entry(loc.segment_id).or_default().push((idx, loc));
+        }
+        for (segment_id, group) in by_segment {
+            match self.segment_file(segment_id) {
+                Ok(file) => {
+                    for (idx, loc) in group {
+                        let start = out.len();
+                        out.resize(start + ValueRecordHeader::SIZE + loc.value_len as usize, 0);
+                        let read = read_exact_or_corrupt(&file, &mut out[start..], loc.rec_offset as u64)
+                            .and_then(|()| self.check_record(&out[start..], loc));
+                        match read {
+                            Ok((value, _)) => ranges.push((idx, Some(start + value.start..start + value.end))),
+                            Err(_) => {
+                                out.truncate(start);
+                                ranges.push((idx, None));
+                            }
+                        }
+                    }
+                }
+                // Reclaimed mid-batch: the caller re-resolves these keys.
+                Err(_) => ranges.extend(group.into_iter().map(|(idx, _)| (idx, None))),
+            }
+        }
+        ranges
     }
 
     // ── GC support ────────────────────────────────────────────────────────

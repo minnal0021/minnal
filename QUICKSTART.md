@@ -36,7 +36,7 @@ then the full [service walkthrough](#using-minnal-as-a-service-rest).
 - [Scripts and Config](#scripts-and-config)
   - [Server scripts](#server-scripts)
   - [Example scripts](#example-scripts)
-  - [Cluster centroids](#cluster-centroids)
+  - [Vector index partitions](#vector-index-partitions)
   - [Sample config](#sample-config)
 
 ---
@@ -199,14 +199,6 @@ Use `release.sh` to build optimised binaries and stage everything under
 data paths rewritten to `./work/doc_store/` as the base.  Run both commands from
 the workspace root.
 
-It stages the cluster centroids for the model `config/sample.toml` names
-(`[semantic_search] model`), as `./work/bin/clusters.bin`. If that file already
-holds different centroids and a database exists under `./work/doc_store`, the
-script stops before building anything: every stored vector is quantised against
-the current file, so swapping it makes semantic search silently wrong. Pass `-c`
-to replace it deliberately, then re-index each semantic-search store
-(`POST /admin/indices/{ns}/vector/reindex-all`).
-
 #### Development workflow
 
 ```bash
@@ -263,30 +255,21 @@ max_retries = 5
 concurrency = 4
 
 [semantic_search]
-# Embedding model to request from the service (sent on every request; default "qwen").
-model = "gemma"
-# Path to the JSONL cluster centroids file (one {"cluster_id":…,"centroid":[…]} per line).
-# One set per model ships under service/embedding_support/{gemma,qwen}/ — use the
-# one matching `model` above.
-cluster_path = "service/embedding_support/gemma/clusters.json"
-# Bits per dimension for the dense (multi-bit) Pass 2 quantisation. 4 = compact, 8 = high recall.
-number_of_bits_for_dense_quantisation = 8
-# IVF clusters probed in the sparse first pass (higher = better recall, slower).
-# n_probes = 64
-# Candidates kept after Pass 1 before dense re-ranking.
-# first_pass_sparse_search_top_k = 1000
-# Sentence-window chunk parameters for documents' Pass 1 single-bit embeddings.
-# window_size = 4
-# sliding_size = 2
+# The embedding service. Each store names its own model in its schema
+# (vector_index.embedding_model, default "gemma").
+embedding_service_url = "http://localhost:8001"
+# Optional: allow only these models, each at its dimension. Without entries,
+# any model the service serves.
+# [[semantic_search.supported_models]]
+# name = "gemma"
+# dimension = 768
 ```
 
-> **Note:** `window_size` and `sliding_size` control how **documents** are split
-> into sentence-window chunks for the sparse (Pass 1) embeddings. Queries are not
-> chunked: a query is embedded once, whole, for both passes. Changing either value
-> after documents have been indexed leaves already-indexed documents with the old
-> chunks (no error is raised). Treat them as a fixed indexing decision: if you
-> change either value, re-embed the corpus with
-> `POST /admin/indices/{ns}/vector/reindex-all`.
+> **Note:** a store's model, dimension and chunking (`window_size` /
+> `sliding_size`: how **documents** are split into sentence windows for Pass 1)
+> live in its schema's `vector_index` and are fixed once semantic search is
+> enabled. Queries are not chunked: a query is embedded once, whole, for both
+> passes.
 
 Config file resolution order (CLI argument → `MINNAL_CONFIG_FILE` → built-in
 defaults) is documented in [`minnal_db_api/README.md`](minnal_db_api/README.md#configuration).
@@ -559,8 +542,9 @@ a transaction — minnal has no multi-key transaction primitive.
 
 See the dedicated **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — it covers
 feature selection as a table, the key-value and field-index APIs with runnable
-examples, `merge` and its typed twin `merge_typed` in full, and the
-document-store handle. Full engine internals are in
+examples, `merge` and its typed twin `merge_typed` in full, the document-store
+handle, and why to build your program with jemalloc as its memory allocator
+(faster, and far less resident memory under load). Full engine internals are in
 [`minnal_db/README.md`](minnal_db/README.md).
 
 ## Scripts and Config
@@ -598,34 +582,16 @@ Run any script against a running server:
 ./service/scripts/examples/indices.sh
 ```
 
-### Cluster centroids
+### Vector index partitions
 
-Two pre-computed centroid files ship in the repo, one per supported model — each
-holds **256 centroids for 768-dimensional embeddings** (~4.4 MB of JSONL on disk,
-~750 KB resident once loaded):
-
-| Model | File |
-|---|---|
-| **gemma** | [`service/embedding_support/gemma/clusters.json`](service/embedding_support/gemma/clusters.json) |
-| **qwen** | [`service/embedding_support/qwen/clusters.json`](service/embedding_support/qwen/clusters.json) |
-
-Both are tracked with **Git LFS**, so a clone made without LFS leaves you with
-132-byte pointer stubs rather than the centroids — run `git lfs install` and
-`git lfs pull` if `clusters.json` is tiny and starts with
-`version https://git-lfs.github.com/spec/v1`. (The bulk-load sample data,
-`minnal_tools/sample_data/sample_data.jsonl`, is tracked the same way.)
-
-Point the server at the one matching `[semantic_search] model` — the model minnal
-asks the embedding service for — via `[semantic_search] cluster_path`. The cluster
-index is loaded once at startup and never mutated. The two settings are separate,
-and both files are 768-dimensional, so the wrong file loads without error; search
-then runs slower and returns worse results. The server compares `cluster_path`
-with the bundled file for `model` at startup and logs a **warning** if their
-centroids differ. Expect that warning if you fitted your own centroids; otherwise
-it means the two settings disagree. It can only compare when it is started from
-the workspace root, where `service/embedding_support/` is.
-
-To use a different embedding model, generate your own centroids (e.g. k-means over a representative corpus sample with `faiss` or `sklearn`) and point the server at that file instead. For the exact JSONL file format and validation rules, see [`README.md` § Adding a New Embedding Model](README.md#adding-a-new-embedding-model).
+No centroid file is needed. A store that enables semantic search starts with one
+posting and grows its own partition as documents arrive: a background task
+splits postings that grow past twice `target_posting_size`, re-checks the chunks
+around each split, and merges postings that deletes have emptied
+(`[semantic_search.maintenance]` in `config/sample.toml`). Its state is at
+`GET /admin/indices/{ns}/vector/partition`. To re-cluster a store from its
+stored codes, without calling the embedding service, run
+`POST /admin/indices/{ns}/vector/rebuild`.
 
 ### Sample config
 

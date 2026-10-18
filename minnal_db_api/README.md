@@ -53,6 +53,10 @@ cargo build --release -p minnal_db_api
 ```
 
 The binary is at `target/release/minnal_db_api`.
+It uses jemalloc as its memory allocator, which the first build compiles
+from source (it needs a C compiler and `make`). Under concurrent load jemalloc is
+faster than the system allocator and holds far less memory; see
+[benchmark.md → Choosing the memory allocator](../minnal_db/benchmark.md#choosing-the-memory-allocator).
 
 ### 2 — Start the server
 
@@ -301,9 +305,9 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 - **Automatically on startup** — a fast, presence-only check that skips namespaces already fully covered, so a clean boot is cheap.
 - **On demand**, via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) — a slower but more thorough pass that also catches corrupted (not just missing) vector-index entries.
 
-To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
+To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
 
-Requires the external embedding service and a cluster index (`semantic_search.cluster_path`) to be available at startup. The server asks the service for the model named in `semantic_search.model` (default `qwen`) on every embedding request, and its startup probe logs an error if the service does not load that model; `cluster_path` must hold the centroids fitted on that same model.
+Requires the external embedding service. Each store names its model in its schema (`vector_index.embedding_model`, default `gemma`), and the server asks the service for that model on every embedding request. Enabling semantic search probes the service and fails with `422` if it does not serve the model at the store's dimension; at startup the same probe only logs an error. No centroid file is needed: each store grows its own IVF partition from its documents (see [`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition)).
 
 ### KV store concept
 
@@ -345,7 +349,7 @@ On top of that there's a set of `/admin/*` routes for backup, diagnostics, and b
 
 ### Store lifecycle
 
-These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendment via `PATCH` applies to document stores only.)
+These endpoints create, list, inspect, and drop stores of **either** kind — document or KV — under the single `/stores` path. `POST`/import select the kind via the payload's `store_type`; the other operations resolve it from the stored schema. A store must exist before any data can be written to it. (Attribute amendments via `PATCH` apply to document stores only; `update_vector_search` applies to both kinds.)
 
 #### `GET /stores`
 
@@ -484,7 +488,7 @@ Returns `404 Not Found` if the namespace does not exist.
 
 Amend the schema. Cannot be used to change indexed fields — drop the index first.
 
-**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries and the `{ns}_sparse_vector`, `{ns}_dense_vector`, `{ns}_sparse_vector_meta` companion namespaces) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
+**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries, the `{ns}_sparse_vector`, `{ns}_dense_vector` and `{ns}_sparse_vector_meta` companion namespaces, and the store's partition in `{ns}_ivf_centres`, `{ns}_ivf_postings` and `{ns}_ivf_journal`) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
 
 **Add an attribute:**
 
@@ -545,6 +549,33 @@ vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
 returns `409` if a vector index already exists, and `400` if `fields` is empty,
 contains duplicates, or names an existing index/attribute.
 
+**Change search or partition settings:** once semantic search is enabled, the
+store owns its search settings (`vector_index.search`) and the settings that
+shape its partition (`vector_index.maintenance`). `update_vector_search` changes
+either or both; settings you leave out keep their current values. It works on
+KV stores as well as document stores, takes effect on later searches, splits and
+merges, and re-embeds nothing.
+
+```bash
+curl -X PATCH http://localhost:8080/stores/users/schema \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "update_vector_search",
+       "search": {"probe_budget_entries": 20000, "top_k": 20},
+       "maintenance": {"target_posting_size": 256}}'
+# → 204 No Content
+```
+
+`search` accepts `probe_budget_entries`, `min_probes`, `max_probes`,
+`first_pass_top_k`, `top_k`, `probe_budget_fraction` and `probe_budget_floor`;
+`maintenance` accepts `target_posting_size`, `reassign_range`, `merge_ratio`,
+`skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
+and `split_lambda_factor`. What each one does, its default and its allowed range
+are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
+The embedding model, dimension and chunking are fixed once semantic search is
+enabled and cannot be changed here. A value out of range returns `400`; a store
+without semantic search returns `422`. Read the current values with
+`GET /stores/{ns}/schema`.
+
 | `op` value                | Required fields          |
 |---------------------------|--------------------------|
 | `add_attribute`           | `name`, `attr_type`      |
@@ -552,8 +583,9 @@ contains duplicates, or names an existing index/attribute.
 | `remove_attribute`        | `name`                   |
 | `add_embedding_attribute` | `name`                   |
 | `enable_vector_index`     | `fields` (non-empty)     |
+| `update_vector_search`    | `search` and/or `maintenance` |
 
-All ops except `enable_vector_index` accept an optional `"description"` string.
+`add_attribute`, `update_attribute` and `add_embedding_attribute` accept an optional `"description"` string.
 
 ---
 
@@ -780,8 +812,7 @@ build progresses; see `GET /admin/indices/{ns}/progress`).
 
 Two-pass ANN similarity search over the document vectors. Requires the store to
 have been created with `semantic_search_enabled = true` and `embedding_fields`
-set, a cluster index loaded at startup (`semantic_search.cluster_path`), and the
-external embedding service reachable. Because vector indexing is
+set, and the external embedding service reachable. Because vector indexing is
 [asynchronous](#semantic-search-async-vector-indexing), a document written moments
 earlier may not be searchable yet. Candidates whose document has since been
 deleted are dropped, so every hit resolves to a live document.
@@ -876,7 +907,7 @@ combinations.
 | `namespace` | string | yes | Unique name (`[a-zA-Z0-9_-]+`) |
 | `key_type` | `str` / `int` | yes | Key type |
 | `value_type` | `str` / `int` / `f32` / `vec_f32` | yes | Value type |
-| `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str` and a cluster index at startup) |
+| `semantic_search_enabled` | bool | no | Enable ANN search (requires `value_type = str`) |
 
 ```bash
 curl -X POST http://localhost:8080/stores \
@@ -1173,6 +1204,7 @@ value. There are two distinct kinds:
 | `GET /admin/storage/health` | Liveness / uptime | `uptime_s` **No**; `status` n/a |
 | `GET /admin/storage/stats` | Value-log aggregate | **Yes** |
 | `GET /admin/storage/wal` | WAL metadata | **Yes** |
+| `GET /admin/storage/vector-index-wal` | Vector index WAL state | **Yes** |
 | `GET /admin/storage/lsm` | LSM manifest | **Yes** (except `in_memory.*` → **No**) |
 | `GET /admin/storage/value-log` | Value-log per shard | **Yes** |
 | `GET /admin/storage/value-log/{ns}/segments` | Value-log per segment | **Yes** |
@@ -1186,8 +1218,8 @@ value. There are two distinct kinds:
 #### Operational metrics — `GET /admin/storage/ops-metrics`
 
 All counters below are **in-memory and reset to zero on restart**. They are grouped
-in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
-`index_overlay`, plus a top-level `uptime_s`.
+in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
+`vector_index_wal` and `index_overlay`, plus a top-level `uptime_s`.
 
 | Field | Group | Meaning | Survives restart? |
 |-------|-------|---------|-------------------|
@@ -1209,7 +1241,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
-| `no_wal_puts` | writes | Upserts written bypassing the WAL (`skip_wal`, vector payloads, query-embedding cache) | **No** |
+| `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache). Vector payloads and partition-maintenance copies are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
 | `no_wal_deletes` | writes | Deletes written bypassing the WAL (`delete_no_wal` callers) | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
 | `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
@@ -1222,6 +1254,15 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
 | `vlog_gc_duration_ms` | gc | Cumulative value-log GC time (ms) | **No** |
 | `wal_gc_runs` | gc | WAL GC passes run | **No** |
 | `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
+| `appends` | vector_index_wal | Records appended to the vector index WAL | **No** |
+| `bytes_appended` | vector_index_wal | Bytes appended to it, frames included | **No** |
+| `fsyncs` | vector_index_wal | Its fsyncs: one per batch of vector writes made durable | **No** |
+| `appends_per_fsync` | vector_index_wal | `appends / fsyncs` (derived): records made durable per fsync. `null` before the first fsync | **No** |
+| `gc_runs` | vector_index_wal | Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete | **No** |
+| `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
+| `pin_flushes` | vector_index_wal | WAL GC tick flushes (each a seal) of a namespace that held the retired cut back | **No** |
+| `records_replayed` | vector_index_wal | Records replayed into memtables when the server started | **No** |
+| `records_skipped` | vector_index_wal | Records not replayed at start because their namespace had been dropped | **No** |
 | `used_bytes` | index_overlay | Bytes the field-index write buffers hold now: changes made since the last index checkpoint, across every field | **No** |
 | `peak_bytes` | index_overlay | Highest `used_bytes` since startup | **No** |
 | `soft_limit_bytes` / `hard_limit_bytes` | index_overlay | `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` | n/a (config) |
@@ -1242,16 +1283,17 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc` and
 > follow the same in-memory, reset-on-restart model.
 
 **Per-namespace breakdown.** Every counter is recorded per namespace; the engine
-view above is their sum plus a small global instance (the WAL-GC counters, which
-belong to the shared WAL, and a fold of every dropped namespace's final totals so
-the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
+view above is their sum plus a small global instance (the WAL-GC and
+`vector_index_wal` counters, which belong to the two shared logs, and a fold of
+every dropped namespace's final totals so the engine aggregate stays monotonic). Two endpoints expose the breakdown, both
 returning the same grouped shape as the engine endpoint:
 
 - `GET /admin/storage/stores/{ns}/ops-metrics` — one namespace's counters (`404`
   if the namespace does not exist). Its `gc.wal_gc_runs` / `gc.wal_segments_deleted`
-  are always `0` — WAL GC is engine-global and reported only by the engine endpoint.
+  and `vector_index_wal` counters are always `0` — both logs are engine-global and
+  reported only by the engine endpoint.
 - `GET /admin/storage/ops-metrics/by-namespace` — an array of `{namespace, reads,
-  lsm_lookups, writes, compaction, gc}` objects, one per live namespace (no
+  lsm_lookups, writes, compaction, gc, vector_index_wal}` objects, one per live namespace (no
   `uptime_s`).
 
 Neither per-namespace view has `index_overlay`: the write-buffer budget is shared
@@ -1288,6 +1330,43 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `live_segments` | Tracked segments still carrying entries |
 | `last_sequence` | Highest write sequence the WAL has observed |
 | `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+
+**`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
+vector worker writes its chunk and whole-document codes to so that one fsync per
+batch makes them durable. One log per database, shared by every namespace. A
+record is **retired** once the memtable holding its write has been flushed to
+disk; restart replays only unretired records, and GC deletes segments that lie
+wholly below the **retired cut**. Each namespace's replay starts at its own
+`safe_offset`, which may be above the cut. Positions are `{segment_id, byte}`.
+
+| Field | Meaning |
+|-------|---------|
+| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first |
+| `segment_count`, `disk_bytes` | Number of segment files and their total size |
+| `tail` | Where the next record goes |
+| `durable_tail` | Everything below it is fsynced |
+| `retired_cut` | Records below it are retired |
+| `unretired_bytes` | Bytes at or above the retired cut (segment headers excluded): what a restart would replay |
+| `last_sequence` | Highest write sequence of a record appended since the server started, or found then at or above the retired cut (0 if none) |
+| `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them (sealing the memtable even when it is empty), which releases them |
+| `stopped` | `null` normally. After a failed fsync of the log, the error: the log then refuses appends and syncs until the server restarts, and vector indexing stops (documents stay queued) |
+
+On a database whose vector worker has written nothing:
+
+```json
+{
+  "segments": [{"segment_id": 0, "bytes": 16}],
+  "segment_count": 1,
+  "disk_bytes": 16,
+  "tail": {"segment_id": 0, "byte": 16},
+  "durable_tail": {"segment_id": 0, "byte": 16},
+  "retired_cut": {"segment_id": 0, "byte": 0},
+  "unretired_bytes": 0,
+  "last_sequence": 0,
+  "holding_cut": [],
+  "stopped": null
+}
+```
 
 **`GET /admin/storage/lsm`** — per-namespace LSM manifest:
 
@@ -1370,6 +1449,7 @@ Storage diagnostics and engine operations. Not intended for application traffic.
 | `GET` | `/admin/storage/ops-metrics/by-namespace` | `200` | The same counters broken out per namespace |
 | `GET` | `/admin/storage/stores/{ns}/ops-metrics` | `200` | Operational counters for one namespace |
 | `GET` | `/admin/storage/wal` | `200` | WAL metadata snapshot |
+| `GET` | `/admin/storage/vector-index-wal` | `200` | Vector index WAL: segments, tail, retired cut, namespaces holding it |
 | `GET` | `/admin/storage/lsm` | `200` | LSM manifest for every namespace |
 | `GET` | `/admin/storage/value-log` | `200` | Per-namespace, per-shard value-log utilisation |
 | `GET` | `/admin/storage/value-log/{ns}/segments` | `200` | Per-segment garbage breakdown for one namespace |
@@ -1524,6 +1604,12 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/reindex/{doc_id}` | `200` | Re-enqueue one document for embedding (doc + KV stores) |
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
+| `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
+| `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
+| `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
+| `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
+| `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find within their budget: the signal for a rebuild |
+| `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/{doc_id}` | `200` | Look up one queue entry |
@@ -1887,6 +1973,181 @@ Returns `409` when a cleanup or campaign is already running. Returns `422` when 
 
 ---
 
+#### `GET /admin/indices/{ns}/vector/partition`
+
+The store's IVF partition at a glance, from memory: `postings` (K), `entries`,
+`chunks`, `size_p10_p50_p90_max` (chunks per posting), `splits`,
+`unfinished_operations` (maintenance a crash interrupted, finished at startup),
+`maintenance` (splits, merges, reassignments and chunk moves since the partition
+loaded), the store's `target_posting_size`, `split_limit` and `merge_limit`, and
+`rebuild` (the last rebuild since the server started, or `null`). With
+`?codes=true` it also reads every chunk code and adds `codes` (mean centre drift
+and error band) and `reencode_candidates`, and records them in the
+[history](#get-adminindicesnsvectorhistory). `last_recall_check` is the latest
+recorded [recall check](#get-adminindicesnsvectorrecall-check), or `null`; it is
+read from the history, never run here.
+
+Centre drift says how far codes have moved from the centre they were encoded
+against. It is a reason to re-encode (re-embed with `vector/reindex-all`), not
+to rebuild: a rebuild re-encodes nothing and moves every code, so it raises
+drift.
+
+```bash
+curl http://localhost:8080/admin/indices/products/vector/partition
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/postings`
+
+Every posting, retired ones included, with its size, state (`active`,
+`draining`, `retired`), centre, parent and origin (`root`, `split`, `rebuild`,
+or `seed` for a store created before partitions grew by themselves).
+Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
+`sort` (`id`, `entries`, `chunks`, `drift`) and `order` (`asc`, `desc`).
+
+---
+
+#### `POST /admin/indices/{ns}/vector/rebuild`
+
+Re-cluster the store's partition from its stored 1-bit codes: k-means over every
+chunk, then each chunk moves to its nearest new posting, and the usual splits
+and merges follow. No embedding request is made and no code is re-encoded.
+Searches and writes continue throughout; a crash part-way is finished at the
+next start. Centres chosen one split at a time are a worse map than one fit on
+everything stored now, which costs recall when a search reads a small share of
+the store (measured: up to 4.4 points of recall@10 at a 1% read, up to 1.3 at
+5%, nothing at the default budget on stores of 5k and 57k documents). Run the
+[recall check](#get-adminindicesnsvectorrecall-check) to see whether it applies,
+and again afterwards. It also moves a store created before partitions grew by
+themselves onto its own centres.
+
+The optional body sets how many postings to fit; by default as many as are
+active now, so a search probes about as many as before. K-means runs on its own
+threads (`[semantic_search.maintenance] rebuild_threads`, 1 or 2), never those
+searches use.
+
+```bash
+curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild
+# → 202 {"namespace": "products", "rebuild": {"state": "running", ...}}
+curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild \
+  -H 'Content-Type: application/json' -d '{"postings": 500}'
+```
+
+Progress and the result are the `rebuild` field of
+[`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition):
+`state` (`running`, `done`, `failed`), `started_at_ms`, `finished_at_ms`, and
+`report` (`postings_before`, `postings_fitted`, `postings_after`, `chunks`,
+`iterations`, `chunks_moved`) or `error`. The finished status is also recorded in
+the [history](#get-adminindicesnsvectorhistory). Returns `409` while a rebuild of
+the store runs, `400` for `postings` of 0, and `422` when semantic search is not
+enabled.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/recall-check`
+
+Answers "would a rebuild help this store?" by measuring what a rebuild can
+change: how much of a full read's results a search finds within its probe
+budget.
+
+It samples real queries from the query-embedding cache: the embeddings of recent
+searches with the store's model and dimension. With fewer than 20 cached, it
+samples stored chunks instead and uses each one's reconstruction as a query
+(leaving that chunk's own document out of the results). Either way it makes no
+embedding request; `query_source` (`cached_queries` or `stored_chunks`) says
+which it used. Chunk queries are a weaker signal: on one store they did not
+move after a rebuild that gained 3 points of recall@10. Each query is
+searched twice: with the store's settings, and with every posting read.
+**Overlap@k** is the share of the full read's top k that the normal search also
+found. On a store of more than 500,000 entries the second search
+reads the nearest postings up to 500,000 entries instead of every posting, which
+bounds its memory (a search holds what it scans until it returns);
+`reference_is_full_read` says which.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `sample` | 100 | Queries, 1 to 1,000 |
+| `seed` | fixed | Same seed, same queries: use it to compare before and after a rebuild |
+| `min_overlap` | 0.95 | Overlap@10 below which the verdict is `below_target` |
+| `probe_budget_entries`, `min_probes`, `max_probes` | the store's | Check another budget, validated as for a search |
+
+The response holds `verdict`, `seed`, `query_source`, `sampled`, `entries`, `postings`,
+`budget_entries`, `read_share` (mean share of entries a search read),
+`probes_mean`, `reference_is_full_read`, `reference_share`, `overlap` (`k` and
+`mean` at 10, 20, 30, 40, 50 and 100),
+`overlap_at_10_p10`, `search_ms`, `full_read_ms` and `elapsed_ms`. The verdict:
+
+| `verdict` | Meaning | Do |
+|---|---|---|
+| `read_in_full` | Every search already reads every posting | Nothing: no partition can change the results |
+| `ok` | Overlap@10 ≥ `min_overlap` | Nothing |
+| `below_target` | Searches miss part of what a full read finds | Rebuild, wait for it, check again with the same `seed`. Keep the rebuild if overlap rose; if it did not, raise `probe_budget_entries` instead |
+| `empty` | No chunks stored | — |
+
+Read the overlap against the same check before and after a change, not against
+a fixed bar: its level depends on the data. On stores grown from one posting,
+real-query overlap@10 at a 1% read share was 0.56–0.63 (5,000 documents) and
+0.85–0.91 (57,000 documents); a rebuild raised it 2–5 points there, matching the
+recall@10 it gained, up to 3 at 5%, and nothing at 20% or at the default
+budget.
+
+**Cost.** One search and one full read per query, one query at a time; each
+takes the same scoring slot as a client search, so a check adds about one
+client's load while it runs. Measured with 300 queries: 1.2–2.1 s on a store of
+23,000 chunks (full read 3–4 ms), 7.5–12.7 s on one of 173,000 chunks (full read
+21–24 ms). The full read costs in proportion to the entries read, up to the
+500,000-entry cap (about 0.1 s and 150 MB per query), so on a large store use a
+smaller `sample`, off-peak. Nothing runs unless asked.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/recall-check?sample=200'
+```
+
+Each result is recorded in the [history](#get-adminindicesnsvectorhistory).
+Returns `400` for a parameter out of range or an unknown one, `404` for an
+unknown store and `422` when semantic search is not enabled.
+
+---
+
+#### `GET /admin/indices/vector/settings`
+
+The server's `[semantic_search]` settings as it runs with them:
+`embedding_service_url`, `supported_models` (empty: any model the service
+serves), the request and connect timeouts, `query_embedding_cache_ttl_secs`,
+`partition_history_ttl_secs`, `maintenance_threads`, `rebuild_threads` (at most
+`max_rebuild_threads`), the recall check's limits (`max_sample`,
+`min_cached_queries`, `max_reference_entries`, `default_min_overlap`), and
+`namespace_defaults`: the search and maintenance settings a store is given when
+it enables semantic search. A store's own settings are in its schema
+(`vector_index`). Returns `422` when semantic search is not configured.
+
+```bash
+curl http://localhost:8080/admin/indices/vector/settings
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/history`
+
+What the store's partition looked like over time, without recomputing anything:
+every `partition?codes=true` read (`kind` `codes`), recall check
+(`recall_check`) and finished rebuild (`rebuild`), each with `recorded_at_ms` and
+the result as its endpoint returned it under `data`. Newest first; `kind` keeps
+one kind, `limit` sets how many (default 50, at most 1,000). Records are kept in
+the system TTL store `system_partition_history` for
+`[semantic_search] partition_history_ttl_secs` (default 30 days; the response's
+`ttl_secs`), and written only when one of those operations runs.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/history?kind=recall_check&limit=10'
+```
+
+Returns `400` for an unknown `kind` or a `limit` out of range, `404` for an
+unknown store and `422` when semantic search is not enabled.
+
+---
+
 #### `GET /admin/indices/{ns}/vector/queue`
 
 All pending queue entries for one namespace, paginated.
@@ -1988,7 +2249,7 @@ All errors return JSON with an `"error"` key:
 | `400`       | Invalid ID / key format, bad schema, type mismatch, malformed request |
 | `404`       | Namespace, document, or KV key not found                 |
 | `409`       | Store already exists, field already indexed, build in progress, attribute/vector operation already active for namespace |
-| `422`       | Semantic search requested but not enabled / cluster index not loaded; no indices to rebuild; entry not yet exhausted |
+| `422`       | Semantic search requested but not enabled, or its model not allowed or not served; no indices to rebuild; entry not yet exhausted |
 | `500`       | Internal database error                                  |
 
 ---
@@ -2070,9 +2331,12 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
     config.json               ← namespace settings
     lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
-  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [cluster_id ‖ doc_id] (Pass 1)
+  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)
-  ns_{namespace}_sparse_vector_meta/ ← each document's clusters, used to clean up on update and delete
+  ns_{namespace}_sparse_vector_meta/ ← each document's postings and chunk counts, used to clean up on update and delete
+  ns_{namespace}_ivf_centres/        ← the store's IVF centres
+  ns_{namespace}_ivf_postings/       ← its postings: routing centre, state, parent
+  ns_{namespace}_ivf_journal/        ← partition maintenance in progress, finished after a crash
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   index/

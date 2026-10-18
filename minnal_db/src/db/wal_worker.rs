@@ -24,6 +24,14 @@ pub trait WalGcTarget: Send + Sync + 'static {
     /// When this returns `false` the worker skips the GC run entirely.
     fn has_deletable_wal_segments(&self) -> bool;
     fn garbage_collect_wal(&self) -> Result<(u64, u64)>;
+    /// Flush every namespace holding the vector index WAL's retired cut back.
+    /// Returns how many were flushed.
+    fn flush_namespaces_pinning_vector_wal(&self) -> usize;
+    /// Whether any vector index WAL segment lies wholly below the retired cut.
+    fn has_deletable_vector_wal_segments(&self) -> bool;
+    /// Delete vector index WAL segments wholly below the retired cut. Returns
+    /// `(segments, bytes)` deleted.
+    fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)>;
 }
 
 /// Commands that can be sent to the WAL GC worker
@@ -77,7 +85,15 @@ impl WalGcWorker {
                 // Periodic WAL GC check
                 _ = interval.tick() => {
                     match target.upgrade() {
-                        Some(t) => Self::perform_wal_gc_check(&t),
+                        // Two independent passes on one tick: a stuck main-WAL
+                        // GC must not leave the vector index WAL growing, nor the
+                        // reverse, so neither pass can skip the other.
+                        // The passes flush memtables and delete files: see
+                        // `run_blocking_pass`.
+                        Some(t) => crate::support::run_blocking_pass(|| {
+                            Self::perform_wal_gc_check(&t);
+                            Self::perform_vector_wal_gc_check(&t);
+                        }),
                         None => break,
                     }
                 }
@@ -147,6 +163,29 @@ impl WalGcWorker {
             }
         }
     }
+
+    /// The vector index WAL's pass: flush namespaces holding its retired cut
+    /// back, then delete the segments wholly below the cut. Uses only the vector
+    /// index WAL's own cut, never the main WAL's decisions.
+    fn perform_vector_wal_gc_check<T: WalGcTarget>(target: &Arc<T>) {
+        if target.is_closed() {
+            return;
+        }
+        let flushed = target.flush_namespaces_pinning_vector_wal();
+        if flushed > 0 {
+            info!("[WalGcWorker] tick — flushed {flushed} namespace(s) holding the vector index WAL's retired cut");
+        }
+        if !target.has_deletable_vector_wal_segments() {
+            debug!("[WalGcWorker] tick — vector index WAL: nothing to reclaim");
+            return;
+        }
+        match target.garbage_collect_vector_wal() {
+            Ok((segments, bytes)) => {
+                info!("[WalGcWorker] vector index WAL GC complete — deleted {segments} segment(s), {bytes} bytes");
+            }
+            Err(e) => error!("[WalGcWorker] vector index WAL GC failed: {e:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +195,49 @@ mod tests {
     use crate::db::database::Database;
     use crate::store::lsm::lsm_tree::LSMConfig;
     use tempfile::TempDir;
+
+    struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);
+
+    impl WalGcTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn flush_namespaces_pinning_wal(&self) -> usize {
+            self.0.block();
+            0
+        }
+        fn get_wal_gc_stats(&self) -> (u64, u64) {
+            (0, 0)
+        }
+        fn has_deletable_wal_segments(&self) -> bool {
+            false
+        }
+        fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+        fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+            0
+        }
+        fn has_deletable_vector_wal_segments(&self) -> bool {
+            false
+        }
+        fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+    }
+
+    /// A GC tick flushes memtables and deletes segments; on a runtime thread it
+    /// holds up the tasks scheduled behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_wal_gc_pass_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = WalGcWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        assert_runtime_free_during_pass(&busy).await;
+        worker.shutdown().await;
+    }
 
     fn create_db_config() -> DbConfig {
         let gc_interval = Duration::from_secs(5);

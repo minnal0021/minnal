@@ -13,7 +13,10 @@ use crate::doc_store::index_observer::InMemoryProgress;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
-use crate::semantic_search::ClusterIndex;
+use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
+#[cfg(feature = "semantic-search")]
+#[cfg(feature = "semantic-search")]
+use crate::semantic_search::PartitionHandle;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::service::SemanticSearchConfig;
 
@@ -167,12 +170,18 @@ pub struct VecReindexProgress {
     pub exhausted_cleared: usize,
     /// Error message when `status == "failed"`.
     pub error: Option<String>,
+    /// Whether every document was enqueued. A `"running"` record without it, and
+    /// with no reindex enqueueing in this process, was cut short by a crash.
+    #[serde(default)]
+    pub enqueue_done: bool,
 }
 
+#[cfg(feature = "semantic-search")]
 pub(super) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
     crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join("vector_reindex.json")
 }
 
+#[cfg(feature = "semantic-search")]
 pub(super) fn read_vec_reindex(path: &Path) -> Option<VecReindexProgress> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -246,12 +255,349 @@ impl IndexBuildHandle {
 /// availability.
 ///
 /// Construct once at startup and attach via [`DocStore::with_semantic_search`].
+///
+/// It holds what is engine-wide: the embedding service settings, the defaults
+/// a namespace's vector-index settings start from, and optionally the models
+/// this server allows (each with its dimension). A namespace that enables semantic search starts with one root
+/// posting ([`init_namespace`]) and grows its own partition by splitting
+/// (design doc M3); it is loaded once into a registry of
+/// [`PartitionHandle`]s. Everything that shapes a namespace's index comes from
+/// its schema; [`for_namespace`] combines the two into the per-call
+/// [`SemanticSearchConfig`] and the namespace's partition.
+///
+/// [`init_namespace`]: SemanticSearchContext::init_namespace
+///
+/// [`for_namespace`]: SemanticSearchContext::for_namespace
 #[cfg(feature = "semantic-search")]
 pub struct SemanticSearchContext {
-    /// Embedding service configuration (URL, model, dimensions).
+    /// Embedding service settings: URL, timeouts and the query-cache TTL. Its
+    /// per-namespace fields are ignored; [`for_namespace`](Self::for_namespace)
+    /// overwrites them from the namespace's settings.
     pub config: SemanticSearchConfig,
-    /// IVF cluster centroids, probed by exact nearest-centroid distance.
-    pub cluster_index: Arc<ClusterIndex>,
+    /// The models this server allows, lower-cased name → dimension. Empty:
+    /// any model the embedding service serves (checked by probing it when a
+    /// namespace enables semantic search).
+    pub supported_models: std::collections::BTreeMap<String, u32>,
+    /// What a namespace's vector-index settings are filled with when it first
+    /// enables semantic search (the server's TOML defaults, or built-in).
+    pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
+    /// Namespaces maintained at once by the partition maintenance task.
+    pub maintenance_threads: usize,
+    /// Threads a partition rebuild's k-means uses (at most
+    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub rebuild_threads: usize,
+    /// Each namespace's last rebuild since start.
+    rebuilds: parking_lot::Mutex<std::collections::HashMap<String, crate::ivf_split::rebuild::RebuildStatus>>,
+    /// Reaches the partition maintenance task, once it runs.
+    maintenance_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Each namespace's partition, loaded once from its stores. Keyed by name and
+    /// `ns_id`, so a namespace dropped and recreated under the same name never
+    /// reuses the old one.
+    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, u32), Arc<PartitionHandle>>>,
+    /// Namespaces whose vector index is being dropped: no partition of theirs
+    /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
+    dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
+}
+
+/// What one namespace's semantic operations run with: the per-call config built
+/// from its settings, and its model's centroids.
+#[cfg(feature = "semantic-search")]
+pub struct NamespaceSemantics {
+    /// Service settings plus the namespace's model, dimension, chunking, code
+    /// widths and search defaults.
+    pub config: SemanticSearchConfig,
+    /// The namespace's own partition (its centres, postings, rotation and
+    /// counts). Take [`PartitionHandle::read_epoch`] before routing a write or
+    /// running a search, then use its [`snapshot`](PartitionHandle::snapshot).
+    pub partition: Arc<PartitionHandle>,
+    /// The namespace's search settings, from which `config.probe` was computed
+    /// (kept so a request's overrides apply to them, not to the computed budget).
+    pub search: SearchSettings,
+    /// The namespace's partition maintenance settings.
+    pub maintenance: crate::doc_store::vector_settings::MaintenanceSettings,
+}
+
+#[cfg(feature = "semantic-search")]
+impl SemanticSearchContext {
+    /// A context with the given service settings, allowing any model.
+    pub fn new(config: SemanticSearchConfig) -> Self {
+        Self {
+            config,
+            supported_models: std::collections::BTreeMap::new(),
+            index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
+            maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
+            rebuild_threads: crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            maintenance_tx: std::sync::OnceLock::new(),
+            ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Maintain at most `threads` namespaces' partitions at once.
+    pub fn with_maintenance_threads(mut self, threads: usize) -> Self {
+        self.maintenance_threads = threads.max(1);
+        self
+    }
+
+    /// Allow only these models, each at its dimension (names are lower-cased).
+    pub fn with_supported_models(mut self, models: impl IntoIterator<Item = (String, u32)>) -> Self {
+        self.supported_models = models.into_iter().map(|(m, d)| (m.to_lowercase(), d)).collect();
+        self
+    }
+
+    /// Run rebuilds' k-means on `threads` threads (1 to
+    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    pub fn with_rebuild_threads(mut self, threads: usize) -> Self {
+        self.rebuild_threads = threads.clamp(1, crate::ivf_split::rebuild::MAX_REBUILD_THREADS);
+        self
+    }
+
+    /// Mark a rebuild of `namespace` as running, unless one already is.
+    pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
+        use crate::ivf_split::rebuild::{RebuildState, RebuildStatus};
+        let mut rebuilds = self.rebuilds.lock();
+        if rebuilds.get(namespace).is_some_and(|s| s.state == RebuildState::Running) {
+            return Err(DocStoreError::VecRebuildInProgress {
+                namespace: namespace.to_owned(),
+            });
+        }
+        rebuilds.insert(
+            namespace.to_owned(),
+            RebuildStatus {
+                state: RebuildState::Running,
+                postings_requested: postings,
+                started_at_ms: unix_ms(),
+                finished_at_ms: None,
+                report: None,
+                error: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record how `namespace`'s running rebuild ended.
+    pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::ivf_split::rebuild::RebuildReport, String>) {
+        use crate::ivf_split::rebuild::RebuildState;
+        if let Some(status) = self.rebuilds.lock().get_mut(namespace) {
+            status.finished_at_ms = Some(unix_ms());
+            match result {
+                Ok(report) => {
+                    status.state = RebuildState::Done;
+                    status.report = Some(report);
+                }
+                Err(e) => {
+                    status.state = RebuildState::Failed;
+                    status.error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// `namespace`'s last rebuild since start, if any.
+    pub fn rebuild_status(&self, namespace: &str) -> Option<crate::ivf_split::rebuild::RebuildStatus> {
+        self.rebuilds.lock().get(namespace).cloned()
+    }
+
+    pub(crate) fn set_maintenance_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        let _ = self.maintenance_tx.set(tx);
+    }
+
+    /// Ask the maintenance task to split `namespace`'s oversized postings. A
+    /// no-op until the task runs.
+    pub fn request_maintenance(&self, namespace: &str) {
+        if let Some(tx) = self.maintenance_tx.get() {
+            let _ = tx.send(namespace.to_owned());
+        }
+    }
+
+    /// Use `defaults` for namespaces that enable semantic search from now on.
+    pub fn with_index_defaults(mut self, defaults: crate::doc_store::vector_settings::IndexDefaults) -> Self {
+        self.index_defaults = defaults;
+        self
+    }
+
+    /// Give `namespace` its starting partition, one root posting at the zero
+    /// centre, unless it already holds one (a re-enable, or a namespace seeded
+    /// from a centroid file before M3). Checks the model first. Durable on
+    /// return.
+    pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
+        self.check_model(settings)?;
+        if !crate::vector_kv::ivf_exists(db, namespace).await? {
+            crate::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
+            self.ivfs.write().retain(|(name, _), _| name != namespace);
+        }
+        Ok(())
+    }
+
+    /// Forget every loaded partition of `namespace` (it was dropped).
+    pub fn evict(&self, namespace: &str) {
+        self.ivfs.write().retain(|(name, _), _| name != namespace);
+    }
+
+    /// Start dropping `namespace`'s vector index: refuse to load or hand out
+    /// its partition from now on, stop maintenance on every loaded one, and
+    /// wait for any maintenance operation in progress to finish. Only then may
+    /// the caller remove the namespaces: maintenance writes resolve them with
+    /// get-or-create and would bring them back. Call
+    /// [`end_drop`](Self::end_drop) once they are gone.
+    pub async fn begin_drop(&self, namespace: &str) {
+        self.dropping.lock().insert(namespace.to_owned());
+        let loaded: Vec<Arc<PartitionHandle>> = {
+            let mut ivfs = self.ivfs.write();
+            let mut out = Vec::new();
+            ivfs.retain(|(name, _), p| {
+                if name == namespace {
+                    out.push(Arc::clone(p));
+                    false
+                } else {
+                    true
+                }
+            });
+            out
+        };
+        for partition in loaded {
+            partition.mark_dropped();
+            drop(partition.lock_maintenance().await);
+        }
+    }
+
+    /// The drop [`begin_drop`](Self::begin_drop) started is done; the name may
+    /// hold a vector index again.
+    pub fn end_drop(&self, namespace: &str) {
+        self.dropping.lock().remove(namespace);
+    }
+
+    /// Apply one document's [`PostingDelta`] to `namespace`'s entry counts, if
+    /// its partition is loaded. When it is not, there is nothing to update: the
+    /// load counts from the store.
+    ///
+    /// [`PostingDelta`]: crate::semantic_search::PostingDelta
+    pub fn apply_posting_delta(&self, namespace: &str, delta: &crate::semantic_search::PostingDelta) {
+        if delta.added.is_empty() && delta.removed.is_empty() {
+            return;
+        }
+        let mut wake = false;
+        for ((name, _), partition) in self.ivfs.read().iter() {
+            if name == namespace {
+                partition.snapshot().apply_delta(delta);
+                wake |= partition.needs_maintenance(delta);
+            }
+        }
+        if wake {
+            self.request_maintenance(namespace);
+        }
+    }
+
+    /// Check that `settings` can run here: when the server lists its models,
+    /// the namespace's is one of them, at the listed dimension.
+    pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
+        if self.supported_models.is_empty() {
+            return Ok(());
+        }
+        let dim = *self
+            .supported_models
+            .get(&settings.embedding_model)
+            .ok_or_else(|| DocStoreError::UnsupportedEmbeddingModel {
+                model: settings.embedding_model.clone(),
+                supported: self.supported_models.keys().map(String::as_str).collect::<Vec<_>>().join(", "),
+            })?;
+        if dim != settings.embedding_dim {
+            return Err(DocStoreError::EmbeddingDimMismatch {
+                model: settings.embedding_model.clone(),
+                dim: settings.embedding_dim,
+                expected: dim as usize,
+            });
+        }
+        Ok(())
+    }
+
+    /// The per-call config and partition for `namespace` (`ns_id`) with `settings`,
+    /// loading the partition from its stores on first use.
+    pub async fn for_namespace(
+        &self,
+        db: &crate::AsyncDb,
+        namespace: &str,
+        ns_id: u32,
+        settings: &VectorIndexSettings,
+    ) -> Result<NamespaceSemantics, DocStoreError> {
+        if self.dropping.lock().contains(namespace) {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
+        let key = (namespace.to_owned(), ns_id);
+        let cached = self.ivfs.read().get(&key).cloned();
+        let partition = match cached {
+            Some(p) => p,
+            None => {
+                let ivf =
+                    crate::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
+                        .await?
+                        .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
+                            namespace: namespace.to_owned(),
+                        })?;
+                #[cfg(test)]
+                load_pause::point(namespace).await;
+                // Two first uses can race to load; keep whichever landed first,
+                // so every count update goes to the one partition in use. Nothing
+                // writes this namespace's vectors before its partition is loaded
+                // (every writer goes through here), so the counts are exact.
+                Arc::clone(self.ivfs.write().entry(key).or_insert_with(|| Arc::new(PartitionHandle::new(ivf))))
+            }
+        };
+        partition.set_limits(
+            u64::from(settings.maintenance.split_limit()),
+            u64::from(settings.maintenance.merge_limit()),
+        );
+        // Nothing uses a partition whose journal is unfinished: a write could
+        // route to postings recovery then retires, and maintenance would start
+        // on top of the unfinished operation. A recovery failure is returned,
+        // so writes wait (their queue entries stay) rather than go ahead.
+        let found = crate::ivf_split::ensure_recovered(db, namespace, &partition, &settings.maintenance.ops()).await?;
+        if found > 0 {
+            log::info!("partition recovery: namespace='{namespace}' finished {found} interrupted operation(s)");
+        }
+        let ivf = partition.snapshot();
+        if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
+            return Err(DocStoreError::EmbeddingDimMismatch {
+                model: settings.embedding_model.clone(),
+                dim: settings.embedding_dim,
+                expected: crate::semantic_search::IvfLayout::dim(ivf.as_ref()),
+            });
+        }
+        let config = SemanticSearchConfig {
+            model_name: settings.embedding_model.clone(),
+            embedding_dim: settings.embedding_dim as usize,
+            window_size: settings.window_size as usize,
+            sliding_size: settings.sliding_size as usize,
+            number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
+            probe: probe_settings(&settings.search, ivf.total_entries()),
+            first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
+            top_k_results: settings.search.top_k as usize,
+            ..self.config.clone()
+        };
+        Ok(NamespaceSemantics {
+            config,
+            partition,
+            search: settings.search,
+            maintenance: settings.maintenance,
+        })
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+impl NamespaceSemantics {
+    /// This namespace's config with one request's search overrides applied
+    /// (validated against the same ranges as the schema).
+    pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
+        let s = overrides.apply(self.search)?;
+        self.config.probe = probe_settings(&s, self.partition.snapshot().total_entries());
+        self.search = s;
+        self.config.first_pass_sparse_search_top_k = s.first_pass_top_k as usize;
+        self.config.top_k_results = s.top_k as usize;
+        Ok(self)
+    }
 }
 
 // ── ReindexStats ─────────────────────────────────────────────────────────────
@@ -277,6 +623,24 @@ pub struct ReindexStats {
     pub exhausted_cleared: usize,
     /// Number of documents enqueued for re-embedding.
     pub enqueued: usize,
+}
+
+/// The probe settings a namespace's search settings describe, for a namespace
+/// holding `entries` (a scaled budget depends on it).
+#[cfg(feature = "semantic-search")]
+fn probe_settings(s: &SearchSettings, entries: u64) -> crate::semantic_search::ProbeSettings {
+    crate::semantic_search::ProbeSettings {
+        budget_entries: s.budget_for(entries),
+        min_probes: s.min_probes as usize,
+        max_probes: s.max_probes as usize,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -370,5 +734,33 @@ mod tests {
         assert!(DocId::from_bytes(&[b'x'; crate::doc_store::key::MAX_STR_KEY_LEN + 1], KeyType::Str).is_err());
         assert!(DocId::from_bytes(&[], KeyType::Str).is_err());
         assert!(DocId::from_bytes(&[0xff, 0xfe], KeyType::Str).is_err());
+    }
+}
+
+/// Test-only: stop one partition load of a namespace after it has counted the
+/// store and before it is installed, so a test can act in between.
+#[cfg(all(test, feature = "semantic-search"))]
+pub(crate) mod load_pause {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Pause>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Pause the next load of `namespace`: returns `(reached, release)`.
+    pub(crate) fn arm(namespace: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PAUSES.lock().insert(namespace.to_owned(), pause.clone());
+        pause
+    }
+
+    pub(crate) async fn point(namespace: &str) {
+        let pause = PAUSES.lock().remove(namespace);
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
     }
 }

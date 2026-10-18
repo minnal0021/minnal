@@ -13,39 +13,27 @@ value-log GC, WAL GC and TTL expiry all tick along inside your binary.
 
 **Semantic search is the one part that reaches outside.** Its ANN index,
 quantisation and search run in-process like the rest, but turning text into
-vectors does not: that calls an external embedding service over HTTP, and the
-IVF centroids it quantises against are a data file you download separately.
-[§6](#6-semantic-search-doc-store--kv-store--semantic-search) covers both.
+vectors does not: that calls an external embedding service over HTTP.
+[§6](#6-semantic-search-doc-store--kv-store--semantic-search) covers it.
 
 For running minnal as a REST **service** instead, see
 [`minnal_db_api`](../minnal_db_api/README.md).
 
 > **Platform:** Linux and macOS only — the engine uses `pread`/`pwrite`.
 
-> **Semantic search needs two things this crate does not ship: an embedding
-> service and a cluster-centroid file.** The default `kv-store` and `doc-store`
-> features have **no external dependencies** — but the moment you enable
-> `semantic-search`, indexing and querying vectors need both of these in place:
->
-> 1. an **embedding service** reachable over HTTP (default
->    `http://localhost:8001`), which minnal calls to turn text into vectors. To
->    get started, run the companion reference service,
->    [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
->    which serves the **gemma** and **qwen** embedding models, then point
->    `SemanticSearchConfig::embedding_service_url` (embedded) or
->    `semantic_search.embedding_service_url` (REST server) at it, and name the
->    model to embed with in `SemanticSearchConfig::model_name` /
->    `semantic_search.model` (sent on every request). Without a
->    service reachable, writes still succeed but vector indexing lags and
->    semantic *queries* error.
-> 2. a **cluster-centroid file** — pre-computed IVF centroids, downloaded
->    separately (they are data, not code, and are not inside the published
->    crate). Two are available, one per supported model:
->    [gemma](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json)
->    and [qwen](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json).
->    Use the one matching the model you configure.
->
-> Both are set up in [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
+> **Semantic search needs one thing this crate does not ship: an embedding
+> service.** The default `kv-store` and `doc-store` features have **no external
+> dependencies** — but the moment you enable `semantic-search`, indexing and
+> querying vectors need an **embedding service** reachable over HTTP (default
+> `http://localhost:8001`), which minnal calls to turn text into vectors. To get
+> started, run the companion reference service,
+> [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
+> which serves the **gemma** and **qwen** embedding models, then point
+> `SemanticSearchConfig::embedding_service_url` (embedded) or
+> `semantic_search.embedding_service_url` (REST server) at it. Each store names
+> its model in its schema. Without a service reachable, writes still succeed but
+> vector indexing lags and semantic *queries* error. It is set up in
+> [§6](#6-semantic-search-doc-store--kv-store--semantic-search).
 
 ---
 
@@ -429,50 +417,19 @@ search on document (or `value_type = "str"` KV) stores — see §6.
 
 With `semantic-search` enabled you can run quantised ANN vector search on either
 a **document** store or a **KV store whose value type is `str`**
-(`value_type = "str"`). It needs two things you must supply:
+(`value_type = "str"`). It needs one thing you must supply: an external
+**embedding service** (default `http://localhost:8001`). Run the companion
+[minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
+which serves the **gemma** and **qwen** models.
 
-1. an external **embedding service** (default `http://localhost:8001`) — run the
-   companion [minnal0021/embedding_service](https://github.com/minnal0021/embedding_service),
-   which serves the **gemma** and **qwen** models (minnal names the one to use
-   on every request, from `SemanticSearchConfig::model_name`); and
-2. a **cluster-centroid file** — the pre-computed IVF centroids the coarse
-   quantiser assigns chunks to. See below.
-
-### Getting the cluster-centroid file
-
-The centroid file is data, not code, and it is **not shipped inside the crate** —
-`cargo add minnal_db` will not put one on your disk. You download it yourself and
-point `ClusterIndex::load_with_dim` (when embedding) or
-`semantic_search.cluster_path` (when running the REST server) at wherever you put
-it.
-
-Two ready-made centroid sets live in the minnal repository, one per supported
-model:
-
-| Model | Download | View on GitHub | Centroids | Dim | Size |
-|---|---|---|:---:|:---:|:---:|
-| **gemma** | [`gemma/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/gemma/clusters.json) | 256 | 768 | 4.4 MB |
-| **qwen** | [`qwen/clusters.json`](https://github.com/minnal0021/minnal/raw/main/service/embedding_support/qwen/clusters.json) | [source](https://github.com/minnal0021/minnal/blob/main/service/embedding_support/qwen/clusters.json) | 256 | 768 | 4.4 MB |
-
-```sh
-# Fetch the gemma centroids next to your application (~4.4 MB)
-curl -L --create-dirs -o clusters/clusters.json \
-  https://github.com/minnal0021/minnal/raw/main/service/embedding_support/gemma/clusters.json
-```
-
-Pick the file that matches the model you set in `model_name` — the model minnal
-asks the service for. Both sets are 768-dimensional, so minnal cannot tell them
-apart: `load_with_dim` checks the dimension and nothing more. Pair the wrong file
-with your model and startup succeeds, queries return results, and recall is
-quietly worse — you get no error at any point. Matching the two is on you.
-
-Neither file is privileged: they are ordinary JSONL, one
-`{"cluster_id": <u32>, "centroid": [f32; dim]}` object per line, and the only
-thing special about them is the model they were fitted on. If you use a
-different model, run k-means over a sample of your own corpus's embeddings and
-load the result exactly the same way. Whichever file you use, it is read into
-memory once at startup and never mutated afterwards — around 750 KB resident for
-256 centroids of 768 `f32`.
+Everything that shapes a store's vector index lives in its schema's
+`vector_index`: the model (`embedding_model`, default `"gemma"`, sent on every
+request to the service), its dimension (`embedding_dim`, default 768), how
+documents are chunked, and the search defaults. The model, dimension and
+chunking are fixed once semantic search is enabled. There is no centroid file to
+download: each store starts with one IVF posting and grows its own partition as
+documents arrive, splitting postings that grow too large and merging ones that
+deletes empty, in the background.
 
 One last thing to expect before the code: indexing is **asynchronous**. A write
 returns as soon as the embed job is enqueued, and a background worker — started
@@ -483,45 +440,32 @@ retrying; only vector *indexing* falls behind, while semantic *queries* error.
 
 ### Shared setup: attaching a `SemanticSearchContext`
 
-Both storage layers are driven the same way. You load the cluster index, build a
-`SemanticSearchConfig`, and hand both to the store as a `SemanticSearchContext`.
-Attach it once, at startup — it is also what spawns the embed-worker and the
-one-shot reconciliation pass.
+Both storage layers are driven the same way. You build a `SemanticSearchConfig`
+naming the embedding service and hand it to the store as a
+`SemanticSearchContext`. Attach it once, at startup — it is also what spawns the
+embed-worker, the partition maintenance task and the one-shot reconciliation
+pass.
 
 ```rust
-use std::sync::Arc;
+use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSpec};
+use minnal_db::semantic_search::service::SemanticSearchConfig;
 use minnal_db::{
     AttributeDef, AttributeType, DocId, DocStore, DocStoreSchema, KeyType, KvKeyType,
     KvStoreSchema, KvValueType, Pagination, SemanticSearchContext, StoreType,
 };
-use minnal_db::semantic_search::ClusterIndex;
-use minnal_db::semantic_search::service::SemanticSearchConfig;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let embedding_dim = 768; // must match the vectors the service returns for `model_name`
-// Path to the centroid file you downloaded above — gemma and qwen centroids are
-// both published in the minnal repo under service/embedding_support/{model}/.
-let cluster_index = Arc::new(ClusterIndex::load_with_dim(
-    "clusters/clusters.json",
-    embedding_dim,
-)?);
-// `embedding_dim` (768) is already the default; it is spelled out here because it
-// must agree with both the centroid file and the vectors the service returns.
-// `model_name` is sent on every request (`/embedding/gemma/document`, `.../query`)
-// and picks which of the service's models embeds the text; it defaults to "qwen".
-// It does not pick the cluster file (that is the `ClusterIndex` above), so keep the
-// two in step.
+// Only the service is configured here; each store picks its model below.
 let config = SemanticSearchConfig {
-    embedding_dim,
-    model_name: "gemma".into(),
+    embedding_service_url: "http://localhost:8001".into(),
     ..Default::default()
 };
 
-// `with_semantic_search` also starts the background embed-worker + a one-shot
-// startup reconciliation, so attach it once, up front.
+// `with_semantic_search` also starts the background embed-worker, the partition
+// maintenance and a one-shot startup reconciliation, so attach it once, up front.
 let store = DocStore::open("/tmp/sem", "/tmp/sem/schemas")
     .await?
-    .with_semantic_search(SemanticSearchContext { config, cluster_index });
+    .with_semantic_search(SemanticSearchContext::new(config));
 ```
 
 ### Searching a document store
@@ -533,7 +477,7 @@ over what has been indexed so far. Results come back with the document's key
 bytes in `document_id`.
 
 ```rust
-// A doc store whose `body` field is embedded (semantic_search_enabled + embedding_fields).
+// A doc store whose `body` field is embedded with gemma (768 dimensions).
 let schema = DocStoreSchema {
     namespace: "articles".into(),
     store_type: StoreType::Doc,
@@ -543,6 +487,10 @@ let schema = DocStoreSchema {
     indices: vec![],
     semantic_search_enabled: true,
     embedding_fields: vec!["body".into()],
+    vector_index: Some(VectorIndexSpec {
+        embedding_model: Some("gemma".into()),
+        ..Default::default()
+    }),
 };
 store.create(schema).await?;
 
@@ -551,7 +499,8 @@ store.put("articles", DocId::U64(1), serde_json::json!({ "body": "thunder and li
 store.put("articles", DocId::U64(2), serde_json::json!({ "body": "a quiet afternoon in the library" })).await?;
 
 // Two-pass ANN search over the stored vectors (top 5). `document_id` is the doc's key bytes.
-let hits = store.search_semantic("articles", "a storm at night", Some(5), Pagination::default()).await?;
+let top5 = SearchSpec { top_k: Some(5), ..Default::default() };
+let hits = store.search_semantic("articles", "a storm at night", &top5, Pagination::default()).await?;
 for r in hits.results {
     let id = u64::from_be_bytes(r.document_id[..8].try_into().unwrap());
     println!("doc {id}  score={:.4}", r.dot_product);
@@ -566,7 +515,7 @@ write gets embedded. Here `document_id` in the results is the raw string key
 rather than encoded key bytes.
 
 ```rust
-// A KV store whose string values are embedded (value_type = str + semantic_search_enabled).
+// A KV store whose string values are embedded, with the default settings (gemma, 768).
 let kv_schema = KvStoreSchema {
     namespace: "notes".into(),
     store_type: StoreType::Kv,
@@ -574,6 +523,7 @@ let kv_schema = KvStoreSchema {
     key_type: KvKeyType::Str,
     value_type: KvValueType::Str,
     semantic_search_enabled: true,
+    vector_index: None,
 };
 store.create_kv(kv_schema).await?;
 
@@ -581,7 +531,7 @@ store.kv_put("notes", &serde_json::json!("n1"), &serde_json::json!("meeting abou
 store.kv_put("notes", &serde_json::json!("n2"), &serde_json::json!("weekend hiking trip planning")).await?;
 
 // `document_id` here is the raw string key.
-let hits = store.kv_search_semantic("notes", "financial planning", Some(5), Pagination::default()).await?;
+let hits = store.kv_search_semantic("notes", "financial planning", &top5, Pagination::default()).await?;
 for r in hits.results {
     println!("key {}  score={:.4}", String::from_utf8_lossy(&r.document_id), r.dot_product);
 }
@@ -589,3 +539,91 @@ for r in hits.results {
 store.shutdown().await?; // stops the embed-worker cleanly
 # Ok(()) }
 ```
+
+---
+
+## 7. Choosing a memory allocator
+
+**Use jemalloc in the program that embeds `minnal_db`.** Every request
+allocates and frees short-lived buffers, from many threads at once. The system
+allocator on Linux, glibc `malloc`, holds on to much of what it frees, and the
+same work ran slower with it. Under 16 concurrent clients, measured in the
+engine benchmark, switching the same binary to jemalloc gave:
+
+| | glibc `malloc` | jemalloc |
+|---|---:|---:|
+| Operations per second | 412 | 444 |
+| Semantic search, median / p99 | 33 / 91 ms | 23 / 61 ms |
+| Resident memory after the load | 5.2 GiB | 1.3 GiB |
+| Highest resident memory over the whole run | 5.7 GiB | 2.7 GiB |
+
+Search quality and write latency were unchanged. The full comparison,
+including glibc's tuning options, is in
+[benchmark.md → Choosing the memory allocator](benchmark.md#choosing-the-memory-allocator).
+The `minnal_db_api` server already uses jemalloc.
+
+`minnal_db` is a library, so it does not choose an allocator for you: Rust
+lets only the final program set one. You set it in your binary crate, the one
+with `main`, never in a library crate that others depend on.
+
+### Switching to jemalloc
+
+Add the allocator to your binary's `Cargo.toml`:
+
+```toml
+[dependencies]
+minnal_db = "0.2"
+tikv-jemallocator = "0.7"
+```
+
+and declare it once in `src/main.rs`. Nothing else changes: every allocation in
+the process, minnal's included, now goes through jemalloc.
+
+```rust
+use minnal_db::Db;
+
+// Every heap allocation in this program, minnal's background workers included,
+// now goes through jemalloc.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open("/tmp/mydb")?;
+    db.put(b"hello", b"world")?;
+    assert_eq!(db.get(b"hello")?.as_deref(), Some(&b"world"[..]));
+    db.shutdown()?;
+    Ok(())
+}
+```
+
+jemalloc is a C library that `tikv-jemallocator` compiles from source the first
+time you build, so the build needs a C compiler and `make`, as most Rust
+toolchains on Linux and macOS already have.
+
+### Checking it is in use
+
+jemalloc reads its options from the `_RJEM_MALLOC_CONF` environment variable
+(the `_RJEM_` prefix keeps it apart from any other jemalloc in the process).
+`stats_print:true` makes it print its statistics when the program exits, so
+seeing them confirms the program runs on jemalloc:
+
+```sh
+_RJEM_MALLOC_CONF=stats_print:true ./target/release/my_app 2>&1 | grep -m1 -A1 'Begin jemalloc'
+# ___ Begin jemalloc statistics ___
+# Version: "5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+```
+
+The same variable tunes it. jemalloc returns freed pages to the operating
+system about ten seconds after they are freed (`dirty_decay_ms:10000`), and it
+does so while the program allocates, so a program that goes idle keeps them
+until it is busy again. `background_thread:true` makes a jemalloc thread return
+them on time even when the program is idle. `dirty_decay_ms:1000` returns them
+sooner, at some CPU cost. The comparison above used the defaults.
+
+### Staying on glibc
+
+If you cannot change the allocator, glibc's own settings help only a little.
+`GLIBC_TUNABLES=glibc.malloc.arena_max=8` caps the number of memory regions it
+spreads threads over. That cut resident memory to 2 GiB in the benchmark, but
+also halved throughput, because threads then wait for each other's locks. Treat
+any glibc setting as something to measure on your own workload first.

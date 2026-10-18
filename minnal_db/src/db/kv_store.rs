@@ -8,7 +8,7 @@
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::IndexCheckpointTrigger;
 use crate::db::stats::{GCStats, Stats};
-use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver};
+use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
 use crate::store::lsm_worker::LsmCompactionCommand;
 use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::store::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
@@ -47,14 +47,67 @@ pub(crate) type ScanPage = (Vec<KeyValue>, Option<Vec<u8>>);
 /// key is re-resolved through the LSM.
 pub(crate) type ResolvedEntry = (Vec<u8>, ShardedValuePointer);
 
-/// A key tagged with the prefix ID it was found under — used to carry keys that
-/// need a single-key retry back to their originating prefix bucket.
-pub(crate) type PrefixIdKey = (u32, Vec<u8>);
-
-/// Map from prefix ID to the [`KeyValue`] pairs that share it.
+/// What a prefix-batch scan (`scan_prefixes_batch`) returns: every live entry
+/// under the requested 4-byte prefixes, in key order, so grouped by prefix.
 ///
-/// Returned by [`KVStore::scan_prefixes_batch`].
-pub(crate) type PrefixBatchResult = std::collections::HashMap<u32, Vec<KeyValue>>;
+/// The keys sit in one buffer and the values in one buffer per value-log bucket,
+/// not in two allocations per entry: a semantic search's first pass reads tens of
+/// thousands of entries at once and frees them all when it is done.
+#[derive(Debug, Default)]
+pub struct PrefixScan {
+    keys: PrefixScanKeys,
+    /// One buffer per value-log bucket read, then one per value re-read after its
+    /// segment was reclaimed mid-scan.
+    values: Vec<Vec<u8>>,
+    /// Per entry, in key order: its index in `keys`, its value's buffer in
+    /// `values` and its range there.
+    entries: Vec<(usize, usize, std::ops::Range<usize>)>,
+}
+
+impl PrefixScan {
+    /// Pack owned `(key, value)` pairs, each key at least 4 bytes (its prefix id),
+    /// into a scan in key order. For stores that hold their entries in memory,
+    /// such as test doubles.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = KeyValue>) -> Self {
+        let mut pairs: Vec<KeyValue> = pairs.into_iter().filter(|(k, _)| k.len() >= 4).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut keys = PrefixScanKeys::with_capacity(pairs.len(), pairs.iter().map(|(k, _)| k.len()).sum());
+        let mut values = Vec::with_capacity(pairs.iter().map(|(_, v)| v.len()).sum());
+        let mut entries = Vec::with_capacity(pairs.len());
+        for (i, (key, value)) in pairs.iter().enumerate() {
+            keys.push(key, 0);
+            entries.push((i, 0, values.len()..values.len() + value.len()));
+            values.extend_from_slice(value);
+        }
+        Self {
+            keys,
+            values: vec![values],
+            entries,
+        }
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no entry matched.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `(prefix_id, key, value)` for every entry, in key order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], &[u8])> + '_ {
+        self.entries.iter().map(|(key, buffer, value)| {
+            let key = self.keys.key(*key);
+            (
+                u32::from_be_bytes(key[..4].try_into().unwrap()),
+                key,
+                &self.values[*buffer][value.clone()],
+            )
+        })
+    }
+}
 
 pub(crate) fn current_epoch_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -96,6 +149,13 @@ pub struct KVStore {
     // this is what tells the background flusher which namespaces are holding
     // data a crash would destroy outright rather than merely delay.
     pub(crate) unflushed_no_wal_writes: Arc<AtomicBool>,
+
+    // Test-only: set by a simulated crash (`AsyncDb::crash`) so that dropping
+    // the store skips the flush below, as a process kill would. Without it the
+    // flush made every unflushed memtable durable, no-WAL writes included, and
+    // no crash test could see a write that a real crash loses.
+    #[cfg(test)]
+    crashed: AtomicBool,
 
     // Flag to prevent concurrent value log GC operations
     pub(crate) value_log_gc_in_progress: Arc<AtomicBool>,
@@ -237,6 +297,8 @@ impl KVStore {
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            crashed: AtomicBool::new(false),
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
@@ -307,7 +369,20 @@ impl KVStore {
     /// Share a global write-sequence counter with this store (called by the
     /// `Database` coordinator with its WAL sequence counter, so all writes —
     /// WAL-backed and non-WAL — draw from one monotonic sequence space).
+    /// Share the database's write-sequence counter, first raising it above
+    /// every sequence this store already holds.
+    ///
+    /// **Load-bearing for no-WAL writes.** The counter is recovered from the WAL
+    /// at open, but a no-WAL write takes a sequence the WAL never sees. After a
+    /// crash the counter could restart below a no-WAL value already flushed to an
+    /// SSTable, and every later write to that key — WAL-backed or not — would
+    /// lose to the stale value under highest-sequence-wins: a delete silently
+    /// undone, an update silently reverted. Found by the M3a split crash audit
+    /// while trying no-WAL meta writes (a meta rewritten after a restart never
+    /// became visible). Regression
+    /// test: `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
     pub(crate) fn set_seq_counter(&self, counter: Arc<AtomicU64>) {
+        counter.fetch_max(self.lsm.max_stored_seq().saturating_add(1), Ordering::SeqCst);
         *self.seq_counter.write() = counter;
     }
 
@@ -1105,76 +1180,72 @@ impl KVStore {
     ///
     /// Collects every live `(key, pointer)` for the whole prefix set in one
     /// [`LSMTree::scan_prefixes`] call (one pass per layer, not one per prefix), then
-    /// resolves the pointers against the value log with one scoped thread per bucket.
-    /// Each value is its own `pread` (in key order, not file order); the reads are not
-    /// coalesced, so the syscall count equals the number of entries.
+    /// resolves the pointers against the value log with one scoped thread per bucket,
+    /// each reading its values into one buffer. Each value is its own `pread` (in
+    /// key order, not file order); the reads are not coalesced, so the syscall count
+    /// equals the number of entries. Keys whose segment GC reclaimed mid-scan are
+    /// re-resolved through [`get`](Self::get).
     ///
-    /// Returns a map from `prefix_id` to `(key_bytes, value_bytes)` pairs. Keys
-    /// shorter than 4 bytes or with no matching pointer are silently skipped.
-    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<PrefixBatchResult> {
-        let (mut result, retry) = self.scan_prefixes_batch_inner(prefix_ids)?;
-        // Keys whose segment GC reclaimed mid-scan: re-resolve through the LSM.
-        for (prefix_id, key) in retry {
-            if let Some(v) = self.get(&key)? {
-                result.entry(prefix_id).or_default().push((key, v));
-            }
-        }
-        Ok(result)
-    }
-
-    fn scan_prefixes_batch_inner(&self, prefix_ids: &[u32]) -> Result<(PrefixBatchResult, Vec<PrefixIdKey>)> {
+    /// Keys shorter than 4 bytes are skipped.
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<PrefixScan> {
         let prefix_id_set: std::collections::HashSet<u32> = prefix_ids.iter().copied().collect();
-        struct Entry {
-            prefix_id: u32,
-            key: Vec<u8>,
-            pointer: ShardedValuePointer,
-        }
-        let mut all_entries: Vec<Entry> = Vec::new();
-        for (key, offset_u128) in self.lsm.scan_prefixes(&prefix_id_set)? {
-            if key.len() < 4 {
-                continue;
-            }
-            let prefix_id = u32::from_be_bytes(key[..4].try_into().unwrap());
-            if let Some(pointer) = decode_sharded_pointer(offset_u128) {
-                all_entries.push(Entry { prefix_id, key, pointer });
-            }
-        }
-        if all_entries.is_empty() {
-            return Ok((std::collections::HashMap::new(), Vec::new()));
+        let keys = self.lsm.scan_prefixes(&prefix_id_set)?;
+        if keys.is_empty() {
+            return Ok(PrefixScan::default());
         }
 
         let num_buckets = self.value_log.num_buckets();
         let mut bucket_work: Vec<Vec<(usize, ValueLocation)>> = (0..num_buckets).map(|_| Vec::new()).collect();
-        for (idx, entry) in all_entries.iter().enumerate() {
-            bucket_work[entry.pointer.bucket as usize].push((idx, entry.pointer.location));
+        for i in 0..keys.len() {
+            if keys.key(i).len() < 4 {
+                continue;
+            }
+            if let Some(pointer) = decode_sharded_pointer(keys.pointer(i)) {
+                bucket_work[pointer.bucket as usize].push((i, pointer.location));
+            }
         }
 
-        let mut values: Vec<Option<Vec<u8>>> = vec![None; all_entries.len()];
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut entries = Vec::with_capacity(keys.len());
+        let mut retry: Vec<usize> = Vec::new();
         std::thread::scope(|s| {
             let handles: Vec<_> = bucket_work
                 .iter()
                 .enumerate()
                 .filter(|(_, work)| !work.is_empty())
-                .map(|(bucket, work)| s.spawn(move || self.value_log.read_values_batch(bucket as u32, work)))
+                .map(|(bucket, work)| {
+                    let handle = s.spawn(move || {
+                        let mut buffer = Vec::new();
+                        let ranges = self.value_log.read_values_batch_into(bucket as u32, work, &mut buffer);
+                        (buffer, ranges)
+                    });
+                    (work, handle)
+                })
                 .collect();
-            for handle in handles {
-                if let Ok(results) = handle.join() {
-                    for (idx, val) in results {
-                        values[idx] = val;
+            for (work, handle) in handles {
+                match handle.join() {
+                    Ok((buffer, ranges)) => {
+                        for (idx, range) in ranges {
+                            match range {
+                                Some(range) => entries.push((idx, values.len(), range)),
+                                None => retry.push(idx),
+                            }
+                        }
+                        values.push(buffer);
                     }
+                    Err(_) => retry.extend(work.iter().map(|(idx, _)| *idx)),
                 }
             }
         });
 
-        let mut result: PrefixBatchResult = std::collections::HashMap::new();
-        let mut retry: Vec<(u32, Vec<u8>)> = Vec::new();
-        for (entry, val_opt) in all_entries.into_iter().zip(values) {
-            match val_opt {
-                Some(val) => result.entry(entry.prefix_id).or_default().push((entry.key, val)),
-                None => retry.push((entry.prefix_id, entry.key)),
+        for idx in retry {
+            if let Some(value) = self.get(keys.key(idx))? {
+                entries.push((idx, values.len(), 0..value.len()));
+                values.push(value);
             }
         }
-        Ok((result, retry))
+        entries.sort_unstable_by_key(|(idx, _, _)| *idx);
+        Ok(PrefixScan { keys, values, entries })
     }
 
     /// Parallel value-log reads for a pre-built entry list.
@@ -1404,6 +1475,20 @@ impl KVStore {
             // `flush_no_wal_memtables` for good and hand a crash the whole
             // memtable. Only restore what we cleared: a failed flush on a
             // WAL-backed namespace must not start claiming no-WAL writes.
+            self.unflushed_no_wal_writes.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    /// As [`Self::flush_memtable_to_level0`], but seals the memtable even when
+    /// it is empty, so the flush observers always see a seal and a flush. The
+    /// vector index WAL's GC pass uses it: a namespace holding that log's
+    /// retired cut is released only by a seal, and its memtable can be empty.
+    pub(crate) fn seal_and_flush_to_level0(&self) -> Result<()> {
+        // Same flag handling as `flush_memtable_to_level0`.
+        let was_set = self.unflushed_no_wal_writes.swap(false, Ordering::AcqRel);
+        let result = self.lsm.seal_and_flush_to_level0().map_err(KVError::from);
+        if result.is_err() && was_set {
             self.unflushed_no_wal_writes.store(true, Ordering::Release);
         }
         result
@@ -1821,6 +1906,17 @@ impl KVStore {
         self.lsm.has_compaction_work()
     }
 
+    /// The background worker's compaction: flush read-only memtables and merge
+    /// only the buckets whose merge is due (`LSMTree::compaction_due`).
+    pub(crate) fn compact_lsm_due(&self) -> Result<()> {
+        self.lsm.compact_due().map_err(KVError::from)
+    }
+
+    /// Whether [`compact_lsm_due`](Self::compact_lsm_due) has anything to do.
+    pub(crate) fn has_due_lsm_compaction_work(&self) -> bool {
+        self.lsm.has_due_compaction_work()
+    }
+
     // ── Shutdown ──────────────────────────────────────────────────────────
 
     /// Flush and sync all data for this namespace.
@@ -1859,6 +1955,21 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
         self.inner.on_memtable_sealed(version);
     }
 
+    // The vector index WAL retires records here, so the values they point at
+    // must be on stable storage first, exactly as for the persisted event below.
+    // The second fsync, before that event, then finds little or nothing to write.
+    // A failed fsync vetoes the flush: the files are not registered and the
+    // memtable is flushed again later.
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before memtable {version}'s L0 files were registered; the flush is undone: {e:?}");
+                return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
+            }
+        }
+        self.inner.on_ro_memtable_written(version)
+    }
+
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
         for log in &self.logs {
             if let Err(e) = log.sync() {
@@ -1870,8 +1981,20 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     }
 }
 
+impl KVStore {
+    /// Test-only: make dropping this store skip its flush, as a crash would.
+    #[cfg(test)]
+    pub(crate) fn mark_crashed(&self) {
+        self.crashed.store(true, Ordering::SeqCst);
+    }
+}
+
 impl Drop for KVStore {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.crashed.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = self.value_log.sync_all();
         let _ = self.lsm.flush_and_compact_all();
         let _ = self.value_log.flush_all_metadata();
@@ -2349,10 +2472,10 @@ mod tests {
 
         let result = store.scan_prefixes_batch(&[7, 8]).unwrap();
 
-        assert_eq!(result[&7].len(), 3);
-        assert_eq!(result[&8].len(), 1);
+        assert_eq!(result.iter().filter(|(p, _, _)| *p == 7).count(), 3);
+        assert_eq!(result.iter().filter(|(p, _, _)| *p == 8).count(), 1);
 
-        let vals_7: Vec<&[u8]> = result[&7].iter().map(|(_, v)| v.as_slice()).collect();
+        let vals_7: Vec<&[u8]> = result.iter().filter(|(p, _, _)| *p == 7).map(|(_, _, v)| v).collect();
         assert!(vals_7.contains(&b"val_7_1".as_slice()));
         assert!(vals_7.contains(&b"val_7_2".as_slice()));
         assert!(vals_7.contains(&b"val_7_3".as_slice()));
@@ -2464,7 +2587,7 @@ mod tests {
         store.put_to_storage(&u32_prefixed_key(1, 1), b"v").unwrap();
 
         let result = store.scan_prefixes_batch(&[99]).unwrap();
-        assert!(!result.contains_key(&99));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -2491,7 +2614,11 @@ mod tests {
         }
 
         let result = store.scan_prefixes_batch(&[2]).unwrap();
-        assert_eq!(result[&2].len(), 8);
+        assert_eq!(result.len(), 8);
+        // Key order, and every value read back whole.
+        let found: Vec<(Vec<u8>, Vec<u8>)> = result.iter().map(|(_, k, v)| (k.to_vec(), v.to_vec())).collect();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (0u32..8).map(|sid| (u32_prefixed_key(2, sid), vec![sid as u8; 16])).collect();
+        assert_eq!(found, expected);
     }
 
     // ── GC race regression tests ──────────────────────────────────────────────

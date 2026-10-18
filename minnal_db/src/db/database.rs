@@ -13,6 +13,7 @@ use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReinde
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
+use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalEntryStatus, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
 use crate::index::{DynFieldIndex, IndexValueType};
@@ -520,14 +521,17 @@ impl WalPersistObserver {
     }
 }
 
-/// Hub that fans out LSM flush events to the WAL observer and compaction trigger.
+/// Hub that fans out LSM flush events to the WAL observer, the vector index
+/// WAL and the compaction trigger.
 ///
 /// One hub per KVStore, which is what supplies the namespace id the shared
-/// [`WalPersistObserver`] needs: the LSM itself only knows memtable versions, and
-/// those are allocated per store.
+/// [`WalPersistObserver`] and [`VectorIndexWal`] need: the LSM itself only knows
+/// memtable versions, and those are allocated per store. Every namespace's hub
+/// reports to the vector index WAL; it ignores namespaces that never appended.
 struct LsmFlushObserverHub {
     namespace_id: u32,
     wal_observer: Arc<WalPersistObserver>,
+    vector_index_wal: Arc<VectorIndexWal>,
     compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
 }
 
@@ -535,11 +539,13 @@ impl LsmFlushObserverHub {
     fn new(
         namespace_id: u32,
         wal_observer: Arc<WalPersistObserver>,
+        vector_index_wal: Arc<VectorIndexWal>,
         compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
     ) -> Self {
         Self {
             namespace_id,
             wal_observer,
+            vector_index_wal,
             compaction_trigger,
         }
     }
@@ -554,7 +560,21 @@ impl LsmFlushObserverHub {
 impl LsmFlushObserver for LsmFlushObserverHub {
     fn on_memtable_sealed(&self, version: u64) {
         self.wal_observer.on_memtable_sealed_ns(self.namespace_id, version);
+        self.vector_index_wal.on_memtable_sealed(self.namespace_id, version);
         self.trigger_compaction();
+    }
+
+    // Before the memtable's L0 files are registered, and through
+    // `SyncValueLogBeforePersist`, so the values the retired records point at
+    // are fsynced first. An error (the progress marker could not be written)
+    // undoes the flush. See `LsmFlushObserver` for the order of events.
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        self.vector_index_wal
+            .on_memtable_written(self.namespace_id, version)
+            .map_err(|e| match e {
+                crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+                other => std::io::Error::other(other.to_string()),
+            })
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
@@ -614,6 +634,10 @@ pub struct Database {
     pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
     last_persisted_wal_offset: Arc<RwLock<u64>>,
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
+
+    /// The vector index WAL: the vector worker's payload writes, one per
+    /// database, shared by every namespace (`db/vector_index_wal.rs`).
+    pub(crate) vector_index_wal: Arc<VectorIndexWal>,
 
     // Namespace registry
     pub(crate) registry: RwLock<NamespaceRegistry>,
@@ -904,6 +928,10 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // The engine-wide counters, shared with the vector index WAL.
+        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
+
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
@@ -920,6 +948,7 @@ impl Database {
             pending_wal_flushes,
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
+            vector_index_wal,
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
@@ -939,7 +968,7 @@ impl Database {
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
             key_locks: KeyLocks::new(),
             fail_log_dir,
-            metrics: Arc::new(crate::db::metrics::Metrics::default()),
+            metrics,
         };
 
         // Share the global WAL sequence counter with every store so that all
@@ -967,6 +996,7 @@ impl Database {
         db.record_no_wal_gaps_after_unclean_shutdown();
 
         // Recover from WAL
+        db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
 
         // Rebuild WAL persisted state and wire up observers
@@ -975,6 +1005,26 @@ impl Database {
         db.wire_up_flush_observers();
 
         Ok(db)
+    }
+
+    /// Open the vector index WAL in its directory, sharing the engine-wide
+    /// counters. Records of namespaces no longer in the registry are released
+    /// at once: replay skips them, so they must not hold the retired cut.
+    fn open_vector_index_wal(db_path: &Path, registry: &NamespaceRegistry, metrics: &Arc<crate::db::metrics::Metrics>) -> Result<VectorIndexWal> {
+        let (wal, report) = VectorIndexWal::open(
+            &crate::db::layout::vector_index_wal_dir(db_path),
+            crate::db::vector_index_wal::DEFAULT_SEGMENT_SIZE,
+            Arc::clone(metrics),
+        )?;
+        if report.torn_bytes_dropped > 0 {
+            warn!("[STARTUP] vector index WAL: dropped a torn tail of {} bytes", report.torn_bytes_dropped);
+        }
+        for ns in wal.tracked_namespaces() {
+            if registry.get_name(ns).is_none() {
+                wal.forget_namespace(ns);
+            }
+        }
+        Ok(wal)
     }
 
     /// Detect an existing database's bucket count from its value-log filenames.
@@ -1008,6 +1058,7 @@ impl Database {
             let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
                 *ns_id,
                 Arc::clone(&self.wal_flush_observer),
+                Arc::clone(&self.vector_index_wal),
                 Arc::clone(&kv_store.lsm_compaction_trigger),
             ));
             kv_store.set_flush_observer(Some(observer));
@@ -1252,6 +1303,45 @@ impl Database {
         kv_store.put_to_storage(key, value)
     }
 
+    /// Write a key-value pair logged in the **vector index WAL** instead of the
+    /// main WAL: no main-WAL append, no per-write fsync. The write is durable
+    /// once a later [`Self::sync_vector_index_wal`] returns; after a crash,
+    /// recovery replays it with its original seq unless the memtable holding it
+    /// was already written to L0.
+    ///
+    /// For the vector worker's payloads (chunk codes, whole-document codes):
+    /// bulky, one durability barrier per batch rather than per write. Deletes
+    /// stay in the main WAL. Order, as on every write path: key stripe, seq,
+    /// append (registered as not yet applied), memtable apply, release.
+    pub fn put_ns_logged(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_closed()?;
+        self.check_write_size(key, value)?;
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        let kv_store = self.get_store(namespace_id)?;
+        let seq = kv_store.alloc_seq();
+        let logged = self.vector_index_wal.append(namespace_id, key, value, seq)?;
+        // The main WAL never sees this write, so a field index on the namespace
+        // could not replay it from there (FR-001's no-WAL marker).
+        self.note_no_wal_index_exposure(namespace_id);
+        // Applied with the logged seq; one retry, as the WAL path's apply. On a
+        // second failure the caller gets the error and does not complete its
+        // work (the vector worker redoes the entry). The record stays in the
+        // log but is in no memtable: it replays only if the database stops
+        // before the namespace's next seal, which otherwise retires it.
+        kv_store
+            .put_to_storage_seq(key, value, seq)
+            .or_else(|_| kv_store.put_to_storage_seq(key, value, seq))?;
+        drop(logged);
+        Ok(())
+    }
+
+    /// Make every write [`Self::put_ns_logged`] returned from before this call
+    /// durable: one fsync of the vector index WAL (none if nothing was appended
+    /// since the last).
+    pub fn sync_vector_index_wal(&self) -> Result<()> {
+        Ok(self.vector_index_wal.sync()?)
+    }
+
     /// Delete a key **without** appending to the WAL.
     ///
     /// The no-WAL counterpart of [`Self::delete_ns`]: it skips the WAL append
@@ -1476,6 +1566,7 @@ impl Database {
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
             ns_id,
             Arc::clone(&self.wal_flush_observer),
+            Arc::clone(&self.vector_index_wal),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
         kv_store.set_flush_observer(Some(observer));
@@ -1530,6 +1621,7 @@ impl Database {
         let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
             ns_id,
             Arc::clone(&self.wal_flush_observer),
+            Arc::clone(&self.vector_index_wal),
             Arc::clone(&kv_store.lsm_compaction_trigger),
         ));
         kv_store.set_flush_observer(Some(observer));
@@ -1616,6 +1708,9 @@ impl Database {
         // forever, pinning the global persisted watermark (and therefore WAL GC)
         // at a stale offset that nothing can ever advance.
         self.wal_flush_observer.forget_namespace(ns_id);
+        // Likewise for the vector index WAL, whose replay skips the dropped
+        // namespace's records.
+        self.vector_index_wal.forget_namespace(ns_id);
 
         // (4) Reclaim disk. Best-effort and independent of the WAL.
         self.remove_namespace_storage(ns_id, name);
@@ -2312,6 +2407,32 @@ impl Database {
         flushed
     }
 
+    /// Make every write already applied to the named namespaces durable, no-WAL
+    /// writes included, by flushing each one's memtables to level 0. Names that
+    /// are not registered are skipped (a dropped namespace must not be recreated).
+    ///
+    /// Test-only: the crash audits use it to choose which namespaces reach disk
+    /// before a simulated crash. (Production barriers are the vector index WAL's
+    /// `sync`.) Unlike [`flush_no_wal_memtables`] it flushes whether or not the
+    /// no-WAL flag is set, and a read-only memtable another thread is already
+    /// flushing is waited for, not skipped.
+    ///
+    /// [`flush_no_wal_memtables`]: Self::flush_no_wal_memtables
+    #[cfg(test)]
+    pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
+        for name in names {
+            let Some(ns_id) = self.registry.read().get_id(name) else {
+                continue;
+            };
+            // Dropped between the lookup and here: nothing left to make durable.
+            let Ok(store) = self.get_store(ns_id) else {
+                continue;
+            };
+            store.flush_memtable_to_level0()?;
+        }
+        Ok(())
+    }
+
     /// Flush every namespace that is holding the WAL persisted watermark back.
     ///
     /// The watermark can only advance to the slowest namespace's flushed offset,
@@ -2338,6 +2459,61 @@ impl Database {
         flushed
     }
 
+    /// Flush every namespace holding the vector index WAL's retired cut back,
+    /// as [`Self::flush_namespaces_pinning_wal`] does for the main WAL. A vector
+    /// namespace that writes a little and goes idle would otherwise keep every
+    /// later segment on disk. Returns how many were flushed.
+    ///
+    /// Seals the memtable even when it is empty: a namespace is released only
+    /// by a seal and its flush, and one can hold the cut with an empty
+    /// memtable (its last record was logged but never applied, for one).
+    pub(crate) fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        let holding = self.vector_index_wal.namespaces_holding_cut();
+        if holding.is_empty() {
+            return 0;
+        }
+        // Cloned so no flush (and its fsyncs) holds the store map, which
+        // creating or dropping a namespace needs.
+        let stores: Vec<(u32, Arc<KVStore>)> = {
+            let stores = self.stores.read();
+            holding.iter().filter_map(|ns| stores.get(ns).map(|s| (*ns, Arc::clone(s)))).collect()
+        };
+        let mut flushed = 0;
+        for (ns_id, kv_store) in stores {
+            match kv_store.seal_and_flush_to_level0() {
+                Ok(()) => {
+                    flushed += 1;
+                    crate::db::metrics::Metrics::bump(&self.metrics.vector_wal_pin_flushes);
+                }
+                Err(e) => warn!("[vector index WAL] failed to flush ns={ns_id} holding the retired cut: {e:?}"),
+            }
+        }
+        flushed
+    }
+
+    /// Whether any vector index WAL segment lies wholly below the retired cut.
+    pub(crate) fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.vector_index_wal.has_deletable_segments().unwrap_or_else(|e| {
+            warn!("[vector index WAL] could not list segments: {e}");
+            false
+        })
+    }
+
+    /// Delete vector index WAL segments wholly below the retired cut. Returns
+    /// `(segments, bytes)` deleted.
+    pub(crate) fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        Ok(self.vector_index_wal.garbage_collect()?)
+    }
+
+    /// The vector index WAL's state: segments, tail, retired cut, and the
+    /// namespaces holding the cut back.
+    pub fn vector_index_wal_stats(&self) -> Result<VectorIndexWalStats> {
+        // The registry is read per name, not held across the log's file I/O.
+        Ok(self
+            .vector_index_wal
+            .stats(|ns| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned))?)
+    }
+
     pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
         let bytes = wal_metadata.to_file_bytes()?;
@@ -2346,6 +2522,89 @@ impl Database {
     }
 
     // ── Recovery ───────────────────────────────────────────────────────
+
+    /// Replay the vector index WAL's unretired records into their memtables,
+    /// with their original seqs, then make them durable in L0 and record that.
+    ///
+    /// Runs at open, before main-WAL recovery and before the flush observers
+    /// are wired: both logs replay with original seqs into memtables that
+    /// resolve by seq, so their order does not matter. Each record is applied
+    /// only if it lies at or above its namespace's durable safe offset
+    /// (`VectorIndexWal::replay`); records of a namespace no longer in the
+    /// registry are skipped. A record that fails twice goes to the fail log,
+    /// as in main-WAL recovery, and is retired with the rest.
+    ///
+    /// **Load-bearing:** no observer sees the replay, so the namespaces it
+    /// replayed into are flushed to L0, their value logs fsynced, and the log
+    /// told they are safe up to its tail, all **before** `recover_from_wal`
+    /// runs. That recovery compacts every store into L1, which drops
+    /// tombstones; had the marker stayed behind, a second crash would replay a
+    /// record whose delete the compaction erased, and the key would come
+    /// back (`a_second_crash_does_not_bring_back_a_deleted_key`). It would
+    /// also leave an idle namespace holding the cut.
+    fn recover_from_vector_index_wal(&self) -> Result<()> {
+        // A new write must never draw a seq below a replayed record's, or it
+        // would lose to it.
+        self.next_seq
+            .fetch_max(self.vector_index_wal.last_seq().saturating_add(1), Ordering::SeqCst);
+
+        let stores = self.stores.read().clone();
+        let (mut replayed, mut skipped) = (0u64, 0u64);
+        let mut failed: Vec<(WalEntry, String)> = Vec::new();
+        self.vector_index_wal.replay(|r| -> Result<()> {
+            let Some(store) = stores.get(&r.ns_id) else {
+                skipped += 1;
+                return Ok(());
+            };
+            match store
+                .replay_upsert(r.key, r.value, r.seq)
+                .or_else(|_| store.replay_upsert(r.key, r.value, r.seq))
+            {
+                Ok(()) => replayed += 1,
+                Err(e) => {
+                    let entry = WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), r.value.to_vec())
+                        .with_sequence(r.seq)
+                        .with_op_name("vector_index_wal_replay");
+                    failed.push((entry, e.to_string()));
+                }
+            }
+            Ok(())
+        })?;
+
+        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_replayed, replayed);
+        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_skipped, skipped);
+        if replayed + skipped > 0 || !failed.is_empty() {
+            info!(
+                "[RECOVERY] vector index WAL: replayed {replayed} record(s), skipped {skipped} of dropped namespaces, {} failed",
+                failed.len()
+            );
+        }
+        if !failed.is_empty() {
+            error!(
+                "[RECOVERY] vector index WAL: {} record(s) failed to replay twice; see the fail log",
+                failed.len()
+            );
+            let failures: Vec<(&WalEntry, String)> = failed.iter().map(|(e, msg)| (e, msg.clone())).collect();
+            crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
+        }
+
+        // Every namespace still holding the cut had its records replayed above
+        // (dropped ones were forgotten at open). Flush them and record it.
+        let holding = self.vector_index_wal.namespaces_holding_cut();
+        if !holding.is_empty() {
+            let mut flushed = Vec::with_capacity(holding.len());
+            for ns_id in holding {
+                let Some(store) = stores.get(&ns_id) else {
+                    continue;
+                };
+                store.flush_memtable_to_level0()?;
+                store.sync_value_log()?;
+                flushed.push(ns_id);
+            }
+            self.vector_index_wal.retire_replayed(&flushed)?;
+        }
+        Ok(())
+    }
 
     fn recover_from_wal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read();
@@ -2608,6 +2867,24 @@ impl Database {
         stores.values().any(|s| s.has_lsm_compaction_work())
     }
 
+    /// What the compaction worker runs: every namespace's read-only memtables
+    /// flushed, and only the buckets whose L0→L1 merge is due merged
+    /// (`LSMTree::compaction_due`). [`compact_lsm`](Self::compact_lsm) merges
+    /// everything.
+    pub(crate) fn compact_lsm_due(&self) -> Result<()> {
+        self.check_closed()?;
+        let stores = self.stores.read();
+        for (_, kv_store) in stores.iter() {
+            kv_store.compact_lsm_due()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_due_lsm_compaction_work(&self) -> bool {
+        let stores = self.stores.read();
+        stores.values().any(|s| s.has_due_lsm_compaction_work())
+    }
+
     // ── Stats ──────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Stats {
@@ -2689,9 +2966,10 @@ impl Database {
 
     /// Operational counters for a single namespace, by name.
     ///
-    /// Note: the WAL-GC counters (`wal_gc_runs`, `wal_segments_deleted`) belong
-    /// to the shared WAL and are not attributed to any namespace — they are
-    /// always `0` here and only populated in [`Self::metrics_snapshot`].
+    /// Note: the WAL-GC counters (`wal_gc_runs`, `wal_segments_deleted`) and
+    /// the `vector_wal_*` counters belong to the two shared logs and are not
+    /// attributed to any namespace — they are always `0` here and only
+    /// populated in [`Self::metrics_snapshot`].
     pub fn metrics_snapshot_for(&self, name: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
         let ns_id = self
             .registry
@@ -2754,31 +3032,79 @@ impl Database {
             return Err(KVError::DatabaseClosed);
         }
 
+        // Every step runs even if an earlier one failed (a failed shutdown
+        // cannot be retried: the database is already closed); the first error
+        // is returned.
+        fn note(first: &mut Option<KVError>, step: &str, r: Result<()>) {
+            if let Err(e) = r {
+                error!("[SHUTDOWN] {step} failed: {e:?}");
+                first.get_or_insert(e);
+            }
+        }
+        let mut first_error: Option<KVError> = None;
+
         // Shutdown all KVStores
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
-            kv_store.set_flush_observer(None);
-            kv_store.shutdown()?;
+        // Flush first, with the observers still attached, so the vector index
+        // WAL retires what reaches L0 — its marker is written before the files
+        // are registered. Each store's shutdown then compacts into L1, which
+        // drops tombstones; with the observers already detached, a stale marker
+        // would make the next open replay records whose keys were deleted
+        // (`a_clean_shutdown_does_not_bring_back_deleted_keys`). The main WAL
+        // sees these flushes too; it marks everything persisted below anyway.
+        let mut flush_failed = std::collections::HashSet::new();
+        for (ns_id, kv_store) in stores.iter() {
+            if let Err(e) = kv_store.flush_memtable_to_level0() {
+                flush_failed.insert(*ns_id);
+                note(&mut first_error, &format!("flushing ns={ns_id}"), Err(e));
+            }
+        }
+        for (ns_id, kv_store) in stores.iter() {
+            // A store whose flush failed keeps its observers: its shutdown
+            // flushes again before compacting, and that flush must be seen by
+            // the vector index WAL (which vetoes it if its marker cannot be
+            // written), so nothing it holds is merged unrecorded.
+            if !flush_failed.contains(ns_id) {
+                kv_store.set_flush_observer(None);
+            }
+            note(&mut first_error, &format!("shutting down ns={ns_id}"), kv_store.shutdown());
         }
         drop(stores);
+        // An entry may be marked persisted only once its key is in an SSTable.
+        let stores_on_disk = first_error.is_none();
 
         // Flush all active field indices (keymap + bitmap data) to disk.
         // This persists in-memory index state accumulated during the session,
         // including entries written via put_no_wal which have no WAL to replay.
-        self.run_index_checkpoint()?;
+        note(&mut first_error, "the index checkpoint", self.run_index_checkpoint().map(|_| ()));
 
         // Mark remaining WAL entries as persisted
-        let start = *self.last_persisted_wal_offset.read();
-        let tail = self.wal_metadata.read().tail;
-        self.wal_flush_observer.mark_persisted_range(start, tail);
+        if stores_on_disk {
+            let start = *self.last_persisted_wal_offset.read();
+            let tail = self.wal_metadata.read().tail;
+            self.wal_flush_observer.mark_persisted_range(start, tail);
+        }
 
         // Flush WAL metadata
-        self.flush_wal_metadata_internal()?;
+        note(&mut first_error, "writing the WAL metadata", self.flush_wal_metadata_internal());
 
         // Sync WAL
-        self.wal.sync()?;
+        note(&mut first_error, "syncing the WAL", self.wal.sync().map_err(KVError::from));
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Test-only: mark the database closed without flushing anything, so its
+    /// `Drop` skips the flushes a clean close runs. See `AsyncDb::crash`.
+    #[cfg(test)]
+    pub(crate) fn mark_crashed(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A crash test must see a missing `sync`: drop what a power loss would.
+        self.vector_index_wal.lose_unsynced();
+        // Each store flushes itself when dropped; a crash must not.
+        for store in self.stores.read().values() {
+            store.mark_crashed();
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2894,6 +3220,10 @@ impl Database {
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
+        // The engine-wide counters, shared with the vector index WAL.
+        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
+
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
@@ -2910,6 +3240,7 @@ impl Database {
             pending_wal_flushes,
             last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
+            vector_index_wal,
             registry: RwLock::new(registry),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
@@ -2929,7 +3260,7 @@ impl Database {
             next_seq: Arc::new(AtomicU64::new(next_seq_start)),
             key_locks: KeyLocks::new(),
             fail_log_dir,
-            metrics: Arc::new(crate::db::metrics::Metrics::default()),
+            metrics,
         };
 
         // Share the global WAL sequence counter with every store (see the other
@@ -2951,6 +3282,7 @@ impl Database {
         // Report field indices left incomplete by no-WAL writes that an unclean
         // shutdown caught before any checkpoint covered them.
         db.record_no_wal_gaps_after_unclean_shutdown();
+        db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
         let last_persisted = db.rebuild_wal_persisted_state()?;
         *db.last_persisted_wal_offset.write() = last_persisted;
@@ -3149,6 +3481,18 @@ impl WalGcTarget for Database {
     fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.garbage_collect_wal()
     }
+
+    fn flush_namespaces_pinning_vector_wal(&self) -> usize {
+        self.flush_namespaces_pinning_vector_wal()
+    }
+
+    fn has_deletable_vector_wal_segments(&self) -> bool {
+        self.has_deletable_vector_wal_segments()
+    }
+
+    fn garbage_collect_vector_wal(&self) -> Result<(u64, u64)> {
+        self.garbage_collect_vector_wal()
+    }
 }
 
 // ── LsmCompactionTarget impl ──────────────────────────────────────────
@@ -3162,12 +3506,12 @@ impl LsmCompactionTarget for Database {
         self.flush_no_wal_memtables()
     }
 
-    fn has_lsm_compaction_work(&self) -> bool {
-        self.has_lsm_compaction_work()
+    fn has_due_compaction_work(&self) -> bool {
+        self.has_due_lsm_compaction_work()
     }
 
-    fn compact_lsm(&self) -> Result<()> {
-        self.compact_lsm()
+    fn compact_due(&self) -> Result<()> {
+        self.compact_lsm_due()
     }
 }
 
