@@ -758,7 +758,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     write_json(
         &out.join("run.json"),
         &json!({
-            "config": cfg, "smoke": smoke, "commit": git_commit(), "host_cores": std::thread::available_parallelism().map_or(0, |n| n.get()),
+            "config": cfg, "smoke": smoke, "commit": git_commit(), "allocator": crate::ALLOCATOR, "host_cores": std::thread::available_parallelism().map_or(0, |n| n.get()),
             "engine": settings, "plan": cells,
             "data": {"stable": ctx.data.stable.len(), "stable_text": ctx.data.stable_text.len(), "base": ctx.data.base.len(),
                      "stream": ctx.data.stream.len(), "queries": ctx.data.queries.len()},

@@ -88,7 +88,8 @@ lines = []
 w = lines.append
 smoke = run["smoke"]
 w(f"# Engine benchmark — {cfg['namespace']}{' (SMOKE RUN: durations too short for conclusions)' if smoke else ''}\n")
-w(f"Commit `{run['commit']}`; {run['host_cores']} cores; started "
+allocator = run.get("allocator", "system")
+w(f"Commit `{run['commit']}`; allocator {allocator}; {run['host_cores']} cores; started "
   + ", resumed ".join(str(s) for s in manifest["starts"]) + " (Unix s).\n")
 
 done = [n for n, s in manifest["cells"].items() if s == "done"]
@@ -193,6 +194,9 @@ for c in CLASSES:
 
 MEMORY = [("rss_anon_bytes", "Resident heap and stacks"), ("rss_file_bytes", "Resident mapped files"),
           ("heap_live_bytes", "Allocated, not freed"), ("heap_free_bytes", "Freed, kept by the allocator")]
+# The heap figures are glibc's own account (mallinfo2); another allocator reports nothing there.
+if allocator != "system":
+    MEMORY = MEMORY[:2]
 
 # ── soak ─────────────────────────────────────────────────────────────────────
 soak = repeats("soak-")
@@ -217,7 +221,7 @@ if soak:
             if k in tl[0]:
                 w(f"| {label} (MiB) | {avg(first, k) / 2**20:.0f} | {avg(last, k) / 2**20:.0f} |")
         w("")
-    if s.get("trim"):
+    if s.get("trim") and allocator == "system":
         b, a = s["trim"]
         w("After the soak the allocator was asked to return the memory it keeps free (`malloc_trim`): resident heap "
           f"{b['rss_anon_bytes'] / 2**20:.0f} → {a['rss_anon_bytes'] / 2**20:.0f} MiB; allocated and not freed "
@@ -283,8 +287,10 @@ if ordered and "rss_anon_bytes" in ordered[0][1]["engine_after"]:
     w("## Memory\n")
     base_mem = run.get("memory_before_engine")
     w("At the end of each cell, MiB. Resident memory split into anonymous pages (heap, stacks) and memory-mapped "
-      "files (which the kernel can drop); and the allocator's own account: what is allocated and not freed (live data, "
-      "or a leak if it only grows), and what was freed but is kept (resident until returned)."
+      "files (which the kernel can drop)"
+      + ("; and the allocator's own account: what is allocated and not freed (live data, "
+         "or a leak if it only grows), and what was freed but is kept (resident until returned)."
+         if allocator == "system" else f". The allocator's own account is glibc's and is not available with {allocator}.")
       + (f" Before the engine opened (the replay table alone): {base_mem['rss_anon_bytes'] / 2**20:.0f} MiB resident heap."
          if base_mem else "") + "\n")
     w("| Cell | documents | " + " | ".join(label for _, label in MEMORY) + " |")

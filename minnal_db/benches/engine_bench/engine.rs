@@ -247,7 +247,7 @@ pub fn rss_bytes() -> u64 {
 /// pages that are anonymous (heap, stacks) or file-backed (memory-mapped files,
 /// which the kernel can drop), and glibc's own account of its heap: what is
 /// allocated and not freed, and what is freed but kept (resident until trimmed).
-/// The heap figures are zero off glibc.
+/// The heap figures are zero off glibc, or with another allocator built in.
 #[derive(serde::Serialize, Default, Clone, Copy)]
 pub struct Memory {
     pub rss_anon_bytes: u64,
@@ -272,7 +272,7 @@ pub fn memory() -> Memory {
         rss_file_bytes: kb("RssFile:"),
         ..Memory::default()
     };
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(minnal_bench_alloc)))]
     {
         // SAFETY: mallinfo2 takes no arguments and returns a plain struct.
         let i = unsafe { libc::mallinfo2() };
@@ -286,7 +286,7 @@ pub fn memory() -> Memory {
 /// returns the memory before and after.
 pub fn trim() -> (Memory, Memory) {
     let before = memory();
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(minnal_bench_alloc)))]
     // SAFETY: malloc_trim only releases free memory back to the system.
     unsafe {
         libc::malloc_trim(0);
