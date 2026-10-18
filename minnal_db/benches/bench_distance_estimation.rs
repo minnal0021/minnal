@@ -221,7 +221,7 @@ fn full_sort_top_n(cluster_map: &HashMap<u32, Cluster>, embedding: &[f32], n: us
 }
 
 /// Compares the current selection-based `find_top_n_cluster_ids` against the old
-/// full-sort baseline over the real cluster file, at a few `n_probes` values. This
+/// full-sort baseline over the bench centres, at a few `n_probes` values. This
 /// is the Pass-1 cluster-probing cost, paid once per query vector (production
 /// queries are not chunked, so once per query).
 fn bench_top_n_cluster_selection(c: &mut Criterion) {
@@ -418,7 +418,8 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let store = build_bench_store(&cluster_map, N_DOCS, 1);
     let dense_query = load_or_generate_embeddings().query;
-    // 64 fixed probes: the cluster file carries no entry counts to budget by.
+    // Every one of the 64 centres is probed: production's entry budget (70,000) covers
+    // every posting of a store this small, and this in-memory index has no entry counts.
     let config = SemanticSearchConfig {
         probe: ProbeSettings::fixed(64),
         ..SemanticSearchConfig::default()

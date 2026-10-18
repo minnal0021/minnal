@@ -83,9 +83,11 @@ difference under 10% between two runs as noise unless the code changed.
 
 ## Writes
 
-Every write is durable when it returns: the WAL is fsynced before the call
-comes back. There is no batching, and no way to turn the sync off per call. So
-a write's cost is the drive's fsync time, and value size hardly matters:
+Every `put`, `delete` and `merge` is durable when it returns: the WAL is
+fsynced before the call comes back, with no batching. (`put_no_wal` and
+`delete_no_wal` skip the WAL, for data that can be regenerated after a crash;
+they are not measured here.) So a write's cost is the drive's fsync time, and
+value size hardly matters:
 
 ![Durable write latency by value size](docs/benchmarks/write.png)
 
@@ -404,8 +406,8 @@ It is `minnal_db/benches/engine_bench` (not Criterion), reported by
   the API server ([Choosing the memory allocator](#choosing-the-memory-allocator)).
 - **Every background worker runs**: memtable flushes, LSM compaction, value-log
   GC, WAL GC, the vector index WAL's GC, field-index checkpoints (every
-  1.75 s), the vector-index worker (4 documents at a time) and partition
-  maintenance (2 threads).
+  1.75 s), the vector-index worker (up to 4 embedding calls in flight) and
+  partition maintenance (2 threads).
 - **No external call: embeddings are replayed.** A document store with semantic
   search sends every new or changed document's text to an embedding service
   (a separate process; here, models on a GPU). That service's speed depends on
@@ -531,6 +533,35 @@ ones.
 
 ### Reproducing it
 
+The data and the starting database are built once.
+
+1. **The data.** Download FiQA from [BEIR](https://github.com/beir-cellar/beir)
+   and split it:
+
+   ```sh
+   python3 minnal_db/docs/benchmarks/engine/prepare.py FIQA_DIR DATA_DIR
+   ```
+
+   It writes the 40,000 starting documents (`base.jsonl`, including every
+   document a test query judges relevant), the 17,638-document ingestion stream
+   (`stream.jsonl`), the test queries and their judgements, and which ids the run
+   may update or delete (`ids.json`). The synthetic fields are seeded per
+   document id, so every run gets the same data.
+2. **The starting database.** Start an API server on an empty data directory
+   (with the embedding service running), load the starting documents into a
+   store created from `docs/benchmarks/engine/schema.json`, and wait until the
+   vector queue is empty (`GET /admin/indices/fiqa/vector/queue`):
+
+   ```sh
+   minnal_tools bulk_load --schema minnal_db/docs/benchmarks/engine/schema.json \
+       http://127.0.0.1:PORT fiqa id DATA_DIR/base.jsonl
+   ```
+
+   Stop the server. Its database and schema directories are the snapshot that
+   `CONFIG.json` names; every run works on a fresh copy of it.
+
+Then:
+
 ```sh
 # Once: record the replay table (needs the embedding service on :8001).
 cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- \
@@ -545,8 +576,9 @@ python3 minnal_db/docs/benchmarks/engine/report.py OUT_DIR
 `CONFIG.json` names the server configuration, the starting database, the data,
 the replay table and the output directory, and sets the mix, durations and
 repeats; `docs/benchmarks/engine/fiqa.example.json` is the configuration used
-here (relative paths resolve from `minnal_db/`, where `cargo bench` runs). `cargo bench` without a command skips this benchmark, so the Criterion
-report above does not run it.
+here (relative paths resolve from `minnal_db/`, where `cargo bench` runs).
+`cargo bench` without a command skips this benchmark, so the Criterion report
+above does not run it.
 
 ### Choosing the memory allocator
 

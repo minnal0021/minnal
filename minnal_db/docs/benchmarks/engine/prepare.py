@@ -11,16 +11,18 @@ split so that quality under load stays comparable with quality at rest.
 Fields, seeded per document id: category c0..c11 (Zipf s = 1.1), year
 2010-2025 (uniform), score 0-1000 (uniform).
 
-    python3 prepare.py [OUT_DIR]   (default work/bench/m5/data)
+    python3 prepare.py FIQA_DIR OUT_DIR
+
+FIQA_DIR is the BEIR FiQA download (corpus.jsonl, queries.jsonl, qrels/test.tsv).
 
 The starting database is base.jsonl loaded into a store created from
 schema.json (gemma, three indexed fields), with the vector queue drained.
 """
 import json, os, random, sys
 
-ROOT = "/home/sperumal/minnal_dev/minnal"
-SRC = f"{ROOT}/work/beir/fiqa"
-OUT = sys.argv[1] if len(sys.argv) > 1 else f"{ROOT}/work/bench/m5/data"
+if len(sys.argv) != 3:
+    sys.exit(__doc__)
+SRC, OUT = sys.argv[1], sys.argv[2]
 BASE = 40_000
 SEED = 5
 
