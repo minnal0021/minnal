@@ -247,7 +247,8 @@ pub fn rss_bytes() -> u64 {
 /// pages that are anonymous (heap, stacks) or file-backed (memory-mapped files,
 /// which the kernel can drop), and glibc's own account of its heap: what is
 /// allocated and not freed, and what is freed but kept (resident until trimmed).
-/// The heap figures are zero off glibc, or with another allocator built in.
+/// The heap figures are zero unless the bench is built with the system allocator
+/// on glibc (`--cfg minnal_bench_alloc="system"`).
 #[derive(serde::Serialize, Default, Clone, Copy)]
 pub struct Memory {
     pub rss_anon_bytes: u64,
@@ -267,12 +268,13 @@ pub fn memory() -> Memory {
             .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
             .map_or(0, |kb| kb * 1024)
     };
+    #[cfg_attr(not(minnal_bench_alloc = "system"), allow(unused_mut))]
     let mut m = Memory {
         rss_anon_bytes: kb("RssAnon:"),
         rss_file_bytes: kb("RssFile:"),
         ..Memory::default()
     };
-    #[cfg(all(target_os = "linux", target_env = "gnu", not(minnal_bench_alloc)))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", minnal_bench_alloc = "system"))]
     {
         // SAFETY: mallinfo2 takes no arguments and returns a plain struct.
         let i = unsafe { libc::mallinfo2() };
@@ -286,7 +288,7 @@ pub fn memory() -> Memory {
 /// returns the memory before and after.
 pub fn trim() -> (Memory, Memory) {
     let before = memory();
-    #[cfg(all(target_os = "linux", target_env = "gnu", not(minnal_bench_alloc)))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", minnal_bench_alloc = "system"))]
     // SAFETY: malloc_trim only releases free memory back to the system.
     unsafe {
         libc::malloc_trim(0);

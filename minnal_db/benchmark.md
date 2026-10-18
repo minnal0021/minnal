@@ -400,7 +400,8 @@ It is `minnal_db/benches/engine_bench` (not Criterion), reported by
   uses, and every operation calls the library directly: the same calls the REST
   handlers make (`get`, `put`, `delete`, `scan_range`, `query_resolved`,
   `search_semantic`, `search_semantic_filtered`). There is no HTTP, no JSON
-  encoding of replies and no network.
+  encoding of replies and no network. The memory allocator is jemalloc, as in
+  the API server ([Choosing the memory allocator](#choosing-the-memory-allocator)).
 - **Every background worker runs**: memtable flushes, LSM compaction, value-log
   GC, WAL GC, the vector index WAL's GC, field-index checkpoints (every
   1.75 s), the vector-index worker (4 documents at a time) and partition
@@ -627,14 +628,15 @@ arm the same. The two glibc runs agree within 1%, and jemalloc's differences
 are far larger than that. Resident memory includes about 0.9 GiB held by the
 benchmark's replay table, which an application does not have.
 
-To repeat a comparison, build the benchmark with another allocator:
+The benchmark uses jemalloc, as the API server does. To repeat a comparison,
+build it with another allocator:
 
 ```sh
-RUSTFLAGS='--cfg minnal_bench_alloc="jemalloc"' \
+RUSTFLAGS='--cfg minnal_bench_alloc="system"' \
     cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- run CONFIG.json
 ```
 
-`"mimalloc"` selects mimalloc. Without the flag the benchmark uses the system
-allocator. The allocator is recorded in `run.json` and named in the report.
-glibc's own account of memory in use and freed but held is reported only for
-glibc builds.
+`"system"` selects glibc `malloc` and `"mimalloc"` selects mimalloc. The
+allocator is recorded in `run.json` and named in the report. glibc's own
+account of memory in use and freed but held is reported only for the system
+allocator.

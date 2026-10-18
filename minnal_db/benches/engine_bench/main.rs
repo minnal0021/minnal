@@ -20,8 +20,8 @@
 //! Without a command it does nothing, so `cargo bench` over every suite (the
 //! Criterion report) skips it.
 //!
-//! The allocator is the system's (glibc) unless the bench is built with
-//! `RUSTFLAGS='--cfg minnal_bench_alloc="jemalloc"'` (or `"mimalloc"`), to
+//! The allocator is jemalloc, as in the API server, unless the bench is built
+//! with `RUSTFLAGS='--cfg minnal_bench_alloc="system"'` (or `"mimalloc"`), to
 //! compare allocators on the same engine. The library sets no allocator.
 
 mod engine;
@@ -32,7 +32,7 @@ mod runner;
 mod stats;
 mod workload;
 
-#[cfg(minnal_bench_alloc = "jemalloc")]
+#[cfg(not(any(minnal_bench_alloc = "system", minnal_bench_alloc = "mimalloc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -41,12 +41,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// The allocator this build uses, recorded in each run.
-pub const ALLOCATOR: &str = if cfg!(minnal_bench_alloc = "jemalloc") {
-    "jemalloc"
+pub const ALLOCATOR: &str = if cfg!(minnal_bench_alloc = "system") {
+    "system"
 } else if cfg!(minnal_bench_alloc = "mimalloc") {
     "mimalloc"
 } else {
-    "system"
+    "jemalloc"
 };
 
 fn main() {
