@@ -171,7 +171,7 @@ enable semantic search
 
 **Who runs it.** One maintenance task per process serves every store, at most `[semantic_search.maintenance] threads` (default 2) stores at a time and never one store twice. The 2-means runs on the blocking thread pool, and a rebuild's k-means on a pool of its own (`rebuild_threads`, 1 or 2), never on the pool that search scoring uses. Per-document moves run in batches of 16 documents, one batch at a time, because a batch holds those documents' write locks and every write to them waits.
 
-**Probing at search time.** Pass 1 computes the distance from the query to **every** active posting's routing centre (nothing is pruned), then takes postings nearest first until their entries reach the probe budget (`probe_budget_entries`, default 70,000), reading at least `min_probes` and at most `max_probes` postings. The cost is T × C × D (query vectors × postings × dimensions); production sends one query vector, so it is one scan of the centres: about 9 µs at 256 postings, growing linearly with their number. Entry counts per posting are kept exactly in memory, loaded from `{ns}_sparse_vector_meta` at startup and updated by every write.
+**Probing at search time.** Pass 1 computes the distance from the query to **every** active posting's routing centre (nothing is pruned), then takes postings nearest first until their entries reach the probe budget (`probe_budget_entries`, default 42,000), reading at least `min_probes` and at most `max_probes` postings. The cost is T × C × D (query vectors × postings × dimensions); production sends one query vector, so it is one scan of the centres: about 9 µs at 256 postings, growing linearly with their number. Entry counts per posting are kept exactly in memory, loaded from `{ns}_sparse_vector_meta` at startup and updated by every write.
 
 ### 3.4 Parameters
 
@@ -187,7 +187,7 @@ Every store owns its partition settings: they are copied into its schema (`vecto
 | `split_init_trials` | 3 | 1–100 | Balanced 2-means: random starting pairs tried |
 | `split_max_iters` | 100 | 1–10,000 | Balanced 2-means: iteration cap |
 | `split_lambda_factor` | 100 | above 0 | Balanced 2-means: balance weight, λ ≤ 1 / (factor × samples) |
-| `search.probe_budget_entries` | 70,000 | | Entries Pass 1 reads |
+| `search.probe_budget_entries` | 42,000 | | Entries Pass 1 reads |
 | `search.min_probes` / `max_probes` | 1 / 1,024 | | Bounds on the postings Pass 1 reads |
 | `search.probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | fraction 0–1 | Optional budget that scales with the store: `clamp(fraction × entries, floor, probe_budget_entries)` |
 
@@ -291,8 +291,8 @@ LSM layers for each probed cluster, then one value-log read per entry, then
 decoding and scoring. Pass 2 is small and roughly fixed, since it re-scores a
 capped candidate set. So latency follows **how many sparse entries the probed
 postings hold**, which the probe budget caps. On FiQA (57,638 documents,
-173,000 chunks) with gemma and the default 70,000-entry budget, a warm query
-takes about 15 ms.
+173,000 chunks) with gemma and the default 42,000-entry budget, a search
+reads 37% of the entries and takes about 8 ms, excluding the embedding call.
 
 That makes small, on-topic postings the main lever: they find more of the right
 documents per entry read. Centroids fitted on general text, rather than on the
@@ -489,7 +489,7 @@ Everything that shapes one store's index lives in its schema's `vector_index`. `
 | `embedding_dim` | `768` | Dimension of the vectors the service returns. Fixed once set. |
 | `chunking.window_size` / `sliding_size` | `4` / `2` | Sentences per document chunk, and the step between chunks (queries are not chunked). Fixed once set. |
 | `quantisation` | 1 / 8 bits, zero Pass-2 centre | Code widths and the rotation seed; read-only. |
-| `search.probe_budget_entries` | `70000` | Pass 1 probes the nearest postings until their entries reach this. |
+| `search.probe_budget_entries` | `42000` | Pass 1 probes the nearest postings until their entries reach this. |
 | `search.min_probes` / `max_probes` | `1` / `1024` | Bounds on postings probed. |
 | `search.first_pass_top_k` | `1000` | Candidates kept after Pass 1 for dense re-ranking. |
 | `search.top_k` | `100` | Results returned. |

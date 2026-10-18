@@ -61,9 +61,11 @@ pub const PASS2_BITS: u8 = 8;
 /// What Pass-2 codes are encoded against. Read-only: only the zero centre
 /// (design doc M2c).
 pub const PASS2_CENTRE: &str = "zero";
-/// Default entries Pass 1 reads per query: about what 64 fixed probes read on
-/// FiQA (design doc M2d). A namespace smaller than this is scanned in full.
-pub const DEFAULT_PROBE_BUDGET_ENTRIES: u32 = 70_000;
+/// Default entries Pass 1 reads per query (design doc M2d): 20% above the
+/// 35,000 at which FiQA's nDCG stops rising, at every cutoff (vector bench,
+/// 2026-10-18). A namespace smaller than this is scanned in full. Equal to
+/// `semantic_search::service::DEFAULT_PROBE`'s, pinned together by a test.
+pub const DEFAULT_PROBE_BUDGET_ENTRIES: u32 = 42_000;
 /// Largest accepted `probe_budget_entries`.
 pub const MAX_PROBE_BUDGET_ENTRIES: u32 = 1_000_000_000;
 /// Default postings always probed, whatever the budget.
@@ -847,6 +849,15 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic-search")]
+    #[test]
+    fn the_default_budget_matches_the_search_default() {
+        assert_eq!(
+            u64::from(DEFAULT_PROBE_BUDGET_ENTRIES),
+            crate::semantic_search::service::DEFAULT_PROBE.budget_entries
+        );
+    }
+
     #[test]
     fn rotation_seed_is_hex_fixed_and_defaults_to_the_pinned_value() {
         let s = VectorIndexSpec::default().resolve().unwrap();
@@ -902,7 +913,7 @@ mod tests {
         assert_eq!(
             s.search,
             SearchSettings {
-                probe_budget_entries: 70_000,
+                probe_budget_entries: 42_000,
                 min_probes: 1,
                 max_probes: 1024,
                 first_pass_top_k: 1000,
@@ -1260,8 +1271,8 @@ mod tests {
         };
         assert_eq!(s.budget_for(10_000), 20_000); // floor: a small namespace is read in full
         assert_eq!(s.budget_for(100_000), 30_000);
-        assert_eq!(s.budget_for(1_000_000), 70_000); // ceiling
-        assert_eq!(SearchSettings::default().budget_for(1_000_000), 70_000);
+        assert_eq!(s.budget_for(1_000_000), 42_000); // ceiling
+        assert_eq!(SearchSettings::default().budget_for(1_000_000), 42_000);
         // 0 turns scaling off, and the floor no longer matters.
         let off = SearchSpec {
             probe_budget_fraction: Some(Ratio(0.0)),

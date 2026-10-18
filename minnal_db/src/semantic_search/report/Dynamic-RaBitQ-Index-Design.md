@@ -1007,7 +1007,7 @@ vector's postings nearest first, in the same order as before, and stops once it
 has probed `min_probes` postings and their entries reach `probe_budget_entries`,
 never going past `max_probes` (`cluster::select_probes`). The posting that
 crosses the budget is probed. The schema's `search` settings are
-`probe_budget_entries` (default 70,000), `min_probes` (1) and `max_probes`
+`probe_budget_entries` (default 42,000; decision 13), `min_probes` (1) and `max_probes`
 (1,024), which replace `n_probes`. They can be changed at any time and
 overridden per request. `ProbeSettings::fixed(n)` probes exactly `n` postings
 and is what tests, raw `vector_kv` users and the criterion benches use.
@@ -1306,7 +1306,7 @@ number of postings:
 | Target posting size | 128 chunks by default; 128 against 256 decided by M3a's probe-cost measurement | §1 |
 | Chunk code width | 1 bit for search and maintenance; codes keep their centre | §3; SPFresh comparison |
 | `reencode_source` | not needed for partition quality; a future option for rotation or width changes | §3 |
-| Probe budget | 70,000 entries, absolute (M2d). The scaled form `clamp(p · E, floor, ceiling)` is available as an option, unset by default, and reviewed after M3a's latency measurement | §4 |
+| Probe budget | 42,000 entries, absolute (M2d; decision 13). The scaled form `clamp(p · E, floor, ceiling)` is available as an option, unset by default, and reviewed after M3a's latency measurement | §4 |
 | M4 rebuild | from 1-bit codes, no floats; triggered by hand (*M4 result*) | §3: 0.978 vs 0.976 |
 
 ### M3 split algorithm (LIRE)
@@ -1475,7 +1475,7 @@ threads = 2                  # engine-only: maintenance threads per process
 
 # Search defaults, copied into vector_index.search.
 [semantic_search.search_defaults]
-probe_budget_entries = 70000 # entries a query reads (the ceiling when a fraction is set)
+probe_budget_entries = 42000 # entries a query reads (the ceiling when a fraction is set)
 min_probes = 1
 max_probes = 1024
 first_pass_top_k = 1000
@@ -1492,7 +1492,7 @@ top_k = 100
 | `skip_uncertain_moves` | off | on: 12–17% fewer key moves, up to 0.9 points less recall at 1% read under topic drift | — | SPFresh comparison |
 | `split_samples`, `split_init_trials`, `split_max_iters`, `split_lambda_factor` | 1000, 3, 100, 100 | SPTAG's values; a posting of 256 chunks is never sampled | — | SPTAG |
 | `threads` | 2 | maintenance keeps up with heavier ingest, at more CPU taken from queries | slower to split under load | measured in M3a |
-| `probe_budget_entries` | 70,000 | more recall, more latency | less of both | M2d |
+| `probe_budget_entries` | 42,000 | more recall, more latency | less of both | decision 13 |
 | `probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | — | a fraction makes large namespaces cheaper (30% of FiQA: 32k entries, −0.0003 nDCG@10 on qwen, −0.0013 on gemma); the floor keeps small namespaces exact | M3-pre §4 |
 | `max_probes` | 1,024 | — | caps probes; keep it at least 1.5 × the fraction of postings the budget needs, or it cuts searches short | M3-pre §4 |
 
@@ -2552,5 +2552,5 @@ so it is not planned.
 | 10 | M2c done (2026-10-04) | Whole-document codes against the zero centre, one Pass-2 estimator per query; gated at nDCG@{10..100} on gemma and qwen, SciFact and FiQA |
 | 11 | How M3 grows a partition (2026-10-10) | Option C built as SPFresh's LIRE: balanced 2-means splits, reassignment over the 64 nearest postings, merges at SPFresh's 10/118 ratio. One deviation: split centres are the means of the code reconstructions, not medoids. 1-bit codes, no replicas, error-bound gate off by default. M3c dropped (*M3 split algorithm (LIRE)*) |
 | 12 | Where M3's levers live (2026-10-10) | Defaults in the server TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`), written into a namespace's schema when it enables semantic search and owned by the namespace from then on; `threads` is engine-only (*Levers and configuration*) |
-| 13 | Default probe budget (2026-10-10) | 70,000 entries, absolute, as M2d. The scaled form `clamp(fraction · E, floor, ceiling)` is available but unset by default, and reviewed after M3a measures probe cost |
+| 13 | Default probe budget (2026-10-10; revised 2026-10-18) | 42,000 entries, absolute. On FiQA with the grown partition nDCG stops rising at every cutoff at about 35,000 entries; 42,000 is that plus 20%. 70,000 (M2d) read 62% of FiQA, 12.2 ms against 6.7 ms at 34,600, for the same nDCG to four decimals. Measured at 42,000: FiQA 7.8 ms p50, nDCG within 0.0007 of a full read at every cutoff; SciFact still read in full, unchanged. The scaled form `clamp(fraction · E, floor, ceiling)` stays available and unset |
 | 14 | Collecting unused centres (2026-10-17) | Deferred: costs no longer depend on the centre count, and in a rarely updated store almost every centre stays in use. Build it (during a rebuild, *Known limitation: centres are never collected*) when a long-lived store with heavy update or delete churn needs it |

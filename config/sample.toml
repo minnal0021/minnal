@@ -383,8 +383,8 @@ embedding_service_url = "http://localhost:8001"
 [semantic_search.search_defaults]
 
 # Entries Pass 1 reads per query: it probes the nearest postings until their
-# entries reach this. A store with fewer entries is read in full. Default: 70000.
-# probe_budget_entries = 70000
+# entries reach this. A store with fewer entries is read in full. Default: 42000.
+# probe_budget_entries = 42000
 
 # Postings always probed / never exceeded, whatever the budget. Defaults: 1, 1024.
 # min_probes = 1

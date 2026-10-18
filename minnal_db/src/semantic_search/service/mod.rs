@@ -48,11 +48,14 @@ type SparseEntryRef<'a> = (u32, &'a [u8], &'a [u8]);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
-/// The default probe settings: read about 70,000 entries per query (what 64
-/// fixed probes read on FiQA, the largest corpus measured), probing 1 to 1,024
-/// postings.
+/// The default probe settings: read about 42,000 entries per query, probing 1
+/// to 1,024 postings. On FiQA (173k chunks, the largest corpus measured) nDCG
+/// stops rising at every cutoff from 10 to 100 at about 35,000 entries; 42,000
+/// is that plus 20%. It reads 37% of FiQA in 7.8 ms warm, within 0.0007 nDCG of
+/// a full read at every cutoff (vector bench, 2026-10-18; 70,000 read 62% in
+/// 12.2 ms for the same nDCG). SciFact (23k chunks) is still read in full.
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
-    budget_entries: 70_000,
+    budget_entries: 42_000,
     min_probes: 1,
     max_probes: 1024,
 };
@@ -94,7 +97,7 @@ pub struct SemanticSearchConfig {
 
     /// How many postings the first-pass sparse (single-bit) search probes: an
     /// entry budget bounded by a minimum and maximum posting count
-    /// ([`ProbeSettings`]). Default: 70,000 entries, 1 to 1,024 postings.
+    /// ([`ProbeSettings`]). Default: 42,000 entries, 1 to 1,024 postings.
     pub probe: ProbeSettings,
 
     /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.

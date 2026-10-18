@@ -50,7 +50,7 @@ async fn create_writes_every_default_into_the_saved_schema() {
         "embedding_model": "gemma", "embedding_dim": 768,
         "chunking": {"window_size": 4, "sliding_size": 2},
         "quantisation": {"pass1_bits": 1, "pass2_bits": 8, "rotation_seed": "0x6d696e6e616c0001", "pass2_centre": "zero"},
-        "search": {"probe_budget_entries": 70_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100,
+        "search": {"probe_budget_entries": 42_000, "min_probes": 1, "max_probes": 1024, "first_pass_top_k": 1000, "top_k": 100,
                    "probe_budget_fraction": 0.0, "probe_budget_floor": 20_000},
         "maintenance": {"target_posting_size": 128, "reassign_range": 64, "merge_ratio": 10.0 / 118.0,
                         "skip_uncertain_moves": false, "split_samples": 1000, "split_init_trials": 3,

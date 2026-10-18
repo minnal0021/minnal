@@ -358,7 +358,7 @@ documents with synthetic 768-dimension vectors, and a query shaped like
 production's: one vector for the whole query. The store is partitioned into 64
 clusters, their centres fitted by k-means on synthetic documents, and every
 search probes all 64. That is what production does with a store this small:
-Pass 1 keeps probing the nearest clusters until they hold 70,000 entries in
+Pass 1 keeps probing the nearest clusters until they hold 42,000 entries in
 all (the default budget; an entry is one document's chunks in one cluster), and
 5,000 documents hold fewer than that.
 
@@ -379,7 +379,7 @@ How these numbers relate to a real query:
   takes 1.9 ms (the one-chunk bar above, measured separately), 4 vectors
   2.1 ms and 40 vectors 2.7 ms.
 - **Real stores are larger and clumpier.** Here every chunk is scored. In a
-  larger store, Pass 1 stops once the clusters it has probed hold 70,000
+  larger store, Pass 1 stops once the clusters it has probed hold 42,000
   entries, so its cost follows the budget rather than the store size. Real
   embeddings also pile into a few clusters, unlike these synthetic ones. The architecture doc's *Where a query's time goes* covers this, and
   [The engine at work](#the-engine-at-work) measures search on a real
