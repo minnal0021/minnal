@@ -21,6 +21,7 @@ to other hardware much better than the raw microseconds do.
 | A field-index equality query over 100,000 rows | 0.5–2.4 µs | [Field-index queries](#field-index-queries) |
 | A field-index range query over 100,000 rows | 61–144 µs | [Field-index queries](#field-index-queries) |
 | A semantic search over 5,000 documents | 1.3–3.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
+| jemalloc instead of glibc `malloc`, 16 clients | 10% more operations, searches 42% faster, a fifth of the resident memory | [Choosing the memory allocator](#choosing-the-memory-allocator) |
 
 The one number that shapes everything else: **a write costs 2.3 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
@@ -45,6 +46,8 @@ because writes fsync one at a time.
 - **fsync.** The system call that waits until the drive has made data durable.
   It is the dominant cost of every write.
 - **Miss.** A lookup for a key that does not exist.
+- **Allocator.** The code behind every memory allocation and free in the
+  process: glibc `malloc` unless the program chooses another, such as jemalloc.
 
 ## Setup
 
@@ -543,3 +546,95 @@ the replay table and the output directory, and sets the mix, durations and
 repeats; `docs/benchmarks/engine/fiqa.example.json` is the configuration used
 here (relative paths resolve from `minnal_db/`, where `cargo bench` runs). `cargo bench` without a command skips this benchmark, so the Criterion
 report above does not run it.
+
+### Choosing the memory allocator
+
+Every request allocates and frees many short-lived buffers. A semantic search
+is the extreme case: its first pass reads tens of thousands of index entries,
+each one copied into its own small allocations, and frees them all when it
+returns. So the *memory allocator*, the code behind every allocation and free,
+matters to both speed and memory use. A Rust program uses the system allocator
+(glibc `malloc` on Linux) unless the binary names another one. `minnal_db` is a
+library and leaves that choice to the program that embeds it. The API server
+(`minnal_db_api`) uses jemalloc. The
+[Embedded Quickstart](QUICKSTART.md#7-choosing-a-memory-allocator) shows how to
+switch an application.
+
+Three builds of `engine_bench` were compared on the same starting database and
+the same operations. The only difference was the allocator: glibc `malloc` 2.43
+(run twice), jemalloc 5.3 (`tikv-jemallocator` 0.7) and mimalloc
+(`mimalloc` 0.1.52).
+
+| | glibc `malloc` (two runs) | **jemalloc** | mimalloc |
+|---|---:|---:|---:|
+| Operations per second, 16 clients | 388 / 391 | **431** | 409 |
+| Operations per second, soak (4 clients) | 254 / 258 | **285** | 274 |
+| `search` p50 / p99, 16 clients (ms) | 51–53 / 113–119 | **30 / 77** | 38 / 95 |
+| `filtered_search` p50 / p99, 16 clients (ms) | 50–51 / 114–119 | **30 / 78** | 38 / 98 |
+| `field_query` p99, 16 clients (ms) | 27–28 | **23** | 28 |
+| `insert` p50, 16 clients (ms) | 62 | 70 | 68 |
+| Share of CPU time spent in the allocator | 14–16% | **5%** | 14% |
+| Resident memory after the 16-client cell (GiB) | 6.3–6.4 | **1.3** | 2.8 |
+| Resident memory at the end of the soak (GiB) | 6.4–6.7 | 3.0 | 2.9 |
+| Highest resident memory during the run (GiB) | 6.7 | **3.5** | 4.0 |
+
+Search quality at rest after the run (nDCG; glibc is the second run):
+
+| | @10 | @20 | @30 | @40 | @50 | @100 |
+|---|---:|---:|---:|---:|---:|---:|
+| glibc `malloc` | 0.504 | 0.531 | 0.540 | 0.548 | 0.553 | 0.567 |
+| jemalloc | 0.506 | 0.533 | 0.542 | 0.549 | 0.555 | 0.569 |
+| mimalloc | 0.506 | 0.533 | 0.541 | 0.549 | 0.554 | 0.568 |
+
+What the numbers show:
+
+- **glibc keeps what it frees.** It spreads threads over many memory regions
+  (*arenas*; up to eight per core), and memory freed into an arena mostly stays
+  there, resident, for the next allocation from that arena. With 16 clients,
+  glibc's own account showed about 1.1 GiB in use and 6 GiB freed but still
+  held. jemalloc hands unused pages back to the
+  operating system over about ten seconds, so resident memory follows what is
+  actually in use.
+- **glibc also spends the most CPU.** The share of CPU time spent in the
+  allocator, sampled with `perf`, drops from 14–16% to 5% with jemalloc. Search
+  gains the most: 42% faster at the median with 16 clients, and 33% faster at
+  p99. Throughput rises 10% at 16 clients and 11% in the soak.
+- **mimalloc falls in between.** It uses less memory than glibc, but its
+  allocator share stays at 14%. Most of that is spent on memory that one thread
+  allocates and another frees, which is how a search's first-pass entries are
+  released (on a separate thread, so the reply is not delayed).
+- **Writes wait slightly longer.** `insert`, `update` and `delete` medians at
+  16 clients rise by 9–13% with either alternative. Writes fsync one at a
+  time, so when reads finish sooner, more writes queue for the fsync at once.
+  Total operations still rise.
+- **Search quality is unchanged** at every cutoff: both alternatives fall
+  within the spread of the five glibc runs made with and without tuning
+  (nDCG@10 0.504–0.506, nDCG@100 0.567–0.571).
+
+Tuning glibc does not close the gap. Limiting it to 8 arenas
+(`GLIBC_TUNABLES=glibc.malloc.arena_max=8`) cut resident memory to 2 GiB but
+**halved** throughput (153 operations per second at 16 clients), because
+threads then queue for the shared arenas' locks. A larger per-thread cache
+(`glibc.malloc.tcache_count=1024`) used more memory (8–8.5 GiB) and was slower
+(361 operations per second).
+
+How these numbers were made. Code at commit `7ebb872`, on 2026-10-18, with the
+machine under [Setup](#setup). Each allocator ran a shortened plan once:
+single-operation cells of 5 seconds, 8 and 16 clients for 3 minutes each, and a
+10-minute soak with 4 clients. Every cell was valid. All arms ran under
+`perf record` (499 samples per second, frame pointers on), which costs every
+arm the same. The two glibc runs agree within 1%, and jemalloc's differences
+are far larger than that. Resident memory includes about 0.9 GiB held by the
+benchmark's replay table, which an application does not have.
+
+To repeat a comparison, build the benchmark with another allocator:
+
+```sh
+RUSTFLAGS='--cfg minnal_bench_alloc="jemalloc"' \
+    cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- run CONFIG.json
+```
+
+`"mimalloc"` selects mimalloc. Without the flag the benchmark uses the system
+allocator. The allocator is recorded in `run.json` and named in the report.
+glibc's own account of memory in use and freed but held is reported only for
+glibc builds.

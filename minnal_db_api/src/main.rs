@@ -17,6 +17,12 @@ use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, Sema
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
+/// jemalloc, not the system allocator: with 16 concurrent clients, glibc malloc
+/// kept about 6 GB of freed memory resident and spent three times jemalloc's CPU
+/// allocating (`minnal_db/benchmark.md`, "Choosing the memory allocator").
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Shared application state passed to every handler via axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {

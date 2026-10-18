@@ -542,8 +542,9 @@ a transaction — minnal has no multi-key transaction primitive.
 
 See the dedicated **[Embedded Quickstart](minnal_db/QUICKSTART.md)** — it covers
 feature selection as a table, the key-value and field-index APIs with runnable
-examples, `merge` and its typed twin `merge_typed` in full, and the
-document-store handle. Full engine internals are in
+examples, `merge` and its typed twin `merge_typed` in full, the document-store
+handle, and why to build your program with jemalloc as its memory allocator
+(faster, and far less resident memory under load). Full engine internals are in
 [`minnal_db/README.md`](minnal_db/README.md).
 
 ## Scripts and Config

@@ -539,3 +539,92 @@ for r in hits.results {
 store.shutdown().await?; // stops the embed-worker cleanly
 # Ok(()) }
 ```
+
+---
+
+## 7. Choosing a memory allocator
+
+**Use jemalloc in the program that embeds `minnal_db`.** Every request
+allocates and frees many short-lived buffers, and a semantic search frees tens
+of thousands at once. The system allocator on Linux, glibc `malloc`, holds on
+to freed memory and spends more CPU per allocation. Under 16 concurrent clients,
+measured in the engine benchmark, switching the same binary to jemalloc gave:
+
+| | glibc `malloc` | jemalloc |
+|---|---:|---:|
+| Operations per second | 388–391 | 431 |
+| Semantic search, median / p99 | 51–53 / 113–119 ms | 30 / 77 ms |
+| CPU time spent in the allocator | 14–16% | 5% |
+| Resident memory after the load | 6.3–6.4 GiB | 1.3 GiB |
+
+Search quality was unchanged. Writes waited about 10% longer at the median,
+because faster reads put more writes in the fsync queue at once. The full
+comparison, including mimalloc and glibc's tuning options, is in
+[benchmark.md → Choosing the memory allocator](benchmark.md#choosing-the-memory-allocator).
+The `minnal_db_api` server already uses jemalloc.
+
+`minnal_db` is a library, so it does not choose an allocator for you: Rust
+lets only the final program set one. You set it in your binary crate, the one
+with `main`, never in a library crate that others depend on.
+
+### Switching to jemalloc
+
+Add the allocator to your binary's `Cargo.toml`:
+
+```toml
+[dependencies]
+minnal_db = "0.2"
+tikv-jemallocator = "0.7"
+```
+
+and declare it once in `src/main.rs`. Nothing else changes: every allocation in
+the process, minnal's included, now goes through jemalloc.
+
+```rust
+use minnal_db::Db;
+
+// Every heap allocation in this program, minnal's background workers included,
+// now goes through jemalloc.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open("/tmp/mydb")?;
+    db.put(b"hello", b"world")?;
+    assert_eq!(db.get(b"hello")?.as_deref(), Some(&b"world"[..]));
+    db.shutdown()?;
+    Ok(())
+}
+```
+
+jemalloc is a C library that `tikv-jemallocator` compiles from source the first
+time you build, so the build needs a C compiler and `make`, as most Rust
+toolchains on Linux and macOS already have.
+
+### Checking it is in use
+
+jemalloc reads its options from the `_RJEM_MALLOC_CONF` environment variable
+(the `_RJEM_` prefix keeps it apart from any other jemalloc in the process).
+`stats_print:true` makes it print its statistics when the program exits, so
+seeing them confirms the program runs on jemalloc:
+
+```sh
+_RJEM_MALLOC_CONF=stats_print:true ./target/release/my_app 2>&1 | grep -m1 -A1 'Begin jemalloc'
+# ___ Begin jemalloc statistics ___
+# Version: "5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+```
+
+The same variable tunes it. jemalloc returns freed pages to the operating
+system about ten seconds after they are freed (`dirty_decay_ms:10000`), and it
+does so while the program allocates, so a program that goes idle keeps them
+until it is busy again. `background_thread:true` makes a jemalloc thread return
+them on time even when the program is idle. `dirty_decay_ms:1000` returns them
+sooner, at some CPU cost. The comparison above used the defaults.
+
+### Staying on glibc
+
+If you cannot change the allocator, glibc's own settings help only a little.
+`GLIBC_TUNABLES=glibc.malloc.arena_max=8` caps the number of memory regions it
+spreads threads over. That cut resident memory to 2 GiB in the benchmark, but
+also halved throughput, because threads then wait for each other's locks. Treat
+any glibc setting as something to measure on your own workload first.
