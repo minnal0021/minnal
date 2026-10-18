@@ -18,6 +18,7 @@ re-check them before starting work.
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
+| [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
 
 ---
 
@@ -1125,3 +1126,92 @@ above it the reference reads the nearest postings up to the cap
   would let an operator check queries that are not cached.
 - **Re-encoding**, the remedy for centre drift (design doc, *Re-encode
   strategies*).
+
+---
+
+## FR-008 — Collect unused IVF centres
+
+**Filed:** 2026-10-18
+**Area:** `minnal_db` (`src/ivf_split/rebuild.rs`, `src/semantic_search/cluster/layout.rs`,
+`{ns}_ivf_centres`)
+**Severity:** Low — memory and disk only; no effect on search results or speed
+**Source:** dynamic RaBitQ index, design decision 14 (deferred 2026-10-17)
+
+### Summary
+
+A namespace's IVF centres are append-only. A split adds two, a rebuild adds one
+per posting it fits, and nothing ever removes one. A chunk code keeps the
+`centre_id` it was encoded against when a split or rebuild moves it to another
+posting, so the old centre stays in use. A centre becomes truly unused only
+once every code encoded against it has been deleted or re-embedded.
+
+Searches and publishes no longer pay for the count: a search builds Pass-1
+estimators only for the centres its probed codes use, and a new snapshot shares
+the already-rotated centres (`evolve` 2.2 ms at FiQA's 1,957 centres, 3.8 ms at
+50,000). What remains is memory and disk: two vectors per centre (original and
+rotated), about 6 KB at 768 dimensions, so about 12 MB at FiQA's size and
+300 MB at 50,000 centres, plus one stored row each.
+
+It matters for long-lived stores with heavy update or delete churn, where whole
+groups of codes are deleted or re-embedded and their centres are left with no
+code at all.
+
+### Why this is a feature, not a bug fix
+
+Nothing is wrong today. Collecting a centre that a code still uses would make
+that code's chunks silently unscorable (Pass 1 skips them, counted only in
+`sparse_corrupt_skipped`), so this needs its own mechanism and tests, not a
+patch.
+
+### Scope
+
+#### Must have
+
+- **Collect at the end of a rebuild.** A rebuild already reads every code. As
+  its last step, under the maintenance lock and after its final publish has
+  waited out older writes, scan the codes afresh and delete every centre that
+  no code and no non-retired posting references. Do not reuse the rebuild's
+  plan-time read: codes written between plan and publish use postings retired
+  by then.
+- **Keep every centre of a non-retired posting**, and anything created since
+  the scan, since new writes encode only against those.
+- **Let retired postings name a missing centre.** `NamespaceIvf::new` must
+  validate centres only for postings that are not retired, or the partition
+  fails to load. Audit every reader of a retired posting's centre (health,
+  drift, history, `abandon`).
+- **Never reuse a centre id.** Take new ids above the highest id any posting
+  names, or persist a counter.
+- **Report it.** Centres collected in the rebuild status and history record,
+  and live against total centres in the partition endpoint.
+
+#### Could have
+
+- A collection pass without a full rebuild (the same scan, no k-means), for
+  stores whose partition is fine but whose churn has left many unused centres.
+
+#### Out of scope
+
+- Re-encoding codes onto their current posting's centre, which would make most
+  centres collectable. It needs the original vectors, or a re-encode from 1-bit
+  reconstructions, which M3-pre measured to lose accuracy (0.861 against
+  0.918).
+
+### Acceptance criteria
+
+- A restart after collection loads the partition (retired postings whose
+  centres are gone).
+- A write racing the collection against a still-active posting is scored
+  correctly afterwards.
+- No centre id is handed out twice, including after the highest one is
+  collected.
+- A crash part-way through the deletes needs no recovery step (each deleted
+  centre is unused and the deletes are WAL-backed and idempotent), and a test
+  shows it.
+- A mutation check: removing "keep the centres of non-retired postings" makes
+  the racing-write test fail.
+- Search results (nDCG at 10, 20, 30, 40, 50 and 100) are unchanged on SciFact
+  and FiQA after a rebuild with collection, against one without.
+
+The design and its risk table are in
+`minnal_db/src/semantic_search/report/Dynamic-RaBitQ-Index-Design.md` →
+*Known limitation: centres are never collected*.
