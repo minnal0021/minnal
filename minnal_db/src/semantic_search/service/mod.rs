@@ -48,16 +48,16 @@ type SparseEntryRef<'a> = (u32, &'a [u8], &'a [u8]);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
-/// The default probe settings: read about 42,000 entries per query, probing 1
-/// to 1,024 postings. On FiQA (173k chunks, the largest corpus measured) nDCG
-/// stops rising at every cutoff from 10 to 100 at about 35,000 entries; 42,000
-/// is that plus 20%. It reads 37% of FiQA in 7.8 ms warm, within 0.0007 nDCG of
-/// a full read at every cutoff (vector bench, 2026-10-18; 70,000 read 62% in
-/// 12.2 ms for the same nDCG). SciFact (23k chunks) is still read in full.
+/// The default probe settings: each query reads its 256 nearest postings
+/// (clusters), or every posting of a namespace with fewer. On FiQA (173k
+/// chunks, about 960 postings, the largest corpus measured) 256 is the smallest
+/// count within 0.001 nDCG of a full read at every cutoff from 10 to 100 on
+/// gemma and qwen; it reads 28% of the entries in 6.4 ms warm (192: up to
+/// 0.0024 behind). SciFact (about 135 postings) is read in full (vector bench,
+/// 2026-10-19).
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
-    budget_entries: 42_000,
     min_probes: 1,
-    max_probes: 1024,
+    max_probes: 256,
 };
 
 /// Configuration required to call the embedding service.
@@ -95,9 +95,8 @@ pub struct SemanticSearchConfig {
     /// How far the document chunk window advances, in sentences. Default: 2.
     pub sliding_size: usize,
 
-    /// How many postings the first-pass sparse (single-bit) search probes: an
-    /// entry budget bounded by a minimum and maximum posting count
-    /// ([`ProbeSettings`]). Default: 42,000 entries, 1 to 1,024 postings.
+    /// How many postings the first-pass sparse (single-bit) search probes
+    /// ([`ProbeSettings`]). Default: the 256 nearest.
     pub probe: ProbeSettings,
 
     /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
@@ -281,9 +280,8 @@ pub async fn embed_query(config: &SemanticSearchConfig, text: &str) -> Result<Qu
 /// # Algorithm
 ///
 /// **Pass 1 — sparse (SingleBit), ColBERT MaxSim over document chunks:**
-/// 1. For each query vector `q_i` in `query_sparse_embeddings`, walk the clusters
-///    nearest first (Euclidean distance) until their entries reach the probe
-///    budget, within the minimum and maximum probe counts (`config.probe`,
+/// 1. For each query vector `q_i` in `query_sparse_embeddings`, take its
+///    `max_probes` nearest clusters (Euclidean distance; `config.probe`,
 ///    [`ProbeSettings`]).
 /// 2. Scan all SingleBit (document-chunk) entries in the union of those clusters in parallel.
 /// 3. For each document `d` and each query vector `q_i`, estimate `max_j ⟨q_i, d_j⟩`
@@ -410,7 +408,7 @@ where
 
     // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
 
-    // Each Pass-1 query vector's nearest clusters within the probe budget, then
+    // Each Pass-1 query vector's nearest clusters (max_probes of them), then
     // their union (in production there is one vector). The per-vector rankings
     // are batched over a contiguous centroid matrix.
     let (probe_clusters, planned_entries) = select_probes(layout, query_sparse_embeddings, &config.probe);

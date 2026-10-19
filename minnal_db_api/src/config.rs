@@ -554,7 +554,7 @@ fn default_concurrency() -> usize {
 /// only give the values a namespace's schema is filled with when it first
 /// enables semantic search; from then on the namespace owns them. Unknown keys
 /// are rejected, so a misplaced key (`model`, `embedding_dim`,
-/// `probe_budget_entries` at this level, ...) fails at startup instead of being
+/// `max_probes` at this level, ...) fails at startup instead of being
 /// silently ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -840,7 +840,6 @@ mod tests {
             "model = \"qwen\"",
             "embedding_dim = 768",
             "n_probes = 64",
-            "probe_budget_entries = 70000",
             "max_probes = 1024",
             "window_size = 4",
             "cluster_path = \"x\"",
@@ -865,14 +864,13 @@ mod tests {
 
         let toml = format!(
             "{base}[semantic_search.maintenance]\ntarget_posting_size = 256\nskip_uncertain_moves = true\nthreads = 4\n\
-             [semantic_search.search_defaults]\nprobe_budget_entries = 40000\nprobe_budget_fraction = 0.3\n"
+             [semantic_search.search_defaults]\nmax_probes = 200\n"
         );
         let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
         let d = cfg.semantic_search.index_defaults().unwrap();
         assert_eq!((d.maintenance.target_posting_size, d.maintenance.skip_uncertain_moves), (256, true));
         assert_eq!(d.maintenance.reassign_range, 64, "unset keys keep the built-in value");
-        assert_eq!(d.search.probe_budget_entries, 40_000);
-        assert_eq!(d.search.probe_budget_fraction.map(|r| r.0), Some(0.3));
+        assert_eq!(d.search.max_probes, 200);
         assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), 4);
         assert_eq!(cfg.semantic_search.maintenance.rebuild_threads().unwrap(), 2);
 
@@ -881,13 +879,17 @@ mod tests {
             ("maintenance", "merge_ratio = 0.7"),
             ("maintenance", "threads = 0"),
             ("maintenance", "rebuild_threads = 3"),
-            ("search_defaults", "probe_budget_fraction = 2.0"),
+            ("search_defaults", "max_probes = 0"),
         ] {
             let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
             let cfg: DocStoreApiConfig = toml::from_str(&toml).unwrap();
             assert!(cfg.semantic_search.index_defaults().is_err(), "{key}");
         }
-        for (table, key) in [("maintenance", "error_bound_gate = true"), ("search_defaults", "n_probes = 64")] {
+        for (table, key) in [
+            ("maintenance", "error_bound_gate = true"),
+            ("search_defaults", "n_probes = 64"),
+            ("search_defaults", "probe_budget_entries = 40000"),
+        ] {
             let toml = format!("{base}[semantic_search.{table}]\n{key}\n");
             assert!(toml::from_str::<DocStoreApiConfig>(&toml).is_err(), "{key}");
         }

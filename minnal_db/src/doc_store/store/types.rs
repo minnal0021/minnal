@@ -572,7 +572,7 @@ impl SemanticSearchContext {
             window_size: settings.window_size as usize,
             sliding_size: settings.sliding_size as usize,
             number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
-            probe: probe_settings(&settings.search, ivf.total_entries()),
+            probe: probe_settings(&settings.search),
             first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
             top_k_results: settings.search.top_k as usize,
             ..self.config.clone()
@@ -592,7 +592,7 @@ impl NamespaceSemantics {
     /// (validated against the same ranges as the schema).
     pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
         let s = overrides.apply(self.search)?;
-        self.config.probe = probe_settings(&s, self.partition.snapshot().total_entries());
+        self.config.probe = probe_settings(&s);
         self.search = s;
         self.config.first_pass_sparse_search_top_k = s.first_pass_top_k as usize;
         self.config.top_k_results = s.top_k as usize;
@@ -625,12 +625,10 @@ pub struct ReindexStats {
     pub enqueued: usize,
 }
 
-/// The probe settings a namespace's search settings describe, for a namespace
-/// holding `entries` (a scaled budget depends on it).
+/// The probe settings a namespace's search settings describe.
 #[cfg(feature = "semantic-search")]
-fn probe_settings(s: &SearchSettings, entries: u64) -> crate::semantic_search::ProbeSettings {
+fn probe_settings(s: &SearchSettings) -> crate::semantic_search::ProbeSettings {
     crate::semantic_search::ProbeSettings {
-        budget_entries: s.budget_for(entries),
         min_probes: s.min_probes as usize,
         max_probes: s.max_probes as usize,
     }

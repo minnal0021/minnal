@@ -285,7 +285,7 @@ concurrency = 4
 # enables semantic search; after that the store owns them (change them with the
 # schema amendment `update_vector_search`), and a later change here never
 # affects an existing store. A namespace key placed directly under
-# [semantic_search] (model, embedding_dim, probe_budget_entries, ...) is a
+# [semantic_search] (model, embedding_dim, max_probes, ...) is a
 # startup error.
 # ---------------------------------------------------------------------------
 [semantic_search]
@@ -377,28 +377,20 @@ embedding_service_url = "http://localhost:8001"
 # [semantic_search.search_defaults] — search settings a new store starts with
 #
 # Copied into a store's schema when it enables semantic search; a search
-# request can still override probe_budget_entries, min_probes, max_probes,
-# first_pass_top_k and top_k.
+# request can still override min_probes, max_probes, first_pass_top_k and
+# top_k.
 # ---------------------------------------------------------------------------
 [semantic_search.search_defaults]
 
-# Entries Pass 1 reads per query: it probes the nearest postings until their
-# entries reach this. A store with fewer entries is read in full. Default: 42000.
-# probe_budget_entries = 42000
-
-# Postings always probed / never exceeded, whatever the budget. Defaults: 1, 1024.
+# Postings (clusters) Pass 1 reads per query: its nearest max_probes, or every
+# posting of a store with fewer. min_probes is a floor for requests that lower
+# max_probes. Defaults: 1, 256.
 # min_probes = 1
-# max_probes = 1024
+# max_probes = 256
 
 # Candidates Pass 1 hands to Pass 2, and results returned. Defaults: 1000, 100.
 # first_pass_top_k = 1000
 # top_k = 100
-
-# Optional scaled budget: budget = clamp(fraction * entries, floor,
-# probe_budget_entries). Large stores then read a share of themselves while
-# small ones stay exact. 0 (default) keeps the absolute budget.
-# probe_budget_fraction = 0.30
-# probe_budget_floor = 20000
 
 # ---------------------------------------------------------------------------
 # [[semantic_search.supported_models]] — optional list of allowed models

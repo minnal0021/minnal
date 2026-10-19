@@ -1002,6 +1002,11 @@ scans on FiQA at M0.
 
 ### M2d result (2026-10-05)
 
+> **Superseded (decision 15).** Searches no longer probe by entry budget: each
+> query reads its `max_probes` nearest postings (default 256), with `min_probes`
+> as a floor for overrides. The rest of this section records how the budget was
+> built and measured.
+
 **Passed**, with one gate clause amended (below). Pass 1 walks each query
 vector's postings nearest first, in the same order as before, and stops once it
 has probed `min_probes` postings and their entries reach `probe_budget_entries`,
@@ -1334,7 +1339,7 @@ its reference implementation (SPTAG, `ExtraDynamicSearcher.h` and
 **Sizes.** Postings are measured in **chunks** (SPFresh counts vectors):
 `split_limit = 2 · target_posting_size` and
 `merge_limit = round(split_limit · merge_ratio)`; at the defaults, 256 and 22.
-The probe budget (M2d) still counts entries.
+Searches count postings read (`max_probes`, decision 15); since splits and merges bound each posting's size, that bounds the entries read.
 
 **State.** Per namespace: the append-only centre table (`{ns}_ivf_centres`),
 the postings (`{ns}_ivf_postings`: posting id, centre id, state `Active` /
@@ -1475,13 +1480,10 @@ threads = 2                  # engine-only: maintenance threads per process
 
 # Search defaults, copied into vector_index.search.
 [semantic_search.search_defaults]
-probe_budget_entries = 42000 # entries a query reads (the ceiling when a fraction is set)
-min_probes = 1
-max_probes = 1024
+min_probes = 1               # floor for requests that lower max_probes
+max_probes = 256             # postings a query reads: its nearest this many
 first_pass_top_k = 1000
 top_k = 100
-# probe_budget_fraction = 0.30  # optional: budget = clamp(fraction * E,
-# probe_budget_floor = 20000    #   floor, probe_budget_entries)
 ```
 
 | Lever | Default | Raising it | Lowering it | Evidence |
@@ -1492,19 +1494,16 @@ top_k = 100
 | `skip_uncertain_moves` | off | on: 12–17% fewer key moves, up to 0.9 points less recall at 1% read under topic drift | — | SPFresh comparison |
 | `split_samples`, `split_init_trials`, `split_max_iters`, `split_lambda_factor` | 1000, 3, 100, 100 | SPTAG's values; a posting of 256 chunks is never sampled | — | SPTAG |
 | `threads` | 2 | maintenance keeps up with heavier ingest, at more CPU taken from queries | slower to split under load | measured in M3a |
-| `probe_budget_entries` | 42,000 | more recall, more latency | less of both | decision 13 |
-| `probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | — | a fraction makes large namespaces cheaper (30% of FiQA: 32k entries, −0.0003 nDCG@10 on qwen, −0.0013 on gemma); the floor keeps small namespaces exact | M3-pre §4 |
-| `max_probes` | 1,024 | — | caps probes; keep it at least 1.5 × the fraction of postings the budget needs, or it cuts searches short | M3-pre §4 |
+| `max_probes` | 256 | more recall, more latency | less of both | decision 15 |
+| `min_probes` | 1 | holds a request that lowers `max_probes` up to it | — | decision 15 |
 
 **Validation**, at startup for the TOML and on every amendment:
 `target_posting_size` 16–65,536; `reassign_range` 0–1,024; `merge_ratio`
 greater than 0 and below 0.5 (a merged posting must stay under the split
 limit); `split_samples` 2–1,000,000; `split_init_trials` 1–100;
 `split_max_iters` 1–10,000; `split_lambda_factor` greater than 0; `threads`
-1–64; `probe_budget_fraction` above 0 and at most 1, or 0 to turn scaling off,
-with `probe_budget_floor` at most `probe_budget_entries` when a fraction is set.
-A request that overrides `probe_budget_entries` reads exactly that budget.
-Unknown keys are rejected, as today.
+1–64; `min_probes` and `max_probes` 1–4,096 with `min_probes` at most
+`max_probes`. Unknown keys are rejected, as today.
 
 ### M3a — Grow and split (split only, no reassign)
 
@@ -2554,3 +2553,4 @@ so it is not planned.
 | 12 | Where M3's levers live (2026-10-10) | Defaults in the server TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`), written into a namespace's schema when it enables semantic search and owned by the namespace from then on; `threads` is engine-only (*Levers and configuration*) |
 | 13 | Default probe budget (2026-10-10; revised 2026-10-18) | 42,000 entries, absolute. On FiQA with the grown partition nDCG stops rising at every cutoff at about 35,000 entries; 42,000 is that plus 20%. 70,000 (M2d) read 62% of FiQA, 12.2 ms against 6.7 ms at 34,600, for the same nDCG to four decimals. Measured at 42,000: FiQA 7.8 ms p50, nDCG within 0.0007 of a full read at every cutoff; SciFact still read in full, unchanged. The scaled form `clamp(fraction · E, floor, ceiling)` stays available and unset |
 | 14 | Collecting unused centres (2026-10-17) | Deferred: costs no longer depend on the centre count, and in a rarely updated store almost every centre stays in use. Build it (during a rebuild, *Known limitation: centres are never collected*) when a long-lived store with heavy update or delete churn needs it |
+| 15 | Probe by posting count (2026-10-19) | Replaces decision 13 and the entry budget: each query reads its `max_probes` nearest postings (default 256), every posting of a namespace with fewer; `min_probes` (default 1) is a floor for overrides. No budget, no scaled fraction: an entry count was not an intuitive knob, and splits and merges keep postings between 22 and 256 chunks, so a posting count bounds the read. Default 256: on FiQA (979 / 952 postings, gemma / qwen) the smallest count within 0.001 nDCG of a full read (768 probes) at every cutoff @10–@100 on both models (gemma ≤ 0.0005, qwen ≤ 0.0006 behind), 31k entries (28%), p50 6.4 ms against 7.8 ms for the 42,000-entry budget; 192 was up to 0.0024 behind on gemma. SciFact (133 / 139 postings) is read in full. Vector bench 2026-10-19, `work/bench/results/probes-{gemma,qwen}` |

@@ -145,7 +145,7 @@ pub(crate) enum AmendRequest {
         #[serde(default)]
         vector_index: Option<VectorIndexSpec>,
     },
-    /// `{"op": "update_vector_search", "search": {"probe_budget_entries": 20000},
+    /// `{"op": "update_vector_search", "search": {"max_probes": 200},
     /// "maintenance": {"target_posting_size": 256}}`: change the store's search
     /// and/or partition maintenance settings (doc and KV stores).
     UpdateVectorSearch {

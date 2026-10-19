@@ -193,9 +193,8 @@ pub enum SchemaAmendment {
         fields: Vec<String>,
         vector_index: Option<VectorIndexSpec>,
     },
-    /// Change the namespace's search settings (`probe_budget_entries`,
-    /// `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`,
-    /// `probe_budget_fraction`, `probe_budget_floor`) and/or its partition
+    /// Change the namespace's search settings (`min_probes`, `max_probes`,
+    /// `first_pass_top_k`, `top_k`) and/or its partition
     /// maintenance settings. Takes effect on later searches, splits and merges;
     /// nothing is re-embedded. Fails if the namespace has never had semantic
     /// search enabled.
