@@ -109,7 +109,7 @@ impl DocStore {
             });
         }
         let ns = self
-            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .namespace_semantics(namespace, schema.ns_id, &self.schemas.vector_settings(namespace)?.0, overrides)
             .await?;
 
         debug!("semantic search namespace='{}' top_k={}", namespace, ns.config.top_k_results);
@@ -176,7 +176,7 @@ impl DocStore {
         }
         // Validate overrides before evaluating the predicate, too.
         let ns = self
-            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .namespace_semantics(namespace, schema.ns_id, &self.schemas.vector_settings(namespace)?.0, overrides)
             .await?;
 
         // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
@@ -412,8 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_by_prefix_after_delete() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         // Insert 5 documents with sequential u64 IDs.
@@ -456,8 +455,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_by_prefix_after_delete_semantic_search_enabled() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Create a schema with semantic_search_enabled + embedding_fields so
         // that `is_semantic_search_enabled()` returns true.
@@ -529,8 +527,7 @@ mod tests {
     async fn test_query_range() {
         // ...existing test...
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         for i in 1u64..=5 {
@@ -554,8 +551,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_range_cursor_pagination_walk() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         for i in 1u64..=5 {
@@ -589,8 +585,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_range_after_delete() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         for i in 1u64..=6 {
@@ -634,8 +629,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_range_open_ended_after_delete() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         for i in 1u64..=4 {
@@ -662,8 +656,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_range_after_delete_semantic_search_enabled() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let schema = DocStoreSchema {
             store_type: StoreType::Doc,
@@ -713,8 +706,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_by_index() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store
             .create(make_schema(
@@ -763,8 +755,7 @@ mod tests {
         use crate::semantic_search::service::SemanticSearchConfig;
 
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let mut store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let mut store = open_fresh(db_dir.path()).await;
         store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(SemanticSearchConfig::default())));
         store.create(make_schema("plain", vec![])).await.unwrap();
         store

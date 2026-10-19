@@ -19,34 +19,6 @@ impl DocStore {
     /// [`add_index`]: DocStore::add_index
     pub fn drop_index(&self, namespace: &str, field: &str) -> Result<(), DocStoreError> {
         info!("dropping index '{}' from namespace '{}'", field, namespace);
-        let mut schema = self.load_schema(namespace)?;
-        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
-            namespace: namespace.to_owned(),
-        })?;
-
-        // Confirm the index exists in the schema
-        let idx_pos = schema
-            .indices
-            .iter()
-            .position(|s| s.field == field)
-            .ok_or_else(|| DocStoreError::IndexNotFound {
-                namespace: namespace.to_owned(),
-                field: field.to_owned(),
-            })?;
-
-        let spec = schema.indices.remove(idx_pos);
-
-        // Demote to a non-indexed attribute so the field is still documented
-        // in the schema. Skip if an AttributeDef with this name already exists
-        // (shouldn't happen, but be safe).
-        if !schema.attributes.iter().any(|a| a.name == spec.field) {
-            schema.attributes.push(crate::doc_store::schema::AttributeDef {
-                name: spec.field.clone(),
-                attr_type: index_type_to_attr_type(spec.index_type),
-                description: Some("previously indexed; field data is still present in stored documents".to_owned()),
-            });
-        }
-
         // Persist the schema BEFORE anything is deregistered or deleted.
         //
         // The reverse order (the original) had a crash window in which the files
@@ -55,7 +27,35 @@ impl DocStore {
         // as `Absent` + empty — the shape `detect_replay_gap` suppresses as a
         // normal first build. The index would come up silently incomplete. See
         // `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
-        schema.save(&self.schema_dir)?;
+        let ns_id = self.schemas.update_doc(namespace, |schema| {
+            let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+                namespace: namespace.to_owned(),
+            })?;
+
+            // Confirm the index exists in the schema
+            let idx_pos = schema
+                .indices
+                .iter()
+                .position(|s| s.field == field)
+                .ok_or_else(|| DocStoreError::IndexNotFound {
+                    namespace: namespace.to_owned(),
+                    field: field.to_owned(),
+                })?;
+
+            let spec = schema.indices.remove(idx_pos);
+
+            // Demote to a non-indexed attribute so the field is still documented
+            // in the schema. Skip if an AttributeDef with this name already exists
+            // (shouldn't happen, but be safe).
+            if !schema.attributes.iter().any(|a| a.name == spec.field) {
+                schema.attributes.push(crate::doc_store::schema::AttributeDef {
+                    name: spec.field.clone(),
+                    attr_type: index_type_to_attr_type(spec.index_type),
+                    description: Some("previously indexed; field data is still present in stored documents".to_owned()),
+                });
+            }
+            Ok(ns_id)
+        })?;
 
         // Drop through the engine, which owns the index paths: it persists the
         // field's `dropped` flag, deregisters the in-memory bitmap, and deletes
@@ -89,12 +89,12 @@ impl DocStore {
     /// interrupted `reindex-all`) finds its own `in_progress` record from before
     /// the crash, and must take it over rather than refuse.
     pub(super) async fn add_index_inner(&self, namespace: &str, spec: IndexSpec, resuming: bool) -> Result<IndexBuildHandle, DocStoreError> {
-        let mut schema = self.load_schema(namespace)?;
+        let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
 
-        // `schema.save()` below does not run `validate`, so check the name here.
+        // Saving the schema does not run `validate`, so check the name here.
         crate::doc_store::schema::validate_index_field_name(&spec.field)?;
 
         if schema.indices.iter().any(|s| s.field == spec.field) {
@@ -104,10 +104,10 @@ impl DocStore {
             });
         }
 
-        // Enforce the per-namespace index cap here too: `schema.save()` below does
-        // not validate (only `validate_and_save` does), so without this check
-        // `add_index` could push the namespace past MAX_INDICES one field at a
-        // time even though create/import reject it.
+        // Enforce the per-namespace index cap here too: saving the schema does not
+        // validate, so without this check `add_index` could push the namespace
+        // past MAX_INDICES one field at a time even though create/import reject
+        // it. (Checked again when the schema is saved.)
         if schema.indices.len() >= crate::doc_store::schema::MAX_INDICES {
             return Err(DocStoreError::Schema(SchemaError::TooManyIndices {
                 count: schema.indices.len() + 1,
@@ -163,9 +163,25 @@ impl DocStore {
 
         // Persist updated schema — if the field was previously declared as a
         // non-indexed attribute, move it to indices (remove from attributes).
-        schema.attributes.retain(|a| a.name != spec.field);
-        schema.indices.push(spec.clone());
-        schema.save(&self.schema_dir)?;
+        // Checked again under the schema write: a concurrent add of the same
+        // field, or one that reached the cap, must not be saved twice.
+        self.schemas.update_doc(namespace, |schema| {
+            if schema.indices.iter().any(|s| s.field == spec.field) {
+                return Err(DocStoreError::IndexAlreadyExists {
+                    namespace: namespace.to_owned(),
+                    field: spec.field.clone(),
+                });
+            }
+            if schema.indices.len() >= crate::doc_store::schema::MAX_INDICES {
+                return Err(DocStoreError::Schema(SchemaError::TooManyIndices {
+                    count: schema.indices.len() + 1,
+                    max: crate::doc_store::schema::MAX_INDICES,
+                }));
+            }
+            schema.attributes.retain(|a| a.name != spec.field);
+            schema.indices.push(spec.clone());
+            Ok(())
+        })?;
 
         // ── Background rebuild ────────────────────────────────────────────
         // Check for a previously interrupted build and resume from where it left off.
@@ -448,12 +464,11 @@ mod tests {
     // ── Drop / add index ────────────────────────────────────────────────────
 
     /// `add_index` must enforce the per-namespace `MAX_INDICES` cap incrementally,
-    /// not just at create/import time (`schema.save()` does not validate).
+    /// not just at create/import time (saving a schema does not validate).
     #[tokio::test]
     async fn test_add_index_enforces_max_indices() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Start at the cap with MAX_INDICES indices.
         let indices = (0..crate::doc_store::schema::MAX_INDICES)
@@ -483,7 +498,7 @@ mod tests {
         }
 
         // And the rejected field must not have been registered/persisted.
-        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        let loaded = store.load_schema("ns").unwrap();
         assert_eq!(loaded.indices.len(), crate::doc_store::schema::MAX_INDICES);
         assert!(!loaded.indices.iter().any(|s| s.field == "one_too_many"));
     }
@@ -491,8 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_index_demotes_to_attribute() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store
             .create(make_schema(
                 "ns",
@@ -506,7 +520,7 @@ mod tests {
 
         store.drop_index("ns", "status").unwrap();
 
-        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        let loaded = store.load_schema("ns").unwrap();
         // Index is gone
         assert!(loaded.indices.is_empty(), "index should be removed");
         // Field is preserved as a non-indexed attribute
@@ -521,8 +535,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_index_deactivates_in_memory_index() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store
             .create(make_schema(
                 "ns",
@@ -556,8 +569,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_index_rejects_a_field_name_no_query_can_reference() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("ns", vec![])).await.unwrap();
 
         for bad in ["address.city", "created-at", "in"] {
@@ -575,17 +587,13 @@ mod tests {
                 "'{bad}' must be rejected"
             );
         }
-        assert!(
-            DocStoreSchema::load(schema_dir.path(), "ns").unwrap().indices.is_empty(),
-            "nothing was added"
-        );
+        assert!(store.load_schema("ns").unwrap().indices.is_empty(), "nothing was added");
     }
 
     #[tokio::test]
     async fn test_add_index_and_wait() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("ns", vec![])).await.unwrap();
 
         // Insert some documents before the index exists
@@ -611,7 +619,7 @@ mod tests {
         handle.wait().await.unwrap();
 
         // Schema must now include the index
-        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        let loaded = store.load_schema("ns").unwrap();
         assert_eq!(loaded.indices.len(), 1);
         assert_eq!(loaded.indices[0].field, "status");
 
@@ -627,8 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_index_rebuild_spans_multiple_pages() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("ns", vec![])).await.unwrap();
 
         let n = REBUILD_PAGE_SIZE + 7; // > 1 page, partial last page
@@ -669,7 +676,6 @@ mod tests {
     #[tokio::test]
     async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
         // Small WAL segments, so the documents' segments are reclaimable.
         let config = || {
             let mut c = crate::doc_store::test_db_config();
@@ -678,7 +684,7 @@ mod tests {
         };
         let n = 300u64;
         {
-            let store = DocStore::open_with_config(db_dir.path(), schema_dir.path(), config()).await.unwrap();
+            let store = DocStore::open_with_config(db_dir.path(), config()).await.unwrap();
             store.create(make_schema("ns", vec![])).await.unwrap();
             for i in 0..n {
                 store
@@ -688,7 +694,7 @@ mod tests {
             }
             store.db.shutdown().await.unwrap(); // flush, so the WAL is persisted
         }
-        let store = DocStore::open_with_config(db_dir.path(), schema_dir.path(), config()).await.unwrap();
+        let store = DocStore::open_with_config(db_dir.path(), config()).await.unwrap();
         let (reclaimed_bytes, _) = store.db.garbage_collect_wal().await.unwrap();
         assert!(reclaimed_bytes > 0, "setup: the documents' WAL must be reclaimed");
 

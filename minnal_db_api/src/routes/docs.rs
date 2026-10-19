@@ -46,22 +46,24 @@ fn doc_cache_miss(state: &AppState, ns: &str) -> AppError {
     }
 }
 
+/// `ns`'s document-store schema from the store's schema cache, or the
+/// appropriate error.
+fn doc_schema(state: &AppState, ns: &str) -> Result<std::sync::Arc<minnal_db::DocStoreSchema>, AppError> {
+    match state.store.schema(ns) {
+        Some(minnal_db::doc_store::StoredSchema::Doc(s)) => Ok(s),
+        _ => Err(doc_cache_miss(state, ns)),
+    }
+}
+
 /// Resolve the key type for `ns` from the schema cache, or the appropriate error.
 async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_db::KeyType, AppError> {
-    state
-        .schemas
-        .read()
-        .await
-        .get(ns)
-        .map(|s| s.key_type)
-        .ok_or_else(|| doc_cache_miss(state, ns))
+    Ok(doc_schema(state, ns)?.key_type)
 }
 
 /// Resolve `(ns_id, key_type)` for `ns` from the schema cache, or the
 /// appropriate error.
 async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(u32, minnal_db::KeyType), AppError> {
-    let schemas = state.schemas.read().await;
-    let schema = schemas.get(ns).ok_or_else(|| doc_cache_miss(state, ns))?;
+    let schema = doc_schema(state, ns)?;
     let ns_id = schema
         .ns_id
         .ok_or_else(|| AppError::from(DocStoreError::MissingNsId { namespace: ns.to_owned() }))?;

@@ -55,8 +55,7 @@ fn ids_of<T>(results: &[(DocId, T)]) -> Vec<String> {
 #[tokio::test]
 async fn put_get_delete_round_trips_a_string_key() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", vec![])).await.unwrap();
 
     store
@@ -81,8 +80,7 @@ async fn put_get_delete_round_trips_a_string_key() {
 #[tokio::test]
 async fn keys_sharing_a_long_prefix_are_distinct_documents() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", status_index())).await.unwrap();
 
     let a = "organisation-profile-alice";
@@ -103,8 +101,7 @@ async fn keys_sharing_a_long_prefix_are_distinct_documents() {
 #[tokio::test]
 async fn index_query_resolves_hits_back_to_string_keys() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", status_index())).await.unwrap();
 
     for (slug, status) in [("alpha", "active"), ("beta", "archived"), ("gamma", "active")] {
@@ -128,10 +125,9 @@ async fn index_query_resolves_hits_back_to_string_keys() {
 #[tokio::test]
 async fn string_keys_and_index_hits_survive_a_restart() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
 
     {
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(str_schema("slugs", status_index())).await.unwrap();
         for (slug, status) in [("alpha", "active"), ("beta", "archived"), ("gamma", "active")] {
             store.put("slugs", sk(slug), serde_json::json!({ "status": status })).await.unwrap();
@@ -139,7 +135,7 @@ async fn string_keys_and_index_hits_survive_a_restart() {
         store.shutdown().await.unwrap();
     }
 
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
 
     // Point reads still work…
     assert_eq!(
@@ -168,8 +164,7 @@ async fn string_keys_and_index_hits_survive_a_restart() {
 #[tokio::test]
 async fn range_scan_walks_string_keys_in_lexicographic_order() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", vec![])).await.unwrap();
 
     for slug in ["aa", "acme", "acme-corp", "b", "z"] {
@@ -190,8 +185,7 @@ async fn range_scan_walks_string_keys_in_lexicographic_order() {
 #[tokio::test]
 async fn range_scan_paginates_string_keys_by_cursor() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", vec![])).await.unwrap();
 
     for slug in ["s-01", "s-02", "s-03", "s-04", "s-05"] {
@@ -217,8 +211,7 @@ async fn range_scan_paginates_string_keys_by_cursor() {
 #[tokio::test]
 async fn prefix_scan_matches_a_raw_string_prefix() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", vec![])).await.unwrap();
 
     for slug in ["acme-1", "acme-2", "beta-1"] {
@@ -237,8 +230,7 @@ async fn prefix_scan_matches_a_raw_string_prefix() {
 #[tokio::test]
 async fn a_key_at_the_length_cap_round_trips() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", status_index())).await.unwrap();
 
     let max_key = "k".repeat(MAX_STR_KEY_LEN);
@@ -256,8 +248,7 @@ async fn a_key_at_the_length_cap_round_trips() {
 #[tokio::test]
 async fn multibyte_keys_round_trip() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create(str_schema("slugs", vec![])).await.unwrap();
 
     let key = "மின்னல்";
@@ -273,8 +264,7 @@ async fn multibyte_keys_round_trip() {
 #[tokio::test]
 async fn kv_string_keys_are_capped_at_the_same_length() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
     store.create_kv(make_kv_schema("cache", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
     let ok = "k".repeat(MAX_STR_KEY_LEN);
@@ -312,8 +302,7 @@ async fn kv_string_keys_are_capped_at_the_same_length() {
 #[tokio::test]
 async fn semantic_search_delete_path_handles_string_ids() {
     let db_dir = TempDir::new().unwrap();
-    let schema_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+    let store = open_fresh(db_dir.path()).await;
 
     let schema = DocStoreSchema {
         store_type: StoreType::Doc,

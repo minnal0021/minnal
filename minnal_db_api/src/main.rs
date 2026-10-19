@@ -12,9 +12,9 @@ use std::{
 };
 
 use config::DocStoreApiConfig;
+use minnal_db::doc_store::StoredSchema;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
 use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
-use tokio::sync::RwLock;
 use tracing::{error, info};
 
 /// jemalloc, not the system allocator: with 16 concurrent clients, glibc malloc
@@ -28,16 +28,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub struct AppState {
     /// The underlying document store.
     pub store: Arc<DocStore>,
-    /// In-memory schema cache for doc stores, keyed by namespace name.
-    ///
-    /// Populated at startup and kept in sync with the store after each mutation.
-    /// Handlers use this to resolve the [`KeyType`] needed to parse `{id}` path
-    /// segments without re-reading from disk on every request.
-    ///
-    /// [`KeyType`]: minnal_db::KeyType
-    pub schemas: Arc<RwLock<HashMap<String, DocStoreSchema>>>,
-    /// In-memory schema cache for KV stores, keyed by namespace name.
-    pub kv_schemas: Arc<RwLock<HashMap<String, KvStoreSchema>>>,
     /// Registry of active background index-build tasks.
     ///
     /// Used to:
@@ -69,6 +59,33 @@ pub struct AppState {
     pub index_checkpoint_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl AppState {
+    /// Every document store's schema by name, from the store's schema cache
+    /// (no I/O; always current, whoever changed a schema).
+    pub fn doc_schemas(&self) -> HashMap<String, Arc<DocStoreSchema>> {
+        self.store
+            .schemas()
+            .into_iter()
+            .filter_map(|s| match s {
+                StoredSchema::Doc(s) => Some((s.namespace.clone(), s)),
+                StoredSchema::Kv(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every KV store's schema by name; see [`doc_schemas`](Self::doc_schemas).
+    pub fn kv_schemas(&self) -> HashMap<String, Arc<KvStoreSchema>> {
+        self.store
+            .schemas()
+            .into_iter()
+            .filter_map(|s| match s {
+                StoredSchema::Kv(s) => Some((s.namespace.clone(), s)),
+                StoredSchema::Doc(_) => None,
+            })
+            .collect()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, raw_toml) = load_config();
@@ -96,7 +113,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         db_path    = %cfg.db_path().display(),
-        schema_dir = %cfg.schema_dir().display(),
         listen     = %cfg.listen_addr(),
         "starting minnal_db_api",
     );
@@ -106,23 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config_report::log_config_table(&cfg, raw_toml.as_ref());
 
     let db_config = cfg.to_db_config();
-    let store = DocStore::open_with_config(cfg.db_path(), cfg.schema_dir(), db_config).await?;
+    let store = DocStore::open_with_config(cfg.db_path(), db_config).await?;
 
-    let schemas: HashMap<String, DocStoreSchema> = store
-        .list()?
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<DocStoreSchema>(v).ok())
-        .map(|s| (s.namespace.clone(), s))
-        .collect();
-
-    let kv_schemas: HashMap<String, KvStoreSchema> = store
-        .list_kv()?
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<KvStoreSchema>(v).ok())
-        .map(|s| (s.namespace.clone(), s))
-        .collect();
-
-    info!("loaded {} doc schema(s) and {} KV schema(s) into cache", schemas.len(), kv_schemas.len());
+    let all_schemas = store.schemas();
+    info!(
+        "loaded {} store schema(s) from {}",
+        all_schemas.len(),
+        minnal_db::doc_store::SCHEMA_NAMESPACE
+    );
 
     let index_manager = Arc::new(IndexBuildManager::new());
 
@@ -162,17 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // unreachable or misconfigured. Non-fatal: semantic requests surface the
         // error at call time.
         let mut in_use: std::collections::BTreeSet<(String, u32)> = std::collections::BTreeSet::new();
-        for settings in schemas
-            .values()
-            .filter(|s| s.semantic_search_enabled)
-            .filter_map(|s| s.vector_settings().ok())
-            .chain(
-                kv_schemas
-                    .values()
-                    .filter(|s| s.is_semantic_search_enabled())
-                    .filter_map(|s| s.vector_settings().ok()),
-            )
-        {
+        for settings in all_schemas.iter().filter(|s| s.is_semantic_search_enabled()).filter_map(|s| match s {
+            StoredSchema::Doc(s) => s.vector_settings().ok(),
+            StoredSchema::Kv(s) => s.vector_settings().ok(),
+        }) {
             in_use.insert((settings.embedding_model, settings.embedding_dim));
         }
         for (model, dim) in in_use {
@@ -204,8 +204,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         store: Arc::new(store),
-        schemas: Arc::new(RwLock::new(schemas)),
-        kv_schemas: Arc::new(RwLock::new(kv_schemas)),
         index_manager: Arc::clone(&index_manager),
         embedding_service,
         started_at: Instant::now(),

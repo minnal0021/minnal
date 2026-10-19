@@ -9,6 +9,7 @@ pub mod key;
 pub mod kv_schema;
 pub mod pagination;
 pub mod schema;
+pub mod schema_store;
 pub mod store;
 #[cfg(feature = "semantic-search")]
 pub(crate) mod vec_index_worker;
@@ -28,6 +29,9 @@ pub use self::schema::{
 
 // ── Pagination types ───────────────────────────────────────────────────────
 pub use self::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
+
+// ── Stored schemas ─────────────────────────────────────────────────────────
+pub use self::schema_store::{SCHEMA_NAMESPACE, StoredSchema};
 
 // ── Store types ────────────────────────────────────────────────────────────
 pub use self::store::{DiskBuildProgress, DocId, DocStore, IndexBuildHandle, IndexBuildProgress, RowMapStats};

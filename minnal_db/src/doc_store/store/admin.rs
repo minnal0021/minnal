@@ -11,7 +11,7 @@ impl DocStore {
     /// - Validates the schema.
     /// - Creates the namespace in minnal_db and records the `ns_id`.
     /// - Registers and activates all declared field indices.
-    /// - Persists the schema (with `ns_id`) to `schema_dir`.
+    /// - Persists the schema (with `ns_id`) in `system_schema`.
     ///
     /// Returns [`DocStoreError::AlreadyExists`] if a store with that namespace
     /// is already registered.
@@ -28,7 +28,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
-        if self.schema_path(&ns_name).exists() {
+        if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
 
@@ -54,8 +54,8 @@ impl DocStore {
             self.seed_vector_index(&ns_name, &settings, &mut schema.vector_index).await?;
         }
 
-        // Persist schema
-        schema.save(&self.schema_dir)?;
+        // Persist schema (last: until then the store does not exist)
+        self.schemas.insert(StoredSchema::Doc(Arc::new(schema)))?;
         info!("namespace '{}' created (ns_id={})", ns_name, ns_id);
         Ok(())
     }
@@ -68,7 +68,7 @@ impl DocStore {
     pub fn list(&self) -> Result<Vec<serde_json::Value>, DocStoreError> {
         self.load_all_schemas()?
             .into_iter()
-            .map(|s| serde_json::to_value(&s).map_err(DocStoreError::from))
+            .map(|s| serde_json::to_value(&*s).map_err(DocStoreError::from))
             .collect()
     }
 
@@ -84,10 +84,9 @@ impl DocStore {
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        let schema_path = self.schema_path(namespace);
         self.without_partition_maintenance(
             namespace,
-            cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path),
+            cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
         )
         .await?;
         info!("namespace '{}' dropped", namespace);
@@ -115,7 +114,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
-        if self.schema_path(&ns_name).exists() {
+        if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
 
@@ -130,8 +129,9 @@ impl DocStore {
             let settings = schema.vector_settings()?;
             self.seed_vector_index(&ns_name, &settings, &mut schema.vector_index).await?;
         }
-        schema.save(&self.schema_dir)?;
-        info!("KV namespace '{}' created (ns_id={})", ns_name, schema.ns_id.unwrap());
+        let ns_id = schema.ns_id;
+        self.schemas.insert(StoredSchema::Kv(Arc::new(schema)))?;
+        info!("KV namespace '{}' created (ns_id={:?})", ns_name, ns_id);
         Ok(())
     }
 
@@ -139,7 +139,7 @@ impl DocStore {
     pub fn list_kv(&self) -> Result<Vec<serde_json::Value>, DocStoreError> {
         self.load_all_kv_schemas()?
             .into_iter()
-            .map(|s| serde_json::to_value(&s).map_err(DocStoreError::from))
+            .map(|s| serde_json::to_value(&*s).map_err(DocStoreError::from))
             .collect()
     }
 
@@ -150,10 +150,9 @@ impl DocStore {
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        let schema_path = self.schema_path(namespace);
         self.without_partition_maintenance(
             namespace,
-            cleanup_store_namespaces(&self.db, &self.db_path, namespace, ns_id, &schema_path),
+            cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
         )
         .await?;
         info!("KV namespace '{}' dropped", namespace);
@@ -169,12 +168,11 @@ impl DocStore {
     /// remove or update an attribute that is used by an active index returns
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
     pub async fn amend(&self, namespace: &str, mut amendment: SchemaAmendment) -> Result<(), DocStoreError> {
-        let mut schema = self.load_schema(namespace)?;
-        let was_enabled = schema.semantic_search_enabled;
+        let current = self.load_schema(namespace)?;
 
         // A namespace without settings yet takes the server's defaults; one that
         // has them keeps its own, whatever the defaults are now.
-        if schema.vector_index.is_none()
+        if current.vector_index.is_none()
             && let SchemaAmendment::AddEmbeddingAttribute { vector_index, .. } | SchemaAmendment::EnableVectorIndex { vector_index, .. } =
                 &mut amendment
         {
@@ -186,30 +184,40 @@ impl DocStore {
         }
 
         // Re-map SchemaError::AttributeIsIndexed to DocStoreError with namespace context
-        schema.apply_amendment(amendment).map_err(|e| match e {
-            SchemaError::AttributeIsIndexed { name } => DocStoreError::AttributeIsIndexed {
-                namespace: namespace.to_owned(),
-                field: name,
-            },
-            other => DocStoreError::Schema(other),
-        })?;
+        let apply = |schema: &mut DocStoreSchema, amendment: SchemaAmendment| {
+            schema.apply_amendment(amendment).map_err(|e| match e {
+                SchemaError::AttributeIsIndexed { name } => DocStoreError::AttributeIsIndexed {
+                    namespace: namespace.to_owned(),
+                    field: name,
+                },
+                other => DocStoreError::Schema(other),
+            })
+        };
+
+        // Try it on a copy first: an invalid amendment fails before anything is
+        // written, and one that turns semantic search on needs its partition
+        // seeded before the schema says it is semantic.
+        let mut trial = DocStoreSchema::clone(&current);
+        apply(&mut trial, amendment.clone())?;
 
         // An amendment that turns on semantic search (e.g. EnableVectorIndex, or an
         // embedding attribute) is unsupported without the `semantic-search` feature.
         #[cfg(not(feature = "semantic-search"))]
-        if schema.semantic_search_enabled {
+        if trial.semantic_search_enabled {
             return Err(DocStoreError::SemanticSearchNotCompiled);
         }
         // Only the amendment that turns semantic search on picks a model; others
         // must keep working even if this server no longer serves it.
-        if schema.semantic_search_enabled && !was_enabled {
-            let settings = schema.vector_settings()?;
+        if trial.semantic_search_enabled && !current.semantic_search_enabled {
+            let settings = trial.vector_settings()?;
             self.check_vector_model(&settings)?;
-            self.seed_vector_index(namespace, &settings, &mut schema.vector_index).await?;
+            // Idempotent: a namespace that already has a partition keeps it.
+            self.seed_vector_index(namespace, &settings, &mut trial.vector_index).await?;
         }
 
-        schema.save(&self.schema_dir)?;
-        Ok(())
+        // Apply it to the schema as it is now, atomically with every other
+        // schema write: a concurrent amendment cannot be lost.
+        self.schemas.update_doc(namespace, |schema| apply(schema, amendment))
     }
 
     /// Change a store's search settings (`min_probes`, `max_probes`,
@@ -236,12 +244,9 @@ impl DocStore {
                 )
                 .await
             }
-            StoreType::Kv => {
-                let mut schema = self.load_kv_schema(namespace)?;
-                schema.update_vector_search(search, maintenance)?;
-                schema.save(&self.schema_dir)?;
-                Ok(())
-            }
+            StoreType::Kv => self
+                .schemas
+                .update_kv(namespace, |schema| Ok(schema.update_vector_search(search, maintenance)?)),
         }
     }
 
@@ -288,14 +293,16 @@ impl DocStore {
     ///
     /// [`list`]: DocStore::list
     pub fn get_schema(&self, namespace: &str) -> Result<DocStoreSchema, DocStoreError> {
-        self.load_schema(namespace)
+        let schema = self.load_schema(namespace)?;
+        Ok(DocStoreSchema::clone(&schema))
     }
 
     /// Return the KV schema for a namespace without the JSON round-trip overhead of [`list_kv`].
     ///
     /// [`list_kv`]: DocStore::list_kv
     pub fn get_kv_schema(&self, namespace: &str) -> Result<KvStoreSchema, DocStoreError> {
-        self.load_kv_schema(namespace)
+        let schema = self.load_kv_schema(namespace)?;
+        Ok(KvStoreSchema::clone(&schema))
     }
 
     /// Remove an attribute from the schema, and, if it is an embedding field,
@@ -310,30 +317,28 @@ impl DocStore {
     /// Returns `Err(AttributeIsIndexed)` if the attribute is used by a field
     /// index — drop the index first.
     pub fn remove_attribute(&self, namespace: &str, field_name: &str) -> Result<bool, DocStoreError> {
-        let mut schema = self.load_schema(namespace)?;
+        self.schemas.update_doc(namespace, |schema| {
+            let was_embedding_field = schema.embedding_fields.contains(&field_name.to_owned());
+            let will_disable_ss = was_embedding_field && schema.embedding_fields.len() == 1;
 
-        let was_embedding_field = schema.embedding_fields.contains(&field_name.to_owned());
-        let will_disable_ss = was_embedding_field && schema.embedding_fields.len() == 1;
+            schema
+                .apply_amendment(SchemaAmendment::RemoveAttribute { name: field_name.to_owned() })
+                .map_err(|e| match e {
+                    SchemaError::AttributeIsIndexed { name } => DocStoreError::AttributeIsIndexed {
+                        namespace: namespace.to_owned(),
+                        field: name,
+                    },
+                    other => DocStoreError::Schema(other),
+                })?;
 
-        schema
-            .apply_amendment(SchemaAmendment::RemoveAttribute { name: field_name.to_owned() })
-            .map_err(|e| match e {
-                SchemaError::AttributeIsIndexed { name } => DocStoreError::AttributeIsIndexed {
-                    namespace: namespace.to_owned(),
-                    field: name,
-                },
-                other => DocStoreError::Schema(other),
-            })?;
-
-        if was_embedding_field {
-            schema.embedding_fields.retain(|f| f != field_name);
-            if schema.embedding_fields.is_empty() {
-                schema.semantic_search_enabled = false;
+            if was_embedding_field {
+                schema.embedding_fields.retain(|f| f != field_name);
+                if schema.embedding_fields.is_empty() {
+                    schema.semantic_search_enabled = false;
+                }
             }
-        }
-
-        schema.save(&self.schema_dir)?;
-        Ok(will_disable_ss)
+            Ok(will_disable_ss)
+        })
     }
 
     /// Disable semantic search for a namespace by clearing `embedding_fields`
@@ -342,16 +347,16 @@ impl DocStore {
     /// Returns `Err(SemanticSearchNotEnabled)` when the namespace does not have
     /// semantic search configured, so callers can surface a proper 422.
     pub fn disable_semantic_search(&self, namespace: &str) -> Result<(), DocStoreError> {
-        let mut schema = self.load_schema(namespace)?;
-        if !schema.semantic_search_enabled && schema.embedding_fields.is_empty() {
-            return Err(DocStoreError::SemanticSearchNotEnabled {
-                namespace: namespace.to_owned(),
-            });
-        }
-        schema.semantic_search_enabled = false;
-        schema.embedding_fields.clear();
-        schema.save(&self.schema_dir)?;
-        Ok(())
+        self.schemas.update_doc(namespace, |schema| {
+            if !schema.semantic_search_enabled && schema.embedding_fields.is_empty() {
+                return Err(DocStoreError::SemanticSearchNotEnabled {
+                    namespace: namespace.to_owned(),
+                });
+            }
+            schema.semantic_search_enabled = false;
+            schema.embedding_fields.clear();
+            Ok(())
+        })
     }
 
     /// Drop every field index for a namespace and return their specs.
@@ -397,13 +402,13 @@ impl DocStore {
             .load_all_schemas()?
             .into_iter()
             .filter(|s| s.is_semantic_search_enabled())
-            .map(|s| s.namespace)
+            .map(|s| s.namespace.clone())
             .collect();
         semantic.extend(
             self.load_all_kv_schemas()?
                 .into_iter()
                 .filter(|s| s.is_semantic_search_enabled())
-                .map(|s| s.namespace),
+                .map(|s| s.namespace.clone()),
         );
         let mut leftover: std::collections::BTreeSet<String> = self
             .db
@@ -507,7 +512,7 @@ impl DocStore {
 ///
 /// Shared by [`DocStore::drop`] and [`DocStore::drop_kv`] to
 /// eliminate the near-identical cleanup sequences in each method.
-async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str, ns_id: u32, schema_path: &Path) -> Result<(), DocStoreError> {
+async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore, namespace: &str, ns_id: u32) -> Result<(), DocStoreError> {
     // Clear this namespace's pending embed-queue entries FIRST.
     //
     // The queue outlives the store otherwise, and the vector worker then embeds
@@ -559,9 +564,9 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, namespace: &str,
         std::fs::remove_dir_all(&index_dir)?;
     }
 
-    if schema_path.exists() {
-        std::fs::remove_file(schema_path)?;
-    }
+    // Last, as the schema file used to be: until here the store still exists,
+    // so a failed or interrupted cleanup can be retried by dropping it again.
+    schemas.remove(namespace)?;
 
     // Drop any in-memory vector corruption counters for this namespace so a
     // dropped store stops appearing in /admin/indices/vector/corruption-metrics.
@@ -581,8 +586,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_list() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let schema = make_schema(
             "users",
@@ -602,8 +606,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_duplicate_is_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create(make_schema("dup", vec![])).await.unwrap();
         let err = store.create(make_schema("dup", vec![])).await.unwrap_err();
@@ -611,16 +614,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_store_removes_schema_file() {
+    async fn system_names_are_reserved_for_both_kinds_of_store() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
+        for name in ["system", "system_schema", "system_mine"] {
+            assert!(
+                matches!(
+                    store.create(make_schema(name, vec![])).await,
+                    Err(DocStoreError::Schema(SchemaError::ReservedNamespace { .. }))
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    store.create_kv(make_kv_schema(name, KvKeyType::Str, KvValueType::Str)).await,
+                    Err(DocStoreError::Schema(SchemaError::ReservedNamespace { .. }))
+                ),
+                "{name}"
+            );
+        }
+        // Only the prefix is reserved.
+        store.create(make_schema("systems", vec![])).await.unwrap();
+        store.create(make_schema("my_system_x", vec![])).await.unwrap();
+    }
+
+    /// Concurrent amendments to one store each read, change and save the schema;
+    /// none may overwrite another's change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_amendments_to_one_store_all_land() {
+        let db_dir = TempDir::new().unwrap();
+        let store = Arc::new(open_fresh(db_dir.path()).await);
+        store.create(make_schema("ns", vec![])).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let store = Arc::clone(&store);
+            tasks.spawn(async move {
+                store
+                    .amend(
+                        "ns",
+                        SchemaAmendment::AddAttribute {
+                            name: format!("a{i}"),
+                            attr_type: AttributeType::Str,
+                            description: None,
+                        },
+                    )
+                    .await
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.unwrap().unwrap();
+        }
+        assert_eq!(store.load_schema("ns").unwrap().attributes.len(), 32);
+        let fresh = SchemaStore::open(&store.db).await.unwrap();
+        assert_eq!(fresh.doc("ns").unwrap().attributes.len(), 32, "every amendment persisted");
+    }
+
+    /// After every kind of schema change, the cache holds exactly what a fresh
+    /// read of `system_schema` finds, and so does a reopened store.
+    #[tokio::test]
+    async fn the_cache_matches_storage_after_every_schema_change() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        let snapshot = |schemas: &SchemaStore| -> Vec<serde_json::Value> {
+            schemas
+                .all()
+                .into_iter()
+                .map(|s| match s {
+                    StoredSchema::Doc(s) => serde_json::to_value(&*s).unwrap(),
+                    StoredSchema::Kv(s) => serde_json::to_value(&*s).unwrap(),
+                })
+                .collect()
+        };
+        let check = |store: &DocStore, step: &str| {
+            let schemas = Arc::clone(&store.schemas);
+            let db = Arc::clone(&store.db);
+            let step = step.to_owned();
+            async move {
+                let fresh = SchemaStore::open(&db).await.unwrap();
+                assert_eq!(snapshot(&schemas), snapshot(&fresh), "after {step}");
+            }
+        };
+        store.create(make_schema("docs", vec![])).await.unwrap();
+        store.create_kv(make_kv_schema("kv", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+        check(&store, "create").await;
+        store
+            .amend(
+                "docs",
+                SchemaAmendment::AddAttribute {
+                    name: "status".to_owned(),
+                    attr_type: AttributeType::Str,
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        check(&store, "amend").await;
+        let spec = IndexSpec {
+            field: "level".to_owned(),
+            index_type: IndexType::Int,
+        };
+        store.add_index("docs", spec).await.unwrap().wait().await.unwrap();
+        check(&store, "add_index").await;
+        store.drop_index("docs", "level").unwrap();
+        check(&store, "drop_index").await;
+        store.remove_attribute("docs", "status").unwrap();
+        check(&store, "remove_attribute").await;
+        store.remove_kv("kv").await.unwrap();
+        check(&store, "remove_kv").await;
+
+        let before = snapshot(&store.schemas);
+        store.shutdown().await.unwrap();
+        drop(store);
+        let reopened = open_fresh(db_dir.path()).await;
+        assert_eq!(snapshot(&reopened.schemas), before, "after reopen");
+        assert_eq!(
+            reopened
+                .load_schema("docs")
+                .unwrap()
+                .attributes
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["level"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_store_removes_schema() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
 
         store.create(make_schema("tmp", vec![])).await.unwrap();
-        assert!(schema_dir.path().join("tmp.json").exists());
+        assert!(store.schemas.contains("tmp"));
 
         store.remove("tmp").await.unwrap();
-        assert!(!schema_dir.path().join("tmp.json").exists());
+        assert!(!store.schemas.contains("tmp"));
     }
 
     /// Regression: dropping a semantic store must clear its embed-queue entries.
@@ -636,8 +764,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_store_clears_its_embed_queue() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let mut schema = make_schema("sem_docs", vec![]);
         schema.attributes = vec![crate::doc_store::schema::AttributeDef {
@@ -680,8 +807,7 @@ mod tests {
     #[tokio::test]
     async fn test_amend_add_and_remove_attribute() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("ns", vec![])).await.unwrap();
 
         store
@@ -696,7 +822,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        let loaded = store.load_schema("ns").unwrap();
         assert_eq!(loaded.attributes.len(), 1);
         assert_eq!(loaded.attributes[0].name, "email");
 
@@ -704,15 +830,14 @@ mod tests {
             .amend("ns", SchemaAmendment::RemoveAttribute { name: "email".to_owned() })
             .await
             .unwrap();
-        let loaded2 = DocStoreSchema::load(schema_dir.path(), "ns").unwrap();
+        let loaded2 = store.load_schema("ns").unwrap();
         assert!(loaded2.attributes.is_empty());
     }
 
     #[tokio::test]
     async fn test_amend_cannot_remove_indexed_attribute() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store
             .create(make_schema(
                 "ns",
@@ -740,11 +865,10 @@ mod tests {
     #[tokio::test]
     async fn test_schema_survives_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         // First open: create store, write data
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store
                 .create(make_schema(
                     "users",
@@ -761,7 +885,7 @@ mod tests {
 
         // Second open: no create() call — schema must be loaded automatically
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             let result = store.query("users", "active = true", Pagination::default()).await.unwrap();
             assert_eq!(result.total, 1);
             match result.results[0].0 {
@@ -776,11 +900,10 @@ mod tests {
     #[tokio::test]
     async fn test_range_query_after_delete_survives_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         // Session 1: create store, insert docs, delete one, then drop.
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store.create(make_schema("docs", vec![])).await.unwrap();
 
             for i in 1u64..=5 {
@@ -797,7 +920,7 @@ mod tests {
 
         // Session 2: reopen — WAL recovery runs, deletions must hold.
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
 
             let result = store.scan_range("docs", DocId::U64(1), None, None, 100).await.unwrap();
             let ids: Vec<u64> = result
@@ -824,10 +947,9 @@ mod tests {
     #[tokio::test]
     async fn test_prefix_scan_after_delete_survives_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store.create(make_schema("docs", vec![])).await.unwrap();
 
             for i in 1u64..=4 {
@@ -838,7 +960,7 @@ mod tests {
         }
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
 
             let page = store.scan_prefix("docs", vec![], None, 100).await.unwrap();
             let ids: Vec<u64> = page
@@ -860,10 +982,9 @@ mod tests {
     #[tokio::test]
     async fn test_predicate_query_after_delete_survives_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store
                 .create(make_schema(
                     "users",
@@ -906,7 +1027,7 @@ mod tests {
 
         // Reopen — index is rebuilt from the WAL tail.
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
 
             let result = store.query("users", "active = true", Pagination::default()).await.unwrap();
             let mut ids: Vec<u64> = result
@@ -962,10 +1083,9 @@ mod tests {
     #[tokio::test]
     async fn row_id_fn_installed_before_index_activation_replay() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store
                 .create(make_schema(
                     "users",
@@ -997,7 +1117,7 @@ mod tests {
         rewind_index_checkpoints(db_dir.path());
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             let result = store.query("users", "active = true", Pagination::default()).await.unwrap();
             let mut ids: Vec<u64> = result
                 .results
@@ -1028,10 +1148,9 @@ mod tests {
     #[tokio::test]
     async fn uuid_keyed_store_packs_its_index_rows_densely() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
         let mut active_ids = Vec::new();
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             let mut schema = make_schema(
                 "events",
                 vec![IndexSpec {
@@ -1060,7 +1179,7 @@ mod tests {
                 stats.bitmap_live_bytes
             );
         }
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let page = store
             .query(
                 "events",
@@ -1091,8 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_create_and_list() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create_kv(make_kv_schema("cache", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
@@ -1107,8 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_get_schema_round_trip() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create_kv(make_kv_schema("cache", KvKeyType::Int, KvValueType::F32)).await.unwrap();
 
@@ -1127,8 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_get_schema_rejects_doc_store() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create(make_schema("docs", vec![])).await.unwrap();
 
@@ -1140,8 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_create_duplicate_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create_kv(make_kv_schema("kv", KvKeyType::Str, KvValueType::Int)).await.unwrap();
         let err = store.create_kv(make_kv_schema("kv", KvKeyType::Str, KvValueType::Int)).await.unwrap_err();
@@ -1149,23 +1264,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_kv_drop_removes_schema_file() {
+    async fn test_kv_drop_removes_schema() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create_kv(make_kv_schema("tmp", KvKeyType::Str, KvValueType::Str)).await.unwrap();
-        assert!(schema_dir.path().join("tmp.json").exists());
+        assert!(store.schemas.contains("tmp"));
 
         store.remove_kv("tmp").await.unwrap();
-        assert!(!schema_dir.path().join("tmp.json").exists());
+        assert!(!store.schemas.contains("tmp"));
     }
 
     #[tokio::test]
     async fn test_kv_list_does_not_include_doc_stores() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create(make_schema("docs", vec![])).await.unwrap();
         store.create_kv(make_kv_schema("cache", KvKeyType::Str, KvValueType::Str)).await.unwrap();
@@ -1184,8 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_schema_round_trips_through_json() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let original = make_schema("export_test", vec![]);
         store.create(original.clone()).await.unwrap();
@@ -1202,8 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_schema_unknown_namespace_is_not_found() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let err = store.get_schema("no_such_ns").unwrap_err();
         assert!(matches!(err, DocStoreError::NotFound { .. }));
@@ -1214,8 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_creates_usable_store() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let schema: DocStoreSchema = serde_json::from_str(
             r#"{
@@ -1244,8 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_stale_ns_id_is_replaced() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Schema carries a stale ns_id from a previous database instance.
         let mut schema = make_schema("ns_id_test", vec![]);
@@ -1263,8 +1372,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_duplicate_is_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         store.create(make_schema("dup_import", vec![])).await.unwrap();
 
@@ -1275,8 +1383,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_invalid_namespace_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         for bad_ns in &["", "has space", "has/slash", "has.dot"] {
             let mut schema = make_schema("placeholder", vec![]);
@@ -1292,8 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_too_many_indices_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let indices = (0..=crate::doc_store::schema::MAX_INDICES)
             .map(|i| IndexSpec {
@@ -1311,8 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_schema_duplicate_index_field_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let indices = vec![
             IndexSpec {
@@ -1338,8 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_index_removes_field_from_attributes() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Create with "agency" as a non-indexed attribute.
         let mut schema = make_schema("agency_ns", vec![]);
@@ -1380,8 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_with_field_in_both_attributes_and_indices_is_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Simulate a stale exported schema that has "agency" in both lists.
         let schema = DocStoreSchema {

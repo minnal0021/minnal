@@ -7,7 +7,7 @@
 //! # Lifecycle
 //!
 //! ```text
-//! DocStore::open(db_path, schema_dir)   ← opens existing stores
+//! DocStore::open(db_path)               ← opens existing stores
 //!   .create(schema)                     ← define a new store
 //!   .put("users", id, doc)              ← write a document
 //!   .get("users", id)            ← read by primary key
@@ -19,6 +19,8 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+
+use crate::doc_store::schema_store::{SchemaStore, StoredSchema};
 use std::sync::Arc;
 
 use crate::{AsyncDb, DbConfig, FieldId};
@@ -72,12 +74,14 @@ use vector::reconcile_all_vector_indexes;
 
 /// A document store manager backed by a `minnal_db` database.
 ///
-/// Each logical document store is one minnal_db namespace with a JSON schema
-/// persisted in `schema_dir`.  `DocStore` owns the `AsyncDb` instance.
+/// Each logical document store is one minnal_db namespace whose schema is kept
+/// in the `system_schema` namespace and cached in memory ([`SchemaStore`]).
+/// `DocStore` owns the `AsyncDb` instance.
 pub struct DocStore {
     db: Arc<AsyncDb>,
     db_path: PathBuf,
-    schema_dir: PathBuf,
+    /// Every store's schema: the only way the doc store reads or writes one.
+    schemas: Arc<SchemaStore>,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -111,17 +115,15 @@ impl DocStore {
     /// Open (or create) a `DocStore` at `db_path` with a custom [`DbConfig`].
     ///
     /// Prefer this over [`open`] when you need to tune the underlying engine
-    /// (e.g. sync policy, GC intervals, WAL segment size).  For every schema
-    /// file found, the corresponding namespace is opened and all field indices
-    /// are activated automatically.
+    /// (e.g. sync policy, GC intervals, WAL segment size).  For every stored
+    /// schema, the corresponding namespace is opened and all field indices are
+    /// activated automatically.
     ///
     /// [`open`]: DocStore::open
-    pub async fn open_with_config(db_path: impl AsRef<Path>, schema_dir: impl AsRef<Path>, config: DbConfig) -> Result<Self, DocStoreError> {
+    pub async fn open_with_config(db_path: impl AsRef<Path>, config: DbConfig) -> Result<Self, DocStoreError> {
         let db_path = db_path.as_ref().to_path_buf();
-        let schema_dir = schema_dir.as_ref().to_path_buf();
         info!("opening doc store at {}", db_path.display());
         std::fs::create_dir_all(&db_path)?;
-        std::fs::create_dir_all(&schema_dir)?;
 
         // Handed to the database once it is open, which releases it only when
         // the database itself is dropped (`AsyncDb::hold_dir_lock`): a worker's
@@ -140,10 +142,12 @@ impl DocStore {
 
         let db = Arc::new(AsyncDb::open_with_config(db_path.clone(), config.clone()).await?);
         db.hold_dir_lock(lock);
+        // After WAL recovery (done by the open above), before anything reads a schema.
+        let schemas = Arc::new(SchemaStore::open(&db).await?);
         let store = Self {
             db,
             db_path,
-            schema_dir,
+            schemas,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
             #[cfg(feature = "semantic-search")]
@@ -190,11 +194,11 @@ impl DocStore {
 
     /// Open (or create) a `DocStore` at `db_path` with default [`DbConfig`].
     ///
-    /// For every schema file found, the corresponding namespace is opened and
-    /// all field indices are activated automatically — no call to
+    /// For every stored schema, the corresponding namespace is opened and all
+    /// field indices are activated automatically — no call to
     /// `register_index_field` is needed after the first `create`.
-    pub async fn open(db_path: impl AsRef<Path>, schema_dir: impl AsRef<Path>) -> Result<Self, DocStoreError> {
-        Self::open_with_config(db_path, schema_dir, DbConfig::default()).await
+    pub async fn open(db_path: impl AsRef<Path>) -> Result<Self, DocStoreError> {
+        Self::open_with_config(db_path, DbConfig::default()).await
     }
 
     /// Set the tuning parameters for the background vector-index worker.
@@ -241,7 +245,7 @@ impl DocStore {
         let handle = VecIndexWorker::start(
             Arc::clone(&self.db),
             Arc::clone(&ctx),
-            self.schema_dir.clone(),
+            Arc::clone(&self.schemas),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
@@ -253,7 +257,7 @@ impl DocStore {
         // an error and leaves recovery to the manual admin endpoint.
         {
             let db = Arc::clone(&self.db);
-            let schema_dir = self.schema_dir.clone();
+            let schemas = Arc::clone(&self.schemas);
             let notify = Arc::clone(&notify);
             let mut startup_pass = handle.startup_pass();
             tokio::spawn(async move {
@@ -262,7 +266,7 @@ impl DocStore {
                 // drops the sender; reconcile anyway.)
                 let _ = startup_pass.wait_for(|done| *done).await;
                 info!("startup vector-index reconciliation: scanning for documents missing a vector index");
-                let outcome = reconcile_all_vector_indexes(&db, &schema_dir, false).await;
+                let outcome = reconcile_all_vector_indexes(&db, &schemas, false).await;
                 if outcome.failed > 0 {
                     error!(
                         "startup vector-index reconciliation did not fully complete ({} namespace(s) failed, {} doc(s) re-enqueued); \
@@ -325,147 +329,43 @@ impl DocStore {
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
-    fn schema_path(&self, namespace: &str) -> PathBuf {
-        self.schema_dir.join(format!("{namespace}.json"))
+    /// A store's schema, of whichever kind, from the in-memory cache (no I/O).
+    /// `None` if there is no such store.
+    pub fn schema(&self, namespace: &str) -> Option<StoredSchema> {
+        self.schemas.get(namespace)
     }
 
-    /// Resolve the [`StoreType`] of an existing namespace by reading its
-    /// persisted schema's discriminant, without committing to either full schema
-    /// struct. Returns [`DocStoreError::NotFound`] if no schema exists (or it
-    /// carries no parseable `store_type`).
+    /// Every store's schema, sorted by name, from the in-memory cache (no I/O).
+    pub fn schemas(&self) -> Vec<StoredSchema> {
+        self.schemas.all()
+    }
+
+    /// Resolve the [`StoreType`] of an existing namespace. Returns
+    /// [`DocStoreError::NotFound`] if it has no schema.
     pub fn store_type(&self, namespace: &str) -> Result<StoreType, DocStoreError> {
-        let path = self.schema_path(namespace);
-        let json = std::fs::read_to_string(&path).map_err(|_| DocStoreError::NotFound {
-            namespace: namespace.to_owned(),
-        })?;
-        crate::doc_store::schema::peek_store_type(&json).ok_or_else(|| DocStoreError::NotFound {
-            namespace: namespace.to_owned(),
-        })
+        self.schemas
+            .get(namespace)
+            .map(|s| s.store_type())
+            .ok_or_else(|| DocStoreError::NotFound {
+                namespace: namespace.to_owned(),
+            })
     }
 
-    fn load_schema(&self, namespace: &str) -> Result<DocStoreSchema, DocStoreError> {
-        DocStoreSchema::load(&self.schema_dir, namespace).map_err(|e| match e {
-            SchemaError::NotFound { namespace } => DocStoreError::NotFound { namespace },
-            other => DocStoreError::Schema(other),
-        })
+    fn load_schema(&self, namespace: &str) -> Result<Arc<DocStoreSchema>, DocStoreError> {
+        self.schemas.doc(namespace)
     }
 
-    fn load_kv_schema(&self, namespace: &str) -> Result<KvStoreSchema, DocStoreError> {
-        KvStoreSchema::load(&self.schema_dir, namespace).map_err(|e| match e {
-            SchemaError::NotFound { namespace } => DocStoreError::NotFound { namespace },
-            other => DocStoreError::Schema(other),
-        })
+    fn load_kv_schema(&self, namespace: &str) -> Result<Arc<KvStoreSchema>, DocStoreError> {
+        self.schemas.kv(namespace)
     }
 
-    fn load_all_schemas(&self) -> Result<Vec<DocStoreSchema>, DocStoreError> {
-        load_all_schemas_from(&self.schema_dir)
+    fn load_all_schemas(&self) -> Result<Vec<Arc<DocStoreSchema>>, DocStoreError> {
+        Ok(self.schemas.docs())
     }
 
-    fn load_all_kv_schemas(&self) -> Result<Vec<KvStoreSchema>, DocStoreError> {
-        load_all_kv_schemas_from(&self.schema_dir)
+    fn load_all_kv_schemas(&self) -> Result<Vec<Arc<KvStoreSchema>>, DocStoreError> {
+        Ok(self.schemas.kvs())
     }
-}
-
-/// Load every persisted document-store schema from `schema_dir`.
-/// The resolved vector-index settings and `ns_id` of `namespace`, whichever kind
-/// of store it is, read from its schema file.
-#[cfg(feature = "semantic-search")]
-/// `Err(SemanticSearchNotEnabled)` unless `namespace` (document or KV store)
-/// has semantic search enabled; `Err(NotFound)` for an unknown namespace.
-#[cfg(feature = "semantic-search")]
-pub(crate) fn require_semantic_search(schema_dir: &Path, namespace: &str) -> Result<(), DocStoreError> {
-    let json = std::fs::read_to_string(schema_dir.join(format!("{namespace}.json"))).map_err(|_| DocStoreError::NotFound {
-        namespace: namespace.to_owned(),
-    })?;
-    let enabled = match crate::doc_store::schema::peek_store_type(&json) {
-        Some(StoreType::Kv) => serde_json::from_str::<KvStoreSchema>(&json)
-            .map_err(SchemaError::Serialize)?
-            .is_semantic_search_enabled(),
-        _ => serde_json::from_str::<DocStoreSchema>(&json)
-            .map_err(SchemaError::Serialize)?
-            .is_semantic_search_enabled(),
-    };
-    if enabled {
-        Ok(())
-    } else {
-        Err(DocStoreError::SemanticSearchNotEnabled {
-            namespace: namespace.to_owned(),
-        })
-    }
-}
-
-#[cfg(feature = "semantic-search")]
-pub(crate) fn load_vector_settings(
-    schema_dir: &Path,
-    namespace: &str,
-) -> Result<(crate::doc_store::vector_settings::VectorIndexSettings, u32), DocStoreError> {
-    let path = schema_dir.join(format!("{namespace}.json"));
-    let json = std::fs::read_to_string(&path).map_err(|_| {
-        DocStoreError::Schema(SchemaError::NotFound {
-            namespace: namespace.to_owned(),
-        })
-    })?;
-    let (settings, ns_id) = match crate::doc_store::schema::peek_store_type(&json) {
-        Some(StoreType::Kv) => {
-            let s = serde_json::from_str::<KvStoreSchema>(&json).map_err(SchemaError::Serialize)?;
-            (s.vector_settings()?, s.ns_id)
-        }
-        _ => {
-            let s = serde_json::from_str::<DocStoreSchema>(&json).map_err(SchemaError::Serialize)?;
-            (s.vector_settings()?, s.ns_id)
-        }
-    };
-    let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
-        namespace: namespace.to_owned(),
-    })?;
-    Ok((settings, ns_id))
-}
-
-fn load_all_schemas_from(schema_dir: &Path) -> Result<Vec<DocStoreSchema>, DocStoreError> {
-    let mut schemas = Vec::new();
-    let entries = match std::fs::read_dir(schema_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(schemas),
-        Err(e) => return Err(DocStoreError::Io(e)),
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let json = std::fs::read_to_string(&path)?;
-            // Dispatch on the explicit `store_type` discriminant; skip anything
-            // that isn't a doc store (or has no parseable discriminant).
-            if crate::doc_store::schema::peek_store_type(&json) == Some(StoreType::Doc)
-                && let Ok(schema) = serde_json::from_str::<DocStoreSchema>(&json)
-            {
-                schemas.push(schema);
-            }
-        }
-    }
-    Ok(schemas)
-}
-
-/// Load every persisted KV-store schema from `schema_dir`.
-fn load_all_kv_schemas_from(schema_dir: &Path) -> Result<Vec<KvStoreSchema>, DocStoreError> {
-    let mut schemas = Vec::new();
-    let entries = match std::fs::read_dir(schema_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(schemas),
-        Err(e) => return Err(DocStoreError::Io(e)),
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let json = std::fs::read_to_string(&path)?;
-            // Dispatch on the explicit `store_type` discriminant; skip anything
-            // that isn't a KV store (or has no parseable discriminant).
-            if crate::doc_store::schema::peek_store_type(&json) == Some(StoreType::Kv)
-                && let Ok(schema) = serde_json::from_str::<KvStoreSchema>(&json)
-            {
-                schemas.push(schema);
-            }
-        }
-    }
-    Ok(schemas)
 }
 
 // There is deliberately no `Drop` impl: the database lock is released when the
@@ -495,31 +395,29 @@ mod tests {
     #[tokio::test]
     async fn the_lock_is_held_while_anything_still_holds_the_database() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let pass = Arc::clone(&store.db); // what a worker's running pass holds
         drop(store);
-        match DocStore::open_with_config(db_dir.path(), schema_dir.path(), crate::doc_store::test_db_config()).await {
+        match DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await {
             Err(DocStoreError::StoreLocked { .. }) => {}
             Err(e) => panic!("expected StoreLocked, got {e:?}"),
             Ok(_) => panic!("a second instance opened the files while the first was still alive"),
         }
 
         drop(pass);
-        let _reopened = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let _reopened = open_fresh(db_dir.path()).await;
     }
 
     #[tokio::test]
     async fn test_stale_lock_file_from_a_crash_does_not_block_open() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         // Exactly what a killed process leaves behind.
         std::fs::create_dir_all(db_dir.path()).unwrap();
         std::fs::write(db_dir.path().join(".lock"), "999999\nminnal: stale\n").unwrap();
 
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
     }
 
@@ -528,11 +426,10 @@ mod tests {
     #[tokio::test]
     async fn test_second_open_of_the_same_directory_is_refused() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
-        let _held = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let _held = open_fresh(db_dir.path()).await;
 
-        match DocStore::open_with_config(db_dir.path(), schema_dir.path(), crate::doc_store::test_db_config()).await {
+        match DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await {
             Err(DocStoreError::StoreLocked { owner_pid, .. }) => {
                 assert_eq!(owner_pid, Some(std::process::id()));
             }
@@ -546,11 +443,10 @@ mod tests {
     #[tokio::test]
     async fn test_kv_schema_survives_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         // First run: create KV store and write data.
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store
                 .create_kv(make_kv_schema("session", KvKeyType::Str, KvValueType::Str))
                 .await
@@ -567,7 +463,7 @@ mod tests {
 
         // Second run: no create_kv call — schema must load automatically.
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             assert_eq!(store.list_kv().unwrap().len(), 1, "KV schema not reloaded after restart");
             assert_eq!(
                 store.kv_get("session", &serde_json::json!("tok1")).await.unwrap(),
@@ -583,10 +479,9 @@ mod tests {
     #[tokio::test]
     async fn test_kv_and_doc_stores_coexist_after_restart() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             store.create(make_schema("docs", vec![])).await.unwrap();
             store.put("docs", DocId::U64(1), serde_json::json!({"x": 1})).await.unwrap();
             store.create_kv(make_kv_schema("cache", KvKeyType::Str, KvValueType::Str)).await.unwrap();
@@ -594,7 +489,7 @@ mod tests {
         }
 
         {
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             // Doc store data intact
             assert_eq!(store.list().unwrap().len(), 1);
             assert_eq!(store.get("docs", DocId::U64(1)).await.unwrap(), Some(serde_json::json!({"x": 1})));

@@ -335,8 +335,7 @@ mod tests {
     #[tokio::test]
     async fn test_count_docs_empty_namespace() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("empty", vec![])).await.unwrap();
 
         assert_eq!(store.count_docs("empty").await.unwrap(), 0);
@@ -345,8 +344,7 @@ mod tests {
     #[tokio::test]
     async fn test_count_docs_reflects_inserts() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("counting", vec![])).await.unwrap();
 
         for i in 1u64..=5 {
@@ -359,8 +357,7 @@ mod tests {
     #[tokio::test]
     async fn test_count_docs_decrements_after_delete() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("del_count", vec![])).await.unwrap();
 
         for i in 1u64..=3 {
@@ -375,8 +372,7 @@ mod tests {
     #[tokio::test]
     async fn test_count_docs_unknown_namespace_is_not_found() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let err = store.count_docs("ghost").await.unwrap_err();
         assert!(matches!(err, DocStoreError::NotFound { .. }));

@@ -216,8 +216,7 @@ The most important sections:
 
 ```toml
 [storage]
-db_path    = "./data/db"       # where minnal_db stores its files
-schema_dir = "./data/schemas"  # where per-store schema JSON files live
+db_path    = "./data/db"       # where minnal_db stores its files (store schemas included)
 
 [api]
 listen_addr = "0.0.0.0:8080"

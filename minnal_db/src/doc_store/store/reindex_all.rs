@@ -183,8 +183,8 @@ mod tests {
     /// A uuid-keyed store with `active` and `tier` indexes over `DOCS`
     /// documents, 80% of them then deleted. Returns the store and the live
     /// `(id, active, tier)` set.
-    async fn seeded(db_dir: &Path, schema_dir: &Path) -> (DocStore, Vec<(u128, bool, i64)>) {
-        let store = open_fresh(db_dir, schema_dir).await;
+    async fn seeded(db_dir: &Path) -> (DocStore, Vec<(u128, bool, i64)>) {
+        let store = open_fresh(db_dir).await;
         let mut schema = make_schema(
             "events",
             vec![
@@ -268,8 +268,8 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_all_frees_the_row_ids_of_deleted_documents() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let (store, live) = seeded(db_dir.path(), schema_dir.path()).await;
+        let db_dir = TempDir::new().unwrap();
+        let (store, live) = seeded(db_dir.path()).await;
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
         assert_eq!(store.db.rowmap_ids_allocated(ns_id).unwrap(), Some(DOCS as u64));
 
@@ -279,7 +279,7 @@ mod tests {
         assert_rebuilt(&store, &live, "after reindex-all").await;
         drop(store);
 
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         assert!(store.resume_pending_builds().await.unwrap().is_empty(), "nothing left to resume");
         assert_rebuilt(&store, &live, "after a restart").await;
     }
@@ -290,8 +290,8 @@ mod tests {
     #[tokio::test]
     async fn an_interrupted_reindex_all_is_finished_at_the_next_start() {
         for stop in 0..5usize {
-            let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-            let (store, live) = seeded(db_dir.path(), schema_dir.path()).await;
+            let db_dir = TempDir::new().unwrap();
+            let (store, live) = seeded(db_dir.path()).await;
             for h in store.reindex_all_until("events", Some(stop)).await.unwrap() {
                 // The build is killed with the process.
                 h.task.abort();
@@ -299,7 +299,7 @@ mod tests {
             }
             drop(store);
 
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             for h in store.resume_pending_builds().await.unwrap() {
                 h.wait().await.unwrap();
             }
@@ -313,8 +313,8 @@ mod tests {
     /// finished at the next start.
     #[tokio::test]
     async fn a_re_add_interrupted_before_its_build_reports_is_finished() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let (store, live) = seeded(db_dir.path(), schema_dir.path()).await;
+        let db_dir = TempDir::new().unwrap();
+        let (store, live) = seeded(db_dir.path()).await;
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
         // Two drops, the reset, and the first re-add; its build is killed at once.
         for h in store.reindex_all_until("events", Some(4)).await.unwrap() {
@@ -343,7 +343,7 @@ mod tests {
         std::fs::write(&tier, serde_json::to_vec(&blank).unwrap()).unwrap();
         drop(store);
 
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         for h in store.resume_pending_builds().await.unwrap() {
             h.wait().await.unwrap();
         }
@@ -355,8 +355,8 @@ mod tests {
     /// documents the build reached. Other fields are not tainted.
     #[tokio::test]
     async fn a_field_being_built_is_reported_degraded() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let (store, _) = seeded(db_dir.path(), schema_dir.path()).await;
+        let db_dir = TempDir::new().unwrap();
+        let (store, _) = seeded(db_dir.path()).await;
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
         let fid = store
             .db
@@ -389,8 +389,8 @@ mod tests {
 
     #[tokio::test]
     async fn drop_all_resets_the_row_map() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let (store, _) = seeded(db_dir.path(), schema_dir.path()).await;
+        let db_dir = TempDir::new().unwrap();
+        let (store, _) = seeded(db_dir.path()).await;
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
         let before = store.rowmap_stats("events").await.unwrap().unwrap();
         assert_eq!(

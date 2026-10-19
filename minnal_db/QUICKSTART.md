@@ -326,8 +326,8 @@ use minnal_db::{DocId, DocStore, DocStoreSchema, IndexSpec, IndexType, KeyType, 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // db data dir + schema dir
-    let store = DocStore::open("/tmp/docs", "/tmp/docs/schemas").await?;
+    // The data directory; store schemas are kept inside it.
+    let store = DocStore::open("/tmp/docs").await?;
 
     // Define a "users" doc store keyed by u64, with `status` (string) and
     // `age` (int) field indices so both can be queried. (`ns_id` is assigned
@@ -463,7 +463,7 @@ let config = SemanticSearchConfig {
 
 // `with_semantic_search` also starts the background embed-worker, the partition
 // maintenance and a one-shot startup reconciliation, so attach it once, up front.
-let store = DocStore::open("/tmp/sem", "/tmp/sem/schemas")
+let store = DocStore::open("/tmp/sem")
     .await?
     .with_semantic_search(SemanticSearchContext::new(config));
 ```

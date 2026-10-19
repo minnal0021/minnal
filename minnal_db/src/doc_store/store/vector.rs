@@ -25,8 +25,8 @@ impl DocStore {
         let Some(ctx) = &self.semantic_ctx else {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         };
-        require_semantic_search(&self.schema_dir, namespace)?;
-        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        self.schemas.require_semantic_search(namespace)?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
         let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
         let (summary, postings) = crate::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
         if codes {
@@ -59,9 +59,9 @@ impl DocStore {
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
-        require_semantic_search(&self.schema_dir, namespace)?;
+        self.schemas.require_semantic_search(namespace)?;
         // Document or KV store alike.
-        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
         let ns = self.namespace_semantics(namespace, Some(ns_id), &settings, overrides).await?;
         // Real queries first: the cache holds the embeddings of recent searches
         // for this model and dimension (one bounded page read, no service call).
@@ -157,7 +157,7 @@ impl DocStore {
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
-        require_semantic_search(&self.schema_dir, namespace)?;
+        self.schemas.require_semantic_search(namespace)?;
         Ok(crate::ivf_split::history::read(&self.db, namespace, kind, limit, self.vector_partition_history_ttl()).await?)
     }
 
@@ -172,8 +172,8 @@ impl DocStore {
         let Some(ctx) = &self.semantic_ctx else {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         };
-        require_semantic_search(&self.schema_dir, namespace)?;
-        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace)?;
+        self.schemas.require_semantic_search(namespace)?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
         ctx.claim_rebuild(namespace, postings)?;
         let (db, ctx, namespace) = (Arc::clone(&self.db), Arc::clone(ctx), namespace.to_owned());
         tokio::spawn(async move {
@@ -266,7 +266,7 @@ impl DocStore {
     #[cfg(feature = "semantic-search")]
     async fn loaded_partition(&self, namespace: &str) -> Option<Arc<crate::semantic_search::PartitionHandle>> {
         let ctx = self.semantic_ctx.as_ref()?;
-        let (settings, ns_id) = load_vector_settings(&self.schema_dir, namespace).ok()?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace).ok()?;
         ctx.for_namespace(&self.db, namespace, ns_id, &settings).await.ok().map(|ns| ns.partition)
     }
 
@@ -309,7 +309,7 @@ impl DocStore {
     /// [`with_semantic_search`]: DocStore::with_semantic_search
     #[cfg(feature = "semantic-search")]
     pub async fn reconcile_vector_indexes(&self) -> usize {
-        let outcome = reconcile_all_vector_indexes(&self.db, &self.schema_dir, false).await;
+        let outcome = reconcile_all_vector_indexes(&self.db, &self.schemas, false).await;
         if outcome.reenqueued > 0
             && let Some(notify) = &self.notify
         {
@@ -330,7 +330,7 @@ impl DocStore {
     /// notifies the worker if any were.
     #[cfg(feature = "semantic-search")]
     pub async fn validate_and_reconcile_vector_indexes(&self) -> usize {
-        let outcome = reconcile_all_vector_indexes(&self.db, &self.schema_dir, true).await;
+        let outcome = reconcile_all_vector_indexes(&self.db, &self.schemas, true).await;
         if outcome.failed > 0 {
             error!(
                 "validating vector-index reconcile did not fully complete: {} namespace(s) failed, {} doc(s) re-enqueued",
@@ -915,11 +915,11 @@ pub(super) struct ReconcileOutcome {
 /// in the background.
 #[cfg(feature = "semantic-search")]
 /// `pub(super)`: called from the parent module's construction path.
-pub(super) async fn reconcile_all_vector_indexes(db: &AsyncDb, schema_dir: &Path, check_bytes: bool) -> ReconcileOutcome {
+pub(super) async fn reconcile_all_vector_indexes(db: &AsyncDb, schemas: &SchemaStore, check_bytes: bool) -> ReconcileOutcome {
     let mut reenqueued = 0usize;
     let mut failed = 0usize;
 
-    for schema in load_all_schemas_from(schema_dir).unwrap_or_default() {
+    for schema in schemas.docs() {
         if !schema.is_semantic_search_enabled() {
             continue;
         }
@@ -932,7 +932,7 @@ pub(super) async fn reconcile_all_vector_indexes(db: &AsyncDb, schema_dir: &Path
         }
     }
 
-    for schema in load_all_kv_schemas_from(schema_dir).unwrap_or_default() {
+    for schema in schemas.kvs() {
         if !schema.is_semantic_search_enabled() {
             continue;
         }
@@ -1074,8 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn test_vector_index_max_retries_default() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         assert_eq!(store.vector_index_max_retries(), 5);
     }
 
@@ -1083,14 +1082,11 @@ mod tests {
     #[tokio::test]
     async fn test_with_vector_index_config_sets_max_retries() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path())
-            .await
-            .with_vector_index_config(VectorIndexConfig {
-                max_retries: 10,
-                retry_wait_secs: 1,
-                concurrency: 2,
-            });
+        let store = open_fresh(db_dir.path()).await.with_vector_index_config(VectorIndexConfig {
+            max_retries: 10,
+            retry_wait_secs: 1,
+            concurrency: 2,
+        });
         assert_eq!(store.vector_index_max_retries(), 10);
     }
 
@@ -1098,8 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_vector_index_count_empty() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         assert_eq!(store.pending_vector_index_count().await, 0);
     }
 
@@ -1107,8 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_pending_queue_entries_empty() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         assert!(store.list_queue_entries().await.is_empty());
     }
 
@@ -1116,8 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_queue_count_and_list_after_enqueue() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Enqueue two entries directly via vector_kv primitives.
         vector_kv::enqueue_embed(&store.db, "ns_a", b"doc1", "text a").await.unwrap();
@@ -1137,8 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pending_queue_entry_removes_entry() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         vector_kv::enqueue_embed(&store.db, "ns", b"doc1", "text").await.unwrap();
 
@@ -1153,8 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pending_queue_entry_noop_for_missing() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         // Deleting a non-existent entry should not error.
         store.delete_queue_entry("ns", b"ghost").await.unwrap();
@@ -1165,8 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pending_queue_entry_only_removes_target() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         vector_kv::enqueue_embed(&store.db, "ns", b"doc1", "t1").await.unwrap();
         vector_kv::enqueue_embed(&store.db, "ns", b"doc2", "t2").await.unwrap();
@@ -1186,8 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn test_semantic_create_rejected_without_feature() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let schema = DocStoreSchema {
             store_type: StoreType::Doc,
             namespace: "sem".to_owned(),
@@ -1266,8 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_reembeds_vectors_of_stale_text() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
         store.put("sem", DocId::U64(1), serde_json::json!({"title": "new"})).await.unwrap();
         let key = DocId::U64(1).to_bytes();
@@ -1286,8 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_enqueues_missing_docs() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         // No SemanticSearchContext is attached, so put() does NOT enqueue —
@@ -1311,8 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_doc_vector_enqueues_single_doc() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         // No SemanticSearchContext attached, so put() does not enqueue.
@@ -1366,8 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_skips_queued_and_is_idempotent() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         store.put("sem", DocId::U64(1), serde_json::json!({"title": "hello"})).await.unwrap();
@@ -1388,8 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_skips_already_indexed() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         let key = DocId::U64(1).to_bytes();
@@ -1409,8 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn test_validating_reconcile_skips_valid_complete_index() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         let key = DocId::U64(1).to_bytes();
@@ -1435,8 +1418,7 @@ mod tests {
         // Corrupt dense.
         {
             let db_dir = TempDir::new().unwrap();
-            let schema_dir = TempDir::new().unwrap();
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             create_semantic_schema(&store, "sem").await;
             let key = DocId::U64(1).to_bytes();
             store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
@@ -1459,8 +1441,7 @@ mod tests {
         // Corrupt a sparse composite entry (commit_complete_index assigns cluster 1).
         {
             let db_dir = TempDir::new().unwrap();
-            let schema_dir = TempDir::new().unwrap();
-            let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+            let store = open_fresh(db_dir.path()).await;
             create_semantic_schema(&store, "sem").await;
             let key = DocId::U64(1).to_bytes();
             store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
@@ -1490,8 +1471,7 @@ mod tests {
         use crate::doc_store::schema::{KvKeyType, KvStoreSchema, KvValueType};
 
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
 
         let schema = KvStoreSchema {
             store_type: StoreType::Kv,
@@ -1520,8 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_partial_index_not_short_circuited() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         // Doc 1 is indexed; doc 2 is written but missing (the crash window).
@@ -1548,8 +1527,7 @@ mod tests {
         use crate::semantic_search::index::vector_index::QuantisationStyle;
 
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         store
@@ -1593,8 +1571,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_inflight_enqueue_does_not_duplicate() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         create_semantic_schema(&store, "sem").await;
 
         // Five docs written through the crash window (durable, but no enqueue).
@@ -1644,8 +1621,8 @@ mod tests {
     }
 
     #[cfg(feature = "semantic-search")]
-    async fn open_kv_semantic(db_dir: &TempDir, schema_dir: &TempDir) -> DocStore {
-        let store = with_worker_notify(open_fresh(db_dir.path(), schema_dir.path()).await);
+    async fn open_kv_semantic(db_dir: &TempDir) -> DocStore {
+        let store = with_worker_notify(open_fresh(db_dir.path()).await);
         let mut schema = make_kv_schema("sem_kv", KvKeyType::Str, KvValueType::Str);
         schema.semantic_search_enabled = true;
         store.create_kv(schema).await.unwrap();
@@ -1662,8 +1639,8 @@ mod tests {
     async fn reconcile_cost_on_a_fiqa_sized_store() {
         use crate::semantic_search::index::vector_index::QuantisationStyle;
         let n: usize = std::env::var("MINNAL_RECONCILE_DOCS").ok().and_then(|v| v.parse().ok()).unwrap_or(57_600);
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();
         for i in 0..n {
             let key = format!("{i:08}").into_bytes();
@@ -1691,7 +1668,7 @@ mod tests {
         }
         store.db.shutdown().await.unwrap();
         drop(store);
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let t = std::time::Instant::now();
         let mut counts = 0usize;
         for ns in [
@@ -1722,9 +1699,9 @@ mod tests {
     #[ignore]
     async fn open_cost_with_a_full_vector_queue() {
         let n: usize = std::env::var("MINNAL_QUEUE_DOCS").ok().and_then(|v| v.parse().ok()).unwrap_or(57_600);
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let db_dir = TempDir::new().unwrap();
         {
-            let store = open_kv_semantic(&db_dir, &schema_dir).await;
+            let store = open_kv_semantic(&db_dir).await;
             let body = "Interest rates, bond yields and portfolio risk over the market cycle. ".repeat(17);
             for i in 0..n {
                 vector_kv::enqueue_embed(&store.db, "sem_kv", format!("{i:08}").as_bytes(), &format!("{i} {body}"))
@@ -1734,7 +1711,7 @@ mod tests {
             store.db.shutdown().await.unwrap();
         }
         let t = std::time::Instant::now();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let open = t.elapsed();
         let t = std::time::Instant::now();
         let entries = vector_kv::list_queue_entries(&store.db).await.unwrap();
@@ -1757,9 +1734,9 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn an_interrupted_vector_index_drop_is_finished_at_open() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let db_dir = TempDir::new().unwrap();
         {
-            let store = open_kv_semantic(&db_dir, &schema_dir).await;
+            let store = open_kv_semantic(&db_dir).await;
             store
                 .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
                 .await
@@ -1773,12 +1750,16 @@ mod tests {
                 .await
                 .unwrap(); // still queued
             // The drop's first step only: the schema, then a crash.
-            let mut schema = store.load_kv_schema("sem_kv").unwrap();
-            schema.semantic_search_enabled = false;
-            schema.save(&store.schema_dir).unwrap();
+            store
+                .schemas
+                .update_kv("sem_kv", |schema| {
+                    schema.semantic_search_enabled = false;
+                    Ok(())
+                })
+                .unwrap();
             store.db.shutdown().await.unwrap();
         }
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
         assert!(
             !names.iter().any(|n| vector_kv::companion_base(n) == Some("sem_kv")),
@@ -1793,8 +1774,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn a_finished_reindex_does_not_block_the_next() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         store
             .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
             .await
@@ -1816,9 +1797,9 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn a_reindex_interrupted_by_a_crash_does_not_block_the_next() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let db_dir = TempDir::new().unwrap();
         {
-            let store = open_kv_semantic(&db_dir, &schema_dir).await;
+            let store = open_kv_semantic(&db_dir).await;
             store
                 .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
                 .await
@@ -1841,7 +1822,7 @@ mod tests {
             );
             store.db.shutdown().await.unwrap();
         }
-        let store = with_worker_notify(open_fresh(db_dir.path(), schema_dir.path()).await);
+        let store = with_worker_notify(open_fresh(db_dir.path()).await);
         let progress = store.vec_reindex_progress("sem_kv").await.unwrap();
         assert_eq!(progress.status, "failed", "{progress:?}");
         store.kv_index_all("sem_kv").await.expect("a new reindex must be allowed");
@@ -1857,8 +1838,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_reconciliation_runs_after_the_crash_queue_is_processed() {
         use crate::semantic_search::service::SemanticSearchConfig;
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         store
             .db
             .namespace("sem_kv".to_string())
@@ -1899,8 +1880,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn kv_delete_during_embed_leaves_no_vectors() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         store
             .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
             .await
@@ -1918,8 +1899,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn kv_put_empty_text_clears_old_vectors() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         store
             .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
             .await
@@ -1947,8 +1928,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn doc_put_empty_embedding_text_clears_pending_embed() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = with_worker_notify(open_fresh(db_dir.path(), schema_dir.path()).await);
+        let db_dir = TempDir::new().unwrap();
+        let store = with_worker_notify(open_fresh(db_dir.path()).await);
         create_semantic_schema(&store, "sem").await;
         store.put("sem", DocId::U64(1), serde_json::json!({"title": "old title"})).await.unwrap();
         let key = DocId::U64(1).to_bytes();
@@ -1969,8 +1950,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn empty_text_on_unindexed_doc_writes_no_queue_entry() {
-        let (db_dir, schema_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let store = open_kv_semantic(&db_dir, &schema_dir).await;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
         store.kv_put("sem_kv", &serde_json::json!("y"), &serde_json::json!("")).await.unwrap();
         assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"y").await.unwrap().is_none());
     }

@@ -21,7 +21,7 @@ use minnal_db::{
 };
 use tracing::{error, info};
 
-use crate::{AppState, error::AppError, routes::stores::reload_schema};
+use crate::{AppState, error::AppError};
 
 /// `GET /stores/{ns}/indices` — list all indices for a namespace.
 pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>) -> impl IntoResponse {
@@ -58,7 +58,6 @@ pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Js
     let handle = state.store.add_index(&ns, spec).await?;
     info!(namespace = %ns, field = %handle.field, "index activated, background build started");
     state.index_manager.insert_field_build(handle);
-    reload_schema(&state, &ns).await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -86,21 +85,17 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
     info!(namespace = %ns, field = %field, "dropping index — background cleanup");
     state.attr_index_ops.lock().insert(ns.clone());
 
-    let state_c = state.clone();
     let store = Arc::clone(&state.store);
     let ops_ref = Arc::clone(&state.attr_index_ops);
     let ns_c = ns.clone();
     let field_c = field.clone();
 
     tokio::spawn(async move {
-        // `drop_index` is what mutates and persists the schema (demoting the
-        // index to a plain attribute) and deactivates the in-memory index, so
-        // the schema cache must be reloaded *after* it succeeds — not before, or
-        // the cache keeps showing the dropped index while the in-memory index is
-        // already gone.
+        // `drop_index` persists the schema (demoting the index to a plain
+        // attribute; the store's schema cache follows) and deactivates the
+        // in-memory index.
         match store.drop_index(&ns_c, &field_c) {
             Ok(()) => {
-                reload_schema(&state_c, &ns_c).await;
                 info!(namespace = %ns_c, field = %field_c, "index drop complete");
             }
             Err(e) => error!(namespace = %ns_c, field = %field_c, error = %e, "index drop failed"),
@@ -153,7 +148,6 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
         (status, Json(serde_json::json!({ "error": e.to_string() })))
     })?;
 
-    reload_schema(&state, &ns).await;
     state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector index drop accepted — running in background");
 

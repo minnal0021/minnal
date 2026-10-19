@@ -278,9 +278,7 @@ A simpler, schema-lite alternative backed by the same minnal_db namespace. Each 
 - A value type: `int`, `str`, `f32`, or `vec_f32`
 - Optionally `semantic_search_enabled = true` when `value_type = str`
 
-KV stores have no field indices; field-index predicate queries belong to document stores only. Both store types support range scans and prefix scans. The two schema types share the same `schema_dir` and are distinguished on disk by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
-
-Schemas are serialised as JSON and written atomically (tmp-then-rename) to a `schema_dir`.
+KV stores have no field indices; field-index predicate queries belong to document stores only. Both store types support range scans and prefix scans. Both kinds of schema are kept inside the database, in the system namespace `system_schema` (key: the store's name, value: its schema as JSON), and are told apart by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare. A schema write goes through the write-ahead log like any other write, so it is durable when the call returns. The server reads schemas from an in-memory copy that every schema change updates, so no request reads them from disk. Store names may not be `system` or start with `system_`; those are reserved for system namespaces.
 
 **Index builds**
 

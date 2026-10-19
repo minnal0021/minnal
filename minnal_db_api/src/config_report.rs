@@ -136,7 +136,6 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
     let mut r = Report::new(raw);
 
     r.add("storage", "db_path", &cfg.storage.db_path);
-    r.add("storage", "schema_dir", &cfg.storage.schema_dir);
     r.add("storage", "log_dir", &cfg.storage.log_dir);
 
     r.add("api", "listen_addr", &cfg.api.listen_addr);

@@ -16,9 +16,8 @@
 # Directory where the minnal_db data files are written.
 db_path = "./data/db"
 
-# Directory where per-store JSON schema files are persisted.
-# One file per namespace, e.g. schemas/users.json.
-schema_dir = "./data/schemas"
+# Store schemas are kept inside the database (the `system_schema` namespace),
+# so there is no schema directory to set; a `schema_dir` key here is an error.
 
 # Directory where rolling log files are written.
 log_dir = "./data/log"

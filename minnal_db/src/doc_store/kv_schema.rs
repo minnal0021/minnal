@@ -8,13 +8,11 @@
 //! Key encodings are chosen so that byte order matches value order — integer
 //! keys are big-endian, which is what makes range scans work on them.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
 use crate::doc_store::error::SchemaError;
 use crate::doc_store::key::StrKey;
-use crate::doc_store::schema::{StoreType, peek_store_type};
+use crate::doc_store::schema::StoreType;
 use crate::doc_store::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// Key type for a KV store namespace.
@@ -72,7 +70,7 @@ pub struct KvStoreSchema {
 }
 
 impl KvStoreSchema {
-    /// Validate the schema without saving.
+    /// Validate the schema.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.store_type != StoreType::Kv {
             return Err(SchemaError::WrongStoreType {
@@ -81,9 +79,7 @@ impl KvStoreSchema {
                 found: "doc",
             });
         }
-        if self.namespace.is_empty() || !self.namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(SchemaError::InvalidNamespace);
-        }
+        crate::doc_store::schema::validate_store_name(&self.namespace)?;
         if self.semantic_search_enabled && self.value_type != KvValueType::Str {
             return Err(SchemaError::KvSemanticSearchOnlyForStr);
         }
@@ -125,40 +121,6 @@ impl KvStoreSchema {
     /// Returns `true` when semantic search is enabled and the value type is `Str`.
     pub fn is_semantic_search_enabled(&self) -> bool {
         self.semantic_search_enabled && self.value_type == KvValueType::Str
-    }
-
-    /// Persist the schema to `schema_dir/<namespace>.json` (atomic write).
-    pub fn save(&self, schema_dir: &Path) -> Result<(), SchemaError> {
-        let path = schema_dir.join(format!("{}.json", self.namespace));
-        let tmp = path.with_extension("tmp");
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Load the KV schema for `namespace` from `schema_dir/<namespace>.json`.
-    ///
-    /// Returns [`SchemaError::WrongStoreType`] if the file on disk is a document
-    /// store rather than a KV store.
-    pub fn load(schema_dir: &Path, namespace: &str) -> Result<Self, SchemaError> {
-        let path = schema_dir.join(format!("{namespace}.json"));
-        if !path.exists() {
-            return Err(SchemaError::NotFound {
-                namespace: namespace.to_owned(),
-            });
-        }
-        let json = std::fs::read_to_string(path)?;
-        if let Some(found) = peek_store_type(&json)
-            && found != StoreType::Kv
-        {
-            return Err(SchemaError::WrongStoreType {
-                namespace: namespace.to_owned(),
-                expected: "kv",
-                found: found.label(),
-            });
-        }
-        serde_json::from_str(&json).map_err(SchemaError::Serialize)
     }
 }
 
@@ -369,29 +331,6 @@ mod tests {
     #[test]
     fn kv_schema_semantic_search_disabled_by_default() {
         assert!(!valid_kv_schema().is_semantic_search_enabled());
-    }
-
-    #[test]
-    fn kv_schema_save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = KvStoreSchema {
-            store_type: StoreType::Kv,
-            namespace: "tokens".to_owned(),
-            ns_id: Some(7),
-            key_type: KvKeyType::Int,
-            value_type: KvValueType::F32,
-            semantic_search_enabled: false,
-            vector_index: None,
-        };
-        schema.save(dir.path()).unwrap();
-        let loaded = KvStoreSchema::load(dir.path(), "tokens").unwrap();
-        assert_eq!(schema, loaded);
-    }
-
-    #[test]
-    fn kv_schema_load_missing_returns_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(KvStoreSchema::load(dir.path(), "nope"), Err(SchemaError::NotFound { .. })));
     }
 
     // ── KvKeyType serialisation ───────────────────────────────────────────────

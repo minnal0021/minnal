@@ -182,8 +182,7 @@ All settings have built-in defaults so no config file is required to get started
 # minnal_db_api.toml
 
 [storage]
-db_path    = "./data/db"       # where minnal_db stores its files
-schema_dir = "./data/schemas"  # where per-store schema JSON files live
+db_path    = "./data/db"       # where minnal_db stores its files (store schemas included)
 
 [api]
 listen_addr = "0.0.0.0:8080"
@@ -317,7 +316,7 @@ A **KV store** is a schema-lite namespace managed under `/stores`. Unlike a docu
 - Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
 - Optional semantic search when `value_type = str`
 
-KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. The schema is persisted alongside doc-store schemas in `schema_dir` and distinguished on disk by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
+KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. Its schema is kept with the doc-store schemas in the `system_schema` namespace and distinguished by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
 
 **Key types:**
 
@@ -2340,6 +2339,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_{namespace}_ivf_journal/        ← partition maintenance in progress, finished after a crash
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
+  ns_system_schema/                  ← every store's schema, keyed by store name
   index/
     {ns_id}/                  ← doc stores only; KV stores have no field indices
       {field_id}/
@@ -2348,12 +2348,12 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
         checkpoint            ← WAL position the field's on-disk state reflects
         gap.json              ← present only when the field is missing updates
       rowmap/                 ← document key ↔ dense row id, shared by the namespace's fields
-
-{schema_dir}/
-  {namespace}.json            ← one schema per store, doc or KV
 ```
 
-Schema files are written atomically (tmp-then-rename). Every schema declares a
-mandatory `store_type` field — `"doc"` or `"kv"` — which tells the two kinds
-apart on disk. Both kinds share the directory and the namespace names, so a doc
-store and a KV store cannot have the same name.
+Schemas are stored in `system_schema` as JSON, one entry per store, written
+through the write-ahead log (durable when the call returns); the server serves
+them from an in-memory copy that each schema change updates. Every schema
+declares a mandatory `store_type` field — `"doc"` or `"kv"` — which tells the
+two kinds apart. Both kinds share the namespace names, so a doc store and a KV
+store cannot have the same name, and no store may be named `system` or start
+with `system_`.

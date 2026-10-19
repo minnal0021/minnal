@@ -558,14 +558,6 @@ impl SemanticSearchContext {
         if found > 0 {
             log::info!("partition recovery: namespace='{namespace}' finished {found} interrupted operation(s)");
         }
-        let ivf = partition.snapshot();
-        if crate::semantic_search::IvfLayout::dim(ivf.as_ref()) != settings.embedding_dim as usize {
-            return Err(DocStoreError::EmbeddingDimMismatch {
-                model: settings.embedding_model.clone(),
-                dim: settings.embedding_dim,
-                expected: crate::semantic_search::IvfLayout::dim(ivf.as_ref()),
-            });
-        }
         let config = SemanticSearchConfig {
             model_name: settings.embedding_model.clone(),
             embedding_dim: settings.embedding_dim as usize,

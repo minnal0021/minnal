@@ -593,7 +593,7 @@ pub struct NamespacesResponse {
 }
 
 pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
-    let schemas = state.schemas.read().await;
+    let schemas = state.doc_schemas();
     let mut doc_stores: Vec<DocStoreNamespaceInfo> = schemas
         .iter()
         .map(|(name, schema)| {
@@ -623,7 +623,7 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
     doc_stores.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let kv_schemas = state.kv_schemas.read().await;
+    let kv_schemas = state.kv_schemas();
     let mut kv_stores: Vec<KvStoreNamespaceInfo> = kv_schemas
         .values()
         .map(|s| KvStoreNamespaceInfo {
@@ -844,8 +844,8 @@ pub struct KvNamespaceInfo {
 }
 
 pub async fn physical_namespaces(State(state): State<AppState>) -> impl IntoResponse {
-    let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
-    let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
+    let doc_names: std::collections::HashSet<String> = state.doc_schemas().keys().cloned().collect();
+    let kv_names: std::collections::HashSet<String> = state.kv_schemas().keys().cloned().collect();
 
     let mut result: Vec<KvNamespaceInfo> = state
         .store
@@ -1050,7 +1050,7 @@ pub struct IndexWasteResponse {
 /// Use it to decide whether to force a `POST /admin/storage/index-checkpoint`.
 pub async fn index_waste(State(state): State<AppState>) -> impl IntoResponse {
     let threshold = state.store.index_blob_waste_threshold();
-    let schemas = state.schemas.read().await;
+    let schemas = state.doc_schemas();
     let mut namespaces: Vec<NamespaceWasteInfo> = schemas
         .iter()
         .filter_map(|(name, schema)| {
@@ -1192,10 +1192,10 @@ pub async fn store_kv_meta(
     match state.store.store_type(&ns) {
         Ok(StoreType::Doc) => {
             let (ns_id, semantic_search_enabled, doc_names, kv_names) = {
-                let schemas = state.schemas.read().await;
+                let schemas = state.doc_schemas();
                 let s = schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
                 let doc_names: std::collections::HashSet<String> = schemas.keys().cloned().collect();
-                let kv_names: std::collections::HashSet<String> = state.kv_schemas.read().await.keys().cloned().collect();
+                let kv_names: std::collections::HashSet<String> = state.kv_schemas().keys().cloned().collect();
                 (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
             };
             let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
@@ -1210,9 +1210,9 @@ pub async fn store_kv_meta(
         }
         Ok(StoreType::Kv) => {
             let (ns_id, key_type, value_type, semantic_search_enabled, doc_names, kv_names) = {
-                let kv_schemas = state.kv_schemas.read().await;
+                let kv_schemas = state.kv_schemas();
                 let s = kv_schemas.get(&ns).filter(|s| s.ns_id.is_some()).ok_or_else(not_found)?;
-                let doc_names: std::collections::HashSet<String> = state.schemas.read().await.keys().cloned().collect();
+                let doc_names: std::collections::HashSet<String> = state.doc_schemas().keys().cloned().collect();
                 let kv_names: std::collections::HashSet<String> = kv_schemas.keys().cloned().collect();
                 (
                     s.ns_id.unwrap(),
@@ -1357,7 +1357,7 @@ pub async fn system_stores(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
-    let schemas = state.schemas.read().await;
+    let schemas = state.doc_schemas();
     let doc_stores: Vec<SystemDocStoreInfo> = schemas
         .values()
         .filter(|s| is_system_ns(&s.namespace))

@@ -38,7 +38,7 @@ use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, Vec
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::{AppState, id::parse_doc_id, routes::stores::reload_schema};
+use crate::{AppState, id::parse_doc_id};
 
 // ── Progress — unified view ───────────────────────────────────────────────────
 
@@ -87,8 +87,8 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
 
     // Build vector reindex snapshots for SS-enabled namespaces.
     let ss_namespaces: Vec<String> = {
-        let schemas = state.schemas.read().await;
-        let kv_schemas = state.kv_schemas.read().await;
+        let schemas = state.doc_schemas();
+        let kv_schemas = state.kv_schemas();
         let mut v: Vec<String> = schemas
             .values()
             .filter(|s| s.semantic_search_enabled)
@@ -252,17 +252,14 @@ pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<St
     state.attr_index_ops.lock().insert(ns.clone());
     info!(namespace = %ns, "attribute drop-all accepted — running in background");
 
-    let state_c = state.clone();
     let store = Arc::clone(&state.store);
     let ops_ref = Arc::clone(&state.attr_index_ops);
 
     tokio::spawn(async move {
-        // drop_all_attribute_indices mutates and persists the schema (demoting
-        // every index to a plain attribute), so the cache must be reloaded after
-        // it succeeds — otherwise it keeps showing the dropped indices.
+        // drop_all_attribute_indices persists the schema (demoting every index
+        // to a plain attribute); the store's schema cache follows.
         match store.drop_all_attribute_indices(&ns) {
             Ok(dropped) => {
-                reload_schema(&state_c, &ns).await;
                 info!(namespace = %ns, count = dropped.len(), "attribute drop-all complete");
             }
             Err(e) => error!(namespace = %ns, error = %e, "attribute drop-all failed"),
@@ -348,7 +345,7 @@ pub async fn attribute_reindex_doc(
     let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
 
     let key_type = {
-        let schemas = state.schemas.read().await;
+        let schemas = state.doc_schemas();
         match schemas.get(&ns).map(|s| s.key_type) {
             Some(kt) => kt,
             None => return Err(err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found"))),
@@ -426,7 +423,6 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
         (status, Json(serde_json::json!({ "error": e.to_string() })))
     })?;
 
-    reload_schema(&state, &ns).await;
     state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector drop-all accepted — running in background");
 
@@ -466,7 +462,7 @@ pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<St
     }
 
     let is_kv = {
-        let kv_schemas = state.kv_schemas.read().await;
+        let kv_schemas = state.kv_schemas();
         kv_schemas.contains_key(&ns)
     };
 
@@ -544,14 +540,14 @@ pub async fn vector_reindex_doc(
     let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
 
     // KV namespace? (mirrors vector_reindex_all's doc-vs-kv split).
-    let is_kv = state.kv_schemas.read().await.contains_key(&ns);
+    let is_kv = state.kv_schemas().contains_key(&ns);
 
     let outcome = if is_kv {
         // KV key is the raw {doc_id} string; the store encodes it per key_type.
         state.store.kv_reindex_doc_vector(&ns, &doc_id).await
     } else {
         let key_type = {
-            let schemas = state.schemas.read().await;
+            let schemas = state.doc_schemas();
             match schemas.get(&ns).map(|s| s.key_type) {
                 Some(kt) => kt,
                 None => return Err(err(StatusCode::NOT_FOUND, format!("namespace '{ns}' not found"))),

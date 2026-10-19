@@ -2037,6 +2037,20 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// [`put`](Self::put) on the calling thread, for crate code that must stay
+    /// synchronous (the doc store's schema store). Wrap a call made on a runtime
+    /// thread in `support::run_blocking_pass`.
+    #[cfg(feature = "doc-store")]
+    pub(crate) fn put_blocking(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.inner.put_ns(self.ns_id, key, value)
+    }
+
+    /// [`delete`](Self::delete) on the calling thread; see [`put_blocking`](Self::put_blocking).
+    #[cfg(feature = "doc-store")]
+    pub(crate) fn delete_blocking(&self, key: &[u8]) -> Result<()> {
+        self.db.inner.delete_ns(self.ns_id, key)
+    }
+
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let db = self.db.clone();
         let ns_id = self.ns_id;

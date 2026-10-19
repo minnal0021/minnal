@@ -15,7 +15,6 @@
 //! vectors while its journal is unfinished.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,7 +22,8 @@ use log::{info, warn};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::AsyncDb;
-use crate::doc_store::store::{SemanticSearchContext, load_vector_settings};
+use crate::doc_store::schema_store::SchemaStore;
+use crate::doc_store::store::SemanticSearchContext;
 use crate::ivf_split;
 
 /// Default maintenance threads per process.
@@ -59,13 +59,12 @@ impl Drop for MaintenanceHandle {
 }
 
 /// Start the task; `ctx.request_maintenance` reaches it from then on.
-pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_dir: PathBuf) -> MaintenanceHandle {
+pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schemas: Arc<SchemaStore>) -> MaintenanceHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     ctx.set_maintenance_sender(tx);
     let stop = Arc::new(Notify::new());
     let stopping = Arc::new(AtomicBool::new(false));
     let permits = Arc::new(Semaphore::new(ctx.maintenance_threads.max(1)));
-    let schema_dir = Arc::new(schema_dir);
     let task = {
         let stop = Arc::clone(&stop);
         let stopping = Arc::clone(&stopping);
@@ -86,9 +85,9 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
                     if stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    let (db, ctx, schema_dir, stopping) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schema_dir), Arc::clone(&stopping));
+                    let (db, ctx, schemas, stopping) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas), Arc::clone(&stopping));
                     running.spawn(async move {
-                        maintain(&db, &ctx, &schema_dir, &namespace, &stopping).await;
+                        maintain(&db, &ctx, &schemas, &namespace, &stopping).await;
                         drop(permit);
                     });
                 }
@@ -106,9 +105,9 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schema_di
 
 /// Split, reassign and merge `namespace`'s postings with its own settings,
 /// until none is left or `stopping` is set.
-async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path, namespace: &str, stopping: &AtomicBool) {
+async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaStore, namespace: &str, stopping: &AtomicBool) {
     let result = async {
-        let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
+        let (settings, ns_id) = schemas.vector_settings(namespace)?;
         let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
         let report = ivf_split::maintain_partition_until(db, namespace, &ns.partition, &settings.maintenance.ops(), stopping).await?;
         Ok::<ivf_split::MaintenanceReport, crate::doc_store::error::DocStoreError>(report)
@@ -133,12 +132,12 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::p
 /// partition recovers its journal ([`SemanticSearchContext::for_namespace`]),
 /// so this only does it early; a namespace whose recovery fails here is tried
 /// again by its next user, and nothing uses it before that succeeds.
-pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schema_dir: &std::path::Path) {
+pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaStore) {
     let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     for name in &names {
         let Some(namespace) = name.strip_suffix("_ivf_journal") else { continue };
         let result = async {
-            let (settings, ns_id) = load_vector_settings(schema_dir, namespace)?;
+            let (settings, ns_id) = schemas.vector_settings(namespace)?;
             ctx.for_namespace(db, namespace, ns_id, &settings).await?;
             Ok::<(), crate::doc_store::error::DocStoreError>(())
         }
@@ -149,7 +148,7 @@ pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schem
     }
     for name in &names {
         if let Some(namespace) = name.strip_suffix("_ivf_postings")
-            && load_vector_settings(schema_dir, namespace).is_ok()
+            && schemas.vector_settings(namespace).is_ok()
         {
             ctx.request_maintenance(namespace);
         }
