@@ -54,7 +54,6 @@
 //! [`PENDING_VEC_INDEX_NS`]: crate::vector_kv::PENDING_VEC_INDEX_NS
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -65,7 +64,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::store::{NamespaceSemantics, SemanticSearchContext, load_vector_settings};
+use crate::doc_store::schema_store::SchemaStore;
+use crate::doc_store::store::{NamespaceSemantics, SemanticSearchContext};
 use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
@@ -177,9 +177,9 @@ impl Drop for VecIndexWorkerHandle {
 pub(crate) struct VecIndexWorker {
     db: Arc<AsyncDb>,
     ctx: Arc<SemanticSearchContext>,
-    /// Where namespace schemas live: each entry is embedded with its
-    /// namespace's model, dimension and chunking, read from its schema.
-    schema_dir: Arc<PathBuf>,
+    /// Every store's schema: each entry is embedded with its namespace's
+    /// model, dimension and chunking, read from its schema.
+    schemas: Arc<SchemaStore>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     config: Arc<VectorIndexConfig>,
@@ -196,17 +196,17 @@ impl VecIndexWorker {
     pub fn start(
         db: Arc<AsyncDb>,
         ctx: Arc<SemanticSearchContext>,
-        schema_dir: PathBuf,
+        schemas: Arc<SchemaStore>,
         notify: Arc<Notify>,
         config: VectorIndexConfig,
     ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (pass_tx, pass_rx) = tokio::sync::watch::channel(false);
-        let maintenance = crate::doc_store::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), schema_dir.clone());
+        let maintenance = crate::doc_store::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas));
         let worker = VecIndexWorker {
             db,
             ctx,
-            schema_dir: Arc::new(schema_dir),
+            schemas,
             notify: Arc::clone(&notify),
             shutdown: Arc::clone(&shutdown),
             config: Arc::new(config),
@@ -225,7 +225,7 @@ impl VecIndexWorker {
     async fn run(self) {
         // Splits a crash interrupted are finished first: nothing may write a
         // namespace's vectors while its journal is unfinished.
-        crate::doc_store::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schema_dir).await;
+        crate::doc_store::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schemas).await;
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
         self.startup_pass.send_replace(true); // also covers an empty queue
@@ -369,7 +369,7 @@ impl VecIndexWorker {
             // name with another model.
             let mut resolved_all: HashMap<String, Result<Arc<NamespaceSemantics>, String>> = HashMap::new();
             for ns in by_namespace.keys() {
-                let resolved = match load_vector_settings(&self.schema_dir, ns) {
+                let resolved = match self.schemas.vector_settings(ns) {
                     Ok((settings, ns_id)) => self.ctx.for_namespace(&self.db, ns, ns_id, &settings).await.map(Arc::new),
                     Err(e) => Err(e),
                 }

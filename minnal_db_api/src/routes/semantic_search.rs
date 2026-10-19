@@ -289,13 +289,10 @@ pub async fn query_filtered(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_db::KeyType, AppError> {
-    state
-        .schemas
-        .read()
-        .await
-        .get(ns)
-        .map(|s| s.key_type)
-        .ok_or_else(|| DocStoreError::NotFound { namespace: ns.to_owned() }.into())
+    match state.store.schema(ns) {
+        Some(minnal_db::doc_store::StoredSchema::Doc(s)) => Ok(s.key_type),
+        _ => Err(DocStoreError::NotFound { namespace: ns.to_owned() }.into()),
+    }
 }
 
 /// Decode raw `QueryResult` bytes into API-friendly [`SemanticSearchResult`]s,

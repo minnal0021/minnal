@@ -45,6 +45,14 @@ pub enum SchemaError {
     #[error("schema not found for namespace '{namespace}'")]
     NotFound { namespace: String },
 
+    /// A schema stored in `system_schema` does not parse.
+    #[error("stored schema of namespace '{namespace}' is unreadable: {reason}")]
+    Corrupt { namespace: String, reason: String },
+
+    /// The name is taken by a system namespace (`system` or `system_*`).
+    #[error("namespace '{namespace}' is reserved: 'system' and names starting with 'system_' belong to system namespaces")]
+    ReservedNamespace { namespace: String },
+
     #[error("semantic_search_enabled is true but no embedding_fields were specified")]
     SemanticSearchMissingField,
 
@@ -136,7 +144,7 @@ pub enum DocStoreError {
     VectorIndexNotSeeded { namespace: String },
 
     /// A namespace's embedding dimension is not the one the server lists for
-    /// its model (or not its partition's).
+    /// its model (`supported_models`).
     #[error("embedding_dim {dim} does not match model '{model}', which this server runs at {expected} dimensions")]
     EmbeddingDimMismatch { model: String, dim: u32, expected: usize },
 

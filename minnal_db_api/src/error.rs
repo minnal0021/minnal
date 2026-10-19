@@ -60,6 +60,7 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::Serialize(_))
             | DocStoreError::Schema(SchemaError::Malformed(_))
             | DocStoreError::Schema(SchemaError::InvalidNamespace)
+            | DocStoreError::Schema(SchemaError::ReservedNamespace { .. })
             | DocStoreError::Schema(SchemaError::TooManyIndices { .. })
             | DocStoreError::Schema(SchemaError::EmptyFieldName { .. })
             | DocStoreError::Schema(SchemaError::EmptyAttributeName)

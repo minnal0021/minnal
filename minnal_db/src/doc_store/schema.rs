@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use json_dotpath::DotPaths;
 use serde::{Deserialize, Serialize};
 
@@ -255,15 +253,7 @@ pub struct DocStoreSchema {
 }
 
 impl DocStoreSchema {
-    /// Validate the schema and save it to `schema_dir/<namespace>.json`.
-    ///
-    /// The directory `schema_dir` must already exist.
-    pub fn validate_and_save(&self, schema_dir: &Path) -> Result<(), SchemaError> {
-        self.validate()?;
-        self.save(schema_dir)
-    }
-
-    /// Validate the schema without saving.
+    /// Validate the schema.
     ///
     /// Rules:
     /// - `namespace` must be non-empty; only ASCII alphanumerics, `_`, or `-`.
@@ -279,9 +269,7 @@ impl DocStoreSchema {
                 found: "kv",
             });
         }
-        if self.namespace.is_empty() || !self.namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(SchemaError::InvalidNamespace);
-        }
+        validate_store_name(&self.namespace)?;
 
         if self.indices.len() > MAX_INDICES {
             return Err(SchemaError::TooManyIndices {
@@ -380,41 +368,6 @@ impl DocStoreSchema {
     /// Use this guard before setting up the vector index KV store.
     pub fn is_semantic_search_enabled(&self) -> bool {
         self.semantic_search_enabled && !self.embedding_fields.is_empty()
-    }
-
-    /// Save the schema to `schema_dir/<namespace>.json` (atomic write).
-    pub fn save(&self, schema_dir: &Path) -> Result<(), SchemaError> {
-        let path = schema_dir.join(format!("{}.json", self.namespace));
-        let tmp = path.with_extension("tmp");
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Load a schema for `namespace` from `schema_dir/<namespace>.json`.
-    ///
-    /// Returns [`SchemaError::WrongStoreType`] if the file on disk is a KV store
-    /// rather than a document store.
-    pub fn load(schema_dir: &Path, namespace: &str) -> Result<Self, SchemaError> {
-        let path = schema_dir.join(format!("{namespace}.json"));
-        if !path.exists() {
-            return Err(SchemaError::NotFound {
-                namespace: namespace.to_owned(),
-            });
-        }
-        let json = std::fs::read_to_string(path)?;
-        if let Some(found) = peek_store_type(&json)
-            && found != StoreType::Doc
-        {
-            return Err(SchemaError::WrongStoreType {
-                namespace: namespace.to_owned(),
-                expected: "doc",
-                found: found.label(),
-            });
-        }
-        let schema: Self = serde_json::from_str(&json)?;
-        Ok(schema)
     }
 
     /// Return the names of all indexed fields.
@@ -617,6 +570,19 @@ impl AttributeType {
 
 /// Words the query lexer reads as keywords, whatever their case.
 const QUERY_KEYWORDS: [&str; 6] = ["and", "or", "not", "in", "true", "false"];
+
+/// Check a store name: non-empty, only ASCII alphanumerics, `_` or `-`, and not
+/// a system namespace's (`system`, or starting with `system_`, such as
+/// `system_schema`, where every store's schema is kept).
+pub fn validate_store_name(name: &str) -> Result<(), SchemaError> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(SchemaError::InvalidNamespace);
+    }
+    if name == crate::SYSTEM_NAMESPACE || name.starts_with("system_") {
+        return Err(SchemaError::ReservedNamespace { namespace: name.to_owned() });
+    }
+    Ok(())
+}
 
 /// Check that an index field name is one the query language can name and the
 /// index extractor can read: an identifier `[A-Za-z_][A-Za-z0-9_]*` that is not
@@ -866,29 +832,6 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let restored: DocStoreSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(s, restored);
-    }
-
-    #[test]
-    fn save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = valid_schema();
-        schema.validate_and_save(dir.path()).unwrap();
-        let loaded = DocStoreSchema::load(dir.path(), "products").unwrap();
-        assert_eq!(schema, loaded);
-    }
-
-    #[test]
-    fn load_missing_schema_returns_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(DocStoreSchema::load(dir.path(), "missing"), Err(SchemaError::NotFound { .. })));
-    }
-
-    #[test]
-    fn save_creates_file_named_after_namespace() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = valid_schema();
-        schema.save(dir.path()).unwrap();
-        assert!(dir.path().join("products.json").exists());
     }
 
     #[test]
@@ -1615,39 +1558,5 @@ mod tests {
         let mut kv = valid_kv_schema();
         kv.store_type = StoreType::Doc;
         assert!(matches!(kv.validate(), Err(SchemaError::WrongStoreType { expected: "kv", .. })));
-    }
-
-    #[test]
-    fn load_rejects_wrong_store_type() {
-        let dir = tempfile::tempdir().unwrap();
-        // Persist a doc schema, then try to load it as a KV schema (same path).
-        let doc = DocStoreSchema {
-            namespace: "shared".to_owned(),
-            ..valid_schema()
-        };
-        doc.save(dir.path()).unwrap();
-        assert!(matches!(
-            KvStoreSchema::load(dir.path(), "shared"),
-            Err(SchemaError::WrongStoreType {
-                expected: "kv",
-                found: "doc",
-                ..
-            })
-        ));
-        // ...and the reverse direction.
-        let dir2 = tempfile::tempdir().unwrap();
-        let kv = KvStoreSchema {
-            namespace: "shared".to_owned(),
-            ..valid_kv_schema()
-        };
-        kv.save(dir2.path()).unwrap();
-        assert!(matches!(
-            DocStoreSchema::load(dir2.path(), "shared"),
-            Err(SchemaError::WrongStoreType {
-                expected: "doc",
-                found: "kv",
-                ..
-            })
-        ));
     }
 }

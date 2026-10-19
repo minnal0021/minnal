@@ -213,7 +213,7 @@ impl DocStore {
             });
         }
         let ns = self
-            .namespace_semantics(namespace, schema.ns_id, &schema.vector_settings()?, overrides)
+            .namespace_semantics(namespace, schema.ns_id, &self.schemas.vector_settings(namespace)?.0, overrides)
             .await?;
 
         let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
@@ -253,8 +253,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_get_str_key_str_value() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         let key = serde_json::json!("hello");
@@ -268,8 +267,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_no_wal_get_round_trip() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         let key = serde_json::json!("hello");
@@ -285,8 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_get_int_key_int_value() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Int)).await.unwrap();
 
         let key = serde_json::json!(99i64);
@@ -300,8 +297,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_get_f32_value() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::F32)).await.unwrap();
 
         let key = serde_json::json!("temp");
@@ -316,8 +312,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_get_vec_f32_value() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::VecF32)).await.unwrap();
 
         let key = serde_json::json!("embedding");
@@ -336,8 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_put_overwrites_existing() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         let key = serde_json::json!("k");
@@ -350,8 +344,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_get_missing_key_returns_none() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         let got = store.kv_get("ns", &serde_json::json!("ghost")).await.unwrap();
@@ -361,8 +354,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_delete_removes_entry() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         let key = serde_json::json!("gone");
@@ -375,8 +367,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_get_by_str_str_key() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
 
         store
@@ -390,8 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_get_by_str_int_key() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Str)).await.unwrap();
 
         store.kv_put("ns", &serde_json::json!(7i64), &serde_json::json!("seven")).await.unwrap();
@@ -406,8 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_int_key_range_scan_spans_negative_keys() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Int, KvValueType::Int)).await.unwrap();
         for k in [-20i64, -10, -3, 0, 3, 10, 20] {
             store.kv_put("ns", &serde_json::json!(k), &serde_json::json!(k)).await.unwrap();
@@ -425,8 +414,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_scan_prefix_ignores_a_cursor_below_the_prefix() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Str)).await.unwrap();
         for k in ["apple", "banana", "user-1", "user-2"] {
             store.kv_put("ns", &serde_json::json!(k), &serde_json::json!("v")).await.unwrap();
@@ -439,8 +427,7 @@ mod tests {
     #[tokio::test]
     async fn test_kv_wrong_value_type_rejected() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create_kv(make_kv_schema("ns", KvKeyType::Str, KvValueType::Int)).await.unwrap();
 
         // Put a string into an Int-typed namespace.

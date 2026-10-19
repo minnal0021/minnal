@@ -75,7 +75,6 @@ echo ""
 echo "==> [5/8] Generating config → ${BIN_DIR}/minnal.toml"
 sed \
     -e 's|db_path = "./data/db"|db_path = "./work/doc_store/db"|' \
-    -e 's|schema_dir = "./data/schemas"|schema_dir = "./work/doc_store/schemas"|' \
     -e 's|log_dir = "./data/log"|log_dir = "./work/doc_store/log"|' \
     "${CONFIG_SRC}" > "${BIN_DIR}/minnal.toml"
 echo "  Written minnal.toml"

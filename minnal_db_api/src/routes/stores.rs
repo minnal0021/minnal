@@ -75,8 +75,6 @@ pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) 
     let ns = schema.namespace.clone();
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
     state.store.create(schema).await?;
-    // Reload from the persisted copy so the cache has the store-assigned ns_id.
-    reload_schema(state, &ns).await;
     info!(namespace = %ns, "store created");
     Ok(StatusCode::CREATED)
 }
@@ -86,11 +84,9 @@ pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -
     match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
         StoreType::Doc => {
             state.store.remove(&ns).await?;
-            state.schemas.write().await.remove(&ns);
         }
         StoreType::Kv => {
             state.store.remove_kv(&ns).await?;
-            state.kv_schemas.write().await.remove(&ns);
         }
     }
     info!(namespace = %ns, "store dropped");
@@ -203,10 +199,6 @@ pub async fn amend_schema(
     // Search defaults apply to doc and KV stores alike.
     if let AmendRequest::UpdateVectorSearch { search, maintenance } = &req {
         state.store.update_vector_search(&ns, search, maintenance.as_ref()).await?;
-        match state.store.store_type(&ns)? {
-            StoreType::Doc => reload_schema(&state, &ns).await,
-            StoreType::Kv => reload_kv_schema(&state, &ns).await,
-        }
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -244,7 +236,6 @@ pub async fn amend_schema(
     // last embedding field was removed (triggering background vector cleanup).
     if let AmendRequest::RemoveAttribute { name } = &req {
         let last_embedding_removed = state.store.remove_attribute(&ns, name)?;
-        reload_schema(&state, &ns).await;
 
         if last_embedding_removed {
             // Check whether a cleanup is already running before spawning another.
@@ -269,7 +260,6 @@ pub async fn amend_schema(
     }
 
     state.store.amend(&ns, req.into()).await?;
-    reload_schema(&state, &ns).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -316,20 +306,6 @@ async fn probe_model(state: &AppState, settings: &VectorIndexSettings) -> Result
     }
 }
 
-/// Re-read one namespace's schema from the store and update the in-memory cache.
-pub(crate) async fn reload_schema(state: &AppState, ns: &str) {
-    if let Ok(list) = state.store.list() {
-        for val in list {
-            if let Ok(s) = serde_json::from_value::<DocStoreSchema>(val)
-                && s.namespace == ns
-            {
-                state.schemas.write().await.insert(ns.to_owned(), s);
-                return;
-            }
-        }
-    }
-}
-
 // ── KV store creation (shared core) ─────────────────────────────────────────────
 
 /// Core KV-store creation, shared by `POST /stores` and schema import.
@@ -343,21 +319,6 @@ pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) ->
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");
     state.store.create_kv(schema).await?;
-    reload_kv_schema(state, &ns).await;
     info!(namespace = %ns, "KV store created");
     Ok(StatusCode::CREATED)
-}
-
-/// Re-read one KV namespace's schema and update the in-memory cache.
-pub(crate) async fn reload_kv_schema(state: &AppState, ns: &str) {
-    if let Ok(list) = state.store.list_kv() {
-        for val in list {
-            if let Ok(s) = serde_json::from_value::<KvStoreSchema>(val)
-                && s.namespace == ns
-            {
-                state.kv_schemas.write().await.insert(ns.to_owned(), s);
-                return;
-            }
-        }
-    }
 }

@@ -378,7 +378,7 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │       └── rowmap/             # Dense row-ID map shared by the namespace's fields
 │
 ├── ns_default/                 # Default namespace (always present)
-│   ├── config.json             # Namespace settings (and, with doc-store, its schema)
+│   ├── config.json             # Field-index registrations (only once a field is indexed)
 │   ├── value_logs/
 │   │   ├── value_log_0.seg000007   # Bucket 0, sealed segment (immutable)
 │   │   ├── value_log_0.seg000008   # Bucket 0, active tail

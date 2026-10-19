@@ -162,8 +162,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_and_find_by_id() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         let id = DocId::U64(42);
@@ -177,8 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_id_missing_returns_none() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         let found = store.get("docs", DocId::U64(99)).await.unwrap();
@@ -190,8 +188,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_rejects_an_id_of_the_wrong_key_type() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap(); // u64 keys
 
         for wrong in [DocId::U128(1), DocId::Uuid(1)] {
@@ -212,8 +209,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_removes_document() {
         let db_dir = TempDir::new().unwrap();
-        let schema_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path(), schema_dir.path()).await;
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("docs", vec![])).await.unwrap();
 
         let id = DocId::U64(1);

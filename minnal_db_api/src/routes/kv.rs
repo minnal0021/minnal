@@ -248,15 +248,12 @@ pub async fn search_kv_semantic(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Look up the `KvKeyType` for `ns` from the in-memory schema cache.
+/// Look up the `KvKeyType` for `ns` from the store's schema cache.
 async fn kv_key_type_for(state: &AppState, ns: &str) -> Result<KvKeyType, AppError> {
-    state
-        .kv_schemas
-        .read()
-        .await
-        .get(ns)
-        .map(|s| s.key_type)
-        .ok_or_else(|| DocStoreError::NotFound { namespace: ns.to_owned() }.into())
+    match state.store.schema(ns) {
+        Some(minnal_db::doc_store::StoredSchema::Kv(s)) => Ok(s.key_type),
+        _ => Err(DocStoreError::NotFound { namespace: ns.to_owned() }.into()),
+    }
 }
 
 /// Convert the URL key string to a typed JSON value using the schema cache.

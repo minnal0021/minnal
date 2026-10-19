@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// The API server's TOML: engine, vector worker and semantic-search settings.
     pub server_toml: String,
-    /// A database directory (`db/`, `schemas/`) with the base documents loaded
+    /// A database directory (`db/`) with the base documents loaded
     /// and indexed; copied, never written.
     pub snapshot: String,
     /// `base.jsonl`, `stream.jsonl`, `ids.json`, `queries.jsonl`, `qrels.tsv`.
@@ -150,7 +150,7 @@ pub struct EngineSettings {
     pub server_toml: String,
 }
 
-/// Open the doc store at `dir` (`db/`, `schemas/`) with every background
+/// Open the doc store at `dir` (`db/`) with every background
 /// worker and the vector worker running, embedding through `embed_url`.
 /// `concurrency` overrides the vector worker's (recording only).
 pub async fn open(cfg: &Config, dir: &Path, embed_url: &str, concurrency: Option<usize>) -> Result<(Arc<DocStore>, EngineSettings), String> {
@@ -173,7 +173,7 @@ pub async fn open(cfg: &Config, dir: &Path, embed_url: &str, concurrency: Option
             .collect(),
         server_toml: cfg.server_toml.clone(),
     };
-    let store = DocStore::open_with_config(dir.join("db"), dir.join("schemas"), engine.to_db_config())
+    let store = DocStore::open_with_config(dir.join("db"), engine.to_db_config())
         .await
         .map_err(|e| format!("open {}: {e}", dir.display()))?;
     let service = SemanticSearchConfig {
@@ -196,7 +196,7 @@ pub async fn open(cfg: &Config, dir: &Path, embed_url: &str, concurrency: Option
     Ok((Arc::new(store), settings))
 }
 
-/// Copy `snapshot/{db,schemas}` to `dir`.
+/// Copy `snapshot/db` to `dir`.
 pub fn copy_snapshot(snapshot: &str, dir: &Path) -> Result<(), String> {
     fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(to)?;
@@ -211,9 +211,8 @@ pub fn copy_snapshot(snapshot: &str, dir: &Path) -> Result<(), String> {
         }
         Ok(())
     }
-    for d in ["db", "schemas"] {
-        copy(&Path::new(snapshot).join(d), &dir.join(d)).map_err(|e| format!("copy {snapshot}/{d}: {e}"))?;
-    }
+    // Schemas live in the database (`system_schema`), so the database is all there is to copy.
+    copy(&Path::new(snapshot).join("db"), &dir.join("db")).map_err(|e| format!("copy {snapshot}/db: {e}"))?;
     Ok(())
 }
 

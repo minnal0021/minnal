@@ -1,19 +1,19 @@
 //! Configuration for the minnal_db_api server.
 //!
 //! [`DocStoreApiConfig`] is a superset of `minnal.toml`: it shares the same
-//! TOML sections as `MinnalTomlConfig` and adds two extras:
-//! - `storage.schema_dir` — where per-store schema files are persisted
-//! - `[api].listen_addr`  — the HTTP bind address
+//! TOML sections as `MinnalTomlConfig` and adds server extras such as
+//! `[api].listen_addr` (the HTTP bind address) and `storage.log_dir`.
+//! Store schemas live inside the database (the `system_schema` namespace), so
+//! there is no schema directory to configure.
 //!
-//! A plain `minnal.toml` (without `schema_dir` or `[api]`) is valid here;
-//! the missing fields fall back to their built-in defaults.
+//! A plain `minnal.toml` (without `[api]`) is valid here; the missing fields
+//! fall back to their built-in defaults.
 //!
 //! # Example `minnal_db_api.toml`
 //!
 //! ```toml
 //! [storage]
 //! db_path    = "/var/lib/minnal/db"
-//! schema_dir = "/var/lib/minnal/schemas"
 //!
 //! [api]
 //! listen_addr = "0.0.0.0:8080"
@@ -142,11 +142,6 @@ impl DocStoreApiConfig {
         PathBuf::from(&self.storage.db_path)
     }
 
-    /// Path to the directory where schema JSON files are stored.
-    pub fn schema_dir(&self) -> PathBuf {
-        PathBuf::from(&self.storage.schema_dir)
-    }
-
     /// Path to the directory where rolling log files are written.
     pub fn log_dir(&self) -> PathBuf {
         PathBuf::from(&self.storage.log_dir)
@@ -211,13 +206,14 @@ impl DocStoreApiConfig {
 // ── Sections ──────────────────────────────────────────────────────────────────
 
 /// Storage paths. Both fields have sensible defaults so the config file may
-/// omit this entire section.
+/// omit this entire section. Unknown keys are rejected: a leftover
+/// `schema_dir` (store schemas live in the database) fails at startup instead of
+/// being silently ignored.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageSection {
     #[serde(default = "default_db_path")]
     pub db_path: String,
-    #[serde(default = "default_schema_dir")]
-    pub schema_dir: String,
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
 }
@@ -226,7 +222,6 @@ impl Default for StorageSection {
     fn default() -> Self {
         Self {
             db_path: default_db_path(),
-            schema_dir: default_schema_dir(),
             log_dir: default_log_dir(),
         }
     }
@@ -234,9 +229,6 @@ impl Default for StorageSection {
 
 fn default_db_path() -> String {
     "./data/db".into()
-}
-fn default_schema_dir() -> String {
-    "./data/schemas".into()
 }
 fn default_log_dir() -> String {
     "./data/log".into()
@@ -794,7 +786,7 @@ mod tests {
 
     #[test]
     fn supported_models_are_checked_and_optional() {
-        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let base = "[storage]\ndb_path = \"/tmp/x\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
         cfg.validate_supported_models().unwrap();
         assert!(cfg.semantic_search.resolve().supported_models().is_empty(), "any model by default");
@@ -835,6 +827,14 @@ mod tests {
     }
 
     #[test]
+    fn a_leftover_schema_dir_is_rejected() {
+        let err = toml::from_str::<DocStoreApiConfig>("[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field") && err.contains("schema_dir"), "{err}");
+    }
+
+    #[test]
     fn a_namespace_setting_left_in_the_server_config_is_rejected() {
         for key in [
             "model = \"qwen\"",
@@ -845,18 +845,18 @@ mod tests {
             "cluster_path = \"x\"",
             "centroid_dir = \"x\"",
         ] {
-            let toml = format!("[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\n{key}\n");
+            let toml = format!("[storage]\ndb_path = \"/tmp/x\"\n[semantic_search]\n{key}\n");
             let err = toml::from_str::<DocStoreApiConfig>(&toml).unwrap_err().to_string();
             assert!(err.contains("unknown field"), "{key}: {err}");
         }
-        let ok = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\n";
+        let ok = "[storage]\ndb_path = \"/tmp/x\"\n[semantic_search]\nembedding_service_url = \"http://h:1\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(ok).unwrap();
         assert_eq!(cfg.semantic_search.embedding_service_url, "http://h:1");
     }
 
     #[test]
     fn maintenance_and_search_defaults_are_read_and_validated() {
-        let base = "[storage]\ndb_path = \"/tmp/x\"\nschema_dir = \"/tmp/y\"\n";
+        let base = "[storage]\ndb_path = \"/tmp/x\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
         let d = cfg.semantic_search.index_defaults().unwrap();
         assert_eq!(d, minnal_db::doc_store::vector_settings::IndexDefaults::default());
