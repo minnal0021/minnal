@@ -190,7 +190,7 @@ Each store partitions its own embeddings into **postings**: groups of nearby chu
 
 Every step is journalled, so a crash at any point is finished on restart. `POST /admin/indices/{ns}/vector/rebuild` re-clusters a whole store from its stored codes (k-means, no embedding calls). A partition grown one split at a time can trail a fresh fit when a search reads only a small share of the store; to see whether a rebuild helps, run `GET /admin/indices/{ns}/vector/recall-check` before and after it with the same `seed`.
 
-This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their posting, so a query only has to scan the chunks of the postings nearest it instead of the whole corpus. The postings are chosen by an **exact** nearest-centre scan, nearest first, until their entries reach the store's probe budget (`probe_budget_entries`, default 70,000). There is deliberately **no precomputed neighbour graph over the postings**: at the counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest postings, whereas an approximate graph traversal would trade away recall for no meaningful speed-up.
+This partitioning is what makes Pass 1 cheap: every document's sparse chunks are stored keyed by their posting, so a query only has to scan the chunks of the postings nearest it instead of the whole corpus. The postings are chosen by an **exact** nearest-centre scan, and the store's `max_probes` nearest are read (default 256; every posting of a store with fewer). There is deliberately **no precomputed neighbour graph over the postings**: at the counts in use, this exhaustive scan takes microseconds and yields the *exact* nearest postings, whereas an approximate graph traversal would trade away recall for no meaningful speed-up.
 
 #### Dual Quantisation at Index Time
 
@@ -206,7 +206,7 @@ A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each d
 
 **Pass 1 — Sparse (SingleBit):**
 1. The query text is embedded **once, whole** (or fetched from the `system_qemb_cache` TTL namespace; TTL configurable via `query_embedding_cache_ttl_secs`, default 1 day). Queries are not chunked — this one vector is used by both passes.
-2. The postings nearest the query vector by Euclidean distance are chosen, nearest first, until their entries reach the probe budget.
+2. The `max_probes` postings nearest the query vector by Euclidean distance are chosen (every posting, when the namespace has fewer).
 3. All SingleBit (document-chunk) entries for the probed postings are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
 5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.

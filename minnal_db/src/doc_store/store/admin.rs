@@ -212,9 +212,8 @@ impl DocStore {
         Ok(())
     }
 
-    /// Change a store's search settings (`probe_budget_entries`, `min_probes`,
-    /// `max_probes`, `first_pass_top_k`, `top_k`, `probe_budget_fraction`,
-    /// `probe_budget_floor`) and/or its partition maintenance settings, for
+    /// Change a store's search settings (`min_probes`, `max_probes`,
+    /// `first_pass_top_k`, `top_k`) and/or its partition maintenance settings, for
     /// document and KV stores alike. Later searches, splits and merges use them;
     /// nothing is re-embedded. Fails with
     /// [`SchemaError::VectorIndexNotConfigured`] if the store has never had

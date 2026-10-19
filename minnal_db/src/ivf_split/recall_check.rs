@@ -2,7 +2,7 @@
 //! "should I rebuild" (FR-007).
 //!
 //! A rebuild changes one thing: which postings hold which chunks, and so which
-//! documents a search reaches within its probe budget. When a search already
+//! documents a search reaches among the postings it probes (`max_probes`). When a search already
 //! reads every posting, no partition can change its results. When it reads a
 //! small share, a better partition finds more of what a full read would.
 //!
@@ -21,8 +21,8 @@
 //!
 //! A chunk query's source document is dropped from both lists (a chunk finds its
 //! own document first). **Overlap@k** is the share of the full read's top k that
-//! the normal search also returns. It is the recall the probe budget costs, so it
-//! is low when the budget is too small for the namespace *or* when the partition
+//! the normal search also returns. It is the recall a partial read costs, so it
+//! is low when `max_probes` is too small for the namespace *or* when the partition
 //! puts neighbours in postings the search does not reach. A rebuild fixes only
 //! the second, so the check is read twice: before a rebuild and after it, with
 //! the same seed (the same queries). A rise is what the rebuild gained.
@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use super::*;
 use crate::semantic_search::service::{SemanticSearchConfig, search};
-use crate::semantic_search::{ProbeSettings, select_probes};
+use crate::semantic_search::{IvfLayout, ProbeSettings, select_probes};
 use crate::vector_kv::DbVectorStore;
 
 /// The cutoffs overlap is reported at.
@@ -92,8 +92,8 @@ pub enum RecallVerdict {
     Ok,
     /// Overlap@10 is below it: searches miss part of what a full read finds.
     /// Rebuild and check again with the same seed; keep the rebuild if overlap
-    /// rose. If it did not, the budget is too small for the namespace, and only a
-    /// larger budget recovers the rest.
+    /// rose. If it did not, `max_probes` is too small for the namespace, and
+    /// only probing more postings recovers the rest.
     BelowTarget,
     /// Nothing to sample.
     Empty,
@@ -136,8 +136,10 @@ pub struct RecallCheck {
     pub entries: u64,
     /// Live postings.
     pub postings: usize,
-    /// The probe budget the namespace's searches use (entries).
-    pub budget_entries: u64,
+    /// The floor on postings a search probes (the store's, or the override).
+    pub min_probes: usize,
+    /// The postings a search probes (the store's, or the override).
+    pub max_probes: usize,
     /// Mean share of the entries a normal search read.
     pub read_share: f64,
     /// Mean postings a normal search probed.
@@ -201,19 +203,7 @@ pub async fn recall_check(
         read_share += planned as f64 / entries.max(1) as f64;
         probes += chosen.len() as f64;
         let mut full = config.clone();
-        full.probe = if entries <= MAX_REFERENCE_ENTRIES {
-            ProbeSettings {
-                budget_entries: u64::MAX,
-                min_probes: postings,
-                max_probes: postings,
-            }
-        } else {
-            ProbeSettings {
-                budget_entries: MAX_REFERENCE_ENTRIES,
-                min_probes: 1,
-                max_probes: postings,
-            }
-        };
+        full.probe = ProbeSettings::fixed(reference_probes(&*ivf, q, postings, entries));
         let (reference, reference_planned) = select_probes(&*ivf, std::slice::from_ref(q), &full.probe);
         reference_full &= reference.len() >= postings;
         reference_share += reference_planned as f64 / entries.max(1) as f64;
@@ -274,7 +264,8 @@ pub async fn recall_check(
         sampled: n,
         entries,
         postings,
-        budget_entries: config.probe.budget_entries,
+        min_probes: config.probe.min_probes,
+        max_probes: config.probe.max_probes,
         read_share: read_share / m,
         probes_mean: probes / m,
         reference_is_full_read: reference_full,
@@ -285,6 +276,23 @@ pub async fn recall_check(
         full_read_ms: full_s * 1e3 / m,
         elapsed_ms: started.elapsed().as_secs_f64() * 1e3,
     })
+}
+
+/// Postings the reference search probes for `q`: all of them, or above
+/// [`MAX_REFERENCE_ENTRIES`] its nearest until their entries reach that cap.
+fn reference_probes<L: IvfLayout + ?Sized>(ivf: &L, q: &[f32], postings: usize, entries: u64) -> usize {
+    if entries <= MAX_REFERENCE_ENTRIES {
+        return postings;
+    }
+    let ranked = ivf.probe(std::slice::from_ref(&q.to_vec()), postings).pop().unwrap_or_default();
+    let mut read = 0u64;
+    for (taken, id) in ranked.iter().enumerate() {
+        if read >= MAX_REFERENCE_ENTRIES {
+            return taken.max(1);
+        }
+        read += ivf.posting_entries(*id).unwrap_or(0);
+    }
+    ranked.len().max(1)
 }
 
 /// Of the full read's top `k`, the share the normal search also has in its top

@@ -4,8 +4,8 @@
 //! ([`index_embeddings`] + [`upsert_vectors`]), runs every judged query through
 //! the production [`search`], and measures relevance, recall against the exact
 //! (unquantised, unpartitioned) ranking, estimator error, partition shape,
-//! footprint, indexing throughput and latency over a sweep of fixed `n_probes`
-//! and of entry budgets (design doc M2d).
+//! footprint, indexing throughput and latency over a sweep of probe counts
+//! (postings each query reads).
 //! Results go to `{bench_root}/results/{label}/{dataset}-{order}.{json,md}`;
 //! `vector_bench_compare` compares two result files with paired per-query deltas.
 //!
@@ -70,17 +70,11 @@ use frozen::Frozen;
 const NS: &str = "bench";
 /// Documents indexed concurrently (quantisation + upsert).
 const INDEX_CONCURRENCY: usize = 8;
-/// `n_probes` values swept; values above the cluster count are skipped.
-const NPROBES: [usize; 7] = [4, 8, 16, 32, 64, 128, 256];
+/// `n_probes` values swept (plus the default, [`DEFAULT_PROBE`]); values above
+/// the posting count are skipped.
+const NPROBES: [usize; 13] = [4, 8, 16, 32, 64, 128, 192, 256, 330, 400, 512, 768, 1024];
 /// The fixed probe count gates compare against (the production setting before M2d).
 const PRODUCTION_NPROBES: usize = 64;
-/// Entry budgets swept, as shares of the namespace's entries (plus the default
-/// budget, [`DEFAULT_PROBE`]), so a small corpus gets a curve too.
-const BUDGET_SHARES: [f64; 9] = [0.025, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
-/// Budgets as shares of the namespace's **chunk count**: the same absolute
-/// number of entries whatever the partition, so runs of different partitions
-/// compare at equal cost (the M3a gate reads from 5% upwards).
-const CHUNK_SHARES: [f64; 5] = [0.01, 0.02, 0.05, 0.1, 0.2];
 /// Documents indexed between two rounds of splitting in `grow` mode.
 const GROW_BATCH: usize = 256;
 /// Candidates kept after Pass 1 (production default), and returned per query so
@@ -193,11 +187,8 @@ struct QueryResultRow {
 
 #[derive(Serialize, Deserialize)]
 struct Setting {
-    /// Fixed probe count, or 0 for a budget row.
+    /// Postings each query probes (0 in results written with an entry budget).
     n_probes: usize,
-    /// Entry budget (min 1, max [`DEFAULT_PROBE`]'s), or `None` for a fixed row.
-    #[serde(default)]
-    budget_entries: Option<u64>,
     mean: QueryResultRow,
     latency_p50_ms: f64,
     latency_p95_ms: f64,
@@ -486,24 +477,15 @@ fn mean_row(rows: &[QueryResultRow]) -> QueryResultRow {
 
 impl Setting {
     fn probe(&self) -> ProbeSettings {
-        match self.budget_entries {
-            Some(budget_entries) => ProbeSettings {
-                budget_entries,
-                ..DEFAULT_PROBE
-            },
-            None => ProbeSettings::fixed(self.n_probes),
-        }
+        ProbeSettings::fixed(self.n_probes)
     }
 
     fn name(&self) -> String {
-        match self.budget_entries {
-            Some(b) => format!("budget {b}"),
-            None => format!("n_probes {}", self.n_probes),
-        }
+        format!("n_probes {}", self.n_probes)
     }
 
     fn same_as(&self, other: &Setting) -> bool {
-        (self.n_probes, self.budget_entries) == (other.n_probes, other.budget_entries)
+        self.n_probes > 0 && self.n_probes == other.n_probes
     }
 }
 
@@ -830,22 +812,15 @@ async fn vector_bench() {
     for qi in 0..frozen.n_queries() {
         run_query(ProbeSettings::fixed(PRODUCTION_NPROBES), qi).await; // warm-up
     }
-    let total_entries = partition.entries as u64;
-    let mut budgets: Vec<u64> = BUDGET_SHARES.iter().map(|s| (s * total_entries as f64).round() as u64).collect();
-    budgets.extend(CHUNK_SHARES.iter().map(|s| (s * partition.chunks as f64).round() as u64));
-    budgets.push(DEFAULT_PROBE.budget_entries);
-    budgets.sort_unstable();
-    budgets.dedup();
-    let sweep = NPROBES
-        .iter()
-        .filter(|&&n| n <= ivf.postings())
-        .map(|&n| (n, None))
-        .chain(budgets.into_iter().map(|b| (0, Some(b))));
+    let mut counts: Vec<usize> = NPROBES.to_vec();
+    counts.push(DEFAULT_PROBE.max_probes);
+    counts.sort_unstable();
+    counts.dedup();
+    let sweep = counts.into_iter().filter(|&n| n <= ivf.postings());
     let mut settings = Vec::new();
-    for (n_probes, budget_entries) in sweep {
+    for n_probes in sweep {
         let mut s = Setting {
             n_probes,
-            budget_entries,
             mean: QueryResultRow::default(),
             latency_p50_ms: 0.0,
             latency_p95_ms: 0.0,
@@ -1282,27 +1257,10 @@ fn paired(b: &Setting, n: &Setting) -> Paired {
     }
 }
 
-/// `f` of the curve (sorted by mean entries scanned) at `x` entries.
-fn interpolate(curve: &[&Setting], x: f64, f: fn(&Setting) -> f64) -> f64 {
-    let e = |s: &Setting| s.mean.entries_scanned as f64;
-    if x <= e(curve[0]) {
-        return f(curve[0]);
-    }
-    for w in curve.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if x <= e(b) {
-            let span = e(b) - e(a);
-            let t = if span > 0.0 { (x - e(a)) / span } else { 1.0 };
-            return f(a) + t * (f(b) - f(a));
-        }
-    }
-    f(curve[curve.len() - 1])
-}
-
 /// Gate `n` against the base row `b`, paired per query: write the nDCG table by
-/// cutoff and push the gate checks, named after `n`. A budget at least the
-/// namespace's `entries` scans it in full, buying recall with time on purpose,
-/// so its latency is reported but not gated.
+/// cutoff and push the gate checks, named after `n`. A setting that reads all of
+/// the namespace's `entries` scans it in full, buying recall with time on
+/// purpose, so its latency is reported but not gated.
 fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &Setting, entries: usize) {
     let who = n.name();
     let p = paired(b, n);
@@ -1349,8 +1307,8 @@ fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &S
     ));
     gate.push((format!("{who}: ANN recall@10 Δ ≥ −0.005"), p.ann.0 >= -0.005));
     gate.push((format!("{who}: nDCG@{{10..100}} Δ ≥ −0.002 at every cutoff"), worst >= -0.002));
-    if n.budget_entries.is_some_and(|budget| budget >= entries as u64) {
-        let _ = writeln!(md, "\nThe budget covers all {entries} entries: a full scan, so latency is not gated.");
+    if n.mean.entries_scanned >= entries {
+        let _ = writeln!(md, "\n{who} reads all {entries} entries: a full scan, so latency is not gated.");
         gate.push((format!("{who}: ANN recall@10 not below the base (full scan)"), p.ann.0 >= 0.0));
         return;
     }
@@ -1412,52 +1370,13 @@ fn vector_bench_compare() {
         );
     }
 
-    // Budget rows against the base's fixed-probe curve, interpolated at the
-    // same mean entries scanned (design doc M2d: the curves should overlay).
-    let curve: Vec<&Setting> = {
-        let mut c: Vec<&Setting> = base.settings.iter().filter(|s| s.budget_entries.is_none()).collect();
-        c.sort_by_key(|s| s.mean.entries_scanned);
-        c
-    };
-    let budget_rows: Vec<&Setting> = new.settings.iter().filter(|s| s.budget_entries.is_some()).collect();
-    if !budget_rows.is_empty() && curve.len() >= 2 {
-        let _ = writeln!(
-            md,
-            "\nBudget rows against the base's fixed-probe curve at equal mean entries (linear interpolation; outside the curve's range, its nearest end):\n"
-        );
-        let _ = writeln!(
-            md,
-            "| Budget | Entries scanned | Postings probed (mean) | nDCG@10 Δ | ANN R@10 Δ | Pass-1 recall Δ | p50 ms Δ | p95 ms Δ |\n|---:|---:|---:|---:|---:|---:|---:|---:|"
-        );
-        for n in &budget_rows {
-            let x = n.mean.entries_scanned as f64;
-            let at = |f: fn(&Setting) -> f64| interpolate(&curve, x, f);
-            let _ = writeln!(
-                md,
-                "| {} | {} | {:.1} | {:+.4} | {:+.4} | {:+.4} | {:+.2} | {:+.2} |",
-                n.budget_entries.unwrap(),
-                n.mean.entries_scanned,
-                n.mean.probes,
-                n.mean.ndcg10 - at(|s| s.mean.ndcg10),
-                n.mean.ann_r10 - at(|s| s.mean.ann_r10),
-                n.mean.pass1_recall - at(|s| s.mean.pass1_recall),
-                n.latency_p50_ms - at(|s| s.latency_p50_ms),
-                n.latency_p95_ms - at(|s| s.latency_p95_ms)
-            );
-        }
-    }
-
     // Gates against the base at the fixed production probe count: the new run
-    // at the same count, and (when it has one) at the default budget.
+    // at the same count, and at the default.
     let mut gate = Vec::new();
-    if let Some(b) = base
-        .settings
-        .iter()
-        .find(|s| s.budget_entries.is_none() && s.n_probes == PRODUCTION_NPROBES)
-    {
+    if let Some(b) = base.settings.iter().find(|s| s.n_probes == PRODUCTION_NPROBES) {
         let candidates = [
             new.settings.iter().find(|s| s.same_as(b)),
-            new.settings.iter().find(|s| s.budget_entries == Some(DEFAULT_PROBE.budget_entries)),
+            new.settings.iter().find(|s| s.n_probes == DEFAULT_PROBE.max_probes),
         ];
         for n in candidates.into_iter().flatten() {
             gate_pair(&mut md, &mut gate, b, n, new.partition.entries);
@@ -1489,8 +1408,8 @@ fn vector_bench_compare() {
     }
 }
 
-/// Print the FR-007 recall check at entry budgets of 1%, 5% and 20% of the
-/// namespace and at the default, plus centre drift (`MINNAL_BENCH_RECALL_CHECK`).
+/// Print the FR-007 recall check probing 1%, 5% and 20% of the namespace's
+/// postings and at the default, plus centre drift (`MINNAL_BENCH_RECALL_CHECK`).
 async fn recall_check_report(
     when: &str,
     db: &AsyncDb,
@@ -1505,21 +1424,17 @@ async fn recall_check_report(
         "  [{when}] {} postings; drift mean {:.3}, p90 {:.3}, foreign {:.3}",
         summary.postings, c.drift_mean, c.drift_p90, c.foreign_share
     );
-    let entries = handle.snapshot().total_entries();
+    let postings = handle.snapshot().postings();
     let sample = env_or("MINNAL_BENCH_RECALL_SAMPLE", "300").parse().unwrap();
-    for (label, budget) in [
-        ("1%", Some(entries / 100)),
-        ("5%", Some(entries / 20)),
-        ("20%", Some(entries / 5)),
+    for (label, probes) in [
+        ("1%", Some(postings / 100)),
+        ("5%", Some(postings / 20)),
+        ("20%", Some(postings / 5)),
         ("default", None),
     ] {
         let mut cfg = config.clone();
-        if let Some(b) = budget {
-            cfg.probe = ProbeSettings {
-                budget_entries: b.max(1),
-                min_probes: 1,
-                max_probes: handle.snapshot().postings(),
-            };
+        if let Some(n) = probes {
+            cfg.probe = ProbeSettings::fixed(n.max(1));
         }
         let params = RecallCheckParams {
             sample,
@@ -1532,7 +1447,7 @@ async fn recall_check_report(
             let r = recall_check(db, NS, handle, &cfg, &params, given).await.unwrap();
             let o: Vec<String> = r.overlap.iter().map(|o| format!("@{} {:.3}", o.k, o.mean)).collect();
             eprintln!(
-                "  [{when}] {source:>7} budget {label:>7}: read {:.3}, {:.1} probes, overlap {} (p10@10 {:.2}), {:?}; {:.1} / {:.1} ms per normal / full search, {:.1}s total",
+                "  [{when}] {source:>7} probes {label:>7}: read {:.3}, {:.1} probes, overlap {} (p10@10 {:.2}), {:?}; {:.1} / {:.1} ms per normal / full search, {:.1}s total",
                 r.read_share,
                 r.probes_mean,
                 o.join(" "),

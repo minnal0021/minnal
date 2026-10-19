@@ -113,13 +113,10 @@ impl DocStore {
             },
             "namespace_defaults": {
                 "search": {
-                    "probe_budget_entries": search.probe_budget_entries,
                     "min_probes": search.min_probes,
                     "max_probes": search.max_probes,
                     "first_pass_top_k": search.first_pass_top_k,
                     "top_k": search.top_k,
-                    "probe_budget_fraction": search.probe_budget_fraction.map(|r| r.0),
-                    "probe_budget_floor": search.probe_budget_floor,
                 },
                 "maintenance": {
                     "target_posting_size": m.target_posting_size,

@@ -52,8 +52,8 @@ pub trait IvfLayout: Sync {
     fn max_centre_id(&self) -> Option<u32> {
         self.centre_ids().into_iter().max()
     }
-    /// How many entries `posting` holds, when the layout knows. Probing by entry
-    /// budget ([`select_probes`]) counts an unknown size as 0.
+    /// How many entries `posting` holds, when the layout knows.
+    /// [`select_probes`] counts an unknown size as 0.
     fn posting_entries(&self, _posting: u32) -> Option<u64> {
         None
     }
@@ -119,54 +119,48 @@ impl<T: IvfLayout + Send + ?Sized> IvfLayout for std::sync::Arc<T> {
     }
 }
 
-/// How many postings a search probes (design doc M2d).
+/// How many postings (clusters) a search probes.
 ///
-/// Each query vector walks its postings nearest first and stops once it has
-/// probed at least `min_probes` **and** their entries add up to
-/// `budget_entries`, and never goes past `max_probes`. The posting that crosses
-/// the budget is probed. The cost of Pass 1 is the entries it reads, so a budget
-/// keeps that cost fixed as postings are split and change size, where a fixed
-/// probe count would not.
+/// Each query vector probes its `max_probes` nearest postings, or every active
+/// posting when the namespace has fewer, and never fewer than `min_probes`
+/// (a floor for overrides that lower `max_probes`). Postings are kept between
+/// the merge and split limits, so the count bounds the cost of Pass 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeSettings {
-    /// Entries to read per query vector before stopping.
-    pub budget_entries: u64,
-    /// Postings always probed per query vector, whatever the budget.
+    /// Postings always probed per query vector (when the namespace has them).
     pub min_probes: usize,
-    /// Postings never exceeded per query vector, whatever the budget.
+    /// Postings probed per query vector at most.
     pub max_probes: usize,
 }
 
 impl ProbeSettings {
-    /// Exactly `n` postings per query vector, whatever their size.
+    /// Exactly `n` postings per query vector.
     pub const fn fixed(n: usize) -> Self {
         Self {
-            budget_entries: 0,
             min_probes: n,
             max_probes: n,
         }
     }
+
+    /// Postings each query vector probes, before the layout caps it at its
+    /// active postings.
+    pub fn per_query(&self) -> usize {
+        self.max_probes.max(self.min_probes)
+    }
 }
 
-/// The postings a search probes under `probe`: per query vector, the nearest
-/// postings within its limits ([`ProbeSettings`]); then their union, in
-/// first-seen order. Also returns the entries the union holds, as far as the
-/// layout knows.
+/// The postings a search probes under `probe`: per query vector, its nearest
+/// postings ([`ProbeSettings`]); then their union, in first-seen order. Also
+/// returns the entries the union holds, as far as the layout knows.
 pub fn select_probes<L: IvfLayout + ?Sized>(layout: &L, queries: &[Vec<f32>], probe: &ProbeSettings) -> (Vec<u32>, u64) {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
     let mut planned = 0u64;
-    for ranked in layout.probe(queries, probe.max_probes) {
-        let mut entries = 0u64;
-        for (taken, id) in ranked.into_iter().enumerate() {
-            if taken >= probe.min_probes && entries >= probe.budget_entries {
-                break;
-            }
-            let size = layout.posting_entries(id).unwrap_or(0);
-            entries += size;
+    for ranked in layout.probe(queries, probe.per_query()) {
+        for id in ranked {
             if seen.insert(id) {
                 ids.push(id);
-                planned += size;
+                planned += layout.posting_entries(id).unwrap_or(0);
             }
         }
     }
@@ -174,8 +168,8 @@ pub fn select_probes<L: IvfLayout + ?Sized>(layout: &L, queries: &[Vec<f32>], pr
 }
 
 /// A layout with entry counts attached: for layouts that keep none
-/// ([`ClusterIndex`]), so they can be probed by budget. Benches and tests use it
-/// with counts taken from the store.
+/// ([`ClusterIndex`]), so a search can report the entries it plans to read.
+/// Benches and tests use it with counts taken from the store.
 pub struct WithEntryCounts<L> {
     /// The layout.
     pub layout: L,
@@ -255,7 +249,7 @@ pub struct PostingCounts {
 /// records when its partition loads, then kept current by every vector write's
 /// [`PostingDelta`]. Shared by every snapshot of a namespace's partition, so a
 /// count never has to be copied when a split publishes a new snapshot. The
-/// split trigger and probing by budget both read it.
+/// split trigger reads it.
 #[derive(Debug, Default)]
 pub struct CountTable {
     map: parking_lot::RwLock<HashMap<u32, Arc<PostingCounts>>>,
@@ -1118,31 +1112,29 @@ mod tests {
         (WithEntryCounts { layout, entries }, q)
     }
 
-    fn budget(budget_entries: u64, min_probes: usize, max_probes: usize) -> ProbeSettings {
-        ProbeSettings {
-            budget_entries,
-            min_probes,
-            max_probes,
-        }
+    fn probes(min_probes: usize, max_probes: usize) -> ProbeSettings {
+        ProbeSettings { min_probes, max_probes }
     }
 
     #[test]
-    fn a_budget_stops_at_the_posting_that_reaches_it() {
+    fn each_query_vector_probes_its_max_probes_nearest_postings() {
         let (layout, q) = ranked_layout([10, 20, 30, 40]);
         let qs = [q];
-        assert_eq!(select_probes(&layout, &qs, &budget(25, 1, 4)), (vec![0, 1], 30));
-        assert_eq!(select_probes(&layout, &qs, &budget(30, 1, 4)), (vec![0, 1], 30));
-        assert_eq!(select_probes(&layout, &qs, &budget(31, 1, 4)), (vec![0, 1, 2], 60));
-        assert_eq!(select_probes(&layout, &qs, &budget(1, 1, 4)), (vec![0], 10));
-        assert_eq!(select_probes(&layout, &qs, &budget(1_000, 1, 4)), (vec![0, 1, 2, 3], 100));
+        assert_eq!(select_probes(&layout, &qs, &probes(1, 1)), (vec![0], 10));
+        assert_eq!(select_probes(&layout, &qs, &probes(1, 2)), (vec![0, 1], 30));
+        assert_eq!(select_probes(&layout, &qs, &probes(1, 3)), (vec![0, 1, 2], 60));
     }
 
     #[test]
-    fn min_and_max_probes_bound_the_budget() {
+    fn a_namespace_with_fewer_postings_than_max_probes_is_read_in_full() {
         let (layout, q) = ranked_layout([10, 20, 30, 40]);
-        let qs = [q];
-        assert_eq!(select_probes(&layout, &qs, &budget(1, 3, 4)).0, vec![0, 1, 2]);
-        assert_eq!(select_probes(&layout, &qs, &budget(1_000, 1, 2)).0, vec![0, 1]);
+        assert_eq!(select_probes(&layout, &[q], &probes(1, 1024)), (vec![0, 1, 2, 3], 100));
+    }
+
+    #[test]
+    fn min_probes_is_a_floor_under_max_probes() {
+        let (layout, q) = ranked_layout([10, 20, 30, 40]);
+        assert_eq!(select_probes(&layout, &[q], &probes(3, 2)).0, vec![0, 1, 2]);
     }
 
     #[test]
@@ -1158,17 +1150,17 @@ mod tests {
     fn unknown_sizes_count_as_zero() {
         let (mut layout, q) = ranked_layout([10, 20, 30, 40]);
         layout.entries.clear();
-        assert_eq!(select_probes(&layout, &[q], &budget(5, 1, 3)), (vec![0, 1, 2], 0));
+        assert_eq!(select_probes(&layout, &[q], &probes(1, 3)), (vec![0, 1, 2], 0));
     }
 
     #[test]
-    fn each_query_vector_has_its_own_budget_and_the_union_is_probed() {
+    fn each_query_vector_probes_its_own_postings_and_the_union_is_probed() {
         let (layout, q) = ranked_layout([10, 20, 30, 40]);
         let mut q2 = vec![0.0f32; 16];
         q2[..4].copy_from_slice(&[0.1, 0.2, 0.4, 0.8]); // nearest 3, then 2
-        // q: {0, 1}; q2: {3}; posting 1 is not counted twice.
-        assert_eq!(select_probes(&layout, &[q.clone(), q2.clone()], &budget(25, 1, 4)), (vec![0, 1, 3], 70));
-        assert_eq!(select_probes(&layout, &[q, q2], &budget(25, 2, 4)), (vec![0, 1, 3, 2], 100));
+        // q: {0, 1}; q2: {3, 2}; nothing is counted twice.
+        assert_eq!(select_probes(&layout, &[q.clone(), q2.clone()], &probes(1, 1)), (vec![0, 3], 50));
+        assert_eq!(select_probes(&layout, &[q, q2], &probes(1, 2)), (vec![0, 1, 3, 2], 100));
     }
 
     #[test]

@@ -186,7 +186,6 @@ pub struct KvSemanticSearchRequest {
     /// Per-request overrides of the store's search settings; see
     /// [`SemanticSearchRequest`](super::semantic_search::SemanticSearchRequest).
     pub top_k: Option<Limit>,
-    pub probe_budget_entries: Option<u32>,
     pub min_probes: Option<u32>,
     pub max_probes: Option<u32>,
     pub first_pass_top_k: Option<u32>,

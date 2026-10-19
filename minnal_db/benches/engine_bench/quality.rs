@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use minnal_db::doc_store::vector_settings::{MAX_FIRST_PASS_TOP_K, MAX_PROBE_BUDGET_ENTRIES, MAX_PROBES, SearchSpec};
+use minnal_db::doc_store::vector_settings::{MAX_FIRST_PASS_TOP_K, MAX_PROBES, SearchSpec};
 use minnal_db::doc_store::{DocStore, Pagination};
 use minnal_db::ivf_split::rebuild::RebuildState;
 use serde_json::json;
@@ -27,7 +27,6 @@ use crate::workload::{Data, search_spec};
 
 fn specs() -> [(&'static str, SearchSpec); 3] {
     let all = SearchSpec {
-        probe_budget_entries: Some(MAX_PROBE_BUDGET_ENTRIES),
         min_probes: Some(MAX_PROBES),
         max_probes: Some(MAX_PROBES),
         ..search_spec()

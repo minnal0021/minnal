@@ -560,13 +560,14 @@ merges, and re-embeds nothing.
 curl -X PATCH http://localhost:8080/stores/users/schema \
   -H 'Content-Type: application/json' \
   -d '{"op": "update_vector_search",
-       "search": {"probe_budget_entries": 20000, "top_k": 20},
+       "search": {"max_probes": 200, "top_k": 20},
        "maintenance": {"target_posting_size": 256}}'
 # → 204 No Content
 ```
 
-`search` accepts `probe_budget_entries`, `min_probes`, `max_probes`,
-`first_pass_top_k`, `top_k`, `probe_budget_fraction` and `probe_budget_floor`;
+`search` accepts `max_probes` (postings, or clusters, a search reads: its nearest
+this many), `min_probes` (a floor for requests that lower `max_probes`),
+`first_pass_top_k` and `top_k`;
 `maintenance` accepts `target_posting_size`, `reassign_range`, `merge_ratio`,
 `skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
 and `split_lambda_factor`. What each one does, its default and its allowed range
@@ -1608,7 +1609,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
-| `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find within their budget: the signal for a rebuild |
+| `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
 | `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
@@ -2017,7 +2018,7 @@ Searches and writes continue throughout; a crash part-way is finished at the
 next start. Centres chosen one split at a time are a worse map than one fit on
 everything stored now, which costs recall when a search reads a small share of
 the store (measured: up to 4.4 points of recall@10 at a 1% read, up to 1.3 at
-5%, nothing at the default budget on stores of 5k and 57k documents). Run the
+5%, nothing at the default `max_probes` on stores of 5k and 57k documents). Run the
 [recall check](#get-adminindicesnsvectorrecall-check) to see whether it applies,
 and again afterwards. It also moves a store created before partitions grew by
 themselves onto its own centres.
@@ -2048,8 +2049,8 @@ enabled.
 #### `GET /admin/indices/{ns}/vector/recall-check`
 
 Answers "would a rebuild help this store?" by measuring what a rebuild can
-change: how much of a full read's results a search finds within its probe
-budget.
+change: how much of a full read's results a search finds among the `max_probes`
+postings it reads.
 
 It samples real queries from the query-embedding cache: the embeddings of recent
 searches with the store's model and dimension. With fewer than 20 cached, it
@@ -2070,10 +2071,10 @@ bounds its memory (a search holds what it scans until it returns);
 | `sample` | 100 | Queries, 1 to 1,000 |
 | `seed` | fixed | Same seed, same queries: use it to compare before and after a rebuild |
 | `min_overlap` | 0.95 | Overlap@10 below which the verdict is `below_target` |
-| `probe_budget_entries`, `min_probes`, `max_probes` | the store's | Check another budget, validated as for a search |
+| `min_probes`, `max_probes` | the store's | Check reading another number of postings, validated as for a search |
 
 The response holds `verdict`, `seed`, `query_source`, `sampled`, `entries`, `postings`,
-`budget_entries`, `read_share` (mean share of entries a search read),
+`min_probes`, `max_probes`, `read_share` (mean share of entries a search read),
 `probes_mean`, `reference_is_full_read`, `reference_share`, `overlap` (`k` and
 `mean` at 10, 20, 30, 40, 50 and 100),
 `overlap_at_10_p10`, `search_ms`, `full_read_ms` and `elapsed_ms`. The verdict:
@@ -2082,7 +2083,7 @@ The response holds `verdict`, `seed`, `query_source`, `sampled`, `entries`, `pos
 |---|---|---|
 | `read_in_full` | Every search already reads every posting | Nothing: no partition can change the results |
 | `ok` | Overlap@10 ≥ `min_overlap` | Nothing |
-| `below_target` | Searches miss part of what a full read finds | Rebuild, wait for it, check again with the same `seed`. Keep the rebuild if overlap rose; if it did not, raise `probe_budget_entries` instead |
+| `below_target` | Searches miss part of what a full read finds | Rebuild, wait for it, check again with the same `seed`. Keep the rebuild if overlap rose; if it did not, raise `max_probes` instead |
 | `empty` | No chunks stored | — |
 
 Read the overlap against the same check before and after a change, not against
@@ -2090,7 +2091,7 @@ a fixed bar: its level depends on the data. On stores grown from one posting,
 real-query overlap@10 at a 1% read share was 0.56–0.63 (5,000 documents) and
 0.85–0.91 (57,000 documents); a rebuild raised it 2–5 points there, matching the
 recall@10 it gained, up to 3 at 5%, and nothing at 20% or at the default
-budget.
+`max_probes`.
 
 **Cost.** One search and one full read per query, one query at a time; each
 takes the same scoring slot as a client search, so a check adds about one

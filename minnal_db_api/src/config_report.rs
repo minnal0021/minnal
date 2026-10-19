@@ -206,17 +206,10 @@ fn build_report<'a>(cfg: &DocStoreApiConfig, raw: Option<&'a toml::Table>) -> Re
             ss.maintenance.rebuild_threads().unwrap_or_default(),
         );
         let q = d.search;
-        r.add("semantic_search.search_defaults", "probe_budget_entries", q.probe_budget_entries);
         r.add("semantic_search.search_defaults", "min_probes", q.min_probes);
         r.add("semantic_search.search_defaults", "max_probes", q.max_probes);
         r.add("semantic_search.search_defaults", "first_pass_top_k", q.first_pass_top_k);
         r.add("semantic_search.search_defaults", "top_k", q.top_k);
-        r.add(
-            "semantic_search.search_defaults",
-            "probe_budget_fraction",
-            q.probe_budget_fraction.map_or("off".to_string(), |f| f.0.to_string()),
-        );
-        r.add("semantic_search.search_defaults", "probe_budget_floor", q.probe_budget_floor);
     }
 
     let v = &cfg.vector_index;

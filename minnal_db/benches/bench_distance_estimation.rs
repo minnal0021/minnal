@@ -418,8 +418,8 @@ fn bench_end_to_end_search(c: &mut Criterion) {
     let index = ClusterIndex::from_clusters(cluster_map.clone());
     let store = build_bench_store(&cluster_map, N_DOCS, 1);
     let dense_query = load_or_generate_embeddings().query;
-    // Every one of the 64 centres is probed: production's entry budget (42,000) covers
-    // every posting of a store this small, and this in-memory index has no entry counts.
+    // Every one of the 64 centres is probed, as production's default (256 postings)
+    // does on a store this small.
     let config = SemanticSearchConfig {
         probe: ProbeSettings::fixed(64),
         ..SemanticSearchConfig::default()

@@ -741,13 +741,11 @@ pub struct RecallCheckParams {
     /// Overlap@10 below which the verdict is `below_target` (default 0.95).
     #[serde(default)]
     pub min_overlap: Option<f64>,
-    /// Check a probe budget other than the namespace's (validated like a search's).
-    #[serde(default)]
-    pub probe_budget_entries: Option<u32>,
     /// Override of the namespace's `min_probes`.
     #[serde(default)]
     pub min_probes: Option<u32>,
-    /// Override of the namespace's `max_probes`.
+    /// Override of the namespace's `max_probes`: check what probing another
+    /// number of postings would find (validated like a search's).
     #[serde(default)]
     pub max_probes: Option<u32>,
 }
@@ -787,7 +785,6 @@ pub async fn vector_recall_check(
     let overrides = crate::routes::semantic_search::search_overrides(
         None,
         crate::routes::semantic_search::ProbeOverrides {
-            probe_budget_entries: params.probe_budget_entries,
             min_probes: params.min_probes,
             max_probes: params.max_probes,
         },

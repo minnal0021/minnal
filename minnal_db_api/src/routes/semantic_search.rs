@@ -77,25 +77,19 @@ use tracing::{debug, warn};
 use crate::{AppState, error::AppError, id::doc_id_to_value};
 
 /// One request's search overrides. Validated by the store against the same
-/// ranges as the namespace's settings (out of range is a 400). A request that
-/// gives `probe_budget_entries` reads exactly that budget, so it also turns a
-/// namespace's scaled budget off for that search.
+/// ranges as the namespace's settings (out of range is a 400).
 pub(crate) fn search_overrides(top_k: Option<Limit>, probe: ProbeOverrides, first_pass_top_k: Option<u32>) -> SearchSpec {
     SearchSpec {
-        probe_budget_entries: probe.probe_budget_entries,
         min_probes: probe.min_probes,
         max_probes: probe.max_probes,
         first_pass_top_k,
         top_k: top_k.map(|l| l.get() as u32),
-        probe_budget_fraction: probe.probe_budget_entries.map(|_| minnal_db::doc_store::vector_settings::Ratio(0.0)),
-        probe_budget_floor: None,
     }
 }
 
 /// A request's overrides of how many postings Pass 1 probes.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ProbeOverrides {
-    pub probe_budget_entries: Option<u32>,
     pub min_probes: Option<u32>,
     pub max_probes: Option<u32>,
 }
@@ -108,7 +102,6 @@ macro_rules! impl_probe_overrides {
         impl $t {
             pub(crate) fn probe(&self) -> ProbeOverrides {
                 ProbeOverrides {
-                    probe_budget_entries: self.probe_budget_entries,
                     min_probes: self.min_probes,
                     max_probes: self.max_probes,
                 }
@@ -140,15 +133,13 @@ pub struct SemanticSearchRequest {
     /// Override the number of results returned for this request only
     /// (clamped to 1,000). When `None`, the namespace's `search.top_k` is used.
     pub top_k: Option<Limit>,
-    /// Override the entries Pass 1 reads (1 to 10⁹), for this request only.
-    /// When `None`, the namespace's `search.probe_budget_entries` is used.
-    pub probe_budget_entries: Option<u32>,
-    /// Override the postings Pass 1 always probes (1 to 4096, at most
-    /// `max_probes`), for this request only. When `None`, the namespace's
+    /// Override the floor on postings (clusters) Pass 1 probes (1 to 4096, at
+    /// most `max_probes`), for this request only. When `None`, the namespace's
     /// `search.min_probes` is used.
     pub min_probes: Option<u32>,
-    /// Override the postings Pass 1 never exceeds (1 to 4096), for this
-    /// request only. When `None`, the namespace's `search.max_probes` is used.
+    /// Override the postings (clusters) Pass 1 probes, its nearest this many
+    /// (1 to 4096), for this request only. When `None`, the namespace's
+    /// `search.max_probes` is used.
     pub max_probes: Option<u32>,
     /// Override the number of candidates Pass 1 hands to Pass 2, for this
     /// request only (`top_k` to 10,000). When `None`, the namespace's
@@ -172,15 +163,13 @@ pub struct SemanticSearchFilteredRequest {
     /// Override the number of results returned for this request only
     /// (clamped to 1,000). When `None`, the namespace's `search.top_k` is used.
     pub top_k: Option<Limit>,
-    /// Override the entries Pass 1 reads (1 to 10⁹), for this request only.
-    /// When `None`, the namespace's `search.probe_budget_entries` is used.
-    pub probe_budget_entries: Option<u32>,
-    /// Override the postings Pass 1 always probes (1 to 4096, at most
-    /// `max_probes`), for this request only. When `None`, the namespace's
+    /// Override the floor on postings (clusters) Pass 1 probes (1 to 4096, at
+    /// most `max_probes`), for this request only. When `None`, the namespace's
     /// `search.min_probes` is used.
     pub min_probes: Option<u32>,
-    /// Override the postings Pass 1 never exceeds (1 to 4096), for this
-    /// request only. When `None`, the namespace's `search.max_probes` is used.
+    /// Override the postings (clusters) Pass 1 probes, its nearest this many
+    /// (1 to 4096), for this request only. When `None`, the namespace's
+    /// `search.max_probes` is used.
     pub max_probes: Option<u32>,
     /// Override the number of candidates Pass 1 hands to Pass 2, for this
     /// request only (`top_k` to 10,000). When `None`, the namespace's

@@ -171,7 +171,7 @@ enable semantic search
 
 **Who runs it.** One maintenance task per process serves every store, at most `[semantic_search.maintenance] threads` (default 2) stores at a time and never one store twice. The 2-means runs on the blocking thread pool, and a rebuild's k-means on a pool of its own (`rebuild_threads`, 1 or 2), never on the pool that search scoring uses. Per-document moves run in batches of 16 documents, one batch at a time, because a batch holds those documents' write locks and every write to them waits.
 
-**Probing at search time.** Pass 1 computes the distance from the query to **every** active posting's routing centre (nothing is pruned), then takes postings nearest first until their entries reach the probe budget (`probe_budget_entries`, default 42,000), reading at least `min_probes` and at most `max_probes` postings. The cost is T × C × D (query vectors × postings × dimensions); production sends one query vector, so it is one scan of the centres: about 9 µs at 256 postings, growing linearly with their number. Entry counts per posting are kept exactly in memory, loaded from `{ns}_sparse_vector_meta` at startup and updated by every write.
+**Probing at search time.** Pass 1 computes the distance from the query to **every** active posting's routing centre (nothing is pruned), then reads the `max_probes` nearest (default 256), or every posting of a store with fewer. `min_probes` (default 1) is a floor for a request that lowers `max_probes`. Splits and merges keep every posting between the merge and split limits, so the number of postings read bounds the entries read. The cost is T × C × D (query vectors × postings × dimensions); production sends one query vector, so it is one scan of the centres: about 9 µs at 256 postings, growing linearly with their number. Entry counts per posting are kept exactly in memory, loaded from `{ns}_sparse_vector_meta` at startup and updated by every write.
 
 ### 3.4 Parameters
 
@@ -187,9 +187,8 @@ Every store owns its partition settings: they are copied into its schema (`vecto
 | `split_init_trials` | 3 | 1–100 | Balanced 2-means: random starting pairs tried |
 | `split_max_iters` | 100 | 1–10,000 | Balanced 2-means: iteration cap |
 | `split_lambda_factor` | 100 | above 0 | Balanced 2-means: balance weight, λ ≤ 1 / (factor × samples) |
-| `search.probe_budget_entries` | 42,000 | | Entries Pass 1 reads |
-| `search.min_probes` / `max_probes` | 1 / 1,024 | | Bounds on the postings Pass 1 reads |
-| `search.probe_budget_fraction` / `probe_budget_floor` | unset / 20,000 | fraction 0–1 | Optional budget that scales with the store: `clamp(fraction × entries, floor, probe_budget_entries)` |
+| `search.max_probes` | 256 | 1–4,096 | Postings (clusters) Pass 1 reads: the nearest this many |
+| `search.min_probes` | 1 | 1–4,096, at most `max_probes` | Floor on the postings Pass 1 reads |
 
 The `split_*` settings are the values of SPFresh's reference implementation (SPTAG); at the default target a posting being split holds far fewer than 1,000 chunks, so every chunk takes part in every iteration. Two server-only settings sit under `[semantic_search.maintenance]`: `threads` (default 2, 1–64: stores maintained at once) and `rebuild_threads` (default 2, 1 or 2: a rebuild's k-means threads).
 
@@ -200,7 +199,7 @@ Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the ge
 | Choice | What it gains | What it costs |
 |---|---|---|
 | **Grow from one posting**, no seeding phase | Searchable from the first document; nothing to prepare; handles growth, topic drift and deletes the same way | Postings are placed one split at a time, so the partition trails static k-means. On FiQA recall@10 is 0.4–1.0 points behind at a 5% read share; on SciFact 0.9–1.8. Seeding with k-means on the first floats gained at most 0.3 points, for about 90 MB of staged floats |
-| **Target 128 chunks** | More recall per millisecond than 256 (FiQA: 0.971 against about 0.966 at 3.7 ms) | About twice as many postings, so more probes to fill the same budget (603 against 293 at 70,000 entries, about 3.5 µs each: p50 14.9 ms against 13.8 ms) and more splits while indexing |
+| **Target 128 chunks** | More recall per millisecond than 256 (FiQA: 0.971 against about 0.966 at 3.7 ms) | About twice as many postings, so twice the probes to read the same entries (603 against 293 at 70,000 entries, about 3.5 µs each: p50 14.9 ms against 13.8 ms) and more splits while indexing |
 | **Mean centres**, not SPFresh's medoid (the member nearest the mean) | With 1-bit codes a medoid is one member's noisy reconstruction, and the partition fragments (FiQA: 12,000–24,000 postings, recall@10 0.58–0.69 at a 1% read). The mean averages the noise away, and beat the medoid even on exact vectors | None measured |
 | **1-bit codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 20 MB of codes instead of 530 MB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors; 2-bit codes would add at most about a point at read shares of 2% or less |
 | **Codes keep their centre** when moved | No re-encoding, no embedding calls, no compounding error (re-encoding from a 1-bit code measured 0.861 against 0.918) | A moved code is a little less precise than a fresh encode against its new posting's centre. This is reported as *centre drift*; no ranking cost from it has been measured |
@@ -209,7 +208,7 @@ Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the ge
 | **Eager merges**, with refused splits | A small posting is merged as soon as it appears, instead of costing a probe on every query that reaches it | Needs the refused-split rule: on SciFact, 2-means split a 262-chunk posting into 259 and 3, the merge sent the 3 back, and the two alternated about 900 times in one pass. A refused posting stays a little over the split limit until its contents change |
 | **Error-bound gate off** by default | Keeps recall when topics arrive one at a time | On, it saves 12–17% of key moves for up to 0.9 points of recall@10 at a 1% read |
 | **Exact scan of every centre** at search and maintenance time | No approximation in the most recall-sensitive step; microseconds at thousands of postings | Linear in the number of postings: at about 100,000 postings (roughly 17 million chunks at FiQA's average posting size) the centres would need an index of their own |
-| **Rebuild only by hand** | A rebuild never runs unasked; it costs FiQA 143–151 s on 2 threads | A grown partition can trail a fresh k-means. A rebuild gained up to 4.4 points of recall@10 at a 1% read share and up to 1.3 at 5%; at the default budget nDCG did not change in any run. Use the recall check (§3.7) before and after to see whether it helped |
+| **Rebuild only by hand** | A rebuild never runs unasked; it costs FiQA 143–151 s on 2 threads | A grown partition can trail a fresh k-means. A rebuild gained up to 4.4 points of recall@10 at a 1% read share and up to 1.3 at 5%; at the default setting nDCG did not change in any run. Use the recall check (§3.7) before and after to see whether it helped |
 
 Deletes do not wear the partition down. Deleting half the documents at random, or whole topics, left FiQA within ±0.8 points of what the partition reached before the deletes. **Known limitation:** SciFact with qwen, after half of its topics were deleted, lost 2.5 points; a small store (87 postings left) is the worst case.
 
@@ -235,11 +234,11 @@ Deletes do not wear the partition down. Deleting half the documents at random, o
 |---|---|
 | `GET /admin/indices/{ns}/vector/partition` | Postings, entries, posting-size spread, splits, merges and key moves since start, and a running rebuild's progress. With `?codes=true` it also reads every code to report centre drift and the mean error band |
 | `GET /admin/indices/{ns}/vector/postings` | Every live posting with its size, centre, parent and how it was created (`root`, `split`, `rebuild`); cursor-paginated |
-| `GET /admin/indices/{ns}/vector/recall-check` | How much of a full read's top 10…100 a normal search finds within its budget, on a sample of real queries from the query-embedding cache (or, with fewer than 20 cached, stored chunks). Verdict `read_in_full`, `ok`, `below_target` (overlap@10 under `min_overlap`, default 0.95) or `empty` (no chunks stored). Pass the same `seed` before and after a rebuild to compare |
+| `GET /admin/indices/{ns}/vector/recall-check` | How much of a full read's top 10…100 a normal search finds among the postings it reads, on a sample of real queries from the query-embedding cache (or, with fewer than 20 cached, stored chunks). Verdict `read_in_full`, `ok`, `below_target` (overlap@10 under `min_overlap`, default 0.95) or `empty` (no chunks stored). Pass the same `seed` before and after a rebuild to compare |
 | `GET /admin/indices/{ns}/vector/history` | Past recall checks, `?codes=true` reads and rebuilds (kept `partition_history_ttl_secs`, default 30 days) |
 | `POST /admin/indices/{ns}/vector/rebuild` | Starts a rebuild (body optional: `{"postings": n}`) |
 
-Use the recall check, not centre drift, to decide on a rebuild. Drift measures how precise the codes are, and a rebuild makes it higher (every code ends up in a posting with a new centre). What a rebuild changes is which postings hold which chunks, and that is what the recall check measures. A low overlap that does not rise after a rebuild means the probe budget, not the partition, is the limit.
+Use the recall check, not centre drift, to decide on a rebuild. Drift measures how precise the codes are, and a rebuild makes it higher (every code ends up in a posting with a new centre). What a rebuild changes is which postings hold which chunks, and that is what the recall check measures. A low overlap that does not rise after a rebuild means `max_probes`, not the partition, is the limit.
 
 ---
 
@@ -257,8 +256,8 @@ Raw query text
   → cache it (TTL configurable; default 1 day)
 
 Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
-  rank every posting by the distance of q to its routing centre; take them
-    nearest first until their entries reach the probe budget
+  rank every posting by the distance of q to its routing centre; take the
+    max_probes nearest
     (several query vectors → union of their posting sets)
   scan_sparse_clusters_batch(probed ids)        ← one LSM pass per layer for all
                                                   probed clusters, then one value-log
@@ -290,9 +289,10 @@ Almost all of a warm query's time goes into Pass 1's sparse scan: merging the
 LSM layers for each probed cluster, then one value-log read per entry, then
 decoding and scoring. Pass 2 is small and roughly fixed, since it re-scores a
 capped candidate set. So latency follows **how many sparse entries the probed
-postings hold**, which the probe budget caps. On FiQA (57,638 documents,
-173,000 chunks) with gemma and the default 42,000-entry budget, a search
-reads 37% of the entries and takes about 8 ms, excluding the embedding call.
+postings hold**, which `max_probes` caps. On FiQA (57,638 documents,
+173,000 chunks, about 960 postings) with the default of 256 postings, a search
+reads 28% of the entries and takes about 6.4 ms, excluding the embedding call,
+within 0.001 nDCG of a full read at every cutoff from 10 to 100.
 
 That makes small, on-topic postings the main lever: they find more of the right
 documents per entry read. Centroids fitted on general text, rather than on the
@@ -489,8 +489,8 @@ Everything that shapes one store's index lives in its schema's `vector_index`. `
 | `embedding_dim` | `768` | Dimension of the vectors the service returns. Fixed once set. |
 | `chunking.window_size` / `sliding_size` | `4` / `2` | Sentences per document chunk, and the step between chunks (queries are not chunked). Fixed once set. |
 | `quantisation` | 1 / 8 bits, zero Pass-2 centre | Code widths and the rotation seed; read-only. |
-| `search.probe_budget_entries` | `42000` | Pass 1 probes the nearest postings until their entries reach this. |
-| `search.min_probes` / `max_probes` | `1` / `1024` | Bounds on postings probed. |
+| `search.max_probes` | `256` | Pass 1 reads the nearest this many postings (every posting of a store with fewer). |
+| `search.min_probes` | `1` | Floor on postings read, for requests that lower `max_probes`. |
 | `search.first_pass_top_k` | `1000` | Candidates kept after Pass 1 for dense re-ranking. |
 | `search.top_k` | `100` | Results returned. |
 | `maintenance.*` | see §3.4 | How the store's partition splits, reassigns and merges. |
@@ -527,7 +527,7 @@ measured on frozen BEIR embeddings by the vector bench
 | RaBitQ quantisation (encode + decode) | `minnal_db/src/semantic_search/quantisation/rabitq/mod.rs` |
 | `VectorIndex` struct + `VectorKvStore` trait | `minnal_db/src/semantic_search/index/vector_index.rs` |
 | Distance estimators (SingleBit, MultiBit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
-| A store's partition (postings, centres, routing epoch) + probing by budget | `minnal_db/src/semantic_search/cluster/layout.rs` |
+| A store's partition (postings, centres, routing epoch) + choosing the postings a search reads | `minnal_db/src/semantic_search/cluster/layout.rs` |
 | Split, reassignment, merge, rebuild and their journal | `minnal_db/src/ivf_split.rs`, `minnal_db/src/ivf_split/` |
 | Recall check and partition history | `minnal_db/src/ivf_split/recall_check.rs`, `ivf_split/history.rs` |
 | Background maintenance task and crash recovery | `minnal_db/src/doc_store/ivf_maintenance.rs` |
