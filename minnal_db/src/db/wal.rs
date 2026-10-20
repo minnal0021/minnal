@@ -358,9 +358,7 @@ impl WalMetadata {
 
     /// Reset all persisted counters to zero (rebuild paths recompute them).
     pub fn reset_segment_persisted(&mut self) {
-        for p in &mut self.segment_persisted_entries {
-            *p = 0;
-        }
+        self.segment_persisted_entries.fill(0);
     }
 
     /// Drop counters for every segment below `segment_id` (reclaimed), bumping

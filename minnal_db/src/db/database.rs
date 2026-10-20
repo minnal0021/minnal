@@ -2721,7 +2721,7 @@ impl Database {
         // Flush all namespaces that had recovered entries.
         if recovered_count > 0 {
             let stores = self.stores.read();
-            for (_, kv_store) in stores.iter() {
+            for kv_store in stores.values() {
                 let _ = kv_store.flush_and_compact_all();
             }
         }
@@ -2856,7 +2856,7 @@ impl Database {
     pub fn compact_lsm(&self) -> Result<()> {
         self.check_closed()?;
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for kv_store in stores.values() {
             kv_store.compact_lsm()?;
         }
         Ok(())
@@ -2874,7 +2874,7 @@ impl Database {
     pub(crate) fn compact_lsm_due(&self) -> Result<()> {
         self.check_closed()?;
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for kv_store in stores.values() {
             kv_store.compact_lsm_due()?;
         }
         Ok(())
@@ -3308,7 +3308,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn flush_all_namespaces(&self) -> Result<()> {
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for kv_store in stores.values() {
             kv_store.flush_and_compact_all()?;
         }
         Ok(())
@@ -3324,7 +3324,7 @@ impl Drop for Database {
 
         // Flush and sync each KVStore
         let stores = self.stores.read();
-        for (_, kv_store) in stores.iter() {
+        for kv_store in stores.values() {
             let _ = kv_store.shutdown();
         }
         drop(stores);

@@ -92,7 +92,7 @@ fn counter_merge(existing: Option<&[u8]>, operand: &[u8]) -> MergeResult {
 /// constant across a benchmark run so the storage cost does not drift.
 fn sorted_set_merge(existing: Option<&[u8]>, operand: &[u8]) -> MergeResult {
     let mut set: Vec<u64> = match existing {
-        Some(bytes) => bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
+        Some(bytes) => bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect(),
         None => Vec::with_capacity(SET_LEN),
     };
     let candidate = u64::from_le_bytes(operand.try_into().unwrap());

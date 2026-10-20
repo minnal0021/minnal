@@ -294,12 +294,10 @@ impl CountTable {
         }
         for &(id, chunks) in &delta.removed {
             let c = self.slot(id);
-            let _ = c
-                .entries
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            let _ = c.entries.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
             let _ = c
                 .chunks
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(u64::from(chunks))));
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(u64::from(chunks))));
         }
     }
 

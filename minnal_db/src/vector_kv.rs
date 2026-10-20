@@ -356,7 +356,7 @@ fn bytes_to_f32_vec_list(bytes: &[u8], expected_dim: usize) -> Option<Vec<Vec<f3
     }
     Some(
         rest.chunks_exact(expected_dim * 4)
-            .map(|chunk| chunk.chunks_exact(4).map(|c| f32::from_be_bytes(c.try_into().unwrap())).collect())
+            .map(|chunk| chunk.as_chunks::<4>().0.iter().map(|c| f32::from_be_bytes(*c)).collect())
             .collect(),
     )
 }
@@ -1350,7 +1350,7 @@ pub(crate) fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 pub(crate) fn bytes_to_f32s(b: &[u8]) -> Option<Vec<f32>> {
-    (b.len().is_multiple_of(4)).then(|| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    (b.len().is_multiple_of(4)).then(|| b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 pub(crate) fn id_from_key(k: &[u8]) -> Option<u32> {

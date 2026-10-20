@@ -120,9 +120,7 @@ impl IndexOverlayBudget {
             let d = delta.unsigned_abs();
             // Saturate rather than wrap: a release can never exceed what was
             // charged, but a wrapped counter would read as permanently full.
-            let _ = self
-                .used
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(d)));
+            let _ = self.used.try_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(d)));
         }
     }
 }

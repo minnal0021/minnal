@@ -222,8 +222,7 @@ fn fwht(x: &mut [f32]) {
     let n = x.len();
     debug_assert!(n.is_power_of_two());
     if n >= 8 {
-        for c in x.chunks_exact_mut(8) {
-            let c: &mut [f32; 8] = c.try_into().unwrap();
+        for c in x.as_chunks_mut::<8>().0 {
             fwht8(c);
         }
     } else {
@@ -277,7 +276,7 @@ mod x86 {
         if n < 128 {
             return fwht(x);
         }
-        for tile in x.chunks_exact_mut(128) {
+        for tile in x.as_chunks_mut::<128>().0 {
             // SAFETY: `tile` is exactly 128 f32s = 8 registers; unaligned loads/stores.
             unsafe {
                 let mut r = [_mm512_setzero_ps(); 8];
@@ -322,7 +321,7 @@ mod x86 {
         if n < 8 {
             return fwht(x);
         }
-        for c in x.chunks_exact_mut(8) {
+        for c in x.as_chunks_mut::<8>().0 {
             // SAFETY: `c` is exactly 8 f32s; unaligned load/store.
             unsafe {
                 let mut v = _mm256_loadu_ps(c.as_ptr());

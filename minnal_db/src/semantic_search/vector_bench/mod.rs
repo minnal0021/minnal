@@ -298,8 +298,10 @@ fn drifting_topics(frozen_dir: &std::path::Path, n_docs: usize) -> (Vec<usize>, 
         })
     };
     let order: Vec<usize> = read("drifting.order.u32")
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b) as usize)
         .collect();
     let topics = read("topics.u8");
     assert_eq!(

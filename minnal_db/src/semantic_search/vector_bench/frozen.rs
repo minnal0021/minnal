@@ -380,10 +380,10 @@ fn write_u32(path: &PathBuf, v: &[u32]) {
 
 fn read_f32(path: &Path) -> Vec<f32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn read_u32(path: &Path) -> Vec<u32> {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
 }

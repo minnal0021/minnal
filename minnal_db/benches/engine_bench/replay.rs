@@ -84,7 +84,7 @@ fn read_record(r: &mut impl Read, buf: &mut Vec<u8>) -> std::io::Result<Option<(
     if !exact(r, buf)? {
         return Ok(None);
     }
-    let v = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let v = buf.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     Ok(Some((k, v)))
 }
 

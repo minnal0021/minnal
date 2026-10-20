@@ -263,7 +263,7 @@ impl Record {
             3 => JournalState::Copied,
             _ => return None,
         };
-        let ids: Vec<u32> = v[3..].chunks_exact(4).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
+        let ids: Vec<u32> = v[3..].as_chunks::<4>().0.iter().map(|b| u32::from_be_bytes(*b)).collect();
         let op = match (v[1], ids.len()) {
             (KIND_SPLIT, 5) => Op::Split {
                 posting: ids[0],
