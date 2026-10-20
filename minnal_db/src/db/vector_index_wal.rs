@@ -628,7 +628,9 @@ fn read_progress(dir: &Path) -> Result<Option<Progress>> {
         return Err(bad("length does not match its entry count"));
     }
     let safe = body[RETIRED_CUT_HEADER_LEN..]
-        .chunks_exact(RETIRED_CUT_ENTRY_LEN)
+        .as_chunks::<RETIRED_CUT_ENTRY_LEN>()
+        .0
+        .iter()
         .map(|e| {
             (
                 u32::from_le_bytes(e[0..4].try_into().unwrap()),

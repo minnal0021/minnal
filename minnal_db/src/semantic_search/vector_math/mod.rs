@@ -125,12 +125,10 @@ pub fn pack(binary_quantized_embeddings: &[u8]) -> Result<Vec<u128>, Box<dyn Err
     }
 
     Ok(binary_quantized_embeddings
-        .chunks_exact(16)
-        .map(|chunk| {
-            let mut array = [0u8; 16];
-            array.copy_from_slice(chunk);
-            u128::from_le_bytes(array)
-        })
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| u128::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -140,12 +138,10 @@ pub fn pack_to_signed_128(binary_quantized_embeddings: &[u8]) -> Result<Vec<i128
     }
 
     Ok(binary_quantized_embeddings
-        .chunks_exact(16)
-        .map(|chunk| {
-            let mut array = [0u8; 16];
-            array.copy_from_slice(chunk);
-            i128::from_le_bytes(array)
-        })
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| i128::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -155,12 +151,10 @@ pub fn pack_to_signed_64(binary_quantized_embeddings: &[u8]) -> Result<Vec<i64>,
     }
 
     Ok(binary_quantized_embeddings
-        .chunks_exact(8)
-        .map(|chunk| {
-            let mut array = [0u8; 8];
-            array.copy_from_slice(chunk);
-            i64::from_le_bytes(array)
-        })
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| i64::from_le_bytes(*chunk))
         .collect())
 }
 

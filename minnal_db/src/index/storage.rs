@@ -111,7 +111,9 @@ pub fn decode_dir(bytes: &[u8]) -> Result<Vec<DirEntry>, StorageError> {
         return Err(StorageError("directory checksum mismatch".into()));
     }
     let entries: Vec<DirEntry> = bytes[DIR_HEADER..body]
-        .chunks_exact(DIR_ENTRY)
+        .as_chunks::<DIR_ENTRY>()
+        .0
+        .iter()
         .map(|c| DirEntry {
             key: u128::from_le_bytes(c[0..16].try_into().unwrap()),
             offset: u64::from_le_bytes(c[16..24].try_into().unwrap()),
