@@ -175,8 +175,7 @@ pub async fn recall_check(
     given: Vec<Vec<f32>>,
 ) -> Result<RecallCheck, crate::KVError> {
     let started = Instant::now();
-    let dim = handle.snapshot().dim();
-    let given: Vec<Vec<f32>> = given.into_iter().filter(|q| q.len() == dim).filter_map(normalised).collect();
+    let given: Vec<Vec<f32>> = given.into_iter().filter_map(normalised).collect();
     let (query_source, queries) = if given.len() >= MIN_GIVEN_QUERIES {
         (QuerySource::CachedQueries, sample_given(given, params))
     } else {
