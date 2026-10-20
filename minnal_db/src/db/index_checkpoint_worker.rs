@@ -22,6 +22,40 @@ use log::{debug, error, info};
 /// so logging each one drowns the log. A slow one is the useful signal: it means
 /// a field's blob store is compacting, or fsyncs are contending.
 const SLOW_CHECKPOINT: Duration = Duration::from_millis(250);
+
+/// At most one slow-checkpoint notice is logged per this period.
+///
+/// A store with many fields can be over [`SLOW_CHECKPOINT`] on every tick (14
+/// fields measured ~450 ms each), which logged one INFO line per tick. The
+/// notice now summarises the slow checkpoints since the last one instead.
+const SLOW_CHECKPOINT_NOTICE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Rate limiter for the slow-checkpoint INFO notice. Owned by the worker task.
+#[derive(Default)]
+struct SlowCheckpointNotice {
+    last_logged: Option<std::time::Instant>,
+    /// Slow checkpoints since the last notice, including the one being logged.
+    slow_count: u64,
+    /// Slowest checkpoint since the last notice.
+    max_elapsed: Duration,
+}
+
+impl SlowCheckpointNotice {
+    /// Record a slow checkpoint; returns `(count, max)` when a notice is due.
+    fn record(&mut self, elapsed: Duration, now: std::time::Instant) -> Option<(u64, Duration)> {
+        self.slow_count += 1;
+        self.max_elapsed = self.max_elapsed.max(elapsed);
+        let due = self.last_logged.is_none_or(|t| now.duration_since(t) >= SLOW_CHECKPOINT_NOTICE_PERIOD);
+        if !due {
+            return None;
+        }
+        let summary = (self.slow_count, self.max_elapsed);
+        self.last_logged = Some(now);
+        self.slow_count = 0;
+        self.max_elapsed = Duration::ZERO;
+        Some(summary)
+    }
+}
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
@@ -164,13 +198,14 @@ impl IndexCheckpointWorker {
     ) {
         info!("[IndexCheckpointWorker] started (interval={}ms)", interval.as_millis());
         let mut ticker = time::interval(interval);
+        let mut notice = SlowCheckpointNotice::default();
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     match target.upgrade() {
-                        Some(t) => Self::perform_checkpoint(&t, &pending),
+                        Some(t) => Self::perform_checkpoint(&t, &pending, &mut notice),
                         None => break,
                     }
                 }
@@ -180,7 +215,7 @@ impl IndexCheckpointWorker {
                         IndexCheckpointCommand::TriggerNow => {
                             debug!("[IndexCheckpointWorker] immediate checkpoint triggered");
                             match target.upgrade() {
-                                Some(t) => Self::perform_checkpoint(&t, &pending),
+                                Some(t) => Self::perform_checkpoint(&t, &pending, &mut notice),
                                 None => break,
                             }
                         }
@@ -204,11 +239,11 @@ impl IndexCheckpointWorker {
 
     /// A checkpoint is a pass of fsyncs (~55 ms with three fields): see
     /// [`run_blocking_pass`](crate::support::run_blocking_pass).
-    fn perform_checkpoint<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool) {
-        crate::support::run_blocking_pass(|| Self::checkpoint_pass(target, pending));
+    fn perform_checkpoint<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool, notice: &mut SlowCheckpointNotice) {
+        crate::support::run_blocking_pass(|| Self::checkpoint_pass(target, pending, notice));
     }
 
-    fn checkpoint_pass<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool) {
+    fn checkpoint_pass<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool, notice: &mut SlowCheckpointNotice) {
         // Clear the debounce flag as we commit to running: any backpressure
         // request arriving *during* this checkpoint re-arms the valve and queues a
         // follow-up, so writes made while we run are not missed.
@@ -223,18 +258,24 @@ impl IndexCheckpointWorker {
         //
         // What stays at INFO is a checkpoint that took long enough to be worth
         // an operator's attention: it is the one signal in here that says the
-        // index is struggling (a large blob compaction, or fsync contention).
+        // index is struggling (a large blob compaction, or fsync contention) —
+        // rate-limited to one summary per `SLOW_CHECKPOINT_NOTICE_PERIOD`, since
+        // a store with many fields can be slow on every tick.
         debug!("[IndexCheckpointWorker] tick — starting index checkpoint");
         let start = std::time::Instant::now();
         match target.run_index_checkpoint() {
             Ok(count) => {
                 let elapsed = start.elapsed();
                 if elapsed >= SLOW_CHECKPOINT {
-                    info!(
-                        "[IndexCheckpointWorker] checkpoint took {:?} — {} field(s) flushed \
-                         (over the {:?} notice threshold; a field's blob may be compacting)",
-                        elapsed, count, SLOW_CHECKPOINT
-                    );
+                    match notice.record(elapsed, std::time::Instant::now()) {
+                        Some((slow, max)) => info!(
+                            "[IndexCheckpointWorker] checkpoint took {:?} — {} field(s) flushed; \
+                             {} checkpoint(s) over the {:?} notice threshold since the last \
+                             notice, slowest {:?} (a field's blob may be compacting)",
+                            elapsed, count, slow, SLOW_CHECKPOINT, max
+                        ),
+                        None => debug!("[IndexCheckpointWorker] slow checkpoint in {:?} — {} field(s) flushed", elapsed, count),
+                    }
                 } else {
                     debug!(
                         "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
@@ -253,6 +294,22 @@ impl IndexCheckpointWorker {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn slow_checkpoint_notice_is_logged_at_most_once_per_period() {
+        let mut notice = SlowCheckpointNotice::default();
+        let t0 = std::time::Instant::now();
+        let ms = Duration::from_millis;
+        // The first slow checkpoint is reported at once.
+        assert_eq!(notice.record(ms(300), t0), Some((1, ms(300))));
+        // Within the period: suppressed, but counted.
+        assert_eq!(notice.record(ms(500), t0 + ms(1_750)), None);
+        assert_eq!(notice.record(ms(400), t0 + ms(3_500)), None);
+        // Once the period has passed, one summary covers all three.
+        let t1 = t0 + SLOW_CHECKPOINT_NOTICE_PERIOD;
+        assert_eq!(notice.record(ms(260), t1), Some((3, ms(500))));
+        assert_eq!(notice.record(ms(260), t1 + ms(1)), None);
+    }
 
     struct FakeTarget {
         closed: AtomicBool,
