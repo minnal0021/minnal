@@ -425,10 +425,18 @@ mod with_service {
         let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
         let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
         let settle = |partition: Arc<crate::semantic_search::PartitionHandle>| async move {
-            // Maintenance is woken asynchronously; wait until it has nothing left.
-            for _ in 0..100 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Maintenance is woken asynchronously; wait until it has nothing
+            // left: the partition unchanged over ten idle polls in a row.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let (mut last, mut quiet) = (None, 0);
+            while quiet < 10 {
+                assert!(std::time::Instant::now() < deadline, "maintenance never settled");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let _idle = partition.lock_maintenance().await;
+                let c = partition.counters().read();
+                let now = Some((partition.snapshot().postings(), c.splits, c.merges));
+                quiet = if now == last { quiet + 1 } else { 0 };
+                last = now;
             }
         };
         settle(Arc::clone(&partition)).await;

@@ -226,24 +226,87 @@ enum Flushed {
     All,
 }
 
-/// A crash before every write of a split, under several flush patterns: after
-/// reopening and recovering, every invariant holds and a later split finishes
-/// the job.
-#[tokio::test]
-async fn a_split_survives_a_crash_before_any_write() {
+/// The operation a crash audit stops part-way.
+#[derive(Clone, Copy, Debug)]
+enum Audited {
+    /// `split_posting` of the root, which must split.
+    Split,
+    /// `maintain_partition`.
+    Maintain,
+    /// `rebuild_partition` into four postings.
+    Rebuild,
+}
+
+/// Run `op`; `false` if it finished but did not do what the audit expects.
+async fn run_audited(db: &AsyncDb, h: &PartitionHandle, op: Audited, ops: &MaintenanceOps) -> Result<bool, crate::KVError> {
+    Ok(match op {
+        Audited::Split => matches!(split_posting(db, NS, h, 0, ops).await?, SplitOutcome::Split { .. }),
+        Audited::Maintain => maintain_partition(db, NS, h, ops).await.map(|_| true)?,
+        Audited::Rebuild => rebuild::rebuild_partition(db, NS, h, ops, &rebuild_params(4)).await.map(|_| true)?,
+    })
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// Stop `op` before its `n`th write for every `n`, under every flush pattern,
+/// each case on a fresh copy of the shut-down database in `template`: after
+/// the crash, reopening, recovering and maintaining, every invariant holds and
+/// each document holds `want` chunks. Returns the writes of an uncrashed run
+/// and every failure.
+///
+/// The crash point is thread-local, so the cases are spread over a few
+/// threads, each with its own current-thread runtime: thread `t` takes every
+/// `n ≡ t` (mod threads) until a run finishes without crashing.
+fn crash_audit(template: &std::path::Path, want: &BTreeMap<Vec<u8>, usize>, op: Audited, ops: MaintenanceOps) -> (usize, Vec<String>) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    rt.block_on(crash_cases(template, want, op, ops, t, threads))
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let writes = results.iter().map(|(w, _)| *w).min().unwrap();
+    (writes, results.into_iter().flat_map(|(_, f)| f).collect())
+}
+
+async fn crash_cases(
+    template: &std::path::Path,
+    want: &BTreeMap<Vec<u8>, usize>,
+    op: Audited,
+    ops: MaintenanceOps,
+    first: usize,
+    step: usize,
+) -> (usize, Vec<String>) {
     let mut failures = Vec::new();
-    let mut writes_seen = 0;
+    let mut writes_seen = usize::MAX;
     for flushed in [Flushed::None, Flushed::Sparse, Flushed::Meta, Flushed::All] {
-        for n in 0.. {
+        for n in (first..).step_by(step) {
             let dir = TempDir::new().unwrap();
-            let db = setup(&dir, 20).await; // 60 chunks
+            copy_dir(template, dir.path());
+            let db = open(&dir).await;
             let h = handle(&db).await;
             crate::vector_kv::crash_point::arm(n);
-            let result = split_posting(&db, NS, &h, 0, &settings(40)).await;
+            let result = run_audited(&db, &h, op, &ops).await;
             let crashed = crate::vector_kv::crash_point::disarm();
             if !crashed {
-                assert!(matches!(result.unwrap(), SplitOutcome::Split { .. }));
-                writes_seen = n;
+                assert!(result.unwrap(), "{op:?} did not do its job");
+                writes_seen = writes_seen.min(n);
             }
             let names = match flushed {
                 Flushed::None => vec![],
@@ -256,10 +319,10 @@ async fn a_split_survives_a_crash_before_any_write() {
             db.crash().await; // unflushed no-WAL writes are lost
             let db = open(&dir).await;
             let h = handle(&db).await;
-            recover(&db, NS, &h, &settings(40)).await.unwrap();
-            maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
-            if let Err(e) = check(&db, &h, &expected(20)).await {
-                failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
+            recover(&db, NS, &h, &ops).await.unwrap();
+            maintain_partition(&db, NS, &h, &ops).await.unwrap();
+            if let Err(e) = check(&db, &h, want).await {
+                failures.push(format!("{op:?}, crash before write {n}, flushed {flushed:?}: {e}"));
             }
             db.shutdown().await.unwrap();
             if !crashed {
@@ -267,7 +330,18 @@ async fn a_split_survives_a_crash_before_any_write() {
             }
         }
     }
-    assert!(writes_seen > 20, "the scenario must cover a whole split ({writes_seen} writes)");
+    (writes_seen, failures)
+}
+
+/// A crash before every write of a split, under several flush patterns: after
+/// reopening and recovering, every invariant holds and a later split finishes
+/// the job.
+#[tokio::test]
+async fn a_split_survives_a_crash_before_any_write() {
+    let template = TempDir::new().unwrap();
+    setup(&template, 20).await.shutdown().await.unwrap(); // 60 chunks
+    let (writes, failures) = crash_audit(template.path(), &expected(20), Audited::Split, settings(40));
+    assert!(writes > 20, "the scenario must cover a whole split ({writes} writes)");
     assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
 }
 
@@ -564,43 +638,12 @@ async fn deletes_merge_small_postings_and_never_the_last() {
 async fn reassign_and_merge_survive_a_crash_before_any_write() {
     let mut failures = Vec::new();
     for scenario in [Scenario::Reassign, Scenario::Merge] {
-        let ops = scenario_ops(scenario);
-        let mut writes_seen = 0;
-        for flushed in [Flushed::None, Flushed::Sparse, Flushed::Meta, Flushed::All] {
-            for n in 0.. {
-                let dir = TempDir::new().unwrap();
-                let (db, want) = prepare(&dir, scenario).await;
-                let h = handle(&db).await;
-                crate::vector_kv::crash_point::arm(n);
-                let result = maintain_partition(&db, NS, &h, &ops).await;
-                let crashed = crate::vector_kv::crash_point::disarm();
-                if !crashed {
-                    result.unwrap();
-                    writes_seen = n;
-                }
-                let names = match flushed {
-                    Flushed::None => vec![],
-                    Flushed::Sparse => vec![sparse_vectors_ns(NS)],
-                    Flushed::Meta => vec![sparse_vectors_meta_ns(NS)],
-                    Flushed::All => crate::vector_kv::companion_namespaces(NS),
-                };
-                db.flush_namespaces(names).await.unwrap();
-                drop(h);
-                db.crash().await; // unflushed no-WAL writes are lost
-                let db = open(&dir).await;
-                let h = handle(&db).await;
-                recover(&db, NS, &h, &ops).await.unwrap();
-                maintain_partition(&db, NS, &h, &ops).await.unwrap();
-                if let Err(e) = check(&db, &h, &want).await {
-                    failures.push(format!("{scenario:?}, crash before write {n}, flushed {flushed:?}: {e}"));
-                }
-                db.shutdown().await.unwrap();
-                if !crashed {
-                    break;
-                }
-            }
-        }
-        assert!(writes_seen > 10, "{scenario:?} must cover a whole run ({writes_seen} writes)");
+        let template = TempDir::new().unwrap();
+        let (db, want) = prepare(&template, scenario).await;
+        db.shutdown().await.unwrap();
+        let (writes, f) = crash_audit(template.path(), &want, Audited::Maintain, scenario_ops(scenario));
+        assert!(writes > 10, "{scenario:?} must cover a whole run ({writes} writes)");
+        failures.extend(f.into_iter().map(|e| format!("{scenario:?}: {e}")));
     }
     assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
 }
@@ -857,44 +900,11 @@ async fn a_rebuild_fits_postings_to_the_chunks_they_hold() {
 /// after reopening and recovering, every invariant holds.
 #[tokio::test]
 async fn a_rebuild_survives_a_crash_before_any_write() {
-    let ops = full(40, 3, 8);
-    let mut failures = Vec::new();
-    let mut writes_seen = 0;
-    for flushed in [Flushed::None, Flushed::Sparse, Flushed::Meta, Flushed::All] {
-        for n in 0.. {
-            let dir = TempDir::new().unwrap();
-            let (db, want) = prepare(&dir, Scenario::Reassign).await;
-            let h = handle(&db).await;
-            crate::vector_kv::crash_point::arm(n);
-            let result = rebuild::rebuild_partition(&db, NS, &h, &ops, &rebuild_params(4)).await;
-            let crashed = crate::vector_kv::crash_point::disarm();
-            if !crashed {
-                result.unwrap();
-                writes_seen = n;
-            }
-            let names = match flushed {
-                Flushed::None => vec![],
-                Flushed::Sparse => vec![sparse_vectors_ns(NS)],
-                Flushed::Meta => vec![sparse_vectors_meta_ns(NS)],
-                Flushed::All => crate::vector_kv::companion_namespaces(NS),
-            };
-            db.flush_namespaces(names).await.unwrap();
-            drop(h);
-            db.crash().await; // unflushed no-WAL writes are lost
-            let db = open(&dir).await;
-            let h = handle(&db).await;
-            recover(&db, NS, &h, &ops).await.unwrap();
-            maintain_partition(&db, NS, &h, &ops).await.unwrap();
-            if let Err(e) = check(&db, &h, &want).await {
-                failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
-            }
-            db.shutdown().await.unwrap();
-            if !crashed {
-                break;
-            }
-        }
-    }
-    assert!(writes_seen > 40, "the scenario must cover a whole rebuild ({writes_seen} writes)");
+    let template = TempDir::new().unwrap();
+    let (db, want) = prepare(&template, Scenario::Reassign).await;
+    db.shutdown().await.unwrap();
+    let (writes, failures) = crash_audit(template.path(), &want, Audited::Rebuild, full(40, 3, 8));
+    assert!(writes > 40, "the scenario must cover a whole rebuild ({writes} writes)");
     assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
 }
 
