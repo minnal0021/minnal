@@ -209,7 +209,7 @@ A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each d
 2. The `max_probes` postings nearest the query vector by Euclidean distance are chosen (every posting, when the namespace has fewer).
 3. All SingleBit (document-chunk) entries for the probed postings are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
-5. Candidates are scored with **ColBERT MaxSim**, which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.
+5. Candidates are scored with **ColBERT MaxSim** (see [Acknowledgements](#colbertv2)), which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.
 6. The top `first_pass_top_k` candidates (a store search setting, default 1,000) are retained.
 
 **Pass 2 — Dense (MultiBit):**
@@ -401,6 +401,28 @@ The quantisation scheme used in the `semantic-search` layer is RaBitQ, which pro
 The reference C++ implementation of RaBitQ, which informed the multi-bit quantisation and distance estimation code in this project, is available at:
 
 > https://github.com/gaoj0017/RaBitQ
+
+### ColBERTv2
+
+Pass 1 scores a document by ColBERT's late-interaction MaxSim: each query vector is matched against every one of the document's vectors, and the best match counts. ColBERTv2 also showed that a multi-vector index stays small when each vector is stored as its nearest centroid plus a low-bit residual; minnal's 1-bit chunk codes are likewise encoded relative to their posting's centre. minnal applies both ideas to sentence-window chunk embeddings rather than to per-token embeddings, and embeds the query as a single vector, so MaxSim picks each document's best-matching chunk.
+
+> **ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction**
+> Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, Matei Zaharia
+> *NAACL '22*
+> https://arxiv.org/abs/2112.01488
+
+### PLAID
+
+PLAID is the retrieval engine for ColBERTv2 indexes. It finds candidates through the centroids nearest the query and scores them cheaply from compressed data, so that only a short list gets the full, more expensive score. minnal's two-pass search has the same shape: Pass 1 scores the 1-bit codes in the probed postings to choose candidates, and Pass 2 rescores only those. Unlike PLAID, Pass 2 rescores a separate 8-bit whole-document vector rather than decompressing the first pass's vectors.
+
+> **PLAID: An Efficient Engine for Late Interaction Retrieval**
+> Keshav Santhanam, Omar Khattab, Christopher Potts, Matei Zaharia
+> *ACM CIKM '22*
+> https://arxiv.org/abs/2205.09707
+
+The reference implementation of ColBERTv2 and PLAID is available at:
+
+> https://github.com/stanford-futuredata/ColBERT
 
 ### SPFresh
 
