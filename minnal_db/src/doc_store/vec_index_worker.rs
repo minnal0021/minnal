@@ -346,6 +346,37 @@ impl VecIndexWorker {
                 );
             }
 
+            // Each namespace's settings, read once per pass: not cached across
+            // passes, because a dropped namespace can be recreated under the same
+            // name with another model.
+            //
+            // A store being dropped (or whose schema the drop already removed)
+            // fails to resolve; its entries leave this pass rather than each
+            // failing with a warning. The drop clears them from the queue, and
+            // any it misses are discarded as orphans on the next pass.
+            let mut resolved_all: HashMap<String, Result<Arc<NamespaceSemantics>, String>> = HashMap::new();
+            let mut dropping: Vec<String> = Vec::new();
+            for ns in by_namespace.keys() {
+                let resolved = match self.schemas.vector_settings(ns) {
+                    Ok((settings, ns_id)) => self.ctx.for_namespace(&self.db, ns, ns_id, &settings).await.map(Arc::new),
+                    Err(e) => Err(e),
+                }
+                .map_err(|e| e.to_string());
+                if let Err(e) = &resolved {
+                    if self.ctx.is_dropping(ns) || !self.schemas.contains(ns) {
+                        dropping.push(ns.clone());
+                        continue;
+                    }
+                    warn!("vec index worker: cannot embed for namespace '{ns}': {e}");
+                }
+                resolved_all.insert(ns.clone(), resolved);
+            }
+            for ns in dropping {
+                let skipped = by_namespace.remove(&ns).map_or(0, |q| q.len());
+                info!("vec index worker: skipped {skipped} queue entry/entries for namespace '{ns}', which is being dropped");
+            }
+            let semantics = Arc::new(resolved_all);
+
             if by_namespace.is_empty() {
                 return;
             }
@@ -365,23 +396,6 @@ impl VecIndexWorker {
                     break;
                 }
             }
-
-            // Each namespace's settings, read once per pass: not cached across
-            // passes, because a dropped namespace can be recreated under the same
-            // name with another model.
-            let mut resolved_all: HashMap<String, Result<Arc<NamespaceSemantics>, String>> = HashMap::new();
-            for ns in by_namespace.keys() {
-                let resolved = match self.schemas.vector_settings(ns) {
-                    Ok((settings, ns_id)) => self.ctx.for_namespace(&self.db, ns, ns_id, &settings).await.map(Arc::new),
-                    Err(e) => Err(e),
-                }
-                .map_err(|e| e.to_string());
-                if let Err(e) = &resolved {
-                    warn!("vec index worker: cannot embed for namespace '{ns}': {e}");
-                }
-                resolved_all.insert(ns.clone(), resolved);
-            }
-            let semantics = Arc::new(resolved_all);
 
             // Process work_queue with bounded concurrency.
             let concurrency = self.config.concurrency.max(1);
