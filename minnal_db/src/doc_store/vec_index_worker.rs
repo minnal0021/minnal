@@ -82,6 +82,8 @@ enum Processed {
     /// Nothing left: a `Clear` entry, whose writes are all WAL-backed, completes
     /// itself.
     Done,
+    /// Skipped: the namespace is being dropped, and the drop removes the entry.
+    Dropped,
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -427,6 +429,13 @@ impl VecIndexWorker {
                             any_failed |= failed > 0;
                         }
                     }
+                    Ok((entry, Ok(Processed::Dropped))) => {
+                        debug!(
+                            "vec index worker: skipped ns='{}' doc='{}': the namespace is being dropped",
+                            entry.namespace,
+                            doc_id_display(&entry.doc_id_bytes),
+                        );
+                    }
                     Ok((entry, Ok(Processed::Done))) => {
                         indexed_count += 1;
                         debug!(
@@ -506,6 +515,11 @@ impl VecIndexWorker {
                     Some(Err(e)) => return Err(DocStoreError::EmbeddingFailed(e.clone())),
                     None => return Err(DocStoreError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
                 };
+                // The partition was resolved at the start of the pass; a drop
+                // since then marks it. No embedding call for a dropped store.
+                if ns.partition.is_dropped() {
+                    return Ok(Processed::Dropped);
+                }
                 // The network call runs outside the routing epoch; routing,
                 // the write and its count update run inside it, against the
                 // snapshot current at that moment (a split may have published a
@@ -514,6 +528,12 @@ impl VecIndexWorker {
                     .await
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
                 let _epoch = ns.partition.read_epoch().await;
+                // Checked again inside the epoch, which the drop waits out
+                // before removing the namespaces: a write after the removal
+                // would recreate them.
+                if ns.partition.is_dropped() {
+                    return Ok(Processed::Dropped);
+                }
                 let ivf = ns.partition.snapshot();
                 let vector_indexes = crate::semantic_search::service::index_embeddings(&ns.config, &*ivf, &dense, &chunks)
                     .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
@@ -525,6 +545,19 @@ impl VecIndexWorker {
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {
+                // As for an embed: the clear's deletes resolve the vector
+                // namespaces with get-or-create too.
+                let partition = match semantics {
+                    Some(Ok(ns)) => Some(&ns.partition),
+                    _ => None,
+                };
+                let _epoch = match partition {
+                    Some(p) => Some(p.read_epoch().await),
+                    None => None,
+                };
+                if partition.is_some_and(|p| p.is_dropped()) || self.ctx.is_dropping(&entry.namespace) {
+                    return Ok(Processed::Dropped);
+                }
                 let delta = vector_kv::process_clear(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
                 self.ctx.apply_posting_delta(&entry.namespace, &delta);
                 Ok(Processed::Done)

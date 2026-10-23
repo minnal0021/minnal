@@ -88,6 +88,7 @@ impl DocStore {
     /// stopping after `stop_after` steps (each drop, the reset and each re-add
     /// is one step) to simulate a crash in tests.
     pub(super) async fn reindex_all_until(&self, namespace: &str, stop_after: Option<usize>) -> Result<Vec<IndexBuildHandle>, DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),

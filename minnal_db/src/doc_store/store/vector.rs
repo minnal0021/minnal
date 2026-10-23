@@ -452,16 +452,7 @@ impl DocStore {
     /// queue for a namespace before dropping it or when forcing a clean slate.
     #[cfg(feature = "semantic-search")]
     pub async fn delete_all_queue_entries(&self, namespace: &str) -> Result<usize, DocStoreError> {
-        let entries = vector_kv::list_queue_entries(&self.db).await?;
-        let to_delete: Vec<_> = entries.into_iter().filter(|e| e.namespace == namespace).collect();
-        let count = to_delete.len();
-        if count == 0 {
-            return Ok(0);
-        }
-        for entry in &to_delete {
-            vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
-        }
-        Ok(count)
+        Ok(vector_kv::clear_queue_for(&self.db, namespace).await?)
     }
 
     /// Validate that `namespace` exists and has semantic search enabled.
@@ -561,7 +552,9 @@ impl DocStore {
         // 409 guard: one reindex of a namespace enqueues at a time. Held until
         // this function returns, however it returns.
         let reindex_path = vec_reindex_path(&self.db_path, ns_id);
+        let _write = self.writes.enter(namespace)?;
         let _claim = ReindexClaim::take(&self.vec_reindexing, namespace)?;
+        self.check_not_dropping(namespace)?;
 
         // Write "running" reindex record immediately so the guard works even
         // if the process crashes before we finish enqueueing.
@@ -602,7 +595,7 @@ impl DocStore {
 
         // Scan all documents in the namespace.
         info!("index_all: namespace='{}' scanning all documents", namespace);
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let all_docs = ns.iter().await?;
         let total_docs = all_docs.len();
         info!("index_all: namespace='{}' document scan done — total_docs={}", namespace, total_docs);
@@ -625,6 +618,7 @@ impl DocStore {
                 };
                 let text = build_embedding_text(&doc, &schema.embedding_fields);
                 if !text.is_empty() {
+                    self.check_not_dropping(namespace)?;
                     vector_kv::enqueue_embed(&self.db, namespace, key, &text).await?;
                     enqueued += 1;
                 } else {
@@ -727,7 +721,9 @@ impl DocStore {
         // 409 guard: one reindex of a namespace enqueues at a time. Held until
         // this function returns, however it returns.
         let reindex_path = vec_reindex_path(&self.db_path, ns_id);
+        let _write = self.writes.enter(namespace)?;
         let _claim = ReindexClaim::take(&self.vec_reindexing, namespace)?;
+        self.check_not_dropping(namespace)?;
 
         let started_at_ms = now_ms();
         std::fs::create_dir_all(reindex_path.parent().unwrap())?;
@@ -762,7 +758,7 @@ impl DocStore {
         );
 
         info!("kv_index_all: namespace='{}' scanning all KV entries", namespace);
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let all_entries = ns.iter().await?;
         info!("kv_index_all: namespace='{}' scan done — total_entries={}", namespace, all_entries.len());
 
@@ -779,6 +775,7 @@ impl DocStore {
             for (key, value_bytes) in &all_entries {
                 match std::str::from_utf8(value_bytes) {
                     Ok(text) if !text.is_empty() => {
+                        self.check_not_dropping(namespace)?;
                         vector_kv::enqueue_embed(&self.db, namespace, key, text).await?;
                         enqueued += 1;
                     }
@@ -844,6 +841,35 @@ impl DocStore {
 /// This process's claim on reindexing one namespace: present in
 /// `DocStore::vec_reindexing` while held, removed on drop (also on an early return
 /// or a panic).
+#[cfg(feature = "semantic-search")]
+impl DocStore {
+    /// Fail when `namespace`, or its vector index, is being dropped. A reindex
+    /// checks it after taking its claim and before every enqueue, and either
+    /// drop waits for the reindex to end before it clears the queue (a store
+    /// drop through the [`WriteGate`], a vector-index drop through the claim):
+    /// an enqueue after that would outlive what was dropped.
+    fn check_not_dropping(&self, namespace: &str) -> Result<(), DocStoreError> {
+        if self.writes.is_closed(namespace) {
+            return Err(DocStoreError::NotFound {
+                namespace: namespace.to_owned(),
+            });
+        }
+        if self.semantic_ctx.as_ref().is_some_and(|ctx| ctx.is_dropping(namespace)) {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Wait until no reindex of `namespace` holds its claim.
+    pub(super) async fn wait_for_reindex(&self, namespace: &str) {
+        while self.vec_reindexing.lock().contains(namespace) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[cfg(feature = "semantic-search")]
 struct ReindexClaim {
     set: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,

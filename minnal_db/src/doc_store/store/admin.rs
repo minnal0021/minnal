@@ -84,10 +84,13 @@ impl DocStore {
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        self.without_partition_maintenance(
-            namespace,
-            cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
-        )
+        self.without_writes(namespace, async {
+            self.without_partition_maintenance(
+                namespace,
+                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
+            )
+            .await
+        })
         .await?;
         info!("namespace '{}' dropped", namespace);
         Ok(())
@@ -150,10 +153,13 @@ impl DocStore {
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        self.without_partition_maintenance(
-            namespace,
-            cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
-        )
+        self.without_writes(namespace, async {
+            self.without_partition_maintenance(
+                namespace,
+                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
+            )
+            .await
+        })
         .await?;
         info!("KV namespace '{}' dropped", namespace);
         Ok(())
@@ -447,10 +453,26 @@ impl DocStore {
             .await
     }
 
+    /// Run `drop`, which removes store `namespace`, with no write to it in
+    /// progress and none let in until it is done ([`WriteGate`]): a write after
+    /// the removal would recreate the namespace or queue an embedding for it.
+    async fn without_writes<T>(
+        &self,
+        namespace: &str,
+        drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
+    ) -> Result<T, DocStoreError> {
+        self.writes.close(namespace).await;
+        let result = drop.await;
+        self.writes.reopen(namespace);
+        result
+    }
+
     /// Run `drop`, which removes `namespace`'s vector namespaces, with its
-    /// partition's maintenance stopped and finished first and no partition of
-    /// it handed out meanwhile ([`SemanticSearchContext::begin_drop`]): a
-    /// maintenance write after the removal would recreate what was removed.
+    /// partition's maintenance and vector writes stopped and finished first, no
+    /// partition of it handed out meanwhile
+    /// ([`SemanticSearchContext::begin_drop`]), and no reindex of it enqueueing:
+    /// a write after the removal would recreate what was removed, and an
+    /// enqueue after the queue is cleared would outlive the store.
     pub(super) async fn without_partition_maintenance<T>(
         &self,
         namespace: &str,
@@ -459,6 +481,8 @@ impl DocStore {
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
             ctx.begin_drop(namespace).await;
+            // A reindex sees the drop and stops at its next enqueue.
+            self.wait_for_reindex(namespace).await;
             let result = drop.await;
             ctx.evict(namespace);
             ctx.end_drop(namespace);
@@ -507,6 +531,30 @@ impl DocStore {
 
 // ── Namespace cleanup helper ──────────────────────────────────────────────────
 
+/// Finish every store drop a crash interrupted: a schema whose namespace is
+/// not registered. A store's namespace is created before its schema and
+/// removed before it, so nothing else leaves one. Called by `open` before it
+/// touches any store: opening would recreate a KV store's namespace (under an
+/// id its schema does not name) and fail on a document store's field indexes.
+pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore) -> Result<(), DocStoreError> {
+    let registered: std::collections::HashSet<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+    let stores: Vec<(String, Option<u32>)> = schemas
+        .docs()
+        .into_iter()
+        .map(|s| (s.namespace.clone(), s.ns_id))
+        .chain(schemas.kvs().into_iter().map(|s| (s.namespace.clone(), s.ns_id)))
+        .collect();
+    for (namespace, ns_id) in stores {
+        let Some(ns_id) = ns_id else { continue };
+        if registered.contains(&namespace) {
+            continue;
+        }
+        log::warn!("finishing the drop of store '{namespace}' (ns_id={ns_id}) that a crash interrupted");
+        cleanup_store_namespaces(db, db_path, schemas, &namespace, ns_id).await?;
+    }
+    Ok(())
+}
+
 /// Remove a namespace (and its vector-index companions) from the engine registry
 /// and delete all on-disk directories and the schema file.
 ///
@@ -527,20 +575,18 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &Schema
     // mid-entry, and a crash here would strand the rest. `VecIndexWorker` also
     // discards queue entries whose namespace has gone.
     #[cfg(feature = "semantic-search")]
-    match vector_kv::list_queue_entries(db).await {
-        Ok(entries) => {
-            for entry in entries.into_iter().filter(|e| e.namespace == namespace) {
-                if let Err(e) = vector_kv::remove_queue_entry(db, &entry.namespace, &entry.doc_id_bytes).await {
-                    warn!("cleanup_store_namespaces: could not clear queue entry for '{namespace}': {e}");
-                }
-            }
-        }
-        Err(e) => warn!("cleanup_store_namespaces: could not scan the embed queue for '{namespace}': {e}"),
-    }
+    clear_queue_entries(db, namespace).await;
 
-    // Primary namespace must exist; propagate error before touching files.
-    // Vector companions are optional — ignore errors on removal.
-    db.remove_namespace(namespace.to_owned()).await?;
+    // Absent only when an earlier drop was interrupted after removing it (the
+    // schema goes last): this drop finishes that one. Vector companions are
+    // optional — ignore errors on removal.
+    if db.existing_namespace(namespace.to_owned()).await?.is_some() {
+        db.remove_namespace(namespace.to_owned()).await?;
+    }
+    // Again, now that no write can reach the store: a `put` that landed
+    // between the first clear and the removal enqueued its embedding.
+    #[cfg(feature = "semantic-search")]
+    clear_queue_entries(db, namespace).await;
 
     #[cfg_attr(not(feature = "semantic-search"), allow(unused_mut))]
     let mut ns_names = vec![namespace.to_owned()];
@@ -574,6 +620,15 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &Schema
     crate::semantic_search::metrics::reset(namespace);
 
     Ok(())
+}
+
+/// Remove every embed-queue entry of `namespace`. Best-effort: a failure is
+/// logged, and the vector worker discards entries whose namespace has gone.
+#[cfg(feature = "semantic-search")]
+async fn clear_queue_entries(db: &AsyncDb, namespace: &str) {
+    if let Err(e) = vector_kv::clear_queue_for(db, namespace).await {
+        warn!("cleanup_store_namespaces: could not clear the embed queue for '{namespace}': {e}");
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +804,53 @@ mod tests {
 
         store.remove("tmp").await.unwrap();
         assert!(!store.schemas.contains("tmp"));
+    }
+
+    /// A store drop interrupted after it removed the store's namespace (the
+    /// schema goes last) must be finishable: by dropping the store again, and
+    /// at the next open. Dropping again failed, since the namespace it removes
+    /// first was gone; and the next open recreated a KV store's namespace (under
+    /// a new id its schema does not name) and failed on a document store's
+    /// field indexes.
+    #[tokio::test]
+    async fn an_interrupted_drop_is_finished_by_a_retry_or_the_next_open() {
+        let index = || IndexSpec {
+            field: "active".to_owned(),
+            index_type: IndexType::Bool,
+        };
+        for retry in [true, false] {
+            let db_dir = TempDir::new().unwrap();
+            {
+                let store = open_fresh(db_dir.path()).await;
+                store.create(make_schema("docs", vec![index()])).await.unwrap();
+                store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
+                store.create_kv(make_kv_schema("kv", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+                store.kv_put("kv", &serde_json::json!("k"), &serde_json::json!("v")).await.unwrap();
+                // Interrupted: the namespaces are gone, the schemas are not.
+                store.db.remove_namespace("docs".to_owned()).await.unwrap();
+                store.db.remove_namespace("kv".to_owned()).await.unwrap();
+                if retry {
+                    store.remove("docs").await.unwrap();
+                    store.remove_kv("kv").await.unwrap();
+                }
+                store.shutdown().await.unwrap();
+            }
+            let store = open_fresh(db_dir.path()).await;
+            assert!(
+                !store.schemas.contains("docs") && !store.schemas.contains("kv"),
+                "retry={retry}: a schema survived"
+            );
+            let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+            assert!(
+                !names.iter().any(|n| n == "docs" || n == "kv"),
+                "retry={retry}: a namespace is back: {names:?}"
+            );
+            // The names are free again.
+            store.create(make_schema("docs", vec![index()])).await.unwrap();
+            store.put("docs", DocId::U64(2), serde_json::json!({"active": true})).await.unwrap();
+            assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
+            store.shutdown().await.unwrap();
+        }
     }
 
     /// Regression: dropping a semantic store must clear its embed-queue entries.

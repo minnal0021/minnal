@@ -404,8 +404,11 @@ impl SemanticSearchContext {
     }
 
     /// Ask the maintenance task to split `namespace`'s oversized postings. A
-    /// no-op until the task runs.
+    /// no-op until the task runs, and while `namespace` is being dropped.
     pub fn request_maintenance(&self, namespace: &str) {
+        if self.is_dropping(namespace) {
+            return;
+        }
         if let Some(tx) = self.maintenance_tx.get() {
             let _ = tx.send(namespace.to_owned());
         }
@@ -436,11 +439,13 @@ impl SemanticSearchContext {
     }
 
     /// Start dropping `namespace`'s vector index: refuse to load or hand out
-    /// its partition from now on, stop maintenance on every loaded one, and
-    /// wait for any maintenance operation in progress to finish. Only then may
-    /// the caller remove the namespaces: maintenance writes resolve them with
-    /// get-or-create and would bring them back. Call
-    /// [`end_drop`](Self::end_drop) once they are gone.
+    /// its partition from now on, stop maintenance and vector writes on every
+    /// loaded one, and wait for any maintenance operation and vector write in
+    /// progress to finish. Only then may the caller remove the namespaces:
+    /// maintenance and vector writes resolve them with get-or-create and would
+    /// bring them back. The vector worker holds a partition for a whole pass,
+    /// so it checks [`PartitionHandle::is_dropped`] inside the routing epoch
+    /// before each write. Call [`end_drop`](Self::end_drop) once they are gone.
     pub async fn begin_drop(&self, namespace: &str) {
         self.dropping.lock().insert(namespace.to_owned());
         let loaded: Vec<Arc<PartitionHandle>> = {
@@ -459,7 +464,16 @@ impl SemanticSearchContext {
         for partition in loaded {
             partition.mark_dropped();
             drop(partition.lock_maintenance().await);
+            // A write that entered the epoch before the mark may not have seen
+            // it; one entering after does (the epoch's lock orders the two).
+            partition.epoch_barrier().await;
         }
+    }
+
+    /// Whether [`begin_drop`](Self::begin_drop) has started dropping
+    /// `namespace` and [`end_drop`](Self::end_drop) has not yet ended it.
+    pub(crate) fn is_dropping(&self, namespace: &str) -> bool {
+        self.dropping.lock().contains(namespace)
     }
 
     /// The drop [`begin_drop`](Self::begin_drop) started is done; the name may
@@ -521,7 +535,7 @@ impl SemanticSearchContext {
         ns_id: u32,
         settings: &VectorIndexSettings,
     ) -> Result<NamespaceSemantics, DocStoreError> {
-        if self.dropping.lock().contains(namespace) {
+        if self.is_dropping(namespace) {
             return Err(DocStoreError::SemanticSearchNotEnabled {
                 namespace: namespace.to_owned(),
             });
@@ -752,5 +766,96 @@ pub(crate) mod load_pause {
             reached.notify_one();
             release.notified().await;
         }
+    }
+}
+
+/// Fences a store's writes off from its drop. Every write to a store (a
+/// document or KV write, a reindex) holds a [`WriteGuard`] for its whole
+/// duration; a drop [`close`](Self::close)s the gate, which refuses new writes
+/// and waits for the ones in progress, before it removes anything. A write
+/// that went on would resolve the store's namespace after its removal and
+/// recreate it, or leave an embed-queue entry the drop already cleared.
+#[derive(Default)]
+pub(crate) struct WriteGate {
+    state: parking_lot::Mutex<WriteGateState>,
+    left: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct WriteGateState {
+    closed: std::collections::HashSet<String>,
+    writers: std::collections::HashMap<String, usize>,
+}
+
+/// A write in progress on one store; see [`WriteGate`]. Owns its gate, so a
+/// background task (an index build) can hold it.
+pub(crate) struct WriteGuard {
+    gate: Arc<WriteGate>,
+    namespace: String,
+}
+
+impl WriteGuard {
+    /// Whether the store is being dropped: a long write stops when it is, so
+    /// the drop waiting for it is not held up.
+    pub(crate) fn store_dropping(&self) -> bool {
+        self.gate.is_closed(&self.namespace)
+    }
+}
+
+impl WriteGate {
+    /// Start a write to `namespace`; fails with [`DocStoreError::NotFound`]
+    /// while it is being dropped.
+    pub(crate) fn enter(self: &Arc<Self>, namespace: &str) -> Result<WriteGuard, DocStoreError> {
+        let mut state = self.state.lock();
+        if state.closed.contains(namespace) {
+            return Err(DocStoreError::NotFound {
+                namespace: namespace.to_owned(),
+            });
+        }
+        *state.writers.entry(namespace.to_owned()).or_default() += 1;
+        Ok(WriteGuard {
+            gate: Arc::clone(self),
+            namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Whether `namespace` is being dropped.
+    pub(crate) fn is_closed(&self, namespace: &str) -> bool {
+        self.state.lock().closed.contains(namespace)
+    }
+
+    /// Refuse new writes to `namespace` and wait for those in progress.
+    pub(crate) async fn close(&self, namespace: &str) {
+        self.state.lock().closed.insert(namespace.to_owned());
+        loop {
+            let left = self.left.notified();
+            tokio::pin!(left);
+            // Registered before the check, so a write leaving between the two is seen.
+            left.as_mut().enable();
+            if !self.state.lock().writers.contains_key(namespace) {
+                return;
+            }
+            left.await;
+        }
+    }
+
+    /// Accept writes to `namespace` again: the drop is over (its schema is
+    /// gone, so they now fail on that, or it failed and the store remains).
+    pub(crate) fn reopen(&self, namespace: &str) {
+        self.state.lock().closed.remove(namespace);
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        if let Some(n) = state.writers.get_mut(&self.namespace) {
+            *n -= 1;
+            if *n == 0 {
+                state.writers.remove(&self.namespace);
+            }
+        }
+        drop(state);
+        self.gate.left.notify_waiters();
     }
 }

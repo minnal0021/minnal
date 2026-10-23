@@ -44,6 +44,7 @@ impl DocStore {
     /// re-enqueues it.
     pub async fn put(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         debug!("put namespace='{}' id={:?}", namespace, id);
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
@@ -58,7 +59,7 @@ impl DocStore {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
             // Write the document first, then the vector-queue op as a separate
             // single op (no cross-namespace atomicity needed).
-            let ns = self.db.namespace(namespace.to_owned()).await?;
+            let ns = self.store_ns(namespace).await?;
             ns.put(key.clone(), value).await?;
             if text.is_empty() {
                 // No embedding text any more: drop the vectors, and any pending
@@ -71,7 +72,7 @@ impl DocStore {
             return Ok(());
         }
 
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         ns.put(key, value).await?;
         Ok(())
     }
@@ -83,6 +84,7 @@ impl DocStore {
     /// on this path, so the worker can recover pending jobs after a crash and
     /// index any documents that survived the no-WAL write.
     pub async fn put_no_wal(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
@@ -90,7 +92,7 @@ impl DocStore {
         let key = id.to_bytes();
         let value = serde_json::to_vec(&doc).map_err(|e| DocStoreError::InvalidId(e.to_string()))?;
 
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         ns.put_no_wal(key.clone(), value).await?;
 
         #[cfg(feature = "semantic-search")]
@@ -120,6 +122,7 @@ impl DocStore {
     /// up), never an orphaned vector.
     pub async fn delete(&self, namespace: &str, id: DocId) -> Result<(), DocStoreError> {
         debug!("delete namespace='{}' id={:?}", namespace, id);
+        let _write = self.writes.enter(namespace)?;
         let key = id.to_bytes();
 
         #[cfg(feature = "semantic-search")]
@@ -127,12 +130,12 @@ impl DocStore {
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
             self.clear_doc_vectors(namespace, &key).await?;
-            let ns = self.db.namespace(namespace.to_owned()).await?;
+            let ns = self.store_ns(namespace).await?;
             ns.delete(key).await?;
             return Ok(());
         }
 
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         ns.delete(key).await?;
         Ok(())
     }
@@ -141,7 +144,7 @@ impl DocStore {
     ///
     /// Returns `None` if no document with that ID exists.
     pub async fn get(&self, namespace: &str, id: DocId) -> Result<Option<serde_json::Value>, DocStoreError> {
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         match ns.get(id.to_bytes()).await? {
             None => Ok(None),
             Some(bytes) => {

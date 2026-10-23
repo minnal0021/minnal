@@ -1058,6 +1058,26 @@ pub async fn remove_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u
     Ok(())
 }
 
+/// Remove every queue entry of `namespace` (a store being dropped), durable on
+/// return; returns how many there were.
+///
+/// The keys start with the namespace, so one prefix scan finds them. They are
+/// deleted without the WAL and made durable by one flush of the queue's
+/// memtable: a WAL-backed delete costs an fsync each, which made dropping a
+/// store with 20 000 queued entries take 48 s.
+pub async fn clear_queue_for(db: &AsyncDb, namespace: &str) -> Result<usize, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let entries = queue_ns.scan_prefix(queue_key(namespace, &[])).await?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    for (key, _) in &entries {
+        queue_ns.delete_no_wal(key.clone()).await?;
+    }
+    db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await?;
+    Ok(entries.len())
+}
+
 /// Return all pending embedding queue entries.
 ///
 /// Called by the [`VecIndexWorker`] on startup (crash recovery) and after

@@ -33,10 +33,11 @@ impl DocStore {
     /// [`kv_put_no_wal`](Self::kv_put_no_wal); `skip_wal` selects the value-write
     /// durability path.
     async fn kv_put_inner(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value, skip_wal: bool) -> Result<(), DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key(key)?;
         let value_bytes = schema.value_type.serialize_value(value)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
 
         if skip_wal {
             ns.put_no_wal(key_bytes.clone(), value_bytes).await?;
@@ -70,7 +71,7 @@ impl DocStore {
     pub async fn kv_get(&self, namespace: &str, key: &serde_json::Value) -> Result<Option<serde_json::Value>, DocStoreError> {
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key(key)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         match ns.get(key_bytes).await? {
             Some(bytes) => Ok(Some(schema.value_type.deserialize_value(&bytes)?)),
             None => Ok(None),
@@ -86,7 +87,7 @@ impl DocStore {
     pub async fn kv_get_by_str(&self, namespace: &str, raw_key: &str) -> Result<Option<serde_json::Value>, DocStoreError> {
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         match ns.get(key_bytes).await? {
             Some(bytes) => Ok(Some(schema.value_type.deserialize_value(&bytes)?)),
             None => Ok(None),
@@ -103,18 +104,19 @@ impl DocStore {
     /// crash between them leaves an un-indexed value (reconciliation cleans it
     /// up), never an orphaned vector.
     pub async fn kv_delete(&self, namespace: &str, raw_key: &str) -> Result<(), DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
 
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
             self.clear_doc_vectors(namespace, &key_bytes).await?;
-            let ns = self.db.namespace(namespace.to_owned()).await?;
+            let ns = self.store_ns(namespace).await?;
             ns.delete(key_bytes).await?;
             return Ok(());
         }
 
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         ns.delete(key_bytes).await?;
         Ok(())
     }
@@ -137,7 +139,7 @@ impl DocStore {
         let start_bytes = schema.key_type.serialize_key_from_str(start)?;
         let end_bytes = end.map(|e| schema.key_type.serialize_key_from_str(e)).transpose()?;
         let scan_start = clamp_cursor(cursor, start_bytes);
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
         let results = pairs
@@ -171,7 +173,7 @@ impl DocStore {
         let prefix_bytes = schema.key_type.serialize_key_from_str(prefix)?;
         let end_bytes = prefix_upper_bound(&prefix_bytes);
         let scan_start = clamp_cursor(cursor, prefix_bytes.clone());
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
         let results = pairs

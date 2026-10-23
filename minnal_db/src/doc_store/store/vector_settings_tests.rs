@@ -236,6 +236,12 @@ mod with_service {
     /// one vector per payload, a different one per model, and every request
     /// recorded.
     fn spawn_service() -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
+        spawn_slow_service(std::time::Duration::ZERO)
+    }
+
+    /// [`spawn_service`], answering each request `delay` after it arrives (one
+    /// at a time).
+    fn spawn_slow_service(delay: std::time::Duration) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -273,6 +279,7 @@ mod with_service {
                         dimensions: dims,
                         payloads: n,
                     });
+                    std::thread::sleep(delay);
                     // gemma points along +x, qwen along +y; each payload slightly different.
                     let axis = if parts[2] == "gemma" { 0 } else { 1 };
                     let embs: Vec<Vec<f32>> = (0..n)
@@ -990,6 +997,130 @@ mod with_service {
             store.shutdown_vec_index_worker().await;
             store.shutdown().await.unwrap();
         }
+    }
+
+    /// Embed-queue entries of `namespace`.
+    async fn queued_for(store: &DocStore, namespace: &str) -> usize {
+        vector_kv::list_queue_entries(&store.db)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.namespace == namespace)
+            .count()
+    }
+
+    /// Dropping a store while the vector worker is part-way through a pass of
+    /// its entries must stop the pass on that store: the worker resolved the
+    /// store's partition at the start of the pass and went on embedding the
+    /// rest of its entries after the drop (embedding calls for a store that is
+    /// gone, maintenance requests that failed, vector writes racing the
+    /// removal of the namespaces they recreate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_stops_the_worker_pass_on_its_store() {
+        let (url, seen) = spawn_slow_service(std::time::Duration::from_millis(20));
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for id in 1..=60 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while seen.lock().len() < 4 {
+            assert!(std::time::Instant::now() < deadline, "the worker never started embedding");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        store.remove("g").await.unwrap();
+        let at_drop = seen.lock().len();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let after = seen.lock().len() - at_drop;
+        // Requests already sent when the drop ended may still be answered: at
+        // most two (whole document, chunks) per concurrent entry.
+        assert!(after <= 8, "{after} embedding request(s) after the drop");
+        let left = companions_left(&store, "g");
+        assert!(left.is_empty(), "dropped namespaces are back: {left:?}");
+        assert_eq!(queued_for(&store, "g").await, 0, "queue entries outlived the store");
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    /// Dropping a store while a reindex of it enqueues must leave none of its
+    /// entries in the queue: the drop cleared the queue once, and the reindex,
+    /// enqueueing from its own scan of the documents, went on after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_during_a_reindex_leaves_no_queue_entries() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        // No worker: the queue keeps what the reindex enqueues.
+        store.shutdown_vec_index_worker().await;
+        for id in 1..=3000 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        let store = std::sync::Arc::new(store);
+        // The puts' own entries, so the reindex's are the ones counted below.
+        store.delete_all_queue_entries("g").await.unwrap();
+        let reindex = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { store.index_all("g").await }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while queued_for(&store, "g").await < 50 {
+            assert!(std::time::Instant::now() < deadline, "the reindex never enqueued");
+            assert!(!reindex.is_finished(), "the reindex finished before the drop; make it longer");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.remove("g").await.unwrap();
+        assert!(reindex.await.unwrap().is_err(), "the reindex went on after the drop");
+        assert_eq!(queued_for(&store, "g").await, 0, "queue entries outlived the store");
+        store.shutdown().await.unwrap();
+    }
+
+    /// Writes that keep arriving while a store is dropped must neither bring
+    /// its namespace back nor leave embed-queue entries behind: a `put` read the
+    /// schema (removed last), then resolved the namespace with get-or-create
+    /// after the drop had removed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_during_a_drop_leave_nothing_behind() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.shutdown_vec_index_worker().await;
+        for id in 1..=500 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        let store = std::sync::Arc::new(store);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4u64)
+            .map(|w| {
+                let (store, stop) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&stop));
+                tokio::spawn(async move {
+                    let mut id = 1_000 + w * 1_000_000;
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await;
+                        let _ = store.delete("g", DocId::U64(id - 1)).await;
+                        id += 1;
+                        // A refused write returns at once: let the drop run.
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        store.remove("g").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        for w in writers {
+            w.await.unwrap();
+        }
+        let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n == "g"), "the dropped store's namespace is back");
+        let left = companions_left(&store, "g");
+        assert!(left.is_empty(), "dropped namespaces are back: {left:?}");
+        assert_eq!(queued_for(&store, "g").await, 0, "queue entries outlived the store");
+        assert!(store.get("g", DocId::U64(1)).await.is_err(), "a read of the dropped store found it");
+        store.shutdown().await.unwrap();
     }
 
     /// A document deleted while its namespace's partition is first loaded
