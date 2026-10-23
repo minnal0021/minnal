@@ -11,8 +11,10 @@
 //! # Completion waits for durability
 //!
 //! The vector payloads go to the vector index WAL (durable only after its next
-//! sync) while the queue removal is WAL-backed (durable at once), so an entry is
-//! completed only after its vectors are synced. Written entries collect in a
+//! sync), and the queue removal skips the WAL (durable at the queue's next flush,
+//! which can come at any moment), so an entry is completed only after its
+//! vectors are synced. A removal a crash loses brings the entry back, and the
+//! document is embedded again. Written entries collect in a
 //! batch of up to [`COMPLETION_BATCH`]; each batch, and whatever is pending at the
 //! end of a pass, is made durable with one fsync of the vector index WAL
 //! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
@@ -587,13 +589,13 @@ impl VecIndexWorker {
     /// this pass's snapshot, and the document may have been upserted or deleted
     /// since (see `vector_kv`'s conditional queue updates).
     ///
-    /// Up to `config.concurrency` completions run at once. Each removes its queue
-    /// entry with a WAL-backed write, and every WAL write in the database waits on
-    /// one lock held across an fsync: completed one at a time, the batch got one
-    /// place in that line against every concurrent REST writer, and while
-    /// documents were being ingested the worker completed ~20 entries/s however
-    /// fast it embedded. Entries in a batch are distinct documents (the queue
-    /// holds one entry per document), so their completions are independent.
+    /// Up to `config.concurrency` completions run at once. A completion can still
+    /// wait on the WAL — the cleanup when a document vanished mid-embed, and the
+    /// re-queue when it came back — and every WAL write in the database waits on
+    /// one lock held across an fsync, so one at a time a batch would hold one
+    /// place in that line against every concurrent REST writer. Entries in a
+    /// batch are distinct documents (the queue holds one entry per document), so
+    /// their completions are independent.
     async fn complete_written(&self, written: Vec<QueueEntry>) -> (usize, usize) {
         if let Err(e) = vector_kv::make_vector_writes_durable(&self.db).await {
             warn!(

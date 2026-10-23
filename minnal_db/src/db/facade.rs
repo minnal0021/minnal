@@ -2152,6 +2152,20 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// [`Self::merge`] whose resolved write skips the WAL — see
+    /// `Database::merge_ns_no_wal` for the crash-safety trade-off. The no-WAL
+    /// counterpart of `merge`, for data whose lost write repairs itself.
+    pub async fn merge_no_wal<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
+    {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.merge_ns_no_wal(ns_id, &key, &value, merge_fn))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn iter(&self) -> Result<Vec<KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))

@@ -1287,10 +1287,16 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        self.check_write_size(key, value)?;
         // Outermost write lock — see `put_ns`. No-WAL writes take it too, so a
         // merge is serialised against bulk loading as well as against `put`.
         let _stripe = self.key_locks.guard(namespace_id, key);
+        self.put_ns_no_wal_locked(namespace_id, key, value)
+    }
+
+    /// The body of [`Self::put_ns_no_wal`], for a caller already holding the
+    /// key's stripe ([`Self::merge_ns_no_wal`]).
+    fn put_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_write_size(key, value)?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
@@ -1354,9 +1360,15 @@ impl Database {
     /// concurrent same-key writes highest-sequence-wins like any other write.
     pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        self.check_write_size(key, &[])?;
         // Outermost write lock — see `put_ns`.
         let _stripe = self.key_locks.guard(namespace_id, key);
+        self.delete_ns_no_wal_locked(namespace_id, key)
+    }
+
+    /// The body of [`Self::delete_ns_no_wal`], for a caller already holding the
+    /// key's stripe ([`Self::merge_ns_no_wal`]).
+    fn delete_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+        self.check_write_size(key, &[])?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
@@ -1436,6 +1448,53 @@ impl Database {
             None if existing.is_some() => {
                 let outcome = self.delete_ns_locked(namespace_id, key, Self::MERGE_OP_NAME)?;
                 Self::require_applied(outcome)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::merge_ns`] whose resolved write skips the WAL: the no-WAL
+    /// counterpart of `merge_ns`, as [`Self::put_ns_no_wal`] and
+    /// [`Self::delete_ns_no_wal`] are of `put_ns` and `delete_ns`.
+    ///
+    /// The read, the closure and the write run under the key's stripe, exactly
+    /// as in `merge_ns`, so the result is atomic against every other write to the
+    /// key; the closure contract, the abort and the absent → absent no-op are the
+    /// same. What differs is durability: the resolved put or delete appends no
+    /// WAL entry and costs no fsync, so it is lost if the process crashes before
+    /// the namespace's memtable is flushed (the LSM worker flushes no-WAL writes
+    /// on its next tick). It still draws a seq from the global counter, so it
+    /// resolves against concurrent writes to the key by seq.
+    ///
+    /// Only for data whose lost write repairs itself — the vector worker's queue
+    /// completions, where a lost removal brings the entry back and the document
+    /// is embedded again. Like the other no-WAL writes it is never replayed into
+    /// a field index (see [`Self::put_ns_no_wal`]).
+    pub fn merge_ns_no_wal<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.check_closed()?;
+        // Held across the read, the closure and the write: see `merge_ns`.
+        let _stripe = self.key_locks.guard(namespace_id, key);
+
+        let kv_store = self.get_store(namespace_id)?;
+        if let Some(m) = kv_store.metrics() {
+            crate::db::metrics::Metrics::bump(&m.merges);
+        }
+
+        let existing = kv_store.get(key)?;
+        let merged = merge_fn(existing.as_deref(), value)?;
+
+        match merged {
+            Some(new_value) => {
+                self.put_ns_no_wal_locked(namespace_id, key, &new_value)?;
+                Ok(Some(new_value))
+            }
+            // As in `merge_ns`: an absent key stays absent with no tombstone.
+            None if existing.is_some() => {
+                self.delete_ns_no_wal_locked(namespace_id, key)?;
                 Ok(None)
             }
             None => Ok(None),
