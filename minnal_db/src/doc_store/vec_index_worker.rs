@@ -586,6 +586,14 @@ impl VecIndexWorker {
     /// next pass redoes it. Each completion is conditional — the entry comes from
     /// this pass's snapshot, and the document may have been upserted or deleted
     /// since (see `vector_kv`'s conditional queue updates).
+    ///
+    /// Up to `config.concurrency` completions run at once. Each removes its queue
+    /// entry with a WAL-backed write, and every WAL write in the database waits on
+    /// one lock held across an fsync: completed one at a time, the batch got one
+    /// place in that line against every concurrent REST writer, and while
+    /// documents were being ingested the worker completed ~20 entries/s however
+    /// fast it embedded. Entries in a batch are distinct documents (the queue
+    /// holds one entry per document), so their completions are independent.
     async fn complete_written(&self, written: Vec<QueueEntry>) -> (usize, usize) {
         if let Err(e) = vector_kv::make_vector_writes_durable(&self.db).await {
             warn!(
@@ -595,9 +603,34 @@ impl VecIndexWorker {
             );
             return (0, written.len());
         }
+        let concurrency = self.config.concurrency.max(1);
+        let mut set: JoinSet<(QueueEntry, Result<crate::semantic_search::PostingDelta, crate::KVError>)> = JoinSet::new();
+        let mut pending = written.into_iter();
+        for entry in (&mut pending).take(concurrency) {
+            let db = self.db.clone();
+            set.spawn(async move {
+                let result = vector_kv::complete_embed(&db, &entry).await;
+                (entry, result)
+            });
+        }
         let (mut done, mut failed) = (0usize, 0usize);
-        for entry in written {
-            match vector_kv::complete_embed(&self.db, &entry).await {
+        while let Some(joined) = set.join_next().await {
+            if let Some(entry) = pending.next() {
+                let db = self.db.clone();
+                set.spawn(async move {
+                    let result = vector_kv::complete_embed(&db, &entry).await;
+                    (entry, result)
+                });
+            }
+            let (entry, result) = match joined {
+                Ok(joined) => joined,
+                Err(join_err) => {
+                    warn!("vec index worker: completion task panicked: {join_err}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            match result {
                 Ok(delta) => {
                     self.ctx.apply_posting_delta(&entry.namespace, &delta);
                     done += 1;
