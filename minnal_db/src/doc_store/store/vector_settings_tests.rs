@@ -1076,6 +1076,49 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A worker pass that starts while a store is being dropped must leave the
+    /// store's entries alone: their settings no longer resolve, and each one
+    /// failed with a warning and a retry (a log line per queued document of a
+    /// large store, and a retry wait after the pass).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pass_during_a_drop_skips_the_dropped_store() {
+        let (url, seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        // No worker while the entries are queued.
+        store.shutdown_vec_index_worker().await;
+        for id in 1..=20 {
+            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        let ctx = std::sync::Arc::clone(store.semantic_ctx.as_ref().unwrap());
+        ctx.begin_drop("g").await;
+        let at_drop = seen.lock().len();
+        let worker = crate::doc_store::vec_index_worker::VecIndexWorker::start(
+            std::sync::Arc::clone(&store.db),
+            std::sync::Arc::clone(&ctx),
+            std::sync::Arc::clone(&store.schemas),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            store.vector_index_config.clone(),
+        );
+        let _ = worker.startup_pass().wait_for(|done| *done).await;
+        worker.shutdown().await;
+        ctx.end_drop("g");
+        let entries: Vec<_> = vector_kv::list_queue_entries(&store.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.namespace == "g")
+            .collect();
+        assert_eq!(entries.len(), 20, "the pass removed entries the drop owns");
+        assert!(
+            entries.iter().all(|e| e.retry_count == 0),
+            "the pass failed entries of a store being dropped"
+        );
+        assert_eq!(seen.lock().len(), at_drop, "embedding calls for a store being dropped");
+        store.shutdown().await.unwrap();
+    }
+
     /// Writes that keep arriving while a store is dropped must neither bring
     /// its namespace back nor leave embed-queue entries behind: a `put` read the
     /// schema (removed last), then resolved the namespace with get-or-create
