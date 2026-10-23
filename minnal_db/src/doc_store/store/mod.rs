@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::doc_store::schema_store::{SchemaStore, StoredSchema};
 use std::sync::Arc;
 
-use crate::{AsyncDb, DbConfig, FieldId};
+use crate::{AsyncDb, AsyncNamespace, DbConfig, FieldId};
 use log::{debug, info};
 #[cfg(feature = "semantic-search")]
 use log::{error, warn};
@@ -107,6 +107,8 @@ pub struct DocStore {
     /// only reports progress (see [`DocStore::vec_reindex_progress`]).
     #[cfg(feature = "semantic-search")]
     vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Writes in progress per store, which a drop waits for.
+    writes: Arc<WriteGate>,
 }
 
 impl DocStore {
@@ -158,7 +160,10 @@ impl DocStore {
             vec_reindexing: Arc::default(),
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
+            writes: Arc::default(),
         };
+
+        admin::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas).await?;
 
         let schemas = store.load_all_schemas()?;
         info!("loaded {} schema(s)", schemas.len());
@@ -346,6 +351,18 @@ impl DocStore {
         self.schemas
             .get(namespace)
             .map(|s| s.store_type())
+            .ok_or_else(|| DocStoreError::NotFound {
+                namespace: namespace.to_owned(),
+            })
+    }
+
+    /// The engine namespace holding store `namespace`'s data. Never creates it:
+    /// a call racing the store's drop fails with [`DocStoreError::NotFound`]
+    /// rather than bring the namespace back.
+    async fn store_ns(&self, namespace: &str) -> Result<AsyncNamespace, DocStoreError> {
+        self.db
+            .existing_namespace(namespace.to_owned())
+            .await?
             .ok_or_else(|| DocStoreError::NotFound {
                 namespace: namespace.to_owned(),
             })

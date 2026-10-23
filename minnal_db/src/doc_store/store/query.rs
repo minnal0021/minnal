@@ -228,7 +228,7 @@ impl DocStore {
         limit: usize,
     ) -> Result<CursorPage<(DocId, serde_json::Value)>, DocStoreError> {
         let schema = self.load_schema(namespace)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
 
         let start_bytes = start.to_bytes();
         let end_bytes = end.map(|e| e.to_bytes());
@@ -270,7 +270,7 @@ impl DocStore {
         let schema = self.load_schema(namespace)?;
         let end_bytes = prefix_upper_bound(&prefix);
         let scan_start = clamp_cursor(cursor, prefix);
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let (pairs, next_cursor) = ns.scan(Some(scan_start), end_bytes, limit).await?;
 
         let results = pairs
@@ -336,7 +336,7 @@ impl DocStore {
         }
 
         let page_keys = outcome.keys;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let values = ns.get_multiple(page_keys.clone()).await?;
         let mut results = Vec::with_capacity(page_keys.len());
         for (key_bytes, value_opt) in page_keys.into_iter().zip(values) {

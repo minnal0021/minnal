@@ -18,10 +18,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::AsyncDb;
+use crate::doc_store::error::DocStoreError;
 use crate::doc_store::schema_store::SchemaStore;
 use crate::doc_store::store::SemanticSearchContext;
 use crate::ivf_split;
@@ -106,11 +107,15 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schemas: 
 /// Split, reassign and merge `namespace`'s postings with its own settings,
 /// until none is left or `stopping` is set.
 async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaStore, namespace: &str, stopping: &AtomicBool) {
+    // A request sent before the namespace's drop began: nothing to maintain.
+    if ctx.is_dropping(namespace) {
+        return;
+    }
     let result = async {
         let (settings, ns_id) = schemas.vector_settings(namespace)?;
         let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
         let report = ivf_split::maintain_partition_until(db, namespace, &ns.partition, &settings.maintenance.ops(), stopping).await?;
-        Ok::<ivf_split::MaintenanceReport, crate::doc_store::error::DocStoreError>(report)
+        Ok::<ivf_split::MaintenanceReport, DocStoreError>(report)
     }
     .await;
     match result {
@@ -119,6 +124,10 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaSto
             "partition maintenance: namespace='{namespace}' split {} posting(s), merged {}",
             r.splits, r.merges
         ),
+        // Dropped (or its semantic search disabled) since the request was sent.
+        Err(e @ (DocStoreError::NotFound { .. } | DocStoreError::SemanticSearchNotEnabled { .. })) => {
+            debug!("partition maintenance: namespace='{namespace}' skipped: {e}")
+        }
         Err(e) => warn!("partition maintenance: namespace='{namespace}' failed: {e}"),
     }
     if stopping.load(Ordering::Acquire) {
@@ -139,7 +148,7 @@ pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schem
         let result = async {
             let (settings, ns_id) = schemas.vector_settings(namespace)?;
             ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-            Ok::<(), crate::doc_store::error::DocStoreError>(())
+            Ok::<(), DocStoreError>(())
         }
         .await;
         if let Err(e) = result {

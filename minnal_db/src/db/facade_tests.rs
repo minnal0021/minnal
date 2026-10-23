@@ -536,6 +536,39 @@ mod tests {
         db.shutdown().await?;
         Ok(())
     }
+
+    /// `existing_namespace` finds a namespace only while it exists, and never
+    /// creates one: a caller racing a removal must not bring it back.
+    #[tokio::test]
+    async fn existing_namespace_never_creates_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config())
+            .await
+            .unwrap();
+        let registered = |db: &AsyncDb| db.list_namespaces().into_iter().any(|(n, _)| n == "ns");
+        assert!(db.existing_namespace("ns".to_owned()).await.unwrap().is_none());
+        assert!(!registered(&db), "the lookup created the namespace");
+        db.namespace("ns".to_owned())
+            .await
+            .unwrap()
+            .put(b"k".to_vec(), b"v".to_vec())
+            .await
+            .unwrap();
+        let ns = db.existing_namespace("ns".to_owned()).await.unwrap().expect("it exists");
+        assert_eq!(ns.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        db.remove_namespace("ns".to_owned()).await.unwrap();
+        assert!(db.existing_namespace("ns".to_owned()).await.unwrap().is_none());
+        assert!(!registered(&db), "the lookup brought the namespace back");
+        db.shutdown().await.unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Db::open_with_config(temp_dir.path(), create_db_config()).unwrap();
+        assert!(db.existing_namespace("ns").is_none());
+        db.namespace("ns").unwrap();
+        assert!(db.existing_namespace("ns").is_some());
+        db.remove_namespace("ns").unwrap();
+        assert!(db.existing_namespace("ns").is_none());
+    }
 }
 
 #[cfg(test)]

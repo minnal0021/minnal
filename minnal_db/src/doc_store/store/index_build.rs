@@ -89,6 +89,9 @@ impl DocStore {
     /// interrupted `reindex-all`) finds its own `in_progress` record from before
     /// the crash, and must take it over rather than refuse.
     pub(super) async fn add_index_inner(&self, namespace: &str, spec: IndexSpec, resuming: bool) -> Result<IndexBuildHandle, DocStoreError> {
+        // Held by the build task until it ends: registering the field creates
+        // its index directory, and the build reads and writes the store.
+        let write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
@@ -210,12 +213,13 @@ impl DocStore {
         let key_type = schema.key_type;
 
         let task = tokio::spawn(async move {
-            let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone).await;
+            let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone, &write).await;
             if let Err(ref e) = result {
                 // Notify the whole chain (in-memory *and* disk), so the failure
                 // is persisted, not just visible to live pollers.
                 fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
             }
+            drop(write);
             result
         });
 
@@ -257,6 +261,8 @@ impl DocStore {
                 if started.contains(&(schema.namespace.clone(), spec.field.clone())) {
                     continue;
                 }
+                // Being dropped: nothing to resume.
+                let Ok(write) = self.writes.enter(&schema.namespace) else { continue };
                 let ivt = to_ivt(spec.index_type);
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
                 let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
@@ -287,12 +293,14 @@ impl DocStore {
                 let key_type = schema.key_type;
 
                 let task = tokio::spawn(async move {
-                    let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone).await;
+                    let result =
+                        rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone, &write).await;
                     if let Err(ref e) = result {
                         // Notify the whole chain (in-memory *and* disk), so the
                         // failure is persisted, not just visible to live pollers.
                         fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
                     }
+                    drop(write);
                     result
                 });
 
@@ -358,8 +366,11 @@ async fn rebuild_index_for_namespace(
     field_id: FieldId,
     resume_after: Option<Vec<u8>>,
     observer: Arc<dyn IndexProgressObserver>,
+    write: &WriteGuard,
 ) -> Result<(), DocStoreError> {
-    let ns = db.namespace(ns_name.clone()).await?;
+    // Never get-or-create: a build outliving its store would bring it back.
+    let dropped = || DocStoreError::NotFound { namespace: ns_name.clone() };
+    let ns = db.existing_namespace(ns_name.clone()).await?.ok_or_else(dropped)?;
 
     // ── Pass 1: count keys, cursor-paginated. We need the exact total up front
     // (it drives the build's percent-complete), but materialising the whole
@@ -372,6 +383,9 @@ async fn rebuild_index_for_namespace(
     {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
+            if write.store_dropping() {
+                return Err(dropped());
+            }
             let (pairs, next_cursor) = ns.scan(cursor, None, REBUILD_PAGE_SIZE).await?;
             for (key, _value) in &pairs {
                 total += 1;
@@ -407,6 +421,10 @@ async fn rebuild_index_for_namespace(
             break;
         }
         for (key, _value) in pairs {
+            // The store is being dropped, and the drop waits for this build.
+            if write.store_dropping() {
+                return Err(dropped());
+            }
             // Index the key's CURRENT value in this one field, under its key
             // stripe (`Db::reindex_field`). This used to re-put the scanned bytes,
             // which was wrong twice over: re-putting unchanged bytes is a no-op for
@@ -632,6 +650,43 @@ mod tests {
     /// documents than a single page so the page-boundary advancement (in both
     /// the count pass and the rebuild pass) is exercised, with a partial final
     /// page.
+    /// Dropping a store while one of its field indexes builds must stop the
+    /// build at its next document and leave nothing behind. The build holds a
+    /// write guard, so the drop waits for it: without the build's checks of
+    /// the guard, the drop waited out the whole build. (The guard is what keeps
+    /// a build that starts or registers its field after the removal from
+    /// recreating the namespace or its index directory.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_stops_a_running_index_build() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+        for i in 0..20_000u64 {
+            store.put_no_wal("ns", DocId::U64(i), serde_json::json!({"status": "a"})).await.unwrap();
+        }
+        let ns_id = store.load_schema("ns").unwrap().ns_id.unwrap();
+        let handle = store
+            .add_index(
+                "ns",
+                IndexSpec {
+                    field: "status".to_owned(),
+                    index_type: IndexType::Str,
+                },
+            )
+            .await
+            .unwrap();
+        while handle.mem.indexed.load(std::sync::atomic::Ordering::Relaxed) < 100 {
+            tokio::task::yield_now().await;
+        }
+        store.remove("ns").await.unwrap();
+        assert!(handle.wait().await.is_err(), "the build ran on after the drop");
+        let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n == "ns"), "the dropped store's namespace is back");
+        let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_dir.path()), ns_id);
+        assert!(!index_dir.exists(), "the dropped store's index directory is back");
+        store.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_add_index_rebuild_spans_multiple_pages() {
         let db_dir = TempDir::new().unwrap();

@@ -17,7 +17,7 @@ impl DocStore {
     /// Return the number of documents stored in `namespace`.
     pub async fn count_docs(&self, namespace: &str) -> Result<usize, DocStoreError> {
         self.load_schema(namespace)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let keys = ns.keys().await?;
         Ok(keys.len())
     }
@@ -252,6 +252,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn reindex_doc_vector(&self, namespace: &str, id: DocId) -> Result<VectorReindexOutcome, DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {
@@ -259,7 +260,7 @@ impl DocStore {
             });
         }
         let key = id.to_bytes();
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let value = match ns.get(key.clone()).await? {
             Some(v) => v,
             None => return Ok(VectorReindexOutcome::NotFound),
@@ -284,6 +285,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn kv_reindex_doc_vector(&self, namespace: &str, raw_key: &str) -> Result<VectorReindexOutcome, DocStoreError> {
+        let _write = self.writes.enter(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {
@@ -291,7 +293,7 @@ impl DocStore {
             });
         }
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
-        let ns = self.db.namespace(namespace.to_owned()).await?;
+        let ns = self.store_ns(namespace).await?;
         let value = match ns.get(key_bytes.clone()).await? {
             Some(v) => v,
             None => return Ok(VectorReindexOutcome::NotFound),

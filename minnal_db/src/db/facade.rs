@@ -349,6 +349,20 @@ impl Db {
         })
     }
 
+    /// The namespace named `name`, if it exists. Unlike [`namespace`](Self::namespace)
+    /// it never creates one, so a caller racing the namespace's removal cannot
+    /// bring it back.
+    pub fn existing_namespace<'a>(&'a self, name: &str) -> Option<Namespace<'a>> {
+        let ns_id = self.inner.get_namespace_id(name)?;
+        // Removed between the two lookups.
+        let store = self.inner.get_store(ns_id).ok()?;
+        Some(Namespace {
+            ns_id,
+            store,
+            db: &self.inner,
+        })
+    }
+
     /// Get or create a namespace with a TTL and return a scoped handle.
     ///
     /// Records in this namespace will be automatically expired after `ttl`.
@@ -486,9 +500,9 @@ impl Db {
         self.inner.compact_lsm()
     }
 
-    /// Test-only: flush the named namespaces' memtables to level 0. See
-    /// `Database::flush_namespaces`.
-    #[cfg(test)]
+    /// Flush the named namespaces' memtables to level 0, making every write
+    /// already applied to them durable. See `Database::flush_namespaces`.
+    #[cfg(any(test, feature = "semantic-search"))]
     pub(crate) fn flush_namespaces(&self, names: &[String]) -> Result<()> {
         self.inner.flush_namespaces(names)
     }
@@ -1499,6 +1513,19 @@ impl AsyncDb {
         })
     }
 
+    /// Async [`Db::existing_namespace`].
+    pub async fn existing_namespace(&self, name: String) -> Result<Option<AsyncNamespace>> {
+        let db = self.inner.clone();
+        let found = tokio::task::spawn_blocking(move || db.existing_namespace(&name).map(|ns| (ns.ns_id, Arc::clone(&ns.store))))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?;
+        Ok(found.map(|(ns_id, store)| AsyncNamespace {
+            ns_id,
+            store,
+            db: self.inner.clone(),
+        }))
+    }
+
     /// Get or create a namespace with a TTL and return an async scoped handle.
     ///
     /// Records in this namespace will be automatically expired after `ttl` by the
@@ -1601,8 +1628,8 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Async [`Db::flush_namespaces`] (test-only).
-    #[cfg(test)]
+    /// Async [`Db::flush_namespaces`].
+    #[cfg(any(test, feature = "semantic-search"))]
     pub(crate) async fn flush_namespaces(&self, names: Vec<String>) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.flush_namespaces(&names))
