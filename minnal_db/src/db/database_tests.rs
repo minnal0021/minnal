@@ -329,7 +329,7 @@ fn an_in_flight_write_holds_the_persisted_watermark_back() {
     }
     db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
 
-    let watermark = *db.last_persisted_wal_offset.read();
+    let watermark = db.wal_metadata.read().cut;
     let tail = db.wal_metadata.read().tail;
     assert!(
         watermark <= in_flight_offset,
@@ -408,7 +408,7 @@ fn dropping_a_store_does_not_persist_a_survivors_in_flight_write() {
 
     db.remove_namespace("victim").unwrap();
 
-    let watermark = *db.last_persisted_wal_offset.read();
+    let watermark = db.wal_metadata.read().cut;
     assert!(
         watermark <= in_flight_offset,
         "dropping a store advanced the watermark to {watermark}, past the survivor's \
@@ -463,7 +463,7 @@ fn the_cut_respects_the_barrier_even_when_no_seal_enforces_it() {
     // the live tail.
     db.remove_namespace("b").unwrap();
 
-    let watermark = *db.last_persisted_wal_offset.read();
+    let watermark = db.wal_metadata.read().cut;
     let tail = db.wal_metadata.read().tail;
     assert!(
         watermark <= barrier,
@@ -496,7 +496,7 @@ fn the_in_flight_barrier_is_released_when_the_write_finishes() {
     // i.e. the barrier bounds progress without stopping it.
     db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
     let tail = db.wal_metadata.read().tail;
-    let watermark = *db.last_persisted_wal_offset.read();
+    let watermark = db.wal_metadata.read().cut;
     assert_eq!(watermark, tail, "watermark stalled at {watermark} with tail {tail}");
 }
 
@@ -531,15 +531,13 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     // Deletes take the same Step-3 sync path and had the same defect.
     db.delete_ns(ns, b"k0000").unwrap();
 
-    let meta = db.wal_metadata.read();
-    let (total, persisted) = (meta.total_entries, meta.persisted_entries);
-    drop(meta);
-
-    assert_eq!(total, 201, "expected every write to be journalled, got total={total}");
+    let meta = db.wal_metadata.read().clone();
+    assert!(meta.tail > 0, "expected every write to be journalled");
     assert_eq!(
-        persisted, 0,
-        "a value-log fsync marked {persisted} of {total} WAL entries persisted, but nothing \
-             has reached an SSTable — recovery would skip them and lose acknowledged writes"
+        meta.cut, 0,
+        "a value-log fsync moved the cut to {} (tail {}), but nothing has reached an SSTable — \
+             recovery would skip those entries and lose acknowledged writes",
+        meta.cut, meta.tail
     );
 }
 
@@ -580,7 +578,7 @@ fn test_pending_flush_records_are_keyed_by_namespace_not_just_version() {
     );
 
     // A's flush may satisfy only A's record.
-    db.wal_flush_observer.on_ro_memtable_flushed_to_level0_ns(a, 0);
+    db.wal_flush_observer.prepare_written(a, 0).unwrap().commit();
 
     let pending = db.pending_wal_flushes.read();
     assert!(!pending.contains_key(&(a, 0)), "A's own record should be consumed by A's flush");
@@ -601,9 +599,9 @@ fn test_pending_flush_records_are_keyed_by_namespace_not_just_version() {
 /// before the fix: 0 of 200 keys in the quiet namespace survived a SIGKILL
 /// after a second namespace flushed repeatedly.
 ///
-/// Asserting on `persisted_entries` rather than on post-crash reads keeps
-/// this a unit test: an entry marked persisted is exactly the entry recovery
-/// will refuse to replay.
+/// Asserting on the saved progress rather than on post-crash reads keeps this
+/// a unit test: an entry below its namespace's `replay_from` is exactly the
+/// entry recovery will refuse to replay.
 #[test]
 fn test_one_namespace_flush_does_not_persist_anothers_wal_entries() {
     let dir = TempDir::new().unwrap();
@@ -616,11 +614,11 @@ fn test_one_namespace_flush_does_not_persist_anothers_wal_entries() {
     let busy = db.create_namespace("busy").unwrap();
 
     // `quiet` writes a handful of records and then goes idle — they stay in
-    // its memtable, so none of them may be marked persisted.
+    // its memtable, so the cut must stay at or below the first of them.
+    let quiet_start = db.wal_metadata.read().tail;
     for i in 0..10u32 {
         db.put_ns(quiet, format!("q{i}").as_bytes(), b"quiet-value").unwrap();
     }
-    let quiet_entries = 10u64;
 
     // `busy` writes, then flushes to level 0 — the event that used to mark
     // everything below the global WAL tail persisted. Flushed explicitly
@@ -631,70 +629,47 @@ fn test_one_namespace_flush_does_not_persist_anothers_wal_entries() {
     }
     db.get_store(busy).unwrap().flush_memtable_to_level0().unwrap();
 
-    let meta = db.wal_metadata.read();
-    let (total, persisted) = (meta.total_entries, meta.persisted_entries);
-    drop(meta);
-
+    let meta = db.wal_metadata.read().clone();
     assert!(
-        persisted <= total.saturating_sub(quiet_entries),
-        "quiet namespace's {quiet_entries} un-flushed entries were marked persisted \
-             by busy's flushes: persisted={persisted} total={total}"
+        meta.replay_from(quiet) <= quiet_start,
+        "busy's flushes retired quiet's un-flushed entries: quiet replays from {} \
+             but its first entry is at {quiet_start} (cut {})",
+        meta.replay_from(quiet),
+        meta.cut
     );
+    assert!(meta.replay_from(busy) > quiet_start, "busy's own flush should have retired its entries");
 }
 
+/// Concurrent flushes in many namespaces each save the WAL progress. The
+/// saves are serialised (`WalPersistObserver::persist_lock`), so the file on
+/// disk always ends equal to the live progress: an older save landing after a
+/// newer one would leave recovery an older cut than WAL GC has acted on.
 #[test]
-fn test_concurrent_mark_persisted_never_overcounts() {
-    // Regression: `mark_persisted_range` is a non-atomic scan → flip → count.
-    // Run concurrently by multiple writers reaching the sync point at once, two
-    // threads would flip and BOTH count the same entry, pushing
-    // `persisted_entries` past `total_entries`. Because the WAL GC deletion gate
-    // was exact equality (`total == persisted`), that impossible state wedged
-    // WAL GC forever (segments never became deletable → unbounded WAL growth).
-    // `persist_lock` must serialize the flip+count so no entry is counted twice.
+fn concurrent_flushes_leave_the_saved_progress_equal_to_the_live_one() {
     let dir = TempDir::new().unwrap();
-    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let mut config = create_db_config();
+    config.lsm_config.skip_list_capacity = 32;
+    let db = Database::open(dir.path(), config).unwrap();
+    let namespaces: Vec<u32> = (0..8).map(|i| db.create_namespace(&format!("ns{i}")).unwrap()).collect();
 
-    // Append a batch of entries (default records_per_sync is high, so these do
-    // not auto-persist during the writes).
-    let n = 500u64;
-    for i in 0..n {
-        db.put(format!("key{i}").as_bytes(), b"value").unwrap();
-    }
-    let tail = db.wal_metadata.read().tail;
-    let total = db.wal_metadata.read().total_entries;
-    assert!(total >= n, "expected at least {n} entries, got {total}");
-
-    // Hammer the same range from many threads at once.
     std::thread::scope(|s| {
-        for _ in 0..16 {
-            s.spawn(|| {
-                for _ in 0..8 {
-                    db.wal_flush_observer.mark_persisted_range(0, tail);
+        for &ns in &namespaces {
+            let db = &db;
+            s.spawn(move || {
+                for i in 0..300u32 {
+                    db.put_ns(ns, format!("k{i:04}").as_bytes(), b"value").unwrap();
+                    if i % 50 == 49 {
+                        db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+                    }
                 }
             });
         }
     });
 
-    let meta = db.wal_metadata.read();
-    // The invariant the bug violated: persisted can never exceed total.
-    assert!(
-        meta.persisted_entries <= meta.total_entries,
-        "persisted_entries ({}) exceeded total_entries ({}) — over-count race",
-        meta.persisted_entries,
-        meta.total_entries,
-    );
-    // The whole range was covered, so every entry is persisted exactly once.
-    assert_eq!(meta.persisted_entries, meta.total_entries);
-    // Per-segment invariant holds too.
-    for seg in meta.tracked_segments() {
-        assert!(
-            meta.segment_persisted(seg) <= meta.segment_total(seg),
-            "segment {seg}: persisted {} > total {}",
-            meta.segment_persisted(seg),
-            meta.segment_total(seg),
-        );
-    }
-    drop(meta);
+    let live = db.wal_metadata.read().clone();
+    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(dir.path().join("wal_metadata")).unwrap()).unwrap();
+    assert!(live.cut > 0, "the flushes should have moved the cut");
+    assert_eq!((saved.cut, &saved.safe), (live.cut, &live.safe), "the saved progress is not the live one");
     db.shutdown().unwrap();
 }
 
@@ -1356,7 +1331,7 @@ fn a_value_too_big_for_a_segment_is_rejected_before_the_wal() {
     let db = Database::open(dir.path(), config).unwrap();
 
     db.put(b"k", b"small").unwrap();
-    let entries_before = db.wal_metadata.read().total_entries;
+    let entries_before = db.wal_metadata.read().tail;
 
     // Comfortably over the segment, but far under the u32 field-width limit that
     // was the only bound before.
@@ -1372,7 +1347,7 @@ fn a_value_too_big_for_a_segment_is_rejected_before_the_wal() {
     }
 
     assert_eq!(
-        db.wal_metadata.read().total_entries,
+        db.wal_metadata.read().tail,
         entries_before,
         "the rejected write reached the WAL — it was not rejected at the boundary"
     );
@@ -1946,7 +1921,7 @@ async fn async_db_wal_gc_worker_reclaims_and_stops() {
     // A direct pass proves GC is reachable and returns sane numbers; the
     // worker firing on its own interval is covered by the workers' own tests.
     let (_reclaimed, remaining) = db.garbage_collect_wal().await.unwrap();
-    assert!(remaining <= 200, "un-persisted count should not exceed what was written");
+    assert!(remaining > 0, "the 200 writes are still in a memtable, so their bytes are pending");
 
     // Shutdown must stop the worker without hanging or erroring.
     db.shutdown().await.unwrap();
@@ -2129,9 +2104,6 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
 
         let mut meta = WalMetadata::new();
         meta.tail = tail;
-        meta.total_entries = 3;
-        meta.segment_total_entries = vec![3];
-        meta.segment_persisted_entries = vec![0];
         std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
     }
 
@@ -2146,7 +2118,7 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
 
 /// Critical regression: WAL entries fsynced *after* the last `wal_metadata`
 /// flush must not be lost. We craft the post-crash state — three durable WAL
-/// entries but a metadata file whose `tail`/counts cover only the first —
+/// entries but a metadata file whose `tail` covers only the first —
 /// and assert recovery reconstructs the true tail and replays all three
 /// (without the fix, recovery scans only up to the stale tail and the last
 /// two are silently dropped).
@@ -2178,9 +2150,6 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
         // Persist metadata as it stood at the earlier flush: it sees only entry 1.
         let mut meta = WalMetadata::new();
         meta.tail = stale_tail;
-        meta.total_entries = 1;
-        meta.segment_total_entries = vec![1];
-        meta.segment_persisted_entries = vec![0];
         std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
     }
 
@@ -2564,14 +2533,10 @@ mod merge_tests {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
-        let before = db.wal_metadata.read().total_entries;
+        let before = db.wal_metadata.read().tail;
         assert_eq!(db.merge(b"never-existed", b"", |_, _| Ok(None)).unwrap(), None);
 
-        assert_eq!(
-            db.wal_metadata.read().total_entries,
-            before,
-            "an absent -> absent merge appended a WAL entry"
-        );
+        assert_eq!(db.wal_metadata.read().tail, before, "an absent -> absent merge appended a WAL entry");
         assert_eq!(db.get(b"never-existed").unwrap(), None);
 
         db.shutdown().unwrap();
@@ -2585,7 +2550,7 @@ mod merge_tests {
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
         db.put(b"capped", &9u64.to_le_bytes()).unwrap();
-        let before = db.wal_metadata.read().total_entries;
+        let before = db.wal_metadata.read().tail;
 
         let err = db
             .merge(b"capped", &1u64.to_le_bytes(), |existing, _| {
@@ -2597,7 +2562,7 @@ mod merge_tests {
             .unwrap_err();
 
         assert!(matches!(err, KVError::MergeAborted(_)), "unexpected error: {err:?}");
-        assert_eq!(db.wal_metadata.read().total_entries, before, "an aborted merge appended a WAL entry");
+        assert_eq!(db.wal_metadata.read().tail, before, "an aborted merge appended a WAL entry");
         assert_eq!(db.get(b"capped").unwrap(), Some(9u64.to_le_bytes().to_vec()));
 
         db.shutdown().unwrap();
@@ -2641,7 +2606,7 @@ mod merge_tests {
         std::fs::set_permissions(&vlog_dir, readonly).unwrap();
 
         let big = vec![9u8; 40 * 1024];
-        let entries_before = db.wal_metadata.read().total_entries;
+        let entries_before = db.wal_metadata.read().tail;
 
         // `put` swallows it and reports success.
         let put_result = db.put(b"target", &big);
@@ -2650,7 +2615,7 @@ mod merge_tests {
         // `merge` surfaces it.
         let merge_result = db.merge(b"target", &big, |_, operand| Ok(Some(operand.to_vec())));
 
-        let entries_after = db.wal_metadata.read().total_entries;
+        let entries_after = db.wal_metadata.read().tail;
         let failures = db.metrics_snapshot().apply_failures;
 
         // Restore before asserting, so a failure still leaves a removable TempDir.
@@ -3007,47 +2972,29 @@ mod merge_tests {
     }
 }
 
-/// Marking a range persisted must cost one fsync per WAL **segment**, not one
-/// per entry.
+/// Retiring entries never writes into the log: a flush moves the cut by
+/// saving the WAL metadata, and the log's bytes stay exactly as appended.
 ///
-/// The per-entry fsync was measured at 218.9 s for 57,735 entries. That loop is
-/// reached from the LSM flush observer, so it runs inside
-/// `flush_ro_memtable_to_level0` with `read_only_memtables` held — which blocks
-/// any writer whose memtable needs sealing, while that writer holds a value-log
-/// bucket lock and a key stripe. Under a stress workload every namespace froze
-/// for minutes behind it.
-///
-/// Asserted on the fsync **count**, not on elapsed time: the property is
-/// algorithmic, so this cannot flake on a slow machine. The counter covers both
-/// the batched and the per-entry path, so reinstating the per-entry fsync fails
-/// here even if the batch fsync is left in place.
+/// The log is append-only on purpose. Rewriting a record in place (as marking
+/// each entry persisted once did) costs a random write and an fsync per touched
+/// segment inside the flush, and means a frame can change after it is written.
 #[test]
-fn marking_a_range_persisted_costs_one_fsync_per_segment_not_per_entry() {
+fn a_flush_retires_entries_without_writing_into_the_log() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     let ns = db.create_namespace("bulk").unwrap();
 
-    let entries = 600u32;
-    for i in 0..entries {
+    for i in 0..600u32 {
         db.put_ns(ns, format!("k{i:05}").as_bytes(), b"v").unwrap();
     }
+    let before = std::fs::read(dir.path().join("wal.log")).unwrap();
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+    db.garbage_collect_wal().unwrap();
+    let after = std::fs::read(dir.path().join("wal.log")).unwrap();
 
-    let before = db.wal.status_sync_count();
-    let tail = db.wal_metadata.read().tail;
-    db.wal_flush_observer.mark_persisted_range(0, tail);
-    let syncs = db.wal.status_sync_count() - before;
-
-    let persisted = db.wal_metadata.read().persisted_entries;
-    assert!(
-        persisted >= entries as u64,
-        "the sweep should have flipped every entry, marked {persisted} of {entries}"
-    );
-    // A default WAL segment is 64 MiB, so 600 tiny entries are all in segment 0.
-    assert!(
-        syncs <= 2,
-        "marking {persisted} entries persisted issued {syncs} fsyncs — it must be one per WAL segment, \
-         not one per entry (the per-entry loop took 218.9 s for 57,735 entries and froze every writer)"
-    );
+    let meta = db.wal_metadata.read().clone();
+    assert_eq!(meta.cut, meta.tail, "the flush should have retired every entry");
+    assert!(before == after, "retiring entries changed the log's bytes");
 }
 
 /// The index checkpoint must never claim an offset past a write whose index
@@ -3137,4 +3084,189 @@ fn reset_rowmap_frees_every_row_id_once_no_field_exists() {
     assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(500), "the compacted map survives a restart");
     assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 500);
     db.shutdown().unwrap();
+}
+
+// ── WAL retirement progress (cut + per-namespace safe offsets) ──────────────
+//
+// A flush saves the WAL's progress on its *written* event, before its L0
+// files are registered, and the progress goes live only once that save and
+// the vector index WAL's both succeeded. These pin the failure paths and the
+// reason the offsets are per namespace.
+
+/// The saved metadata file, as recovery would read it (a fresh database has
+/// not saved one yet).
+fn saved_wal_metadata(dir: &TempDir) -> WalMetadata {
+    match std::fs::read(dir.path().join("wal_metadata")) {
+        Ok(bytes) => WalMetadata::from_file_bytes(&bytes).unwrap(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => WalMetadata::new(),
+        Err(e) => panic!("reading the WAL metadata: {e}"),
+    }
+}
+
+#[test]
+fn a_failed_progress_save_undoes_the_flush_and_a_retry_completes_it() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("ns").unwrap();
+        for i in 0..20u32 {
+            db.put_ns(ns, format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        let cut_before = db.wal_metadata.read().cut;
+
+        db.wal_flush_observer.script_saves(&[true]);
+        assert!(
+            db.get_store(ns).unwrap().flush_memtable_to_level0().is_err(),
+            "the failed save must veto the flush"
+        );
+        assert_eq!(db.wal_metadata.read().cut, cut_before, "a failed save must not move the live cut");
+        assert_eq!(saved_wal_metadata(&dir).cut, cut_before);
+        for i in 0..20u32 {
+            assert_eq!(db.get_ns(ns, format!("k{i}").as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+
+        db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+        let meta = db.wal_metadata.read().clone();
+        assert_eq!(meta.cut, meta.tail, "the retry should retire everything");
+        assert_eq!(saved_wal_metadata(&dir).cut, meta.cut);
+        db.mark_crashed();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.get_namespace_id("ns").unwrap();
+    for i in 0..20u32 {
+        assert_eq!(db.get_ns(ns, format!("k{i}").as_bytes()).unwrap(), Some(b"v".to_vec()), "k{i} lost");
+    }
+}
+
+/// The vector index WAL saves its progress in the same event, after the main
+/// WAL. If it fails, the flush is undone and its L0 files deleted, so the main
+/// WAL must put back the progress it already saved: left in place, recovery
+/// would skip entries whose only on-disk copy was just deleted.
+#[test]
+fn a_vector_wal_failure_after_the_main_save_puts_the_main_progress_back() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("docs_sparse_vector").unwrap();
+        for i in 0..20u32 {
+            db.put_ns(ns, format!("main{i}").as_bytes(), b"v").unwrap();
+        }
+        db.put_ns_logged(ns, b"logged", b"code").unwrap();
+        db.sync_vector_index_wal().unwrap();
+        let before = saved_wal_metadata(&dir);
+
+        db.vector_index_wal.fail_next_marker_write();
+        assert!(db.get_store(ns).unwrap().flush_memtable_to_level0().is_err());
+        let after = saved_wal_metadata(&dir);
+        assert_eq!(
+            (after.cut, &after.safe),
+            (before.cut, &before.safe),
+            "the main WAL's saved progress was not put back"
+        );
+        assert_eq!(db.wal_metadata.read().cut, before.cut, "the live cut moved for an undone flush");
+        assert!(db.wal_flush_observer.check_poisoned().is_ok());
+        db.mark_crashed();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.get_namespace_id("docs_sparse_vector").unwrap();
+    for i in 0..20u32 {
+        assert_eq!(db.get_ns(ns, format!("main{i}").as_bytes()).unwrap(), Some(b"v".to_vec()), "main{i} lost");
+    }
+    assert_eq!(db.get_ns(ns, b"logged").unwrap(), Some(b"code".to_vec()));
+}
+
+/// If putting the progress back fails too, the file on disk may claim entries
+/// are in L0 that are not, so the main WAL stops accepting writes.
+#[test]
+fn a_failed_rollback_stops_the_main_wal() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("docs_sparse_vector").unwrap();
+    db.put_ns(ns, b"main", b"v").unwrap();
+    db.put_ns_logged(ns, b"logged", b"code").unwrap();
+    db.sync_vector_index_wal().unwrap();
+
+    db.vector_index_wal.fail_next_marker_write();
+    db.wal_flush_observer.script_saves(&[false, true]);
+    assert!(db.get_store(ns).unwrap().flush_memtable_to_level0().is_err());
+    assert!(
+        matches!(db.put_ns(ns, b"after", b"v"), Err(KVError::WalPoisoned(_))),
+        "writes must be refused"
+    );
+    assert!(matches!(db.delete_ns(ns, b"main"), Err(KVError::WalPoisoned(_))));
+}
+
+/// Why the offsets are per namespace. A key's put is in the main WAL and its
+/// later delete in the vector index WAL; both reach L1, which drops the
+/// tombstone. Another namespace with older unflushed writes holds the global
+/// cut below the put, so replaying from the cut would bring the key back with
+/// nothing newer to beat it.
+#[test]
+fn main_wal_replay_does_not_bring_back_a_key_whose_logged_delete_reached_l1() {
+    let dir = TempDir::new().unwrap();
+    let k: &[u8] = b"key";
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let holder = db.create_namespace("holder").unwrap();
+        let ns = db.create_namespace("ns").unwrap();
+        // `holder` writes first and never flushes: the cut stays below the put.
+        db.put_ns(holder, b"h", b"v").unwrap();
+        db.put_ns(ns, k, b"old").unwrap();
+        let put_end = db.wal_metadata.read().tail;
+        let store = db.get_store(ns).unwrap();
+        store.flush_memtable_to_level0().unwrap();
+        db.delete_ns_logged(ns, k).unwrap();
+        db.sync_vector_index_wal().unwrap();
+        store.flush_memtable_to_level0().unwrap();
+        store.compact_lsm().unwrap();
+        assert_eq!(db.get_ns(ns, k).unwrap(), None);
+        // A second pass also removes the L0 files the first merge made
+        // obsolete, tombstone included: now nothing on disk mentions the key.
+        db.put_ns(ns, b"other", b"v").unwrap();
+        store.flush_memtable_to_level0().unwrap();
+        store.compact_lsm().unwrap();
+        let meta = db.wal_metadata.read().clone();
+        assert!(meta.cut < put_end, "setup: the cut must stay below the put");
+        assert!(meta.replay_from(ns) >= put_end, "setup: ns flushed past its put");
+        db.mark_crashed();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.get_namespace_id("ns").unwrap();
+    assert_eq!(db.get_ns(ns, k).unwrap(), None, "a deleted key came back after recovery");
+    let holder = db.get_namespace_id("holder").unwrap();
+    assert_eq!(
+        db.get_ns(holder, b"h").unwrap(),
+        Some(b"v".to_vec()),
+        "holder's unflushed write must replay"
+    );
+}
+
+/// Recovery skips a namespace's entries below its saved offset and replays
+/// the rest; afterwards the whole log is retired.
+#[test]
+fn recovery_replays_each_namespace_from_its_own_offset_then_retires_the_log() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let a = db.create_namespace("a").unwrap();
+        let b = db.create_namespace("b").unwrap();
+        db.put_ns(a, b"a0", b"v").unwrap();
+        for i in 0..10u32 {
+            db.put_ns(b, format!("b{i}").as_bytes(), b"v").unwrap();
+        }
+        db.get_store(b).unwrap().flush_memtable_to_level0().unwrap();
+        db.put_ns(b, b"b-late", b"v").unwrap();
+        let saved = saved_wal_metadata(&dir);
+        assert!(saved.replay_from(b) > saved.cut, "b's offset should be saved above the cut");
+        db.mark_crashed();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let (a, b) = (db.get_namespace_id("a").unwrap(), db.get_namespace_id("b").unwrap());
+    assert_eq!(db.get_ns(a, b"a0").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get_ns(b, b"b-late").unwrap(), Some(b"v".to_vec()));
+    for i in 0..10u32 {
+        assert_eq!(db.get_ns(b, format!("b{i}").as_bytes()).unwrap(), Some(b"v".to_vec()));
+    }
+    let meta = db.wal_metadata.read().clone();
+    assert_eq!((meta.cut, meta.safe.len()), (meta.tail, 0), "recovery should retire the whole log");
 }

@@ -2497,7 +2497,7 @@ mod tests {
             store.flush_memtable_to_level0().unwrap();
             store.compact_lsm().unwrap();
             let m = db.wal_metadata();
-            assert_eq!(m.persisted_entries, m.total_entries, "main-WAL recovery has nothing to replay");
+            assert_eq!(m.cut, m.tail, "main-WAL recovery has nothing to replay");
             // 7. Crash.
             db.mark_crashed();
             (sparse, k.to_vec())

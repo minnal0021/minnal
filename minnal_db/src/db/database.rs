@@ -14,7 +14,7 @@ use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
-use crate::db::wal::{Wal, WalEntry, WalEntryStatus, WalError, WalMetadata, WalOperationType};
+use crate::db::wal::{Wal, WalEntry, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
 use crate::index::{DynFieldIndex, IndexValueType};
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
@@ -58,29 +58,42 @@ impl NsFlushProgress {
     }
 }
 
-/// Observes LSM flush events and marks WAL entries as persisted.
+/// Observes LSM flush events and keeps the WAL's retirement progress: each
+/// namespace's safe offset and the cut, saved in the WAL metadata.
 /// Shared across all namespaces since the WAL is global.
+///
+/// Progress moves on a flush's *written* event, when its L0 files are durable
+/// but not yet registered, and takes effect only once the metadata recording it
+/// is on disk ([`Self::on_memtable_written_ns`]). So recovery and WAL GC never
+/// act on progress a crash could undo, and the saved per-namespace offsets are
+/// durable before L1 compaction can merge the files they describe.
 pub(crate) struct WalPersistObserver {
-    wal: Arc<Wal>,
     wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_metadata_path: PathBuf,
     /// Keyed by `(namespace_id, memtable version)`. Memtable versions are
     /// allocated **per KVStore**, so keying by version alone made namespace A's
     /// version 7 and namespace B's version 7 the same entry — A's flush would
-    /// then satisfy B's pending record and advance the watermark past B's
+    /// then satisfy B's pending record and advance the cut past B's
     /// un-flushed writes.
     pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
-    /// Per-namespace flush progress — the input to the global watermark.
+    /// Per-namespace flush progress — the input to the cut.
     ns_progress: RwLock<std::collections::HashMap<u32, NsFlushProgress>>,
-    last_persisted_offset: Arc<RwLock<u64>>,
-    /// Serializes every persisted-marking operation (`mark_persisted_range`,
-    /// `mark_namespace_persisted`). These do a non-atomic scan → check status →
-    /// flip → count over a WAL offset range; run concurrently they would flip and
-    /// **count the same entry twice**, driving `persisted_entries` past
-    /// `total_entries` and permanently wedging WAL GC (whose deletion gate is
-    /// `persisted >= total`). Holding this across the whole operation makes the
-    /// on-disk `status == Persisted` check a reliable per-entry dedup.
+    /// Serialises every change to the saved progress and every save of the WAL
+    /// metadata file, so two saves cannot land in the opposite order (older
+    /// progress overwriting newer). Held across the file write; never taken
+    /// while holding `pending`, `ns_progress`, `wal_metadata` or `in_flight`.
+    ///
+    /// **Lock ordering: `persist_lock` → `pending` → `ns_progress` →
+    /// `wal_metadata` → `in_flight`.**
     persist_lock: Mutex<()>,
+    /// Set when the WAL metadata on disk may claim progress that L0 does not
+    /// hold (a rollback save failed, see [`PreparedProgress::abort`]). Writes
+    /// are refused until the database is reopened, whose recovery rebuilds the
+    /// truth from the log and L0.
+    poisoned: Mutex<Option<String>>,
+    /// Test hook: outcomes for the next metadata saves, `true` = fail.
+    #[cfg(test)]
+    save_failures: Mutex<std::collections::VecDeque<bool>>,
     /// Start offsets of writes appended to the WAL but not yet applied to a
     /// memtable — the writes for which "it is in the WAL" and "it is in the LSM"
     /// disagree *right now*.
@@ -90,7 +103,7 @@ pub(crate) struct WalPersistObserver {
     /// over-states durability: `put_ns` appends under the WAL lock (advancing
     /// the tail) and applies to the memtable *after* releasing it, so between
     /// those two points an entry is visible in the tail while its key is
-    /// nowhere. Marking such an entry `Persisted` tells recovery to skip a write
+    /// nowhere. Moving the cut past such an entry tells recovery to skip a write
     /// that only ever existed in a memtable — and a crash before that memtable
     /// flushes loses an acknowledged write. Measured: 4 acknowledged writes lost
     /// in one round of `work/stress/repro/drop_loses_a_write.py`, and 1 in
@@ -117,8 +130,8 @@ pub(crate) struct WalPersistObserver {
 /// RAII is load-bearing, not stylistic: `put_ns` has fallible steps between the
 /// WAL append and the memtable apply (`get_store`), and a leaked registration
 /// pins [`WalPersistObserver::wal_cut_ceiling`] forever — which freezes the
-/// persisted watermark, so WAL GC's `persisted >= total` gate never fires again
-/// and the WAL grows without bound. That is the same failure mode as the dropped
+/// cut, so WAL GC never reclaims another segment and the WAL grows without
+/// bound. That is the same failure mode as the dropped
 /// namespace in `17a8a0c`, reached a different way.
 pub(crate) struct InFlightWrite<'a> {
     observer: &'a WalPersistObserver,
@@ -140,23 +153,38 @@ impl Drop for InFlightWrite<'_> {
 }
 
 impl WalPersistObserver {
-    fn new(
-        wal: Arc<Wal>,
-        wal_metadata: Arc<RwLock<WalMetadata>>,
-        wal_metadata_path: PathBuf,
-        pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
-        last_persisted_offset: Arc<RwLock<u64>>,
-    ) -> Self {
+    fn new(wal_metadata: Arc<RwLock<WalMetadata>>, wal_metadata_path: PathBuf, pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>) -> Self {
         Self {
-            wal,
             wal_metadata,
             wal_metadata_path,
             pending,
             ns_progress: RwLock::new(std::collections::HashMap::new()),
-            last_persisted_offset,
             persist_lock: Mutex::new(()),
+            poisoned: Mutex::new(None),
+            #[cfg(test)]
+            save_failures: Mutex::new(std::collections::VecDeque::new()),
             in_flight: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Test hook: script the outcome of the next metadata saves, in order
+    /// (`true` = the save fails).
+    #[cfg(test)]
+    pub(crate) fn script_saves(&self, outcomes: &[bool]) {
+        self.save_failures.lock().extend(outcomes.iter().copied());
+    }
+
+    /// `Err` once the main WAL has been stopped; see `poisoned`.
+    pub(crate) fn check_poisoned(&self) -> Result<()> {
+        match self.poisoned.lock().as_ref() {
+            None => Ok(()),
+            Some(why) => Err(KVError::WalPoisoned(why.clone())),
+        }
+    }
+
+    fn poison(&self, why: String) {
+        error!("[WAL] stopping the main WAL; writes are refused until the database is reopened: {why}");
+        self.poisoned.lock().get_or_insert(why);
     }
 
     /// Register `offset` as appended-to-the-WAL-but-not-yet-applied.
@@ -177,7 +205,7 @@ impl WalPersistObserver {
     /// appended but not yet applied to a memtable. Both consumers of "how far
     /// has the WAL got" must go through it:
     ///
-    /// * [`Self::try_advance_persisted`], whose cut would otherwise be the live
+    /// * [`Self::compute_cut`], whose cut would otherwise be the live
     ///   tail whenever no namespace reports un-flushed writes;
     /// * [`Self::on_memtable_sealed_ns`], which records "everything up to here is
     ///   in the memtable I am sealing" — false for a write whose apply has not
@@ -227,270 +255,134 @@ impl WalPersistObserver {
     /// A dropped namespace's store is gone from the registry, so it can never
     /// flush again and its `safe_offset` can never advance. Left in
     /// `ns_progress` it reports [`has_unflushed`](NsFlushProgress::has_unflushed)
-    /// forever, which pins the global cut in [`try_advance_persisted`] at its
-    /// stale offset — and [`Database::flush_namespaces_pinning_wal`] cannot clear
-    /// it, because the store it would flush no longer exists. The watermark then
-    /// never advances, `persisted_entries` stops tracking `total_entries`, and
-    /// WAL GC's `persisted >= total` gate never fires again: unbounded WAL growth
-    /// after any namespace drop.
+    /// forever, which pins the cut at its stale offset — and
+    /// [`Database::flush_namespaces_pinning_wal`] cannot clear it, because the
+    /// store it would flush no longer exists: unbounded WAL growth after any
+    /// namespace drop.
     ///
-    /// Forgetting it is sound because `remove_namespace` has already flushed and
-    /// shut the store down and marked its WAL entries persisted
-    /// ([`mark_namespace_persisted`]) before calling this — those entries need no
-    /// further protection, and recovery skips entries for namespaces missing from
-    /// the registry anyway.
-    ///
-    /// [`try_advance_persisted`]: Self::try_advance_persisted
-    /// [`mark_namespace_persisted`]: Self::mark_namespace_persisted
+    /// Forgetting it is sound because recovery skips entries for namespaces
+    /// missing from the registry, which `remove_namespace` has already updated.
+    /// The new cut is saved; a failed save only leaves the saved cut behind,
+    /// which costs replay, not data.
     pub(crate) fn forget_namespace(&self, namespace_id: u32) {
-        {
-            self.ns_progress.write().remove(&namespace_id);
-            // Seal records for memtables that will now never be flushed; left
-            // behind they would be folded into a future namespace's scan.
-            self.pending.write().retain(|(ns, _), _| *ns != namespace_id);
-        }
-        // Locks released: the dropped namespace was potentially the one holding
-        // the cut back, so re-evaluate it now rather than waiting for some other
-        // namespace to happen to flush.
-        self.try_advance_persisted();
-    }
-
-    pub(crate) fn mark_persisted_range(&self, start: u64, end: u64) {
-        // Serialize with every other persisted-marking operation so no entry is
-        // scanned+flipped+counted concurrently (see `persist_lock`).
         let _persist = self.persist_lock.lock();
-
-        // Re-read the authoritative watermark under the lock: the caller's `start`
-        // may be stale if another persist advanced past it while we waited, and
-        // processing an already-counted range would double-count it. `start` is
-        // kept as a floor (it only ever equals the watermark at call sites).
-        let start = (*self.last_persisted_offset.read()).max(start);
-        if end <= start {
-            return;
-        }
-
-        let entries = match self.wal.scan_entries(start, end) {
-            Ok(entries) => entries,
-            Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                warn!("[WAL] Failed to scan entries for persist update: {:?}", e);
-                return;
-            }
-        };
-
-        let mut updated = 0u64;
-        let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut had_error = false;
-
-        for (pointer, entry) in entries {
-            if entry.status == WalEntryStatus::Persisted {
-                continue;
-            }
-            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
-                warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
-                had_error = true;
-                continue;
-            }
-            updated += 1;
-            let segment_id = self.wal.segment_id_for_offset(pointer.offset);
-            *per_segment.entry(segment_id).or_insert(0) += 1;
-        }
-
-        if updated > 0 {
-            // One fsync per touched segment, not one per entry. See
-            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
-            // happens BEFORE the metadata write below, so the on-disk statuses are
-            // never less durable than the counters that describe them.
-            for &segment_id in per_segment.keys() {
-                if let Err(e) = self.wal.sync_segment(segment_id) {
-                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a persist sweep: {e:?}");
-                    had_error = true;
-                }
-            }
-            let mut wal_metadata = self.wal_metadata.write();
-            for (segment_id, count) in per_segment {
-                wal_metadata.add_segment_persisted(segment_id, count);
-            }
-            wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_add(updated);
-            let bytes = match wal_metadata.to_file_bytes() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("[WAL] Failed to serialize WAL metadata: {:?}", e);
-                    had_error = true;
-                    Vec::new()
-                }
-            };
-            if !bytes.is_empty()
-                && let Err(e) = crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)
-            {
-                warn!("[WAL] Failed to write WAL metadata: {:?}", e);
-                had_error = true;
-            }
-        }
-
-        if !had_error {
-            *self.last_persisted_offset.write() = end;
+        self.ns_progress.write().remove(&namespace_id);
+        // Seal records for memtables that will now never be flushed; left
+        // behind they would be folded into a future namespace's scan.
+        self.pending.write().retain(|(ns, _), _| *ns != namespace_id);
+        let progress = self.ns_progress.read().clone();
+        if let Err(e) = self.commit_progress(&progress) {
+            warn!("[WAL] Failed to save WAL progress after dropping ns={namespace_id}: {e:?}");
         }
     }
 
-    /// Mark WAL entries belonging to `namespace_id` in `[start, end)` as persisted.
+    /// The cut `progress` implies: the lowest safe offset among namespaces with
+    /// un-flushed writes, capped at the oldest in-flight write, and never below
+    /// the cut already saved.
     ///
-    /// Unlike [`mark_persisted_range`], this skips entries from other namespaces and
-    /// therefore does **not** advance `last_persisted_offset`. It is called when a
-    /// namespace is dropped: its KVStore has been flushed and shut down, so those
-    /// entries are durable and no longer need WAL protection, but other namespaces
-    /// may still have un-persisted entries in the same offset window.
-    pub(crate) fn mark_namespace_persisted(&self, namespace_id: u32, start: u64, end: u64) {
-        if end <= start {
-            return;
-        }
+    /// The WAL is shared, so the cut is the **minimum** over the namespaces that
+    /// still hold un-flushed writes; one namespace's own progress says nothing
+    /// about another's un-flushed entries. Namespaces with nothing outstanding
+    /// do not constrain it; if none do, everything written so far is in L0 and
+    /// the cut is the ceiling.
+    ///
+    /// The ceiling excludes writes that are in the WAL but not yet in any
+    /// memtable. It is applied to BOTH branches: capping the `Some` branch costs
+    /// nothing (a namespace's `safe_offset` is already below any later write)
+    /// and removes the need to re-derive that argument every time this is read.
+    /// Without it, the `None` branch cut at the live tail, which is how a store
+    /// drop lost acknowledged writes: `forget_namespace` recomputes the cut the
+    /// instant it removes a namespace, which is precisely when the set of
+    /// namespaces reporting un-flushed writes can go empty while other
+    /// namespaces are mid-write.
+    fn compute_cut(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> u64 {
+        let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
+        let ceiling = self.wal_cut_ceiling();
+        let cut = match slowest {
+            Some(offset) => offset.min(ceiling),
+            None => ceiling,
+        };
+        cut.max(self.wal_metadata.read().cut)
+    }
 
-        // Serialize with `mark_persisted_range` (same `persist_lock`): both flip and
-        // count entries in overlapping windows, so running concurrently they could
-        // count the same entry twice. Under the lock, whichever flips an entry first
-        // marks it `Persisted` on disk and the other skips it uncounted.
+    /// The metadata `progress` implies: the current metadata with its cut and
+    /// per-namespace offsets replaced.
+    fn progress_snapshot(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> WalMetadata {
+        let cut = self.compute_cut(progress);
+        let mut safe: Vec<(u32, u64)> = progress
+            .iter()
+            .filter(|(_, p)| p.safe_offset > cut)
+            .map(|(&ns, p)| (ns, p.safe_offset))
+            .collect();
+        safe.sort_unstable();
+        let mut snapshot = self.wal_metadata.read().clone();
+        snapshot.cut = cut;
+        snapshot.safe = safe;
+        snapshot
+    }
+
+    /// Make a saved snapshot's progress the live one.
+    fn apply_progress(&self, snapshot: &WalMetadata) {
+        let mut live = self.wal_metadata.write();
+        live.cut = snapshot.cut;
+        live.safe = snapshot.safe.clone();
+    }
+
+    /// Save the progress `progress` implies, then make it live. Caller holds
+    /// `persist_lock`. On a failed save nothing changes in memory: recovery and
+    /// WAL GC read the in-memory `cut` / `safe`, and they must never act on
+    /// progress that a crash could undo.
+    fn commit_progress(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> std::io::Result<()> {
+        let snapshot = self.progress_snapshot(progress);
+        self.write_metadata(&snapshot)?;
+        self.apply_progress(&snapshot);
+        Ok(())
+    }
+
+    /// Write `metadata` to the metadata file, durably. Caller holds
+    /// `persist_lock`.
+    fn write_metadata(&self, metadata: &WalMetadata) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.save_failures.lock().pop_front() == Some(true) {
+            return Err(std::io::Error::other("injected WAL metadata save failure"));
+        }
+        let bytes = metadata.to_file_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
+        crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)
+    }
+
+    /// Save the WAL metadata as it is (counters, head, tail), serialised with
+    /// every progress save.
+    pub(crate) fn save_metadata(&self) -> std::io::Result<()> {
         let _persist = self.persist_lock.lock();
-
-        let entries = match self.wal.scan_entries(start, end) {
-            Ok(entries) => entries,
-            Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                warn!("[WAL] Failed to scan entries for namespace {} persist update: {:?}", namespace_id, e);
-                return;
-            }
-        };
-
-        let mut updated = 0u64;
-        let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
-
-        for (pointer, entry) in entries {
-            if entry.namespace_id != namespace_id {
-                continue;
-            }
-            if entry.status == WalEntryStatus::Persisted {
-                continue;
-            }
-            if let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted) {
-                warn!("[WAL] Failed to update entry status at offset {}: {:?}", pointer.offset, e);
-                continue;
-            }
-            updated += 1;
-            let segment_id = self.wal.segment_id_for_offset(pointer.offset);
-            *per_segment.entry(segment_id).or_insert(0) += 1;
-        }
-
-        if updated > 0 {
-            // One fsync per touched segment, not one per entry. See
-            // `Wal::update_entry_status_deferred` for why deferring is safe — and it
-            // happens BEFORE the metadata write below, so the on-disk statuses are
-            // never less durable than the counters that describe them.
-            for &segment_id in per_segment.keys() {
-                if let Err(e) = self.wal.sync_segment(segment_id) {
-                    warn!("[WAL] Failed to sync WAL segment {segment_id} after a namespace persist sweep: {e:?}");
-                }
-            }
-            let mut wal_metadata = self.wal_metadata.write();
-            for (segment_id, count) in per_segment {
-                wal_metadata.add_segment_persisted(segment_id, count);
-            }
-            wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_add(updated);
-            match wal_metadata.to_file_bytes() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    if let Err(e) = crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes) {
-                        warn!("[WAL] Failed to write WAL metadata after namespace drop: {:?}", e);
-                    }
-                }
-                Err(e) => warn!("[WAL] Failed to serialize WAL metadata after namespace drop: {:?}", e),
-                _ => {}
-            }
-        }
+        let snapshot = self.wal_metadata.read().clone();
+        self.write_metadata(&snapshot)
     }
 
-    /// Fold `namespace_id`'s completed flushes into its `safe_offset`.
-    ///
-    /// Versions are consumed in order and only while flushed, so an out-of-order
-    /// flush cannot advance the namespace past a still-pending older memtable.
-    fn advance_namespace(&self, namespace_id: u32) {
-        let mut new_safe = 0u64;
-        loop {
-            let next = {
-                let pending = self.pending.read();
-                // BTreeMap ordering makes this the namespace's lowest version.
-                let Some((&key, state)) = pending.range((namespace_id, 0)..=(namespace_id, u64::MAX)).next() else {
-                    break;
-                };
-                if !state.flushed {
-                    break;
-                }
-                (key, state.tail)
-            };
-
-            {
-                let mut pending = self.pending.write();
-                let Some(state) = pending.get(&next.0) else {
-                    continue;
-                };
-                if !state.flushed {
-                    break;
-                }
-                pending.remove(&next.0);
-            }
-            new_safe = new_safe.max(next.1);
+    /// Retire everything written so far: cut at the ceiling, no per-namespace
+    /// offsets. Only for when every namespace's writes are known to be in L0
+    /// (clean shutdown after flushing every store, the end of recovery).
+    pub(crate) fn retire_all(&self) -> std::io::Result<()> {
+        let _persist = self.persist_lock.lock();
+        let mut snapshot = self.wal_metadata.read().clone();
+        snapshot.cut = self.wal_cut_ceiling().max(snapshot.cut);
+        snapshot.safe.clear();
+        self.write_metadata(&snapshot)?;
+        let mut live = self.wal_metadata.write();
+        live.cut = snapshot.cut;
+        live.safe.clear();
+        drop(live);
+        for p in self.ns_progress.write().values_mut() {
+            p.safe_offset = p.safe_offset.max(snapshot.cut);
         }
-
-        if new_safe > 0 {
-            let mut progress = self.ns_progress.write();
-            let entry = progress.entry(namespace_id).or_default();
-            entry.safe_offset = entry.safe_offset.max(new_safe);
-        }
+        Ok(())
     }
 
-    /// Advance the global watermark to the point every namespace has reached.
-    ///
-    /// A WAL entry may only be marked `Persisted` once the namespace that owns it
-    /// has flushed it to an SSTable, because recovery skips `Persisted` entries.
-    /// The WAL is shared, so the safe cut is the **minimum** `safe_offset` over
-    /// the namespaces that still hold un-flushed writes. Marking up to one
-    /// namespace's own tail — as this did before — declared every *other*
-    /// namespace's un-flushed entries persisted too, and a crash then lost them.
-    /// Namespaces with nothing outstanding do not constrain the cut; if none do,
-    /// everything written so far is durable and the cut is the current tail.
-    fn try_advance_persisted(&self) {
-        let cut = {
-            let progress = self.ns_progress.read();
-            let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
-            // The ceiling excludes writes that are in the WAL but not yet in any
-            // memtable. It is applied to BOTH branches, not just the `None` one:
-            // capping the `Some` branch too costs nothing (a namespace's
-            // `safe_offset` is already below any later write) and removes the
-            // need to re-derive that argument every time this is read.
-            //
-            // Without it, the `None` branch cut at the live tail, which is how a
-            // store drop lost acknowledged writes: `forget_namespace` calls this
-            // the instant it removes a namespace from `ns_progress`, and that is
-            // precisely when the set of namespaces reporting un-flushed writes
-            // can go empty while other namespaces are mid-write.
-            let ceiling = self.wal_cut_ceiling();
-            match slowest {
-                Some(offset) => offset.min(ceiling),
-                None => ceiling,
-            }
-        };
-
-        let start = *self.last_persisted_offset.read();
-        if cut > start {
-            self.mark_persisted_range(start, cut);
-        }
-    }
-}
-
-impl WalPersistObserver {
     fn on_memtable_sealed_ns(&self, namespace_id: u32, version: u64) {
         // The ceiling, not the raw tail. This record means "every WAL entry below
         // `tail` is in the memtable being sealed", and that is false for a write
         // whose apply has not landed yet: its apply will go into the *next*
         // memtable, while its offset is below this tail. Recording the raw tail
-        // therefore let `advance_namespace` push `safe_offset` past an entry that
+        // therefore let the written event push `safe_offset` past an entry that
         // no SSTable holds — the same lost-write bug as the cut, reached without
         // any namespace drop.
         //
@@ -502,12 +394,25 @@ impl WalPersistObserver {
         pending.entry((namespace_id, version)).or_insert(WalFlushState { tail, flushed: false });
     }
 
-    fn on_ro_memtable_flushed_to_level0_ns(&self, namespace_id: u32, version: u64) {
-        // Same reasoning as the seal path, for the case where the flush is
-        // observed without a preceding seal record.
+    /// `namespace_id`'s memtable `version` has its L0 files durable, not yet
+    /// registered. Fold the namespace's completed flushes (in version order)
+    /// into its safe offset, recompute the cut and **save** both, but do not make
+    /// them live yet: the flush can still be undone by another observer of the
+    /// same event (the vector index WAL), which deletes the L0 files. The
+    /// returned [`PreparedProgress`] holds `persist_lock` until it is committed
+    /// or aborted.
+    ///
+    /// An error means the save failed: nothing changed, and the LSM undoes the
+    /// flush (nothing registered, the memtable kept for a retry).
+    fn prepare_written(&self, namespace_id: u32, version: u64) -> std::io::Result<PreparedProgress<'_>> {
+        // Same reasoning as the seal path, for a flush observed without a
+        // preceding seal record.
         let ceiling = self.wal_cut_ceiling();
-        {
+        let guard = self.persist_lock.lock();
+        let previous = self.wal_metadata.read().clone();
+        let (fresh, folded, new_safe) = {
             let mut pending = self.pending.write();
+            let fresh = !pending.contains_key(&(namespace_id, version));
             let entry = pending
                 .entry((namespace_id, version))
                 .or_insert(WalFlushState { tail: 0, flushed: false });
@@ -515,9 +420,102 @@ impl WalPersistObserver {
                 entry.tail = ceiling;
             }
             entry.flushed = true;
+            // Versions are consumed in order and only while flushed, so an
+            // out-of-order flush cannot advance the namespace past a
+            // still-pending older memtable.
+            let mut folded = Vec::new();
+            let mut new_safe = 0u64;
+            for (&key, state) in pending.range((namespace_id, 0)..=(namespace_id, u64::MAX)) {
+                if !state.flushed {
+                    break;
+                }
+                folded.push(key);
+                new_safe = new_safe.max(state.tail);
+            }
+            (fresh, folded, new_safe)
+        };
+
+        let mut progress = self.ns_progress.read().clone();
+        if new_safe > 0 {
+            let entry = progress.entry(namespace_id).or_default();
+            entry.safe_offset = entry.safe_offset.max(new_safe);
         }
-        self.advance_namespace(namespace_id);
-        self.try_advance_persisted();
+        let snapshot = self.progress_snapshot(&progress);
+        let prepared = PreparedProgress {
+            observer: self,
+            _guard: guard,
+            namespace_id,
+            version,
+            fresh,
+            folded,
+            new_safe,
+            previous,
+            snapshot,
+        };
+        if let Err(e) = self.write_metadata(&prepared.snapshot) {
+            prepared.withdraw();
+            return Err(e);
+        }
+        Ok(prepared)
+    }
+}
+
+/// A flush's progress, saved by [`WalPersistObserver::prepare_written`] but not
+/// yet live. Holds `persist_lock`, so no other save can land in between.
+pub(crate) struct PreparedProgress<'a> {
+    observer: &'a WalPersistObserver,
+    _guard: parking_lot::MutexGuard<'a, ()>,
+    namespace_id: u32,
+    version: u64,
+    /// The flush had no seal record before this event.
+    fresh: bool,
+    /// Pending seal records this flush completes, in version order.
+    folded: Vec<(u32, u64)>,
+    new_safe: u64,
+    /// The metadata before this flush, re-saved by [`Self::abort`].
+    previous: WalMetadata,
+    snapshot: WalMetadata,
+}
+
+impl PreparedProgress<'_> {
+    /// The flush is registered: make its progress live.
+    fn commit(self) {
+        let o = self.observer;
+        {
+            let mut pending = o.pending.write();
+            for key in &self.folded {
+                pending.remove(key);
+            }
+        }
+        if self.new_safe > 0 {
+            let mut live = o.ns_progress.write();
+            let entry = live.entry(self.namespace_id).or_default();
+            entry.safe_offset = entry.safe_offset.max(self.new_safe);
+        }
+        o.apply_progress(&self.snapshot);
+    }
+
+    /// The flush is being undone and its L0 files deleted: put the saved
+    /// progress back. If that save fails too, the file on disk may claim
+    /// entries are in L0 that will not be, so the main WAL is stopped.
+    fn abort(self) {
+        if let Err(e) = self.observer.write_metadata(&self.previous) {
+            self.observer.poison(format!(
+                "could not restore the WAL progress after ns={} memtable {} failed to flush: {e}",
+                self.namespace_id, self.version
+            ));
+        }
+        self.withdraw();
+    }
+
+    /// Take back the flush mark this event set.
+    fn withdraw(self) {
+        let mut pending = self.observer.pending.write();
+        if self.fresh {
+            pending.remove(&(self.namespace_id, self.version));
+        } else if let Some(state) = pending.get_mut(&(self.namespace_id, self.version)) {
+            state.flushed = false;
+        }
     }
 }
 
@@ -576,20 +574,32 @@ impl LsmFlushObserver for LsmFlushObserverHub {
 
     // Before the memtable's L0 files are registered, and through
     // `SyncValueLogBeforePersist`, so the values the retired records point at
-    // are fsynced first. An error (the progress marker could not be written)
-    // undoes the flush. See `LsmFlushObserver` for the order of events.
+    // are fsynced first. Both logs save their progress here; an error from
+    // either undoes the flush, deleting its L0 files. See `LsmFlushObserver`
+    // for the order of events.
+    //
+    // The main WAL saves first and makes its progress live only once the
+    // vector index WAL has succeeded too: had it gone live, the undo would
+    // leave it claiming entries are in L0 files that were just deleted. If the
+    // vector index WAL fails, the main WAL puts its saved progress back.
     fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
-        self.vector_index_wal
-            .on_memtable_written(self.namespace_id, version)
-            .map_err(|e| match e {
-                crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
-                other => std::io::Error::other(other.to_string()),
-            })
+        let prepared = self.wal_observer.prepare_written(self.namespace_id, version)?;
+        match self.vector_index_wal.on_memtable_written(self.namespace_id, version) {
+            Ok(()) => {
+                prepared.commit();
+                Ok(())
+            }
+            Err(e) => {
+                prepared.abort();
+                Err(match e {
+                    crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+                    other => std::io::Error::other(other.to_string()),
+                })
+            }
+        }
     }
 
-    fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
-        self.wal_observer.on_ro_memtable_flushed_to_level0_ns(self.namespace_id, version);
-    }
+    fn on_ro_memtable_flushed_to_level0(&self, _version: u64) {}
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -637,12 +647,10 @@ pub struct Database {
     pub(crate) wal: Arc<Wal>,
     #[allow(dead_code)]
     wal_path: PathBuf,
-    wal_metadata_path: PathBuf,
     pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
     pub(crate) wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
     pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
-    last_persisted_wal_offset: Arc<RwLock<u64>>,
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     /// The vector index WAL: the vector worker's payload writes, one per
@@ -854,33 +862,22 @@ impl Database {
         } else {
             WalMetadata::new()
         };
-        wal_metadata.reconcile_segment_lengths();
 
         // WAL entries are fsynced on every write, but `wal_metadata` (which holds
-        // the tail) is only flushed periodically — so after a crash the persisted
-        // tail can lag the durable end of the log, and recovery scanning only up
-        // to the stale tail would silently drop fsynced entries. Reconstruct the
-        // true tail from the self-describing WAL and fold the durable-but-
-        // unaccounted entries into the counters so recovery actually replays them
-        // (and is not short-circuited by the stale total/persisted counts). With
-        // a lost/corrupt metadata file (tail = 0) this rebuilds the tail wholesale.
+        // the tail) is only saved now and then — so after a crash the saved tail
+        // can lag the durable end of the log, and recovery scanning only up to
+        // the stale tail would silently drop fsynced entries. Reconstruct the
+        // true tail from the self-describing WAL. With a lost/corrupt metadata
+        // file (tail = 0, cut = 0) this rebuilds the tail wholesale and recovery
+        // replays everything still in the log.
         {
             let persisted_tail = wal_metadata.tail;
             let true_tail = wal.recover_tail(persisted_tail);
             if true_tail > persisted_tail {
-                let extra = wal.scan_entries(persisted_tail, true_tail).unwrap_or_default();
                 warn!(
-                    "[RECOVERY] WAL metadata tail ({}) lagged the durable log end ({}); \
-                     recovering {} entry(ies) appended since the last metadata flush",
-                    persisted_tail,
-                    true_tail,
-                    extra.len()
+                    "[RECOVERY] WAL metadata tail ({persisted_tail}) lagged the durable log end ({true_tail}); \
+                     recovering the entries appended since the last metadata save"
                 );
-                for (pointer, _) in &extra {
-                    let segment_id = wal.segment_id_for_offset(pointer.offset);
-                    wal_metadata.add_segment_total(segment_id, 1);
-                }
-                wal_metadata.total_entries = wal_metadata.total_entries.saturating_add(extra.len() as u64);
                 wal_metadata.tail = true_tail;
             }
         }
@@ -889,13 +886,10 @@ impl Database {
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
-        let last_persisted_wal_offset = Arc::new(RwLock::new(0u64));
         let wal_flush_observer = Arc::new(WalPersistObserver::new(
-            Arc::clone(&wal),
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
-            Arc::clone(&last_persisted_wal_offset),
         ));
 
         // Open namespace registry
@@ -952,11 +946,9 @@ impl Database {
             config,
             wal,
             wal_path,
-            wal_metadata_path,
             wal_metadata,
             wal_flush_observer,
             pending_wal_flushes,
-            last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,
             registry: RwLock::new(registry),
@@ -1009,9 +1001,6 @@ impl Database {
         db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
 
-        // Rebuild WAL persisted state and wire up observers
-        let last_persisted = db.rebuild_wal_persisted_state()?;
-        *db.last_persisted_wal_offset.write() = last_persisted;
         db.wire_up_flush_observers();
 
         Ok(db)
@@ -1219,6 +1208,7 @@ impl Database {
     /// its own `Ok(())` contract unchanged.
     fn put_ns_locked(&self, namespace_id: u32, key: &[u8], value: &[u8], op_name: &str) -> Result<WriteOutcome> {
         self.check_write_size(key, value)?;
+        self.wal_flush_observer.check_poisoned()?;
 
         // Step 1: Write to shared WAL.
         // Allocate the sequence number *inside* the WAL lock so the global
@@ -1235,9 +1225,6 @@ impl Database {
             wal_entry = wal_entry.with_op_name(op_name);
         }
         let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
-        let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
-        wal_metadata.add_segment_total(segment_id, 1);
-        wal_metadata.total_entries += 1;
         let wal_tail = wal_metadata.tail;
         // Registered BEFORE the WAL lock is released, so no observer can see a
         // tail containing this entry without also seeing that it is not yet in
@@ -1247,8 +1234,8 @@ impl Database {
         drop(wal_metadata);
 
         // This namespace now has a WAL-backed write that is not yet in an
-        // SSTable, so it holds the global persisted watermark back until it
-        // flushes (see `WalPersistObserver::try_advance_persisted`).
+        // SSTable, so it holds the cut back until it flushes (see
+        // `WalPersistObserver::compute_cut`).
         self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
         // Step 2: Apply to the namespace's in-memory store. The write is already
@@ -1563,6 +1550,7 @@ impl Database {
     /// See [`Self::put_ns_locked`] for why this split exists.
     fn delete_ns_locked(&self, namespace_id: u32, key: &[u8], op_name: &str) -> Result<WriteOutcome> {
         self.check_write_size(key, &[])?; // delete carries only a key
+        self.wal_flush_observer.check_poisoned()?;
 
         // Step 1: Write DELETE to shared WAL.
         // Allocate the sequence inside the WAL lock so sequence order == WAL
@@ -1575,9 +1563,6 @@ impl Database {
             wal_entry = wal_entry.with_op_name(op_name);
         }
         let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
-        let segment_id = self.wal.segment_id_for_offset(wal_pointer.offset);
-        wal_metadata.add_segment_total(segment_id, 1);
-        wal_metadata.total_entries += 1;
         let wal_tail = wal_metadata.tail;
         // As in `put_ns`: registered under the WAL lock, released on return.
         // A lost delete is as damaging as a lost put — recovery skipping it
@@ -1784,18 +1769,11 @@ impl Database {
             drop(store);
         }
 
-        // (3) The KVStore has been flushed and shut down, so all WAL entries for
-        // this namespace are now durable. Mark them persisted so WAL GC can
-        // reclaim the segments they occupy without waiting for a flush that will
-        // never come.
-        let start = *self.last_persisted_wal_offset.read();
-        let tail = self.wal_metadata.read().tail;
-        self.wal_flush_observer.mark_namespace_persisted(ns_id, start, tail);
-
-        // (3b) Stop tracking its flush progress. The store is gone, so it can
+        // (3) Stop tracking its flush progress. The store is gone, so it can
         // never flush again — left in place it would report un-flushed writes
-        // forever, pinning the global persisted watermark (and therefore WAL GC)
-        // at a stale offset that nothing can ever advance.
+        // forever, pinning the cut (and therefore WAL GC) at a stale offset that
+        // nothing can ever advance. Its entries above the cut need no flush:
+        // recovery skips entries of a namespace missing from the registry.
         self.wal_flush_observer.forget_namespace(ns_id);
         // Likewise for the vector index WAL, whose replay skips the dropped
         // namespace's records.
@@ -2603,11 +2581,10 @@ impl Database {
             .stats(|ns| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned))?)
     }
 
+    /// Save the WAL metadata, serialised with every progress save (see
+    /// `WalPersistObserver::persist_lock`).
     pub(crate) fn flush_wal_metadata_internal(&self) -> Result<()> {
-        let wal_metadata = self.wal_metadata.read();
-        let bytes = wal_metadata.to_file_bytes()?;
-        crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
-        Ok(())
+        Ok(self.wal_flush_observer.save_metadata()?)
     }
 
     // ── Recovery ───────────────────────────────────────────────────────
@@ -2700,24 +2677,18 @@ impl Database {
     }
 
     fn recover_from_wal(&self) -> Result<()> {
-        let wal_metadata = self.wal_metadata.read();
-        let head = wal_metadata.head;
+        let wal_metadata = self.wal_metadata.read().clone();
         let tail = wal_metadata.tail;
-        let total_entries = wal_metadata.total_entries;
-        let persisted_entries = wal_metadata.persisted_entries;
-        drop(wal_metadata);
+        let start = wal_metadata.cut.max(wal_metadata.head);
 
-        if persisted_entries >= total_entries || tail == 0 {
+        if start >= tail {
             debug!("[RECOVERY] No recovery needed.");
             return Ok(());
         }
 
-        info!(
-            "[RECOVERY] Starting WAL recovery. Total: {}, Persisted: {}",
-            total_entries, persisted_entries
-        );
+        info!("[RECOVERY] Starting WAL recovery: replaying from {start} to {tail}");
 
-        let all_entries = self.wal.scan_entries(head, tail)?;
+        let all_entries = self.wal.scan_entries(start, tail)?;
 
         // Collect every eligible entry into a single flat list, then replay
         // strictly in global sequence order.
@@ -2729,11 +2700,15 @@ impl Database {
         // original order.
         //
         // Eligibility:
-        //   • Already-Persisted entries are skipped (nothing to replay).
-        //   • Entries for a namespace that no longer exists are skipped. This
-        //     happens when a crash interrupts `remove_namespace` after it has
-        //     persisted the registry deletion but before it could mark the
-        //     namespace's WAL entries Persisted (see `mark_namespace_persisted`).
+        //   • Entries below their namespace's saved safe offset are skipped:
+        //     they are in L0 files already (`WalMetadata::replay_from`). Per
+        //     namespace, not just from the cut: a namespace that flushed past an
+        //     entry may since have had a later delete of that key merged into L1,
+        //     its tombstone dropped, and replaying the entry would bring the key
+        //     back with nothing newer to beat it.
+        //   • Entries for a namespace that no longer exists are skipped: a
+        //     dropped namespace's entries above the cut stay in the log until
+        //     WAL GC passes them.
         //     The namespace is intentionally gone, so replaying its writes would
         //     be wrong — and there is no KVStore to replay them into. We drop
         //     them with a WARN rather than routing them to the fail log, which is
@@ -2744,8 +2719,10 @@ impl Database {
         let mut skipped_unknown_ns_count = 0u64;
         let mut warned_namespaces: HashSet<u32> = HashSet::new();
         let mut eligible: Vec<WalEntry> = Vec::new();
-        for (_, entry) in &all_entries {
-            if entry.status == WalEntryStatus::Persisted {
+        let mut skipped_flushed_count = 0u64;
+        for (pointer, entry) in &all_entries {
+            if pointer.offset < wal_metadata.replay_from(entry.namespace_id) {
+                skipped_flushed_count += 1;
                 continue;
             }
             if !known_namespaces.contains(&entry.namespace_id) {
@@ -2811,55 +2788,28 @@ impl Database {
             crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
         }
 
-        // Flush all namespaces that had recovered entries.
+        // Flush all namespaces that had recovered entries, then retire the whole
+        // log: every replayed entry is in L0 now (or in the fail log, which is
+        // the operator's recovery path). A flush that fails leaves the progress
+        // where it was, so the next open replays again.
+        let mut flushed = true;
         if recovered_count > 0 {
             let stores = self.stores.read();
             for kv_store in stores.values() {
-                let _ = kv_store.flush_and_compact_all();
+                if let Err(e) = kv_store.flush_and_compact_all() {
+                    warn!("[RECOVERY] Flushing a namespace after replay failed; the WAL keeps its entries: {e:?}");
+                    flushed = false;
+                }
             }
         }
-
-        // Mark all scanned entries as Persisted — including entries that failed
-        // after retry.  WAL GC can now reclaim their segments; the fail log is
-        // the operator's recovery path.
-        let entries = self.wal.scan_entries(head, tail)?;
-        let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
-        for (pointer, entry) in entries {
-            if entry.status != WalEntryStatus::Persisted
-                && let Err(e) = self.wal.update_entry_status_deferred(pointer.offset, WalEntryStatus::Persisted)
-            {
-                warn!("[RECOVERY] Failed to update WAL entry status: {:?}", e);
-            }
-            let segment_id = self.wal.segment_id_for_offset(pointer.offset);
-            *per_segment.entry(segment_id).or_insert(0) += 1;
+        if flushed {
+            self.wal_flush_observer.retire_all()?;
         }
-        // One fsync per touched segment, not one per entry. See
-        // `Wal::update_entry_status_deferred` for why deferring is safe — and it
-        // happens BEFORE the metadata write below, so the on-disk statuses are
-        // never less durable than the counters that describe them.
-        for &segment_id in per_segment.keys() {
-            if let Err(e) = self.wal.sync_segment(segment_id) {
-                warn!("[RECOVERY] Failed to sync WAL segment {segment_id}: {e:?}");
-            }
-        }
-
-        {
-            let mut wal_metadata = self.wal_metadata.write();
-            wal_metadata.reconcile_segment_lengths();
-            for segment_id in wal_metadata.tracked_segments().collect::<Vec<_>>() {
-                let total = wal_metadata.segment_total(segment_id);
-                let persisted = per_segment.get(&segment_id).copied().unwrap_or(0);
-                wal_metadata.set_segment_persisted(segment_id, persisted.min(total));
-            }
-            wal_metadata.persisted_entries = wal_metadata.total_entries;
-        }
-        *self.last_persisted_wal_offset.write() = tail;
-        self.flush_wal_metadata_internal()?;
 
         info!(
-            "[RECOVERY] Complete. Recovered: {}, \
+            "[RECOVERY] Complete. Recovered: {}, Skipped (already in L0): {}, \
              Skipped (unknown/deleted namespaces): {}, Failed after retry (see fail log): {}",
-            recovered_count, skipped_unknown_ns_count, error_count
+            recovered_count, skipped_flushed_count, skipped_unknown_ns_count, error_count
         );
         Ok(())
     }
@@ -2883,45 +2833,6 @@ impl Database {
             }
             WalOperationType::Delete => kv_store.replay_delete(&entry.key, seq),
         }
-    }
-
-    fn rebuild_wal_persisted_state(&self) -> Result<u64> {
-        let wal_metadata = self.wal_metadata.read();
-        let head = wal_metadata.head;
-        let tail = wal_metadata.tail;
-        drop(wal_metadata);
-
-        if tail == 0 {
-            return Ok(head);
-        }
-
-        let entries = self.wal.scan_entries(head, tail)?;
-        let mut persisted_entries = 0u64;
-        let mut per_segment: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut last_persisted_offset = head;
-
-        for (pointer, entry) in entries {
-            if entry.status != WalEntryStatus::Persisted {
-                break;
-            }
-            persisted_entries += 1;
-            let segment_id = self.wal.segment_id_for_offset(pointer.offset);
-            *per_segment.entry(segment_id).or_insert(0) += 1;
-            last_persisted_offset = pointer.offset + 4 + pointer.size as u64;
-        }
-
-        {
-            let mut wal_metadata = self.wal_metadata.write();
-            wal_metadata.persisted_entries = persisted_entries;
-            wal_metadata.reconcile_segment_lengths();
-            wal_metadata.reset_segment_persisted();
-            for (segment_id, count) in per_segment {
-                let total = wal_metadata.segment_total(segment_id);
-                wal_metadata.set_segment_persisted(segment_id, count.min(total));
-            }
-        }
-        self.flush_wal_metadata_internal()?;
-        Ok(last_persisted_offset)
     }
 
     // ── Value log GC (per namespace) ───────────────────────────────────
@@ -3171,15 +3082,18 @@ impl Database {
         // including entries written via put_no_wal which have no WAL to replay.
         note(&mut first_error, "the index checkpoint", self.run_index_checkpoint().map(|_| ()));
 
-        // Mark remaining WAL entries as persisted
+        // Every store is flushed, so every WAL entry is in L0: retire the whole
+        // log (this also saves the WAL metadata). Otherwise just save it, and the
+        // next open replays what the flush did not cover.
         if stores_on_disk {
-            let start = *self.last_persisted_wal_offset.read();
-            let tail = self.wal_metadata.read().tail;
-            self.wal_flush_observer.mark_persisted_range(start, tail);
+            note(
+                &mut first_error,
+                "retiring the WAL",
+                self.wal_flush_observer.retire_all().map_err(KVError::from),
+            );
+        } else {
+            note(&mut first_error, "writing the WAL metadata", self.flush_wal_metadata_internal());
         }
-
-        // Flush WAL metadata
-        note(&mut first_error, "writing the WAL metadata", self.flush_wal_metadata_internal());
 
         // Sync WAL
         note(&mut first_error, "syncing the WAL", self.wal.sync().map_err(KVError::from));
@@ -3243,33 +3157,22 @@ impl Database {
         } else {
             WalMetadata::new()
         };
-        wal_metadata.reconcile_segment_lengths();
 
         // WAL entries are fsynced on every write, but `wal_metadata` (which holds
-        // the tail) is only flushed periodically — so after a crash the persisted
-        // tail can lag the durable end of the log, and recovery scanning only up
-        // to the stale tail would silently drop fsynced entries. Reconstruct the
-        // true tail from the self-describing WAL and fold the durable-but-
-        // unaccounted entries into the counters so recovery actually replays them
-        // (and is not short-circuited by the stale total/persisted counts). With
-        // a lost/corrupt metadata file (tail = 0) this rebuilds the tail wholesale.
+        // the tail) is only saved now and then — so after a crash the saved tail
+        // can lag the durable end of the log, and recovery scanning only up to
+        // the stale tail would silently drop fsynced entries. Reconstruct the
+        // true tail from the self-describing WAL. With a lost/corrupt metadata
+        // file (tail = 0, cut = 0) this rebuilds the tail wholesale and recovery
+        // replays everything still in the log.
         {
             let persisted_tail = wal_metadata.tail;
             let true_tail = wal.recover_tail(persisted_tail);
             if true_tail > persisted_tail {
-                let extra = wal.scan_entries(persisted_tail, true_tail).unwrap_or_default();
                 warn!(
-                    "[RECOVERY] WAL metadata tail ({}) lagged the durable log end ({}); \
-                     recovering {} entry(ies) appended since the last metadata flush",
-                    persisted_tail,
-                    true_tail,
-                    extra.len()
+                    "[RECOVERY] WAL metadata tail ({persisted_tail}) lagged the durable log end ({true_tail}); \
+                     recovering the entries appended since the last metadata save"
                 );
-                for (pointer, _) in &extra {
-                    let segment_id = wal.segment_id_for_offset(pointer.offset);
-                    wal_metadata.add_segment_total(segment_id, 1);
-                }
-                wal_metadata.total_entries = wal_metadata.total_entries.saturating_add(extra.len() as u64);
                 wal_metadata.tail = true_tail;
             }
         }
@@ -3278,13 +3181,10 @@ impl Database {
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
-        let last_persisted_wal_offset = Arc::new(RwLock::new(0u64));
         let wal_flush_observer = Arc::new(WalPersistObserver::new(
-            Arc::clone(&wal),
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
-            Arc::clone(&last_persisted_wal_offset),
         ));
 
         let registry = NamespaceRegistry::open(db_path)?;
@@ -3327,11 +3227,9 @@ impl Database {
             config,
             wal,
             wal_path,
-            wal_metadata_path,
             wal_metadata,
             wal_flush_observer,
             pending_wal_flushes,
-            last_persisted_wal_offset,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,
             registry: RwLock::new(registry),
@@ -3377,8 +3275,6 @@ impl Database {
         db.record_no_wal_gaps_after_unclean_shutdown();
         db.recover_from_vector_index_wal()?;
         db.recover_from_wal()?;
-        let last_persisted = db.rebuild_wal_persisted_state()?;
-        *db.last_persisted_wal_offset.write() = last_persisted;
         db.wire_up_flush_observers();
 
         Ok(db)
@@ -3389,9 +3285,6 @@ impl Database {
         let mut wal_metadata = self.wal_metadata.write();
         for entry in entries {
             let _ = self.wal.append_entry(&entry, &mut wal_metadata.tail, false)?;
-            let segment_id = self.wal.segment_id_for_offset(wal_metadata.tail.saturating_sub(1));
-            wal_metadata.add_segment_total(segment_id, 1);
-            wal_metadata.total_entries += 1;
         }
         drop(wal_metadata);
         self.flush_wal_metadata_internal()?;
@@ -3563,8 +3456,8 @@ impl WalGcTarget for Database {
         self.flush_namespaces_pinning_wal()
     }
 
-    fn get_wal_gc_stats(&self) -> (u64, u64) {
-        self.get_wal_gc_stats()
+    fn wal_pending_bytes(&self) -> u64 {
+        self.wal_pending_bytes()
     }
 
     fn has_deletable_wal_segments(&self) -> bool {

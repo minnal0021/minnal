@@ -84,6 +84,12 @@ impl DocStore {
         self.db.wal_metadata()
     }
 
+    /// Returns the main WAL's state: bounds, cut, per-namespace progress and
+    /// each segment from the head to the tail.
+    pub fn wal_stats(&self) -> crate::WalStats {
+        self.db.wal_stats()
+    }
+
     /// Returns the vector index WAL's state.
     pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats, crate::KVError> {
         self.db.vector_index_wal_stats()
@@ -119,12 +125,12 @@ impl DocStore {
         self.db.garbage_collect_all().await
     }
 
-    /// Run WAL garbage collection (reclaims fully-persisted WAL segments).
+    /// Run WAL garbage collection (reclaims WAL segments wholly below the cut).
     ///
-    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
-    /// files deleted by this pass, and the WAL entries not yet persisted to an
-    /// SSTable afterwards. If another pass is already running, nothing is
-    /// reclaimed and the result is `(0, unpersisted_entries)`.
+    /// Returns `(bytes_reclaimed, pending_bytes)`: the bytes of segment files
+    /// deleted by this pass, and the bytes of WAL recovery would replay
+    /// afterwards (from the cut to the tail). If another pass is already
+    /// running, nothing is reclaimed and the result is `(0, pending_bytes)`.
     pub async fn garbage_collect_wal(&self) -> Result<(u64, u64), crate::KVError> {
         self.db.garbage_collect_wal().await
     }

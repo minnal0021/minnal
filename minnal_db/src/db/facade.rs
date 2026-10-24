@@ -444,6 +444,12 @@ impl Db {
         self.inner.wal_metadata()
     }
 
+    /// Returns the main WAL's state: bounds, cut, per-namespace progress and
+    /// each segment from the head to the tail.
+    pub fn wal_stats(&self) -> crate::WalStats {
+        self.inner.wal_stats()
+    }
+
     /// Returns the vector index WAL's state: segments, tail, retired cut and
     /// the namespaces holding the cut back.
     pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats> {
@@ -485,12 +491,12 @@ impl Db {
         self.inner.garbage_collect_all()
     }
 
-    /// Run WAL garbage collection (reclaims fully-persisted segments).
+    /// Run WAL garbage collection (reclaims segments wholly below the cut).
     ///
-    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
-    /// files deleted by this pass, and the WAL entries not yet persisted to an
-    /// SSTable afterwards. If another pass is already running, nothing is
-    /// reclaimed and the result is `(0, unpersisted_entries)`.
+    /// Returns `(bytes_reclaimed, pending_bytes)`: the bytes of segment files
+    /// deleted by this pass, and the bytes of WAL recovery would replay
+    /// afterwards (from the cut to the tail). If another pass is already
+    /// running, nothing is reclaimed and the result is `(0, pending_bytes)`.
     pub fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         self.inner.garbage_collect_wal()
     }
@@ -819,8 +825,8 @@ impl WalGcTarget for Db {
     fn flush_namespaces_pinning_wal(&self) -> usize {
         self.inner.flush_namespaces_pinning_wal()
     }
-    fn get_wal_gc_stats(&self) -> (u64, u64) {
-        self.inner.get_wal_gc_stats()
+    fn wal_pending_bytes(&self) -> u64 {
+        self.inner.wal_pending_bytes()
     }
     fn has_deletable_wal_segments(&self) -> bool {
         self.inner.has_deletable_wal_segments()
@@ -1608,12 +1614,12 @@ impl AsyncDb {
         tokio::task::spawn_blocking(move || db.garbage_collect_all()).await.unwrap_or_default()
     }
 
-    /// Run WAL garbage collection (reclaims fully-persisted segments).
+    /// Run WAL garbage collection (reclaims segments wholly below the cut).
     ///
-    /// Returns `(bytes_reclaimed, unpersisted_entries)`: the bytes of segment
-    /// files deleted by this pass, and the WAL entries not yet persisted to an
-    /// SSTable afterwards. If another pass is already running, nothing is
-    /// reclaimed and the result is `(0, unpersisted_entries)`.
+    /// Returns `(bytes_reclaimed, pending_bytes)`: the bytes of segment files
+    /// deleted by this pass, and the bytes of WAL recovery would replay
+    /// afterwards (from the cut to the tail). If another pass is already
+    /// running, nothing is reclaimed and the result is `(0, pending_bytes)`.
     pub async fn garbage_collect_wal(&self) -> Result<(u64, u64)> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.garbage_collect_wal())
@@ -1691,6 +1697,12 @@ impl AsyncDb {
     /// Returns a snapshot of the current WAL metadata.
     pub fn wal_metadata(&self) -> crate::db::wal::WalMetadata {
         self.inner.wal_metadata()
+    }
+
+    /// Returns the main WAL's state: bounds, cut, per-namespace progress and
+    /// each segment from the head to the tail.
+    pub fn wal_stats(&self) -> crate::WalStats {
+        self.inner.wal_stats()
     }
 
     /// Returns the vector index WAL's state: segments, tail, retired cut and

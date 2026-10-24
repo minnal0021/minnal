@@ -1,7 +1,7 @@
 //! Write-Ahead Log Worker
 //!
 //! This module provides background garbage collection for the WAL.
-//! It monitors the WAL and triggers GC when needed based on persisted entries.
+//! It monitors the WAL and triggers GC when segments lie wholly below the cut.
 
 use crate::db::error::Result;
 use log::{debug, error, info};
@@ -16,10 +16,11 @@ use tokio::time;
 pub trait WalGcTarget: Send + Sync + 'static {
     fn is_closed(&self) -> bool;
     /// Flush any namespace still holding un-flushed WAL-backed writes, so the
-    /// persisted watermark can advance past them. Returns how many were flushed.
+    /// cut can advance past them. Returns how many were flushed.
     fn flush_namespaces_pinning_wal(&self) -> usize;
-    fn get_wal_gc_stats(&self) -> (u64, u64);
-    /// Returns `true` if there is at least one fully-persisted WAL segment
+    /// Bytes of WAL recovery would replay: from the cut to the tail.
+    fn wal_pending_bytes(&self) -> u64;
+    /// Returns `true` if there is at least one WAL segment wholly below the cut
     /// that is not the active (current) segment and can therefore be deleted.
     /// When this returns `false` the worker skips the GC run entirely.
     fn has_deletable_wal_segments(&self) -> bool;
@@ -122,27 +123,22 @@ impl WalGcWorker {
             return;
         }
 
-        // The persisted watermark can only advance to the slowest namespace's
+        // The cut can only advance to the slowest namespace's
         // flushed offset (the WAL is shared, memtables are not), so a namespace
         // that writes a little and then goes idle would pin the WAL forever.
         // Flush those memtables first, then reassess what is reclaimable.
         let flushed = target.flush_namespaces_pinning_wal();
         if flushed > 0 {
-            info!("[WalGcWorker] tick — flushed {} namespace(s) holding the WAL watermark", flushed);
+            info!("[WalGcWorker] tick — flushed {} namespace(s) holding the WAL cut", flushed);
         }
 
-        // Only run GC when there is at least one fully-persisted non-current segment
-        // to delete.  Entries that are in the active segment (not yet flushed to
-        // SSTable) cannot be reclaimed by GC — they stay until the next memtable
-        // flush or shutdown marks them persisted.
+        // Only run GC when at least one non-current segment lies wholly below
+        // the cut. Entries not yet in an SSTable cannot be reclaimed — they stay
+        // until their memtable is flushed or the database shuts down cleanly.
         if !target.has_deletable_wal_segments() {
-            let (total, persisted) = target.get_wal_gc_stats();
-            let pending = total.saturating_sub(persisted);
+            let pending = target.wal_pending_bytes();
             if pending > 0 {
-                info!(
-                    "[WalGcWorker] tick — {} entries pending SSTable flush, no segments ready to reclaim",
-                    pending
-                );
+                info!("[WalGcWorker] tick — {pending} bytes of WAL pending SSTable flush, no segments ready to reclaim");
             } else {
                 // Routine "nothing to do" tick — see the LSM worker for the rule.
                 debug!("[WalGcWorker] tick — WAL clean, nothing to reclaim");
@@ -154,7 +150,7 @@ impl WalGcWorker {
         match target.garbage_collect_wal() {
             Ok((reclaimed, remaining)) => {
                 info!(
-                    "[WalGcWorker] WAL GC complete — reclaimed {} bytes, {} entries remaining",
+                    "[WalGcWorker] WAL GC complete — reclaimed {} bytes, {} bytes still to replay on recovery",
                     reclaimed, remaining
                 );
             }
@@ -206,8 +202,8 @@ mod tests {
             self.0.block();
             0
         }
-        fn get_wal_gc_stats(&self) -> (u64, u64) {
-            (0, 0)
+        fn wal_pending_bytes(&self) -> u64 {
+            0
         }
         fn has_deletable_wal_segments(&self) -> bool {
             false

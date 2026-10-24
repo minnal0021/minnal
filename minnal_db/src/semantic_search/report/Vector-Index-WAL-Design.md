@@ -178,9 +178,8 @@ gain: `Fewer-WAL-Fsyncs-Design.md`, Part 2.
 
 ### Why a separate log and not the main WAL
 
-- **The main WAL does not change.** Its write path, lock, fsync-per-write rule,
-  persisted watermark and GC stay as they are; only recovery reads one more
-  log. All new logic lives in one module, so a fault in it cannot reach ordinary
+- **The main WAL keeps its own write path.** Its lock, fsync and GC are its
+  own; recovery reads one more log, and a flush saves both logs' progress. All new logic lives in one module, so a fault in it cannot reach ordinary
   writes.
 - **No contention with client writes.** The vector index WAL has its own lock and its
   own fsync. Embedding traffic stops queueing on the one lock every client write
@@ -499,8 +498,7 @@ durable tail, the retired cut, the unretired bytes between them (what a restart
 would replay), the last seq appended, and the namespaces holding the cut back
 with their `safe_offset` (why the log is not shrinking). Positions are shown as
 `{segment_id, byte}`. It is a separate endpoint because
-the main WAL's response counts entries and persisted entries, which this log
-does not have. After a failed fsync it also reports `stopped`, with the error
+the two logs have different segment layouts and stopping rules. After a failed fsync it also reports `stopped`, with the error
 (the log refuses appends until the database is reopened, §6).
 
 Counters since startup, engine-wide only (as the main WAL's GC counters are; a
@@ -608,7 +606,7 @@ above, so the full M5 run checks both.
   L0 files. Superseded by this design.
 - **A conditional completion record in the main WAL** ("remove entry E, valid
   only if the vector namespaces flushed past seq S"). No forced flushes, but it
-  needs a cross-namespace pin in the main WAL's persisted watermark and GC — new
+  needs a cross-namespace pin in the main WAL's cut and GC — new
   rules in the most sensitive code. Rejected for that reason.
 - **The value log as the WAL** (WiscKey's approach). No-WAL values already go to
   the value log; only the key's pointer is memory-only. Recovery could rebuild

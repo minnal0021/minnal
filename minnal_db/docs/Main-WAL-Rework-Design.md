@@ -877,8 +877,12 @@ Each step is built, tested and reviewed before the next.
    gains `commit_delay_us` under `[sync]`. Update `minnal_db/README.md` (*Durability model*, *WAL
    terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
    bench comments that describe per-write fsync.
-5. **Measure** (§10) on the settled snapshot, against the current main.
-6. **Preallocation**, if §10's microbenchmark shows it is worth it.
+5. **minnal_ui** (change D): the admin console reads the WAL fields A1 and
+   C change (per-segment entry counts, `wal_fsyncs`, the GC result's
+   unpersisted entries); it switches to the cut, pending bytes, `wal_writes`
+   and the commit-round counters.
+6. **Measure** (§10) on the settled snapshot, against the current main.
+7. **Preallocation**, if §10's microbenchmark shows it is worth it.
 
 ## Not covered here
 

@@ -1318,19 +1318,21 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `total_gc_runs` | Value-log GC passes ever run (persisted in metadata) |
 | `total_bytes_reclaimed` | Bytes ever reclaimed by value-log GC (persisted) |
 
-**`GET /admin/storage/wal`** — WAL metadata:
+**`GET /admin/storage/wal`** — the main WAL. Every entry below the **cut** is
+already in an SSTable, so a restart replays only the bytes from the cut to the
+tail, and WAL GC deletes segments wholly below the cut.
 
 | Field | Meaning |
 |-------|---------|
-| `head`, `tail` | WAL byte offsets of the live window |
-| `total_entries` | Entries currently tracked |
-| `persisted_entries` | Entries already applied + persisted |
-| `pending_entries` | `total − persisted` (replayed on next open) |
+| `head`, `tail` | Byte offsets of the oldest byte still on disk and of the next write |
+| `cut` | Every entry below this offset is in an SSTable |
+| `pending_bytes` | `tail − cut`: what a restart would replay |
+| `segment_size` | Bytes per WAL segment file |
+| `namespaces_ahead_of_cut[]` | `{namespace, safe_offset}`: namespaces whose writes are in SSTables past the cut; a restart skips their entries below `safe_offset` |
+| `namespaces_holding_cut[]` | Namespaces with writes not yet in an SSTable; the slowest holds the cut, and the WAL GC tick flushes them |
 | `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
-| `base_segment_id` | Absolute id the per-segment counters start at (lower segments trimmed) |
-| `live_segments` | Tracked segments still carrying entries |
 | `last_sequence` | Highest write sequence the WAL has observed |
-| `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+| `segments[]` | Each segment from the head to the tail: `{segment_id, start, end, retired, pending_bytes}`; `retired` means wholly below the cut |
 
 **`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
 vector worker writes its chunk and whole-document codes to, and partition
@@ -1499,18 +1501,19 @@ curl -X POST http://localhost:8080/admin/storage/gc
 #### `POST /admin/storage/gc/wal`
 
 Run WAL garbage collection now instead of waiting for the next tick. It deletes
-the WAL segments whose entries are all persisted to SSTables (never the segment
-being written), keeping any a field index still needs to replay.
+the WAL segments wholly below the cut, whose entries are all in SSTables (never
+the segment being written), keeping any a field index still needs to replay.
 
 ```bash
 curl -X POST http://localhost:8080/admin/storage/gc/wal
-# → {"bytes_reclaimed": 67108864, "unpersisted_entries": 12}
+# → {"bytes_reclaimed": 67108864, "pending_bytes": 1840}
 ```
 
 `bytes_reclaimed` is the size of the segment files deleted by this pass.
-`unpersisted_entries` is the number of WAL entries not yet persisted to an
-SSTable; their segments stay until a memtable flush persists them. If a WAL GC
-pass is already running, this one reclaims nothing and reports `0`.
+`pending_bytes` is what a restart would replay (from the cut to the tail); the
+segments holding those bytes stay until a memtable flush moves the cut past
+them. If a WAL GC pass is already running, this one reclaims nothing and
+reports `0` for `bytes_reclaimed`.
 
 ---
 
