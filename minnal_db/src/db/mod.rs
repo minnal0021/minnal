@@ -32,3 +32,8 @@ pub(crate) mod test_support;
 /// and needed an `allow(clippy::module_inception)` to say so.
 #[cfg(test)]
 mod facade_tests;
+
+/// Power-loss and kill tests for the main WAL's write path (group commit,
+/// retirement, checksummed frames).
+#[cfg(test)]
+mod power_loss_tests;

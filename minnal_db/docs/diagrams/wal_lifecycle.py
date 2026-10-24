@@ -19,8 +19,8 @@ SLOTS = 4  # entries per segment, for the drawing (real segments are 64 MB)
 NAMES = ["wal.log", "wal.log.seg000001", "wal.log.seg000002"]
 
 SCRIPT = [
-    ("put", "put() appends entry 1 to <tspan class='ink-a'>wal.log</tspan> and fsyncs before returning."),
-    ("put", "More writes append to the same segment. Each is fsynced on its own."),
+    ("put", "put() appends entry 1 to <tspan class='ink-a'>wal.log</tspan> and returns once an fsync covers it."),
+    ("put", "More writes append to the same segment. Concurrent ones share one fsync."),
     ("put", "Every entry is <tspan class='ink-a'>above the cut</tspan>: the WAL is the only durable copy of these writes."),
     ("put", "The segment is now full."),
     ("put", "The next write opens wal.log.seg000001, which becomes the active segment."),
@@ -67,7 +67,7 @@ def main():
     W, H = 940, 590
     out = [
         text(44, 42, "WAL lifecycle: append → retire → reclaim", "t1", 19, extra=' font-weight="700"'),
-        text(44, 64, "Every write is fsynced into one shared log. Once a flush has put its keys in an SSTable, "
+        text(44, 64, "Every write is durable in one shared log when it returns. Once a flush has put its keys in an SSTable, "
              "the cut moves past them and WAL GC can delete the segment.", "t2", 13),
         legend(470, 104, [(AMBER, "Above the cut: only the WAL holds it"), (BLUE, "Below the cut: also in an SSTable")]),
         text(44, 104, "WAL SEGMENTS", "t3", 12, extra=' letter-spacing="0.06em"'),

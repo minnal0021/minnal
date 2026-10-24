@@ -187,9 +187,7 @@ impl DocStoreApiConfig {
                 index_overlay_hard_bytes: self.thresholds.index_overlay_hard_bytes,
                 max_pinned_wal_segments: self.thresholds.max_pinned_wal_segments,
             },
-            sync_config: SyncConfig {
-                records_per_sync: self.sync.records_per_sync,
-            },
+            sync_config: SyncConfig::new(self.sync.records_per_sync).with_commit_delay_us(self.sync.commit_delay_us),
             scheduled_task_config: scheduled,
             // data_dir is overridden inside AsyncDb::open_with_config at open-time.
             lsm_config: LSMConfig::new(self.lsm.compaction_threshold_percent, PathBuf::from("lsm_data")),
@@ -334,12 +332,17 @@ fn default_compaction_threshold_percent() -> usize {
 pub struct SyncSection {
     #[serde(default = "default_records_per_sync")]
     pub records_per_sync: usize,
+    /// The main WAL's commit delay in microseconds; default 0 (see
+    /// `minnal_db::SyncConfig`).
+    #[serde(default)]
+    pub commit_delay_us: u64,
 }
 
 impl Default for SyncSection {
     fn default() -> Self {
         Self {
             records_per_sync: default_records_per_sync(),
+            commit_delay_us: 0,
         }
     }
 }

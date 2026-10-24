@@ -258,7 +258,7 @@ Batch reads (`get_multiple`, scans) group their pointers by bucket and read each
 
 The WAL is the safety net beneath every write. It is a single, global, append-only log shared by all namespaces, and its job is to make a write durable *before* it is acknowledged — bridging the gap between "the caller was told it succeeded" and "it has been flushed from the in-memory MemTable into a stable SSTable."
 
-**Durability model (deliberate — do not "optimise" with group commit).** Every `put`/`delete` `fsync`s the WAL *before returning*, so each acknowledged write is durable against power loss the moment the call returns. The engine intentionally does **not** group-commit independent writes — that is, it never defers or batches their WAL `fsync`. Doing so would let a write be acknowledged before it reached stable storage, so a power loss in that window would silently lose a write the caller believed had succeeded. (Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL already holds a durable copy that recovery can replay.)
+**Durability model.** Every `put`/`delete`/`merge` returns only once a WAL `fsync` that started after its entry was written has finished, so each acknowledged write is durable against power loss the moment the call returns. Concurrent writes **share** fsyncs (**group commit**): each appends its entry under the WAL lock and releases it, then waits for a **commit round** — one fsync, issued by whichever waiting writer finds no round running, that covers every entry appended before it started. A lone writer pays one fsync per write; under load one fsync covers many. No write is acknowledged early: the fsync is shared, not skipped or deferred. A failed fsync stops the WAL (**poisoned**): every writer in that round, and every later one, gets an error until the database is reopened. (`sync.commit_delay_us` can make a round's leader wait briefly for more writers when others are already waiting; it is 0 by default. Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL holds a durable copy until the entry is retired.)
 
 Each WAL entry is a **frame**: its length, a CRC32 of its body, then the body in a compact binary format. Once written, an entry never changes: the log is append-only.
 
@@ -302,7 +302,7 @@ The steady-state footprint therefore isn't "everything ever written" but roughly
 
 #### One write, step by step
 
-A `put` (a `delete` is the same with no value) takes its key's stripe lock, then the WAL lock, and returns only once its WAL entry is on disk:
+A `put` (a `delete` is the same with no value) takes its key's stripe lock, then the WAL lock to append, and returns only once an fsync covers its WAL entry:
 
 ```mermaid
 sequenceDiagram
@@ -316,8 +316,9 @@ sequenceDiagram
     D->>K: lock the key's stripe
     D->>W: take the WAL lock
     Note over W: take the next seq<br/>(under the lock, so seq order = log order)
-    D->>W: append the entry, fsync
-    D->>W: release the WAL lock
+    D->>W: append the entry (no fsync yet), release the WAL lock
+    D->>W: wait for a commit round that covers the entry
+    Note over W: if no round is running, lead one:<br/>fsync the active segment for every writer waiting
     D->>M: apply (key → value pointer) with that seq
     D->>K: release the stripe
     D-->>C: Ok (the write is durable)
@@ -339,7 +340,7 @@ sequenceDiagram
     G->>W: delete every segment wholly below the cut
 ```
 
-Only one writer holds the WAL lock at a time, and it holds it across the fsync. On the NVMe drive the benchmarks here were measured on, an fsync takes about 2.3 ms, so the whole database makes at most about 400 WAL-backed writes per second, however many clients write at once.
+The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, an fsync takes about 2.3 ms, so a single client makes at most about 400 WAL-backed writes per second; concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 
 ### Vector index WAL
 
@@ -397,8 +398,9 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 
 - **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and fsyncs it before the call returns.
 - **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 2.3 ms each on the NVMe drive the benchmarks use.
-- **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write holds across its append and fsync, so main-WAL writes run one at a time.
-- **Group commit** — letting several concurrent writers share one fsync. The main WAL does not do it (see *Durability model* above).
+- **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write takes to append its entry (and take its seq). It is released before the fsync.
+- **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
+- **Commit round** (main WAL) — one fsync and the writers it releases: the writer that finds no round running leads one, fsyncing the active segment up to the tail it read; writers whose entries came later wait for, or lead, the next. `wal_commit_rounds` / `wal_commit_writes` count them.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
 - **Key stripe lock** (`db/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
@@ -411,7 +413,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 - **Logged write** — `put_ns_logged` / `delete_ns_logged` (facade: `put_logged` / `delete_logged`): a write recorded in the vector index WAL instead of the main WAL, durable at the log's next sync.
 - **`LoggedWrite`** — the guard an append returns. While it is alive the record counts as *in flight* (appended, not yet in a memtable), so no seal can count it as covered.
 - **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker) and the next is started.
-- **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced.
+- **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced. In the main WAL the saved metadata never records a tail beyond the durable tail.
 - **Torn tail** — a partly written last record after a crash, found by its length running past the data or its CRC not matching. Opening either log cuts it off (truncates the file there), so a later, shorter record cannot leave older valid-looking records behind it; only the last segment may have one.
 - **Ceiling** — when a namespace's memtable is sealed, how far into the vector index WAL its applied records reach: the tail, lowered to the oldest of its records still in flight.
 - **Safe offset** — per namespace, in either log: every one of its records below this position is in L0 files. Its replay starts here.
@@ -419,7 +421,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 - **Holding the cut** — a namespace whose unflushed records keep the retired cut from moving. The WAL GC tick flushes such namespaces.
 - **Replay** — re-applying a log's records at open, each with its original seq: in either log, a namespace's records from its safe offset (or the cut) on.
 - **Prefix rule** — whatever survives a crash of the vector index WAL is a prefix of it: a flush syncs the log before writing L0 files.
-- **Poisoned** — the vector index WAL's state after a failed fsync: it refuses appends and syncs until the database is reopened.
+- **Poisoned** — either log's state after a failed fsync: it refuses writes until the database is reopened, since the kernel may have dropped the unwritten pages and a later fsync would not say so. The main WAL is also poisoned if a flush's saved progress cannot be put back after the flush was undone.
 - **Flush observer** (`LsmFlushObserver`) — the hook through which a namespace's LSM tree reports each flush, in order: sealed, flushing (before any L0 file is written), written (files durable, not yet registered), flushed (registered). Both logs listen to it: the vector index WAL syncs at *flushing*, and both save their progress at *written*, the main WAL first; if either save fails the flush is undone (and the main WAL puts its saved progress back).
 
 ### Sharding
@@ -543,9 +545,10 @@ A write is durable the moment the WAL `fsync` returns — everything after that 
 ```
 put(key, value)
         │
-        ├──► WAL.append(Upsert)             ← fsynced on every single-op write,
-        │                                      so the write is crash-durable
-        │                                      before put() returns
+        ├──► WAL.append(Upsert)             ← put() returns only once a WAL
+        │                                      fsync covers it (one fsync shared
+        │                                      by concurrent writes), so the write
+        │                                      is crash-durable before it returns
         │
         ├──► ValueLog.append(value)          ← sharded by Murmur3(key)
         │         └─ returns u128 pointer
@@ -757,12 +760,12 @@ In short: on Apple Silicon, key comparison, field-index queries, and vector sear
 
 ### Expected throughput
 
-These are ballpark figures; treat them as orders of magnitude rather than guarantees. Only the *value log's* fsync cadence is configurable (`records_per_sync`). The WAL is fsynced on every write, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so write throughput is set by the drive's fsync latency, and no setting raises it.
+These are ballpark figures; treat them as orders of magnitude rather than guarantees. Only the *value log's* fsync cadence is configurable (`records_per_sync`). Every write waits for a WAL fsync, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so one writer's throughput is set by the drive's fsync latency. Concurrent writers share each fsync, so together they write faster than one.
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values) | ~400–500 ops/s on an NVMe drive without power-loss protection. This is the limit for the whole database, not per writer: writes fsync one at a time under the WAL lock. |
-| `delete` | ~400–500 ops/s — same fsync bound as `put` |
+| `put` (small values) | ~400–500 ops/s for one writer on an NVMe drive without power-loss protection: each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more. |
+| `delete` | ~400–500 ops/s for one writer — same fsync bound as `put` |
 | `merge` (small values) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
 | `get` from memory | 1M–2.5M ops/s per thread |
 | `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
@@ -770,7 +773,7 @@ These are ballpark figures; treat them as orders of magnitude rather than guaran
 
 Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs about 3,000 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
 
-**Every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
+**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
 
 ---
 

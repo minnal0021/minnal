@@ -108,9 +108,10 @@ where
 /// whose *last write* is stuck in that window computes from the stale value and
 /// has no way to know.
 ///
-/// Every write is its own transaction and its own fsync. There is no batch or
-/// multi-key transaction primitive and no group commit, so write throughput is
-/// bounded by the storage's fsync rate. [`merge`](Db::merge) is a *single-key*
+/// Every write is its own transaction, and returns only once a WAL fsync covers
+/// it. Concurrent writes share fsyncs (group commit), so one writer's throughput
+/// is bounded by the storage's fsync rate and concurrent writers go further.
+/// There is no batch or multi-key transaction primitive. [`merge`](Db::merge) is a *single-key*
 /// exception and not a transaction: it makes one key's read-modify-write
 /// indivisible, and says nothing about any other key. The `_no_wal` variants
 /// (e.g. [`AsyncNamespace::put_no_wal`]) skip the WAL entirely and give up this

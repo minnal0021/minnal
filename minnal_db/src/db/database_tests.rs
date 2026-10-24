@@ -1445,7 +1445,7 @@ fn test_ops_metrics_counters_move() {
     assert_eq!(m.read_hits, 1, "one hit");
     assert_eq!(m.read_misses, 1, "one miss");
     // Every WAL-backed write fsyncs once (2 puts + 1 delete).
-    assert_eq!(m.wal_fsyncs, 3);
+    assert_eq!(m.wal_writes, 3);
     assert!(m.wal_bytes_appended > 0);
     // Reads go through the LSM point-lookup path.
     assert!(m.lookups >= 2, "lookups should cover the user reads, got {}", m.lookups);
@@ -2866,7 +2866,7 @@ mod merge_tests {
         db.merge_ns_no_wal(ns, b"absent", b"", |_, _| Ok(None)).unwrap();
 
         let after = db.metrics_snapshot();
-        assert_eq!(after.wal_fsyncs, before.wal_fsyncs, "a no-WAL merge must not fsync the WAL");
+        assert_eq!(after.wal_writes, before.wal_writes, "a no-WAL merge must not fsync the WAL");
         assert_eq!(after.merges - before.merges, 5);
         assert_eq!(after.no_wal_puts - before.no_wal_puts, 2, "the two writing merges");
         assert_eq!(

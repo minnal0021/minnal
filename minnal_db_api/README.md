@@ -1244,7 +1244,10 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache, embed-queue updates written by a no-WAL merge). Vector payloads and partition maintenance's writes are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
 | `no_wal_deletes` | writes | Deletes written bypassing every log: mostly the vector worker removing finished entries from the embed queue (a no-WAL merge), plus `delete_no_wal` callers | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
-| `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
+| `wal_writes` | writes | WAL-backed writes; each returned once a WAL fsync covered it | **No** |
+| `wal_commit_rounds` | writes | Main-WAL fsyncs issued by commit rounds (engine-wide only). Concurrent writes share one, so this is the WAL's durability cost | **No** |
+| `wal_commit_writes` | writes | Writes those rounds covered (engine-wide only) | **No** |
+| `writes_per_commit_round` | writes | `wal_commit_writes / wal_commit_rounds`: writes covered by one fsync on average; `null` before the first round | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
 | `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
 | `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
@@ -1276,7 +1279,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 > of them before any user request arrives — they are **regenerated, not persisted**.
 > In particular WAL replay does one `lsm.get` per replayed entry (bumping
 > `lookups`), and startup vector-index reconciliation re-enqueues missing docs via
-> the normal write path (bumping `puts` / `wal_fsyncs` / `wal_bytes_appended`). So
+> the normal write path (bumping `puts` / `wal_writes` / `wal_bytes_appended`). So
 > a non-zero reading right after a restart is expected and reflects startup
 > activity, not pre-restart totals — `lookups` in particular jumps with the size of
 > the WAL replay. Vector-search corruption counters

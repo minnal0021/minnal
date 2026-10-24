@@ -65,7 +65,7 @@ impl KeyLocks {
     /// [`get_bucket_for_key`](crate::support::get_bucket_for_key), which hashes
     /// only the first 8 bytes: reusing it would collapse every key sharing an
     /// 8-byte prefix — the common shape for string keys — onto one stripe.
-    fn stripe_of(&self, namespace_id: u32, key: &[u8]) -> usize {
+    pub(crate) fn stripe_of(&self, namespace_id: u32, key: &[u8]) -> usize {
         let mut hasher = Murmur3Hasher::new_with_seed(SEED);
         hasher.write(&namespace_id.to_le_bytes());
         hasher.write(key);

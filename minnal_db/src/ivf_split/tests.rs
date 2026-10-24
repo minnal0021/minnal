@@ -361,7 +361,7 @@ async fn a_split_writes_nothing_per_document_to_the_main_wal() {
         SplitOutcome::Split { .. }
     ));
     let after = db.ops_metrics();
-    let main = after.wal_fsyncs - before.wal_fsyncs;
+    let main = after.wal_writes - before.wal_writes;
     let logged = after.vector_wal_fsyncs - before.vector_wal_fsyncs;
     assert!(main < docs / 2, "{main} main-WAL fsyncs for {docs} moved documents");
     // A copy and a delete pass, each a sync per batch of 16 (plus reassign's).

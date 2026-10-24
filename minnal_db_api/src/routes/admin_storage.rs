@@ -149,7 +149,16 @@ pub struct WriteMetrics {
     no_wal_puts: u64,
     no_wal_deletes: u64,
     wal_bytes_appended: u64,
-    wal_fsyncs: u64,
+    /// WAL-backed writes; each returned once a WAL fsync covered it.
+    wal_writes: u64,
+    /// Main-WAL fsyncs issued by commit rounds (engine-global: `0` on
+    /// per-namespace views). Concurrent writes share one.
+    wal_commit_rounds: u64,
+    /// Writes those rounds covered (engine-global).
+    wal_commit_writes: u64,
+    /// `wal_commit_writes / wal_commit_rounds`: how many writes one fsync
+    /// covered on average. `null` before the first round.
+    writes_per_commit_round: Option<f64>,
     apply_failures: u64,
 }
 
@@ -274,7 +283,10 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             no_wal_puts: m.no_wal_puts,
             no_wal_deletes: m.no_wal_deletes,
             wal_bytes_appended: m.wal_bytes_appended,
-            wal_fsyncs: m.wal_fsyncs,
+            wal_writes: m.wal_writes,
+            wal_commit_rounds: m.wal_commit_rounds,
+            wal_commit_writes: m.wal_commit_writes,
+            writes_per_commit_round: (m.wal_commit_rounds > 0).then(|| m.wal_commit_writes as f64 / m.wal_commit_rounds as f64),
             apply_failures: m.apply_failures,
         },
         compaction: CompactionMetrics {

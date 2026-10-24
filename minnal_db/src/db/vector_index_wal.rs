@@ -1358,6 +1358,17 @@ impl VectorIndexWal {
     }
 
     /// Test-only: make the next `sync` fail (and so poison the log).
+    /// Test hook for the power-loss model: the active segment's file and how
+    /// many of its bytes are fsynced (its header always is: a segment's header
+    /// is fsynced before any record goes in).
+    #[cfg(test)]
+    pub(crate) fn power_loss_extent(&self) -> (PathBuf, u64) {
+        let a = self.active.lock();
+        let (seg, byte) = split(self.durable_tail.load(Ordering::Acquire));
+        let durable = if seg == a.segment_id { byte } else { 0 };
+        (segment_path(&self.dir, a.segment_id), u64::from(durable.max(SEGMENT_HEADER_LEN)))
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_sync(&self) {
         self.fail_next_sync.store(true, Ordering::SeqCst);

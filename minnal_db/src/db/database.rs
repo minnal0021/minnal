@@ -14,7 +14,7 @@ use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
-use crate::db::wal::{Wal, WalEntry, WalMetadata, WalOperationType};
+use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
 use crate::index::{DynFieldIndex, IndexValueType};
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
@@ -68,6 +68,7 @@ impl NsFlushProgress {
 /// act on progress a crash could undo, and the saved per-namespace offsets are
 /// durable before L1 compaction can merge the files they describe.
 pub(crate) struct WalPersistObserver {
+    wal: Arc<Wal>,
     wal_metadata: Arc<RwLock<WalMetadata>>,
     wal_metadata_path: PathBuf,
     /// Keyed by `(namespace_id, memtable version)`. Memtable versions are
@@ -86,11 +87,6 @@ pub(crate) struct WalPersistObserver {
     /// **Lock ordering: `persist_lock` → `pending` → `ns_progress` →
     /// `wal_metadata` → `in_flight`.**
     persist_lock: Mutex<()>,
-    /// Set when the WAL metadata on disk may claim progress that L0 does not
-    /// hold (a rollback save failed, see [`PreparedProgress::abort`]). Writes
-    /// are refused until the database is reopened, whose recovery rebuilds the
-    /// truth from the log and L0.
-    poisoned: Mutex<Option<String>>,
     /// The field indexes that need the WAL, each from its last checkpoint's
     /// position (the other kind of WAL consumer, beside the namespaces'
     /// memtables). `Some(p)`: the field replays from `p` after a crash. `None`:
@@ -162,14 +158,19 @@ impl Drop for InFlightWrite<'_> {
 }
 
 impl WalPersistObserver {
-    fn new(wal_metadata: Arc<RwLock<WalMetadata>>, wal_metadata_path: PathBuf, pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>) -> Self {
+    fn new(
+        wal: Arc<Wal>,
+        wal_metadata: Arc<RwLock<WalMetadata>>,
+        wal_metadata_path: PathBuf,
+        pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    ) -> Self {
         Self {
+            wal,
             wal_metadata,
             wal_metadata_path,
             pending,
             ns_progress: RwLock::new(std::collections::HashMap::new()),
             persist_lock: Mutex::new(()),
-            poisoned: Mutex::new(None),
             field_consumers: RwLock::new(BTreeMap::new()),
             #[cfg(test)]
             save_failures: Mutex::new(std::collections::VecDeque::new()),
@@ -184,17 +185,13 @@ impl WalPersistObserver {
         self.save_failures.lock().extend(outcomes.iter().copied());
     }
 
-    /// `Err` once the main WAL has been stopped; see `poisoned`.
+    /// `Err(WalPoisoned)` once the main WAL has been stopped: by a failed
+    /// fsync (`Wal::commit`), or by a failed rollback of saved progress
+    /// ([`PreparedProgress::abort`]), after which the metadata on disk may claim
+    /// entries are in L0 that are not. Reopening runs recovery, which rebuilds
+    /// the truth from the log and L0.
     pub(crate) fn check_poisoned(&self) -> Result<()> {
-        match self.poisoned.lock().as_ref() {
-            None => Ok(()),
-            Some(why) => Err(KVError::WalPoisoned(why.clone())),
-        }
-    }
-
-    fn poison(&self, why: String) {
-        error!("[WAL] stopping the main WAL; writes are refused until the database is reopened: {why}");
-        self.poisoned.lock().get_or_insert(why);
+        self.wal.check_poisoned().map_err(wal_write_error)
     }
 
     /// Register `offset` as appended-to-the-WAL-but-not-yet-applied.
@@ -386,6 +383,11 @@ impl WalPersistObserver {
         if self.save_failures.lock().pop_front() == Some(true) {
             return Err(std::io::Error::other("injected WAL metadata save failure"));
         }
+        // Never a tail beyond what is fsynced: recovery scans forward from the
+        // saved tail, and a tail past a hole a crash left would make it append
+        // after the hole and skip acknowledged writes behind it.
+        let mut metadata = metadata.clone();
+        metadata.tail = metadata.tail.min(self.wal.durable_tail());
         let bytes = metadata.to_file_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
         crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)
     }
@@ -540,7 +542,7 @@ impl PreparedProgress<'_> {
     /// entries are in L0 that will not be, so the main WAL is stopped.
     fn abort(self) {
         if let Err(e) = self.observer.write_metadata(&self.previous) {
-            self.observer.poison(format!(
+            self.observer.wal.poison(format!(
                 "could not restore the WAL progress after ns={} memtable {} failed to flush: {e}",
                 self.namespace_id, self.version
             ));
@@ -556,6 +558,15 @@ impl PreparedProgress<'_> {
         } else if let Some(state) = pending.get_mut(&(self.namespace_id, self.version)) {
             state.flushed = false;
         }
+    }
+}
+
+/// A main-WAL error on the write path: a poisoned log becomes
+/// [`KVError::WalPoisoned`], the rest pass through.
+fn wal_write_error(e: WalError) -> KVError {
+    match e {
+        WalError::Poisoned(why) => KVError::WalPoisoned(why),
+        other => KVError::from(other),
     }
 }
 
@@ -921,8 +932,10 @@ impl Database {
                 wal_metadata.tail = true_tail;
             }
             // Cut off anything past the valid frames (a torn tail), so a later,
-            // shorter append cannot leave stale frames behind it.
+            // shorter append cannot leave stale frames behind it. What is left is
+            // durable.
             wal.truncate_after(wal_metadata.tail)?;
+            wal.opened_at(wal_metadata.tail);
         }
 
         let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);
@@ -930,6 +943,7 @@ impl Database {
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
         let wal_flush_observer = Arc::new(WalPersistObserver::new(
+            Arc::clone(&wal),
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
@@ -1267,7 +1281,10 @@ impl Database {
         if op_name == Self::MERGE_OP_NAME {
             wal_entry = wal_entry.with_op_name(op_name);
         }
-        let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
+        let wal_pointer = self
+            .wal
+            .append_entry(&wal_entry, &mut wal_metadata.tail, false)
+            .map_err(wal_write_error)?;
         let wal_tail = wal_metadata.tail;
         // Registered BEFORE the WAL lock is released, so no observer can see a
         // tail containing this entry without also seeing that it is not yet in
@@ -1281,6 +1298,11 @@ impl Database {
         // `WalPersistObserver::compute_cut`).
         self.wal_flush_observer.note_write(namespace_id, wal_tail);
 
+        // Wait for an fsync that covers the entry (group commit), outside the
+        // WAL lock so other writers keep appending meanwhile. Only then is it
+        // applied: a reader must never see a write a crash could still undo.
+        self.commit_wal(wal_tail)?;
+
         // Step 2: Apply to the namespace's in-memory store. The write is already
         // durable in the WAL, so this is best-effort with bounded retry: on
         // persistent failure we log and still return Ok, because recovery will
@@ -1292,7 +1314,7 @@ impl Database {
         // already in hand, so this is no extra lookup).
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.puts);
-            crate::db::metrics::Metrics::bump(&m.wal_fsyncs);
+            crate::db::metrics::Metrics::bump(&m.wal_writes);
             crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
         }
 
@@ -1316,6 +1338,29 @@ impl Database {
         }
 
         Ok(WriteOutcome { seq, applied })
+    }
+
+    /// Wait until the main WAL is durable up to `end` (`Wal::commit`), as a
+    /// commit round's leader or follower, and count it.
+    fn commit_wal(&self, end: u64) -> Result<()> {
+        let delay = Duration::from_micros(self.config.sync_config.commit_delay_us);
+        let led = self
+            .wal
+            .commit(end, delay, || {
+                let meta = self.wal_metadata.read();
+                let (segment_id, file) = self.wal.active_file()?;
+                Ok((meta.tail, segment_id, file))
+            })
+            .map_err(wal_write_error)?;
+        // The invariant group commit exists to keep, checked in every test: a
+        // write is acknowledged only once an fsync covered its bytes.
+        #[cfg(test)]
+        assert!(self.wal.covered(end), "acknowledged a WAL write ending at {end} that no fsync covered");
+        crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_writes);
+        if led {
+            crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_rounds);
+        }
+        Ok(())
     }
 
     /// Write a key-value pair **without** appending to the WAL.
@@ -1605,7 +1650,10 @@ impl Database {
         if op_name == Self::MERGE_OP_NAME {
             wal_entry = wal_entry.with_op_name(op_name);
         }
-        let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail, true)?;
+        let wal_pointer = self
+            .wal
+            .append_entry(&wal_entry, &mut wal_metadata.tail, false)
+            .map_err(wal_write_error)?;
         let wal_tail = wal_metadata.tail;
         // As in `put_ns`: registered under the WAL lock, released on return.
         // A lost delete is as damaging as a lost put — recovery skipping it
@@ -1613,8 +1661,10 @@ impl Database {
         let _in_flight = self.wal_flush_observer.begin_write(wal_pointer.offset);
         drop(wal_metadata);
 
-        // As in `put_ns`: this namespace now holds an un-flushed WAL-backed write.
+        // As in `put_ns`: this namespace now holds an un-flushed WAL-backed
+        // write, and the entry is applied only once an fsync covers it.
         self.wal_flush_observer.note_write(namespace_id, wal_tail);
+        self.commit_wal(wal_tail)?;
 
         // Step 2: Apply the delete to the in-memory store (best-effort with
         // bounded retry; durable in the WAL — see `put_ns`).
@@ -1622,7 +1672,7 @@ impl Database {
 
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.deletes);
-            crate::db::metrics::Metrics::bump(&m.wal_fsyncs);
+            crate::db::metrics::Metrics::bump(&m.wal_writes);
             crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
         }
 
@@ -3234,8 +3284,10 @@ impl Database {
                 wal_metadata.tail = true_tail;
             }
             // Cut off anything past the valid frames (a torn tail), so a later,
-            // shorter append cannot leave stale frames behind it.
+            // shorter append cannot leave stale frames behind it. What is left is
+            // durable.
             wal.truncate_after(wal_metadata.tail)?;
+            wal.opened_at(wal_metadata.tail);
         }
 
         let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);
@@ -3243,6 +3295,7 @@ impl Database {
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
         let wal_flush_observer = Arc::new(WalPersistObserver::new(
+            Arc::clone(&wal),
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
@@ -3341,13 +3394,68 @@ impl Database {
         Ok(db)
     }
 
+    /// Test hook: the key-stripe lock `key` takes in `namespace_id`.
+    #[cfg(test)]
+    pub(crate) fn stripe_of(&self, namespace_id: u32, key: &[u8]) -> usize {
+        self.key_locks.stripe_of(namespace_id, key)
+    }
+
+    /// Test hook: copy this database's directory to `to` as a power loss
+    /// would leave it — every log cut back to what was fsynced: the main WAL
+    /// to its durable tail, each value-log bucket to its synced offset, the
+    /// vector index WAL to its durable tail. Other files are written durably
+    /// before anything depends on them (L0 files, metadata, markers), so they
+    /// are copied whole.
+    ///
+    /// The caller must have stopped every writer and worker first
+    /// (`Wal::freeze_commits` holds writers at the point a power loss would
+    /// catch them), or the copy is not one moment.
+    #[cfg(test)]
+    pub(crate) fn power_loss_image(&self, to: &Path) -> std::io::Result<()> {
+        let mut extents = self.wal.power_loss_extents();
+        extents.push(self.vector_index_wal.power_loss_extent());
+        for store in self.stores.read().values() {
+            for log in store.value_log.bucket_logs() {
+                extents.push(log.power_loss_extent());
+            }
+        }
+        fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                let target = to.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_dir(&entry.path(), &target)?;
+                } else {
+                    std::fs::copy(entry.path(), &target)?;
+                }
+            }
+            Ok(())
+        }
+        copy_dir(&self.db_path, to)?;
+        for (file, durable) in extents {
+            let Ok(relative) = file.strip_prefix(&self.db_path) else { continue };
+            let copy = to.join(relative);
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&copy)
+                && f.metadata()?.len() > durable
+            {
+                f.set_len(durable)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn simulate_crash_with_wal_entries(&self, entries: Vec<WalEntry>) -> Result<()> {
+        // The entries stand for acknowledged writes, so they are made durable as
+        // a commit round would, then left unapplied, as a crash would leave them.
         let mut wal_metadata = self.wal_metadata.write();
         for entry in entries {
-            let _ = self.wal.append_entry(&entry, &mut wal_metadata.tail, false)?;
+            let _ = self.wal.append_entry(&entry, &mut wal_metadata.tail, true)?;
         }
+        let tail = wal_metadata.tail;
         drop(wal_metadata);
+        self.wal.set_durable_tail(tail);
         self.flush_wal_metadata_internal()?;
         Ok(())
     }

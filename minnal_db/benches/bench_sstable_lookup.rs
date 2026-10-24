@@ -155,8 +155,8 @@ fn bench_l1_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("sstable_lookup");
     group.measurement_time(Duration::from_secs(10));
 
-    // NOTE: sizes are capped at 100k because `put` fsyncs the WAL on every write
-    // (deliberate per-write durability, no group commit). At ~6 ms/fsync on WSL2
+    // NOTE: sizes are capped at 100k because a single-threaded `put` waits for
+    // its own WAL fsync on every write (durable on return). At ~6 ms/fsync on WSL2
     // that's ~6 ms/key, so populate is fsync-bound: ~10 min at 100k, ~1.9 h at 1M
     // (the apparent "hang" we first saw was just this, not a deadlock). 1k-100k
     // is enough range to see the lookup's real shape: latency is roughly FLAT

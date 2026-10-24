@@ -1,6 +1,7 @@
 # Main WAL rework: retire by cut, checksum frames, group commit — design note
 
-**Status:** design for review, 2026-10-24. Nothing here is built.
+**Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13.
+The measurements in §10 are still to run.
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
@@ -912,3 +913,78 @@ Each step is built, tested and reviewed before the next.
 6. Rename the per-namespace `wal_fsyncs` to `wal_writes` and add the two global
    round counters (§6.6).
 7. Order: A1, A2, B, C1, then C2 (§11).
+
+## 13. What was built, and how it was tested
+
+Each change was built as its own commit, with its tests and mutation checks:
+A1, A2, B, then C1 and C2 together.
+
+**The power-loss model** (`Database::power_loss_image`). A process kill keeps
+the page cache, so it cannot show a write acknowledged before an fsync covered
+it. The model copies the database directory at one moment, with every writer
+and worker stopped, and in the copy cuts each log back to what an fsync
+actually covered:
+
+- the main WAL to the length each segment had when an fsync of it was issued
+  (recorded as the fsyncs happen, not taken from the WAL's own bookkeeping, so
+  a missing fsync shows up as lost bytes);
+- each value-log bucket to its synced offset;
+- the vector index WAL to its durable tail.
+
+The copy is then opened, which runs recovery. Writers are stopped either between
+operations or inside a commit (`Wal::freeze_commits`), with their entry
+appended but not yet covered, which is where a power loss would catch them.
+
+**Tests** (`db/power_loss_tests.rs`, plus the per-change tests in §9):
+
+- deterministic: an unacknowledged write is not readable and does not survive;
+  concurrent writers share fsyncs and all survive; a lone writer issues one
+  fsync per write; the commit delay never slows a lone writer and forms larger
+  rounds under load; a failed fsync fails every writer in its round and stops
+  the WAL; leaving a segment makes it durable, including a segment filled to
+  its last byte; the saved tail never passes the durable tail;
+- a randomised stress: 8 writers (puts, deletes, merges over two namespaces), a
+  maintenance thread (flushes, WAL GC, field-index checkpoints), 64-entry
+  memtables and 4 KiB WAL segments, stopped at random moments; each image is
+  checked key by key, and its field index against the documents. The default
+  run takes 12 images; the long run (`--ignored`) took 400 and passed;
+- a kill harness: a child process writes the same way and is killed with
+  SIGKILL at a random moment, four kill-and-recover cycles on one directory,
+  checked against the child's log of each operation's start and
+  acknowledgement. It passed 10 runs out of 10;
+- a test-only assertion in `Database::commit_wal`: every write that returns
+  was covered by an fsync actually issued.
+
+**A bug the stress test found.** When a frame filled a segment to its last
+byte, the tail landed on the segment boundary, and the next append moved to the
+next segment from there, without fsyncing the full one. Commit rounds fsync
+only the active segment, so writes in the full segment that a later round
+acknowledged had no fsync behind them. 13 of 30 stress runs lost acknowledged
+writes before the fix and none of 30 after. Every way of leaving a segment now
+fsyncs it (`a_segment_filled_to_its_last_byte_is_durable_when_left`).
+
+**Mutation checks** (each made at least one test fail, then was reverted):
+
+| Change | Mutation | Caught by |
+|---|---|---|
+| A1 | replay from the global cut, not each namespace's offset | `main_wal_replay_does_not_bring_back_a_key_whose_logged_delete_reached_l1` |
+| A1 | skip the rollback when the vector index WAL fails | `a_vector_wal_failure_after_the_main_save_puts_the_main_progress_back`, `a_failed_rollback_stops_the_main_wal` |
+| A1 | make progress live before the vector index WAL succeeds | the same two |
+| A1 | save progress at the seal (before L0 is durable) | three progress tests |
+| A2 | fire the checkpointed event before the marker is durable | `a_checkpoint_whose_marker_fails_does_not_move_the_position` |
+| A2 | keep a dropped field's consumer | `deactivating_or_dropping_a_field_stops_it_holding_the_wal` |
+| A2 | register a first build at 0 | `a_field_without_a_checkpoint_holds_the_wal_only_once_populated`, `a_never_checkpointed_empty_field_index_does_not_pin_wal_gc` |
+| A2 | keep a dropped namespace's fields | `dropping_a_namespace_stops_its_fields_holding_the_wal` |
+| B | skip the CRC check | `a_changed_byte_in_a_value_is_rejected_and_recovery_stops_there`, `open_truncates_a_torn_tail_so_stale_frames_cannot_replay` |
+| B | skip the truncation at open | `open_truncates_a_torn_tail_so_stale_frames_cannot_replay` |
+| C | leave a full segment without an fsync | `a_segment_filled_to_its_last_byte_is_durable_when_left` |
+| C | return before the round | five power-loss tests |
+| C | apply before the fsync | three power-loss tests |
+| C | seal a segment without an fsync | the stress, via the coverage assertion |
+| C | save the raw tail | `the_saved_tail_never_passes_the_durable_tail` |
+| C | a failed fsync does not poison | `a_failed_fsync_fails_the_write_and_stops_the_wal`, `a_failed_round_fails_every_writer_in_it` |
+
+**Not covered by the model:** the field-index files are memory-mapped and
+synced at checkpoints, and are copied whole; their own recovery (checkpoint
+marker plus WAL replay) is what the stress's index check exercises.
+

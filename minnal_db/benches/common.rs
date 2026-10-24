@@ -37,12 +37,12 @@ pub fn bench_tempdir() -> TempDir {
 
 /// Config tuned for benchmarking: background workers effectively disabled.
 ///
-/// **This does not disable fsync, and no config can.** `SyncConfig` carries only
-/// `records_per_sync`, which paces the *value log*; `Database::put_ns` passes
-/// `sync = true` to the WAL append unconditionally, so every `put`, `delete` and
-/// `merge` measured here pays a WAL fsync. That is deliberate engine behaviour
-/// (`minnal_db/CLAUDE.md` → "Per-write WAL fsync is deliberate — do NOT add
-/// group-commit"), so write benchmarks are storage-latency-bound and their
+/// **This does not disable fsync, and no config can.** `SyncConfig`'s
+/// `records_per_sync` paces only the *value log*, and every `put`, `delete` and
+/// `merge` returns only once a WAL fsync covers it. Concurrent writers share
+/// fsyncs (group commit), but these benchmarks write from one thread, so each
+/// write measured here pays its own WAL fsync: write benchmarks are
+/// storage-latency-bound and their
 /// absolute numbers say more about the disk than about the code.
 pub fn bench_config() -> DbConfig {
     DbConfig::new(
