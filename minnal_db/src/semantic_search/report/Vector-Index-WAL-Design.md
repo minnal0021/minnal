@@ -68,8 +68,9 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
   records above its own, capped by the oldest record still in flight. Records
   below it are retired for every namespace; GC deletes segments wholly below it.
 - **Marker** — the `retired_cut` file, holding the cut and each namespace's safe
-  offset above it. It is written at the *written* event, before the L0 files
-  are registered.
+  offset above it, in the progress-file format both logs share
+  (`segmented_log::ProgressFile`, `minnal_db/docs/WAL-Architecture.md`). It is
+  written at the *written* event, before the L0 files are registered.
 - **Holding the cut** — a namespace whose unflushed records keep the cut from
   moving. The WAL GC tick flushes such namespaces.
 - **Prefix rule** — what survives any crash is a prefix of the log, across all

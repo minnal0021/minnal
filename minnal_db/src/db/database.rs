@@ -11,6 +11,7 @@ use crate::db::key_locks::KeyLocks;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
+use crate::db::segmented_log::LogError;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
@@ -393,10 +394,9 @@ impl WalPersistObserver {
         // saved tail, and a tail past a hole a crash left would make it append
         // after the hole and skip acknowledged writes behind it.
         let mut metadata = metadata.clone();
-        metadata.tail = metadata.tail.min(self.wal.durable_tail());
         // Every sequence handed out so far (an over-estimate is harmless).
         metadata.last_sequence = metadata.last_sequence.max(self.next_seq.load(Ordering::Acquire).saturating_sub(1));
-        let bytes = metadata.to_file_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let bytes = metadata.to_file_bytes();
         crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
         // The live copy shows what is saved (`Db::wal_stats`).
         let mut live = self.wal_metadata.write();
@@ -578,10 +578,10 @@ impl PreparedProgress<'_> {
 /// [`KVError::WriteTooLarge`], the rest pass through.
 fn wal_write_error(e: WalError) -> KVError {
     match e {
-        WalError::Poisoned(why) => KVError::WalPoisoned(why),
+        WalError::Log(LogError::Poisoned(why)) => KVError::WalPoisoned(why),
         // Refused before anything was written: the same kind of error as the
         // other write-size bounds (`check_write_size`).
-        WalError::RecordTooLarge { len, max } => KVError::WriteTooLarge(format!(
+        WalError::Log(LogError::RecordTooLarge { len, max }) => KVError::WriteTooLarge(format!(
             "the WAL entry is {len} bytes, more than a WAL segment holds ({max}); raise wal.segment_size_bytes"
         )),
         other => KVError::from(other),
@@ -636,7 +636,7 @@ impl LsmFlushObserver for LsmFlushObserverHub {
     // logged write the log could still lose.
     fn on_ro_memtable_flushing(&self, _version: u64) -> std::io::Result<()> {
         self.vector_index_wal.before_memtable_written(self.namespace_id).map_err(|e| match e {
-            crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+            crate::db::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
             other => std::io::Error::other(other.to_string()),
         })
     }
@@ -661,7 +661,7 @@ impl LsmFlushObserver for LsmFlushObserverHub {
             Err(e) => {
                 prepared.abort();
                 Err(match e {
-                    crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+                    crate::db::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
                     other => std::io::Error::other(other.to_string()),
                 })
             }
@@ -679,46 +679,68 @@ impl LsmFlushObserver for LsmFlushObserverHub {
 /// The metadata says where reading starts (its cut) and the furthest position
 /// its progress names; the log validates everything from the cut, drops a
 /// torn tail, and starts a new segment if the progress names positions past
-/// what survived (`SegmentedLog::open`). The saved tail is only a record: the
-/// tail is wherever the log's valid frames end.
+/// what survived (`SegmentedLog::open`). The head and the tail are taken from
+/// the log, not the metadata.
 ///
-/// Missing metadata means none was ever saved, and the log must then start at
-/// segment 0 (it is replayed whole). Unreadable metadata is treated the same
-/// way and kept as `metadata.corrupt`; if segments were already reclaimed, the
-/// open fails rather than replaying an unknown range.
+/// **Missing or unreadable metadata.** Without it the cut is unknown, and the
+/// whole log is replayed. That is safe only while no tombstone can have been
+/// dropped, and compaction drops tombstones only into L1: so a database with
+/// L1 data and WAL segments to replay fails the open instead (a replayed put
+/// could otherwise bring back a key deleted since). With no L1 data — a fresh
+/// database, or a crash during its first flush — the log is replayed whole.
+/// Unreadable metadata is kept as `metadata.corrupt`.
 ///
 /// The counter starts above the saved high-water mark and every entry at or
 /// above the cut; entries below the cut are in SSTables, which raise it too
 /// (`KVStore::set_seq_counter`).
-fn open_main_wal(db_path: &Path, segment_size: u64) -> Result<(Arc<Wal>, WalMetadata, PathBuf, u64)> {
+fn open_main_wal(db_path: &Path, segment_size: u32) -> Result<(Arc<Wal>, WalMetadata, PathBuf, u64)> {
     let dir = crate::db::layout::main_wal_dir(db_path);
     let metadata_path = dir.join(crate::db::wal::METADATA_FILE);
-    let (saved, corrupt) = match std::fs::read(&metadata_path) {
+    let (saved, unreadable) = match std::fs::read(&metadata_path) {
         Ok(data) => match WalMetadata::from_file_bytes(&data) {
-            Ok(m) => (Some(m), false),
-            Err(e) => {
-                warn!("[WAL] the WAL metadata is unreadable ({e}); reading the log from its start");
-                (None, true)
-            }
+            Ok(m) => (Some(m), None),
+            Err(e) => (None, Some(e)),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(e) => return Err(e.into()),
     };
-    let from = crate::db::segmented_log::OpenFrom {
-        cut: saved.as_ref().map(|m| m.cut),
-        furthest: saved
-            .as_ref()
-            .map_or(0, |m| m.safe.iter().map(|&(_, safe)| safe).chain([m.cut]).max().unwrap_or(0)),
-    };
-    let segment_size = u32::try_from(segment_size).unwrap_or(u32::MAX);
-    let (wal, report) = Wal::open(&dir, segment_size, from)?;
-    if corrupt {
+    if saved.is_none() && crate::db::segmented_log::has_segments(&dir)? && any_level1_data(db_path)? {
+        let state = match &unreadable {
+            Some(e) => format!("unreadable ({e})"),
+            None => "missing".to_owned(),
+        };
+        return Err(WalError::Log(LogError::Corruption(format!(
+            "the WAL metadata ({}) is {state}, but the database holds L1 data: replaying the whole log could bring back \
+             deleted keys. Restore the metadata file, or remove the `wal` directory to start the WAL empty (writes not \
+             yet flushed to an SSTable are then lost)",
+            metadata_path.display()
+        )))
+        .into());
+    }
+    let (wal, report) = Wal::open(
+        &dir,
+        segment_size,
+        crate::db::segmented_log::Progress::open_from(saved.as_ref().map(|m| m.progress()).as_ref()),
+    )?;
+    if let Some(e) = unreadable {
+        warn!("[WAL] the WAL metadata was unreadable ({e}); the log was read from its start (no L1 data yet)");
         let _ = std::fs::rename(&metadata_path, metadata_path.with_extension("corrupt"));
     }
     let mut metadata = saved.unwrap_or_default();
     metadata.tail = report.tail;
+    metadata.head = wal.head()?;
     let next_seq = metadata.last_sequence.max(report.max_sequence).saturating_add(1);
     Ok((Arc::new(wal), metadata, metadata_path, next_seq))
+}
+
+/// Whether any namespace directory under `db_path` holds L1 data.
+fn any_level1_data(db_path: &Path) -> std::io::Result<bool> {
+    for dir in crate::db::layout::namespace_data_dirs(db_path)? {
+        if KVStore::has_level1_data(&dir)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Format a key for log output: UTF-8 string if valid, otherwise `hex:<hex>`.
@@ -903,7 +925,7 @@ impl Database {
         config.lsm_config.num_buckets = config.num_buckets;
         config.lsm_config.skip_list_capacity = config.skip_list_capacity;
 
-        let (wal, wal_metadata, wal_metadata_path, next_seq_start) = open_main_wal(db_path, config.wal_segment_size)?;
+        let (wal, wal_metadata, wal_metadata_path, next_seq_start) = open_main_wal(db_path, Wal::validate_segment_size(config.wal_segment_size)?)?;
         let next_seq = Arc::new(AtomicU64::new(next_seq_start));
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
@@ -3199,7 +3221,8 @@ impl Database {
         config.lsm_config.num_buckets = config.num_buckets;
         config.lsm_config.skip_list_capacity = config.skip_list_capacity;
 
-        let (wal, wal_metadata, wal_metadata_path, next_seq_start) = open_main_wal(db_path, wal_segment_size)?;
+        let (wal, wal_metadata, wal_metadata_path, next_seq_start) =
+            open_main_wal(db_path, u32::try_from(wal_segment_size).expect("a test segment size fits u32"))?;
         let next_seq = Arc::new(AtomicU64::new(next_seq_start));
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));

@@ -42,6 +42,21 @@ pub(crate) struct CommitRounds {
     frozen: Mutex<(bool, usize)>,
     #[cfg(test)]
     thawed: Condvar,
+    /// Test hook: runs in a failed round's leader after it has woken the
+    /// waiters and released the state lock, before it returns.
+    #[cfg(test)]
+    after_failed_round: Mutex<Option<TestHook>>,
+}
+
+/// A test hook closure (`Debug` so `CommitRounds` can derive it).
+#[cfg(test)]
+struct TestHook(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 
 impl CommitRounds {
@@ -129,7 +144,17 @@ impl CommitRounds {
             st = self.state.lock();
             st.running = false;
             self.round_done.notify_all();
-            st.durable = st.durable.max(covered?);
+            match covered {
+                Ok(position) => st.durable = st.durable.max(position),
+                Err(why) => {
+                    drop(st);
+                    #[cfg(test)]
+                    if let Some(hook) = self.after_failed_round.lock().as_ref() {
+                        (hook.0)();
+                    }
+                    return Err(why);
+                }
+            }
             if st.durable >= end {
                 return Ok(true);
             }
@@ -203,35 +228,50 @@ mod tests {
     }
 
     /// A caller waiting on a round that fails gets the error; it never leads a
-    /// round of its own, whose fsync could succeed over dropped pages.
+    /// round of its own, whose fsync could succeed over dropped pages. The
+    /// failed leader is held after waking the waiters (where the poison used
+    /// to be set) until the waiter has finished, so a wrong order always shows.
     #[test]
     fn a_caller_waiting_on_a_failed_round_never_leads_another() {
-        // The window is a few instructions wide, so try many times.
-        for _ in 0..5000 {
-            let rounds = CommitRounds::new(0);
-            let led_after_failure = AtomicU64::new(0);
-            std::thread::scope(|s| {
-                let leader = s.spawn(|| {
-                    rounds.commit(1, Duration::ZERO, || {
-                        // Hold the round until the follower is waiting on it.
-                        while rounds.state.lock().waiting == 0 {
-                            std::thread::yield_now();
-                        }
-                        Err("disk".into())
-                    })
-                });
-                while !rounds.state.lock().running {
-                    std::thread::yield_now();
+        let rounds = Arc::new(CommitRounds::new(0));
+        let follower_done = Arc::new((Mutex::new(false), Condvar::new()));
+        {
+            let follower_done = Arc::clone(&follower_done);
+            *rounds.after_failed_round.lock() = Some(TestHook(Box::new(move || {
+                let (done, cv) = &*follower_done;
+                let mut done = done.lock();
+                if !*done {
+                    cv.wait_for(&mut done, Duration::from_secs(5));
                 }
-                let follower = rounds.commit(2, Duration::ZERO, || {
-                    led_after_failure.fetch_add(1, Ordering::SeqCst);
-                    Ok(2)
-                });
-                assert_eq!(follower, Err("disk".into()));
-                assert_eq!(leader.join().unwrap(), Err("disk".into()));
-            });
-            assert_eq!(led_after_failure.load(Ordering::SeqCst), 0, "a round ran after a failed one");
+            })));
         }
+        let led_after_failure = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            let leader = s.spawn(|| {
+                rounds.commit(1, Duration::ZERO, || {
+                    // Hold the round until the follower is waiting on it.
+                    while rounds.state.lock().waiting == 0 {
+                        std::thread::yield_now();
+                    }
+                    Err("disk".into())
+                })
+            });
+            while !rounds.state.lock().running {
+                std::thread::yield_now();
+            }
+            let follower = rounds.commit(2, Duration::ZERO, || {
+                led_after_failure.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            });
+            {
+                let (done, cv) = &*follower_done;
+                *done.lock() = true;
+                cv.notify_all();
+            }
+            assert_eq!(follower, Err("disk".into()));
+            assert_eq!(leader.join().unwrap(), Err("disk".into()));
+        });
+        assert_eq!(led_after_failure.load(Ordering::SeqCst), 0, "a round ran after a failed one");
     }
 
     /// A round that succeeds while the log is poisoned (a failed rotation

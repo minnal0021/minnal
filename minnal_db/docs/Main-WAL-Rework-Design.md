@@ -1,8 +1,16 @@
 # Main WAL rework: retire by cut, checksum frames, group commit — design note
 
-**Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13
+> **A decision record, not a description of the current code.** It records
+> why the main WAL works as it does and how each step was measured and tested,
+> in the order the steps were built. The current design of both logs, with its
+> rules and tests, is in [`WAL-Architecture.md`](WAL-Architecture.md). Sections
+> tagged *Superseded* describe a step as first built; the tag names what
+> replaced it.
+
+**Status:** built, 2026-10-24–25: A1, A2, B and C, with the crash testing in §13
 and the measurements in §14. Preallocated segments (§15) built after; the vector index
-WAL's syncs coalesced the same way (§16).
+WAL's syncs coalesced the same way (§16); zero-filled segments (§17, §18); one
+log format for both WALs (§19) and the review that followed it (§20).
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
@@ -567,6 +575,9 @@ needs are gone).
 
 ### 5.1 Frame layout
 
+*Superseded by §19: frames now sit in segments that start with a header
+(magic, format version, segment id).*
+
 A frame is today `[len u32][rkyv WalEntry]`. It becomes:
 
 ```
@@ -578,6 +589,9 @@ matches and its body decodes. Greenfield: no format version and no reader for
 the old frame.
 
 ### 5.2 Open truncates the log at the recovered tail
+
+*Superseded by §19: `SegmentedLog::open` finds and zeroes the torn tail;
+`recover_tail` no longer exists.*
 
 `Wal::recover_tail` finds the end of the valid frames. Open then truncates the
 last segment to that point and fsyncs it before accepting appends, as the
@@ -660,12 +674,18 @@ lock, so the target never covers a half-written frame.
 
 ### 6.2 Rotation fsyncs the segment it leaves
 
+*Still true; since §19 every sealed segment also ends in an end marker,
+reserved in advance, so a frame never fills a segment exactly.*
+
 Rounds fsync only the active segment. So a writer that fills a segment and
 rotates fsyncs the old segment (under the WAL lock, once per 64 MiB) before
 writing into the new one. Every segment but the last is then fully durable, and
 "durable tail" is a single position.
 
 ### 6.3 Neither saved position runs ahead of the durable tail
+
+*Superseded by §20 for the tail: the tail is no longer saved (open finds it
+in the log). The cut bullet below still holds.*
 
 - **Tail.** The metadata's saved tail is where recovery starts scanning
   forward for the real end (`recover_tail`). If it were saved beyond the
@@ -1007,7 +1027,7 @@ fsyncs it (`a_segment_filled_to_its_last_byte_is_durable_when_left`).
 | C | return before the round | five power-loss tests |
 | C | apply before the fsync | three power-loss tests |
 | C | seal a segment without an fsync | the stress, via the coverage assertion |
-| C | save the raw tail | `the_saved_tail_never_passes_the_durable_tail` |
+| C | save the raw tail | `the_saved_tail_never_passes_the_durable_tail` (superseded by §20: the tail is no longer saved; the end-to-end half is `a_write_after_losing_an_unsynced_tail_survives_the_next_power_loss`) |
 | C | a failed fsync does not poison | `a_failed_fsync_fails_the_write_and_stops_the_wal`, `a_failed_round_fails_every_writer_in_it` |
 
 **Not covered by the model:** the field-index files are memory-mapped and
@@ -1179,6 +1199,9 @@ which segment a bad frame is in; preallocation changes what the zeros past
 the tail mean to that rule, so it is a separate step.
 
 ## 17. Zero-filled segments, prepared ahead
+
+*File names superseded by §19: segments are `wal/{id:010}.log`, prepared as
+`{id:010}.log.prep`.*
 
 **Why.** §15's sparse segments save the size update but not block allocation:
 an fsync after a write that starts a new 4 KiB block still costs about as much
@@ -1387,14 +1410,12 @@ rule for each.
   between opens; the `wal_segment_size` marker is gone.
 - Open reads only from the cut. The sequence counter starts above the
   entries there, the SSTables' stored sequences, and `last_sequence`, which
-  every metadata save now records (it was saved only by WAL GC).
+  every metadata save records.
 - Lost or unreadable metadata with segments already reclaimed fails the open
-  (the cut is unknown). With every segment still present it replays the log
-  from the start, as before.
+  (the cut is unknown); §20 narrows when the whole log may be replayed.
 - An entry too large for a segment is refused before anything is written,
-  as `KVError::WriteTooLarge`. (A value between a WAL segment and a value-log
-  segment used to be written past the segment's end, then read back as a bad
-  frame by recovery.)
+  as `KVError::WriteTooLarge`, so a value larger than a WAL segment can never
+  become a frame recovery would read as bad.
 - The admin API shows main-WAL positions as `{segment_id, byte}`, as the
   vector index WAL's already were; `segments[]` lists the files on disk with
   their sizes.
@@ -1428,3 +1449,34 @@ stresses pass at 100 seeds (main WAL, 2,000 power losses) and 3,000 rounds
 | No new segment when saved progress is past the tail | `progress_past_the_durable_tail_starts_a_new_segment`, `progress_saved_past_a_failed_fsync_does_not_hide_later_writes`, and two progress-save tests |
 | A torn frame in a sealed segment accepted | `a_bad_frame_before_the_last_segment_fails_the_open`, `a_crc_failure_is_a_torn_tail_only_in_the_last_segment` |
 | Metadata saves without the sequence high-water mark | `test_gc_updates_last_sequence_before_deleting_segments` |
+
+## 20. Review of the shared log
+
+An external review of §19 asked for the following; each is built and tested.
+
+- **Missing or unreadable metadata.** Replaying the whole log ignores every
+  namespace's safe offset, so a replayed put could bring back a key whose
+  delete reached L1, where compaction dropped its tombstone. Tombstones are
+  dropped only into L1, so open now fails when the metadata is missing or
+  unreadable, the WAL has segments, and any namespace holds L1 data. With no
+  L1 data (a new database, or a crash during its first flushes, which can
+  leave L0 files and no metadata) the whole log is replayed, as is safe.
+  Tests: `unreadable_wal_metadata_with_l1_data_fails_the_open`,
+  `unreadable_wal_metadata_without_l1_data_replays_the_log`.
+- **Head and tail are not saved.** Open takes the tail from the log and the
+  head from the oldest segment on disk, so neither can be stale after a crash
+  mid-GC (`the_head_is_the_oldest_segment_on_disk_after_a_reopen`). The
+  metadata file holds the progress, the GC counters and the sequence
+  high-water mark.
+- **One progress-file format** (`ProgressFile`) for both logs' progress, with
+  the same validation (sorted namespaces, no safe offset below the cut).
+- **Errors:** each log wraps `LogError` in one variant instead of mirroring
+  it; readers pass an error mapping instead of defining wrapper types.
+- **Segment size** must lie in [64 KiB, 4 GiB] (`InvalidSegmentSize` at open).
+- **Swallowed errors** are logged: a partial segment delete, and a failed
+  segment listing for the stats. The stats read the durable tail before the
+  tail, so it never shows past it.
+- **Deterministic tests:** a test-only fsync delay replaces the real disk in
+  the commit-delay test, and a pause point after a failed round makes the
+  poisoning race test fail every time on the wrong order (5 of 5), where it
+  failed about 3 in 5 before.

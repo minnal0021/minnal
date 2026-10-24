@@ -681,34 +681,38 @@ fn concurrent_flushes_leave_the_saved_progress_equal_to_the_live_one() {
 #[test]
 fn test_wal_segment_size_can_change_between_opens() {
     let dir = TempDir::new().unwrap();
-    let small = 4 * 1024;
+    let small = crate::db::wal::MIN_CONFIGURED_SEGMENT_SIZE;
+    let large = 4 * small;
+    let value = vec![b'v'; 1000];
     {
         let mut cfg = create_db_config();
         cfg.wal_segment_size = small;
         let db = Database::open(dir.path(), cfg).unwrap();
         assert_eq!(db.wal.segment_size(), small, "a fresh WAL honours the config");
         for i in 0..200u32 {
-            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+            db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
         }
         assert!(db.wal.active_segment() >= 2, "setup: the writes should span segments");
         db.mark_crashed();
     }
     let mut cfg = create_db_config();
-    cfg.wal_segment_size = 64 * 1024;
+    cfg.wal_segment_size = large;
     let db = Database::open(dir.path(), cfg).unwrap();
-    assert_eq!(db.wal.segment_size(), 64 * 1024, "new segments take the configured size");
+    assert_eq!(db.wal.segment_size(), large, "new segments take the configured size");
     for i in 0..200u32 {
         assert_eq!(
             db.get(format!("k{i:03}").as_bytes()).unwrap(),
-            Some(vec![b'v'; 40]),
+            Some(value.clone()),
             "k{i:03} after the reopen"
         );
     }
-    for i in 200..2000u32 {
-        db.put(format!("k{i:04}").as_bytes(), &[b'v'; 40]).unwrap();
+    let first_new = db.wal.active_segment() + 1;
+    for i in 200..800u32 {
+        db.put(format!("k{i:04}").as_bytes(), &value).unwrap();
     }
     let last = db.wal.active_segment();
-    assert_eq!(std::fs::metadata(wal_segment_path(dir.path(), last)).unwrap().len(), 64 * 1024);
+    assert!(last >= first_new, "setup: the new writes should reach a new segment");
+    assert_eq!(std::fs::metadata(wal_segment_path(dir.path(), last)).unwrap().len(), large);
     db.shutdown().unwrap();
 }
 
@@ -2114,7 +2118,7 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
 
         let mut meta = WalMetadata::new();
         meta.tail = tail;
-        std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
+        std::fs::write(&wal_meta_path, meta.to_file_bytes()).unwrap();
     }
 
     let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -2160,7 +2164,7 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
         // Persist metadata as it stood at the earlier flush: it sees only entry 1.
         let mut meta = WalMetadata::new();
         meta.tail = stale_tail;
-        std::fs::write(&wal_meta_path, meta.to_file_bytes().unwrap()).unwrap();
+        std::fs::write(&wal_meta_path, meta.to_file_bytes()).unwrap();
     }
 
     let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -2346,7 +2350,7 @@ fn a_missing_middle_wal_segment_fails_the_open() -> Result<()> {
     }
     std::fs::remove_file(wal_segment_path(temp_dir.path(), 1))?;
     match Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256) {
-        Err(KVError::WalError(crate::db::wal::WalError::Corruption(why))) => {
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
             assert!(why.contains("segment 1 is missing"), "{why}");
         }
         Err(e) => panic!("expected a corruption error, got {e}"),
@@ -2432,31 +2436,139 @@ fn test_sequence_recovered_after_reopen() -> Result<()> {
     Ok(())
 }
 
+/// Flip a byte of the saved WAL metadata, so its checksum fails.
+fn damage_wal_metadata(db_path: &std::path::Path) {
+    let metadata_path = wal_metadata_path(db_path);
+    let mut data = std::fs::read(&metadata_path).unwrap();
+    data[16] ^= 0xFF;
+    std::fs::write(&metadata_path, data).unwrap();
+}
+
+/// Unreadable WAL metadata on a database with L1 data: the cut is unknown,
+/// and replaying the whole log could bring back a key whose delete reached L1
+/// (where its tombstone is dropped). The open fails, naming the file and the
+/// way out, and leaves the file where it is. Removing the WAL directory (the
+/// documented way out once every write is flushed) opens the database with
+/// its data, and the deleted key stays deleted.
 #[test]
-fn test_metadata_checksum_corruption_recovery() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let path = temp_dir.path().to_path_buf();
-
+fn unreadable_wal_metadata_with_l1_data_fails_the_open() {
+    let dir = TempDir::new().unwrap();
     {
-        let db = Database::open(&path, create_db_config())?;
-        db.put(b"key1", b"value1")?;
-        db.shutdown()?;
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        db.put(b"kept", b"v").unwrap();
+        db.put(b"gone", b"v").unwrap();
+        db.delete(b"gone").unwrap();
+        db.shutdown().unwrap(); // flushes and compacts into L1
     }
-
-    {
-        let metadata_path = wal_metadata_path(&path);
-        let mut data = std::fs::read(&metadata_path)?;
-        if let Some(byte) = data.get_mut(16) {
-            *byte ^= 0xFF;
+    assert!(any_level1_data_for_test(dir.path()), "setup: shutdown should leave L1 data");
+    damage_wal_metadata(dir.path());
+    match Database::open(dir.path(), create_db_config()) {
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
+            assert!(
+                why.contains("unreadable") && why.contains("L1 data") && why.contains("remove the `wal` directory"),
+                "{why}"
+            );
         }
-        std::fs::write(&metadata_path, data)?;
+        Err(e) => panic!("expected a corruption error, got {e}"),
+        Ok(_) => panic!("the open must fail when the WAL metadata is unreadable and L1 holds data"),
     }
+    assert!(
+        wal_metadata_path(dir.path()).exists(),
+        "a failed open must leave the metadata where it is"
+    );
+    std::fs::remove_file(wal_metadata_path(dir.path())).unwrap();
+    assert!(
+        Database::open(dir.path(), create_db_config()).is_err(),
+        "missing metadata is refused the same way"
+    );
 
-    let db = Database::open(&path, create_db_config())?;
-    assert!(wal_metadata_path(&path).with_extension("corrupt").exists());
-    assert_eq!(db.get(b"key1")?, Some(b"value1".to_vec()));
+    std::fs::remove_dir_all(crate::db::layout::main_wal_dir(dir.path())).unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    assert_eq!(db.get(b"kept").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"gone").unwrap(), None);
+    db.shutdown().unwrap();
+}
 
-    Ok(())
+/// Unreadable WAL metadata with no L1 data (a crash during a database's first
+/// flushes, before any compaction): no tombstone can have been dropped, so
+/// replaying the whole log is safe, and the open does it, keeping the damaged
+/// file as `metadata.corrupt`.
+#[test]
+fn unreadable_wal_metadata_without_l1_data_replays_the_log() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        db.put(b"flushed", b"v").unwrap();
+        db.get_store(crate::db::namespace::DEFAULT_NAMESPACE_ID)
+            .unwrap()
+            .flush_memtable_to_level0()
+            .unwrap();
+        db.put(b"unflushed", b"v").unwrap();
+        db.mark_crashed();
+    }
+    assert!(!any_level1_data_for_test(dir.path()), "setup: nothing should have reached L1");
+    damage_wal_metadata(dir.path());
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    assert!(wal_metadata_path(dir.path()).with_extension("corrupt").exists());
+    assert_eq!(db.get(b"flushed").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"unflushed").unwrap(), Some(b"v".to_vec()));
+    db.shutdown().unwrap();
+}
+
+/// Whether any namespace under `db_path` holds L1 data.
+fn any_level1_data_for_test(db_path: &std::path::Path) -> bool {
+    crate::db::layout::namespace_data_dirs(db_path)
+        .unwrap()
+        .iter()
+        .any(|d| crate::db::kv_store::KVStore::has_level1_data(d).unwrap())
+}
+
+/// The head is derived from the log at open (the oldest segment on disk), not
+/// read from the metadata, so it is right even when WAL GC deleted segments
+/// and no metadata save followed.
+#[test]
+fn the_head_is_the_oldest_segment_on_disk_after_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let oldest = {
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+        for i in 0..100u32 {
+            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+        }
+        db.flush_all_namespaces().unwrap();
+        // Delete retired segments behind the metadata's back, as a crash after
+        // GC's deletes and before its save would leave them.
+        let cut_segment = db.wal.segment_of(db.wal_metadata.read().cut);
+        db.wal.delete_segments_below(cut_segment).unwrap();
+        db.mark_crashed();
+        cut_segment
+    };
+    assert!(oldest >= 2, "setup: some segments should be deleted");
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+    assert_eq!(db.wal_metadata.read().head, crate::db::segmented_log::segment_start(oldest));
+    assert_eq!(db.wal_stats().head.segment_id, oldest);
+    assert_eq!(db.get(b"k099").unwrap(), Some(vec![b'v'; 40]));
+}
+
+/// A configured WAL segment size must lie in [64 KiB, 4 GiB): a tiny one would
+/// refuse every write, and a larger one cannot be addressed by a position.
+#[test]
+fn an_out_of_range_wal_segment_size_is_refused_at_open() {
+    for size in [0u64, 1024, 64 * 1024 - 1, u64::from(u32::MAX) + 1, 8 << 30] {
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.wal_segment_size = size;
+        match Database::open(dir.path(), config) {
+            Err(KVError::WalError(crate::db::wal::WalError::InvalidSegmentSize(s))) => assert_eq!(s, size),
+            Err(e) => panic!("size {size}: expected InvalidSegmentSize, got {e}"),
+            Ok(_) => panic!("size {size} should be refused"),
+        }
+    }
+    for size in [64 * 1024u64, u64::from(u32::MAX)] {
+        let dir = TempDir::new().unwrap();
+        let mut config = create_db_config();
+        config.wal_segment_size = size;
+        Database::open(dir.path(), config).unwrap().shutdown().unwrap();
+    }
 }
 
 // ── merge (atomic read-modify-write) ───────────────────────────────
@@ -3352,8 +3464,8 @@ fn a_write_after_a_reopen_beats_entries_below_the_cut() {
 }
 
 /// Lost metadata with segments already reclaimed: the cut is unknown, and
-/// replaying whatever is left could bring back retired entries, so the open
-/// fails instead of guessing.
+/// replaying whatever is left could bring back retired entries or deleted
+/// keys, so the open fails instead of guessing.
 #[test]
 fn lost_wal_metadata_after_gc_fails_the_open() {
     let dir = TempDir::new().unwrap();
@@ -3369,7 +3481,9 @@ fn lost_wal_metadata_after_gc_fails_the_open() {
     }
     std::fs::remove_file(wal_metadata_path(dir.path())).unwrap();
     match Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512) {
-        Err(KVError::WalError(crate::db::wal::WalError::Corruption(why))) => assert!(why.contains("no progress was saved"), "{why}"),
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
+            assert!(why.contains("missing") && why.contains("L1 data"), "{why}")
+        }
         Err(e) => panic!("expected a corruption error, got {e}"),
         Ok(_) => panic!("the open must fail when the WAL's progress is lost after GC"),
     }

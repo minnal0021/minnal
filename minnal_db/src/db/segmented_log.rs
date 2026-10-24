@@ -115,14 +115,18 @@ pub(crate) struct LogFormat {
     pub version: u32,
 }
 
-/// Errors from a [`SegmentedLog`].
+/// Errors from a [`SegmentedLog`], and from a log built on it: each log wraps
+/// this in one variant of its own error type (naming the log), rather than
+/// mirroring its variants.
 #[derive(Error, Debug)]
 pub enum LogError {
     /// An I/O error reading or writing the log.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    /// The log is damaged somewhere other than its torn tail.
-    #[error("{0}")]
+    /// The log is damaged somewhere other than its torn tail (including a
+    /// body that passes its CRC but does not decode, or a damaged progress
+    /// file).
+    #[error("corrupt: {0}")]
     Corruption(String),
     /// A record too large for one segment. Nothing was written.
     #[error("a record of {len} bytes does not fit a segment (at most {max})")]
@@ -134,7 +138,7 @@ pub enum LogError {
     },
     /// An fsync or a rotation failed; the log refuses appends and commits
     /// until the database is reopened.
-    #[error("{0}")]
+    #[error("stopped after a failed fsync ({0}); reopen the database to recover")]
     Poisoned(String),
 }
 
@@ -189,6 +193,146 @@ pub(crate) struct OpenFrom {
     /// The furthest position the saved progress names (the cut, or a
     /// namespace's offset above it). New appends land above it.
     pub furthest: u64,
+}
+
+/// A log's saved retirement progress: everything below `cut` is in SSTables,
+/// and each namespace listed in `safe` has everything of its own below its
+/// offset in SSTables too (offsets above the cut only, sorted by namespace).
+/// Replay applies a record only at or above its namespace's
+/// [`replay_from`](Self::replay_from).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Progress {
+    /// Records below this are retired; GC deletes segments wholly below it.
+    pub cut: u64,
+    /// Namespaces whose safe offset is above the cut, sorted by namespace.
+    pub safe: Vec<(u32, u64)>,
+}
+
+impl Progress {
+    /// Where replay starts for namespace `ns`.
+    pub(crate) fn replay_from(&self, ns: u32) -> u64 {
+        self.safe
+            .binary_search_by_key(&ns, |&(n, _)| n)
+            .map_or(self.cut, |i| self.safe[i].1.max(self.cut))
+    }
+
+    /// The furthest position the progress names.
+    pub(crate) fn furthest(&self) -> u64 {
+        self.safe.iter().map(|&(_, s)| s).chain([self.cut]).max().unwrap_or(0)
+    }
+
+    /// Where [`SegmentedLog::open`] reads from, given the saved progress
+    /// (`None`: none was ever saved).
+    pub(crate) fn open_from(saved: Option<&Progress>) -> OpenFrom {
+        OpenFrom {
+            cut: saved.map(|p| p.cut),
+            furthest: saved.map_or(0, Progress::furthest),
+        }
+    }
+}
+
+/// A log's progress file: [`Progress`] plus the log's own extra bytes (the
+/// main WAL's counters; nothing for the vector index WAL), written atomically
+/// and durably, checked on read. One format for every log, told apart by its
+/// magic.
+///
+/// ```text
+/// [magic 4][version u32][cut u64][count u32][count × (ns u32, safe u64)]
+/// [extra_len u32][extra][crc32 of everything before it]
+/// ```
+pub(crate) struct ProgressFile {
+    /// The file's first four bytes, per log.
+    pub magic: [u8; 4],
+}
+
+/// The progress file layout's version.
+const PROGRESS_VERSION: u32 = 3;
+const PROGRESS_FIXED_LEN: usize = 4 + 4 + 8 + 4;
+const PROGRESS_ENTRY_LEN: usize = 4 + 8;
+
+impl ProgressFile {
+    /// The file's bytes for `p` and `extra`.
+    pub(crate) fn encode(&self, p: &Progress, extra: &[u8]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(PROGRESS_FIXED_LEN + p.safe.len() * PROGRESS_ENTRY_LEN + 4 + extra.len() + 4);
+        b.extend_from_slice(&self.magic);
+        b.extend_from_slice(&PROGRESS_VERSION.to_le_bytes());
+        b.extend_from_slice(&p.cut.to_le_bytes());
+        b.extend_from_slice(&(p.safe.len() as u32).to_le_bytes());
+        for (ns, safe) in &p.safe {
+            b.extend_from_slice(&ns.to_le_bytes());
+            b.extend_from_slice(&safe.to_le_bytes());
+        }
+        b.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+        b.extend_from_slice(extra);
+        let crc = crc32fast::hash(&b);
+        b.extend_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// Decode and check a progress file: its magic, version, checksum and
+    /// length, that the namespaces are sorted and unique, and that no safe
+    /// offset is below the cut. Any failure is corruption.
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<(Progress, Vec<u8>)> {
+        let bad = |why: &str| LogError::Corruption(format!("the progress file is damaged: {why}"));
+        if bytes.len() < PROGRESS_FIXED_LEN + 8 || bytes[0..4] != self.magic {
+            return Err(bad("no header"));
+        }
+        let (body, crc) = bytes.split_at(bytes.len() - 4);
+        if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+            return Err(bad("CRC mismatch"));
+        }
+        let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        if version != PROGRESS_VERSION {
+            return Err(bad(&format!("version {version}, expected {PROGRESS_VERSION}")));
+        }
+        let cut = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let count = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+        let entries_end = PROGRESS_FIXED_LEN
+            .checked_add(count.checked_mul(PROGRESS_ENTRY_LEN).ok_or_else(|| bad("entry count overflows"))?)
+            .filter(|&e| e + 4 <= body.len())
+            .ok_or_else(|| bad("length does not match its entry count"))?;
+        let safe: Vec<(u32, u64)> = body[PROGRESS_FIXED_LEN..entries_end]
+            .as_chunks::<PROGRESS_ENTRY_LEN>()
+            .0
+            .iter()
+            .map(|e| {
+                (
+                    u32::from_le_bytes(e[0..4].try_into().unwrap()),
+                    u64::from_le_bytes(e[4..12].try_into().unwrap()),
+                )
+            })
+            .collect();
+        let extra_len = u32::from_le_bytes(body[entries_end..entries_end + 4].try_into().unwrap()) as usize;
+        if body.len() != entries_end + 4 + extra_len {
+            return Err(bad("length does not match its extra bytes"));
+        }
+        if safe.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(bad("namespaces are not sorted"));
+        }
+        if let Some((ns, offset)) = safe.iter().find(|&&(_, s)| s < cut) {
+            return Err(bad(&format!(
+                "namespace {ns}'s safe offset {:?} is below the cut {:?}",
+                LogPosition::of(*offset),
+                LogPosition::of(cut)
+            )));
+        }
+        Ok((Progress { cut, safe }, body[entries_end + 4..].to_vec()))
+    }
+
+    /// Read and decode the file at `path`; `None` if it does not exist.
+    pub(crate) fn read(&self, path: &Path) -> Result<Option<(Progress, Vec<u8>)>> {
+        match std::fs::read(path) {
+            Ok(bytes) => self.decode(&bytes).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write `p` and `extra` to `path`, atomically and durably (temp file,
+    /// fsync, rename, directory fsync).
+    pub(crate) fn write(&self, path: &Path, p: &Progress, extra: &[u8]) -> std::io::Result<()> {
+        crate::support::write_atomic_durable(path, &self.encode(p, extra))
+    }
 }
 
 /// What [`SegmentedLog::open`] found.
@@ -254,6 +398,10 @@ pub(crate) struct SegmentedLog {
     /// Test-only fault: the next fsync fails.
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Test-only: every fsync takes at least this long (µs), as on a real
+    /// disk, so tests of fsync sharing do not depend on the machine.
+    #[cfg(test)]
+    fsync_delay_us: AtomicU64,
 }
 
 /// A segment file's path in `dir`.
@@ -283,6 +431,17 @@ fn list_segments(dir: &Path) -> Result<Vec<u64>> {
     }
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// Whether `dir` holds any segment file (a log that may have records to
+/// replay). A missing directory holds none.
+pub(crate) fn has_segments(dir: &Path) -> std::io::Result<bool> {
+    match list_segments(dir) {
+        Ok(ids) => Ok(!ids.is_empty()),
+        Err(LogError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(LogError::Io(e)) => Err(e),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    }
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -380,15 +539,16 @@ fn zero_past(file: &File, pos: u32, len: u32, segment_size: u32) -> Result<()> {
 ///
 /// Every length is checked against the bytes left before anything is
 /// allocated for it (a corrupt length could otherwise ask for 4 GiB).
-fn walk_segment<E: From<LogError>>(
+fn walk_segment<E>(
     file: &File,
     segment_id: u64,
     start: u32,
     limit: u32,
     buf: &mut Vec<u8>,
+    lift: impl Fn(LogError) -> E,
     mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
 ) -> std::result::Result<WalkEnd, E> {
-    let io = |e: std::io::Error| E::from(LogError::Io(e));
+    let io = |e: std::io::Error| lift(LogError::Io(e));
     let mut pos = start;
     loop {
         if pos >= limit {
@@ -440,7 +600,7 @@ fn walk_segment<E: From<LogError>>(
 /// segment's end marker (see the module docs).
 fn sealed_at_or_below(file: &File, segment_id: u64, from: u32, len: u32, buf: &mut Vec<u8>) -> Result<Option<u32>> {
     let limit = from.saturating_add(END_MARKER_LEN).min(len);
-    match walk_segment(file, segment_id, SEGMENT_HEADER_LEN, limit, buf, |_, _| Ok::<(), LogError>(()))? {
+    match walk_segment(file, segment_id, SEGMENT_HEADER_LEN, limit, buf, |e| e, |_, _| Ok::<(), LogError>(()))? {
         WalkEnd::Sealed { pos } if pos <= from => Ok(Some(pos)),
         _ => Ok(None),
     }
@@ -514,7 +674,7 @@ impl SegmentedLog {
                 std::cmp::Ordering::Equal => cut_byte.max(SEGMENT_HEADER_LEN),
                 std::cmp::Ordering::Greater => SEGMENT_HEADER_LEN,
             };
-            match walk_segment(&file, id, start, len, &mut buf, &mut visit_from_cut)? {
+            match walk_segment(&file, id, start, len, &mut buf, E::from, &mut visit_from_cut)? {
                 WalkEnd::Sealed { pos } => {
                     sealed_ends.insert(id, pos);
                 }
@@ -557,7 +717,7 @@ impl SegmentedLog {
                     (id, create_segment(format, dir, id, segment_size)?, SEGMENT_HEADER_LEN)
                 } else {
                     check_header(format, &file, id)?;
-                    match walk_segment(&file, id, SEGMENT_HEADER_LEN, len, &mut buf, &mut visit_from_cut)? {
+                    match walk_segment(&file, id, SEGMENT_HEADER_LEN, len, &mut buf, E::from, &mut visit_from_cut)? {
                         WalkEnd::Unwritten { pos } => {
                             zero_past(&file, pos, len, segment_size)?;
                             (id, file, pos)
@@ -630,6 +790,8 @@ impl SegmentedLog {
             first_open_segment: segment_id,
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fsync_delay_us: AtomicU64::new(0),
         };
         Ok((log, OpenReport { tail, torn_bytes_dropped }))
     }
@@ -804,11 +966,19 @@ impl SegmentedLog {
     }
 
     /// fsync segment `segment_id`'s `file`; the caller poisons the log on an
-    /// error.
+    /// error. `segment_id` feeds only the test-only power-loss model.
+    #[cfg_attr(not(test), allow(unused_variables))]
     fn sync_file(&self, file: &File, segment_id: u64) -> Result<()> {
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("injected fsync failure").into());
+        }
+        #[cfg(test)]
+        {
+            let delay = self.fsync_delay_us.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_micros(delay));
+            }
         }
         // What this fsync covers, for the power-loss model: what was written
         // before it starts (bytes written later may or may not be covered).
@@ -821,7 +991,6 @@ impl SegmentedLog {
             let entry = synced.entry(segment_id).or_insert(0);
             *entry = (*entry).max(covered);
         }
-        let _ = segment_id;
         Ok(())
     }
 
@@ -845,8 +1014,22 @@ impl SegmentedLog {
         LogError::Poisoned(self.rounds.poison(why))
     }
 
+    /// [`for_each_with`](Self::for_each_with) for a caller whose error type
+    /// converts from [`LogError`].
+    pub(crate) fn for_each<E: From<LogError>>(
+        &self,
+        start: u64,
+        end: u64,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.for_each_with(start, end, E::from, f)
+    }
+
     /// Hands every record in `[start, end)` to `f`, in log order. `start` is a
     /// record's position or a segment's start; `end` is at most the tail.
+    /// `lift` turns the log's own errors into the caller's error type, so a
+    /// log whose caller's error does not convert from [`LogError`] directly
+    /// needs no wrapper type.
     /// Segments wholly below the oldest one on disk are retired and skipped
     /// (a reader racing GC skips a segment GC deletes under it the same way),
     /// so a caller that must know about them asks
@@ -855,13 +1038,14 @@ impl SegmentedLog {
     ///
     /// Streams with one reused buffer, so a long read holds one record at a
     /// time.
-    pub(crate) fn for_each<E: From<LogError>>(
+    pub(crate) fn for_each_with<E>(
         &self,
         start: u64,
         end: u64,
+        lift: impl Fn(LogError) -> E,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        let corrupt = |why: String| E::from(LogError::Corruption(why));
+        let corrupt = |why: String| lift(LogError::Corruption(why));
         if end <= start {
             return Ok(());
         }
@@ -875,7 +1059,7 @@ impl SegmentedLog {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Retired and deleted (now, or before the call): skip to
                     // the oldest segment still on disk.
-                    match list_segments(&self.dir)?.first() {
+                    match list_segments(&self.dir).map_err(&lift)?.first() {
                         Some(&oldest) if oldest > id => {
                             id = oldest;
                             start = segment_start(oldest);
@@ -884,22 +1068,22 @@ impl SegmentedLog {
                         _ => return Err(corrupt(format!("segment {id} is missing"))),
                     }
                 }
-                Err(e) => return Err(LogError::Io(e).into()),
+                Err(e) => return Err(lift(LogError::Io(e))),
             };
-            check_header(self.format, &file, id)?;
+            check_header(self.format, &file, id).map_err(&lift)?;
             let from = if id == segment_of(start) {
                 split(start).1.max(SEGMENT_HEADER_LEN)
             } else {
                 SEGMENT_HEADER_LEN
             };
-            let len = file_len(&file)?;
+            let len = file_len(&file).map_err(&lift)?;
             let limit = if id == end_id { end_pos.min(len) } else { len };
-            match walk_segment(&file, id, from, limit, &mut buf, &mut f)? {
+            match walk_segment(&file, id, from, limit, &mut buf, &lift, &mut f)? {
                 WalkEnd::Unwritten { .. } if id == end_id => {}
                 WalkEnd::Sealed { .. } => {}
                 // A start past a sealed segment's end marker (see `open`).
                 WalkEnd::Unwritten { pos }
-                    if pos == from && from > SEGMENT_HEADER_LEN && sealed_at_or_below(&file, id, from, len, &mut buf)?.is_some() => {}
+                    if pos == from && from > SEGMENT_HEADER_LEN && sealed_at_or_below(&file, id, from, len, &mut buf).map_err(&lift)?.is_some() => {}
                 WalkEnd::Torn { pos, reason, .. } => {
                     return Err(corrupt(format!("segment {id} is damaged at byte {pos}: {reason}")));
                 }
@@ -1003,7 +1187,16 @@ impl SegmentedLog {
         self.sealed_ends.lock().retain(|&id, _| id >= below);
         match failed {
             Some(e) if segments == 0 => Err(e.into()),
-            _ => Ok((segments, bytes)),
+            Some(e) => {
+                // What was deleted is still one run from the oldest up; the
+                // rest is retried by the next pass.
+                log::warn!(
+                    "[{}] deleted {segments} retired segment(s), then could not delete the next: {e}",
+                    self.format.name
+                );
+                Ok((segments, bytes))
+            }
+            None => Ok((segments, bytes)),
         }
     }
 
@@ -1060,6 +1253,12 @@ impl SegmentedLog {
     #[cfg(test)]
     pub(crate) fn fail_next_sync(&self) {
         self.fail_next_sync.store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only: make every fsync take at least `delay`.
+    #[cfg(test)]
+    pub(crate) fn set_fsync_delay(&self, delay: Duration) {
+        self.fsync_delay_us.store(delay.as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -1543,6 +1742,49 @@ mod tests {
         drop(log);
         open(dir.path(), FRESH).unwrap();
         assert!(!prep_path(dir.path(), 9).exists());
+    }
+
+    /// A progress file round-trips with its extra bytes, and every kind of
+    /// damage is corruption: another log's magic, a changed byte, a truncated
+    /// file, unsorted namespaces, an offset below the cut.
+    #[test]
+    fn a_progress_file_round_trips_and_rejects_damage() {
+        let file = ProgressFile { magic: *b"TPRG" };
+        let p = Progress {
+            cut: segment_start(2),
+            safe: vec![(1, position(2, 900)), (7, position(3, 40))],
+        };
+        let bytes = file.encode(&p, b"extra");
+        assert_eq!(file.decode(&bytes).unwrap(), (p.clone(), b"extra".to_vec()));
+        assert_eq!(p.replay_from(7), position(3, 40));
+        assert_eq!(p.replay_from(4), p.cut);
+        assert_eq!(p.furthest(), position(3, 40));
+
+        let damaged = |b: Vec<u8>| match file.decode(&b) {
+            Err(LogError::Corruption(why)) => why,
+            other => panic!("expected corruption, got {other:?}"),
+        };
+        assert!(damaged(ProgressFile { magic: *b"OTHR" }.encode(&p, &[])).contains("no header"));
+        let mut flipped = bytes.clone();
+        flipped[10] ^= 1;
+        assert!(damaged(flipped).contains("CRC"));
+        assert!(damaged(bytes[..bytes.len() - 3].to_vec()).contains("CRC"));
+        let unsorted = Progress {
+            cut: 0,
+            safe: vec![(7, 5), (1, 5)],
+        };
+        assert!(damaged(file.encode(&unsorted, &[])).contains("not sorted"));
+        let below = Progress {
+            cut: 100,
+            safe: vec![(1, 50)],
+        };
+        assert!(damaged(file.encode(&below, &[])).contains("below the cut"));
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("progress");
+        assert_eq!(file.read(&path).unwrap(), None);
+        file.write(&path, &p, &[]).unwrap();
+        assert_eq!(file.read(&path).unwrap(), Some((p, Vec::new())));
     }
 
     /// The power-loss model: what no fsync covered is lost, and what one did

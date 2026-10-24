@@ -17,7 +17,6 @@
 //! `database.rs`.
 
 use crate::db::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
-use crc32fast::Hasher;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::path::Path;
 #[cfg(test)]
@@ -25,36 +24,34 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
+/// Errors from the main WAL: the shared log's own errors, plus encoding a
+/// [`WalEntry`] or [`WalMetadata`].
 #[derive(Error, Debug)]
 pub enum WalError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Serialization error: {0}")]
+    /// From the segmented log (I/O, corruption, an oversized entry, or a
+    /// failed fsync that stopped the WAL).
+    #[error("main WAL: {0}")]
+    Log(#[from] LogError),
+    /// An entry or the metadata could not be encoded.
+    #[error("main WAL encoding: {0}")]
     Serialization(String),
-    /// Damage open or a read cannot treat as a torn tail.
-    #[error("WAL corrupted: {0}")]
-    Corruption(String),
-    /// An entry too large for one segment. Nothing was written.
-    #[error("WAL entry of {len} bytes does not fit a segment (at most {max})")]
-    RecordTooLarge {
-        /// The entry's framed length.
-        len: u64,
-        /// The largest framed entry a segment holds.
-        max: u64,
-    },
-    /// An fsync of the log failed, so the log refuses writes until the database
-    /// is reopened (see [`Wal::commit`]).
-    #[error("WAL stopped after a failed fsync: {0}")]
-    Poisoned(String),
+    /// `wal.segment_size_bytes` is out of range.
+    #[error("invalid WAL segment size {0} bytes: must be at least {MIN_CONFIGURED_SEGMENT_SIZE} and at most {max}", max = u32::MAX)]
+    InvalidSegmentSize(u64),
 }
 
-impl From<LogError> for WalError {
-    fn from(e: LogError) -> Self {
-        match e {
-            LogError::Io(e) => Self::Io(e),
-            LogError::Corruption(why) => Self::Corruption(why),
-            LogError::RecordTooLarge { len, max } => Self::RecordTooLarge { len, max },
-            LogError::Poisoned(why) => Self::Poisoned(why),
+impl From<std::io::Error> for WalError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Log(LogError::Io(e))
+    }
+}
+
+impl WalError {
+    /// Why the WAL stopped, if this is the error a stopped WAL returns.
+    pub fn poisoned(&self) -> Option<&str> {
+        match self {
+            Self::Log(LogError::Poisoned(why)) => Some(why),
+            _ => None,
         }
     }
 }
@@ -72,11 +69,12 @@ pub(crate) static FORMAT: LogFormat = LogFormat {
 /// Default WAL segment size (64 MiB).
 pub const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
 
+/// Smallest segment size a configuration may ask for (64 KiB, as the value
+/// log). A record must fit one segment, so a tiny segment would refuse writes.
+pub const MIN_CONFIGURED_SEGMENT_SIZE: u64 = 64 * 1024;
+
 /// The metadata file, in the log's directory.
 pub(crate) const METADATA_FILE: &str = "metadata";
-
-const WAL_METADATA_MAGIC: [u8; 4] = *b"WALM";
-const WAL_METADATA_VERSION: u32 = 2;
 
 /// Operation type for WAL entries
 #[derive(Debug, Clone, Copy, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -235,19 +233,26 @@ impl WalPointer {
     }
 }
 
-/// Metadata for tracking WAL state.
+/// The main WAL's state in memory, and what its metadata file saves.
 ///
-/// Besides the log's bounds it holds the **retirement progress**: how far each
-/// namespace's writes are in L0 files. Recovery replays an entry only if it
-/// lies at or above its namespace's [`replay_from`](Self::replay_from), and WAL
-/// GC deletes segments wholly below [`cut`](Self::cut). It is saved by the
-/// flush that moves it, before that flush's L0 files are registered (see
+/// The file (`wal/metadata`) holds the **retirement progress** — the cut and
+/// each namespace's safe offset, in the shared progress-file format
+/// (`segmented_log::ProgressFile`, magic `WALM`) — plus the WAL GC counters
+/// and the sequence high-water mark. Recovery replays an entry only if it lies
+/// at or above its namespace's [`replay_from`](Self::replay_from), and WAL GC
+/// deletes segments wholly below [`cut`](Self::cut). It is saved by the flush
+/// that moves it, before that flush's L0 files are registered (see
 /// `WalPersistObserver::prepare_written` in `database.rs`).
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+///
+/// `head` and `tail` are not saved: open derives them from the log (the oldest
+/// segment on disk, and the end of its valid frames).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WalMetadata {
-    /// The first segment still on disk starts here (WAL GC moves it).
+    /// The first record of the oldest segment on disk (WAL GC moves it).
+    /// Derived at open, not saved.
     pub head: u64,
-    /// Where new writes go, as of the save (capped at what was fsynced).
+    /// Where new writes go: the log's own tail, mirrored here under the WAL
+    /// lock for the readers of the cut. Derived at open, not saved.
     pub tail: u64,
     /// Every entry below this is in an SSTable. The lowest safe offset among
     /// namespaces with unflushed writes, capped at the oldest in-flight write.
@@ -255,13 +260,21 @@ pub struct WalMetadata {
     /// Namespaces whose safe offset is above `cut`, sorted by namespace: each
     /// one's writes below its offset are in L0 files too.
     pub safe: Vec<(u32, u64)>,
-    pub total_gc_runs: u64,         // Number of GC operations
-    pub total_bytes_reclaimed: u64, // Total bytes freed by GC
+    /// WAL GC passes ever run.
+    pub total_gc_runs: u64,
+    /// Bytes of segment files ever deleted by WAL GC.
+    pub total_bytes_reclaimed: u64,
     /// High-water mark for the global sequence number, updated on every save.
     /// Open reads the log only from the cut, so this is what covers the
     /// sequences of entries below it (their SSTables cover them too).
     pub last_sequence: u64,
 }
+
+/// The metadata file: the shared progress format, magic `WALM`.
+const METADATA_FORMAT: segmented_log::ProgressFile = segmented_log::ProgressFile { magic: *b"WALM" };
+/// The metadata file's extra bytes: `total_gc_runs`, `total_bytes_reclaimed`,
+/// `last_sequence`.
+const METADATA_EXTRA_LEN: usize = 24;
 
 impl Default for WalMetadata {
     fn default() -> Self {
@@ -285,83 +298,50 @@ impl WalMetadata {
         }
     }
 
+    /// The retirement progress alone.
+    pub(crate) fn progress(&self) -> segmented_log::Progress {
+        segmented_log::Progress {
+            cut: self.cut,
+            safe: self.safe.clone(),
+        }
+    }
+
     /// Where replay starts for namespace `ns`: its saved safe offset, or the
     /// cut for a namespace not listed.
     pub fn replay_from(&self, ns: u32) -> u64 {
-        match self.safe.binary_search_by_key(&ns, |&(n, _)| n) {
-            Ok(i) => self.safe[i].1.max(self.cut),
-            Err(_) => self.cut,
-        }
+        self.progress().replay_from(ns)
     }
 
-    /// Serialize metadata to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| WalError::Serialization(format!("Failed to serialize WAL metadata: {}", e)))
-            .map(|buf| buf.to_vec())
+    /// The metadata file's bytes.
+    pub fn to_file_bytes(&self) -> Vec<u8> {
+        let mut extra = Vec::with_capacity(METADATA_EXTRA_LEN);
+        extra.extend_from_slice(&self.total_gc_runs.to_le_bytes());
+        extra.extend_from_slice(&self.total_bytes_reclaimed.to_le_bytes());
+        extra.extend_from_slice(&self.last_sequence.to_le_bytes());
+        METADATA_FORMAT.encode(&self.progress(), &extra)
     }
 
-    /// Deserialize metadata from bytes
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let min_size = std::mem::size_of::<ArchivedWalMetadata>();
-        if bytes.len() < min_size {
-            return Err(WalError::Serialization(format!("WAL metadata too small: {} < {}", bytes.len(), min_size)));
-        }
-        let archived = rkyv::access::<ArchivedWalMetadata, rkyv::rancor::Error>(bytes)
-            .map_err(|e| WalError::Serialization(format!("WAL metadata validation failed: {}", e)))?;
-        Ok(WalMetadata {
-            head: archived.head.to_native(),
-            tail: archived.tail.to_native(),
-            cut: archived.cut.to_native(),
-            safe: archived.safe.iter().map(|t| (t.0.to_native(), t.1.to_native())).collect(),
-            total_gc_runs: archived.total_gc_runs.to_native(),
-            total_bytes_reclaimed: archived.total_bytes_reclaimed.to_native(),
-            last_sequence: archived.last_sequence.to_native(),
-        })
-    }
-
-    pub fn to_file_bytes(&self) -> Result<Vec<u8>> {
-        let payload = self.to_bytes()?;
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        let checksum = hasher.finalize();
-
-        let mut out = Vec::with_capacity(16 + payload.len());
-        out.extend_from_slice(&WAL_METADATA_MAGIC);
-        out.extend_from_slice(&WAL_METADATA_VERSION.to_le_bytes());
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
-    }
-
+    /// Decode and check a metadata file (see `ProgressFile::decode`); any
+    /// damage is corruption. `head` and `tail` come back at the first record's
+    /// position, for open to set from the log.
     pub fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() >= 16 && bytes.get(0..4) == Some(&WAL_METADATA_MAGIC) {
-            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            if version != WAL_METADATA_VERSION {
-                return Err(WalError::Serialization(format!("Unsupported WAL metadata version: {}", version)));
-            }
-            let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-            let payload_end = 16usize.saturating_add(payload_len);
-            if bytes.len() < payload_end {
-                return Err(WalError::Serialization(format!(
-                    "WAL metadata payload truncated: {} < {}",
-                    bytes.len(),
-                    payload_end
-                )));
-            }
-            let payload = &bytes[16..payload_end];
-            let mut hasher = Hasher::new();
-            hasher.update(payload);
-            let actual = hasher.finalize();
-            if actual != checksum {
-                return Err(WalError::Serialization("WAL metadata checksum mismatch".to_string()));
-            }
-            return Self::from_bytes(payload);
+        let (progress, extra) = METADATA_FORMAT.decode(bytes)?;
+        if extra.len() != METADATA_EXTRA_LEN {
+            return Err(LogError::Corruption(format!(
+                "the WAL metadata holds {} extra bytes, expected {METADATA_EXTRA_LEN}",
+                extra.len()
+            ))
+            .into());
         }
-
-        Self::from_bytes(bytes)
+        let word = |i: usize| u64::from_le_bytes(extra[i * 8..i * 8 + 8].try_into().unwrap());
+        Ok(Self {
+            cut: progress.cut,
+            safe: progress.safe,
+            total_gc_runs: word(0),
+            total_bytes_reclaimed: word(1),
+            last_sequence: word(2),
+            ..Self::new()
+        })
     }
 }
 
@@ -434,15 +414,6 @@ pub struct Wal {
     log: SegmentedLog,
 }
 
-/// A caller's error from a scan, carried through the segmented log's reader.
-struct Scan(WalError);
-
-impl From<LogError> for Scan {
-    fn from(e: LogError) -> Self {
-        Scan(e.into())
-    }
-}
-
 impl Wal {
     /// Opens the log in `dir` from its saved progress (`SegmentedLog::open`:
     /// validation, the torn tail, a new segment when the progress names
@@ -451,11 +422,10 @@ impl Wal {
     /// is corruption.
     pub(crate) fn open(dir: &Path, segment_size: u32, from: OpenFrom) -> Result<(Self, WalOpenReport)> {
         let mut max_sequence = 0u64;
-        let (log, report) = SegmentedLog::open(dir, &FORMAT, segment_size, from, |at, body| -> std::result::Result<(), Scan> {
-            max_sequence = max_sequence.max(WalEntry::peek_sequence(body).map_err(|e| Scan(undecodable(at, e)))?);
+        let (log, report) = SegmentedLog::open(dir, &FORMAT, segment_size, from, |at, body| -> Result<()> {
+            max_sequence = max_sequence.max(WalEntry::peek_sequence(body).map_err(|e| undecodable(at, e))?);
             Ok(())
-        })
-        .map_err(|Scan(e)| e)?;
+        })?;
         Ok((
             Self { log },
             WalOpenReport {
@@ -466,9 +436,25 @@ impl Wal {
         ))
     }
 
+    /// A configured segment size, checked: at least
+    /// [`MIN_CONFIGURED_SEGMENT_SIZE`], at most 4 GiB (positions keep the byte
+    /// within a segment in 32 bits).
+    pub fn validate_segment_size(size: u64) -> Result<u32> {
+        match u32::try_from(size) {
+            Ok(s) if size >= MIN_CONFIGURED_SEGMENT_SIZE => Ok(s),
+            _ => Err(WalError::InvalidSegmentSize(size)),
+        }
+    }
+
+    /// Where the oldest segment on disk starts: the head.
+    pub(crate) fn head(&self) -> Result<u64> {
+        Ok(segmented_log::segment_start(self.log.oldest_segment()?.unwrap_or(0)))
+    }
+
     /// Open (or create) a standalone log in `dir` with no saved progress: it
     /// is read whole. For benchmarks and tools; a database opens its WAL from
     /// its metadata. Returns the log and its tail.
+    #[doc(hidden)]
     pub fn open_standalone(dir: &Path, segment_size: u32) -> Result<(Self, u64)> {
         let (wal, report) = Self::open(dir, segment_size, OpenFrom { cut: None, furthest: 0 })?;
         Ok((wal, report.tail))
@@ -489,7 +475,7 @@ impl Wal {
     /// waiting first sleeps this long, so more writes join its round; a lone
     /// writer never waits. Returns `true` if this caller led a round (issued
     /// an fsync). A failed fsync poisons the log: every writer in that round,
-    /// and every later one, gets [`WalError::Poisoned`].
+    /// and every later one, gets the stopped error ([`WalError::poisoned`]).
     pub fn commit(&self, end: u64, delay: Duration) -> Result<bool> {
         Ok(self.log.commit(end, delay)?)
     }
@@ -551,7 +537,8 @@ impl Wal {
         Ok(self.log.segments()?)
     }
 
-    /// Segment ids covering `[start, end)` whose files are **absent**.
+    /// Segment ids from `start`'s segment through `end`'s, inclusive, whose
+    /// files are **absent**.
     ///
     /// A scan below the oldest segment skips the reclaimed ones (they are
     /// retired, below the cut), which is right for recovery but means any
@@ -572,12 +559,10 @@ impl Wal {
     /// body to `extract`. The one loop every scan uses.
     fn walk<T>(&self, start: u64, end: u64, mut extract: impl FnMut(u64, &[u8]) -> Result<T>) -> Result<Vec<T>> {
         let mut out = Vec::new();
-        self.log
-            .for_each(start, end, |at, body| -> std::result::Result<(), Scan> {
-                out.push(extract(at, body).map_err(Scan)?);
-                Ok(())
-            })
-            .map_err(|Scan(e)| e)?;
+        self.log.for_each(start, end, |at, body| -> Result<()> {
+            out.push(extract(at, body)?);
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -662,13 +647,21 @@ impl Wal {
     pub(crate) fn fail_next_sync(&self) {
         self.log.fail_next_sync();
     }
+
+    /// Test hook: make every fsync take at least `delay`.
+    #[cfg(test)]
+    pub(crate) fn set_fsync_delay(&self, delay: Duration) {
+        self.log.set_fsync_delay(delay);
+    }
 }
 
 /// An entry at `at` that passed its CRC but does not decode: the CRC says
 /// these are the bytes written, so this is corruption (or a layout change
 /// without a version bump), never a torn tail.
 fn undecodable(at: u64, e: WalError) -> WalError {
-    WalError::Corruption(format!("the entry at {at:#x} passes its CRC but does not decode: {e}"))
+    WalError::Log(LogError::Corruption(format!(
+        "the entry at {at:#x} passes its CRC but does not decode: {e}"
+    )))
 }
 
 #[cfg(test)]
@@ -733,14 +726,17 @@ mod tests {
             last_sequence: 41,
         };
 
-        let file_bytes = metadata.to_file_bytes()?;
+        let file_bytes = metadata.to_file_bytes();
         let restored = WalMetadata::from_file_bytes(&file_bytes)?;
 
-        assert_eq!(metadata.head, restored.head);
-        assert_eq!(metadata.tail, restored.tail);
-        assert_eq!(metadata.cut, restored.cut);
-        assert_eq!(metadata.safe, restored.safe);
-        assert_eq!(metadata.last_sequence, restored.last_sequence);
+        // The progress and the counters are saved; the head and the tail are
+        // not (open derives them from the log).
+        assert_eq!((restored.cut, &restored.safe), (metadata.cut, &metadata.safe));
+        assert_eq!(
+            (restored.total_gc_runs, restored.total_bytes_reclaimed, restored.last_sequence),
+            (2, 256, 41)
+        );
+        assert_eq!((restored.head, restored.tail), (segment_start(0), segment_start(0)));
 
         let mut damaged = file_bytes.clone();
         *damaged.last_mut().unwrap() ^= 1;
@@ -841,9 +837,12 @@ mod tests {
         // Not an entry, but a well-formed frame.
         let (_, end) = wal.log.append(&[b"not an rkyv entry"], |_, _| {})?;
         wal.commit(end, Duration::ZERO)?;
-        assert!(matches!(wal.scan_entries(segment_start(0), end), Err(WalError::Corruption(_))));
+        assert!(matches!(
+            wal.scan_entries(segment_start(0), end),
+            Err(WalError::Log(LogError::Corruption(_)))
+        ));
         drop(wal);
-        assert!(matches!(open(dir.path(), 512), Err(WalError::Corruption(_))));
+        assert!(matches!(open(dir.path(), 512), Err(WalError::Log(LogError::Corruption(_)))));
         Ok(())
     }
 
@@ -903,7 +902,7 @@ mod tests {
         bytes[..SEGMENT_HEADER_LEN as usize].copy_from_slice(&segmented_log::header_bytes(&crate::db::vector_index_wal::FORMAT, 0));
         std::fs::write(&seg0, bytes)?;
         match open(dir.path(), 512) {
-            Err(WalError::Corruption(why)) => assert!(why.contains("main WAL"), "{why}"),
+            Err(WalError::Log(LogError::Corruption(why))) => assert!(why.contains("main WAL"), "{why}"),
             other => panic!("expected corruption, got {:?}", other.map(|_| ())),
         }
         Ok(())
@@ -916,7 +915,10 @@ mod tests {
         let (wal, _) = open(dir.path(), 512)?;
         let mut tail = wal.tail();
         let big = WalEntry::new_upsert(b"k".to_vec(), vec![0u8; 1024]);
-        assert!(matches!(wal.append_entry(&big, &mut tail), Err(WalError::RecordTooLarge { .. })));
+        assert!(matches!(
+            wal.append_entry(&big, &mut tail),
+            Err(WalError::Log(LogError::RecordTooLarge { .. }))
+        ));
         assert_eq!(tail, segment_start(0));
         Ok(())
     }

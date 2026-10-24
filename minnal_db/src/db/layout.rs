@@ -41,6 +41,24 @@ pub(crate) fn namespace_data_dir(db_path: &Path, name: &str) -> PathBuf {
     db_path.join(format!("{NAMESPACE_DIR_PREFIX}{name}"))
 }
 
+/// Every namespace data directory under `db_path` (`ns_*`), whether or not
+/// the registry still lists it.
+pub(crate) fn namespace_data_dirs(db_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    let entries = match std::fs::read_dir(db_path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(NAMESPACE_DIR_PREFIX) && entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 /// The index subtree root: `{db_path}/index`.
 pub(crate) fn index_root(db_path: &Path) -> PathBuf {
     db_path.join(INDEX_DIR)

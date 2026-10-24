@@ -225,7 +225,8 @@ index_checkpoint_interval_ms = 1750
 # ---------------------------------------------------------------------------
 [wal]
 
-# Size of each new WAL segment file in bytes. Default: 64 MiB; at most 4 GiB.
+# Size of each new WAL segment file in bytes. Default: 64 MiB; at least
+# 64 KiB and at most 4 GiB (out of range fails startup).
 # A record must fit in one segment, so this also bounds the largest write.
 #
 # Can change between restarts: existing segments keep the size they were

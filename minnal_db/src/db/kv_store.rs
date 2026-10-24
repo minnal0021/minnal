@@ -230,6 +230,12 @@ struct BucketGCResult {
 type BatchReadWithRetries = (Vec<Option<Vec<u8>>>, Vec<usize>);
 
 impl KVStore {
+    /// Whether the namespace whose data directory is `base_path` holds any L1
+    /// data, without opening it (see `LSMTree::has_level1_data`).
+    pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
+        crate::store::lsm::lsm_tree::LSMTree::has_level1_data(&base_path.join("lsm"))
+    }
+
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
     /// See `DbConfig::verify_checksums_on_read`.
     pub fn set_verify_checksums_on_read(&self, verify: bool) {

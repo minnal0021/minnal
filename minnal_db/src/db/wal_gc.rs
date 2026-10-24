@@ -49,13 +49,19 @@ impl Database {
     /// The main WAL's state for operators: bounds, cut, saved per-namespace
     /// progress, and each segment on disk.
     pub fn wal_stats(&self) -> WalStats {
+        // Read before the metadata, so the durable tail shown is never past
+        // the tail shown (both only grow).
+        let durable_tail = self.wal.durable_tail();
         let m = self.wal_metadata.read().clone();
         let name = |ns: u32| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned);
         let cut_segment = self.wal.segment_of(m.cut);
         let segments = self
             .wal
             .segments()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                warn!("[WAL] could not list the WAL's segment files for its stats: {e}");
+                Vec::new()
+            })
             .into_iter()
             .map(|(id, bytes)| WalSegmentState {
                 segment_id: id,
@@ -73,7 +79,7 @@ impl Database {
         WalStats {
             head: LogPosition::of(m.head),
             tail: LogPosition::of(m.tail),
-            durable_tail: LogPosition::of(self.wal.durable_tail()),
+            durable_tail: LogPosition::of(durable_tail),
             cut: LogPosition::of(m.cut),
             pending_bytes: self.wal.bytes_between(m.cut, m.tail),
             segment_size: self.wal.segment_size(),

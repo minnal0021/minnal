@@ -145,16 +145,17 @@ fn the_commit_delay_never_slows_a_lone_writer() {
     assert!(started.elapsed() < Duration::from_secs(1), "a lone writer waited for the commit delay");
 }
 
-/// On the real disk (the repository's `target/`), not a RAM-backed `/tmp`:
-/// there an fsync costs nothing, so how many writers share a round depends on
-/// lock timing, not on what the delay buys.
+/// Every fsync is made to cost 500 µs, as on a real disk: on a RAM-backed
+/// `/tmp` an fsync costs nothing, and how many writers share a round would
+/// depend on lock timing rather than on what the delay buys.
 #[test]
 fn the_commit_delay_groups_concurrent_writers_into_larger_rounds() {
     fn rounds_for(delay_us: u64) -> u64 {
-        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
+        let dir = TempDir::new().unwrap();
         let mut config = create_db_config();
         config.sync_config = config.sync_config.with_commit_delay_us(delay_us);
         let db = Database::open(dir.path(), config).unwrap();
+        db.wal.set_fsync_delay(Duration::from_micros(500));
         let ns = db.create_namespace("ns").unwrap();
         let before = db.metrics_snapshot().wal_commit_rounds;
         std::thread::scope(|s| {
@@ -299,12 +300,12 @@ fn a_segment_filled_to_its_last_byte_is_durable_when_left() {
     assert_eq!(image.get_ns(ns_image, b"next").unwrap(), Some(b"n".to_vec()));
 }
 
-/// The saved metadata never records a tail beyond what is fsynced. If it did,
-/// a power loss would leave the saved tail past the log's real end, the next
-/// open would append after a hole, and the following recovery would read the
-/// hole as the end of the segment and skip the acknowledged writes after it.
+/// A metadata save while a write waits for its fsync, then a power loss that
+/// takes the write: the reopened log finds its tail from the log itself (the
+/// metadata saves none), so a write after the reopen lands where the next
+/// open reads it, and survives a second power loss.
 #[test]
-fn the_saved_tail_never_passes_the_durable_tail() {
+fn a_write_after_losing_an_unsynced_tail_survives_the_next_power_loss() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
     let ns = db.create_namespace("ns").unwrap();
@@ -317,13 +318,6 @@ fn the_saved_tail_never_passes_the_durable_tail() {
     };
     wait_for("the writer to reach its commit", || db.wal.frozen_writers() == 1);
     db.flush_wal_metadata_internal().unwrap();
-    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(wal_metadata_path(dir.path())).unwrap()).unwrap();
-    assert!(
-        saved.tail <= db.wal.durable_tail(),
-        "saved tail {} passed the durable tail {}",
-        saved.tail,
-        db.wal.durable_tail()
-    );
 
     // End to end: lose the unsynced bytes, write after reopening, crash again.
     let image_dir = TempDir::new().unwrap();

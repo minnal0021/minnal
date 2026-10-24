@@ -125,7 +125,7 @@
 //! the bytes written.
 
 use crate::db::metrics::Metrics;
-use crate::db::segmented_log::{self, LogError, LogFormat, OpenFrom, SegmentedLog, segment_of};
+use crate::db::segmented_log::{self, LogError, LogFormat, Progress, ProgressFile, SegmentedLog, segment_of};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -151,62 +151,31 @@ const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
 /// The `value_len` of a delete record, which has no value bytes.
 const DELETE_VALUE_LEN: u32 = u32::MAX;
 
-/// The progress marker file, in the log's directory.
+/// The progress marker file, in the log's directory: the shared progress file
+/// format (`segmented_log::ProgressFile`) with magic `MVIC` and no extra bytes.
 const RETIRED_CUT_FILE: &str = "retired_cut";
-/// Marker layout: magic, version, cut (u64), count (u32), then `count` ×
-/// (namespace u32, safe offset u64), then crc32 of everything before it.
-const RETIRED_CUT_MAGIC: [u8; 4] = *b"MVIC";
-const RETIRED_CUT_VERSION: u32 = 2;
-const RETIRED_CUT_HEADER_LEN: usize = 4 + 4 + 8 + 4;
-const RETIRED_CUT_ENTRY_LEN: usize = 4 + 8;
+const MARKER: ProgressFile = ProgressFile { magic: *b"MVIC" };
 
-/// What the progress marker records.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Progress {
-    /// Records below this are retired; GC deletes segments wholly below it.
-    cut: u64,
-    /// Namespaces whose `safe_offset` is above the cut, sorted by namespace.
-    safe: Vec<(u32, u64)>,
+/// Errors from the vector index WAL: the shared log's errors, naming this log.
+/// Its own damage (a body or the progress marker that does not decode) is
+/// `LogError::Corruption` too.
+#[derive(Error, Debug)]
+pub enum VectorIndexWalError {
+    /// From the segmented log or this log's own files.
+    #[error("vector index WAL: {0}")]
+    Log(#[from] LogError),
 }
 
-impl Progress {
-    /// Where replay starts for `ns`.
-    fn replay_from(&self, ns: u32) -> u64 {
-        self.safe.binary_search_by_key(&ns, |(n, _)| *n).map_or(self.cut, |i| self.safe[i].1)
+impl From<std::io::Error> for VectorIndexWalError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Log(LogError::Io(e))
     }
 }
 
-/// Errors from the vector index WAL.
-#[derive(Error, Debug)]
-pub enum VectorIndexWalError {
-    /// An I/O error reading or writing the log.
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    /// The log is damaged somewhere other than its torn tail.
-    #[error("vector index WAL corrupt: {0}")]
-    Corruption(String),
-    /// A record too large for one segment. Nothing was written.
-    #[error("vector index WAL record of {len} bytes does not fit a segment (at most {max})")]
-    RecordTooLarge {
-        /// The record's framed length.
-        len: u64,
-        /// The largest framed record a segment holds.
-        max: u64,
-    },
-    /// An earlier fsync failed; the log refuses appends and syncs until the
-    /// database is reopened (see the module docs).
-    #[error("vector index WAL stopped after a failed fsync ({0}); reopen the database to recover")]
-    Poisoned(String),
-}
-
-impl From<LogError> for VectorIndexWalError {
-    fn from(e: LogError) -> Self {
-        match e {
-            LogError::Io(e) => Self::Io(e),
-            LogError::Corruption(why) => Self::Corruption(why),
-            LogError::RecordTooLarge { len, max } => Self::RecordTooLarge { len, max },
-            LogError::Poisoned(why) => Self::Poisoned(why),
-        }
+impl VectorIndexWalError {
+    /// Damage to the log or its marker.
+    fn corruption(why: String) -> Self {
+        Self::Log(LogError::Corruption(why))
     }
 }
 
@@ -231,7 +200,7 @@ fn frame_len_of(key: &[u8], value: Option<&[u8]>) -> u64 {
 /// Decodes a body whose CRC has passed. A layout that does not add up is
 /// corruption, not a torn write: the CRC says these are the bytes written.
 fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
-    let bad = || VectorIndexWalError::Corruption(format!("record at {at:#x} passes its CRC but does not decode"));
+    let bad = || VectorIndexWalError::corruption(format!("record at {at:#x} passes its CRC but does not decode"));
     if body.len() < BODY_FIXED_LEN {
         return Err(bad());
     }
@@ -418,55 +387,12 @@ struct PendingFlush {
 }
 
 fn read_progress(dir: &Path) -> Result<Option<Progress>> {
-    let bytes = match std::fs::read(dir.join(RETIRED_CUT_FILE)) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let bad = |why: &str| VectorIndexWalError::Corruption(format!("the retired-cut marker is damaged: {why}"));
-    if bytes.len() < RETIRED_CUT_HEADER_LEN + 4 || bytes[0..4] != RETIRED_CUT_MAGIC {
-        return Err(bad("no header"));
-    }
-    let (body, crc) = bytes.split_at(bytes.len() - 4);
-    if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
-        return Err(bad("CRC mismatch"));
-    }
-    let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    if version != RETIRED_CUT_VERSION {
-        return Err(bad(&format!("version {version}, expected {RETIRED_CUT_VERSION}")));
-    }
-    let cut = u64::from_le_bytes(body[8..16].try_into().unwrap());
-    let count = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
-    if body.len() != RETIRED_CUT_HEADER_LEN + count * RETIRED_CUT_ENTRY_LEN {
-        return Err(bad("length does not match its entry count"));
-    }
-    let safe = body[RETIRED_CUT_HEADER_LEN..]
-        .as_chunks::<RETIRED_CUT_ENTRY_LEN>()
-        .0
-        .iter()
-        .map(|e| {
-            (
-                u32::from_le_bytes(e[0..4].try_into().unwrap()),
-                u64::from_le_bytes(e[4..12].try_into().unwrap()),
-            )
-        })
-        .collect();
-    Ok(Some(Progress { cut, safe }))
+    Ok(MARKER.read(&dir.join(RETIRED_CUT_FILE))?.map(|(p, _)| p))
 }
 
+#[cfg(test)]
 fn progress_bytes(p: &Progress) -> Vec<u8> {
-    let mut b = Vec::with_capacity(RETIRED_CUT_HEADER_LEN + p.safe.len() * RETIRED_CUT_ENTRY_LEN + 4);
-    b.extend_from_slice(&RETIRED_CUT_MAGIC);
-    b.extend_from_slice(&RETIRED_CUT_VERSION.to_le_bytes());
-    b.extend_from_slice(&p.cut.to_le_bytes());
-    b.extend_from_slice(&(p.safe.len() as u32).to_le_bytes());
-    for (ns, safe) in &p.safe {
-        b.extend_from_slice(&ns.to_le_bytes());
-        b.extend_from_slice(&safe.to_le_bytes());
-    }
-    let crc = crc32fast::hash(&b);
-    b.extend_from_slice(&crc.to_le_bytes());
-    b
+    MARKER.encode(p, &[])
 }
 
 impl VectorIndexWal {
@@ -478,19 +404,9 @@ impl VectorIndexWal {
     /// tail), decoding every record at or above the cut for the highest seq
     /// and for who holds the cut.
     pub(crate) fn open(dir: &Path, segment_size: u32, metrics: Arc<Metrics>) -> Result<(Self, OpenReport)> {
+        // Checked on read: a safe offset below the cut is corruption.
         let marker = if dir.exists() { read_progress(dir)? } else { None };
-        if let Some(p) = &marker
-            && let Some((ns, safe)) = p.safe.iter().find(|(_, s)| *s < p.cut)
-        {
-            return Err(VectorIndexWalError::Corruption(format!(
-                "namespace {ns}'s safe offset {:?} is below the cut",
-                VectorIndexWalPosition::of(*safe)
-            )));
-        }
         let cut = marker.as_ref().map_or(0, |p| p.cut);
-        let furthest = marker
-            .as_ref()
-            .map_or(0, |p| p.safe.iter().map(|(_, s)| *s).chain([p.cut]).max().unwrap_or(0));
 
         let mut last_seq = 0u64;
         // Each namespace's last record end, to rebuild who holds the cut.
@@ -499,10 +415,7 @@ impl VectorIndexWal {
             dir,
             &FORMAT,
             segment_size,
-            OpenFrom {
-                cut: marker.as_ref().map(|p| p.cut),
-                furthest,
-            },
+            Progress::open_from(marker.as_ref()),
             |at, body| -> Result<()> {
                 let r = decode_body(body, at)?;
                 last_seq = last_seq.max(r.seq);
@@ -646,12 +559,11 @@ impl VectorIndexWal {
         start: u64,
         mut f: impl FnMut(u64, RecordRef<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        self.log
-            .for_each(start, self.log.tail(), |at, body| -> std::result::Result<(), Wrapped<E>> {
-                let record = decode_body(body, at).map_err(|e| Wrapped(E::from(e)))?;
-                f(at, record).map_err(Wrapped)
-            })
-            .map_err(|Wrapped(e)| e)
+        let lift = |e: LogError| E::from(VectorIndexWalError::from(e));
+        self.log.for_each_with(start, self.log.tail(), lift, |at, body| {
+            let record = decode_body(body, at).map_err(E::from)?;
+            f(at, record)
+        })
     }
 
     /// Position of the next append.
@@ -869,9 +781,9 @@ impl VectorIndexWal {
         if self.fail_next_marker_write.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("injected marker write failure").into());
         }
-        crate::support::write_atomic_durable(&self.dir().join(RETIRED_CUT_FILE), &progress_bytes(&next)).map_err(|e| {
+        MARKER.write(&self.dir().join(RETIRED_CUT_FILE), &next, &[]).map_err(|e| {
             log::error!("[vector index WAL] could not write the progress marker: {e}");
-            VectorIndexWalError::Io(e)
+            VectorIndexWalError::from(e)
         })?;
         self.retired_cut.store(next.cut, Ordering::Release);
         r.written = next;
@@ -976,16 +888,6 @@ impl VectorIndexWal {
     }
 }
 
-/// An error of a [`VectorIndexWal::for_each_from`] caller, carried through
-/// the segmented log's reader.
-struct Wrapped<E>(E);
-
-impl<E: From<VectorIndexWalError>> From<LogError> for Wrapped<E> {
-    fn from(e: LogError) -> Self {
-        Wrapped(E::from(VectorIndexWalError::from(e)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,7 +961,7 @@ mod tests {
 
     fn corruption(r: Result<(VectorIndexWal, OpenReport)>) -> String {
         match r {
-            Err(VectorIndexWalError::Corruption(m)) => m,
+            Err(VectorIndexWalError::Log(LogError::Corruption(m))) => m,
             Err(e) => panic!("expected corruption, got {e}"),
             Ok(_) => panic!("expected corruption, the open succeeded"),
         }
@@ -1305,7 +1207,7 @@ mod tests {
         let fits = vec![0u8; (max - u64::from(FRAME_HEADER_LEN) - BODY_FIXED_LEN as u64) as usize];
         let too_big = vec![0u8; fits.len() + 1];
         match wal.append(0, b"", &too_big, 9) {
-            Err(VectorIndexWalError::RecordTooLarge { len, max: m }) => assert_eq!((len, m), (max + 1, max)),
+            Err(VectorIndexWalError::Log(LogError::RecordTooLarge { len, max: m })) => assert_eq!((len, m), (max + 1, max)),
             other => panic!("expected RecordTooLarge, got {other:?}"),
         }
         assert_eq!((wal.tail(), wal.segments().unwrap()), (tail, segs));
@@ -1831,10 +1733,13 @@ mod tests {
         let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
         applied(&wal, 1, 1);
         wal.fail_next_sync();
-        assert!(matches!(wal.sync(), Err(VectorIndexWalError::Poisoned(_))));
-        assert!(matches!(wal.append(1, b"k", b"v", 9), Err(VectorIndexWalError::Poisoned(_))));
+        assert!(matches!(wal.sync(), Err(VectorIndexWalError::Log(LogError::Poisoned(_)))));
+        assert!(matches!(
+            wal.append(1, b"k", b"v", 9),
+            Err(VectorIndexWalError::Log(LogError::Poisoned(_)))
+        ));
         assert!(
-            matches!(wal.sync(), Err(VectorIndexWalError::Poisoned(_))),
+            matches!(wal.sync(), Err(VectorIndexWalError::Log(LogError::Poisoned(_)))),
             "a later sync must not succeed"
         );
         assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_some());
@@ -1937,7 +1842,7 @@ mod tests {
             wal.log.rounds.freeze(false);
             for sync in syncs {
                 assert!(
-                    matches!(sync.join().unwrap(), Err(VectorIndexWalError::Poisoned(_))),
+                    matches!(sync.join().unwrap(), Err(VectorIndexWalError::Log(LogError::Poisoned(_)))),
                     "a waiting sync succeeded"
                 );
             }
