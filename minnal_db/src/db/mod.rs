@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod namespace;
 pub mod namespace_index;
 pub(crate) mod query;
+pub(crate) mod segment_prep;
 pub mod stats;
 pub mod toml_config;
 pub(crate) mod ttl_worker;

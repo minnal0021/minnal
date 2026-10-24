@@ -1350,12 +1350,12 @@ wholly below the **retired cut**. Each namespace's replay starts at its own
 
 | Field | Meaning |
 |-------|---------|
-| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first |
+| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first. A segment is created at its full size (64 MiB), so `bytes` is that size whatever it holds |
 | `segment_count`, `disk_bytes` | Number of segment files and their total size |
 | `tail` | Where the next record goes |
 | `durable_tail` | Everything below it is fsynced |
 | `retired_cut` | Records below it are retired |
-| `unretired_bytes` | Bytes at or above the retired cut (segment headers excluded): what a restart would replay |
+| `unretired_bytes` | Bytes of records at or above the retired cut (segment headers excluded): what a restart would replay |
 | `last_sequence` | Highest write sequence of a record appended since the server started, or found then at or above the retired cut (0 if none) |
 | `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them (sealing the memtable even when it is empty), which releases them |
 | `stopped` | `null` normally. After a failed fsync of the log, the error: the log then refuses appends and syncs until the server restarts, and vector indexing stops (documents stay queued) |
@@ -1364,9 +1364,9 @@ On a database whose vector worker has written nothing:
 
 ```json
 {
-  "segments": [{"segment_id": 0, "bytes": 16}],
+  "segments": [{"segment_id": 0, "bytes": 67108864}],
   "segment_count": 1,
-  "disk_bytes": 16,
+  "disk_bytes": 67108864,
   "tail": {"segment_id": 0, "byte": 16},
   "durable_tail": {"segment_id": 0, "byte": 16},
   "retired_cut": {"segment_id": 0, "byte": 0},

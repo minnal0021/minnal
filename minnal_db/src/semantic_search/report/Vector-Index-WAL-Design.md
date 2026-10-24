@@ -222,18 +222,26 @@ no-WAL flush tick does not need to flush them.
 
 ## 4. Record and file format
 
-- **Segments.** `vector_index_wal/{segment id}.log`, each up to a fixed size (64 MiB),
-  appended in order. A new segment's directory entry is fsynced before anything
-  in it is relied on.
+- **Segments.** `vector_index_wal/{segment id}.log`, each a fixed size (64 MiB),
+  appended in order. A segment is created at its full size, and from the
+  log's second segment on it is zero-filled ahead in the background (as
+  `{segment id}.log.prep`, renamed into place when the log reaches it), so a
+  sync commits no new file size or block allocation. A new segment's header
+  and directory entry are fsynced before anything in it is relied on.
 - **Header** per segment: magic, format version, segment id.
+- **End of a segment's records.** A full segment is sealed with an end marker:
+  a length of `0xFFFF_FFFF`, which no record can have. A length of 0 is
+  unwritten space: the records end there.
 - **Record:** length, CRC32 of the body, then the body: namespace id (u32), seq
   (u64), key length and key, value length and value. A **delete** has value
   length `u32::MAX` and no value bytes; no put can be that long, since a record
   must fit a segment. Replay applies a delete with its seq.
 - **Torn tail.** A record whose length runs past the end, or whose CRC fails, is
-  the end of the log; everything after it in that segment is ignored. Only the
-  last segment may end this way; a bad record in an earlier segment fails the
-  open, as a corrupt main WAL does.
+  the end of the log, as is unwritten space. Open zeroes everything after the
+  end in that segment before any append, so records a power loss kept beyond
+  a lost one can never follow new records. Only the last segment may end this
+  way; a bad record, or unwritten space before the end marker, in an earlier
+  segment fails the open, as a corrupt main WAL does.
 
 The format is versioned so a later change can be rejected rather than misread.
 
@@ -428,8 +436,9 @@ no meta.
 | recovery, after its flush and marker | replayed records in L0 and retired | not replayed again; later compactions cannot bring a deleted key back |
 
 Power loss differs from a process kill: unsynced appends vanish. The crash
-simulation (`AsyncDb::crash`) must model that by truncating the vector index WAL to its
-last `sync`, or the tests cannot see a missing fsync. (The same blind spot hid
+simulation (`AsyncDb::crash`) must model that by cutting each segment of the
+vector index WAL back to what an fsync actually covered, or the tests cannot
+see a missing fsync. (The same blind spot hid
 no-WAL writes until 2026-10-11.)
 
 **Mutation checks** — each must make a test fail, or the test is not guarding

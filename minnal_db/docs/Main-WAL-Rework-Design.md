@@ -1152,7 +1152,7 @@ tests); a failed round's fsync fails every sync waiting on it and poisons the
 log (`a_failed_fsync_stops_the_log_until_it_is_reopened`, plus a concurrent
 variant); every main-WAL test still passes on the shared type.
 
-**Not covered here:** preallocating the vector index WAL's segments and
+**Not covered here** (done in §18): preallocating the vector index WAL's segments and
 zeroing (rather than truncating) its torn tail. Its segments have a header,
 end markers and an open-time rule that tells a torn tail from corruption by
 which segment a bad frame is in; preallocation changes what the zeros past
@@ -1195,4 +1195,139 @@ segments, 2 MiB segments): 0.743 ms at 128 B, 0.726 ms at 2 KiB, 0.748 ms at
 blocks are allocated, and the log reads back whole),
 `a_leftover_prepared_segment_is_removed_at_open`; the power-loss stress, whose
 4 KiB segments switch to prepared ones constantly, and the kill harness pass.
+
+
+## 18. The vector index WAL's segments are preallocated too
+
+**Why.** After §16 the two logs still differ in how a segment sits on disk.
+The main WAL's segments are created at full size and, from the second on,
+zero-filled ahead (§15, §17), so a sync commits neither a new file size nor a
+block allocation. The vector index WAL's segments grow with each record, so
+every sync after a batch pays both, about 2.3 ms against 0.7 ms (§15's
+table). Its crash tests also cut the log at the log's own durable tail rather
+than at the bytes an fsync actually covered, which the main WAL's model does
+(§13), so a missing fsync there — the kind the main WAL's stress found on a
+segment switch — would go unseen.
+
+What stood in the way is one format detail. A sealed segment ends with an end
+marker whose length field is **0**, and open tells a sealed segment from the
+last one by that marker. In a preallocated segment every byte past the last
+record is 0 too, so the active segment would read as sealed.
+
+**Format.** The end marker becomes a length of `0xFFFF_FFFF`, a length no
+record can have (a record must fit a segment, and segments are at most 4 GiB
+less a header). A length of 0 now only means *unwritten space*: the records of
+this segment end here. The segment format version goes from 1 to 2;
+greenfield, so a version-1 log fails the open (no conversion).
+
+**Segments.**
+
+- A new segment is created at its full size: header written, file sized to
+  the segment size (sparse), fsynced, directory fsynced — as today, plus the
+  size.
+- Once the active segment is half full, the next one is zero-filled in the
+  background under `{id:010}.log.prep`, with its header, and fsynced; rotation
+  renames it into place and fsyncs the directory, waiting for it if
+  unfinished, or creates the segment sparse if there is none. This is §17's
+  mechanism, moved into one small shared type (`db/segment_prep.rs`) that both
+  logs use, as §16 did for commit rounds. Open deletes leftover `.prep` files;
+  the `.prep` name keeps a half-written file from looking like the next
+  segment.
+
+**Open.** A walk over one segment ends one of three ways: at **unwritten
+space** (a 0 length, or the end of the file), at the **end marker**, or at a
+**bad frame** (one that runs past the end of the file, or fails its CRC).
+
+| Segment | Unwritten space | End marker | Bad frame |
+|---|---|---|---|
+| Last | The tail | A crash after sealing: start the next segment | A torn tail: the tail |
+| Any earlier one | Corruption: not sealed (one exception below) | Fine | Corruption |
+
+- **Zeros past the tail.** In the last segment, every byte from the tail to
+  the end of the file is zeroed (the file shrunk to the tail and grown back,
+  as the main WAL does at open, §5.2 and §15), then fsynced, before any append. A
+  power loss can keep some pages past the tail and lose others, so a complete
+  record can sit beyond a zeroed one; new records written over the gap could
+  end exactly where it starts, and the next open would read it as part of the
+  log. Zeroing it removes that. A torn tail is handled the same way, instead
+  of truncating the file. The rest of that segment is then sparse, as the
+  main WAL's active segment is after an open (§17); the next one is prepared
+  as usual.
+- **A cut past a sealed segment's end.** When open finds a progress marker
+  naming positions past the durable tail (a power loss took records whose
+  memtable was already flushed), it seals the segment there and starts the
+  next, so new records land above every named position. A later open may then
+  start reading that sealed segment at a cut beyond its end marker, in
+  unwritten space. That is the exception above: unwritten space right where
+  the walk starts, in a segment whose end marker is below that start (checked
+  by walking the segment from its header), is fine. With growing files this
+  was "the cut is past the end of the file"; preallocated, the file always
+  reaches past the cut.
+- **A segment cut short in creation.** A last segment whose header is all
+  zeros (or that is shorter than a header) was being created when the power
+  went: its header is fsynced before any record goes in, so it holds none,
+  and it is created again. Any other bad header is corruption.
+- `torn_bytes_dropped` reports the bad frame's own length (capped at the file
+  end), not the rest of the file.
+
+**Sizes reported.** A segment's file size is now its full size, so the admin
+statistics' `unretired_bytes` (what a restart would replay) is counted from
+each segment's end marker — remembered from open and from each rotation —
+and the tail, not from file sizes. Each segment's `bytes` stays its file size.
+
+**Power-loss model.** As the main WAL's (§13): the log records, per segment,
+how far records and end markers have been written and how much of that an
+fsync covered — taken when the fsync is issued, not from the log's durable
+tail. The power-loss image and `lose_unsynced` cut each segment this process
+wrote back to what an fsync covered, keeping its size. A test-only check in
+`sync` asserts that every byte below the sync's end is covered: every earlier
+segment up to its end marker, and the active one up to the end.
+
+**Tests.**
+
+- Unit: a preallocated segment reopens with the same tail; a sealed segment
+  is told from the last one; unwritten space in an earlier segment is
+  corruption; the cut-past-end-marker case reopens and replays; a segment
+  with a zeroed header is created again; the next segment is prepared and
+  installed (its blocks allocated), and a leftover `.prep` is removed; a
+  version-1 segment fails the open.
+- Concurrent power-loss stress at the log level: writers append fixed-size
+  records (so a record laid over a gap ends exactly at an old record's start)
+  and sync from several threads, on small segments, and the power fails at a
+  random moment, with each 4 KiB page past the fsynced bytes kept or lost at
+  random. Reopen; every synced record is there; append and sync more; fail the
+  power again with nothing unsynced; reopen and check the log is exactly the
+  surviving records, then the new ones — nothing from before the first power
+  loss reappears after them.
+- The existing crash tests (prefix rule, maintenance journal, worker) on the
+  new model.
+- Mutations, each shown to fail a test, then reverted (results below).
+
+**Unchanged.** Batching (callers sync per batch, §16), positions, the record
+layout, retirement and the progress marker, replay.
+
+**Measured** (one caller appending a batch of 8 records of 1 KiB, then
+syncing, 1,500 batches on the benchmark NVMe, past the log's first segment):
+2.31 ms per batch with growing segments, 0.73 ms with prepared ones. The
+vector worker and partition maintenance sync once per batch, so this is the
+cost each of their batches waits for.
+
+**Tests and mutations.** The unit tests above, the log-level stress
+(`every_synced_record_survives_random_power_losses`, 12 rounds; the ignored
+`…_many_…` variant, 300 rounds), the main WAL's power-loss stress, long
+stress and kill harness, and the vector worker and partition maintenance
+crash tests all pass. Each mutation failed at least one test:
+
+| Mutation | Caught by |
+|---|---|
+| No zeroing past the tail at open | `records_past_a_lost_one_never_rejoin_the_log`, `a_torn_tail_is_dropped_and_later_appends_read_back`, and the long stress (an old record read after the new ones) |
+| No fsync when leaving a segment | the `covered` check in `sync`: `a_power_loss_keeps_exactly_what_an_fsync_covered`, `concurrent_appends_and_syncs_lose_nothing`, the stress, `the_next_segment_is_prepared_ahead_and_installed` |
+| End marker back to 0 | every test that seals a segment (an earlier segment reads as unsealed) |
+| No cut-past-end-marker exception | `a_marker_past_the_durable_tail_starts_a_new_segment` |
+| A prepared segment without its header | every test that rotates (the installed segment fails its header check) |
+
+"The prepared file installed before it is fsynced" was dropped from the
+list: a sync's `fdatasync` writes the prepared file's header out with the
+records, so the power-loss model cannot tell it apart, and the header check
+above covers what matters.
 

@@ -115,10 +115,17 @@
 //!
 //! ```text
 //! [header 16B: magic "MVIW" | format_version u32 | segment_id u64]
-//! [frame] [frame] ... [end marker: u32 0, sealed segments only]
+//! [frame] [frame] ... [end marker: u32 0xFFFF_FFFF, sealed segments only]
+//! [zeros to the end of the file: unwritten space]
 //! frame: [len u32][crc32(body) u32][body]
 //! body:  [ns_id u32][seq u64][key_len u32][key][value_len u32][value]
 //! ```
+//!
+//! Segments are created at their full size, and from a log's second segment
+//! on they are zero-filled ahead (`db/segment_prep.rs`), so a sync commits no
+//! new file size or block allocation. A length of 0 is therefore unwritten
+//! space — the segment's records end there — and the end marker is a length no
+//! record can have.
 //!
 //! A delete is a body whose `value_len` is `u32::MAX` and that has no value
 //! bytes (no put can be that long: a record must fit a segment).
@@ -137,17 +144,23 @@
 //! # Torn tail and corruption
 //!
 //! Only the last segment can hold bytes that were never synced: leaving a
-//! segment syncs it first. So a frame that runs past the end, or whose CRC
-//! fails, in the **last** segment is a torn tail: [`open`](VectorIndexWal::open)
-//! truncates the file there, so stale bytes can never be read as records once
-//! new appends land behind them. The same in an **earlier** segment at or
-//! above the retired cut, a gap in the segment ids, or a bad header fails the
-//! open. Records below the cut are retired and never read again, so `open`
-//! does not read them: it walks the log from the cut (and the whole last
-//! segment, to find the tail).
+//! segment syncs it first. So in the **last** segment, unwritten space, or a
+//! frame that runs past the end or fails its CRC (a torn tail), is the tail:
+//! [`open`](VectorIndexWal::open) zeroes every byte from there to the end of
+//! the file before any append. A power loss can keep some pages past the tail
+//! and lose others, so a whole record can sit beyond the gap; new records laid
+//! over the gap could end exactly where it starts, and a later open would read
+//! it as part of the log. In an **earlier** segment at or above the retired
+//! cut, a bad frame or unwritten space before the end marker, a gap in the
+//! segment ids, or a bad header fails the open — except unwritten space right
+//! where reading starts, in a segment whose end marker lies below that start:
+//! a cut past a sealed segment's end (see `open`). Records below the cut are
+//! retired and never read again, so `open` does not read them: it walks the log
+//! from the cut (and the whole last segment, to find the tail).
 
 use crate::db::commit_rounds::CommitRounds;
 use crate::db::metrics::Metrics;
+use crate::db::segment_prep::{self, SegmentPrep};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -166,12 +179,15 @@ pub(crate) const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
 pub(crate) const MIN_SEGMENT_SIZE: u32 = 64;
 
 const SEGMENT_MAGIC: [u8; 4] = *b"MVIW";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 /// Bytes of the segment header; the first record starts here.
 pub(crate) const SEGMENT_HEADER_LEN: u32 = 16;
 /// `len` and `crc32` before each body.
 const FRAME_HEADER_LEN: u32 = 8;
-/// The end marker of a sealed segment: a zero `len`.
+/// The end marker of a sealed segment: this `len`, which no record can have (a
+/// record must fit a segment). A `len` of 0 is unwritten space.
+const END_MARKER: u32 = u32::MAX;
+/// Bytes of the end marker.
 const END_MARKER_LEN: u32 = 4;
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
 const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
@@ -369,7 +385,9 @@ pub(crate) struct OpenReport {
     pub tail: u64,
     /// Highest seq of any record in the log (0 if none).
     pub last_seq: u64,
-    /// Bytes of a torn tail truncated from the last segment.
+    /// The torn frame's length (capped at the end of its segment) when open
+    /// found a torn tail, or the bytes of a last segment's unfinished header;
+    /// 0 otherwise.
     pub torn_bytes_dropped: u64,
 }
 
@@ -405,6 +423,21 @@ pub(crate) struct VectorIndexWal {
     opened_progress: Progress,
     /// The database's engine-wide counters.
     metrics: Arc<Metrics>,
+    /// The next segment, zero-filled ahead (`db/segment_prep.rs`).
+    prep: SegmentPrep,
+    /// Where each sealed segment at or above the cut ends (its end marker), for
+    /// the stats: a segment's file is its full size whatever it holds.
+    sealed_ends: Mutex<BTreeMap<u64, u32>>,
+    /// Test hook for the power-loss model: per segment, how far records and
+    /// end markers have been written, and how much of that an fsync issued by
+    /// this process covered; and the first segment this process could write
+    /// (every earlier one survived a reopen, so it is durable).
+    #[cfg(test)]
+    written: Mutex<BTreeMap<u64, u32>>,
+    #[cfg(test)]
+    synced: Mutex<BTreeMap<u64, u32>>,
+    #[cfg(test)]
+    first_open_segment: u64,
     /// Test-only fault: the next `sync` fails.
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
@@ -450,12 +483,14 @@ struct Active {
 /// How a walk over one segment ended.
 #[derive(Debug, PartialEq, Eq)]
 enum WalkEnd {
-    /// Reached the limit on a frame boundary.
-    Clean { pos: u32 },
+    /// Reached unwritten space at `pos`: a zero length, or the limit, on a
+    /// frame boundary.
+    Unwritten { pos: u32 },
     /// Found the end marker at `pos`.
     Sealed { pos: u32 },
-    /// Found a frame that is incomplete or fails its CRC at `pos`.
-    Torn { pos: u32, reason: String },
+    /// Found a frame that is incomplete or fails its CRC at `pos`; it claims
+    /// `bytes` (at most the bytes left).
+    Torn { pos: u32, bytes: u32, reason: String },
 }
 
 fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {
@@ -516,12 +551,31 @@ fn check_header(file: &File, segment_id: u64) -> Result<()> {
     Ok(())
 }
 
-/// Creates segment `segment_id` with its header, durable (contents and name)
-/// before it returns, so a record in it always has a header behind it.
-fn create_segment(dir: &Path, segment_id: u64) -> Result<File> {
+/// Whether a segment's header is all zeros: a segment whose creation a power
+/// loss cut short (its header is fsynced before any record goes in).
+fn header_is_blank(file: &File) -> Result<bool> {
+    let mut h = [0u8; SEGMENT_HEADER_LEN as usize];
+    file.read_exact_at(&mut h, 0)?;
+    Ok(h.iter().all(|&b| b == 0))
+}
+
+/// Where segment `segment_id` is zero-filled before it is needed.
+fn prep_path(dir: &Path, segment_id: u64) -> PathBuf {
+    dir.join(format!("{segment_id:010}.log.prep"))
+}
+
+fn check_segment_id(segment_id: u64) -> Result<()> {
     if segment_id > u64::from(u32::MAX) {
         return Err(VectorIndexWalError::Corruption("segment ids exhausted".to_owned()));
     }
+    Ok(())
+}
+
+/// Creates segment `segment_id` with its header, at its full `size` (sparse),
+/// durable (contents, size and name) before it returns, so a record in it
+/// always has a header behind it and a sync never commits a new size.
+fn create_segment(dir: &Path, segment_id: u64, size: u32) -> Result<File> {
+    check_segment_id(segment_id)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -529,9 +583,22 @@ fn create_segment(dir: &Path, segment_id: u64) -> Result<File> {
         .truncate(true)
         .open(segment_path(dir, segment_id))?;
     file.write_all_at(&header_bytes(segment_id), 0)?;
+    file.set_len(u64::from(size))?;
     file.sync_all()?;
     sync_dir(dir)?;
     Ok(file)
+}
+
+/// The end of a sealed segment's records, its end marker, when that lies at or
+/// below `from`; `None` otherwise. For a walk of a sealed segment that found
+/// unwritten space right where it started: fine when the cut it started at is
+/// past the segment's end marker (see `open`).
+fn sealed_at_or_below(file: &File, segment_id: u64, from: u32, len: u32, buf: &mut Vec<u8>) -> Result<Option<u32>> {
+    let limit = from.saturating_add(END_MARKER_LEN).min(len);
+    match walk_segment(file, segment_id, SEGMENT_HEADER_LEN, limit, buf, |_, _| Ok::<(), VectorIndexWalError>(()))? {
+        WalkEnd::Sealed { pos } if pos <= from => Ok(Some(pos)),
+        _ => Ok(None),
+    }
 }
 
 /// A record's frame; `value` `None` encodes a delete.
@@ -601,12 +668,13 @@ fn walk_segment<E: From<VectorIndexWalError>>(
     let mut pos = start;
     loop {
         if pos >= limit {
-            return Ok(WalkEnd::Clean { pos });
+            return Ok(WalkEnd::Unwritten { pos });
         }
         let left = limit - pos;
         if left < END_MARKER_LEN {
             return Ok(WalkEnd::Torn {
                 pos,
+                bytes: left,
                 reason: format!("{left} bytes where a frame length belongs"),
             });
         }
@@ -614,11 +682,15 @@ fn walk_segment<E: From<VectorIndexWalError>>(
         file.read_exact_at(&mut len_buf, u64::from(pos)).map_err(io)?;
         let len = u32::from_le_bytes(len_buf);
         if len == 0 {
+            return Ok(WalkEnd::Unwritten { pos });
+        }
+        if len == END_MARKER {
             return Ok(WalkEnd::Sealed { pos });
         }
         if left < FRAME_HEADER_LEN || len > left - FRAME_HEADER_LEN {
             return Ok(WalkEnd::Torn {
                 pos,
+                bytes: left,
                 reason: format!("frame length {len} runs past the end ({left} bytes left)"),
             });
         }
@@ -629,6 +701,7 @@ fn walk_segment<E: From<VectorIndexWalError>>(
         if crc32fast::hash(buf) != u32::from_le_bytes(crc_buf) {
             return Ok(WalkEnd::Torn {
                 pos,
+                bytes: FRAME_HEADER_LEN + len,
                 reason: "CRC mismatch".to_owned(),
             });
         }
@@ -696,16 +769,29 @@ fn file_len(file: &File) -> Result<u32> {
     u32::try_from(len).map_err(|_| VectorIndexWalError::Corruption(format!("segment of {len} bytes")))
 }
 
+/// Zero every byte of the last segment from the tail `pos` to the end of its
+/// file (`len` bytes): shrink the file to the tail, then size it back, to at
+/// least `segment_size`. So nothing past the tail can be read as a record once
+/// new records land behind it (see *Torn tail and corruption*). The caller
+/// fsyncs.
+fn zero_past(file: &File, pos: u32, len: u32, segment_size: u32) -> Result<()> {
+    if pos < len {
+        file.set_len(u64::from(pos))?;
+    }
+    file.set_len(u64::from(len.max(segment_size)))?;
+    Ok(())
+}
+
 impl VectorIndexWal {
     /// Opens the log in `dir`, creating it if absent, and finds its tail.
     ///
     /// Validates the segments at or above the retired cut and reads their
     /// records (for the highest seq, and who holds the cut); segments wholly
     /// below the cut are retired and only checked to exist. A torn tail in the
-    /// last segment is truncated away; any other damage fails the open. A last
-    /// segment that was sealed but has no successor (a crash mid-rotation)
-    /// gets one. The last segment is fsynced before returning, so everything
-    /// below the tail is durable.
+    /// last segment is dropped and everything past the tail zeroed; any other
+    /// damage fails the open. A last segment that was sealed but has no
+    /// successor (a crash mid-rotation) gets one. The last segment is fsynced
+    /// before returning, so everything below the tail is durable.
     pub(crate) fn open(dir: &Path, segment_size: u32, metrics: Arc<Metrics>) -> Result<(Self, OpenReport)> {
         let segment_size = segment_size.max(MIN_SEGMENT_SIZE);
         if !dir.exists() {
@@ -715,6 +801,8 @@ impl VectorIndexWal {
             }
         }
 
+        // Segments a previous run left half-prepared are not part of the log.
+        segment_prep::remove_leftovers(dir, "");
         let ids = list_segments(dir)?;
         if let Some(w) = ids.windows(2).find(|w| w[1] != w[0] + 1) {
             return Err(VectorIndexWalError::Corruption(format!(
@@ -773,6 +861,8 @@ impl VectorIndexWal {
             Some((&last, sealed)) => (sealed, Some(last)),
             None => (&[][..], None),
         };
+        // Where each segment at or above the cut ends, for the stats.
+        let mut sealed_ends = BTreeMap::new();
         for &id in sealed {
             let file = File::open(segment_path(dir, id))?;
             let len = file_len(&file)?;
@@ -785,17 +875,26 @@ impl VectorIndexWal {
                 std::cmp::Ordering::Equal => cut_byte.max(SEGMENT_HEADER_LEN),
                 std::cmp::Ordering::Greater => SEGMENT_HEADER_LEN,
             };
-            if from >= len {
-                // A cut past a sealed segment's end: a marker naming records a
-                // power loss took (an earlier open started a new segment).
-                continue;
-            }
             match walk_segment(&file, id, from, len, &mut buf, &mut note_seq)? {
-                WalkEnd::Sealed { .. } => {}
-                WalkEnd::Clean { .. } => {
-                    return Err(VectorIndexWalError::Corruption(format!("segment {id} is not sealed but is not the last")));
+                WalkEnd::Sealed { pos } => {
+                    sealed_ends.insert(id, pos);
                 }
-                WalkEnd::Torn { pos, reason } => {
+                WalkEnd::Unwritten { pos } => {
+                    // Unwritten space where reading starts, past the end
+                    // marker: the cut is past this segment's end (a marker
+                    // naming records a power loss took, after which an earlier
+                    // open started a new segment). Anywhere else, the segment
+                    // was never sealed.
+                    match sealed_at_or_below(&file, id, from, len, &mut buf)? {
+                        Some(end) if pos == from && from > SEGMENT_HEADER_LEN => {
+                            sealed_ends.insert(id, end);
+                        }
+                        _ => {
+                            return Err(VectorIndexWalError::Corruption(format!("segment {id} is not sealed but is not the last")));
+                        }
+                    }
+                }
+                WalkEnd::Torn { pos, reason, .. } => {
                     return Err(VectorIndexWalError::Corruption(format!(
                         "segment {id} (not the last) is damaged at byte {pos}: {reason}"
                     )));
@@ -807,33 +906,34 @@ impl VectorIndexWal {
         // find the tail.
         let mut torn_bytes_dropped = 0u64;
         let (mut segment_id, mut file, mut pos) = match last {
-            None => (0, create_segment(dir, 0)?, SEGMENT_HEADER_LEN),
+            None => (0, create_segment(dir, 0, segment_size)?, SEGMENT_HEADER_LEN),
             Some(id) => {
                 let file = OpenOptions::new().read(true).write(true).open(segment_path(dir, id))?;
                 let len = file_len(&file)?;
-                if len < SEGMENT_HEADER_LEN || (len == SEGMENT_HEADER_LEN && check_header(&file, id).is_err()) {
+                if len < SEGMENT_HEADER_LEN || header_is_blank(&file)? || (len == SEGMENT_HEADER_LEN && check_header(&file, id).is_err()) {
                     // A crash while creating the segment: its header was not yet
                     // durable, so no record can be in it.
-                    torn_bytes_dropped = u64::from(len);
+                    torn_bytes_dropped = u64::from(len.min(SEGMENT_HEADER_LEN));
                     drop(file);
-                    (id, create_segment(dir, id)?, SEGMENT_HEADER_LEN)
+                    (id, create_segment(dir, id, segment_size)?, SEGMENT_HEADER_LEN)
                 } else {
                     check_header(&file, id)?;
                     match walk_segment(&file, id, SEGMENT_HEADER_LEN, len, &mut buf, &mut note_seq)? {
-                        WalkEnd::Clean { pos } => (id, file, pos),
-                        WalkEnd::Torn { pos, reason } => {
-                            log::warn!(
-                                "[vector index WAL] truncating a torn tail: segment {id}, byte {pos}, {} bytes dropped ({reason})",
-                                len - pos
-                            );
-                            file.set_len(u64::from(pos))?;
-                            torn_bytes_dropped = u64::from(len - pos);
+                        WalkEnd::Unwritten { pos } => {
+                            zero_past(&file, pos, len, segment_size)?;
                             (id, file, pos)
                         }
-                        WalkEnd::Sealed { .. } => {
+                        WalkEnd::Torn { pos, bytes, reason } => {
+                            log::warn!("[vector index WAL] dropping a torn tail: segment {id}, byte {pos}, a {bytes}-byte frame ({reason})");
+                            zero_past(&file, pos, len, segment_size)?;
+                            torn_bytes_dropped = u64::from(bytes);
+                            (id, file, pos)
+                        }
+                        WalkEnd::Sealed { pos } => {
                             // A crash after sealing, before the next segment existed.
+                            sealed_ends.insert(id, pos);
                             drop(file);
-                            (id + 1, create_segment(dir, id + 1)?, SEGMENT_HEADER_LEN)
+                            (id + 1, create_segment(dir, id + 1, segment_size)?, SEGMENT_HEADER_LEN)
                         }
                     }
                 }
@@ -860,10 +960,11 @@ impl VectorIndexWal {
                     VectorIndexWalPosition::of(position(segment_id, pos)),
                     segment_id + 1
                 );
-                file.write_all_at(&0u32.to_le_bytes(), u64::from(pos))?;
+                file.write_all_at(&END_MARKER.to_le_bytes(), u64::from(pos))?;
                 file.sync_all()?;
+                sealed_ends.insert(segment_id, pos);
                 segment_id += 1;
-                file = create_segment(dir, segment_id)?;
+                file = create_segment(dir, segment_id, segment_size)?;
                 pos = SEGMENT_HEADER_LEN;
             }
         }
@@ -905,6 +1006,15 @@ impl VectorIndexWal {
             retired_cut: AtomicU64::new(cut),
             opened_progress,
             metrics,
+            prep: SegmentPrep::new("vector index WAL"),
+            sealed_ends: Mutex::new(sealed_ends),
+            #[cfg(test)]
+            written: Mutex::new(BTreeMap::from([(segment_id, pos)])),
+            // `open` fsynced the active segment up to the tail.
+            #[cfg(test)]
+            synced: Mutex::new(BTreeMap::from([(segment_id, pos)])),
+            #[cfg(test)]
+            first_open_segment: segment_id,
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -961,6 +1071,17 @@ impl VectorIndexWal {
         a.file.write_all_at(&frame, u64::from(a.pos))?;
         let start = position(a.segment_id, a.pos);
         a.pos += frame_len;
+        #[cfg(test)]
+        self.note_written(a.segment_id, a.pos);
+        let next = a.segment_id + 1;
+        if u64::from(a.pos) * 2 >= u64::from(self.segment_size) && !self.prep.started(next) {
+            self.prep.start(
+                next,
+                prep_path(&self.dir, next),
+                u64::from(self.segment_size),
+                header_bytes(next).to_vec(),
+            );
+        }
         a.last_seq = a.last_seq.max(seq);
         let end = position(a.segment_id, a.pos);
         // Registered under the append lock, and before the tail is published:
@@ -989,13 +1110,29 @@ impl VectorIndexWal {
     /// Seals the active segment and starts the next. The sealed segment is
     /// fsynced first, so only the last segment can ever hold unsynced bytes.
     fn rotate(&self, a: &mut Active) -> Result<()> {
-        a.file.write_all_at(&0u32.to_le_bytes(), u64::from(a.pos))?;
-        if let Err(e) = a.file.sync_data() {
+        a.file.write_all_at(&END_MARKER.to_le_bytes(), u64::from(a.pos))?;
+        #[cfg(test)]
+        self.note_written(a.segment_id, a.pos + END_MARKER_LEN);
+        if let Err(e) = self.sync_file(&a.file, a.segment_id) {
             return Err(self.poison(e));
         }
         self.rounds.advance(position(a.segment_id, a.pos));
+        self.sealed_ends.lock().insert(a.segment_id, a.pos);
         let next = a.segment_id + 1;
-        a.file = Arc::new(create_segment(&self.dir, next)?);
+        check_segment_id(next)?;
+        let path = segment_path(&self.dir, next);
+        let file = if self.prep.install(next, &path)? {
+            OpenOptions::new().read(true).write(true).open(&path)?
+        } else {
+            create_segment(&self.dir, next, self.segment_size)?
+        };
+        // Its header is durable either way.
+        #[cfg(test)]
+        {
+            self.written.lock().insert(next, SEGMENT_HEADER_LEN);
+            self.synced.lock().insert(next, SEGMENT_HEADER_LEN);
+        }
+        a.file = Arc::new(file);
         a.segment_id = next;
         a.pos = SEGMENT_HEADER_LEN;
         self.tail.store(position(next, SEGMENT_HEADER_LEN), Ordering::Release);
@@ -1018,16 +1155,40 @@ impl VectorIndexWal {
                 }
                 // Earlier segments were fsynced when they were sealed; the one
                 // at `tail` holds every append made before the snapshot.
-                let (file, tail) = {
+                let (file, segment_id, tail) = {
                     let a = self.active.lock();
-                    (Arc::clone(&a.file), position(a.segment_id, a.pos))
+                    (Arc::clone(&a.file), a.segment_id, position(a.segment_id, a.pos))
                 };
-                file.sync_data().map_err(|e| Self::stopping(e.to_string()))?;
+                self.sync_file(&file, segment_id).map_err(|e| Self::stopping(e.to_string()))?;
                 Metrics::bump(&self.metrics.vector_wal_fsyncs);
                 Ok(tail)
             })
-            .map(|_| ())
-            .map_err(VectorIndexWalError::Poisoned)
+            .map_err(VectorIndexWalError::Poisoned)?;
+        #[cfg(test)]
+        assert!(
+            self.covered(end),
+            "sync returned before an fsync covered {:?}",
+            VectorIndexWalPosition::of(end)
+        );
+        Ok(())
+    }
+
+    /// fsync segment `segment_id`'s `file`. The caller poisons the log on an
+    /// error.
+    fn sync_file(&self, file: &File, segment_id: u64) -> std::io::Result<()> {
+        // What this fsync covers, for the power-loss model: what was written
+        // before it starts (bytes written later may or may not be covered).
+        #[cfg(test)]
+        let covered = self.written.lock().get(&segment_id).copied().unwrap_or(0);
+        file.sync_data()?;
+        #[cfg(test)]
+        {
+            let mut synced = self.synced.lock();
+            let entry = synced.entry(segment_id).or_insert(0);
+            *entry = (*entry).max(covered);
+        }
+        let _ = segment_id;
+        Ok(())
     }
 
     /// Log that the log is stopping after a failed fsync; returns `why`.
@@ -1093,17 +1254,18 @@ impl VectorIndexWal {
             } else {
                 SEGMENT_HEADER_LEN
             };
-            let limit = if id == end_id { end_pos } else { file_len(&file)? };
-            if id != end_id && from >= limit {
-                // A start past a sealed segment's end: a marker naming records a
-                // power loss took (`open` started a new segment after them).
-                continue;
-            }
+            let len = file_len(&file)?;
+            let limit = if id == end_id { end_pos } else { len };
             let end = walk_segment(&file, id, from, limit, &mut buf, &mut f)?;
             match end {
-                WalkEnd::Clean { .. } if id == end_id => {}
+                WalkEnd::Unwritten { .. } if id == end_id => {}
                 WalkEnd::Sealed { .. } if id != end_id => {}
-                WalkEnd::Torn { pos, reason } => {
+                // A start past a sealed segment's end marker: a marker naming
+                // records a power loss took (`open` started a new segment
+                // after them).
+                WalkEnd::Unwritten { pos }
+                    if pos == from && from > SEGMENT_HEADER_LEN && sealed_at_or_below(&file, id, from, len, &mut buf)?.is_some() => {}
+                WalkEnd::Torn { pos, reason, .. } => {
                     return Err(VectorIndexWalError::Corruption(format!("segment {id} is damaged at byte {pos}: {reason}")).into());
                 }
                 other => {
@@ -1358,18 +1520,42 @@ impl VectorIndexWal {
         self.for_each_from(progress.cut, |at, r| if at >= progress.replay_from(r.ns_id) { f(r) } else { Ok(()) })
     }
 
-    /// Test-only: make the next `sync` fail (and so poison the log).
-    /// Test hook for the power-loss model: the active segment's file and how
-    /// many of its bytes are fsynced (its header always is: a segment's header
-    /// is fsynced before any record goes in).
     #[cfg(test)]
-    pub(crate) fn power_loss_extent(&self) -> (PathBuf, u64) {
-        let a = self.active.lock();
-        let (seg, byte) = split(self.durable_tail());
-        let durable = if seg == a.segment_id { byte } else { 0 };
-        (segment_path(&self.dir, a.segment_id), u64::from(durable.max(SEGMENT_HEADER_LEN)))
+    fn note_written(&self, segment_id: u64, end: u32) {
+        let mut written = self.written.lock();
+        let entry = written.entry(segment_id).or_insert(0);
+        *entry = (*entry).max(end);
     }
 
+    /// Test hook: whether fsyncs issued by this process (or the reopen) cover
+    /// every byte below `end`: each earlier segment up to its end marker, and
+    /// `end`'s own segment up to `end`.
+    #[cfg(test)]
+    pub(crate) fn covered(&self, end: u64) -> bool {
+        let (seg, byte) = split(end);
+        if seg < self.first_open_segment {
+            return true;
+        }
+        let written = self.written.lock();
+        let synced = self.synced.lock();
+        let synced_to = |s: u64| synced.get(&s).copied().unwrap_or(0);
+        (self.first_open_segment..seg).all(|s| synced_to(s) >= written.get(&s).copied().unwrap_or(0)) && synced_to(seg) >= byte
+    }
+
+    /// Test hook for the power-loss model: for every segment this process
+    /// could have written, its file and how many of its bytes an fsync
+    /// actually covered. Taken from the fsyncs issued, not from the durable
+    /// tail, so a missing fsync shows up as lost bytes.
+    #[cfg(test)]
+    pub(crate) fn power_loss_extents(&self) -> Vec<(PathBuf, u64)> {
+        let last = self.active.lock().segment_id;
+        let synced = self.synced.lock();
+        (self.first_open_segment..=last)
+            .map(|id| (segment_path(&self.dir, id), u64::from(synced.get(&id).copied().unwrap_or(0))))
+            .collect()
+    }
+
+    /// Test-only: make the next `sync` fail (and so poison the log).
     #[cfg(test)]
     pub(crate) fn fail_next_sync(&self) {
         self.fail_next_sync.store(true, Ordering::SeqCst);
@@ -1381,15 +1567,19 @@ impl VectorIndexWal {
         self.fail_next_marker_write.store(true, Ordering::SeqCst);
     }
 
-    /// Test-only: drop every byte appended since the last `sync`, as a power
-    /// loss would. `AsyncDb::crash` calls it, so a crash test can see a
-    /// missing `sync`.
+    /// Test-only: zero every byte no fsync covered, in each segment this
+    /// process wrote, keeping the files' sizes, as a power loss would.
+    /// `AsyncDb::crash` calls it, so a crash test can see a missing `sync`.
     #[cfg(test)]
     pub(crate) fn lose_unsynced(&self) {
-        let a = self.active.lock();
-        let (durable_id, durable_byte) = split(self.durable_tail());
-        let keep = if durable_id == a.segment_id { durable_byte } else { SEGMENT_HEADER_LEN };
-        a.file.set_len(u64::from(keep)).expect("truncate the active segment");
+        for (path, durable) in self.power_loss_extents() {
+            let file = OpenOptions::new().write(true).open(&path).expect("open a segment");
+            let len = file.metadata().expect("segment metadata").len();
+            if len > durable {
+                file.set_len(durable).expect("cut a segment");
+                file.set_len(len).expect("size a segment back");
+            }
+        }
     }
 
     /// Deletes every segment wholly below the retired cut, oldest first, then
@@ -1414,6 +1604,7 @@ impl VectorIndexWal {
             sync_dir(&self.dir)?;
             Metrics::add(&self.metrics.vector_wal_segments_deleted, segments);
         }
+        self.sealed_ends.lock().retain(|&id, _| id >= below);
         Ok((segments, bytes))
     }
 
@@ -1434,6 +1625,8 @@ impl VectorIndexWal {
             let a = self.active.lock();
             (position(a.segment_id, a.pos), a.last_seq)
         };
+        let (tail_id, tail_byte) = split(tail);
+        let sealed_ends = self.sealed_ends.lock().clone();
         let cut = self.retired_cut();
         let (cut_id, cut_byte) = split(cut);
         let segments: Vec<VectorIndexWalSegment> = self
@@ -1441,12 +1634,23 @@ impl VectorIndexWal {
             .into_iter()
             .map(|(segment_id, bytes)| VectorIndexWalSegment { segment_id, bytes })
             .collect();
+        // Counted from where each segment's records end, not its file size: a
+        // segment is created at its full size.
         let unretired_bytes = segments
             .iter()
-            .map(|s| match s.segment_id.cmp(&cut_id) {
-                std::cmp::Ordering::Less => 0,
-                std::cmp::Ordering::Equal => s.bytes.saturating_sub(u64::from(cut_byte.max(SEGMENT_HEADER_LEN))),
-                std::cmp::Ordering::Greater => s.bytes.saturating_sub(u64::from(SEGMENT_HEADER_LEN)),
+            .map(|s| {
+                let end = if s.segment_id == tail_id {
+                    tail_byte
+                } else {
+                    // Through the end marker.
+                    sealed_ends.get(&s.segment_id).map_or(SEGMENT_HEADER_LEN, |&e| e + END_MARKER_LEN)
+                };
+                let from = match s.segment_id.cmp(&cut_id) {
+                    std::cmp::Ordering::Less => return 0,
+                    std::cmp::Ordering::Equal => cut_byte.max(SEGMENT_HEADER_LEN),
+                    std::cmp::Ordering::Greater => SEGMENT_HEADER_LEN,
+                };
+                u64::from(end.saturating_sub(from))
             })
             .sum();
         Ok(VectorIndexWalStats {
@@ -1617,13 +1821,15 @@ mod tests {
         let appended = append_n(&wal, 20);
         let segs = wal.segments().unwrap();
         assert_eq!(segs.len(), 7);
-        for &(id, len) in &segs[..segs.len() - 1] {
-            assert_eq!(len, u64::from(SEGMENT_HEADER_LEN + 3 * FRAME + END_MARKER_LEN), "segment {id}");
+        for &(id, len) in &segs {
+            assert_eq!(len, 256, "segment {id} is created at its full size");
+        }
+        for &(id, _) in &segs[..segs.len() - 1] {
             let f = File::open(segment_path(dir.path(), id)).unwrap();
             check_header(&f, id).unwrap();
-            let mut m = [0xffu8; 4];
-            f.read_exact_at(&mut m, len - 4).unwrap();
-            assert_eq!(m, [0; 4], "segment {id} ends in the end marker");
+            let mut m = [0u8; 4];
+            f.read_exact_at(&mut m, u64::from(SEGMENT_HEADER_LEN + 3 * FRAME)).unwrap();
+            assert_eq!(m, END_MARKER.to_le_bytes(), "segment {id} ends in the end marker");
         }
         assert_eq!(split(appended[3].start), (1, SEGMENT_HEADER_LEN));
         assert_eq!(rows_from(&wal, 0), expected(&appended, 0..20));
@@ -1644,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_tail_is_truncated_and_later_appends_read_back() {
+    fn a_torn_tail_is_dropped_and_later_appends_read_back() {
         for cut in [2u64, u64::from(FRAME_HEADER_LEN) + 5, u64::from(FRAME) - 1] {
             let dir = TempDir::new().unwrap();
             let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
@@ -1701,13 +1907,15 @@ mod tests {
         let write_len = |at: u64| {
             let (seg, byte) = split(at);
             let f = OpenOptions::new().write(true).open(segment_path(dir.path(), seg)).unwrap();
-            f.write_all_at(&u32::MAX.to_le_bytes(), u64::from(byte)).unwrap();
+            // Not `u32::MAX`: that is the end marker.
+            f.write_all_at(&(u32::MAX - 1).to_le_bytes(), u64::from(byte)).unwrap();
         };
 
         write_len(appended[7].start);
         let (_, report) = reopen(dir.path(), 256).unwrap();
         assert_eq!(report.tail, appended[7].start);
-        assert_eq!(report.torn_bytes_dropped, u64::from(FRAME));
+        // The frame claims more than the segment holds: capped at its end.
+        assert_eq!(report.torn_bytes_dropped, 256 - u64::from(split(appended[7].start).1));
 
         write_len(appended[4].start);
         let msg = corruption(reopen(dir.path(), 256));
@@ -1876,7 +2084,7 @@ mod tests {
             torn_bytes_dropped: 0,
         };
         assert_eq!(report, empty);
-        assert_eq!(wal.segments().unwrap(), vec![(0, u64::from(SEGMENT_HEADER_LEN))]);
+        assert_eq!(wal.segments().unwrap(), vec![(0, u64::from(DEFAULT_SEGMENT_SIZE))]);
         assert_eq!(rows_from(&wal, 0), vec![]);
         drop(wal);
         std::fs::write(path.join("notes.txt"), b"not a segment").unwrap();
@@ -2024,8 +2232,8 @@ mod tests {
         seal_and_flush(&wal, 1, 0);
         assert_eq!(split(wal.retired_cut()).0, 2);
         assert!(wal.has_deletable_segments().unwrap());
-        let sealed = u64::from(SEGMENT_HEADER_LEN + 3 * FRAME + END_MARKER_LEN);
-        assert_eq!(wal.garbage_collect().unwrap(), (2, 2 * sealed));
+        // Segment files are their full size.
+        assert_eq!(wal.garbage_collect().unwrap(), (2, 2 * 256));
         assert_eq!(wal.segments().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), vec![2]);
         assert!(!wal.has_deletable_segments().unwrap());
         let s = metrics.snapshot();
@@ -2933,5 +3141,358 @@ mod tests {
             0,
             "a clean shutdown retires everything"
         );
+    }
+
+    // ── Preallocated segments (design note §18) ──────────────────────────
+
+    /// The bytes of segment `segment_id` from `from` to `to`.
+    fn bytes_of(dir: &Path, segment_id: u64, from: u64, to: u64) -> Vec<u8> {
+        let f = File::open(segment_path(dir, segment_id)).unwrap();
+        let mut b = vec![0u8; (to - from) as usize];
+        f.read_exact_at(&mut b, from).unwrap();
+        b
+    }
+
+    fn zero(dir: &Path, segment_id: u64, from: u64, to: u64) {
+        let f = OpenOptions::new().write(true).open(segment_path(dir, segment_id)).unwrap();
+        f.write_all_at(&vec![0u8; (to - from) as usize], from).unwrap();
+    }
+
+    /// The last segment's records end at unwritten space; a reopen finds the
+    /// same tail and the file keeps its full size.
+    #[test]
+    fn a_preallocated_segment_reopens_at_the_same_tail() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 4096);
+        let appended = append_n(&wal, 5);
+        wal.sync().unwrap();
+        let tail = wal.tail();
+        drop(wal);
+        let (wal, report) = reopen(dir.path(), 4096).unwrap();
+        assert_eq!((report.tail, report.torn_bytes_dropped), (tail, 0));
+        assert_eq!(rows_from(&wal, 0), expected(&appended, 0..5));
+        assert_eq!(wal.segments().unwrap(), vec![(0, 4096)]);
+    }
+
+    /// An earlier segment whose end marker is gone reads as unwritten space
+    /// before its end: it was never sealed, which only the last segment may be.
+    #[test]
+    fn unwritten_space_in_an_earlier_segment_is_corruption() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        append_n(&wal, 4); // segment 0 sealed with 3
+        drop(wal);
+        let marker = u64::from(SEGMENT_HEADER_LEN + 3 * FRAME);
+        zero(dir.path(), 0, marker, marker + 4);
+        let msg = corruption(reopen(dir.path(), 256));
+        assert!(msg.contains("segment 0 is not sealed"), "{msg}");
+    }
+
+    /// A last segment whose header is all zeros was being created when the
+    /// power went (its header is fsynced before any record goes in): it is
+    /// created again. Other bad headers stay corruption.
+    #[test]
+    fn a_last_segment_with_a_blank_header_is_created_again() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        let appended = append_n(&wal, 3);
+        wal.append(0, b"k", b"v", 99).unwrap(); // starts segment 1
+        drop(wal);
+        zero(dir.path(), 1, 0, 256);
+        let (wal, report) = reopen(dir.path(), 256).unwrap();
+        assert_eq!(report.tail, position(1, SEGMENT_HEADER_LEN));
+        assert_eq!(rows_from(&wal, 0), expected(&appended, 0..3));
+        let f = File::open(segment_path(dir.path(), 1)).unwrap();
+        check_header(&f, 1).unwrap();
+        drop(wal);
+
+        flip(dir.path(), 1, 2);
+        let msg = corruption(reopen(dir.path(), 256));
+        assert!(msg.contains("no vector index WAL header"), "{msg}");
+    }
+
+    /// A segment of the earlier format (end marker 0) fails the open: no
+    /// conversion.
+    #[test]
+    fn a_version_1_segment_fails_the_open() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        append_n(&wal, 2);
+        drop(wal);
+        let f = OpenOptions::new().write(true).open(segment_path(dir.path(), 0)).unwrap();
+        f.write_all_at(&1u32.to_le_bytes(), 4).unwrap();
+        let msg = corruption(reopen(dir.path(), 256));
+        assert!(msg.contains("format version 1, expected 2"), "{msg}");
+    }
+
+    /// Past half of the active segment the next one is zero-filled ahead,
+    /// with its header, under a `.prep` name; moving to it installs it with
+    /// its blocks written, and the log reads back whole.
+    #[test]
+    fn the_next_segment_is_prepared_ahead_and_installed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 64 * 1024);
+        let per_segment = u64::from((64 * 1024 - SEGMENT_HEADER_LEN - END_MARKER_LEN) / FRAME);
+        let mut appended = append_n(&wal, per_segment / 2 + 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !wal.prep.pending().is_some_and(|(id, done)| id == 1 && done) {
+            assert!(std::time::Instant::now() < deadline, "segment 1 was never prepared");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let prep = prep_path(dir.path(), 1);
+        assert!(prep.exists() && !segment_path(dir.path(), 1).exists());
+        let before = appended.len() as u64;
+        appended.extend((before..per_segment + 2).map(|i| wal.append((i % 3) as u32, &key(i), &value(i), i + 1).unwrap().appended()));
+        assert!(!prep.exists(), "the prepared file was moved into place");
+        let m = std::fs::metadata(segment_path(dir.path(), 1)).unwrap();
+        assert_eq!(m.len(), 64 * 1024);
+        assert!(m.blocks() * 512 >= 64 * 1024, "the installed segment's blocks are written");
+        wal.sync().unwrap();
+        drop(wal);
+        let (wal, _) = reopen(dir.path(), 64 * 1024).unwrap();
+        assert_eq!(rows_from(&wal, 0), expected(&appended, 0..per_segment + 2));
+    }
+
+    /// A segment a previous run left half-prepared is removed at open and
+    /// never read as part of the log.
+    #[test]
+    fn a_leftover_prepared_segment_is_removed_at_open() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        let appended = append_n(&wal, 2);
+        drop(wal);
+        let prep = prep_path(dir.path(), 1);
+        std::fs::write(&prep, header_bytes(1)).unwrap();
+        let (wal, report) = reopen(dir.path(), 256).unwrap();
+        assert!(!prep.exists());
+        assert_eq!(split(report.tail).0, 0);
+        assert_eq!(rows_from(&wal, 0), expected(&appended, 0..2));
+    }
+
+    /// A power loss kept records past one it lost. Open zeroes everything
+    /// past the tail, so a record later laid over the gap — ending exactly
+    /// where an old record starts, as same-size records do — is followed by
+    /// unwritten space, not by the old records.
+    #[test]
+    fn records_past_a_lost_one_never_rejoin_the_log() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 64 * 1024);
+        let appended = append_n(&wal, 40);
+        wal.sync().unwrap();
+        drop(wal);
+        let (lost_seg, lost) = split(appended[10].start);
+        zero(dir.path(), lost_seg, u64::from(lost), u64::from(split(appended[10].end).1));
+
+        let (wal, report) = reopen(dir.path(), 64 * 1024).unwrap();
+        assert_eq!(report.tail, appended[10].start);
+        let past = bytes_of(dir.path(), 0, u64::from(lost), 64 * 1024);
+        assert!(past.iter().all(|&b| b == 0), "open zeroes every byte past the tail");
+        let new = wal.append(0, &key(9_000), &value(9_000), 9_001).unwrap().appended();
+        assert_eq!(new.end, appended[11].start, "a same-size record ends where an old one started");
+        wal.sync().unwrap();
+        drop(wal);
+
+        let (wal, _) = reopen(dir.path(), 64 * 1024).unwrap();
+        let mut want = expected(&appended, 0..10);
+        want.push((new.start, 0, 9_001, key(9_000), Some(value(9_000))));
+        assert_eq!(rows_from(&wal, 0), want);
+    }
+
+    /// `lose_unsynced` and the power-loss image cut each segment at what an
+    /// fsync covered, not at the durable tail: an append that no sync covered
+    /// is gone, a synced one stays, and the file keeps its size.
+    #[test]
+    fn a_power_loss_keeps_exactly_what_an_fsync_covered() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), 256);
+        let appended = append_n(&wal, 4); // segment 0 sealed (fsynced) with 3
+        wal.sync().unwrap();
+        let lost = wal.append(1, &key(50), &value(50), 51).unwrap().appended();
+        assert!(!wal.covered(lost.end));
+        wal.lose_unsynced();
+        drop(wal);
+        let (wal, report) = reopen(dir.path(), 256).unwrap();
+        assert_eq!(report.tail, lost.start);
+        assert_eq!(rows_from(&wal, 0), expected(&appended, 0..4));
+        assert!(wal.segments().unwrap().iter().all(|&(_, len)| len == 256));
+    }
+
+    /// Writers append same-size records and sync from several threads, on
+    /// small segments; at a random moment the power fails, keeping or losing
+    /// each 4 KiB page that no fsync covered at random. Every synced record
+    /// survives and every record read is one that was appended there. Then
+    /// more records are appended and synced over the gap, the log is reopened
+    /// with nothing unsynced, and it must read as exactly the surviving
+    /// records and then the new ones: nothing from before the power loss comes
+    /// back after them.
+    fn vector_wal_power_loss_round(seed: u64) {
+        use std::sync::atomic::AtomicBool;
+        const WRITERS: usize = 6;
+        const SEGMENT: u32 = 16 * 1024;
+        const PAGE: u64 = 4096;
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+        }
+        // Same-size records: 9-byte keys, 300-byte values.
+        let rec_key = |s: u64| format!("k{s:08}").into_bytes();
+        let rec_value = |s: u64| vec![(s % 251) as u8; 300];
+
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), SEGMENT);
+        let appended: Mutex<BTreeMap<u64, (u32, u64)>> = Mutex::new(BTreeMap::new());
+        let synced: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let synced_at_loss: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let next_seq = AtomicU64::new(1);
+        let stop = AtomicBool::new(false);
+        let image = TempDir::new().unwrap();
+        let mut rng = Rng(seed);
+
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let (wal, appended, synced, next_seq, stop) = (&wal, &appended, &synced, &next_seq, &stop);
+                s.spawn(move || {
+                    let mut rng = Rng(seed ^ (w as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    while !stop.load(Ordering::SeqCst) {
+                        let mut mine = Vec::new();
+                        for _ in 0..1 + rng.below(12) {
+                            let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                            let at = wal.append(w as u32, &rec_key(seq), &rec_value(seq), seq).unwrap();
+                            appended.lock().insert(at.start, (w as u32, seq));
+                            mine.push(at.start);
+                        }
+                        wal.sync().unwrap();
+                        synced.lock().extend(mine);
+                    }
+                });
+            }
+
+            // If a check fails, release the writers so the scope can end.
+            struct Release<'a>(&'a AtomicBool, &'a VectorIndexWal);
+            impl Drop for Release<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                    self.1.rounds.freeze(false);
+                }
+            }
+            let _release = Release(&stop, &wal);
+
+            std::thread::sleep(std::time::Duration::from_millis(2 + rng.below(30)));
+            // Stop the world: every writer waits inside a sync, its records
+            // written but not yet covered.
+            wal.rounds.freeze(true);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while wal.rounds.frozen_callers() < WRITERS {
+                assert!(std::time::Instant::now() < deadline, "seed {seed}: the writers never stopped");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // What was synced when the power failed: writers stopped inside a
+            // sync finish it after the image is taken.
+            *synced_at_loss.lock() = synced.lock().clone();
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), image.path().join(entry.file_name())).unwrap();
+            }
+            for (path, durable) in wal.power_loss_extents() {
+                let copy = image.path().join(path.file_name().unwrap());
+                let f = OpenOptions::new().write(true).open(&copy).unwrap();
+                let len = f.metadata().unwrap().len();
+                let mut at = durable;
+                while at < len {
+                    let page_end = ((at / PAGE) + 1) * PAGE;
+                    let end = page_end.min(len);
+                    if rng.below(2) == 0 {
+                        f.write_all_at(&vec![0u8; (end - at) as usize], at).unwrap();
+                    }
+                    at = end;
+                }
+            }
+        });
+        drop(wal);
+
+        let appended = appended.into_inner();
+        let (wal, _) = reopen(image.path(), SEGMENT).unwrap();
+        let rows = rows_from(&wal, 0);
+        for (at, ns, seq, key, value) in &rows {
+            assert_eq!(
+                appended.get(at),
+                Some(&(*ns, *seq)),
+                "seed {seed}: a record at {at:#x} that was never appended there"
+            );
+            assert_eq!(
+                (key, value),
+                (&rec_key(*seq), &Some(rec_value(*seq))),
+                "seed {seed}: record {seq} damaged"
+            );
+        }
+        let read: HashSet<u64> = rows.iter().map(|r| r.0).collect();
+        for at in synced_at_loss.into_inner() {
+            assert!(read.contains(&at), "seed {seed}: the synced record at {at:#x} was lost");
+        }
+
+        // Over the gap: more records, synced; then a reopen with nothing
+        // unsynced reads the survivors, then exactly these.
+        let first = appended.values().map(|v| v.1).max().unwrap_or(0) + 1;
+        let mut want = rows;
+        for seq in first..first + 1 + rng.below(200) {
+            let at = wal.append(7, &rec_key(seq), &rec_value(seq), seq).unwrap().appended();
+            want.push((at.start, 7, seq, rec_key(seq), Some(rec_value(seq))));
+        }
+        wal.sync().unwrap();
+        drop(wal);
+        let (wal, _) = reopen(image.path(), SEGMENT).unwrap();
+        assert_eq!(rows_from(&wal, 0), want, "seed {seed}: the log after the power loss and new records");
+    }
+
+    #[test]
+    fn every_synced_record_survives_random_power_losses() {
+        for seed in 1..=12u64 {
+            vector_wal_power_loss_round(0xF00D_0000 + seed);
+        }
+    }
+
+    /// The long variant: `MINNAL_POWER_LOSS_SEEDS` rounds (default 300).
+    #[test]
+    #[ignore = "long; run explicitly with --ignored"]
+    fn every_synced_record_survives_many_random_power_losses() {
+        let rounds: u64 = std::env::var("MINNAL_POWER_LOSS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+        for seed in 1..=rounds {
+            vector_wal_power_loss_round(0xBEEF_0000 + seed);
+        }
+    }
+
+    /// Measurement, not a check: one caller appending a batch of 8 records of
+    /// 1 KiB, then syncing, on the real disk (the repository's `target/`).
+    /// Past the first segment, so the log is on prepared segments.
+    #[test]
+    #[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
+    fn measure_batch_sync_latency() {
+        const SEGMENT: u32 = 4 << 20;
+        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
+        let (wal, _) = open_at(dir.path(), SEGMENT);
+        let value = vec![7u8; 1024];
+        let mut seq = 0u64;
+        let mut batch = |wal: &VectorIndexWal| {
+            for _ in 0..8 {
+                seq += 1;
+                wal.append(1, format!("k{seq:09}").as_bytes(), &value, seq).unwrap();
+            }
+            wal.sync().unwrap();
+        };
+        while split(wal.tail.load(Ordering::Acquire)).0 < 2 {
+            batch(&wal);
+        }
+        let n = 1500u32;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            batch(&wal);
+        }
+        println!("vector WAL batch of 8 x 1 KiB + sync: {:?} each", started.elapsed() / n);
     }
 }

@@ -3413,7 +3413,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn power_loss_image(&self, to: &Path) -> std::io::Result<()> {
         let mut extents = self.wal.power_loss_extents();
-        extents.push(self.vector_index_wal.power_loss_extent());
+        extents.extend(self.vector_index_wal.power_loss_extents());
         for store in self.stores.read().values() {
             for log in store.value_log.bucket_logs() {
                 extents.push(log.power_loss_extent());

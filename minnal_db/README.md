@@ -413,9 +413,9 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 - **`merge` / `merge_no_wal`** — read a key, run a closure on its value, write the result back (or delete the key), all under the key's stripe. `merge` logs the result in the main WAL; `merge_no_wal` does not.
 - **Logged write** — `put_ns_logged` / `delete_ns_logged` (facade: `put_logged` / `delete_logged`): a write recorded in the vector index WAL instead of the main WAL, durable at the log's next sync.
 - **`LoggedWrite`** — the guard an append returns. While it is alive the record counts as *in flight* (appended, not yet in a memtable), so no seal can count it as covered.
-- **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker, and fsynced) and the next is started. Main-WAL segments are created at their full size, and from a database's second segment on they are zero-filled ahead, so an fsync never has to commit a new file size or block allocation.
+- **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker, and fsynced) and the next is started. Segments of both logs are created at their full size, and from a log's second segment on they are zero-filled ahead, so an fsync never has to commit a new file size or block allocation.
 - **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced. In the main WAL the saved metadata never records a tail beyond the durable tail.
-- **Torn tail** — a partly written last record after a crash, found by its length running past the data or its CRC not matching. Opening either log cuts it off there (the main WAL zeroes the rest of its preallocated segment; the vector index WAL truncates the file), so a later, shorter record cannot leave older valid-looking records behind it; only the last segment may have one.
+- **Torn tail** — a partly written last record after a crash, found by its length running past the data or its CRC not matching. Opening either log cuts it off there by zeroing the rest of the segment, so a later, shorter record cannot leave older valid-looking records behind it; only the last segment may have one.
 - **Ceiling** — when a namespace's memtable is sealed, how far into the vector index WAL its applied records reach: the tail, lowered to the oldest of its records still in flight.
 - **Safe offset** — per namespace, in either log: every one of its records below this position is in L0 files. Its replay starts here.
 - **Retired cut** — the lowest safe offset of any namespace that still has records above its own (capped by the oldest record still in flight). Records below it are retired; GC deletes segments that lie wholly below it. It is kept in the `retired_cut` marker file, written before the flush's L0 files are registered.
@@ -504,7 +504,8 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │                               #  prepared as wal.log.segNNNNNN.prep, zero-filled)
 │
 ├── vector_index_wal/           # The vector index WAL (semantic search only)
-│   ├── 0000000000.log          # Segments, 64 MiB each
+│   ├── 0000000000.log          # Segments, 64 MiB each, created at full size; the
+│   │                           #  next is prepared as NNNNNNNNNN.log.prep, zero-filled
 │   └── retired_cut             # Where replay starts, per namespace
 │
 ├── fail_logs/                  # Recovery fail-log files (one per recovery run)
