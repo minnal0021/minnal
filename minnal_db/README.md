@@ -283,7 +283,7 @@ The **`sequence` number** is what keeps recovery correct. It is allocated under 
 
 The WAL knows how far it is no longer needed through its **cut**: every entry below that offset is safely in an L0 or L1 SSTable on disk. Each namespace also has a **safe offset** — all of *its* entries below it are in SSTables — which can be ahead of the cut (the cut is the slowest namespace's). Both are kept in the WAL metadata file, saved by the flush that moves them, before the flush's L0 files become readable. Recovery replays each namespace's entries from its own safe offset (or the cut), and nothing below.
 
-Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Each is created at its full size (a sparse file, so it takes disk space only as it is written): an fsync on a file whose size does not change is about 3× cheaper than on one that grows with every write. Once a segment lies wholly below the cut, and every field index has checkpointed past it (field indexes rebuild themselves after a crash by replaying the WAL from their last checkpoint), the WAL garbage collector deletes the whole segment and advances the WAL head pointer past it, so a later startup scan never tries to open a file that is gone.
+Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Each is created at its full size (a sparse file, so it takes disk space only as it is written), so an fsync never has to commit a new file size. That makes an fsync after a small write about 3× cheaper (0.77 ms against 2.28 ms for a 128-byte write); a write that starts a new 4 KiB block still pays for allocating it (about 1.5 ms for 2 KiB writes, 2.3 ms for 8 KiB). Once a segment lies wholly below the cut, and every field index has checkpointed past it (field indexes rebuild themselves after a crash by replaying the WAL from their last checkpoint), the WAL garbage collector deletes the whole segment and advances the WAL head pointer past it, so a later startup scan never tries to open a file that is gone.
 
 #### How WAL storage evolves over time
 
@@ -340,7 +340,7 @@ sequenceDiagram
     G->>W: delete every segment wholly below the cut
 ```
 
-The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, an fsync of a preallocated WAL segment takes about 0.8 ms, so a single client makes at most about 1,200 WAL-backed writes per second (measured: 0.82 ms per 128-byte `put`); concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
+The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, a single client's small writes take about 0.8 ms each (measured: 0.82 ms per 128-byte `put`, about 1,200 a second), and larger ones up to about 2.3 ms, when each write starts a new disk block; concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 
 ### Vector index WAL
 
@@ -398,7 +398,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 ### WAL terms
 
 - **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and returns only once an fsync covers it.
-- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 0.8 ms for a preallocated WAL segment on the NVMe drive the benchmarks use, and about 2.3 ms for a file that grows with every write.
+- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here, on the NVMe drive the benchmarks use: about 2.3 ms when the fsync must also commit file metadata (a new file size, or a newly allocated block), about 0.7 ms when it need not. A preallocated WAL segment avoids the first; small writes mostly avoid the second.
 - **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write takes to append its entry (and take its seq). It is released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** — one fsync and the callers it releases, in either log (`db/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
@@ -766,7 +766,7 @@ These are ballpark figures; treat them as orders of magnitude rather than guaran
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values) | ~1,200 ops/s for one writer on an NVMe drive without power-loss protection (0.82 ms each, measured): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
+| `put` (small values) | ~1,200 ops/s for one writer on an NVMe drive without power-loss protection (0.82 ms each for 128-byte values, measured; about 1.6 ms for 2 KiB values): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
 | `delete` | ~1,200 ops/s for one writer — same fsync bound as `put` |
 | `merge` (small values) | ~1,200 ops/s for one writer — the read-modify-write and its per-key lock add ~0.5–0.7 µs, small next to the fsync it pays anyway |
 | `get` from memory | 1M–2.5M ops/s per thread |

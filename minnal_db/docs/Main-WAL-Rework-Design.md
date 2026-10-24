@@ -1091,10 +1091,24 @@ One writer is about 2.8× faster, since each of its writes waits for its own
 fsync. With 16 clients nothing changes: a commit round already covers about
 8 writes, and ingest is limited elsewhere.
 
-Open question: the criterion benchmark `write/put` still reports 2.32 ms per
-`put` with preallocation. It opens a fresh store for each batch, so it
-measures writes into new files; why that keeps the old cost is not yet
-understood. `benchmark.md` predates this change and needs a full refresh.
+**Found afterwards: sparse preallocation helps only small writes.** An fsync
+after a write that starts a new 4 KiB block must also commit that block's
+allocation, in a sparse file as in an `fallocate`d one; only a segment filled
+with zeros avoids it:
+
+| fsync after a write of | grows | sparse (`set_len`, built) | `fallocate` | zero-filled |
+|---|---|---|---|---|
+| 128 B | 2.28 ms | 0.77 ms | 0.77 ms | 0.73 ms |
+| 2 KiB | 2.28 ms | 1.50 ms | 1.51 ms | 0.71 ms |
+| 8 KiB | 2.29 ms | 2.36 ms | 2.31 ms | 0.71 ms |
+
+The steady-state `crud/put/2KiB` benchmark measures 1.57 ms, which matches.
+The criterion `write/put` benchmark (2.32 ms) is a different problem: criterion
+calls its `setup` once per iteration, and the setup opens a new database, so it
+times the first write into a brand-new database — new blocks every time. The
+same holds for `wal/db_put_with_wal`, the typed puts and the mixed workload.
+`benchmark.md` predates all of this and needs a refresh once the benchmarks
+measure the steady state.
 
 ## 16. The vector index WAL shares the commit rounds
 
