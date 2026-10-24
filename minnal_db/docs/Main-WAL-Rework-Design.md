@@ -15,6 +15,8 @@
 - **B. Checksummed frames.** Every record carries a CRC, and open truncates a
   torn tail.
 - **C. Group commit.** Concurrent writers share one fsync.
+  - **C1.** Commit rounds with no deliberate wait.
+  - **C2.** An optional commit delay, off by default, chosen by measurement.
 
 The guarantee a caller gets does not change: a `put`, `delete` or `merge`
 returns only once its WAL record is on stable storage. The vector index WAL,
@@ -572,8 +574,8 @@ commit(my_end):
 
 `commit` uses a `parking_lot::Mutex` and `Condvar` of its own, never the WAL
 lock, so writers keep appending while a round's fsync runs; the next round's
-leader picks all of them up. There is no deliberate wait to grow a round
-(RocksDB's choice; PostgreSQL's `commit_delay` is the opposite knob): a round
+leader picks all of them up. By default there is no deliberate wait to grow a
+round (RocksDB's choice; C2, §6.5, adds an optional one): a round
 starts as soon as the previous one ends, so a lone writer pays one fsync, as
 today, and under load each fsync covers everyone who wrote during the
 previous one.
@@ -645,7 +647,30 @@ frames already sit after the failed ones, so overwriting is no longer possible
 and poisoning is the only safe answer. (After change A, rounds and rotation
 are the only fsyncs of the log, so there is no other path to cover.)
 
-### 6.5 Metrics
+### 6.5 C2: an optional commit delay
+
+A leader can wait a moment before its fsync so that more writers join the
+round: PostgreSQL's `commit_delay`, and turbopuffer's one-second window. It
+trades each write's latency for fewer fsyncs, and it only pays when the fsync
+is expensive compared with the wait. minnal's clients also wait for each write
+before sending the next, so a long delay lowers throughput: with 16 clients and
+a 200 ms delay, at most 16 / 0.2 = 80 writes a second, and a document's three
+main-WAL writes in a row would each pay it.
+
+So the delay is a setting, `sync.commit_delay_us` (`SyncConfig`, next to
+`records_per_sync`), **default 0**:
+
+- A leader waits `commit_delay_us` before taking its target, then fsyncs.
+- It waits only if another writer is already waiting for a round (PostgreSQL's
+  `commit_siblings` idea, with a threshold of one), so a lone writer never pays
+  it.
+- The wait is bounded by the setting; no writer waits longer than one delay
+  plus two fsyncs.
+
+The value is chosen by the sweep in §10; the default changes only if a value
+other than 0 wins there.
+
+### 6.6 Metrics
 
 - Per namespace, `wal_fsyncs` becomes `wal_writes` (it counts writes, which
   is what the tests that use it mean).
@@ -737,6 +762,8 @@ What does not change:
 - A lone writer still costs one round per write.
 - An injected fsync failure in a round: every writer in it gets an error,
   none of their writes is readable, and later writes fail with `Poisoned`.
+- With `commit_delay_us` set, a lone writer still returns after one fsync
+  (no delay), and concurrent writers form larger rounds than with 0.
 
 **A crash that drops unsynced bytes.** The crash simulation today keeps
 everything written to the page cache, so it cannot tell a durable byte from a
@@ -777,6 +804,11 @@ against change C:
 - docs embedded a second during and after ingest;
 - a lone writer's latency (one client), to confirm it has not risen.
 
+C2's commit delay is swept on the same pair: `commit_delay_us` at 0, 1,000,
+2,000, 5,000, 20,000 and 200,000 (0 to 200 ms), recording writes a second,
+writes per round, ingest docs a second and p50/p99 for each. The default stays
+0 unless another value raises ingest without raising p99.
+
 Change A is measured on its own too (time writers spend waiting on the WAL
 lock during flushes, before and after), so its effect is not folded into C's.
 
@@ -796,8 +828,9 @@ Each step is built, tested and reviewed before the next.
 2. **Field-index checkpoints as events** (A2). Update the README's WAL GC and
    field-index sections.
 3. **Checksummed frames** (change B). Fix the README's format diagram.
-4. **Group commit** (change C), with the drop-unsynced crash helper and the
-   mutation checks. Update `minnal_db/README.md` (*Durability model*, *WAL
+4. **Group commit** (C1, then C2's setting at default 0), with the
+   drop-unsynced crash helper and the mutation checks; `config/sample.toml`
+   gains `commit_delay_us` under `[sync]`. Update `minnal_db/README.md` (*Durability model*, *WAL
    terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
    bench comments that describe per-write fsync.
 5. **Measure** (§10) on the settled snapshot, against the current main.
@@ -814,9 +847,6 @@ Each step is built, tested and reviewed before the next.
   lets the writes of one logical operation share an fsync when they are
   concurrent; a batch would make them atomic, which is a larger change to the
   engine's single-op model.
-- **A deliberate commit delay** (`commit_delay`, turbopuffer's one-second
-  window). Rounds form without one under load; a delay would only add latency
-  when the database is quiet.
 - **The vector index WAL's syncs.** It keeps its own fsyncs; it shares the
   drive, not the lock.
 
@@ -829,9 +859,11 @@ Each step is built, tested and reviewed before the next.
    and removed in the same calls that activate, deactivate and drop fields.
 3. `garbage_collect_wal` and the admin API report pending bytes (`tail - cut`)
    instead of entry counts. Greenfield: no compatibility fields.
-4. Group commit as in §6.1, with no deliberate wait.
+4. Group commit as in §6.1 (C1), plus an optional commit delay
+   `sync.commit_delay_us`, default 0, applied only when another writer is
+   waiting, its value chosen by the §10 sweep (C2).
 5. A failed fsync poisons the main WAL until reopen (§6.4), the same rule as the
    vector index WAL.
 6. Rename the per-namespace `wal_fsyncs` to `wal_writes` and add the two global
-   round counters (§6.5).
-7. Order: A1, A2, B, then C (§11).
+   round counters (§6.6).
+7. Order: A1, A2, B, C1, then C2 (§11).
