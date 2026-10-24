@@ -1,0 +1,599 @@
+# Main WAL rework: retire by cut, checksum frames, group commit — design note
+
+**Status:** design for review, 2026-10-24. Nothing here is built.
+**Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
+`delete_ns_locked`, its recovery and its GC). Three changes, built in order:
+
+- **A. Retire by cut.** The log records how far it is safe to skip as one
+  position in its metadata, instead of rewriting each entry's status in place.
+  The log becomes append-only.
+- **B. Checksummed frames.** Every record carries a CRC, and open truncates a
+  torn tail.
+- **C. Group commit.** Concurrent writers share one fsync.
+
+The guarantee a caller gets does not change: a `put`, `delete` or `merge`
+returns only once its WAL record is on stable storage. The vector index WAL,
+the no-WAL writes and the doc store's API are unchanged.
+
+Section 2 compares minnal's two logs with RocksDB, Milvus and turbopuffer; the
+three changes follow from that comparison.
+
+## Terms used here
+
+The engine-wide log terms (seq, key stripe lock, memtable, seal, flush,
+segment, tail, torn tail, poisoned, flush observer and the rest) are defined in
+`minnal_db/README.md` → *WAL terms*. The ones this note adds or leans on most:
+
+- **fsync** — the system call that waits until a file's written bytes are on
+  stable storage (`File::sync_data` here). On the benchmark NVMe drive one takes
+  about 2.3 ms, and the drive completes about 420 of them a second, shared by
+  every file on it.
+- **WAL lock** — `Database::wal_metadata`, the lock every main-WAL write takes.
+  It guards the log's **tail** (where the next record goes) and the in-memory
+  WAL metadata, and it makes seq order equal to append order.
+- **WAL metadata** — the small file `<db_path>/wal_metadata`, saved atomically
+  (write a copy, fsync, rename, fsync the directory). It records the log's head
+  and tail and, after change A, the cut.
+- **Status** (today) — each entry's Inserted or Persisted flag, stored inside
+  the entry. Marking an entry **Persisted** tells recovery to skip it.
+- **Safe offset** (per namespace) and **cut** — kept by `WalPersistObserver`
+  from the flush events. A namespace's safe offset is the WAL position below
+  which all its writes are in L0 files. The cut is the lowest safe offset of
+  the namespaces that still have unflushed writes, capped at the oldest write
+  that is appended but not yet applied (*in flight*). Every entry below the cut
+  is in an SSTable. In code it is `last_persisted_offset`.
+- **Written tail** — the end of the bytes handed to the kernel (`write_at`).
+  They are readable but can vanish in a power loss.
+- **Durable tail** — the end of the bytes an fsync has confirmed. Today the two
+  tails are equal whenever the WAL lock is free; with group commit the durable
+  tail can lag the written tail.
+- **Group commit** — several concurrent writers share one fsync. Each writer
+  still waits for an fsync that covers its own record before it returns, so no
+  write is acknowledged early. (Acknowledging first and fsyncing later is a
+  different thing, *asynchronous commit*; this note does not do that.)
+- **Commit round** — one fsync and the writers it releases. The writer that
+  issues it is the round's **leader**; the others are **followers**.
+- **Frame** — one record as stored in a segment: a length, then the body.
+- **CRC** — a 32-bit checksum of a frame's body (`crc32fast`, already used by
+  the vector index WAL and the WAL metadata file).
+- **Field-index replay watermark** — the oldest WAL segment some field index
+  still needs to replay after a crash (`index_replay_watermark_segment`). WAL GC
+  keeps segments from it on, up to `max_pinned_wal_segments`.
+
+## 1. The cost now
+
+Every main-WAL write does this, one writer at a time:
+
+```mermaid
+sequenceDiagram
+    participant W as Writer
+    participant S as Key stripe
+    participant L as WAL lock
+    participant F as Segment file
+    participant M as Memtable
+    W->>S: lock the key's stripe
+    W->>L: lock
+    W->>W: seq = next_seq++
+    W->>F: write_at(record)
+    W->>F: fsync (about 2.3 ms)
+    W->>L: begin_write(offset), unlock
+    W->>M: apply with seq
+    W->>S: unlock
+```
+
+The fsync is inside the WAL lock, so a second writer, in any namespace, waits
+for the first writer's fsync to finish before it can even write its bytes. The
+main WAL therefore manages one write per device flush, whatever the number of
+clients: 387–402 writes a second during the semantic-search ingest benchmark,
+with the drive about 92% busy (`Fewer-WAL-Fsyncs-Design.md`, §14).
+
+Retirement adds to it. When a memtable flush moves the cut forward,
+`Database::mark_persisted_range` reads every entry between the old and new cut,
+rewrites each one with status Persisted, fsyncs every segment it touched,
+updates per-segment persisted counts, and saves the WAL metadata file, the
+last two while holding the WAL lock. Every writer waits for that save's fsyncs.
+
+## 2. How other systems log, and where minnal stands
+
+### 2.1 RocksDB (embedded LSM, the closest relative)
+
+- **One log for the whole database**, shared by all column families (its
+  namespaces). A log file is deleted once every column family has flushed past
+  its last sequence number; past `max_total_wal_size` RocksDB forces the
+  slowest column families to flush so old files can go.
+- **Group commit.** Concurrent writers form a group; one leader writes the
+  group's records and issues one fsync for all of them. A group is capped at
+  1 MB, and RocksDB never waits on purpose to make a group larger.
+- **Durability is the caller's choice.** `sync=false` (the default) skips the
+  fsync; `sync=true` fsyncs before returning; `manual_wal_flush` plus
+  `FlushWAL`/`SyncWAL` lets the caller decide when; `disableWAL` skips the log.
+- **Batches.** A `WriteBatch` can touch several column families and lands as one
+  record, atomically.
+- **Records carry checksums.** Recovery has four modes; the default,
+  point-in-time recovery, stops at the first bad record, so what survives is a
+  prefix of the log.
+- **Fewer metadata writes per fsync:** log files can be recycled
+  (`recycle_log_file_num`), so an fsync does not also have to commit a file-size
+  change.
+
+### 2.2 Milvus 2.6 (distributed)
+
+- **The log is the source of truth.** It is Woodpecker, Milvus's own log on
+  object storage (it replaced Kafka and Pulsar). It buffers writes in memory, or
+  on a three-replica quorum that acknowledges after two, then uploads to object
+  storage. Measured latency: about 2 ms on a local filesystem, about 166 ms on
+  S3.
+- **Indexes are never logged.** Inserts accumulate in growing segments, which
+  are flushed to object storage, and indexes are built from those segments
+  afterwards. (Woodpecker's blog post does not describe this path; it is how
+  Milvus 2.x works generally.)
+
+### 2.3 turbopuffer (vector database on object storage)
+
+- **One log per namespace,** on S3, one object per log entry.
+- **Group commit with a deliberate wait.** Concurrent writes to a namespace are
+  batched into one entry, and a namespace commits at most one entry a second.
+  A write takes 165–285 ms at the median (the docs give both figures).
+- **Indexing follows the log** asynchronously, tracking its progress with an
+  index cursor. Queries also scan the not-yet-indexed tail of the log, so they
+  are strongly consistent by default.
+
+### 2.4 Side by side
+
+| | RocksDB | Milvus | turbopuffer | minnal main WAL | minnal vector index WAL |
+|---|---|---|---|---|---|
+| Logs | 1 per database | 1 per channel | 1 per namespace | 1 per database | 1 per database, a second log on the same drive |
+| Fsyncs per write | shared by a group | shared by a buffer | shared, ≤ 1 commit a second | **one per write, inside a global lock** | one per batch, when the caller syncs |
+| Record checksum | yes | yes | yes (object store) | **no**, only rkyv's structural check | CRC32 |
+| After a crash | a prefix (default) | what was committed | what was committed | stops at the first frame that will not decode | a prefix, kept across flushes (the prefix rule) |
+| Log reclaimed by | all column families past it; forced flushes | per-channel checkpoint | index cursor | per-entry statuses and counts; field-index pin | per-namespace safe offsets and a retired cut; forced flushes |
+| Log written in place | never | never | never | **yes**: each entry's status is rewritten when it is retired | never |
+| Vector index in a log | — | no, rebuilt from segments | no, built from the log | — | yes (the quantised codes) |
+| Atomic multi-namespace write | `WriteBatch` | per message | per write | none: ordered single writes, reconciled later | none |
+
+### 2.5 What minnal gets right, so-so and wrong
+
+**Right.**
+
+- *Vector index WAL:* appends are separate from syncs (RocksDB's
+  `FlushWAL`/`SyncWAL` split), frames are checksummed, a torn tail is
+  truncated so its stale bytes cannot replay later, retirement is recorded as
+  positions rather than written into the log, and the prefix rule makes a
+  memtable flush sync the log before any L0 file is written. A failed fsync
+  poisons the log instead of retrying, as PostgreSQL does after learning that a
+  retried fsync can report success over lost pages.
+- *Both logs* draw from one sequence counter, so replay of either can be
+  ordered against the other and against what is on disk.
+- *Main WAL:* the cut is already computed from flush events (per-namespace safe
+  offsets, capped by the oldest in-flight write); a new segment's directory
+  entry is fsynced before anything is acknowledged into it; recovery stops at a
+  torn tail; `merge_no_wal` is a general engine operation, like RocksDB's
+  `disableWAL`.
+
+**So-so: defensible, with a cost.**
+
+- *Logging derived vector data.* Milvus and turbopuffer rebuild indexes from
+  stored raw data. minnal stores only codes, not float vectors, so rebuilding
+  means re-embedding on the GPU; logging the codes is the cheaper recovery. It
+  is a consequence of that storage choice.
+- *Two logs on one drive.* Everyone else has one log per shard. Two logs keep
+  the bulky codes out of the main WAL and let them retire per namespace, but
+  their fsyncs share the drive's flush budget: a main-WAL fsync that overlaps a
+  vector-index-WAL fsync takes 3.56 ms instead of 2.34 ms
+  (`Fewer-WAL-Fsyncs-Design.md`, §14).
+- *No multi-namespace batch.* It keeps the engine small; the price is one fsync
+  per namespace a logical operation touches, and reconciliation code for the
+  gaps between them.
+
+**Wrong.**
+
+1. **Retirement rewrites the log.** The main WAL computes a cut, then records
+   it by rewriting every entry below it, with segment fsyncs and a metadata
+   save under the WAL lock (§1). No other log here modifies a record after
+   writing it; they keep a position. The statuses hold nothing the cut does not
+   (§4.1).
+2. **No checksum on frames.** rkyv's validation catches a body whose structure
+   is broken, but not changed bytes inside a key or value: those decode, and
+   replay would write them. (The README's format diagram shows a CRC; the code
+   does not write one.)
+3. **One fsync per write, inside the global lock.** This is the
+   400-writes-a-second ceiling of §1. Group commit is what RocksDB, PostgreSQL
+   and MySQL do; §3 explains why it keeps minnal's guarantee.
+4. **Segments grow as they are written.** Each `fdatasync` on a file that grew
+   must also commit its new size. The trace counted about one device flush per
+   fsync, so this does not double the flushes; whether it lengthens each one is
+   unmeasured.
+
+Changes A, B and C fix 1, 2 and 3. Item 4 is measured before deciding (§10).
+
+## 3. Why per-write fsync is not what makes a write durable
+
+`minnal_db/README.md` and `minnal_db/CLAUDE.md` say not to add group commit,
+because it "would let a write be acknowledged before it reached stable storage".
+That describes asynchronous commit. Group commit as designed here acknowledges
+nothing early: each writer returns only after an fsync that began after its
+bytes were written. "Durable on return" is unchanged; the fsync is shared, not
+skipped.
+
+What group commit does change:
+
+- **Latency of one write** can rise slightly: a writer that arrives just after
+  a round started waits for that round and the next one, up to two fsyncs
+  instead of one. Under load it falls, because today a writer waits for every
+  queued writer's fsync before its own.
+- **What a crash can leave on disk** is more than one unfinished record:
+  several records may be written but not yet covered by an fsync. None of them
+  was acknowledged. §8 shows recovery handles that.
+
+Both files' rules change with change C (§11).
+
+# Change A — retire by cut
+
+## 4. The design
+
+### 4.1 What the statuses record today
+
+Statuses are written in exactly two places:
+
+- `mark_persisted_range(start, cut)`, called when the cut moves (after a
+  flush, and at clean shutdown with the cut at the tail). It marks every entry
+  below the cut, so the Persisted entries are always exactly the prefix below
+  the cut.
+- `mark_namespace_persisted`, called when a namespace is dropped, for that
+  namespace's entries. Recovery already skips entries of a namespace that no
+  longer exists (`recover_from_wal`, "unknown namespace"), and
+  `forget_namespace` stops the dropped namespace from holding the cut back. So
+  these flips only feed the per-segment persisted counts that WAL GC reads.
+
+So one saved position, the cut, tells recovery and GC everything the statuses
+do.
+
+### 4.2 The metadata records the cut
+
+The WAL metadata gains `cut`. When `try_advance_persisted` moves the cut (on a
+flush's *flushed* event, after its L0 files are durable and registered), it
+saves the metadata with the new cut. That is the moment the statuses are made
+durable today, so recovery sees the same position it would have read from the
+statuses.
+
+The save runs under `persist_lock` (which already serialises retirement), not
+the WAL lock: it reads the tail and cut under a brief read lock, then writes the
+file. Holding `persist_lock` across the write means two saves cannot finish in
+the opposite order, so an older cut never overwrites a newer one. The other
+saves (WAL GC, clean shutdown, recovery) take the same lock. Writers no
+longer wait for any metadata fsync.
+
+The saved cut may lag the real one (a crash between a flush and its save). That
+only replays entries that are also in SSTables, which seq resolution makes
+harmless, as it does today when a crash lands before the status flips are
+synced. A saved cut can never be **ahead** of what is in SSTables: it is only
+saved after the flush it reflects.
+
+### 4.3 Recovery replays from the cut
+
+`recover_from_wal` scans `[cut, tail)`, skips entries of namespaces that no
+longer exist, and replays the rest in seq order, as today. After it has flushed
+and compacted every namespace it sets the cut to the tail and saves the
+metadata (today it rewrites every replayed entry's status).
+
+`rebuild_wal_persisted_state`, the open-time scan that counts Persisted entries
+to find where the prefix ends, goes: the cut is read from the metadata.
+
+### 4.4 WAL GC deletes segments below the cut
+
+A segment is reclaimable when it is not the active segment and lies wholly
+below the cut, with the field-index replay watermark, its
+`max_pinned_wal_segments` backstop and the flush of namespaces holding the cut
+(`flush_namespaces_pinning_wal`) unchanged. The per-segment total and persisted
+counts, and `WalMetadata::persisted_entries` / `total_entries`, go.
+
+What reports them changes:
+
+- `garbage_collect_wal` returns `(bytes_reclaimed, pending_bytes)`, where
+  `pending_bytes` is `tail - cut`: the bytes recovery would replay.
+- The admin API's WAL section reports `cut`, `tail`, `pending_bytes` and the
+  live segments, instead of entry counts per segment.
+
+### 4.5 What goes away
+
+- The status field of `WalEntry`, and `WalPointer.status`.
+- `write_entry_status`, `update_entry_status_deferred`, `sync_segment` and the
+  `status_syncs` guard counter.
+- The per-entry sweeps `mark_persisted_range` and `mark_namespace_persisted`
+  (the first becomes "save the cut"; the second has nothing left to do).
+- `rebuild_wal_persisted_state`.
+- The per-segment entry counts in `WalMetadata` and their reconciliation.
+
+After change A nothing writes into the log except appends, so a frame never
+changes once written, which change B relies on.
+
+# Change B — checksummed frames
+
+## 5. The design
+
+### 5.1 Frame layout
+
+A frame is today `[len u32][rkyv WalEntry]`. It becomes:
+
+```
+[len u32][crc32(body) u32][body: rkyv WalEntry]
+```
+
+Recovery reads a frame as valid only if its length fits in the segment, its CRC
+matches and its body decodes. Greenfield: no format version and no reader for
+the old frame.
+
+### 5.2 Open truncates the log at the recovered tail
+
+`Wal::recover_tail` finds the end of the valid frames. Open then truncates the
+last segment to that point and fsyncs it before accepting appends, as the
+vector index WAL's `open` does. Without that, a later, shorter record written
+over a torn region can leave older valid-looking frames behind it, and a second
+recovery would replay them. A checksum does not prevent this, since those old
+frames were valid when written.
+
+# Change C — group commit
+
+## 6. The design
+
+### 6.1 Append and fsync split; one fsync per commit round
+
+Under the WAL lock a writer does what it does today except the fsync: take a
+seq, write its frame, `begin_write(offset)`, and note the frame's end
+`my_end`. Then it releases the lock and waits until the durable tail reaches
+`my_end`:
+
+```text
+commit(my_end):
+    loop:
+        if durable_tail >= my_end: return Ok
+        if poisoned: return Err(Poisoned)
+        if no round is running:
+            become leader: running = true
+            target = written_tail          (read under the WAL lock)
+            unlock state; fsync the active segment; lock state
+            on error: poison, wake all, return Err
+            durable_tail = target; running = false; wake all
+        else:
+            wait on the condition variable
+```
+
+`commit` uses a `parking_lot::Mutex` and `Condvar` of its own, never the WAL
+lock, so writers keep appending while a round's fsync runs; the next round's
+leader picks all of them up. There is no deliberate wait to grow a round
+(RocksDB's choice; PostgreSQL's `commit_delay` is the opposite knob): a round
+starts as soon as the previous one ends, so a lone writer pays one fsync, as
+today, and under load each fsync covers everyone who wrote during the
+previous one.
+
+```mermaid
+sequenceDiagram
+    participant A as Writer A
+    participant B as Writer B
+    participant C as Writer C
+    participant L as WAL lock
+    participant R as Commit state
+    participant F as Segment file
+    A->>L: lock, seq 7, write frame, unlock
+    A->>R: durable < A's end, no round: lead
+    A->>F: fsync (covers seq 7)
+    B->>L: lock, seq 8, write frame, unlock
+    C->>L: lock, seq 9, write frame, unlock
+    B->>R: round running: wait
+    C->>R: round running: wait
+    F-->>A: done
+    A->>R: durable = end of seq 7, wake all
+    A->>A: apply seq 7, return
+    B->>R: durable < B's end, no round: lead
+    B->>F: fsync (covers seqs 8 and 9)
+    F-->>B: done
+    B->>R: durable = end of seq 9, wake all
+    B->>B: apply seq 8, return
+    C->>C: durable covers C: apply seq 9, return
+```
+
+Everything after the wait is unchanged: the writer applies its record to the
+memtable with its seq, bumps counters, may sync the value log, releases its key
+stripe and returns. The stripe is held across the wait, so two writes to one
+key still apply in seq order. The leader reads the written tail under the WAL
+lock, so the target never covers a half-written frame.
+
+### 6.2 Rotation fsyncs the segment it leaves
+
+Rounds fsync only the active segment. So a writer that fills a segment and
+rotates fsyncs the old segment (under the WAL lock, once per 64 MiB) before
+writing into the new one. Every segment but the last is then fully durable, and
+"durable tail" is a single position.
+
+### 6.3 Neither saved position runs ahead of the durable tail
+
+- **Tail.** The metadata's saved tail is where recovery starts scanning
+  forward for the real end (`recover_tail`). If it were saved beyond the
+  durable tail and a crash lost the bytes below it, open would append at the
+  saved tail behind a hole of zeros; a later recovery reads a zero length as
+  the end of a segment and would skip every acknowledged write after the hole.
+  So every save records `min(tail, durable_tail)`.
+- **Cut.** No rule needed: a write is *in flight* from before the WAL lock is
+  released until after it is applied, which is after its round's fsync, and
+  the cut is capped at the oldest in-flight write. So the cut is always at or
+  below the durable tail.
+
+### 6.4 A failed fsync poisons the main WAL
+
+If a round's fsync fails, the main WAL is poisoned: every writer waiting in
+that round and every later write gets an error, until the database is
+reopened. The writers in the failed round do not apply their records, so no
+reader ever sees a write that was not acknowledged. This is the vector index
+WAL's rule (and PostgreSQL's): after a failed fsync the kernel may have dropped
+the dirty pages, and a later fsync that succeeds says nothing about them.
+
+Today a failed fsync returns an error to its one writer and leaves the tail
+unmoved, so the next write overwrites the same bytes. With rounds, other
+frames already sit after the failed ones, so overwriting is no longer possible
+and poisoning is the only safe answer. (After change A, rounds and rotation
+are the only fsyncs of the log, so there is no other path to cover.)
+
+### 6.5 Metrics
+
+- Per namespace, `wal_fsyncs` becomes `wal_writes` (it counts writes, which
+  is what the tests that use it mean).
+- Global: `wal_commit_rounds` (fsyncs issued by rounds) and
+  `wal_commit_writes` (writes they covered); the admin API reports both, and
+  their ratio is the average round size.
+
+## 7. Expected effect
+
+The drive's flush rate (about 420 a second) stays the limit on fsyncs, but each
+fsync covers every writer that queued during the previous one. With 16 ingest
+clients plus the vector worker, rounds should hold several writes, so main-WAL
+writes a second should rise well past 400. Writers also stop waiting for the
+retirement sweep's fsyncs (change A). Ingest should then be limited by
+something else (request handling, the value log, or the embedding service), and
+the vector worker's own WAL writes stop queueing behind ingest. §10 says what is
+measured; no number is promised here.
+
+## 8. Crash analysis
+
+What can be on disk after a power loss, and what recovery makes of it, with all
+three changes in:
+
+| Crash point | On disk | Recovery | Acknowledged writes lost |
+|---|---|---|---|
+| Before a round's fsync starts | the round's frames partly or fully, in any order | `recover_tail` stops at the first frame whose length, CRC or body fails; open truncates there | none: the round's writers had not returned |
+| During the fsync | same | same | none |
+| After the fsync, before the writers apply | the round's frames are durable | replayed with their seqs | none |
+| Hole inside a round (a later page reached disk, an earlier one did not) | valid frames after a zero or torn region | recovery stops at the hole; later frames are truncated | none: every frame after the hole belongs to the same unfinished round or a later one |
+| After a flush, before its cut is saved | saved cut lags | replays from the older cut; those entries are also in SSTables, and seq resolution keeps the newer versions | none |
+| Mid metadata save | old or new file (atomic rename) | either is valid: the tail is ≤ durable, the cut ≤ what is in SSTables | none |
+| During namespace drop | its entries above the cut | skipped as an unknown namespace, as today | none (the namespace was being dropped) |
+
+What does not change:
+
+- **Seq order equals append order** (seq is taken inside the WAL lock), which
+  recovery relies on.
+- **Visibility:** a record is applied to the memtable only after its fsync, so
+  a reader never sees a write that a crash could undo.
+- **The vector index WAL** and its prefix rule are untouched; the two logs share
+  only the sequence counter. The cut moves at the same moments the statuses
+  were flipped, so the cross-log replay argument in
+  `Vector-Index-WAL-Design.md` holds as it is.
+
+## 9. Tests
+
+**Change A** (`db/database_tests.rs`, `db/wal_gc.rs`):
+
+- After a flush the saved cut equals the observer's cut, and a crash then
+  replays nothing below it.
+- A crash between a flush and its metadata save replays the flushed entries
+  and every key reads its last value (including a key whose delete was later
+  compacted).
+- A dropped namespace's entries never replay, and do not hold back WAL GC.
+- WAL GC reclaims exactly the segments wholly below the cut, still held by the
+  field-index watermark and backstop (the existing watermark tests keep
+  passing).
+- Writing to the log after a frame is appended never happens: a test reads
+  every segment's bytes before and after a flush and a GC pass and checks the
+  frames are unchanged.
+
+**Change B** (`db/wal.rs`):
+
+- A frame with one changed byte in its key or value is rejected, and recovery
+  stops there.
+- Open truncates a torn tail: after a torn record and a shorter new record, a
+  second open replays only the new one.
+
+**Change C** (`db/wal.rs`, `db/database_tests.rs`):
+
+- Sixteen threads writing concurrently: every write is readable and replays
+  after a crash, and `wal_commit_rounds` < writes.
+- A lone writer still costs one round per write.
+- An injected fsync failure in a round: every writer in it gets an error,
+  none of their writes is readable, and later writes fail with `Poisoned`.
+
+**A crash that drops unsynced bytes.** The crash simulation today keeps
+everything written to the page cache, so it cannot tell a durable byte from a
+merely written one. A test helper truncates each main-WAL segment to its
+durable length (the active one to the durable tail) before reopening. Under it,
+every write that returned survives (16 threads, many rounds), and no write that
+had not returned is half-applied.
+
+**Mutation checks** (each must make a test fail, then be reverted):
+
+- Save the cut before the flush is registered → a crash after the save loses
+  writes that were only in the memtable.
+- GC a segment that straddles the cut → its entries above the cut are lost.
+- Skip the truncate at open → a stale frame replays.
+- Return before waiting for the round → the drop-unsynced crash loses
+  acknowledged writes.
+- Apply to the memtable before the fsync → a read sees a write that the crash
+  then loses.
+- Rotate without fsyncing the old segment → the crash loses acknowledged writes
+  from the old segment.
+- Save `tail` instead of `min(tail, durable_tail)` → after the crash and one
+  more write, recovery skips acknowledged writes.
+
+Feature combos and clippy as usual (`-p minnal_db`, four combos).
+
+## 10. Measurements
+
+On the settled-store pair (`work/bench/wal-contention`), the current main
+against change C:
+
+- main-WAL fsyncs a second, writes per round, and the drive's flush rate and
+  busy time (iostat);
+- ingest docs a second and p50/p99 latency, 16 clients;
+- docs embedded a second during and after ingest;
+- a lone writer's latency (one client), to confirm it has not risen.
+
+Change A is measured on its own too (time writers spend waiting on the WAL
+lock during flushes, before and after), so its effect is not folded into C's.
+
+Separately, a microbenchmark of `fdatasync` after a small append on a growing
+file against a preallocated one, on the same drive: if preallocation saves
+more than a few percent per fsync, segments are preallocated (with
+`fallocate`, zero-filled, which keeps a zero length meaning "end of segment").
+
+## 11. Steps
+
+Each step is built, tested and reviewed before the next.
+
+1. **Retire by cut** (change A). Removes the status field, so it goes before the
+   frame change. Update the README's WAL sections (*Persisted*, the recovery
+   steps, WAL GC) and the admin API's WAL section and its README.
+2. **Checksummed frames** (change B). Fix the README's format diagram.
+3. **Group commit** (change C), with the drop-unsynced crash helper and the
+   mutation checks. Update `minnal_db/README.md` (*Durability model*, *WAL
+   terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
+   bench comments that describe per-write fsync.
+4. **Measure** (§10) on the settled snapshot, against the current main.
+5. **Preallocation**, if §10's microbenchmark shows it is worth it.
+
+## Not covered here
+
+- **Per-namespace safe offsets in the metadata**, so recovery could skip a
+  flushed namespace's entries above the global cut. The statuses never did
+  this (they flip only below the cut), so the single cut loses nothing; it
+  would be a later refinement, and it is how the vector index WAL already
+  works.
+- **A multi-namespace batch** (RocksDB's `WriteBatch`). Group commit already
+  lets the writes of one logical operation share an fsync when they are
+  concurrent; a batch would make them atomic, which is a larger change to the
+  engine's single-op model.
+- **A deliberate commit delay** (`commit_delay`, turbopuffer's one-second
+  window). Rounds form without one under load; a delay would only add latency
+  when the database is quiet.
+- **The vector index WAL's syncs.** It keeps its own fsyncs; it shares the
+  drive, not the lock.
+
+## 12. Decisions for review
+
+1. Retire by a saved cut instead of per-entry statuses (change A), saved under
+   `persist_lock` rather than the WAL lock.
+2. `garbage_collect_wal` and the admin API report pending bytes (`tail - cut`)
+   instead of entry counts. Greenfield: no compatibility fields.
+3. Group commit as in §6.1, with no deliberate wait.
+4. A failed fsync poisons the main WAL until reopen (§6.4), the same rule as the
+   vector index WAL.
+5. Rename the per-namespace `wal_fsyncs` to `wal_writes` and add the two global
+   round counters (§6.5).
+6. Order: A, then B, then C (§11).
