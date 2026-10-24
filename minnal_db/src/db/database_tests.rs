@@ -3404,8 +3404,13 @@ fn both_logs_report_positions_as_segment_and_byte() {
     assert!(s.tail.segment_id >= 2);
     assert_eq!(s.pending_bytes, db.wal.bytes_between(m.cut, m.tail));
     assert!(s.pending_bytes > 0 && s.segments.iter().any(|seg| !seg.retired));
+    assert_eq!(s.durable_tail, s.tail, "every acknowledged write is fsynced");
+    assert_eq!(s.stopped, None);
     let json = serde_json::to_value(&s).unwrap();
     assert!(json["tail"]["segment_id"].is_u64() && json["tail"]["byte"].is_u64(), "{json}");
+    db.wal.fail_next_sync();
+    assert!(db.put(b"after", b"v").is_err());
+    assert!(db.wal_stats().stopped.is_some(), "a failed fsync must show in the stats");
     let v = serde_json::to_value(db.vector_index_wal_stats().unwrap()).unwrap();
     assert!(v["tail"]["segment_id"].is_u64() && v["tail"]["byte"].is_u64(), "{v}");
 }

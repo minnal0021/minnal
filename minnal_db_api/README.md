@@ -1329,6 +1329,7 @@ tail, and WAL GC deletes segments wholly below the cut.
 | Field | Meaning |
 |-------|---------|
 | `head`, `tail` | Positions `{segment_id, byte}` of the first entry still on disk and of the next write |
+| `durable_tail` | Everything below it is fsynced (equal to `tail` whenever no write is waiting for its fsync) |
 | `cut` | Every entry below this position is in an SSTable |
 | `pending_bytes` | Bytes of entries from the cut to the tail: what a restart would replay |
 | `segment_size` | Bytes each new WAL segment file is created at |
@@ -1337,6 +1338,7 @@ tail, and WAL GC deletes segments wholly below the cut.
 | `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
 | `last_sequence` | Highest write sequence handed out as of the last metadata save (every flush and WAL GC pass saves it): a restart's sequence counter starts above it |
 | `segments[]` | Each segment file on disk: `{segment_id, bytes, retired, pending_bytes}`. A segment is created at its full size, so `bytes` is that size whatever it holds; `retired` means wholly below the cut |
+| `stopped` | `null` normally. After a failed fsync of the WAL, the error: every write is refused until the server restarts |
 
 After creating a KV store and writing three keys to it (none flushed yet):
 
@@ -1344,6 +1346,7 @@ After creating a KV store and writing three keys to it (none flushed yet):
 {
   "head": {"segment_id": 0, "byte": 16},
   "tail": {"segment_id": 0, "byte": 396},
+  "durable_tail": {"segment_id": 0, "byte": 396},
   "cut": {"segment_id": 0, "byte": 16},
   "pending_bytes": 380,
   "segment_size": 67108864,
@@ -1352,7 +1355,8 @@ After creating a KV store and writing three keys to it (none flushed yet):
   "total_gc_runs": 0,
   "total_bytes_reclaimed": 0,
   "last_sequence": 0,
-  "segments": [{"segment_id": 0, "bytes": 67108864, "retired": false, "pending_bytes": 380}]
+  "segments": [{"segment_id": 0, "bytes": 67108864, "retired": false, "pending_bytes": 380}],
+  "stopped": null
 }
 ```
 

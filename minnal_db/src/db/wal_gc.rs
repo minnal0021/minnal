@@ -73,6 +73,7 @@ impl Database {
         WalStats {
             head: LogPosition::of(m.head),
             tail: LogPosition::of(m.tail),
+            durable_tail: LogPosition::of(self.wal.durable_tail()),
             cut: LogPosition::of(m.cut),
             pending_bytes: self.wal.bytes_between(m.cut, m.tail),
             segment_size: self.wal.segment_size(),
@@ -89,6 +90,7 @@ impl Database {
             total_bytes_reclaimed: m.total_bytes_reclaimed,
             last_sequence: m.last_sequence,
             segments,
+            stopped: self.wal.poisoned(),
         }
     }
 

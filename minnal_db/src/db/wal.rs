@@ -372,6 +372,8 @@ pub struct WalStats {
     pub head: LogPosition,
     /// Where the next record goes.
     pub tail: LogPosition,
+    /// Everything below it is fsynced.
+    pub durable_tail: LogPosition,
     /// Every entry below this is in an SSTable; WAL GC reclaims segments
     /// wholly below it.
     pub cut: LogPosition,
@@ -388,8 +390,11 @@ pub struct WalStats {
     pub total_bytes_reclaimed: u64,
     /// Highest write sequence handed out as of the last metadata save.
     pub last_sequence: u64,
-    /// Every segment from the head to the tail, oldest first.
+    /// Every segment file on disk, oldest first.
     pub segments: Vec<WalSegmentState>,
+    /// Set after a failed fsync, with its error: the WAL refuses writes until
+    /// the database is reopened. `None` while it works.
+    pub stopped: Option<String>,
 }
 
 /// One namespace's saved progress, in [`WalStats`].
@@ -504,6 +509,11 @@ impl Wal {
     #[cfg(test)]
     pub(crate) fn tail(&self) -> u64 {
         self.log.tail()
+    }
+
+    /// Why the log is stopped, if it is (a failed fsync).
+    pub(crate) fn poisoned(&self) -> Option<String> {
+        self.log.poisoned()
     }
 
     /// `Err(Poisoned)` once the log has been stopped.
