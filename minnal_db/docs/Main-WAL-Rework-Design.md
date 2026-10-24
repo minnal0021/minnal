@@ -1078,3 +1078,20 @@ each followed by `fdatasync`:
   started. A power loss then zeroes everything after that point, as the
   kernel would for pages never written back.
 
+**Measured** after building it, same benchmark as §14:
+
+| | Without preallocation | With |
+|---|---|---|
+| One writer, 2,000 `put`s of 128 B into one database (mean) | 2.31 ms (433/s) | **0.82 ms (1,220/s)** |
+| Ingest, 1 client, settled store | 172 docs/s, p50 4.9 ms | **364 docs/s, p50 1.8 ms** |
+| Ingest, 16 clients, settled store (two runs each) | 1,458 / 1,447 docs/s | 1,458 / 1,457 docs/s |
+
+One writer is about 2.8× faster, since each of its writes waits for its own
+fsync. With 16 clients nothing changes: a commit round already covers about
+8 writes, and ingest is limited elsewhere.
+
+Open question: the criterion benchmark `write/put` still reports 2.32 ms per
+`put` with preallocation. It opens a fresh store for each batch, so it
+measures writes into new files; why that keeps the old cost is not yet
+understood. `benchmark.md` predates this change and needs a full refresh.
+

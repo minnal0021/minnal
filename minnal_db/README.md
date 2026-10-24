@@ -340,7 +340,7 @@ sequenceDiagram
     G->>W: delete every segment wholly below the cut
 ```
 
-The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, an fsync takes about 2.3 ms, so a single client makes at most about 400 WAL-backed writes per second; concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
+The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, an fsync of a preallocated WAL segment takes about 0.8 ms, so a single client makes at most about 1,200 WAL-backed writes per second (measured: 0.82 ms per 128-byte `put`); concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 
 ### Vector index WAL
 
@@ -397,7 +397,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 ### WAL terms
 
 - **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and fsyncs it before the call returns.
-- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 2.3 ms each on the NVMe drive the benchmarks use.
+- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 0.8 ms for a preallocated WAL segment on the NVMe drive the benchmarks use, and about 2.3 ms for a file that grows with every write.
 - **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write takes to append its entry (and take its seq). It is released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** (main WAL) — one fsync and the writers it releases: the writer that finds no round running leads one, fsyncing the active segment up to the tail it read; writers whose entries came later wait for, or lead, the next. `wal_commit_rounds` / `wal_commit_writes` count them.
@@ -764,9 +764,9 @@ These are ballpark figures; treat them as orders of magnitude rather than guaran
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values) | ~400–500 ops/s for one writer on an NVMe drive without power-loss protection: each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more. |
-| `delete` | ~400–500 ops/s for one writer — same fsync bound as `put` |
-| `merge` (small values) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
+| `put` (small values) | ~1,200 ops/s for one writer on an NVMe drive without power-loss protection (0.82 ms each, measured): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
+| `delete` | ~1,200 ops/s for one writer — same fsync bound as `put` |
+| `merge` (small values) | ~1,200 ops/s for one writer — the read-modify-write and its per-key lock add ~0.5–0.7 µs, small next to the fsync it pays anyway |
 | `get` from memory | 1M–2.5M ops/s per thread |
 | `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
 | Range / prefix scan | Proportional to the number of results |

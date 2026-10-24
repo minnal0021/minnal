@@ -787,3 +787,23 @@ fn reopening_zeroes_past_the_tail_and_keeps_the_segment_preallocated() {
     assert_eq!(bytes.len() as u64, SEGMENT, "the segment lost its preallocation");
     assert!(bytes[tail as usize..].iter().all(|&b| b == 0), "bytes past the tail were not zeroed");
 }
+
+/// Measurement, not a check: one writer's `put` latency on the real disk
+/// (the repository's `target/` directory), after a warm-up.
+#[test]
+#[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
+fn measure_one_writer_put_latency() {
+    let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+    for i in 0..200u32 {
+        db.put_ns(ns, format!("warm{i}").as_bytes(), &[b'v'; 128]).unwrap();
+    }
+    let n = 2000u32;
+    let started = std::time::Instant::now();
+    for i in 0..n {
+        db.put_ns(ns, format!("k{i:05}").as_bytes(), &[b'v'; 128]).unwrap();
+    }
+    let per = started.elapsed() / n;
+    println!("one-writer put, 128 B: {per:?} each, {:.0}/s", 1.0 / per.as_secs_f64());
+}
