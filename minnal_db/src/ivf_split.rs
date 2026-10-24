@@ -29,20 +29,27 @@
 //! | 1. Plan | split: recount P, 2-means; write the record | WAL | `Planned` |
 //! | 2. Prepare | split: append two centres, write P1, P2 `Active`; mark P `Draining` | WAL | `Planned` |
 //! | 3. Publish | record `Published`, then install the new snapshot and wait out every write and search that entered by the old one | WAL | `Published` |
-//! | 4. Copy | per document, under its vector lock: list each destination in its meta, write its chunks there | meta WAL, keys vector index WAL | `Published` |
-//! | 5. Barrier | one fsync of the vector index WAL | fsync | `Copied` |
-//! | 6. Delete | after an epoch barrier, per document under its lock: drop P from its meta, delete `P‖doc` | WAL | `Copied` |
+//! | 4. Copy | per document, under its vector lock: list each destination in its meta, write its chunks there | vector index WAL, one sync per batch | `Published` |
+//! | 5. Barrier | one fsync of the vector index WAL (a no-op after the last batch's) | fsync | `Copied` |
+//! | 6. Delete | after an epoch barrier, per document under its lock: drop P from its meta, delete `P‖doc` | vector index WAL, one sync per batch | `Copied` |
 //! | 7. Retire | P `Retired`; publish; (a split) record its reassignment; delete the record | WAL | (gone) |
 //!
 //! A reassignment has no publish (routing does not change): `Planned` → copy →
-//! barrier → `Copied` → epoch barrier → shrink each source key (WAL) → gone.
+//! barrier → `Copied` → epoch barrier → shrink each source key → gone.
+//!
+//! Every per-document write (meta and keys, both namespaces) is logged in the
+//! vector index WAL, and each batch syncs it before releasing its documents'
+//! locks ([`sync_batch`]). The journal records, centres and postings are
+//! main-WAL writes, durable on return. A crash keeps a prefix of the vector
+//! index WAL (a flush syncs it before writing L0 files), so the orders below
+//! hold across the two namespaces exactly as if each write were durable on
+//! return.
 //!
 //! Rules the steps depend on:
 //!
-//! 1. **Barrier before delete.** The copies are durable only at the vector
-//!    index WAL's next fsync; deletes and shrinks are WAL-backed and durable at
-//!    once. Without the barrier, a crash after a delete could lose the copy and
-//!    the chunk would be gone for good.
+//! 1. **Barrier before delete.** The copies must be durable before the record
+//!    says `Copied`; after it, recovery redoes only the delete, and a lost copy
+//!    would leave the chunk gone for good.
 //! 2. **The meta is always a superset of the live postings.** A document's
 //!    meta (WAL-backed, as since M0-2) is the only record of which postings hold
 //!    its chunks; a destination is added to it before the copy. A source is the
@@ -622,10 +629,11 @@ type Moving = BTreeMap<u32, Vec<VectorIndex>>;
 
 /// Add each document's `moving` codes (`destination → codes`, each already
 /// filed under its destination) to its keys and meta: per document, the meta
-/// first (WAL), then the keys (vector index WAL), each key gaining only the codes it does
-/// not already hold. The caller holds every document's vector lock. A document
-/// with no meta is being deleted and is skipped (rule 2). Returns the count
-/// change and how many codes were newly written.
+/// first, then the keys, each key gaining only the codes it does not already
+/// hold. All are logged in the vector index WAL, in that order, and synced once
+/// at the end ([`sync_batch`]). The caller holds every document's vector lock.
+/// A document with no meta is being deleted and is skipped (rule 2). Returns
+/// the count change and how many codes were newly written.
 async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Moving)>) -> Result<(PostingDelta, u64), crate::KVError> {
     if items.is_empty() {
         return Ok((PostingDelta::default(), 0));
@@ -679,7 +687,9 @@ async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Mov
         }
         if !doc_delta.is_empty() {
             crash_point!();
-            meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
+            meta_ns
+                .put_logged(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings))
+                .await?;
         }
         for (_, key, merged, new) in writes {
             if new > 0 {
@@ -690,7 +700,19 @@ async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Mov
         }
         delta.extend(doc_delta);
     }
+    sync_batch(db).await?;
     Ok((delta, copied))
+}
+
+/// Make a batch's logged writes durable: one fsync of the vector index WAL.
+/// Called before the batch releases its documents' vector locks, so no
+/// foreground write (a re-embed, a delete) builds on a maintenance write a
+/// crash could still lose. What survives a crash is a prefix of the log
+/// (`db/vector_index_wal.rs`), so within a batch the meta-before-key order
+/// holds across the two namespaces.
+async fn sync_batch(db: &AsyncDb) -> Result<(), crate::KVError> {
+    crash_point!();
+    db.sync_vector_index_wal().await
 }
 
 /// Split `posting` if it holds more than `ops.split_limit` chunks, then reassign
@@ -1059,7 +1081,7 @@ async fn drain_copy(
 }
 
 /// 6. Delete the drained posting's keys, and the posting from each document's
-///    meta.
+///    meta (both logged, synced per batch).
 async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, drained: u32) -> Result<(), crate::KVError> {
     let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
     let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
@@ -1090,16 +1112,18 @@ async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, d
                 {
                     let (_, chunks) = meta.postings.remove(i);
                     crash_point!();
-                    meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
+                    meta_ns
+                        .put_logged(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings))
+                        .await?;
                     handle.snapshot().apply_delta(&PostingDelta {
                         added: vec![],
                         removed: vec![(drained, chunks)],
                     });
                 }
                 crash_point!();
-                sparse.delete(composite_key::encode(drained, doc)).await?;
+                sparse.delete_logged(composite_key::encode(drained, doc)).await?;
             }
-            Ok::<(), crate::KVError>(())
+            sync_batch(db).await
         })
         .await?;
     }

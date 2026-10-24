@@ -345,6 +345,31 @@ async fn a_split_survives_a_crash_before_any_write() {
     assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
 }
 
+/// A split moves every document of the posting, but its per-document writes
+/// go to the vector index WAL, one fsync per batch: the main WAL sees only the
+/// operation's own records (journal, centres, postings), however many
+/// documents move.
+#[tokio::test]
+async fn a_split_writes_nothing_per_document_to_the_main_wal() {
+    let dir = TempDir::new().unwrap();
+    let docs = 40;
+    let db = setup(&dir, docs).await;
+    let h = handle(&db).await;
+    let before = db.ops_metrics();
+    assert!(matches!(
+        split_posting(&db, NS, &h, 0, &settings(40)).await.unwrap(),
+        SplitOutcome::Split { .. }
+    ));
+    let after = db.ops_metrics();
+    let main = after.wal_fsyncs - before.wal_fsyncs;
+    let logged = after.vector_wal_fsyncs - before.vector_wal_fsyncs;
+    assert!(main < docs / 2, "{main} main-WAL fsyncs for {docs} moved documents");
+    // A copy and a delete pass, each a sync per batch of 16 (plus reassign's).
+    assert!(logged >= 2 * docs.div_ceil(16), "{logged} vector-index-WAL fsyncs");
+    check(&db, &h, &expected(docs)).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
 /// Re-embeds and deletes racing a split: no chunk is lost or orphaned, nothing
 /// is written to a draining or retired posting, and every count stays exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

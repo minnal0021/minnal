@@ -564,6 +564,16 @@ impl LsmFlushObserver for LsmFlushObserverHub {
         self.trigger_compaction();
     }
 
+    // Before any L0 file is written: a namespace with records in the vector
+    // index WAL past its durable tail syncs it first, so no L0 file can hold a
+    // logged write the log could still lose.
+    fn on_ro_memtable_flushing(&self, _version: u64) -> std::io::Result<()> {
+        self.vector_index_wal.before_memtable_written(self.namespace_id).map_err(|e| match e {
+            crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        })
+    }
+
     // Before the memtable's L0 files are registered, and through
     // `SyncValueLogBeforePersist`, so the values the retired records point at
     // are fsynced first. An error (the progress marker could not be written)
@@ -1315,10 +1325,10 @@ impl Database {
     /// recovery replays it with its original seq unless the memtable holding it
     /// was already written to L0.
     ///
-    /// For the vector worker's payloads (chunk codes, whole-document codes):
-    /// bulky, one durability barrier per batch rather than per write. Deletes
-    /// stay in the main WAL. Order, as on every write path: key stripe, seq,
-    /// append (registered as not yet applied), memtable apply, release.
+    /// For the vector worker's payloads (chunk codes, whole-document codes) and
+    /// partition maintenance's per-document writes: one durability barrier per
+    /// batch rather than per write. Order, as on every write path: key stripe,
+    /// seq, append (registered as not yet applied), memtable apply, release.
     pub fn put_ns_logged(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, value)?;
@@ -1337,6 +1347,26 @@ impl Database {
         kv_store
             .put_to_storage_seq(key, value, seq)
             .or_else(|_| kv_store.put_to_storage_seq(key, value, seq))?;
+        drop(logged);
+        Ok(())
+    }
+
+    /// Delete a key logged in the **vector index WAL** instead of the main WAL:
+    /// the counterpart of [`Self::put_ns_logged`], durable once a later
+    /// [`Self::sync_vector_index_wal`] returns. Replay applies it with its
+    /// original seq, as the main WAL replays a delete.
+    pub fn delete_ns_logged(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+        self.check_closed()?;
+        self.check_write_size(key, &[])?;
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        let kv_store = self.get_store(namespace_id)?;
+        let seq = kv_store.alloc_seq();
+        let logged = self.vector_index_wal.append_delete(namespace_id, key, seq)?;
+        self.note_no_wal_index_exposure(namespace_id);
+        // One retry, as `put_ns_logged`.
+        kv_store
+            .delete_from_storage_seq(key, seq)
+            .or_else(|_| kv_store.delete_from_storage_seq(key, seq))?;
         drop(logged);
         Ok(())
     }
@@ -2615,15 +2645,19 @@ impl Database {
                 skipped += 1;
                 return Ok(());
             };
-            match store
-                .replay_upsert(r.key, r.value, r.seq)
-                .or_else(|_| store.replay_upsert(r.key, r.value, r.seq))
-            {
+            let apply = || match r.value {
+                Some(value) => store.replay_upsert(r.key, value, r.seq),
+                None => store.replay_delete(r.key, r.seq),
+            };
+            match apply().or_else(|_| apply()) {
                 Ok(()) => replayed += 1,
                 Err(e) => {
-                    let entry = WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), r.value.to_vec())
-                        .with_sequence(r.seq)
-                        .with_op_name("vector_index_wal_replay");
+                    let entry = match r.value {
+                        Some(value) => WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), value.to_vec()),
+                        None => WalEntry::new_delete_ns(r.ns_id, r.key.to_vec()),
+                    }
+                    .with_sequence(r.seq)
+                    .with_op_name("vector_index_wal_replay");
                     failed.push((entry, e.to_string()));
                 }
             }

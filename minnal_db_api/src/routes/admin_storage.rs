@@ -189,8 +189,13 @@ pub struct VectorIndexWalMetrics {
     appends: u64,
     /// Bytes appended, frames included.
     bytes_appended: u64,
-    /// Fsyncs (one per completion batch that wrote anything).
+    /// Fsyncs: one per batch of vector writes (the worker's completion
+    /// batches, maintenance's batches) or memtable flush that had anything to
+    /// make durable.
     fsyncs: u64,
+    /// Syncs a memtable flush asked for before writing its L0 files, because
+    /// its namespace had records not yet durable in the log.
+    flush_syncs: u64,
     /// `appends / fsyncs`: the records each fsync made durable. `null` before
     /// the first fsync.
     appends_per_fsync: Option<f64>,
@@ -292,6 +297,7 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             appends: m.vector_wal_appends,
             bytes_appended: m.vector_wal_bytes_appended,
             fsyncs: m.vector_wal_fsyncs,
+            flush_syncs: m.vector_wal_flush_syncs,
             appends_per_fsync: (m.vector_wal_fsyncs > 0).then(|| m.vector_wal_appends as f64 / m.vector_wal_fsyncs as f64),
             gc_runs: m.vector_wal_gc_runs,
             segments_deleted: m.vector_wal_segments_deleted,
