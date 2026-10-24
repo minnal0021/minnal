@@ -1,7 +1,8 @@
 # Main WAL rework: retire by cut, checksum frames, group commit — design note
 
-**Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13.
-The measurements in §10 are still to run.
+**Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13
+and the measurements in §14. Preallocating segments is proposed in §14, not
+built.
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
@@ -990,4 +991,57 @@ fsyncs it (`a_segment_filled_to_its_last_byte_is_durable_when_left`).
 **Not covered by the model:** the field-index files are memory-mapped and
 synced at checkpoints, and are copied whole; their own recovery (checkpoint
 marker plus WAL replay) is what the stress's index check exercises.
+
+## 14. Measured
+
+Hardware and load as in `Fewer-WAL-Fsyncs-Design.md` §14: the semantic-search
+ingest benchmark (`work/bench/wal-contention/run_pair.sh`), 16 clients writing
+17,638 FiQA documents with embedding enabled, on a new store and on the settled
+snapshot. "Before" is main at `bee8b04`; "after" is this branch. Both ran the
+same day against the same embedding service.
+
+| | Before, new | After, new | Before, settled | After, settled |
+|---|---|---|---|---|
+| Ingest docs/s | 159 | **1,463** | 155 | **1,413** |
+| Ingest p50 | 90.7 ms | 9.5 ms | 96.7 ms | 9.6 ms |
+| Ingest p99 | 176.5 ms | 27.2 ms | 182.2 ms | 30.8 ms |
+| Main-WAL writes/s during ingest | 375 | 2,265 | 377 | 2,210 |
+| Embedding queue empty at | 407 s | 261 s | 273 s | 261 s |
+
+- **Ingest is about 9× faster.** Main-WAL writes per document stay at 3.2; the
+  difference is that one fsync now covers about 8 of them (8.2 writes per
+  round on the settled store at the default delay).
+- **Embedding is not faster.** The queue empties in about 260 s either way,
+  with the GPU about 60% busy: the embedding service is the limit
+  (`Fewer-WAL-Fsyncs-Design.md` §14), not the WAL.
+- The settled runs open a snapshot written in the old WAL format. Its frames
+  fail their CRC, so the log starts empty (the snapshot was shut down cleanly,
+  so nothing is lost), and its field-index markers point past the new tail and
+  are treated as uncheckpointed (6 warnings at open). Greenfield: no reader
+  for the old format.
+
+**C2, the commit delay**, swept on the settled store (ingest only):
+
+| `commit_delay_us` | docs/s | p50 | p99 | writes per fsync |
+|---|---|---|---|---|
+| 0 (default) | 1,407 | 9.6 ms | 32.0 ms | 8.2 |
+| 1,000 | 1,447 | 10.5 ms | 27.6 ms | 11.0 |
+| 2,000 | 1,316 | 11.7 ms | 30.6 ms | 11.4 |
+| 5,000 | 908 | 17.6 ms | 29.9 ms | 11.9 |
+| 20,000 | 339 | 48.4 ms | 67.9 ms | 13.3 |
+| 200,000 | 38 | 424 ms | 633 ms | 19.4 |
+
+1 ms is within the noise of a single run of 0 and raises p50, so the default
+stays 0. Longer delays put more writes in each fsync but cut throughput, since
+each client waits for its write before sending the next.
+
+**Preallocation** (microbenchmark, `fdatasync` after a 128-byte write, 3,000
+writes, same drive): on a file that grows with every write, 2.30 ms mean
+(p99 2.53 ms); on a preallocated file, 0.79 ms mean (p99 2.40 ms). The
+growing file pays for committing its new size on every fsync. That is a
+large enough saving to propose preallocating WAL segments (zero-filled, so a
+zero length still ends a segment's records), but it changes how segments
+are laid out, which recovery, open-time truncation and the power-loss
+model's coverage bookkeeping all depend on. So it is a separate design step
+for review, not part of this change.
 
