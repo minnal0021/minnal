@@ -16,7 +16,6 @@ use common::*;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use minnal_db::db::wal::{Wal, WalEntry};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bytes of appends one WAL receives before the next is opened. Half the
@@ -158,24 +157,19 @@ fn bench_full_put_throughput(c: &mut Criterion) {
 
     let value_size = 512usize;
     let value = vec![0xABu8; value_size];
-    const BATCH: usize = 1_000;
+    // One store, already in its steady state (see `steady_store`): a store
+    // per iteration would time a first write into a new database instead.
+    let temp = bench_tempdir();
+    let store = steady_store(temp.path(), value_size);
 
     // Full path: Db::put (WAL + value log + LSM)
     group.throughput(Throughput::Elements(1));
     group.bench_function("db_put_with_wal", |b| {
-        b.iter_batched_ref(
-            || {
-                let temp = bench_tempdir();
-                let store = AutoCloseStore::open(temp.path());
-                (store, AtomicU64::new(0), temp)
-            },
-            |(store, counter, _temp)| {
-                let seq = counter.fetch_add(1, Ordering::Relaxed);
-                let key = make_key("wal_put:", seq);
-                black_box(store.store().put(&key, &value)).unwrap();
-            },
-            criterion::BatchSize::NumIterations(BATCH as u64),
-        );
+        let mut seq = 0u64;
+        b.iter(|| {
+            seq += 1;
+            black_box(store.store().put(&make_key("wal_put:", seq), &value)).unwrap();
+        });
     });
 
     group.finish();

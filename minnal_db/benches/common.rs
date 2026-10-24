@@ -132,6 +132,35 @@ impl Drop for AutoCloseStore {
     }
 }
 
+/// WAL segment size for the steady-state write benchmarks: small, so warming
+/// the log past a database's first segment takes seconds rather than 64 MiB of
+/// writes. Segment size does not change what one fsync costs.
+pub const STEADY_WAL_SEGMENT: u64 = 1 << 20;
+
+/// A store already in its steady state for writes: opened once, with its WAL
+/// moved past its first segment onto zero-filled ones (`minnal_db/docs/
+/// Main-WAL-Rework-Design.md` §17), by writing `value_len`-byte values under
+/// `warm:` keys.
+///
+/// **Open the store once per case and time writes in `b.iter`.** Criterion's
+/// `iter_batched*` calls its setup once per *iteration*, so a setup that opens
+/// a store times one write into a brand-new database every iteration: new
+/// file blocks every time, about 2.3 ms on the benchmark drive whatever the
+/// engine does. The `first_write_into_new_db` cases measure exactly that, on
+/// purpose.
+pub fn steady_store(dir: &Path, value_len: usize) -> AutoCloseStore {
+    let mut config = bench_config();
+    config.wal_segment_size = STEADY_WAL_SEGMENT;
+    let store = AutoCloseStore(Some(Db::open_with_config(dir, config).expect("failed to open Db")));
+    let value = vec![0x5Au8; value_len];
+    let mut i = 0u64;
+    while store.store().wal_metadata().tail < STEADY_WAL_SEGMENT * 2 + STEADY_WAL_SEGMENT / 4 {
+        store.store().put(&make_key("warm:", i), &value).unwrap();
+        i += 1;
+    }
+    store
+}
+
 /// Generate a key with a given prefix and zero-padded sequence number.
 /// Using a fixed-width number keeps keys lexicographically ordered.
 #[inline]
