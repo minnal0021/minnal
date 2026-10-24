@@ -91,6 +91,15 @@ pub(crate) struct WalPersistObserver {
     /// are refused until the database is reopened, whose recovery rebuilds the
     /// truth from the log and L0.
     poisoned: Mutex<Option<String>>,
+    /// The field indexes that need the WAL, each from its last checkpoint's
+    /// position (the other kind of WAL consumer, beside the namespaces'
+    /// memtables). `Some(p)`: the field replays from `p` after a crash. `None`:
+    /// it has no checkpoint yet, and holds the WAL from 0 once its index has
+    /// entries (a first build is populated from the stored documents, not by
+    /// replay, so an empty one holds nothing). Kept current by
+    /// [`Self::fields_checkpointed`]; a field is added when it is activated and
+    /// removed when it is deactivated or dropped, or its namespace is.
+    field_consumers: RwLock<BTreeMap<(u32, FieldId), Option<u64>>>,
     /// Test hook: outcomes for the next metadata saves, `true` = fail.
     #[cfg(test)]
     save_failures: Mutex<std::collections::VecDeque<bool>>,
@@ -161,6 +170,7 @@ impl WalPersistObserver {
             ns_progress: RwLock::new(std::collections::HashMap::new()),
             persist_lock: Mutex::new(()),
             poisoned: Mutex::new(None),
+            field_consumers: RwLock::new(BTreeMap::new()),
             #[cfg(test)]
             save_failures: Mutex::new(std::collections::VecDeque::new()),
             in_flight: Mutex::new(BTreeMap::new()),
@@ -250,6 +260,35 @@ impl WalPersistObserver {
         entry.last_write_offset = entry.last_write_offset.max(tail);
     }
 
+    /// Field `(namespace_id, field_id)` is active and needs the WAL from
+    /// `position` (see `field_consumers`).
+    pub(crate) fn add_field_consumer(&self, namespace_id: u32, field_id: FieldId, position: Option<u64>) {
+        self.field_consumers.write().insert((namespace_id, field_id), position);
+    }
+
+    /// The field is no longer active: it stops holding the WAL.
+    pub(crate) fn remove_field_consumer(&self, namespace_id: u32, field_id: FieldId) {
+        self.field_consumers.write().remove(&(namespace_id, field_id));
+    }
+
+    /// The *checkpointed* event: every field in `fields` has a durable
+    /// checkpoint marker at `position`. Reported only after the markers are on
+    /// disk; reported early, WAL GC could delete a segment a crash would send
+    /// the field back to. A field no longer active is not re-added.
+    pub(crate) fn fields_checkpointed(&self, fields: &[(u32, FieldId)], position: u64) {
+        let mut consumers = self.field_consumers.write();
+        for key in fields {
+            if let Some(p) = consumers.get_mut(key) {
+                *p = Some(p.map_or(position, |old| old.max(position)));
+            }
+        }
+    }
+
+    /// Every field consumer and its position.
+    pub(crate) fn field_consumers(&self) -> Vec<((u32, FieldId), Option<u64>)> {
+        self.field_consumers.read().iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
     /// Stop tracking a namespace that has been dropped.
     ///
     /// A dropped namespace's store is gone from the registry, so it can never
@@ -265,6 +304,7 @@ impl WalPersistObserver {
     /// The new cut is saved; a failed save only leaves the saved cut behind,
     /// which costs replay, not data.
     pub(crate) fn forget_namespace(&self, namespace_id: u32) {
+        self.field_consumers.write().retain(|(ns, _), _| *ns != namespace_id);
         let _persist = self.persist_lock.lock();
         self.ns_progress.write().remove(&namespace_id);
         // Seal records for memtables that will now never be flushed; left
@@ -2198,7 +2238,17 @@ impl Database {
             extractor,
             index: Arc::new(parking_lot::RwLock::new(dyn_index)),
         };
-        store.namespace_index.write().register(entry);
+        // The field now needs the WAL from its checkpoint (`field_consumers`).
+        // Registered with the field, so the two cannot disagree.
+        let wal_tail = self.wal_metadata.read().tail;
+        let position = match self.index_manager.read_checkpoint_state(namespace_id, field_id, wal_tail) {
+            crate::db::index_manager::CheckpointState::At(p) => Some(p),
+            crate::db::index_manager::CheckpointState::Absent => None,
+            crate::db::index_manager::CheckpointState::Unusable => Some(0),
+        };
+        let mut namespace_index = store.namespace_index.write();
+        namespace_index.register(entry);
+        self.wal_flush_observer.add_field_consumer(namespace_id, field_id, position);
         Ok(())
     }
 
@@ -2209,7 +2259,10 @@ impl Database {
     /// [`crate::index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
-        self.get_store(namespace_id)?.namespace_index.write().deregister(field_id);
+        let store = self.get_store(namespace_id)?;
+        let mut namespace_index = store.namespace_index.write();
+        namespace_index.deregister(field_id);
+        self.wal_flush_observer.remove_field_consumer(namespace_id, field_id);
         Ok(())
     }
 
@@ -2248,6 +2301,8 @@ impl Database {
         if let Ok(store) = self.get_store(namespace_id) {
             store.namespace_index.write().deregister(field_id);
         }
+        // Not active any more, whether or not its store is open.
+        self.wal_flush_observer.remove_field_consumer(namespace_id, field_id);
 
         // (3) Reclaim disk.
         self.index_manager.remove_field_path(namespace_id, field_id)
@@ -3431,6 +3486,8 @@ impl IndexCheckpointTarget for Database {
 
         self.index_manager.checkpoint_fields(wal_tail, &active_fields)?;
         drop(stores);
+        // Their markers are durable: the *checkpointed* event.
+        self.wal_flush_observer.fields_checkpointed(&active_fields, wal_tail);
 
         // The index is now durable up to `wal_tail`, so any no-WAL writes before
         // this point are covered and their markers can go.

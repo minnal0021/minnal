@@ -4,6 +4,10 @@
 //! index still needs to replay after a crash -- without that gate the index
 //! silently loses those documents for the life of the database (FR-001).
 //!
+//! The watermark comes from the WAL observer's field consumers, kept by events
+//! (activation, each checkpoint, deactivation and drops), not from reading
+//! checkpoint markers on each tick.
+//!
 //! Three properties here are load-bearing; see `minnal_db/CLAUDE.md`:
 //! the watermark is scoped to *active* fields, the pin drains by asking the
 //! checkpoint worker rather than by waiting for its timer, and the backstop
@@ -106,52 +110,51 @@ impl Database {
         !plan.reclaim.is_empty()
     }
 
-    /// The oldest WAL segment any **currently active** field index still needs in
-    /// order to replay after a crash, or `None` when nothing is pinned.
+    /// Every field index that holds the WAL right now, with the offset it
+    /// would replay from after a crash.
     ///
-    /// `min(checkpoint offset)` over active fields, mapped to its segment. Each
-    /// field already records its replay offset in its `checkpoint` marker, so
-    /// this needs no new per-entry or per-segment state — just one marker read
-    /// per active field, on a path that runs every 60 s.
-    ///
-    /// **Scoped to active fields on purpose.** Two kinds of inactive field would
-    /// otherwise pin the WAL without bound:
-    ///
-    /// - a **dropped** field, whose marker is frozen wherever it was last
-    ///   checkpointed. Step 1 of FR-001 deletes those markers, but a field can be
-    ///   inactive without being dropped (e.g. while rebuilding) and cleanup can
-    ///   itself be interrupted, so the filter stays;
-    /// - a field **being built for the first time**, which has no marker at all
-    ///   and so reads as "replay from 0". A new index is populated by a build,
-    ///   not by replay, so it is suppressed here exactly as `detect_replay_gap`
-    ///   suppresses it — otherwise every `add_index` on an established database
-    ///   would pin the entire WAL.
-    pub(crate) fn index_replay_watermark_segment(&self) -> Option<u64> {
-        let wal_tail = self.wal_metadata.read().tail;
-        if wal_tail == 0 {
-            return None;
+    /// Read from the WAL observer's field consumers, kept by events (activation,
+    /// the *checkpointed* event, deactivation and drops), so no checkpoint marker
+    /// is read here. Only active fields are consumers: a **dropped** or
+    /// deactivated field, whose marker is frozen wherever it was last
+    /// checkpointed, would otherwise pin the WAL without bound. A field with no
+    /// checkpoint yet holds the WAL from 0 only once its index has entries: a
+    /// **first build** is populated from the stored documents, not by replay,
+    /// and is suppressed here exactly as `detect_replay_gap` suppresses it —
+    /// otherwise every `add_index` on an established database would pin the
+    /// entire WAL.
+    fn field_replay_offsets(&self) -> Vec<(u32, FieldId, u64)> {
+        let consumers = self.wal_flush_observer.field_consumers();
+        if consumers.is_empty() {
+            return Vec::new();
         }
-        let fields = self.registry.read().all_indexed_fields();
-        if fields.is_empty() {
-            return None;
-        }
-
         let stores = self.stores.read();
-        let mut watermark: Option<u64> = None;
-        for (ns_id, field_id) in fields {
-            let Some(store) = stores.get(&ns_id) else { continue };
-            let ns_index = store.namespace_index.read();
-            // Not activated → not replayed into → nothing to pin for.
-            let Some(entry) = ns_index.get(field_id) else { continue };
+        consumers
+            .into_iter()
+            .filter_map(|((ns_id, field_id), position)| match position {
+                Some(offset) => Some((ns_id, field_id, offset)),
+                None => {
+                    let store = stores.get(&ns_id)?;
+                    let ns_index = store.namespace_index.read();
+                    let populated = ns_index.get(field_id).is_some_and(|e| e.index.read().distinct_count() > 0);
+                    populated.then_some((ns_id, field_id, 0))
+                }
+            })
+            .collect()
+    }
 
-            let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-            if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                continue;
-            }
-            let segment = self.wal.segment_id_for_offset(state.replay_offset());
-            watermark = Some(watermark.map_or(segment, |w: u64| w.min(segment)));
+    /// The oldest WAL segment any **currently active** field index still needs in
+    /// order to replay after a crash, or `None` when nothing is pinned: the
+    /// lowest of [`field_replay_offsets`](Self::field_replay_offsets), mapped to
+    /// its segment.
+    pub(crate) fn index_replay_watermark_segment(&self) -> Option<u64> {
+        if self.wal_metadata.read().tail == 0 {
+            return None;
         }
-        watermark
+        self.field_replay_offsets()
+            .into_iter()
+            .map(|(_, _, offset)| self.wal.segment_id_for_offset(offset))
+            .min()
     }
 
     /// Harvest the keys held by segments the backstop is about to reclaim, and
@@ -174,24 +177,11 @@ impl Database {
     /// very outage the backstop exists to prevent.
     fn record_backstop_gaps(&self, forced: &[u64], wal_tail: u64) {
         // Which active fields needed each reclaimed segment, by checkpoint offset.
-        let mut affected: Vec<(u32, FieldId, u64)> = Vec::new();
-        {
-            let fields = self.registry.read().all_indexed_fields();
-            let stores = self.stores.read();
-            for (ns_id, field_id) in fields {
-                let Some(store) = stores.get(&ns_id) else { continue };
-                let ns_index = store.namespace_index.read();
-                let Some(entry) = ns_index.get(field_id) else { continue };
-                let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-                // Same suppression as the watermark: a never-checkpointed empty
-                // index is populated by a build, not by replay, so it loses
-                // nothing when a segment goes.
-                if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                    continue;
-                }
-                affected.push((ns_id, field_id, self.wal.segment_id_for_offset(state.replay_offset())));
-            }
-        }
+        let affected: Vec<(u32, FieldId, u64, u64)> = self
+            .field_replay_offsets()
+            .into_iter()
+            .map(|(ns_id, field_id, offset)| (ns_id, field_id, offset, self.wal.segment_id_for_offset(offset)))
+            .collect();
         if affected.is_empty() {
             return;
         }
@@ -211,7 +201,7 @@ impl Database {
 
         let cap = Self::GAP_KEY_WORKLIST_CAP;
         let detected_at_ms = crate::db::kv_store::current_epoch_millis();
-        for (ns_id, field_id, field_segment) in affected {
+        for (ns_id, field_id, from, field_segment) in affected {
             // A field checkpointed past every reclaimed segment lost nothing.
             if !forced.iter().any(|&s| s >= field_segment) {
                 continue;
@@ -231,7 +221,7 @@ impl Database {
                 namespace_id: ns_id,
                 field_id,
                 cause: crate::db::index_manager::GapCause::BackstopReclaim,
-                from: self.index_manager.read_checkpoint(ns_id, field_id, wal_tail),
+                from,
                 to: wal_tail,
                 missing_segments: forced.to_vec(),
                 detected_at_ms,
@@ -974,6 +964,164 @@ mod tests {
             "last_sequence ({}) must be >= highest written seq ({}) after GC",
             last_seq,
             seq_before_gc
+        );
+        Ok(())
+    }
+
+    // ── Field indexes as WAL consumers (A2) ──────────────────────────────────
+    //
+    // A field index needs the WAL from its last checkpoint; its position is
+    // kept by events (activation, the checkpointed event, deactivate, drop)
+    // rather than read from its marker on each GC tick.
+
+    /// The field's consumer position, if it is one.
+    fn consumer(db: &Database, ns: u32, field: FieldId) -> Option<Option<u64>> {
+        db.wal_flush_observer
+            .field_consumers()
+            .into_iter()
+            .find(|(k, _)| *k == (ns, field))
+            .map(|(_, p)| p)
+    }
+
+    #[test]
+    fn a_checkpoint_moves_its_fields_position_and_releases_the_wal_below_it() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        db.run_index_checkpoint()?;
+        let first = consumer(&db, ns, field).expect("an active field is a consumer").expect("checkpointed");
+
+        for i in 0..400u32 {
+            db.put(format!("k{i:04}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+        db.flush_all_namespaces()?;
+        db.garbage_collect_wal()?;
+        assert_eq!(db.wal_metadata.read().head, 0, "the field's position holds every segment above it");
+
+        db.run_index_checkpoint()?;
+        let second = consumer(&db, ns, field).unwrap().unwrap();
+        assert!(second > first, "the checkpointed event should move the position ({first} -> {second})");
+        db.garbage_collect_wal()?;
+        assert!(db.wal_metadata.read().head > 0, "segments below the new position should be reclaimed");
+        Ok(())
+    }
+
+    #[test]
+    fn deactivating_or_dropping_a_field_stops_it_holding_the_wal() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let a = activate_named_index(&db, ns, "a");
+        let b = activate_named_index(&db, ns, "b");
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, a).is_some() && consumer(&db, ns, b).is_some());
+
+        db.deactivate_field_index(ns, a)?;
+        assert!(consumer(&db, ns, a).is_none(), "a deactivated field still holds the WAL");
+        db.drop_field_index(ns, b)?;
+        assert!(consumer(&db, ns, b).is_none(), "a dropped field still holds the WAL");
+        assert_eq!(db.index_replay_watermark_segment(), None);
+
+        // A checkpoint after the fact does not bring them back.
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, a).is_none() && consumer(&db, ns, b).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_a_namespace_stops_its_fields_holding_the_wal() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = db.create_namespace("doomed")?;
+        let field = activate_status_index(&db, ns);
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, field).is_some());
+        db.remove_namespace("doomed")?;
+        assert!(consumer(&db, ns, field).is_none(), "a dropped namespace's field still holds the WAL");
+        Ok(())
+    }
+
+    /// A field with no checkpoint yet is populated by a build, not by replay,
+    /// so it holds nothing while its index is empty; once it has entries and
+    /// still no checkpoint, it holds the WAL from 0.
+    #[test]
+    fn a_field_without_a_checkpoint_holds_the_wal_only_once_populated() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        assert_eq!(consumer(&db, ns, field), Some(None), "no checkpoint yet");
+        assert_eq!(db.index_replay_watermark_segment(), None, "an empty first build must not pin the WAL");
+
+        db.put(b"k", br#"{"status":"active"}"#)?;
+        assert_eq!(
+            db.index_replay_watermark_segment(),
+            Some(0),
+            "a populated field without a checkpoint replays from 0"
+        );
+
+        db.run_index_checkpoint()?;
+        assert!(matches!(consumer(&db, ns, field), Some(Some(p)) if p > 0));
+        Ok(())
+    }
+
+    /// Reopening rebuilds the consumers from the markers when the fields are
+    /// activated again, so the field watermark is the one before the close.
+    #[test]
+    fn reopening_restores_the_field_positions_from_their_markers() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let (field, before) = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field = activate_status_index(&db, DEFAULT_NAMESPACE_ID);
+            for i in 0..50u32 {
+                db.put(format!("k{i}").as_bytes(), br#"{"status":"active"}"#)?;
+            }
+            db.run_index_checkpoint()?;
+            let before = consumer(&db, DEFAULT_NAMESPACE_ID, field).unwrap();
+            db.shutdown()?;
+            (field, before)
+        };
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        assert!(consumer(&db, DEFAULT_NAMESPACE_ID, field).is_none(), "not a consumer until activated");
+        let again = activate_status_index(&db, DEFAULT_NAMESPACE_ID);
+        assert_eq!(again, field);
+        let after = consumer(&db, DEFAULT_NAMESPACE_ID, field).unwrap();
+        assert!(after >= before, "the reopened position {after:?} is behind the saved one {before:?}");
+        Ok(())
+    }
+
+    /// The checkpointed event fires only once the marker is durable. A
+    /// checkpoint whose marker cannot be written leaves the position where it
+    /// was: moved anyway, WAL GC could delete segments a crash would send the
+    /// field back to.
+    #[test]
+    fn a_checkpoint_whose_marker_fails_does_not_move_the_position() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        db.put(b"k0", br#"{"status":"active"}"#)?;
+        db.run_index_checkpoint()?;
+        let before = consumer(&db, ns, field).unwrap();
+        for i in 1..50u32 {
+            db.put(format!("k{i}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+
+        // The marker is written as `checkpoint.tmp` then renamed in the field's
+        // directory; a read-only directory fails exactly that step.
+        let dir = db.index_manager.field_path(ns, field);
+        let original = std::fs::metadata(&dir)?.permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        let result = db.run_index_checkpoint();
+        std::fs::set_permissions(&dir, original)?;
+
+        assert!(result.is_err(), "setup: the marker write should fail");
+        assert_eq!(
+            consumer(&db, ns, field).unwrap(),
+            before,
+            "a failed checkpoint moved the field's position"
         );
         Ok(())
     }
