@@ -734,3 +734,56 @@ fn acknowledged_writes_survive_repeated_kills() {
         db.shutdown().unwrap();
     }
 }
+
+// ── Preallocated segments ────────────────────────────────────────────────────
+
+/// Every segment is created at its full size, so an fsync never has to commit
+/// a new file size (design note §15).
+#[test]
+fn wal_segments_are_created_at_full_size() {
+    const SEGMENT: u64 = 4096;
+    let dir = TempDir::new().unwrap();
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+    assert_eq!(std::fs::metadata(dir.path().join("wal.log")).unwrap().len(), SEGMENT);
+    for i in 0..200u32 {
+        db.put_ns(ns, format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+    }
+    let last = db.wal.segment_id_for_offset(db.wal_metadata.read().tail);
+    assert!(last >= 2, "setup: the writes should span segments");
+    for id in 1..=last {
+        let path = dir.path().join(format!("wal.log.seg{id:06}"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), SEGMENT, "segment {id} is not preallocated");
+    }
+}
+
+/// Reopening zeroes everything past the recovered tail (so a stale frame there
+/// cannot replay later) and leaves the segment at its full size.
+#[test]
+fn reopening_zeroes_past_the_tail_and_keeps_the_segment_preallocated() {
+    use std::os::unix::fs::FileExt;
+    const SEGMENT: u64 = 4096;
+    let dir = TempDir::new().unwrap();
+    let tail = {
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
+        let ns = db.create_namespace("ns").unwrap();
+        db.put_ns(ns, b"k", b"v").unwrap();
+        let tail = db.wal_metadata.read().tail;
+        db.mark_crashed();
+        tail
+    };
+    // Garbage past the tail, as a torn write would leave.
+    let wal = dir.path().join("wal.log");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal)
+        .unwrap()
+        .write_at(&[0xAB; 64], tail)
+        .unwrap();
+
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
+    assert_eq!(db.wal_metadata.read().tail, tail);
+    let bytes = std::fs::read(&wal).unwrap();
+    assert_eq!(bytes.len() as u64, SEGMENT, "the segment lost its preallocation");
+    assert!(bytes[tail as usize..].iter().all(|&b| b == 0), "bytes past the tail were not zeroed");
+}

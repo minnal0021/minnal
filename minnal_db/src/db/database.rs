@@ -3436,10 +3436,15 @@ impl Database {
         for (file, durable) in extents {
             let Ok(relative) = file.strip_prefix(&self.db_path) else { continue };
             let copy = to.join(relative);
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&copy)
-                && f.metadata()?.len() > durable
-            {
-                f.set_len(durable)?;
+            // Lose everything past what was fsynced, keeping the file's size:
+            // a preallocated WAL segment then reads as zeros there, as it would
+            // after the kernel lost those pages.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&copy) {
+                let len = f.metadata()?.len();
+                if len > durable {
+                    f.set_len(durable)?;
+                    f.set_len(len)?;
+                }
             }
         }
         Ok(())

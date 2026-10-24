@@ -1,8 +1,7 @@
 # Main WAL rework: retire by cut, checksum frames, group commit — design note
 
 **Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13
-and the measurements in §14. Preallocating segments is proposed in §14, not
-built.
+and the measurements in §14. Preallocated segments (§15) built after.
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
@@ -1044,4 +1043,38 @@ zero length still ends a segment's records), but it changes how segments
 are laid out, which recovery, open-time truncation and the power-loss
 model's coverage bookkeeping all depend on. So it is a separate design step
 for review, not part of this change.
+
+## 15. Preallocated segments
+
+**Why.** An `fdatasync` on a file that grows with each write must also commit
+the new file size. On the benchmark drive (ext4, NVMe), 3,000 128-byte writes
+each followed by `fdatasync`:
+
+| File | mean | p99 |
+|---|---|---|
+| grows with each write | 2.31 ms | 2.81 ms |
+| sized up front (`set_len`, sparse) | 0.76 ms | 2.33 ms |
+| `posix_fallocate` | 0.75 ms | 2.32 ms |
+| zero-filled | 0.71 ms | 1.02 ms |
+
+**Design.**
+
+- A new segment file is created at its full size with `set_len(segment_size)`
+  (a sparse file of zeros) and fsynced, before its directory entry is fsynced
+  and anything is written into it. `set_len` is std-only and works on Linux
+  and macOS; it matches `fallocate` here. Zero-filling has the best p99 but
+  would write 64 MiB inside the WAL lock at every segment change.
+- Nothing about reading changes: past the last frame a segment holds zeros,
+  and a zero length already ends a segment's records (§5).
+- Open still cuts the log off at the recovered tail, by zeroing what follows
+  it: truncate to the tail, then size the file back up. So stale frames past a
+  torn tail still cannot replay (§5.2), and the active segment stays
+  preallocated.
+- A segment takes its full size on disk only as it is written (sparse), though
+  `ls` shows 64 MiB for each segment file.
+- The power-loss model can no longer use a segment's file length as what an
+  fsync covered (it is always the full size). It records, per segment, how far
+  frames have been written, and an fsync covers what was written before it
+  started. A power loss then zeroes everything after that point, as the
+  kernel would for pages never written back.
 

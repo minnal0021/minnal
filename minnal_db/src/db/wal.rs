@@ -64,6 +64,19 @@ enum Frame {
     Valid(u32),
 }
 
+/// Size `file` to `size` bytes up front (a sparse file of zeros past its data)
+/// and make that durable. An `fdatasync` on a file that grows with each write
+/// must also commit its new size; on a file already at its full size it does
+/// not, which measured about 3× cheaper (design note §15). Past the last frame
+/// the file reads as zeros, and a zero length already ends a segment.
+fn preallocate(file: &File, size: u64) -> std::io::Result<()> {
+    if file.metadata()?.len() < size {
+        file.set_len(size)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
 /// The frame bytes for `body`: header, then the body.
 fn encode_frame(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(FRAME_HEADER_LEN as usize + body.len());
@@ -449,6 +462,11 @@ pub struct Wal {
     /// could write (every earlier one survived a reopen, so it is durable).
     #[cfg(test)]
     synced: parking_lot::Mutex<BTreeMap<u64, u64>>,
+    /// Test hook for the power-loss model: per segment, how far frames have
+    /// been written (segments are preallocated, so the file length says
+    /// nothing about it).
+    #[cfg(test)]
+    written: parking_lot::Mutex<BTreeMap<u64, u64>>,
     #[cfg(test)]
     first_open_segment: AtomicU64,
     #[cfg(test)]
@@ -515,6 +533,9 @@ impl Wal {
             options.create(true);
         }
         let file = options.open(&path)?;
+        if is_new {
+            preallocate(&file, self.segment_size)?;
+        }
         // A new segment's *name* must be durable before any write into it is
         // acknowledged. Every append fsyncs the file's contents, but a file's
         // directory entry is only durable once the directory is fsynced — until
@@ -581,6 +602,9 @@ impl Wal {
         let path = path.as_ref().to_path_buf();
         let is_new = !path.exists();
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        if is_new {
+            preallocate(&file, segment_size.max(MIN_SEGMENT_SIZE))?;
+        }
         // As in `open_segment_file`: a newly created WAL file's name must be
         // durable before the first write into it is acknowledged.
         if is_new && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -603,6 +627,8 @@ impl Wal {
             frozen: parking_lot::Mutex::new((false, 0)),
             #[cfg(test)]
             synced: parking_lot::Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            written: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             first_open_segment: AtomicU64::new(0),
             #[cfg(test)]
@@ -649,6 +675,8 @@ impl Wal {
         if entry_len > remaining {
             if remaining >= 4 {
                 self.write_all_at(&file_arc, &0u32.to_le_bytes(), segment_offset)?;
+                #[cfg(test)]
+                self.note_written(segment_id, segment_offset + 4);
             }
             // Commit rounds fsync only the active segment, so a segment is made
             // durable as it is left: then everything below the active segment
@@ -665,6 +693,8 @@ impl Wal {
 
         // One write: header (length + CRC) and body.
         self.write_all_at(&file_arc, &encode_frame(&entry_bytes), segment_offset)?;
+        #[cfg(test)]
+        self.note_written(segment_id, segment_offset + entry_len);
         if sync {
             self.sync_or_poison(&file_arc, segment_id, "syncing a WAL append")?;
         }
@@ -704,6 +734,7 @@ impl Wal {
             let segment_id = self.segment_id_for(tail);
             self.first_open_segment.store(segment_id, Ordering::SeqCst);
             self.synced.lock().insert(segment_id, self.segment_offset_for(tail));
+            self.written.lock().insert(segment_id, self.segment_offset_for(tail));
         }
     }
 
@@ -767,6 +798,13 @@ impl Wal {
             .collect()
     }
 
+    #[cfg(test)]
+    fn note_written(&self, segment_id: u64, end: u64) {
+        let mut written = self.written.lock();
+        let entry = written.entry(segment_id).or_insert(0);
+        *entry = (*entry).max(end);
+    }
+
     /// Test hook: whether an fsync issued by this process (or the reopen)
     /// covered every byte below `end`.
     #[cfg(test)]
@@ -797,10 +835,12 @@ impl Wal {
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
             return Err(self.poison(format!("{what}: injected fsync failure")));
         }
-        // What this fsync covers, for the power-loss model: the file's length
-        // before it starts (bytes written later may or may not be covered).
+        // What this fsync covers, for the power-loss model: how far frames were
+        // written before it starts (bytes written later may or may not be
+        // covered).
         #[cfg(test)]
-        let covered = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let covered = self.written.lock().get(&segment_id).copied().unwrap_or(0);
+        let _ = file;
         file.sync_data().map_err(|e| self.poison(format!("{what}: {e}")))?;
         #[cfg(test)]
         {
@@ -1187,8 +1227,9 @@ impl Wal {
     }
 
     /// Cut the log off at `tail`, the end of its valid frames found by
-    /// [`recover_tail`](Self::recover_tail): truncate the segment holding it and
-    /// remove any later segment files, then make that durable. Called at open,
+    /// [`recover_tail`](Self::recover_tail): zero the segment holding it from
+    /// there on (keeping it at its full, preallocated size) and remove any
+    /// later segment files, then make that durable. Called at open,
     /// before anything is appended.
     ///
     /// Without it, a later, shorter record written over a torn region leaves
@@ -1199,10 +1240,11 @@ impl Wal {
         let keep = self.segment_offset_for(tail);
         let path = self.segment_path_for(segment_id);
         let mut changed = false;
-        if let Ok(file) = OpenOptions::new().write(true).open(&path)
-            && file.metadata()?.len() > keep
-        {
+        if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+            // Zero everything after the tail (cut, then size back up), so the
+            // active segment stays preallocated.
             file.set_len(keep)?;
+            file.set_len(self.segment_size)?;
             file.sync_all()?;
             changed = true;
         }
