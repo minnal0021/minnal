@@ -78,6 +78,21 @@ fn preallocate(file: &File, size: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write `path` in full with zeros, `size` bytes, and fsync it: a segment whose
+/// blocks are all written, so an fsync after a write into it commits no block
+/// allocation (design note §17).
+fn zero_fill(path: &Path, size: u64) -> std::io::Result<()> {
+    let file = OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
+    let chunk = vec![0u8; (1 << 20).min(size as usize)];
+    let mut offset = 0u64;
+    while offset < size {
+        let n = chunk.len().min((size - offset) as usize);
+        file.write_all_at(&chunk[..n], offset)?;
+        offset += n as u64;
+    }
+    file.sync_all()
+}
+
 /// The frame bytes for `body`: header, then the body.
 fn encode_frame(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(FRAME_HEADER_LEN as usize + body.len());
@@ -438,6 +453,9 @@ pub struct Wal {
     /// Group commit: the durable tail, commit rounds and poisoning, shared in
     /// shape with the vector index WAL (`db/commit_rounds.rs`).
     rounds: CommitRounds,
+    /// The next segment being zero-filled ahead, under its `.prep` name, by a
+    /// background thread (design note §17): its id and the thread.
+    prepared: parking_lot::Mutex<Option<(u64, std::thread::JoinHandle<std::io::Result<()>>)>>,
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
     /// Test hook for the power-loss model: per segment, the most bytes an fsync
@@ -476,6 +494,12 @@ pub struct Wal {
 /// reference is gone. This mirrors the `Drop` pattern in `Atomic`'s own docs.
 impl Drop for Wal {
     fn drop(&mut self) {
+        // A segment still being prepared is not needed: let its thread finish,
+        // then remove the file (the next open would remove it anyway).
+        if let Some((id, thread)) = self.prepared.lock().take() {
+            let _ = thread.join();
+            let _ = std::fs::remove_file(self.prep_path_for(id));
+        }
         let handle = std::mem::replace(&mut self.handle, Atomic::null());
         // SAFETY: we hold `&mut self`, so this pointer is unreachable from any
         // other thread and is dropped exactly once. The pointer can be null if
@@ -528,7 +552,65 @@ impl Wal {
         Ok(file)
     }
 
+    /// Where segment `segment_id` is zero-filled before it is needed.
+    fn prep_path_for(&self, segment_id: u64) -> PathBuf {
+        let mut path = self.segment_path_for(segment_id).into_os_string();
+        path.push(".prep");
+        PathBuf::from(path)
+    }
+
+    /// Once the active segment is half full, start zero-filling the next one
+    /// in the background (design note §17), unless that is already under way.
+    fn maybe_prepare_next(&self, segment_id: u64, written: u64) {
+        if written * 2 < self.segment_size {
+            return;
+        }
+        let next = segment_id + 1;
+        let mut prepared = self.prepared.lock();
+        if prepared.as_ref().is_some_and(|(id, _)| *id >= next) {
+            return;
+        }
+        let path = self.prep_path_for(next);
+        let size = self.segment_size;
+        let thread = std::thread::Builder::new()
+            .name("wal-prepare".into())
+            .spawn(move || zero_fill(&path, size));
+        match thread {
+            Ok(thread) => *prepared = Some((next, thread)),
+            Err(e) => log::warn!("[WAL] could not start preparing segment {next}; it will be created sparse: {e}"),
+        }
+    }
+
+    /// Move a zero-filled segment `segment_id` into place, if one was
+    /// prepared; returns whether it was. Waits for an unfinished preparation.
+    fn install_prepared(&self, segment_id: u64) -> Result<bool> {
+        let Some((id, thread)) = self.prepared.lock().take() else {
+            return Ok(false);
+        };
+        let prep = self.prep_path_for(id);
+        let done = thread
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("the preparing thread panicked")));
+        if id != segment_id || done.is_err() {
+            if let Err(e) = &done {
+                log::warn!("[WAL] preparing segment {id} failed; segment {segment_id} will be created sparse: {e}");
+            }
+            let _ = std::fs::remove_file(&prep);
+            return Ok(false);
+        }
+        let path = self.segment_path_for(segment_id);
+        std::fs::rename(&prep, &path)?;
+        // The new name must be durable before anything is acknowledged into it.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(true)
+    }
+
     fn rotate_to_segment(&self, segment_id: u64) -> Result<()> {
+        if !self.segment_path_for(segment_id).exists() {
+            self.install_prepared(segment_id)?;
+        }
         let file = self.open_segment_file(segment_id, true)?;
         let new_handle = WalHandle::new(Arc::new(file));
         let guard = epoch::pin();
@@ -581,6 +663,18 @@ impl Wal {
 
     pub fn open_with_options_and_segment_size<P: AsRef<Path>>(path: P, _use_mmap: bool, segment_size: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // A segment left half-prepared by a previous run is not part of the log.
+        if let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+            && let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+        {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.starts_with(name) && file_name.ends_with(".prep") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let is_new = !path.exists();
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
         if is_new {
@@ -600,6 +694,7 @@ impl Wal {
             segment_size: segment_size.max(MIN_SEGMENT_SIZE),
             current_segment_id: AtomicU64::new(0),
             rounds: CommitRounds::new(0),
+            prepared: parking_lot::Mutex::new(None),
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -670,6 +765,7 @@ impl Wal {
         self.write_all_at(&file_arc, &encode_frame(&entry_bytes), segment_offset)?;
         #[cfg(test)]
         self.note_written(segment_id, segment_offset + entry_len);
+        self.maybe_prepare_next(segment_id, segment_offset + entry_len);
         if sync {
             self.sync_or_poison(&file_arc, segment_id, "syncing a WAL append")?;
         }
@@ -1864,6 +1960,55 @@ mod tests {
         assert_eq!(scanned.len(), 1, "the scan must stop at the corrupt frame");
         assert_eq!(scanned[0].0.offset, first.offset);
         assert!(wal.read_entry(second).is_err(), "reading the corrupt frame must fail");
+        Ok(())
+    }
+
+    /// Past half of a segment, the next one is zero-filled ahead under a
+    /// temporary name; moving to it installs that file, with every block
+    /// written (so an fsync there commits no block allocation), and the log
+    /// reads back whole.
+    #[test]
+    fn the_next_segment_is_zero_filled_ahead_and_installed() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        const SEGMENT: u64 = 4096;
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("z.wal");
+        let wal = Wal::open_with_options_and_segment_size(&path, false, SEGMENT)?;
+        let mut tail = 0u64;
+        let mut n = 0u32;
+        while tail < SEGMENT / 2 + 64 {
+            wal.append_entry(&WalEntry::new_upsert(format!("k{n}").into_bytes(), vec![b'v'; 40]), &mut tail, false)?;
+            n += 1;
+        }
+        let prep = wal.prep_path_for(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !wal.prepared.lock().as_ref().is_some_and(|(_, t)| t.is_finished()) {
+            assert!(std::time::Instant::now() < deadline, "the next segment was never prepared");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(prep.exists(), "the prepared segment should wait under its temporary name");
+        assert!(!wal.segment_path_for(1).exists(), "recovery must not see the next segment early");
+        while tail < SEGMENT + 64 {
+            wal.append_entry(&WalEntry::new_upsert(format!("k{n}").into_bytes(), vec![b'v'; 40]), &mut tail, false)?;
+            n += 1;
+        }
+        let seg1 = std::fs::metadata(wal.segment_path_for(1))?;
+        assert!(!prep.exists(), "the prepared file should have been moved into place");
+        assert_eq!(seg1.len(), SEGMENT);
+        assert!(seg1.blocks() * 512 >= SEGMENT, "the installed segment is sparse, not zero-filled");
+        assert_eq!(wal.recover_tail(0), tail);
+        assert_eq!(wal.scan_entries(0, tail)?.len(), n as usize);
+        Ok(())
+    }
+
+    #[test]
+    fn a_leftover_prepared_segment_is_removed_at_open() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("z.wal");
+        let leftover = temp_dir.path().join("z.wal.seg000003.prep");
+        std::fs::write(&leftover, [0u8; 16])?;
+        let _wal = Wal::open(&path)?;
+        assert!(!leftover.exists());
         Ok(())
     }
 }

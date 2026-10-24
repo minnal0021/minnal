@@ -789,21 +789,28 @@ fn reopening_zeroes_past_the_tail_and_keeps_the_segment_preallocated() {
 }
 
 /// Measurement, not a check: one writer's `put` latency on the real disk
-/// (the repository's `target/` directory), after a warm-up.
+/// (the repository's `target/` directory), per value size, once the log has
+/// moved past its first (sparse) segment onto zero-filled ones (design note
+/// §17). 2 MiB segments so that happens quickly.
 #[test]
 #[ignore = "measurement; run explicitly with --release --ignored --nocapture"]
 fn measure_one_writer_put_latency() {
-    let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
-    let db = Database::open(dir.path(), create_db_config()).unwrap();
-    let ns = db.create_namespace("ns").unwrap();
-    for i in 0..200u32 {
-        db.put_ns(ns, format!("warm{i}").as_bytes(), &[b'v'; 128]).unwrap();
+    const SEGMENT: u64 = 2 << 20;
+    for size in [128usize, 2048, 8192] {
+        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
+        let ns = db.create_namespace("ns").unwrap();
+        let mut i = 0u64;
+        while db.wal_metadata.read().tail < SEGMENT * 2 + SEGMENT / 4 {
+            db.put_ns(ns, format!("warm{i}").as_bytes(), &vec![b'v'; size]).unwrap();
+            i += 1;
+        }
+        let n = 2000u32;
+        let started = std::time::Instant::now();
+        for k in 0..n {
+            db.put_ns(ns, format!("k{k:05}").as_bytes(), &vec![b'v'; size]).unwrap();
+        }
+        let per = started.elapsed() / n;
+        println!("one-writer put, {size} B: {per:?} each, {:.0}/s", 1.0 / per.as_secs_f64());
     }
-    let n = 2000u32;
-    let started = std::time::Instant::now();
-    for i in 0..n {
-        db.put_ns(ns, format!("k{i:05}").as_bytes(), &[b'v'; 128]).unwrap();
-    }
-    let per = started.elapsed() / n;
-    println!("one-writer put, 128 B: {per:?} each, {:.0}/s", 1.0 / per.as_secs_f64());
 }

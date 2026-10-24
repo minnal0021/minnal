@@ -1158,3 +1158,41 @@ end markers and an open-time rule that tells a torn tail from corruption by
 which segment a bad frame is in; preallocation changes what the zeros past
 the tail mean to that rule, so it is a separate step.
 
+## 17. Zero-filled segments, prepared ahead
+
+**Why.** §15's sparse segments save the size update but not block allocation:
+an fsync after a write that starts a new 4 KiB block still costs about as much
+as before (table in §15). Blocks that already hold data — zeros written and
+fsynced — need neither, so every write's fsync costs about 0.7 ms whatever its
+size.
+
+**Design.**
+
+- When the active segment passes half its size, a background thread writes
+  the next segment's file in full with zeros, under a temporary name
+  (`wal.log.segNNNNNN.prep`), and fsyncs it. Half full leaves a whole half
+  segment of writes for it to finish, and a database that never writes much
+  never pays the 64 MiB.
+- When the log moves to that segment, the prepared file is renamed into place
+  and the directory fsynced (a new segment's name was already fsynced before
+  anything is acknowledged into it). If preparation has not finished, the
+  writer waits for it; if there is none, the segment is created sparse, as in
+  §15.
+- The temporary name keeps the file invisible to recovery, which takes "the
+  next segment file exists" to mean the log continues there. Open deletes any
+  leftover `.prep` file.
+- Reading is unchanged: past the last frame a segment holds zeros, which ends
+  its records.
+- The first segment of a new database, and the active segment at open, stay
+  sparse; the zero-filled ones start from the next segment.
+
+**Cost.** One extra 64 MiB write per 64 MiB of WAL, off the write path.
+
+**Measured** (one writer, 2,000 `put`s after the log moved onto zero-filled
+segments, 2 MiB segments): 0.743 ms at 128 B, 0.726 ms at 2 KiB, 0.748 ms at
+8 KiB — against 0.77, 1.5 and 2.3 ms with sparse segments (§15). Tests:
+`the_next_segment_is_zero_filled_ahead_and_installed` (the installed file's
+blocks are allocated, and the log reads back whole),
+`a_leftover_prepared_segment_is_removed_at_open`; the power-loss stress, whose
+4 KiB segments switch to prepared ones constantly, and the kill harness pass.
+
