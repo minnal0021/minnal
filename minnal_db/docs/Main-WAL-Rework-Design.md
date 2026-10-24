@@ -6,9 +6,10 @@
 
 - **A. Retire by cut.** Everything that needs the WAL reports, by an event, how
   far it no longer does, and the WAL keeps the log from the lowest such point.
-  - **A1.** Memtable flushes: the log records the flush cut as one position
-    in its metadata, instead of rewriting each entry's status in place. The
-    log becomes append-only.
+  - **A1.** Memtable flushes: the log records its progress (the cut and each
+    namespace's safe offset) in its metadata, before the flush's L0 files are
+    registered, instead of rewriting each entry's status in place. The log
+    becomes append-only, and the two logs retire the same way.
   - **A2.** Field-index checkpoints: each checkpoint reports its WAL position
     as an event, instead of WAL GC reading every checkpoint marker on every
     tick. WAL GC keeps the log from the lower of the two.
@@ -135,7 +136,8 @@ order:
 - *flushing* — before any L0 file is written (the vector index WAL syncs here);
 - *written* — L0 files durable, not yet registered (the vector index WAL
   records its progress here);
-- *flushed* — L0 files registered. This is the main WAL's event.
+- *flushed* — L0 files registered. This is the main WAL's event today (A1
+  moves it to *written*, §4.2).
 
 **On *flushed*, the namespace's safe offset moves, then the cut.**
 
@@ -375,38 +377,69 @@ Statuses are written in exactly two places:
   these flips only feed the per-segment persisted counts that WAL GC reads.
 
 So one saved position, the cut, tells recovery and GC everything the statuses
-do.
+do. A1 saves a little more than that, for the reason in §4.2.
 
-### 4.2 The metadata records the cut
+### 4.2 The metadata records the cut and each namespace's safe offset
 
-The WAL metadata gains `cut`. When `try_advance_persisted` moves the cut (on a
-flush's *flushed* event, after its L0 files are durable and registered), it
-saves the metadata with the new cut. That is the moment the statuses are made
-durable today, so recovery sees the same position it would have read from the
-statuses.
+The WAL metadata gains the cut and, for every namespace whose safe offset is
+above the cut, that offset (the layout the vector index WAL's `retired_cut`
+marker already uses). Recovery replays an entry only if it lies at or above
+its own namespace's saved offset (the cut, for a namespace not listed).
+
+**Why per namespace, and not just the cut.** One key's writes can be split
+across the two logs. If a main-WAL put of a key were followed by a delete of
+it in the vector index WAL, and that delete's tombstone were later dropped by
+L1 compaction, replaying the put from a cut below its namespace's real
+progress would bring the key back with nothing newer to beat it. The vector
+index WAL guards against exactly this the other way round
+(`replay_does_not_bring_back_a_key_whose_delete_reached_l1`). No caller does
+it to the main WAL today (the only vector-index-WAL deletes are maintenance's
+deletes of chunk-code keys, which get no main-WAL puts), but with
+per-namespace offsets that stops being a rule every future caller must know.
+
+**When it is saved: on *written*, before the L0 files are registered.** The
+per-namespace offsets only protect replay if they are durable before the L0
+files they describe can be compacted into L1. So the main WAL's observer moves
+from the *flushed* event to *written* (L0 files durable, not yet registered),
+as the vector index WAL's did:
+
+1. The namespace's safe offset advances to the sealed memtable's ceiling
+   (`advance_namespace`, still only through flushes that finished in order).
+2. The cut is recomputed (`try_advance_persisted`).
+3. The metadata is saved with the new cut and offsets.
+4. Only then does the event return, and the LSM registers the L0 files.
+
+If the save fails, the event returns an error and the LSM undoes the flush
+(nothing registered, the memtable kept for a retry), which the flush events
+already support. The event runs behind `SyncValueLogBeforePersist`, so the
+values these entries point at are fsynced first, as they must be before the
+entries stop being replayed.
+
+A crash after the save but before registration leaves durable L0 files that
+open finds by listing the level directory, so their writes are not lost; a
+crash before the save replays those entries again, which is harmless because
+files not yet registered cannot have been compacted. A saved offset is never
+**ahead** of what is on disk, and never behind what L1 compaction can have
+merged.
 
 The save runs under `persist_lock` (which already serialises retirement), not
-the WAL lock: it reads the tail and cut under a brief read lock, then writes the
-file. Holding `persist_lock` across the write means two saves cannot finish in
-the opposite order, so an older cut never overwrites a newer one. The other
-saves (WAL GC, clean shutdown, recovery) take the same lock. Writers no
-longer wait for any metadata fsync.
+the WAL lock: it reads the tail and the progress under brief locks, then writes
+the file. Holding `persist_lock` across the write means two saves cannot finish
+in the opposite order, so older progress never overwrites newer. The other
+saves (WAL GC, clean shutdown, recovery) take the same lock. Writers no longer
+wait for any metadata fsync; the flush that triggers a save waits for it, as it
+waits for its L0 fsyncs.
 
-The saved cut may lag the real one (a crash between a flush and its save). That
-only replays entries that are also in SSTables, which seq resolution makes
-harmless, as it does today when a crash lands before the status flips are
-synced. A saved cut can never be **ahead** of what is in SSTables: it is only
-saved after the flush it reflects.
+### 4.3 Recovery replays each namespace from its own offset
 
-### 4.3 Recovery replays from the cut
-
-`recover_from_wal` scans `[cut, tail)`, skips entries of namespaces that no
-longer exist, and replays the rest in seq order, as today. After it has flushed
-and compacted every namespace it sets the cut to the tail and saves the
+`recover_from_wal` scans from the cut to the tail, skips entries of namespaces
+that no longer exist and entries below their namespace's saved offset, and
+replays the rest in seq order, as today. After it has flushed and compacted
+every namespace it sets the cut to the tail, clears the offsets and saves the
 metadata (today it rewrites every replayed entry's status).
 
 `rebuild_wal_persisted_state`, the open-time scan that counts Persisted entries
-to find where the prefix ends, goes: the cut is read from the metadata.
+to find where the prefix ends, goes: the progress is read from the metadata.
 
 ### 4.4 WAL GC deletes segments below the cut
 
@@ -700,8 +733,8 @@ three changes in:
 | During the fsync | same | same | none |
 | After the fsync, before the writers apply | the round's frames are durable | replayed with their seqs | none |
 | Hole inside a round (a later page reached disk, an earlier one did not) | valid frames after a zero or torn region | recovery stops at the hole; later frames are truncated | none: every frame after the hole belongs to the same unfinished round or a later one |
-| After a flush, before its cut is saved | saved cut lags | replays from the older cut; those entries are also in SSTables, and seq resolution keeps the newer versions | none |
-| Mid metadata save | old or new file (atomic rename) | either is valid: the tail is ≤ durable, the cut ≤ what is in SSTables | none |
+| In a flush's *written* event, before its save | L0 files durable, not registered; saved progress lags | open finds the L0 files by listing; replays those entries again from the older offsets, harmless because unregistered files cannot have been compacted | none |
+| Mid metadata save | old or new file (atomic rename) | either is valid: the tail is ≤ durable, each offset ≤ what is in L0 | none |
 | During namespace drop | its entries above the cut | skipped as an unknown namespace, as today | none (the namespace was being dropped) |
 | After a field's marker is durable, before its *checkpointed* event | marker at P; GC still held the older position | the consumers are rebuilt from the markers at open; the field replays from P | none (GC was only more conservative) |
 
@@ -712,8 +745,9 @@ What does not change:
 - **Visibility:** a record is applied to the memtable only after its fsync, so
   a reader never sees a write that a crash could undo.
 - **The vector index WAL** and its prefix rule are untouched; the two logs share
-  only the sequence counter. The cut moves at the same moments the statuses
-  were flipped, so the cross-log replay argument in
+  only the sequence counter, and both now save per-namespace progress before
+  L0 files are registered. A main-WAL entry still retires only once the L0
+  files holding its write are durable, so the cross-log replay argument in
   `Vector-Index-WAL-Design.md` holds as it is.
 
 ## 9. Tests
@@ -722,6 +756,12 @@ What does not change:
 
 - After a flush the saved cut equals the observer's cut, and a crash then
   replays nothing below it.
+- A main-WAL put followed by a vector-index-WAL delete of the same key
+  (a test-only use), flushed and compacted to L1, does not come back after a
+  crash (the main-WAL twin of
+  `replay_does_not_bring_back_a_key_whose_delete_reached_l1`).
+- A failed metadata save in *written* undoes the flush, and the retry
+  completes it.
 - A crash between a flush and its metadata save replays the flushed entries
   and every key reads its last value (including a key whose delete was later
   compacted).
@@ -774,8 +814,12 @@ had not returned is half-applied.
 
 **Mutation checks** (each must make a test fail, then be reverted):
 
-- Save the cut before the flush is registered → a crash after the save loses
-  writes that were only in the memtable.
+- Save the progress before the L0 files are durable (at *sealed*) → a crash
+  after the save loses writes that were only in the memtable.
+- Save it on *flushed*, after registration → the cross-log test above brings
+  the key back (with a test hook that compacts between registration and the
+  save).
+- Replay from the cut instead of each namespace's offset → the same test fails.
 - GC a segment that straddles the cut → its entries above the cut are lost.
 - Send *checkpointed* before the field's marker is durable → after GC and a
   crash, the field misses entries with no gap recorded.
@@ -838,11 +882,6 @@ Each step is built, tested and reviewed before the next.
 
 ## Not covered here
 
-- **Per-namespace safe offsets in the metadata**, so recovery could skip a
-  flushed namespace's entries above the global cut. The statuses never did
-  this (they flip only below the cut), so the single cut loses nothing; it
-  would be a later refinement, and it is how the vector index WAL already
-  works.
 - **A multi-namespace batch** (RocksDB's `WriteBatch`). Group commit already
   lets the writes of one logical operation share an fsync when they are
   concurrent; a batch would make them atomic, which is a larger change to the
@@ -852,8 +891,10 @@ Each step is built, tested and reviewed before the next.
 
 ## 12. Decisions for review
 
-1. Retire by a saved cut instead of per-entry statuses (A1), saved under
-   `persist_lock` rather than the WAL lock.
+1. Retire by saved progress instead of per-entry statuses (A1): the cut plus
+   each namespace's safe offset, saved on the *written* event before L0 files
+   are registered (a failed save undoes the flush), under `persist_lock` rather
+   than the WAL lock. Recovery replays each namespace from its own offset.
 2. Field-index checkpoints report their position as an event, and WAL GC
    retires below the lowest position of all consumers (A2); consumers are added
    and removed in the same calls that activate, deactivate and drop fields.
