@@ -4,9 +4,14 @@
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
-- **A. Retire by cut.** The log records how far it is safe to skip as one
-  position in its metadata, instead of rewriting each entry's status in place.
-  The log becomes append-only.
+- **A. Retire by cut.** Everything that needs the WAL reports, by an event, how
+  far it no longer does, and the WAL keeps the log from the lowest such point.
+  - **A1.** Memtable flushes: the log records the flush cut as one position
+    in its metadata, instead of rewriting each entry's status in place. The
+    log becomes append-only.
+  - **A2.** Field-index checkpoints: each checkpoint reports its WAL position
+    as an event, instead of WAL GC reading every checkpoint marker on every
+    tick. WAL GC keeps the log from the lower of the two.
 - **B. Checksummed frames.** Every record carries a CRC, and open truncates a
   torn tail.
 - **C. Group commit.** Concurrent writers share one fsync.
@@ -15,6 +20,7 @@ The guarantee a caller gets does not change: a `put`, `delete` or `merge`
 returns only once its WAL record is on stable storage. The vector index WAL,
 the no-WAL writes and the doc store's API are unchanged.
 
+Section 1.2 explains how a flush retires WAL entries and how WAL GC works now.
 Section 2 compares minnal's two logs with RocksDB, Milvus and turbopuffer; the
 three changes follow from that comparison.
 
@@ -59,8 +65,17 @@ segment, tail, torn tail, poisoned, flush observer and the rest) are defined in
 - **Field-index replay watermark** — the oldest WAL segment some field index
   still needs to replay after a crash (`index_replay_watermark_segment`). WAL GC
   keeps segments from it on, up to `max_pinned_wal_segments`.
+- **WAL consumer** (A2) — anything that needs the WAL from some position on,
+  and reports by an event when that position moves: a namespace's memtables
+  (moved by the *flushed* event) and a field index (moved by its checkpoint).
+- **Flush cut / retirement cut** — the flush cut is the cut above, where
+  memtable replay starts after a crash. The retirement cut is the lowest
+  position of all WAL consumers, memtables and field indexes; WAL GC deletes
+  segments wholly below it.
 
 ## 1. The cost now
+
+### 1.1 One write
 
 Every main-WAL write does this, one writer at a time:
 
@@ -87,11 +102,120 @@ main WAL therefore manages one write per device flush, whatever the number of
 clients: 387–402 writes a second during the semantic-search ingest benchmark,
 with the drive about 92% busy (`Fewer-WAL-Fsyncs-Design.md`, §14).
 
-Retirement adds to it. When a memtable flush moves the cut forward,
-`Database::mark_persisted_range` reads every entry between the old and new cut,
-rewrites each one with status Persisted, fsyncs every segment it touched,
-updates per-segment persisted counts, and saves the WAL metadata file, the
-last two while holding the WAL lock. Every writer waits for that save's fsyncs.
+### 1.2 From flush to garbage collection
+
+An entry can leave the log once its write is in an L0 file. The WAL works that
+out in two stages: it keeps a **cut** (every entry below it is in an SSTable)
+and records it; WAL GC later deletes segments wholly below it.
+`WalPersistObserver` in `db/database.rs` does the first stage, driven by the
+flush events.
+
+**While writes come in.** Each write is appended to the WAL, then applied to
+its namespace's memtable. The observer tracks:
+
+- each namespace's furthest WAL position (`note_write`), for example "*docs*
+  has written up to 900";
+- the *in-flight* writes, appended but not yet applied (`begin_write`,
+  registered before the WAL lock is released and cleared after the apply), so
+  nothing counts them as saved.
+
+**Seal.** When a memtable fills, it is made read-only and a new one takes the
+writes. The *sealed* event records, for that namespace and memtable, a
+position X: "every entry of this namespace below X is in this memtable". X is
+the log's tail capped at the oldest in-flight write (`wal_cut_ceiling`): an
+in-flight write sits below the tail in the log but will be applied to the
+*new* memtable.
+
+**Flush.** The sealed memtable is written to L0, and four events fire in
+order:
+
+- *sealed* — above;
+- *flushing* — before any L0 file is written (the vector index WAL syncs here);
+- *written* — L0 files durable, not yet registered (the vector index WAL
+  records its progress here);
+- *flushed* — L0 files registered. This is the main WAL's event.
+
+**On *flushed*, the namespace's safe offset moves, then the cut.**
+
+1. The namespace's safe offset moves up to X (`advance_namespace`). It only
+   moves through flushes that finished in order: if a newer memtable of the
+   namespace finishes first, its X waits until the older one has flushed too.
+2. The cut is recomputed (`try_advance_persisted`): the lowest safe offset
+   among namespaces that still have unflushed writes (furthest position above
+   their safe offset), capped at the oldest in-flight write. A namespace whose
+   writes are all flushed does not hold it back. With *docs* flushed to 900 and
+   *users* to 400, both with unflushed writes, the cut is 400; when *users*
+   flushes to 1,000, it becomes 900.
+
+```mermaid
+sequenceDiagram
+    participant W as Writers
+    participant O as WAL observer
+    participant M as Memtable (docs)
+    participant F as LSM flush
+    participant G as WAL GC (each tick)
+    W->>O: docs wrote up to 900 (note_write)
+    M->>F: full: seal
+    F->>O: sealed: docs entries below X are in this memtable
+    F->>F: write and fsync L0 files, register them
+    F->>O: flushed
+    O->>O: docs safe offset = X
+    O->>O: cut = lowest safe offset of namespaces with unflushed writes
+    O->>O: record the cut (mark entries below it Persisted)
+    G->>O: which segments lie wholly below the cut?
+    G->>G: delete them, unless a field index still needs them
+```
+
+**Recording the cut.** `Database::mark_persisted_range` reads every entry
+between the old cut and the new one, rewrites each with status Persisted,
+fsyncs every segment it touched, updates the per-segment persisted counts and
+saves the WAL metadata file. The last two run while holding the WAL lock, so
+every writer waits for that save's fsyncs. Change A replaces all of this with
+saving the cut itself.
+
+**WAL GC**, on its worker's tick, deletes a segment when both hold:
+
+- **It is fully retired**: every entry in it is Persisted (after change A: it
+  lies wholly below the cut), and it is not the active segment.
+- **No field index still needs it.** A field index (the bitmaps behind field
+  queries) is held in memory and saved to disk by periodic checkpoints. Each
+  checkpoint records the WAL position it covers. After a crash, a field index
+  is rebuilt by loading its last checkpoint and replaying the WAL from that
+  position, so WAL GC keeps every segment from the oldest active field's
+  checkpoint on (the *field-index replay watermark*).
+
+**The backstop, and what a gap is.** If the checkpoint worker stalls, that
+watermark stops moving and the WAL would grow without limit. So once more than
+`max_pinned_wal_segments` (default 32) retired segments are held only by the
+watermark, WAL GC deletes the oldest of them anyway. A field whose checkpoint
+is older than a deleted segment could no longer be rebuilt fully after a
+crash: the writes in that segment would be missing from its bitmaps. That is
+the **gap**. Because the segment is the only record of which keys it held, WAL
+GC first reads the keys out of it and saves a gap record beside the field's
+checkpoint (`gap.json`): which field, which segments, and the keys
+(`record_backstop_gaps`). The field is then reported as degraded, and
+`POST /admin/indices/{ns}/attribute/{field}/repair` (`repair_field_index`)
+re-derives just those keys' entries from their current stored values, or
+rebuilds the whole field if the key list was too long, and clears the record.
+If the process does not crash, the in-memory index is complete and the next
+checkpoint covers it; the record is written anyway, because once the segment
+is deleted nothing could reconstruct the keys later, and it stays until a
+repair clears it. The documents themselves
+are never affected: their writes are in SSTables, which is why the segment was
+retired.
+
+**What keeps the cut moving.** An idle namespace with a few unflushed writes
+never fills its memtable, so it would hold the cut for good; the GC tick
+flushes such namespaces (`flush_namespaces_pinning_wal`). A dropped namespace
+is forgotten (`forget_namespace`), so it stops holding the cut, and recovery
+skips its entries.
+
+**After a crash**, recovery replays the entries from the cut to the tail, in
+seq order, into the memtables, skipping namespaces that no longer exist. An
+entry above the cut whose write is already in L0 is simply applied again,
+which is harmless: the highest seq for a key wins. The cut is recorded only
+after the flush it describes, so it can lag what is on disk (more replay) but
+never run ahead of it (a lost write).
 
 ## 2. How other systems log, and where minnal stands
 
@@ -231,6 +355,9 @@ Both files' rules change with change C (§11).
 
 ## 4. The design
 
+A1 (§4.1–§4.5) retires memtable entries by a saved cut. A2 (§4.6–§4.10) turns
+field-index checkpoints into events, so WAL GC has one rule for both.
+
 ### 4.1 What the statuses record today
 
 Statuses are written in exactly two places:
@@ -284,8 +411,9 @@ to find where the prefix ends, goes: the cut is read from the metadata.
 A segment is reclaimable when it is not the active segment and lies wholly
 below the cut, with the field-index replay watermark, its
 `max_pinned_wal_segments` backstop and the flush of namespaces holding the cut
-(`flush_namespaces_pinning_wal`) unchanged. The per-segment total and persisted
-counts, and `WalMetadata::persisted_entries` / `total_entries`, go.
+(`flush_namespaces_pinning_wal`) unchanged (A2 then replaces how the watermark
+is found, §4.9). The per-segment total and persisted counts, and
+`WalMetadata::persisted_entries` / `total_entries`, go.
 
 What reports them changes:
 
@@ -304,8 +432,92 @@ What reports them changes:
 - `rebuild_wal_persisted_state`.
 - The per-segment entry counts in `WalMetadata` and their reconciliation.
 
-After change A nothing writes into the log except appends, so a frame never
-changes once written, which change B relies on.
+After A1 nothing writes into the log except appends, so a frame never changes
+once written, which change B relies on.
+
+### 4.6 A2: why field-index checkpoints should be events
+
+The two things that hold the WAL are found in different ways:
+
+- **Memtables** are event-driven: the *flushed* event moves a namespace's safe
+  offset, then the cut (§1.2).
+- **Field indexes** are polled: on every GC tick,
+  `index_replay_watermark_segment` reads each active field's checkpoint marker
+  from disk, applies GC's own rules for which fields count (only active ones;
+  not one being built for the first time, which has no marker and an empty
+  index), and takes the lowest position.
+
+A2 makes both the same thing, a **WAL consumer**: something that needs the WAL
+from a position on, tells the WAL by an event when that position moves, and
+has a remedy when it lags.
+
+| Consumer | Needs the WAL from | Moved by | When it lags |
+|---|---|---|---|
+| A namespace's memtables | its safe offset | the *flushed* event | the GC tick flushes it (`flush_namespaces_pinning_wal`) |
+| A field index | its checkpoint position | the *checkpointed* event (new) | the GC tick requests a checkpoint; past `max_pinned_wal_segments`, segments go anyway and a gap is recorded |
+
+WAL GC then has one rule: delete segments wholly below the **retirement cut**,
+the lowest position of all consumers.
+
+### 4.7 The checkpointed event
+
+`run_index_checkpoint` takes its position P from `wal_cut_ceiling`, so P never
+covers a write whose index update has not landed. It flushes each namespace's
+row map, then each field's bitmaps, then writes the field markers
+(`IndexManager::checkpoint_fields`: write, fsync, rename, fsync the
+directory). After a field's marker is durable, the checkpoint reports
+*checkpointed* (namespace, field, P) to the WAL observer, which sets that
+field's position to P.
+
+The event fires only after the marker is durable. Reported earlier, GC could
+delete a segment that a crash would then send the field back to.
+
+The row maps are checkpointed in the same pass, before the fields and at the
+same P, so the field positions bound them too; they need no consumer of their
+own.
+
+### 4.8 Adding and removing field consumers
+
+The field's registration in the namespace index stays the source of truth for
+whether it is a consumer. Its consumer is added or removed in the same call
+that changes that, so the two cannot disagree:
+
+- **Added** when the field is activated (`activate_field_index`), at the
+  position GC's rules give today: the field's checkpoint position if it has a
+  marker; from 0 if it has no marker but holds entries; not at all while it has
+  no marker and an empty index (a first build, populated from the stored
+  documents rather than by replay), until its first *checkpointed* event.
+- **Removed** when the field is deactivated (`deactivate_field_index`) or
+  dropped (`drop_field_index`), and with all its namespace's fields when the
+  namespace is dropped (next to `forget_namespace`).
+- **At open**, the consumers are built once from the markers with the same
+  rules, which is the read GC does on every tick today.
+
+A consumer that is never removed would hold the retirement cut for good, the
+same failure a dropped namespace caused before `forget_namespace`; §9's tests
+cover each removal path.
+
+### 4.9 WAL GC with consumers
+
+- The retirement cut is `min(flush cut, lowest field position)`, read from
+  memory; no marker is read on a tick.
+- The backstop is unchanged: when more than `max_pinned_wal_segments` retired
+  segments are held only by field consumers, the oldest are deleted anyway,
+  after `record_backstop_gaps` has saved their keys in the affected fields' gap
+  records. The lagging field keeps its position; segments that no longer exist
+  simply hold nothing.
+- `has_deletable_wal_segments` uses the same in-memory state.
+
+Recovery is unchanged by A2: memtable replay starts at the saved flush cut
+(A1), and each field index replays from its own marker when it is activated,
+as today (`activate_field_index`, which also detects a gap if the segments it
+needs are gone).
+
+### 4.10 What goes away (A2)
+
+- The per-tick marker reads in `index_replay_watermark_segment`, and the
+  activity and first-build filters there and in `record_backstop_gaps`, which
+  move to where consumers are added (§4.8).
 
 # Change B — checksummed frames
 
@@ -466,6 +678,7 @@ three changes in:
 | After a flush, before its cut is saved | saved cut lags | replays from the older cut; those entries are also in SSTables, and seq resolution keeps the newer versions | none |
 | Mid metadata save | old or new file (atomic rename) | either is valid: the tail is ≤ durable, the cut ≤ what is in SSTables | none |
 | During namespace drop | its entries above the cut | skipped as an unknown namespace, as today | none (the namespace was being dropped) |
+| After a field's marker is durable, before its *checkpointed* event | marker at P; GC still held the older position | the consumers are rebuilt from the markers at open; the field replays from P | none (GC was only more conservative) |
 
 What does not change:
 
@@ -495,6 +708,21 @@ What does not change:
   every segment's bytes before and after a flush and a GC pass and checks the
   frames are unchanged.
 
+**A2** (`db/wal_gc.rs`, `db/database_tests.rs`):
+
+- A field whose checkpoint is behind a segment holds it; after its
+  *checkpointed* event moves past, GC deletes it.
+- A deactivated field, a dropped field and the fields of a dropped namespace
+  stop holding the WAL (one test per removal path).
+- A field being built for the first time does not hold the WAL; after its first
+  checkpoint it does.
+- After a reopen, the consumers rebuilt from the markers give the same
+  retirement cut as before the close.
+- The existing watermark and backstop tests
+  (`wal_gc_does_not_reclaim_segments_an_active_field_index_still_needs`,
+  `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable` and the
+  rest) keep passing.
+
 **Change B** (`db/wal.rs`):
 
 - A frame with one changed byte in its key or value is rejected, and recovery
@@ -522,6 +750,10 @@ had not returned is half-applied.
 - Save the cut before the flush is registered → a crash after the save loses
   writes that were only in the memtable.
 - GC a segment that straddles the cut → its entries above the cut are lost.
+- Send *checkpointed* before the field's marker is durable → after GC and a
+  crash, the field misses entries with no gap recorded.
+- Do not remove a dropped field's consumer → the WAL stops shrinking.
+- Add a first-build field's consumer at 0 → the whole WAL is held.
 - Skip the truncate at open → a stale frame replays.
 - Return before waiting for the round → the drop-unsynced crash loses
   acknowledged writes.
@@ -557,16 +789,19 @@ more than a few percent per fsync, segments are preallocated (with
 
 Each step is built, tested and reviewed before the next.
 
-1. **Retire by cut** (change A). Removes the status field, so it goes before the
-   frame change. Update the README's WAL sections (*Persisted*, the recovery
-   steps, WAL GC) and the admin API's WAL section and its README.
-2. **Checksummed frames** (change B). Fix the README's format diagram.
-3. **Group commit** (change C), with the drop-unsynced crash helper and the
+1. **Retire memtable entries by cut** (A1). Removes the status field, so it
+   goes before the frame change. Update the README's WAL sections
+   (*Persisted*, the recovery steps, WAL GC) and the admin API's WAL section and
+   its README.
+2. **Field-index checkpoints as events** (A2). Update the README's WAL GC and
+   field-index sections.
+3. **Checksummed frames** (change B). Fix the README's format diagram.
+4. **Group commit** (change C), with the drop-unsynced crash helper and the
    mutation checks. Update `minnal_db/README.md` (*Durability model*, *WAL
    terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
    bench comments that describe per-write fsync.
-4. **Measure** (§10) on the settled snapshot, against the current main.
-5. **Preallocation**, if §10's microbenchmark shows it is worth it.
+5. **Measure** (§10) on the settled snapshot, against the current main.
+6. **Preallocation**, if §10's microbenchmark shows it is worth it.
 
 ## Not covered here
 
@@ -587,13 +822,16 @@ Each step is built, tested and reviewed before the next.
 
 ## 12. Decisions for review
 
-1. Retire by a saved cut instead of per-entry statuses (change A), saved under
+1. Retire by a saved cut instead of per-entry statuses (A1), saved under
    `persist_lock` rather than the WAL lock.
-2. `garbage_collect_wal` and the admin API report pending bytes (`tail - cut`)
+2. Field-index checkpoints report their position as an event, and WAL GC
+   retires below the lowest position of all consumers (A2); consumers are added
+   and removed in the same calls that activate, deactivate and drop fields.
+3. `garbage_collect_wal` and the admin API report pending bytes (`tail - cut`)
    instead of entry counts. Greenfield: no compatibility fields.
-3. Group commit as in §6.1, with no deliberate wait.
-4. A failed fsync poisons the main WAL until reopen (§6.4), the same rule as the
+4. Group commit as in §6.1, with no deliberate wait.
+5. A failed fsync poisons the main WAL until reopen (§6.4), the same rule as the
    vector index WAL.
-5. Rename the per-namespace `wal_fsyncs` to `wal_writes` and add the two global
+6. Rename the per-namespace `wal_fsyncs` to `wal_writes` and add the two global
    round counters (§6.5).
-6. Order: A, then B, then C (§11).
+7. Order: A1, A2, B, then C (§11).
