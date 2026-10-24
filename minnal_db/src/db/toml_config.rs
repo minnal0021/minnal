@@ -240,7 +240,7 @@ impl Default for WalSection {
 }
 
 fn default_wal_segment_size_bytes() -> u64 {
-    64 * 1024 * 1024
+    crate::db::wal::DEFAULT_SEGMENT_SIZE as u64
 }
 
 #[derive(Debug, Deserialize)]

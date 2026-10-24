@@ -631,8 +631,10 @@ above, so the full M5 run checks both.
 
 ## Decisions (review, 2026-10-15)
 
-1. **Code location:** `db/vector_index_wal.rs` holds the log (format, append,
-   sync, observer, GC); `database.rs` calls it at open and from the GC tick.
+1. **Code location:** `db/vector_index_wal.rs` holds the log (record body,
+   observer, retirement, replay) on the segmented log shared with the main WAL
+   (`db/segmented_log.rs`: segments, frames, append, sync, open, GC);
+   `database.rs` calls it at open and from the GC tick.
    `minnal_db/CLAUDE.md`'s WAL-ownership rule names both files.
 2. **Fsync policy:** one `sync` per completion batch; no time bound.
 3. **Segment size:** 64 MiB, as the main WAL.

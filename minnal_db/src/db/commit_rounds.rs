@@ -117,21 +117,21 @@ impl CommitRounds {
             if others_waiting && !delay.is_zero() {
                 std::thread::sleep(delay);
             }
-            let covered = round();
+            // A failed round is recorded as poison BEFORE `running` is cleared: a
+            // waiter woken by this round would otherwise find no poison, lead the
+            // next round, and have its fsync succeed over pages the kernel
+            // dropped. A round that succeeded is not trusted either if the log
+            // was poisoned while it ran (a failed rotation fsync of the file it
+            // synced).
+            let covered = round()
+                .and_then(|position| self.check_poisoned().map(|()| position))
+                .map_err(|why| self.poisoned.lock().get_or_insert(why).clone());
             st = self.state.lock();
             st.running = false;
             self.round_done.notify_all();
-            match covered {
-                Ok(position) => {
-                    st.durable = st.durable.max(position);
-                    if st.durable >= end {
-                        return Ok(true);
-                    }
-                }
-                Err(why) => {
-                    drop(st);
-                    return Err(self.poison(why));
-                }
+            st.durable = st.durable.max(covered?);
+            if st.durable >= end {
+                return Ok(true);
             }
         }
     }
@@ -200,6 +200,51 @@ mod tests {
         });
         let n = fsyncs.load(Ordering::SeqCst);
         assert!(n < 800, "16 concurrent callers never shared a round ({n} fsyncs for 800 commits)");
+    }
+
+    /// A caller waiting on a round that fails gets the error; it never leads a
+    /// round of its own, whose fsync could succeed over dropped pages.
+    #[test]
+    fn a_caller_waiting_on_a_failed_round_never_leads_another() {
+        // The window is a few instructions wide, so try many times.
+        for _ in 0..5000 {
+            let rounds = CommitRounds::new(0);
+            let led_after_failure = AtomicU64::new(0);
+            std::thread::scope(|s| {
+                let leader = s.spawn(|| {
+                    rounds.commit(1, Duration::ZERO, || {
+                        // Hold the round until the follower is waiting on it.
+                        while rounds.state.lock().waiting == 0 {
+                            std::thread::yield_now();
+                        }
+                        Err("disk".into())
+                    })
+                });
+                while !rounds.state.lock().running {
+                    std::thread::yield_now();
+                }
+                let follower = rounds.commit(2, Duration::ZERO, || {
+                    led_after_failure.fetch_add(1, Ordering::SeqCst);
+                    Ok(2)
+                });
+                assert_eq!(follower, Err("disk".into()));
+                assert_eq!(leader.join().unwrap(), Err("disk".into()));
+            });
+            assert_eq!(led_after_failure.load(Ordering::SeqCst), 0, "a round ran after a failed one");
+        }
+    }
+
+    /// A round that succeeds while the log is poisoned (a failed rotation
+    /// fsync of the same file) acknowledges nothing.
+    #[test]
+    fn a_round_that_finishes_after_the_log_is_poisoned_fails() {
+        let rounds = CommitRounds::new(0);
+        let result = rounds.commit(1, Duration::ZERO, || {
+            rounds.poison("rotation".into());
+            Ok(1)
+        });
+        assert_eq!(result, Err("rotation".into()));
+        assert_eq!(rounds.durable(), 0);
     }
 
     /// A failed round fails its leader and every later caller.

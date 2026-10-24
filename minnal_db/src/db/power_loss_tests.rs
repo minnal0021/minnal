@@ -145,10 +145,13 @@ fn the_commit_delay_never_slows_a_lone_writer() {
     assert!(started.elapsed() < Duration::from_secs(1), "a lone writer waited for the commit delay");
 }
 
+/// On the real disk (the repository's `target/`), not a RAM-backed `/tmp`:
+/// there an fsync costs nothing, so how many writers share a round depends on
+/// lock timing, not on what the delay buys.
 #[test]
 fn the_commit_delay_groups_concurrent_writers_into_larger_rounds() {
     fn rounds_for(delay_us: u64) -> u64 {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")).unwrap();
         let mut config = create_db_config();
         config.sync_config = config.sync_config.with_commit_delay_us(delay_us);
         let db = Database::open(dir.path(), config).unwrap();
@@ -228,10 +231,7 @@ fn leaving_a_segment_makes_it_durable() {
     for i in 0..200u32 {
         db.put_ns(ns, format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
     }
-    assert!(
-        db.wal.segment_id_for_offset(db.wal_metadata.read().tail) > 5,
-        "setup: the writes should span segments"
-    );
+    assert!(db.wal.active_segment() > 5, "setup: the writes should span segments");
     let (_image_dir, image) = open_image(&db);
     let ns_image = image.get_namespace_id("ns").unwrap();
     for i in 0..200u32 {
@@ -243,14 +243,14 @@ fn leaving_a_segment_makes_it_durable() {
     }
 }
 
-/// A frame that fills a segment to its last byte leaves the tail on the
-/// segment boundary, and the next append moves to the next segment from there.
-/// That move must fsync the full segment too: a commit round fsyncs only the
-/// active segment, so a write in the full segment, acknowledged by a round
-/// that ran after the move, would otherwise have no fsync behind it. Found by
-/// the power-loss stress below.
+/// A frame that fills a segment up to the room kept for its end marker leaves
+/// nothing for the next one, which rotates first. The rotation must fsync the
+/// full segment: a commit round fsyncs only the active segment, so a write in
+/// the full segment, acknowledged by a round that ran after the move, would
+/// otherwise have no fsync behind it. Found by the power-loss stress below.
 #[test]
 fn a_segment_filled_to_its_last_byte_is_durable_when_left() {
+    use crate::db::segmented_log::{END_MARKER_LEN, FRAME_HEADER_LEN, split};
     const SEGMENT: u64 = 512;
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap());
@@ -258,10 +258,10 @@ fn a_segment_filled_to_its_last_byte_is_durable_when_left() {
     // Find a value length whose frame ends exactly at the segment's end, padding
     // with small writes until one exists (frames are padded for alignment).
     let fill = loop {
-        let remaining = SEGMENT - db.wal_metadata.read().tail % SEGMENT;
+        let remaining = SEGMENT - u64::from(END_MARKER_LEN) - u64::from(split(db.wal_metadata.read().tail).1);
         let fits = (0..remaining as usize).find(|&len| {
             let entry = crate::db::wal::WalEntry::new_upsert_ns(ns, b"full".to_vec(), vec![b'f'; len]).with_sequence(1);
-            crate::db::wal::FRAME_HEADER_LEN + entry.to_bytes().unwrap().len() as u64 == remaining
+            u64::from(FRAME_HEADER_LEN) + entry.to_bytes().unwrap().len() as u64 == remaining
         });
         match fits {
             Some(len) => break len,
@@ -276,9 +276,9 @@ fn a_segment_filled_to_its_last_byte_is_durable_when_left() {
     };
     wait_for("the first writer to reach its commit", || db.wal.frozen_writers() == 1);
     assert_eq!(
-        db.wal_metadata.read().tail % SEGMENT,
-        0,
-        "setup: the first frame must end on the boundary"
+        u64::from(split(db.wal_metadata.read().tail).1),
+        SEGMENT - u64::from(END_MARKER_LEN),
+        "setup: the first frame must fill the segment"
     );
     let second = {
         let db = Arc::clone(&db);
@@ -317,7 +317,7 @@ fn the_saved_tail_never_passes_the_durable_tail() {
     };
     wait_for("the writer to reach its commit", || db.wal.frozen_writers() == 1);
     db.flush_wal_metadata_internal().unwrap();
-    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(dir.path().join("wal_metadata")).unwrap()).unwrap();
+    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(wal_metadata_path(dir.path())).unwrap()).unwrap();
     assert!(
         saved.tail <= db.wal.durable_tail(),
         "saved tail {} passed the durable tail {}",
@@ -745,14 +745,14 @@ fn wal_segments_are_created_at_full_size() {
     let dir = TempDir::new().unwrap();
     let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
     let ns = db.create_namespace("ns").unwrap();
-    assert_eq!(std::fs::metadata(dir.path().join("wal.log")).unwrap().len(), SEGMENT);
+    assert_eq!(std::fs::metadata(wal_segment_path(dir.path(), 0)).unwrap().len(), SEGMENT);
     for i in 0..200u32 {
         db.put_ns(ns, format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
     }
-    let last = db.wal.segment_id_for_offset(db.wal_metadata.read().tail);
+    let last = db.wal.active_segment();
     assert!(last >= 2, "setup: the writes should span segments");
     for id in 1..=last {
-        let path = dir.path().join(format!("wal.log.seg{id:06}"));
+        let path = wal_segment_path(dir.path(), id);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), SEGMENT, "segment {id} is not preallocated");
     }
 }
@@ -773,19 +773,20 @@ fn reopening_zeroes_past_the_tail_and_keeps_the_segment_preallocated() {
         tail
     };
     // Garbage past the tail, as a torn write would leave.
-    let wal = dir.path().join("wal.log");
+    let (segment, byte) = crate::db::segmented_log::split(tail);
+    let wal = wal_segment_path(dir.path(), segment);
     std::fs::OpenOptions::new()
         .write(true)
         .open(&wal)
         .unwrap()
-        .write_at(&[0xAB; 64], tail)
+        .write_at(&[0xAB; 64], u64::from(byte))
         .unwrap();
 
     let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap();
     assert_eq!(db.wal_metadata.read().tail, tail);
     let bytes = std::fs::read(&wal).unwrap();
     assert_eq!(bytes.len() as u64, SEGMENT, "the segment lost its preallocation");
-    assert!(bytes[tail as usize..].iter().all(|&b| b == 0), "bytes past the tail were not zeroed");
+    assert!(bytes[byte as usize..].iter().all(|&b| b == 0), "bytes past the tail were not zeroed");
 }
 
 /// Measurement, not a check: one writer's `put` latency on the real disk
@@ -813,4 +814,40 @@ fn measure_one_writer_put_latency() {
         let per = started.elapsed() / n;
         println!("one-writer put, {size} B: {per:?} each, {:.0}/s", 1.0 / per.as_secs_f64());
     }
+}
+
+/// A write whose fsync fails stops holding the cut back, but its frame stays
+/// in the live tail, so a flush after it saves a cut past the durable tail. If
+/// a power loss then takes that frame, the reopened log must still put new
+/// writes above the saved cut, or the next recovery skips them: an
+/// acknowledged write lost.
+#[test]
+fn progress_saved_past_a_failed_fsync_does_not_hide_later_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = db.create_namespace("ns").unwrap();
+    db.put_ns(ns, b"before", b"v").unwrap();
+    db.wal.fail_next_sync();
+    assert!(matches!(db.put_ns(ns, b"failed", &[b'x'; 4096]), Err(KVError::WalPoisoned(_))));
+    db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
+    let saved = db.wal_metadata.read().clone();
+    assert!(
+        saved.cut > db.wal.durable_tail(),
+        "setup: the flush should save a cut past the durable tail"
+    );
+
+    // Power loss: the failed frame is gone.
+    let (_first, reopened) = open_image(&db);
+    let ns1 = reopened.get_namespace_id("ns").unwrap();
+    reopened.put_ns(ns1, b"after", b"acknowledged").unwrap();
+    // A second power loss, before anything is flushed.
+    let (_second, again) = open_image(&reopened);
+    let ns2 = again.get_namespace_id("ns").unwrap();
+    assert_eq!(again.get_ns(ns2, b"before").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(again.get_ns(ns2, b"failed").unwrap(), None);
+    assert_eq!(
+        again.get_ns(ns2, b"after").unwrap(),
+        Some(b"acknowledged".to_vec()),
+        "a write acknowledged after the reopen was skipped by the next recovery"
+    );
 }

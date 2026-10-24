@@ -1328,15 +1328,35 @@ tail, and WAL GC deletes segments wholly below the cut.
 
 | Field | Meaning |
 |-------|---------|
-| `head`, `tail` | Byte offsets of the oldest byte still on disk and of the next write |
-| `cut` | Every entry below this offset is in an SSTable |
-| `pending_bytes` | `tail − cut`: what a restart would replay |
-| `segment_size` | Bytes per WAL segment file |
-| `namespaces_ahead_of_cut[]` | `{namespace, safe_offset}`: namespaces whose writes are in SSTables past the cut; a restart skips their entries below `safe_offset` |
+| `head`, `tail` | Positions `{segment_id, byte}` of the first entry still on disk and of the next write |
+| `cut` | Every entry below this position is in an SSTable |
+| `pending_bytes` | Bytes of entries from the cut to the tail: what a restart would replay |
+| `segment_size` | Bytes each new WAL segment file is created at |
+| `namespaces_ahead_of_cut[]` | `{namespace, safe_offset}` (`safe_offset` a position): namespaces whose writes are in SSTables past the cut; a restart skips their entries below `safe_offset` |
 | `namespaces_holding_cut[]` | Namespaces with writes not yet in an SSTable; the slowest holds the cut, and the WAL GC tick flushes them |
 | `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
-| `last_sequence` | Highest write sequence the WAL has observed |
-| `segments[]` | Each segment from the head to the tail: `{segment_id, start, end, retired, pending_bytes}`; `retired` means wholly below the cut |
+| `last_sequence` | Highest write sequence handed out as of the last metadata save (every flush and WAL GC pass saves it): a restart's sequence counter starts above it |
+| `segments[]` | Each segment file on disk: `{segment_id, bytes, retired, pending_bytes}`. A segment is created at its full size, so `bytes` is that size whatever it holds; `retired` means wholly below the cut |
+
+After creating a KV store and writing three keys to it (none flushed yet):
+
+```json
+{
+  "head": {"segment_id": 0, "byte": 16},
+  "tail": {"segment_id": 0, "byte": 396},
+  "cut": {"segment_id": 0, "byte": 16},
+  "pending_bytes": 380,
+  "segment_size": 67108864,
+  "namespaces_ahead_of_cut": [],
+  "namespaces_holding_cut": ["session-cache", "system_schema"],
+  "total_gc_runs": 0,
+  "total_bytes_reclaimed": 0,
+  "last_sequence": 0,
+  "segments": [{"segment_id": 0, "bytes": 67108864, "retired": false, "pending_bytes": 380}]
+}
+```
+
+Positions are `{segment_id, byte}` in both logs; a segment's records start at byte 16, after its header.
 
 **`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
 vector worker writes its chunk and whole-document codes to, and partition
@@ -1355,7 +1375,7 @@ wholly below the **retired cut**. Each namespace's replay starts at its own
 | `tail` | Where the next record goes |
 | `durable_tail` | Everything below it is fsynced |
 | `retired_cut` | Records below it are retired |
-| `unretired_bytes` | Bytes of records at or above the retired cut (segment headers excluded): what a restart would replay |
+| `unretired_bytes` | Bytes of records at or above the retired cut (segment headers and end markers excluded): what a restart would replay |
 | `last_sequence` | Highest write sequence of a record appended since the server started, or found then at or above the retired cut (0 if none) |
 | `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them (sealing the memtable even when it is empty), which releases them |
 | `stopped` | `null` normally. After a failed fsync of the log, the error: the log then refuses appends and syncs until the server restarts, and vector indexing stops (documents stay queued) |
@@ -2334,8 +2354,8 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 ```
 {db_path}/
   namespace_registry          ← namespace name → id map, plus TTL settings
-  wal.log, wal.log.seg*       ← the shared write-ahead log (64 MiB segments)
-  wal_metadata, wal_segment_size
+  wal/                        ← the main write-ahead log: {segment_id}.log segments (64 MiB), metadata
+  vector_index_wal/           ← the vector index WAL: {segment_id}.log segments, retired_cut
   fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
     config.json               ← namespace settings

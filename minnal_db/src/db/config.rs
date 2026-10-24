@@ -350,14 +350,12 @@ pub struct DbConfig {
     pub num_buckets: usize,
     /// Maximum number of entries (including tombstones) in the in-memory skip list.
     pub skip_list_capacity: usize,
-    /// WAL segment size in bytes (default 64 MiB).
+    /// Size of each new main-WAL segment in bytes (default 64 MiB, at most
+    /// 4 GiB).
     ///
-    /// **Fixed at creation.** Unlike [`segment_size_bytes`](Self::segment_size_bytes)
-    /// for the value log, a WAL segment id is `offset / wal_segment_size`, so this
-    /// cannot change once the WAL holds data — a different size would map stored
-    /// offsets to the wrong segment files. It is honoured only for a brand-new WAL
-    /// and then recorded in a `wal_segment_size` marker; on an existing WAL the
-    /// recorded size wins and a differing config value is ignored with a warning.
+    /// Not fixed at creation: a WAL position is `(segment_id << 32) | byte`, so
+    /// the size is not encoded in positions, existing segments keep the size
+    /// they were created at, and new ones use whatever is configured now.
     pub wal_segment_size: u64,
     /// Size at which a value-log segment is sealed and a new one opened
     /// (default 256 MiB).
@@ -393,7 +391,7 @@ impl Default for DbConfig {
             lsm_config: LSMConfig::default(),
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
-            wal_segment_size: 64 * 1024 * 1024,
+            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
             segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
@@ -415,7 +413,7 @@ impl DbConfig {
             lsm_config,
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
-            wal_segment_size: 64 * 1024 * 1024,
+            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
             segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,

@@ -16,23 +16,23 @@ from pathlib import Path
 from anim import AMBER, BLUE, GREY, Anim, caption, document, esc, legend, text
 
 SLOTS = 4  # entries per segment, for the drawing (real segments are 64 MB)
-NAMES = ["wal.log", "wal.log.seg000001", "wal.log.seg000002"]
+NAMES = ["wal/0000000000.log", "wal/0000000001.log", "wal/0000000002.log"]
 
 SCRIPT = [
-    ("put", "put() appends entry 1 to <tspan class='ink-a'>wal.log</tspan> and returns once an fsync covers it."),
+    ("put", "put() appends entry 1 to segment <tspan class='ink-a'>0000000000.log</tspan> and returns once an fsync covers it."),
     ("put", "More writes append to the same segment. Concurrent ones share one fsync."),
     ("put", "Every entry is <tspan class='ink-a'>above the cut</tspan>: the WAL is the only durable copy of these writes."),
     ("put", "The segment is now full."),
-    ("put", "The next write opens wal.log.seg000001, which becomes the active segment."),
+    ("put", "The next write seals it with an end marker, fsyncs it, and opens 0000000001.log."),
     ("put", "Nothing can be reclaimed yet: every entry is still needed for crash recovery."),
     ("flush", "A memtable flush writes these keys to an SSTable and moves the cut past them: they are <tspan class='ink-b'>retired</tspan>."),
-    ("GC", "WAL GC deletes wal.log: it lies wholly below the cut and it is not the active segment."),
+    ("GC", "WAL GC deletes 0000000000.log: it lies wholly below the cut and it is not the active segment."),
     ("put", "New writes keep appending to the active segment."),
-    ("put", "seg000001 is full again: the cut runs through it."),
-    ("put", "The next write opens seg000002."),
-    ("GC", "GC finds nothing to delete: seg000001 has entries above the cut, and seg000002 is active."),
+    ("put", "0000000001.log is full again: the cut runs through it."),
+    ("put", "The next write seals it and opens 0000000002.log."),
+    ("GC", "GC finds nothing to delete: 0000000001.log has entries above the cut, and 0000000002.log is active."),
     ("flush", "The next flush moves the cut to the end of the log."),
-    ("GC", "GC deletes seg000001. The active segment is never deleted, even when all of it is retired."),
+    ("GC", "GC deletes 0000000001.log. The active segment is never deleted, even when all of it is retired."),
 ]
 
 

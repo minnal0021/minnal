@@ -302,7 +302,7 @@ fn test_concurrent_activation_of_one_field_index_does_not_kill_the_process() {
 
 /// The cut must not pass a write that is in the WAL but not yet in a memtable.
 ///
-/// `try_advance_persisted` cut at the **live tail** whenever no namespace
+/// `compute_cut` cut at the **live tail** whenever no namespace
 /// reported un-flushed writes — which is exactly the state this test sets up.
 #[test]
 fn an_in_flight_write_holds_the_persisted_watermark_back() {
@@ -377,7 +377,7 @@ fn a_memtable_seal_does_not_claim_an_unapplied_write() {
 
 /// The path a user actually hit: dropping a store while another namespace writes.
 ///
-/// `forget_namespace` calls `try_advance_persisted()` the instant it removes the
+/// `forget_namespace` calls `compute_cut` the instant it removes the
 /// dropped namespace from `ns_progress` — deliberately, to unpin the cut — and
 /// that is precisely when the set of namespaces reporting un-flushed writes can
 /// go empty while a survivor is mid-write. Measured before the fix: 4
@@ -417,7 +417,7 @@ fn dropping_a_store_does_not_persist_a_survivors_in_flight_write() {
     drop(guard);
 }
 
-/// `try_advance_persisted`'s cut must respect the ceiling on its own.
+/// `compute_cut`'s cut must respect the ceiling on its own.
 ///
 /// The other three tests all pass with the cut's cap reverted, because the seal
 /// cap alone keeps `safe_offset` behind the barrier — and that is not an
@@ -432,7 +432,7 @@ fn dropping_a_store_does_not_persist_a_survivors_in_flight_write() {
 /// should not depend on remembering why it is safe.
 ///
 /// The final trigger here is a **namespace drop**, which reaches
-/// `try_advance_persisted` through `forget_namespace` with no seal after it — so
+/// `compute_cut` through `forget_namespace` with no seal after it — so
 /// the cut's own cap is the only thing left holding the barrier.
 #[test]
 fn the_cut_respects_the_barrier_even_when_no_seal_enforces_it() {
@@ -534,10 +534,12 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     let meta = db.wal_metadata.read().clone();
     assert!(meta.tail > 0, "expected every write to be journalled");
     assert_eq!(
-        meta.cut, 0,
+        meta.cut,
+        crate::db::segmented_log::segment_start(0),
         "a value-log fsync moved the cut to {} (tail {}), but nothing has reached an SSTable — \
              recovery would skip those entries and lose acknowledged writes",
-        meta.cut, meta.tail
+        meta.cut,
+        meta.tail
     );
 }
 
@@ -667,39 +669,47 @@ fn concurrent_flushes_leave_the_saved_progress_equal_to_the_live_one() {
     });
 
     let live = db.wal_metadata.read().clone();
-    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(dir.path().join("wal_metadata")).unwrap()).unwrap();
+    let saved = crate::db::wal::WalMetadata::from_file_bytes(&std::fs::read(wal_metadata_path(dir.path())).unwrap()).unwrap();
     assert!(live.cut > 0, "the flushes should have moved the cut");
     assert_eq!((saved.cut, &saved.safe), (live.cut, &live.safe), "the saved progress is not the live one");
     db.shutdown().unwrap();
 }
 
+/// The WAL segment size is not fixed at creation: positions do not encode it,
+/// so a reopen with another size reads the old segments back and creates new
+/// ones at the new size.
 #[test]
-fn test_wal_segment_size_is_locked_at_creation() {
-    // The configured WAL segment size applies only to a brand-new WAL, and is
-    // then fixed: reopening with a different config value must NOT change it
-    // (a segment id is offset / segment_size, so a change would re-bucket
-    // stored offsets into the wrong files).
+fn test_wal_segment_size_can_change_between_opens() {
     let dir = TempDir::new().unwrap();
-    let small = 64 * 1024; // 64 KiB
+    let small = 4 * 1024;
     {
         let mut cfg = create_db_config();
         cfg.wal_segment_size = small;
         let db = Database::open(dir.path(), cfg).unwrap();
-        assert_eq!(db.wal.segment_size(), small, "fresh WAL should honour config");
-        db.put(b"k", b"v").unwrap();
-        db.shutdown().unwrap();
+        assert_eq!(db.wal.segment_size(), small, "a fresh WAL honours the config");
+        for i in 0..200u32 {
+            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+        }
+        assert!(db.wal.active_segment() >= 2, "setup: the writes should span segments");
+        db.mark_crashed();
     }
-    // A marker must have been recorded.
-    assert!(dir.path().join("wal_segment_size").exists());
-    {
-        // Reopen with a DIFFERENT configured size — the created size must win.
-        let mut cfg = create_db_config();
-        cfg.wal_segment_size = 8 * 1024 * 1024;
-        let db = Database::open(dir.path(), cfg).unwrap();
-        assert_eq!(db.wal.segment_size(), small, "existing WAL size must be locked");
-        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
-        db.shutdown().unwrap();
+    let mut cfg = create_db_config();
+    cfg.wal_segment_size = 64 * 1024;
+    let db = Database::open(dir.path(), cfg).unwrap();
+    assert_eq!(db.wal.segment_size(), 64 * 1024, "new segments take the configured size");
+    for i in 0..200u32 {
+        assert_eq!(
+            db.get(format!("k{i:03}").as_bytes()).unwrap(),
+            Some(vec![b'v'; 40]),
+            "k{i:03} after the reopen"
+        );
     }
+    for i in 200..2000u32 {
+        db.put(format!("k{i:04}").as_bytes(), &[b'v'; 40]).unwrap();
+    }
+    let last = db.wal.active_segment();
+    assert_eq!(std::fs::metadata(wal_segment_path(dir.path(), last)).unwrap().len(), 64 * 1024);
+    db.shutdown().unwrap();
 }
 
 #[test]
@@ -2089,15 +2099,15 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
     use crate::db::wal::{Wal, WalEntry, WalMetadata};
 
     let dir = TempDir::new().unwrap();
-    let wal_path = dir.path().join("wal.log");
-    let wal_meta_path = dir.path().join("wal_metadata");
+    let wal_dir = crate::db::layout::main_wal_dir(dir.path());
+    let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
     {
-        let wal = Wal::open(&wal_path).unwrap();
-        let mut tail = 0u64;
+        let (wal, report) = Wal::open(&wal_dir, crate::db::wal::DEFAULT_SEGMENT_SIZE, FRESH_WAL).unwrap();
+        let mut tail = report.tail;
 
         // Physical order: seq 5, seq 9, seq 7. Sequence order says seq 9 wins.
         for (seq, val) in [(5u64, b"v5".to_vec()), (9, b"v9".to_vec()), (7, b"v7".to_vec())] {
-            wal.append_entry(&WalEntry::new_upsert(b"k".to_vec(), val).with_sequence(seq), &mut tail, false)
+            wal.append_entry(&WalEntry::new_upsert(b"k".to_vec(), val).with_sequence(seq), &mut tail)
                 .unwrap();
         }
         wal.sync().unwrap();
@@ -2127,23 +2137,23 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
     use crate::db::wal::{Wal, WalEntry, WalMetadata};
 
     let dir = TempDir::new().unwrap();
-    let wal_path = dir.path().join("wal.log");
-    let wal_meta_path = dir.path().join("wal_metadata");
+    let wal_dir = crate::db::layout::main_wal_dir(dir.path());
+    let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
 
     let stale_tail;
     {
-        let wal = Wal::open(&wal_path).unwrap();
-        let mut tail = 0u64;
+        let (wal, report) = Wal::open(&wal_dir, crate::db::wal::DEFAULT_SEGMENT_SIZE, FRESH_WAL).unwrap();
+        let mut tail = report.tail;
 
         // Entry 1 — covered by the (earlier) metadata flush.
-        wal.append_entry(&WalEntry::new_upsert(b"k1".to_vec(), b"v1".to_vec()).with_sequence(1), &mut tail, false)
+        wal.append_entry(&WalEntry::new_upsert(b"k1".to_vec(), b"v1".to_vec()).with_sequence(1), &mut tail)
             .unwrap();
         stale_tail = tail;
 
         // Entries 2 and 3 — fsynced after the flush; metadata never recorded them.
-        wal.append_entry(&WalEntry::new_upsert(b"k2".to_vec(), b"v2".to_vec()).with_sequence(2), &mut tail, false)
+        wal.append_entry(&WalEntry::new_upsert(b"k2".to_vec(), b"v2".to_vec()).with_sequence(2), &mut tail)
             .unwrap();
-        wal.append_entry(&WalEntry::new_upsert(b"k3".to_vec(), b"v3".to_vec()).with_sequence(3), &mut tail, false)
+        wal.append_entry(&WalEntry::new_upsert(b"k3".to_vec(), b"v3".to_vec()).with_sequence(3), &mut tail)
             .unwrap();
         wal.sync().unwrap();
 
@@ -2193,7 +2203,7 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
 #[test]
 fn test_recovery_from_stale_metadata_via_real_write_path() {
     let dir = TempDir::new().unwrap();
-    let wal_meta_path = dir.path().join("wal_metadata");
+    let wal_meta_path = wal_metadata_path(dir.path());
 
     let stale_metadata: Vec<u8>;
     {
@@ -2318,39 +2328,31 @@ fn test_field_index_targeted_update_and_delete() {
     db.shutdown().unwrap();
 }
 
-// Regression: WAL GC can delete a fully-persisted segment out of segment
-// order (e.g. a dropped namespace persists a trailing segment while an
-// earlier one stays live), leaving a "hole". Recovery scans head→tail, so it
-// must survive the missing middle segment. Before the `scan_entries` hole-skip
-// fix, the open-time scan aborted with NotFound and `Database::open` failed.
+/// A missing segment between two that exist is not something WAL GC can
+/// leave (it deletes from the oldest up): the log is damaged, and reading
+/// past the hole would replay a log with acknowledged writes missing. The open
+/// fails and leaves the files as they are.
 #[test]
-fn test_recovery_survives_deleted_middle_wal_segment() -> Result<()> {
+fn a_missing_middle_wal_segment_fails_the_open() -> Result<()> {
     let temp_dir = TempDir::new()?;
     {
         let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-        // Inject un-persisted entries spanning several WAL segments so reopen
-        // actually runs recovery (persisted < total).
         let entries: Vec<WalEntry> = (0..60u32)
             .map(|i| WalEntry::new_upsert(format!("rk{:03}", i).into_bytes(), vec![b'v'; 32]))
             .collect();
         db.simulate_crash_with_wal_entries(entries)?;
-        assert!(
-            temp_dir.path().join("wal.log.seg000002").exists(),
-            "need >= 3 segments to have a middle one"
-        );
-
-        // Punch a hole: delete a middle segment while segment 0 stays live
-        // (so head is not advanced past it) — exactly what WAL GC would leave.
-        db.wal.delete_segment_file(1)?;
-        drop(db);
+        assert!(wal_segment_path(temp_dir.path(), 2).exists(), "need >= 3 segments to have a middle one");
+        db.mark_crashed();
     }
-
-    // Reopen: recovery must NOT crash on the hole, and the entries from the
-    // surviving segments must be recovered (the deleted segment's are lost).
-    let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-    assert_eq!(db.get(b"rk000")?, Some(vec![b'v'; 32]), "segment 0 entry must survive the hole");
-    assert_eq!(db.get(b"rk059")?, Some(vec![b'v'; 32]), "last-segment entry must survive the hole");
-    db.shutdown()?;
+    std::fs::remove_file(wal_segment_path(temp_dir.path(), 1))?;
+    match Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256) {
+        Err(KVError::WalError(crate::db::wal::WalError::Corruption(why))) => {
+            assert!(why.contains("segment 1 is missing"), "{why}");
+        }
+        Err(e) => panic!("expected a corruption error, got {e}"),
+        Ok(_) => panic!("the open must fail on a missing middle segment"),
+    }
+    assert!(wal_segment_path(temp_dir.path(), 0).exists() && wal_segment_path(temp_dir.path(), 2).exists());
     Ok(())
 }
 
@@ -2442,16 +2444,16 @@ fn test_metadata_checksum_corruption_recovery() -> Result<()> {
     }
 
     {
-        let wal_metadata_path = path.join("wal_metadata");
-        let mut data = std::fs::read(&wal_metadata_path)?;
+        let metadata_path = wal_metadata_path(&path);
+        let mut data = std::fs::read(&metadata_path)?;
         if let Some(byte) = data.get_mut(16) {
             *byte ^= 0xFF;
         }
-        std::fs::write(&wal_metadata_path, data)?;
+        std::fs::write(&metadata_path, data)?;
     }
 
     let db = Database::open(&path, create_db_config())?;
-    assert!(path.join("wal_metadata.corrupt").exists());
+    assert!(wal_metadata_path(&path).with_extension("corrupt").exists());
     assert_eq!(db.get(b"key1")?, Some(b"value1".to_vec()));
 
     Ok(())
@@ -2987,10 +2989,10 @@ fn a_flush_retires_entries_without_writing_into_the_log() {
     for i in 0..600u32 {
         db.put_ns(ns, format!("k{i:05}").as_bytes(), b"v").unwrap();
     }
-    let before = std::fs::read(dir.path().join("wal.log")).unwrap();
+    let before = std::fs::read(wal_segment_path(dir.path(), 0)).unwrap();
     db.get_store(ns).unwrap().flush_memtable_to_level0().unwrap();
     db.garbage_collect_wal().unwrap();
-    let after = std::fs::read(dir.path().join("wal.log")).unwrap();
+    let after = std::fs::read(wal_segment_path(dir.path(), 0)).unwrap();
 
     let meta = db.wal_metadata.read().clone();
     assert_eq!(meta.cut, meta.tail, "the flush should have retired every entry");
@@ -3096,7 +3098,7 @@ fn reset_rowmap_frees_every_row_id_once_no_field_exists() {
 /// The saved metadata file, as recovery would read it (a fresh database has
 /// not saved one yet).
 fn saved_wal_metadata(dir: &TempDir) -> WalMetadata {
-    match std::fs::read(dir.path().join("wal_metadata")) {
+    match std::fs::read(wal_metadata_path(dir.path())) {
         Ok(bytes) => WalMetadata::from_file_bytes(&bytes).unwrap(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => WalMetadata::new(),
         Err(e) => panic!("reading the WAL metadata: {e}"),
@@ -3288,14 +3290,19 @@ fn open_truncates_a_torn_tail_so_stale_frames_cannot_replay() {
         (second, ns)
     };
     // Tear the second frame: change its CRC, so the log's valid frames end at k1.
-    let wal_path = dir.path().join("wal.log");
     {
         use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+        let (segment, byte) = crate::db::segmented_log::split(second);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(wal_segment_path(dir.path(), segment))
+            .unwrap();
+        let at = u64::from(byte) + 4;
         let mut crc = [0u8; 4];
-        f.read_exact_at(&mut crc, second + 4).unwrap();
+        f.read_exact_at(&mut crc, at).unwrap();
         crc[0] ^= 0xFF;
-        f.write_at(&crc, second + 4).unwrap();
+        f.write_at(&crc, at).unwrap();
     }
     {
         let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -3308,4 +3315,97 @@ fn open_truncates_a_torn_tail_so_stale_frames_cannot_replay() {
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     assert_eq!(db.get_ns(ns, b"k4").unwrap(), Some(b"v".to_vec()));
     assert_eq!(db.get_ns(ns, b"k3").unwrap(), None, "a stale frame past the old torn tail was replayed");
+}
+
+// ── The main WAL on the shared segmented log ─────────────────────────────────
+
+/// Open reads the main WAL only from the cut, so the sequence counter must not
+/// depend on the entries below it: after a reopen, a new write to a key beats
+/// every earlier one, flushed or not.
+#[test]
+fn a_write_after_a_reopen_beats_entries_below_the_cut() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+        for i in 0..100u32 {
+            db.put(b"k", format!("v{i}").as_bytes()).unwrap();
+        }
+        db.flush_all_namespaces().unwrap();
+        db.put(b"other", b"x").unwrap();
+        let m = db.wal_metadata.read().clone();
+        assert!(db.wal.segment_of(m.cut) >= 2, "setup: the cut should be several segments in");
+        db.mark_crashed();
+    }
+    {
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v99".to_vec()));
+        db.put(b"k", b"after").unwrap();
+        db.mark_crashed();
+    }
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+    assert_eq!(
+        db.get(b"k").unwrap(),
+        Some(b"after".to_vec()),
+        "a write after the reopen lost to an older one"
+    );
+    assert_eq!(db.get(b"other").unwrap(), Some(b"x".to_vec()));
+}
+
+/// Lost metadata with segments already reclaimed: the cut is unknown, and
+/// replaying whatever is left could bring back retired entries, so the open
+/// fails instead of guessing.
+#[test]
+fn lost_wal_metadata_after_gc_fails_the_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+        for i in 0..100u32 {
+            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+        }
+        db.flush_all_namespaces().unwrap();
+        db.garbage_collect_wal().unwrap();
+        assert!(!wal_segment_path(dir.path(), 0).exists(), "setup: GC should have reclaimed segment 0");
+        db.shutdown().unwrap();
+    }
+    std::fs::remove_file(wal_metadata_path(dir.path())).unwrap();
+    match Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512) {
+        Err(KVError::WalError(crate::db::wal::WalError::Corruption(why))) => assert!(why.contains("no progress was saved"), "{why}"),
+        Err(e) => panic!("expected a corruption error, got {e}"),
+        Ok(_) => panic!("the open must fail when the WAL's progress is lost after GC"),
+    }
+}
+
+/// An entry too large for a WAL segment is refused as `WriteTooLarge` before
+/// anything is written, and the database keeps working.
+#[test]
+fn a_write_too_large_for_a_wal_segment_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 4096).unwrap();
+    let tail = db.wal_metadata.read().tail;
+    assert!(matches!(db.put(b"big", &vec![b'x'; 8192]), Err(KVError::WriteTooLarge(_))));
+    assert_eq!(db.wal_metadata.read().tail, tail, "a refused write must not grow the WAL");
+    assert_eq!(db.get(b"big").unwrap(), None);
+    db.put(b"small", b"v").unwrap();
+    assert_eq!(db.get(b"small").unwrap(), Some(b"v".to_vec()));
+}
+
+/// Both logs' stats show positions the same way, `{segment_id, byte}`, and
+/// the main WAL's pending bytes count entries only.
+#[test]
+fn both_logs_report_positions_as_segment_and_byte() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
+    for i in 0..40u32 {
+        db.put(format!("k{i:03}").as_bytes(), &[b'v'; 40]).unwrap();
+    }
+    let s = db.wal_stats();
+    let m = db.wal_metadata.read().clone();
+    assert_eq!(s.tail, crate::db::segmented_log::LogPosition::of(m.tail));
+    assert!(s.tail.segment_id >= 2);
+    assert_eq!(s.pending_bytes, db.wal.bytes_between(m.cut, m.tail));
+    assert!(s.pending_bytes > 0 && s.segments.iter().any(|seg| !seg.retired));
+    let json = serde_json::to_value(&s).unwrap();
+    assert!(json["tail"]["segment_id"].is_u64() && json["tail"]["byte"].is_u64(), "{json}");
+    let v = serde_json::to_value(db.vector_index_wal_stats().unwrap()).unwrap();
+    assert!(v["tail"]["segment_id"].is_u64() && v["tail"]["byte"].is_u64(), "{v}");
 }

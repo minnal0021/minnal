@@ -64,7 +64,7 @@ impl NsFlushProgress {
 ///
 /// Progress moves on a flush's *written* event, when its L0 files are durable
 /// but not yet registered, and takes effect only once the metadata recording it
-/// is on disk ([`Self::on_memtable_written_ns`]). So recovery and WAL GC never
+/// is on disk ([`Self::prepare_written`]). So recovery and WAL GC never
 /// act on progress a crash could undo, and the saved per-namespace offsets are
 /// durable before L1 compaction can merge the files they describe.
 pub(crate) struct WalPersistObserver {
@@ -77,6 +77,10 @@ pub(crate) struct WalPersistObserver {
     /// then satisfy B's pending record and advance the cut past B's
     /// un-flushed writes.
     pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    /// The database's sequence counter, whose high-water mark every metadata
+    /// save records: open reads the log only from the cut, and this covers the
+    /// sequences below it.
+    next_seq: Arc<AtomicU64>,
     /// Per-namespace flush progress — the input to the cut.
     ns_progress: RwLock<std::collections::HashMap<u32, NsFlushProgress>>,
     /// Serialises every change to the saved progress and every save of the WAL
@@ -163,12 +167,14 @@ impl WalPersistObserver {
         wal_metadata: Arc<RwLock<WalMetadata>>,
         wal_metadata_path: PathBuf,
         pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+        next_seq: Arc<AtomicU64>,
     ) -> Self {
         Self {
             wal,
             wal_metadata,
             wal_metadata_path,
             pending,
+            next_seq,
             ns_progress: RwLock::new(std::collections::HashMap::new()),
             persist_lock: Mutex::new(()),
             field_consumers: RwLock::new(BTreeMap::new()),
@@ -388,8 +394,14 @@ impl WalPersistObserver {
         // after the hole and skip acknowledged writes behind it.
         let mut metadata = metadata.clone();
         metadata.tail = metadata.tail.min(self.wal.durable_tail());
+        // Every sequence handed out so far (an over-estimate is harmless).
+        metadata.last_sequence = metadata.last_sequence.max(self.next_seq.load(Ordering::Acquire).saturating_sub(1));
         let bytes = metadata.to_file_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
-        crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)
+        crate::support::write_atomic_durable(&self.wal_metadata_path, &bytes)?;
+        // The live copy shows what is saved (`Db::wal_stats`).
+        let mut live = self.wal_metadata.write();
+        live.last_sequence = live.last_sequence.max(metadata.last_sequence);
+        Ok(())
     }
 
     /// Save the WAL metadata as it is (counters, head, tail), serialised with
@@ -562,10 +574,16 @@ impl PreparedProgress<'_> {
 }
 
 /// A main-WAL error on the write path: a poisoned log becomes
-/// [`KVError::WalPoisoned`], the rest pass through.
+/// [`KVError::WalPoisoned`], an entry too large for a segment
+/// [`KVError::WriteTooLarge`], the rest pass through.
 fn wal_write_error(e: WalError) -> KVError {
     match e {
         WalError::Poisoned(why) => KVError::WalPoisoned(why),
+        // Refused before anything was written: the same kind of error as the
+        // other write-size bounds (`check_write_size`).
+        WalError::RecordTooLarge { len, max } => KVError::WriteTooLarge(format!(
+            "the WAL entry is {len} bytes, more than a WAL segment holds ({max}); raise wal.segment_size_bytes"
+        )),
         other => KVError::from(other),
     }
 }
@@ -655,6 +673,54 @@ impl LsmFlushObserver for LsmFlushObserverHub {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Open the main WAL in `{db_path}/wal` from its saved metadata, and work out
+/// where the sequence counter starts.
+///
+/// The metadata says where reading starts (its cut) and the furthest position
+/// its progress names; the log validates everything from the cut, drops a
+/// torn tail, and starts a new segment if the progress names positions past
+/// what survived (`SegmentedLog::open`). The saved tail is only a record: the
+/// tail is wherever the log's valid frames end.
+///
+/// Missing metadata means none was ever saved, and the log must then start at
+/// segment 0 (it is replayed whole). Unreadable metadata is treated the same
+/// way and kept as `metadata.corrupt`; if segments were already reclaimed, the
+/// open fails rather than replaying an unknown range.
+///
+/// The counter starts above the saved high-water mark and every entry at or
+/// above the cut; entries below the cut are in SSTables, which raise it too
+/// (`KVStore::set_seq_counter`).
+fn open_main_wal(db_path: &Path, segment_size: u64) -> Result<(Arc<Wal>, WalMetadata, PathBuf, u64)> {
+    let dir = crate::db::layout::main_wal_dir(db_path);
+    let metadata_path = dir.join(crate::db::wal::METADATA_FILE);
+    let (saved, corrupt) = match std::fs::read(&metadata_path) {
+        Ok(data) => match WalMetadata::from_file_bytes(&data) {
+            Ok(m) => (Some(m), false),
+            Err(e) => {
+                warn!("[WAL] the WAL metadata is unreadable ({e}); reading the log from its start");
+                (None, true)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
+        Err(e) => return Err(e.into()),
+    };
+    let from = crate::db::segmented_log::OpenFrom {
+        cut: saved.as_ref().map(|m| m.cut),
+        furthest: saved
+            .as_ref()
+            .map_or(0, |m| m.safe.iter().map(|&(_, safe)| safe).chain([m.cut]).max().unwrap_or(0)),
+    };
+    let segment_size = u32::try_from(segment_size).unwrap_or(u32::MAX);
+    let (wal, report) = Wal::open(&dir, segment_size, from)?;
+    if corrupt {
+        let _ = std::fs::rename(&metadata_path, metadata_path.with_extension("corrupt"));
+    }
+    let mut metadata = saved.unwrap_or_default();
+    metadata.tail = report.tail;
+    let next_seq = metadata.last_sequence.max(report.max_sequence).saturating_add(1);
+    Ok((Arc::new(wal), metadata, metadata_path, next_seq))
+}
+
 /// Format a key for log output: UTF-8 string if valid, otherwise `hex:<hex>`.
 fn display_key(key: &[u8]) -> String {
     match std::str::from_utf8(key) {
@@ -696,8 +762,6 @@ pub struct Database {
 
     // Shared WAL
     pub(crate) wal: Arc<Wal>,
-    #[allow(dead_code)]
-    wal_path: PathBuf,
     pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
     pub(crate) wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
@@ -814,52 +878,6 @@ pub struct Database {
 }
 
 impl Database {
-    /// Resolve the WAL segment size to open with, locking it at creation.
-    ///
-    /// Precedence:
-    /// 1. An existing `wal_segment_size` marker wins — the size is fixed for the
-    ///    life of the WAL, because a segment id is `offset / segment_size` and a
-    ///    different size would map stored offsets to the wrong segment files.
-    /// 2. No marker but the WAL already holds data (a metadata file, or a
-    ///    non-empty `wal.log`): a pre-marker WAL, which was written at the
-    ///    historical [`DEFAULT_SEGMENT_SIZE`]. Use that and stamp the marker.
-    /// 3. Brand-new WAL: honour `configured` and stamp the marker.
-    ///
-    /// The marker write is best-effort; if it fails the effective size is still
-    /// correct for this run (it just re-resolves the same way next open).
-    fn resolve_wal_segment_size(db_path: &Path, wal_path: &Path, wal_metadata_path: &Path, configured: u64) -> u64 {
-        let marker = db_path.join("wal_segment_size");
-
-        if let Ok(bytes) = std::fs::read(&marker)
-            && let Ok(arr) = <[u8; 8]>::try_from(bytes.as_slice())
-        {
-            let recorded = u64::from_le_bytes(arr);
-            if recorded != 0 {
-                if configured != recorded {
-                    warn!(
-                        "[WAL] Configured wal.segment_size_bytes={} but this WAL was created at {}. \
-                         The segment size is fixed at creation and cannot change on existing data; \
-                         the configured value will NOT be applied.",
-                        configured, recorded,
-                    );
-                }
-                return recorded;
-            }
-        }
-
-        let preexisting = wal_metadata_path.exists() || std::fs::metadata(wal_path).map(|m| m.len() > 0).unwrap_or(false);
-        let size = if preexisting {
-            crate::db::wal::DEFAULT_SEGMENT_SIZE
-        } else {
-            configured.max(crate::db::wal::MIN_SEGMENT_SIZE)
-        };
-
-        if let Err(e) = crate::support::write_atomic_durable(&marker, &size.to_le_bytes()) {
-            warn!("[WAL] Failed to record WAL segment-size marker at {}: {:?}", marker.display(), e);
-        }
-        size
-    }
-
     /// Open a multi-namespace database at the given path
     pub fn open(db_path: &Path, mut config: DbConfig) -> Result<Self> {
         std::fs::create_dir_all(db_path)?;
@@ -885,60 +903,8 @@ impl Database {
         config.lsm_config.num_buckets = config.num_buckets;
         config.lsm_config.skip_list_capacity = config.skip_list_capacity;
 
-        let wal_path = db_path.join("wal.log");
-        let wal_metadata_path = db_path.join("wal_metadata");
-
-        // The WAL segment size is fixed at creation and honoured from config only
-        // for a brand-new WAL. It cannot change on existing data: a segment id is
-        // `offset / segment_size`, so a different size re-buckets every stored
-        // offset into the wrong segment file. The chosen size is recorded in a
-        // marker so it survives restarts; a pre-marker WAL falls back to the
-        // historical 64 MiB it was written at. (`wal.segment_size_bytes` in config.)
-        let wal_segment_size = Self::resolve_wal_segment_size(db_path, &wal_path, &wal_metadata_path, config.wal_segment_size);
-
-        // Open WAL
-        let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
-
-        // Load or initialize WAL metadata
-        let mut wal_metadata = if wal_metadata_path.exists() {
-            let data = std::fs::read(&wal_metadata_path)?;
-            match WalMetadata::from_file_bytes(&data) {
-                Ok(m) => m,
-                Err(_) => {
-                    let backup = wal_metadata_path.with_extension("corrupt");
-                    let _ = std::fs::rename(&wal_metadata_path, &backup);
-                    WalMetadata::new()
-                }
-            }
-        } else {
-            WalMetadata::new()
-        };
-
-        // WAL entries are fsynced on every write, but `wal_metadata` (which holds
-        // the tail) is only saved now and then — so after a crash the saved tail
-        // can lag the durable end of the log, and recovery scanning only up to
-        // the stale tail would silently drop fsynced entries. Reconstruct the
-        // true tail from the self-describing WAL. With a lost/corrupt metadata
-        // file (tail = 0, cut = 0) this rebuilds the tail wholesale and recovery
-        // replays everything still in the log.
-        {
-            let persisted_tail = wal_metadata.tail;
-            let true_tail = wal.recover_tail(persisted_tail);
-            if true_tail > persisted_tail {
-                warn!(
-                    "[RECOVERY] WAL metadata tail ({persisted_tail}) lagged the durable log end ({true_tail}); \
-                     recovering the entries appended since the last metadata save"
-                );
-                wal_metadata.tail = true_tail;
-            }
-            // Cut off anything past the valid frames (a torn tail), so a later,
-            // shorter append cannot leave stale frames behind it. What is left is
-            // durable.
-            wal.truncate_after(wal_metadata.tail)?;
-            wal.opened_at(wal_metadata.tail);
-        }
-
-        let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);
+        let (wal, wal_metadata, wal_metadata_path, next_seq_start) = open_main_wal(db_path, config.wal_segment_size)?;
+        let next_seq = Arc::new(AtomicU64::new(next_seq_start));
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
@@ -947,6 +913,7 @@ impl Database {
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
+            Arc::clone(&next_seq),
         ));
 
         // Open namespace registry
@@ -1002,7 +969,6 @@ impl Database {
             db_path: db_path.to_path_buf(),
             config,
             wal,
-            wal_path,
             wal_metadata,
             wal_flush_observer,
             pending_wal_flushes,
@@ -1024,7 +990,7 @@ impl Database {
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
-            next_seq: Arc::new(AtomicU64::new(next_seq_start)),
+            next_seq,
             key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
@@ -1281,10 +1247,7 @@ impl Database {
         if op_name == Self::MERGE_OP_NAME {
             wal_entry = wal_entry.with_op_name(op_name);
         }
-        let wal_pointer = self
-            .wal
-            .append_entry(&wal_entry, &mut wal_metadata.tail, false)
-            .map_err(wal_write_error)?;
+        let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail).map_err(wal_write_error)?;
         let wal_tail = wal_metadata.tail;
         // Registered BEFORE the WAL lock is released, so no observer can see a
         // tail containing this entry without also seeing that it is not yet in
@@ -1315,7 +1278,10 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.puts);
             crate::db::metrics::Metrics::bump(&m.wal_writes);
-            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
+            crate::db::metrics::Metrics::add(
+                &m.wal_bytes_appended,
+                wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
+            );
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq));
@@ -1332,7 +1298,8 @@ impl Database {
         // entries whose keys exist nowhere on disk, silently losing acknowledged
         // writes and stranding their values in the value log. The persisted
         // watermark is advanced solely by `WalPersistObserver`, which waits for
-        // the memtable flush (`on_memtable_sealed` → `try_advance_persisted`).
+        // the memtable flush (the seal, then `prepare_written` on the written
+        // event).
         if kv_store.should_sync() {
             let _ = kv_store.sync_value_log();
         }
@@ -1344,18 +1311,7 @@ impl Database {
     /// commit round's leader or follower, and count it.
     fn commit_wal(&self, end: u64) -> Result<()> {
         let delay = Duration::from_micros(self.config.sync_config.commit_delay_us);
-        let led = self
-            .wal
-            .commit(end, delay, || {
-                let meta = self.wal_metadata.read();
-                let (segment_id, file) = self.wal.active_file()?;
-                Ok((meta.tail, segment_id, file))
-            })
-            .map_err(wal_write_error)?;
-        // The invariant group commit exists to keep, checked in every test: a
-        // write is acknowledged only once an fsync covered its bytes.
-        #[cfg(test)]
-        assert!(self.wal.covered(end), "acknowledged a WAL write ending at {end} that no fsync covered");
+        let led = self.wal.commit(end, delay).map_err(wal_write_error)?;
         crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_writes);
         if led {
             crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_rounds);
@@ -1650,10 +1606,7 @@ impl Database {
         if op_name == Self::MERGE_OP_NAME {
             wal_entry = wal_entry.with_op_name(op_name);
         }
-        let wal_pointer = self
-            .wal
-            .append_entry(&wal_entry, &mut wal_metadata.tail, false)
-            .map_err(wal_write_error)?;
+        let wal_pointer = self.wal.append_entry(&wal_entry, &mut wal_metadata.tail).map_err(wal_write_error)?;
         let wal_tail = wal_metadata.tail;
         // As in `put_ns`: registered under the WAL lock, released on return.
         // A lost delete is as damaging as a lost put — recovery skipping it
@@ -1673,7 +1626,10 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.deletes);
             crate::db::metrics::Metrics::bump(&m.wal_writes);
-            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
+            crate::db::metrics::Metrics::add(
+                &m.wal_bytes_appended,
+                wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
+            );
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq));
@@ -2828,7 +2784,7 @@ impl Database {
         let mut warned_namespaces: HashSet<u32> = HashSet::new();
         let mut eligible: Vec<WalEntry> = Vec::new();
         let mut skipped_flushed_count = 0u64;
-        for (pointer, entry) in &all_entries {
+        for (pointer, entry) in all_entries {
             if pointer.offset < wal_metadata.replay_from(entry.namespace_id) {
                 skipped_flushed_count += 1;
                 continue;
@@ -2847,7 +2803,7 @@ impl Database {
                 skipped_unknown_ns_count += 1;
                 continue;
             }
-            eligible.push(entry.clone());
+            eligible.push(entry);
         }
         // Stable sort by sequence so entries replay in their original order.
         eligible.sort_by_key(|e| e.sequence);
@@ -3243,54 +3199,8 @@ impl Database {
         config.lsm_config.num_buckets = config.num_buckets;
         config.lsm_config.skip_list_capacity = config.skip_list_capacity;
 
-        let wal_path = db_path.join("wal.log");
-        let wal_metadata_path = db_path.join("wal_metadata");
-
-        // Record the forced size so a later production `open` of this dir honours
-        // it rather than re-resolving to the default (mirrors `open`).
-        let _ = crate::support::write_atomic_durable(&db_path.join("wal_segment_size"), &wal_segment_size.to_le_bytes());
-
-        let wal = Arc::new(Wal::open_with_options_and_segment_size(&wal_path, false, wal_segment_size)?);
-
-        let mut wal_metadata = if wal_metadata_path.exists() {
-            let data = std::fs::read(&wal_metadata_path)?;
-            match WalMetadata::from_file_bytes(&data) {
-                Ok(m) => m,
-                Err(_) => {
-                    let backup = wal_metadata_path.with_extension("corrupt");
-                    let _ = std::fs::rename(&wal_metadata_path, &backup);
-                    WalMetadata::new()
-                }
-            }
-        } else {
-            WalMetadata::new()
-        };
-
-        // WAL entries are fsynced on every write, but `wal_metadata` (which holds
-        // the tail) is only saved now and then — so after a crash the saved tail
-        // can lag the durable end of the log, and recovery scanning only up to
-        // the stale tail would silently drop fsynced entries. Reconstruct the
-        // true tail from the self-describing WAL. With a lost/corrupt metadata
-        // file (tail = 0, cut = 0) this rebuilds the tail wholesale and recovery
-        // replays everything still in the log.
-        {
-            let persisted_tail = wal_metadata.tail;
-            let true_tail = wal.recover_tail(persisted_tail);
-            if true_tail > persisted_tail {
-                warn!(
-                    "[RECOVERY] WAL metadata tail ({persisted_tail}) lagged the durable log end ({true_tail}); \
-                     recovering the entries appended since the last metadata save"
-                );
-                wal_metadata.tail = true_tail;
-            }
-            // Cut off anything past the valid frames (a torn tail), so a later,
-            // shorter append cannot leave stale frames behind it. What is left is
-            // durable.
-            wal.truncate_after(wal_metadata.tail)?;
-            wal.opened_at(wal_metadata.tail);
-        }
-
-        let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);
+        let (wal, wal_metadata, wal_metadata_path, next_seq_start) = open_main_wal(db_path, wal_segment_size)?;
+        let next_seq = Arc::new(AtomicU64::new(next_seq_start));
 
         let wal_metadata = Arc::new(RwLock::new(wal_metadata));
         let pending_wal_flushes = Arc::new(RwLock::new(BTreeMap::new()));
@@ -3299,6 +3209,7 @@ impl Database {
             Arc::clone(&wal_metadata),
             wal_metadata_path.clone(),
             Arc::clone(&pending_wal_flushes),
+            Arc::clone(&next_seq),
         ));
 
         let registry = NamespaceRegistry::open(db_path)?;
@@ -3340,7 +3251,6 @@ impl Database {
             db_path: db_path.to_path_buf(),
             config,
             wal,
-            wal_path,
             wal_metadata,
             wal_flush_observer,
             pending_wal_flushes,
@@ -3362,7 +3272,7 @@ impl Database {
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
-            next_seq: Arc::new(AtomicU64::new(next_seq_start)),
+            next_seq,
             key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
@@ -3456,11 +3366,11 @@ impl Database {
         // a commit round would, then left unapplied, as a crash would leave them.
         let mut wal_metadata = self.wal_metadata.write();
         for entry in entries {
-            let _ = self.wal.append_entry(&entry, &mut wal_metadata.tail, true)?;
+            let _ = self.wal.append_entry(&entry, &mut wal_metadata.tail)?;
         }
         let tail = wal_metadata.tail;
         drop(wal_metadata);
-        self.wal.set_durable_tail(tail);
+        self.wal.commit(tail, Duration::ZERO)?;
         self.flush_wal_metadata_internal()?;
         Ok(())
     }

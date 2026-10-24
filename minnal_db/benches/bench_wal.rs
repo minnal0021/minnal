@@ -14,7 +14,7 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use minnal_db::db::wal::{Wal, WalEntry};
+use minnal_db::db::wal::{DEFAULT_SEGMENT_SIZE, Wal, WalEntry};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 /// creation it did not ask for.
 const WAL_BYTES_PER_RUN: usize = 32 * 1024 * 1024;
 
-/// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`.
+/// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`; with
+/// `sync`, each append is committed (one fsync each: a lone writer's rounds).
 ///
 /// Appends go into an already-open WAL, so the number is the append alone.
 /// Every `per_wal` appends the WAL is dropped and a fresh one opened, outside
@@ -38,12 +39,14 @@ fn time_appends(iters: u64, per_wal: u64, sync: bool, make_entry: impl Fn() -> W
     while done < iters {
         let n = per_wal.min(iters - done);
         let temp = bench_tempdir();
-        let wal = Wal::open(temp.path().join("wal.log")).unwrap();
-        let mut tail = 0u64;
+        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), DEFAULT_SEGMENT_SIZE).unwrap();
         let start = Instant::now();
         for _ in 0..n {
             let entry = make_entry();
-            black_box(wal.append_entry(&entry, &mut tail, sync)).unwrap();
+            black_box(wal.append_entry(&entry, &mut tail)).unwrap();
+            if sync {
+                wal.commit(tail, Duration::ZERO).unwrap();
+            }
         }
         elapsed += start.elapsed();
         done += n;
@@ -122,15 +125,14 @@ fn bench_wal_scan(c: &mut Criterion) {
 
     for &(num_entries, value_size) in &[(1_000u64, 128usize), (1_000, 4_096), (5_000, 128)] {
         let temp = bench_tempdir();
-        let wal = Wal::open(temp.path().join("wal.log")).expect("failed to open WAL");
+        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), DEFAULT_SEGMENT_SIZE).expect("failed to open WAL");
         let value = vec![0xEFu8; value_size];
-        let mut tail = 0u64;
 
         // Pre-populate
         for i in 0..num_entries {
             let key = format!("scan_key_{:010}", i).into_bytes();
             let entry = WalEntry::new_upsert(key, value.clone());
-            wal.append_entry(&entry, &mut tail, false).unwrap();
+            wal.append_entry(&entry, &mut tail).unwrap();
         }
         wal.sync().unwrap();
 

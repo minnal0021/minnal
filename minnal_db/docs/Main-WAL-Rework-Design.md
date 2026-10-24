@@ -586,6 +586,12 @@ over a torn region can leave older valid-looking frames behind it, and a second
 recovery would replay them. A checksum does not prevent this, since those old
 frames were valid when written.
 
+A bad frame is a torn tail only in the **last** segment. Every segment is
+fsynced before the next one is named (§6.2), so a bad frame in a segment that
+has a successor is damage to acknowledged data, and open fails with a
+corruption error instead of cutting the log there, which would delete every
+later segment. The vector index WAL's `open` has the same rule.
+
 # Change C — group commit
 
 ## 6. The design
@@ -667,10 +673,18 @@ writing into the new one. Every segment but the last is then fully durable, and
   saved tail behind a hole of zeros; a later recovery reads a zero length as
   the end of a segment and would skip every acknowledged write after the hole.
   So every save records `min(tail, durable_tail)`.
-- **Cut.** No rule needed: a write is *in flight* from before the WAL lock is
-  released until after it is applied, which is after its round's fsync, and
-  the cut is capped at the oldest in-flight write. So the cut is always at or
-  below the durable tail.
+- **Cut.** While every fsync succeeds, the cut stays at or below the durable
+  tail: a write is *in flight* from before the WAL lock is released until
+  after it is applied, which is after its round's fsync, and the cut is capped
+  at the oldest in-flight write. A write whose fsync **fails** leaves the
+  in-flight set but its frame stays in the tail, so a later flush can save a
+  cut past the durable tail. If a power loss then takes that frame, appending
+  at the recovered tail would put new writes below the cut, and the next
+  recovery would skip them. So open moves the tail up to the next segment
+  boundary at or above the furthest saved position (the cut and every saved
+  per-namespace offset): the gap reads as a segment end, and a scan from the
+  old saved tail continues into the next segment. The vector index WAL's open
+  does the same.
 
 ### 6.4 A failed fsync poisons the main WAL
 
@@ -680,6 +694,12 @@ reopened. The writers in the failed round do not apply their records, so no
 reader ever sees a write that was not acknowledged. This is the vector index
 WAL's rule (and PostgreSQL's): after a failed fsync the kernel may have dropped
 the dirty pages, and a later fsync that succeeds says nothing about them.
+
+The poison is recorded before the failed round ends. Were waiters woken
+first, one could find no poison, lead the next round, and have its fsync
+succeed over the dropped pages. For the same reason a round that succeeds
+while the log is poisoned (a rotation's fsync of the same file failed in the
+meantime) acknowledges nothing.
 
 Today a failed fsync returns an error to its one writer and leaves the tail
 unmoved, so the next write overwrites the same bytes. With rounds, other
@@ -1331,3 +1351,80 @@ list: a sync's `fdatasync` writes the prepared file's header out with the
 records, so the power-loss model cannot tell it apart, and the header check
 above covers what matters.
 
+
+## 19. One log format for both WALs
+
+**What.** The main WAL and the vector index WAL are one log, the segmented
+log (`db/segmented_log.rs`, `SegmentedLog`), configured by a `LogFormat`
+(name, magic, body version). Everything about how bytes reach the disk and
+come back after a crash is there once: segment files `{id:010}.log` with a
+16-byte header (magic, version, segment id), `[len][crc32(body)][body]`
+frames, the `u32::MAX` end marker on every sealed segment, positions
+`(segment_id << 32) | byte`, preallocation and zero-filling ahead, commit
+rounds, open's torn-tail and corruption rules, reads, deleting retired
+segments, and the power-loss test hooks. Each log keeps only its body
+encoding and its retirement: the main WAL an rkyv `WalEntry` and
+`WalMetadata` (now `wal/metadata`), the vector index WAL its
+`[ns_id|seq|key|value]` body and `retired_cut` marker. A future log is a
+`LogFormat` plus a body codec.
+
+**Why.** The two logs had grown the same mechanics twice, and the main WAL's
+copy was the weaker one: a zero length ended a segment, so a block that read
+back as zeros inside a sealed segment silently skipped the rest of it; a bad
+frame anywhere was a torn tail, so open cut the log there and deleted every
+later segment; a segment carried no header, so a file from another log or
+format was parsed; and positions were `id × segment_size`, so the segment
+size was locked at creation. The vector index WAL already had the stronger
+rule for each.
+
+**Behaviour that changed for the main WAL.**
+
+- A bad frame, or unwritten space before the end marker, in any segment but
+  the last fails the open; so does a missing segment between two that exist.
+  Only the last segment has a torn tail.
+- A segment whose header names another log or format version fails the open.
+- The segment size (`wal.segment_size_bytes`, at most 4 GiB) can change
+  between opens; the `wal_segment_size` marker is gone.
+- Open reads only from the cut. The sequence counter starts above the
+  entries there, the SSTables' stored sequences, and `last_sequence`, which
+  every metadata save now records (it was saved only by WAL GC).
+- Lost or unreadable metadata with segments already reclaimed fails the open
+  (the cut is unknown). With every segment still present it replays the log
+  from the start, as before.
+- An entry too large for a segment is refused before anything is written,
+  as `KVError::WriteTooLarge`. (A value between a WAL segment and a value-log
+  segment used to be written past the segment's end, then read back as a bad
+  frame by recovery.)
+- The admin API shows main-WAL positions as `{segment_id, byte}`, as the
+  vector index WAL's already were; `segments[]` lists the files on disk with
+  their sizes.
+
+**Group commit on the shared log.** A round's leader now snapshots the
+active segment under the log's own append lock, not the main WAL lock. On
+the benchmark NVMe, 8 writers × 40 puts formed about 80 rounds without a
+commit delay and 42 with 2 ms, against 72–75 and 41–42 before. On a
+RAM-backed `/tmp` an fsync costs nothing, so grouping there followed lock
+timing (the old leader waited on the WAL lock, which batched writers by
+accident); `the_commit_delay_groups_concurrent_writers_into_larger_rounds`
+therefore runs in `target/`.
+
+**Tests.** `segmented_log.rs` tests the format once for any log: records
+across segments and reopen, segment size changing between opens, reading
+from the cut, torn tail zeroed, bad frames and missing or foreign segments
+failing the open, lost progress, a blank last segment, progress past the
+durable tail, shared fsyncs, poisoning by a failed fsync or rotation,
+oversized records, bodies in parts, `under_lock` ordering, deleting retired
+segments, `bytes_between`, prepared segments, and a randomised power-loss
+loop. Each WAL keeps its own tests on top (the vector index WAL's 66 pass
+unchanged apart from three expectations: a message, record-only
+`unretired_bytes`, and its format version kept at 2 since its bytes did not
+change). Database-level tests cover the sequence counter after a reopen,
+lost metadata after GC, an oversized write, and both logs' stats. The long
+stresses pass at 100 seeds (main WAL, 2,000 power losses) and 3,000 rounds
+(vector index WAL).
+
+| Mutation | Caught by |
+|---|---|
+| No new segment when saved progress is past the tail | `progress_past_the_durable_tail_starts_a_new_segment`, `progress_saved_past_a_failed_fsync_does_not_hide_later_writes`, and two progress-save tests |
+| A torn frame in a sealed segment accepted | `a_bad_frame_before_the_last_segment_fails_the_open`, `a_crc_failure_is_a_torn_tail_only_in_the_last_segment` |
+| Metadata saves without the sequence high-water mark | `test_gc_updates_last_sequence_before_deleting_segments` |

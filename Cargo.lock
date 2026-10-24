@@ -973,7 +973,6 @@ dependencies = [
  "bytecheck",
  "crc32fast",
  "criterion",
- "crossbeam-epoch",
  "json_dotpath",
  "libc",
  "log",

@@ -60,7 +60,7 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — facade, config, namespace, WAL, fail_log, TTL, stats, error
+src/db/                — facade, config, namespace, WALs (both on `segmented_log.rs`), fail_log, TTL, stats, error
 src/store/             — LSM tree, value log, GC workers
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/index/             — folded field-indexing module (always compiled)
