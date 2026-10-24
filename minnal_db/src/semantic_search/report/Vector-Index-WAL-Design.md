@@ -20,7 +20,9 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
   main WAL: `Database::put_ns_logged` / `delete_ns_logged`, called through a
   namespace as `put_logged` / `delete_logged`. Appended and applied with no
   fsync; durable at the next **sync** (`sync_vector_index_wal`), one fsync for
-  everything appended before it.
+  everything appended before it. Concurrent syncs share one fsync, through the
+  same commit rounds as the main WAL (`minnal_db/docs/Main-WAL-Rework-Design.md`
+  §16).
 - **No-WAL write** — `put_no_wal` (and `delete_no_wal`, `merge_no_wal`): the
   value goes to the value log and the key's pointer goes to the memtable, with
   no log entry at all. The pointer exists only in memory until the memtable is

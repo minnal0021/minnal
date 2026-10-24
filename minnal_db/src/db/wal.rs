@@ -9,6 +9,7 @@
 //!   each namespace's safe offset) that recovery and WAL GC read
 //! - Atomic file swapping during GC
 
+use crate::db::commit_rounds::CommitRounds;
 use crc32fast::Hasher;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -421,18 +422,6 @@ impl WalHandle {
     }
 }
 
-/// Group-commit state: how far the log is durable, and whether a commit
-/// round's fsync is running. See [`Wal::commit`].
-#[derive(Debug, Default)]
-struct CommitState {
-    /// Every byte below this offset is fsynced.
-    durable_tail: u64,
-    /// A leader is fsyncing; others wait for it to finish.
-    round_running: bool,
-    /// Writers waiting for a round (not counting a running leader).
-    waiting: usize,
-}
-
 /// Write-Ahead Log Manager
 ///
 /// Handles WAL file operations with head/tail tracking
@@ -446,17 +435,11 @@ pub struct Wal {
     segment_size: u64,
     current_segment_id: AtomicU64,
 
-    commit: parking_lot::Mutex<CommitState>,
-    /// Signalled when a round ends (or the log is poisoned).
-    round_done: parking_lot::Condvar,
-    /// Set by the first failed fsync; see [`Wal::commit`].
-    poisoned: parking_lot::Mutex<Option<String>>,
+    /// Group commit: the durable tail, commit rounds and poisoning, shared in
+    /// shape with the vector index WAL (`db/commit_rounds.rs`).
+    rounds: CommitRounds,
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
-    /// Test hook: while set, writers entering [`Wal::commit`] wait (see
-    /// [`Wal::freeze_commits`]); the count is how many are waiting.
-    #[cfg(test)]
-    frozen: parking_lot::Mutex<(bool, usize)>,
     /// Test hook for the power-loss model: per segment, the most bytes an fsync
     /// issued by this process covered, and the first segment this process
     /// could write (every earlier one survived a reopen, so it is durable).
@@ -469,8 +452,6 @@ pub struct Wal {
     written: parking_lot::Mutex<BTreeMap<u64, u64>>,
     #[cfg(test)]
     first_open_segment: AtomicU64,
-    #[cfg(test)]
-    thawed: parking_lot::Condvar,
 }
 
 /// Reclaims the current [`WalHandle`], and with it the open file descriptor.
@@ -618,21 +599,15 @@ impl Wal {
             path,
             segment_size: segment_size.max(MIN_SEGMENT_SIZE),
             current_segment_id: AtomicU64::new(0),
-            commit: parking_lot::Mutex::new(CommitState::default()),
-            round_done: parking_lot::Condvar::new(),
-            poisoned: parking_lot::Mutex::new(None),
+            rounds: CommitRounds::new(0),
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            frozen: parking_lot::Mutex::new((false, 0)),
             #[cfg(test)]
             synced: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             written: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             first_open_segment: AtomicU64::new(0),
-            #[cfg(test)]
-            thawed: parking_lot::Condvar::new(),
         })
     }
 
@@ -714,15 +689,14 @@ impl Wal {
 
     /// Every byte below this offset is fsynced.
     pub fn durable_tail(&self) -> u64 {
-        self.commit.lock().durable_tail
+        self.rounds.durable()
     }
 
     /// Record that everything below `tail` is durable: at open, after
     /// recovery has found and truncated the log's end, and as a segment is
     /// sealed.
     pub(crate) fn set_durable_tail(&self, tail: u64) {
-        let mut st = self.commit.lock();
-        st.durable_tail = st.durable_tail.max(tail);
+        self.rounds.advance(tail);
     }
 
     /// At open: what is on disk now survived, so it is durable (for the
@@ -740,19 +714,13 @@ impl Wal {
 
     /// `Err(Poisoned)` once an fsync of the log has failed.
     pub fn check_poisoned(&self) -> Result<()> {
-        match self.poisoned.lock().as_ref() {
-            None => Ok(()),
-            Some(why) => Err(WalError::Poisoned(why.clone())),
-        }
+        self.rounds.check_poisoned().map_err(WalError::Poisoned)
     }
 
     /// Stop the log: every waiting and later commit fails until reopen.
     pub(crate) fn poison(&self, why: String) -> WalError {
         log::error!("[WAL] stopping the main WAL; writes are refused until the database is reopened: {why}");
-        self.poisoned.lock().get_or_insert(why.clone());
-        let _st = self.commit.lock();
-        self.round_done.notify_all();
-        WalError::Poisoned(why)
+        WalError::Poisoned(self.rounds.poison(why))
     }
 
     /// Test hook: while `on`, every writer reaching [`commit`](Self::commit)
@@ -760,28 +728,13 @@ impl Wal {
     /// loss would catch it in. Turning it off releases them.
     #[cfg(test)]
     pub(crate) fn freeze_commits(&self, on: bool) {
-        self.frozen.lock().0 = on;
-        if !on {
-            self.thawed.notify_all();
-        }
+        self.rounds.freeze(on);
     }
 
     /// Test hook: how many writers are waiting in a frozen commit.
     #[cfg(test)]
     pub(crate) fn frozen_writers(&self) -> usize {
-        self.frozen.lock().1
-    }
-
-    #[cfg(test)]
-    fn wait_while_frozen(&self) {
-        let mut f = self.frozen.lock();
-        if f.0 {
-            f.1 += 1;
-            while f.0 {
-                self.thawed.wait(&mut f);
-            }
-            f.1 -= 1;
-        }
+        self.rounds.frozen_callers()
     }
 
     /// Test hook for the power-loss model: for every segment this process
@@ -831,17 +784,22 @@ impl Wal {
     /// fsync that succeeds says nothing about them, so nothing appended before
     /// it may be acknowledged: PostgreSQL's rule, and the vector index WAL's.
     fn sync_or_poison(&self, file: &File, segment_id: u64, what: &str) -> Result<()> {
+        self.sync_file(file, segment_id, what).map_err(|why| self.poison(why))
+    }
+
+    /// fsync `file` (segment `segment_id`); the error says what failed. The
+    /// caller poisons the log (directly, or through a commit round).
+    fn sync_file(&self, file: &File, segment_id: u64, what: &str) -> std::result::Result<(), String> {
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            return Err(self.poison(format!("{what}: injected fsync failure")));
+            return Err(format!("{what}: injected fsync failure"));
         }
         // What this fsync covers, for the power-loss model: how far frames were
         // written before it starts (bytes written later may or may not be
         // covered).
         #[cfg(test)]
         let covered = self.written.lock().get(&segment_id).copied().unwrap_or(0);
-        let _ = file;
-        file.sync_data().map_err(|e| self.poison(format!("{what}: {e}")))?;
+        file.sync_data().map_err(|e| format!("{what}: {e}"))?;
         #[cfg(test)]
         {
             let mut synced = self.synced.lock();
@@ -872,35 +830,15 @@ impl Wal {
     /// fsync poisons the log: every writer in that round, and every later one,
     /// gets [`WalError::Poisoned`].
     pub fn commit(&self, end: u64, delay: std::time::Duration, snapshot: impl Fn() -> Result<(u64, u64, Arc<File>)>) -> Result<bool> {
-        #[cfg(test)]
-        self.wait_while_frozen();
-        let mut st = self.commit.lock();
-        loop {
-            self.check_poisoned()?;
-            if st.durable_tail >= end {
-                return Ok(false);
-            }
-            if st.round_running {
-                st.waiting += 1;
-                self.round_done.wait(&mut st);
-                st.waiting -= 1;
-                continue;
-            }
-            st.round_running = true;
-            let others_waiting = st.waiting > 0;
-            drop(st);
-            if others_waiting && !delay.is_zero() {
-                std::thread::sleep(delay);
-            }
-            let round = snapshot().and_then(|(target, segment_id, file)| self.sync_or_poison(&file, segment_id, "a commit round").map(|()| target));
-            st = self.commit.lock();
-            st.round_running = false;
-            self.round_done.notify_all();
-            st.durable_tail = st.durable_tail.max(round?);
-            if st.durable_tail >= end {
-                return Ok(true);
-            }
-        }
+        self.rounds
+            .commit(end, delay, || {
+                let (target, segment_id, file) = snapshot().map_err(|e| format!("a commit round's snapshot: {e}"))?;
+                self.sync_file(&file, segment_id, "a commit round").inspect_err(|why| {
+                    log::error!("[WAL] stopping the main WAL; writes are refused until the database is reopened: {why}");
+                })?;
+                Ok(target)
+            })
+            .map_err(WalError::Poisoned)
     }
 
     /// Read a WAL entry from the given pointer

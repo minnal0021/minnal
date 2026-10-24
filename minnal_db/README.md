@@ -349,6 +349,7 @@ Semantic search (the `semantic-search` feature) writes a lot per document: each 
 - **One per database**, shared by every namespace, in `<db_path>/vector_index_wal/`. Each record names its namespace.
 - **No fsync per write.** `Database::put_ns_logged` / `delete_ns_logged` (called through a namespace as `put_logged` / `delete_logged`) append the record and apply it to the memtable, and return. A later `sync_vector_index_wal` makes every record appended before it durable with one fsync. The vector worker syncs once per batch of up to 256 documents before it removes their queue entries; partition maintenance syncs once per batch of 16 documents.
 - **Its own lock.** Appends take the log's append lock only to write the bytes, and the fsync runs outside it. A client's main-WAL write never waits on this log.
+- **Syncs share fsyncs**, through the same commit rounds as the main WAL (`db/commit_rounds.rs`): when the vector worker, partition maintenance and a flush sync at once, one fsync covers them all.
 - **Same seq counter, same key stripe** as every other write, so writes to one key through either log apply in seq order, and the highest seq wins after a crash too.
 
 ```mermaid
@@ -400,7 +401,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 - **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 0.8 ms for a preallocated WAL segment on the NVMe drive the benchmarks use, and about 2.3 ms for a file that grows with every write.
 - **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write takes to append its entry (and take its seq). It is released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
-- **Commit round** (main WAL) — one fsync and the writers it releases: the writer that finds no round running leads one, fsyncing the active segment up to the tail it read; writers whose entries came later wait for, or lead, the next. `wal_commit_rounds` / `wal_commit_writes` count them.
+- **Commit round** — one fsync and the callers it releases, in either log (`db/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
 - **Key stripe lock** (`db/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.

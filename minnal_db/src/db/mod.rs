@@ -1,3 +1,4 @@
+pub(crate) mod commit_rounds;
 pub mod config;
 pub mod database;
 pub mod error;

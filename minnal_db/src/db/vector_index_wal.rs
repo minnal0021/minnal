@@ -146,6 +146,7 @@
 //! does not read them: it walks the log from the cut (and the whole last
 //! segment, to find the tail).
 
+use crate::db::commit_rounds::CommitRounds;
 use crate::db::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -384,10 +385,11 @@ pub(crate) struct VectorIndexWal {
     /// read the tail without waiting on `active`, which a rotation holds
     /// across fsyncs.
     tail: AtomicU64,
-    /// Every byte below this position is on stable storage.
-    durable_tail: AtomicU64,
-    /// Why the log stopped, once an fsync has failed (see the module docs).
-    poisoned: Mutex<Option<String>>,
+    /// Syncs as commit rounds, shared in shape with the main WAL
+    /// (`db/commit_rounds.rs`): the durable tail (every byte below it is on
+    /// stable storage), concurrent syncs coalescing into one fsync, and the
+    /// poisoned state once an fsync has failed (see the module docs).
+    rounds: CommitRounds,
     /// Appends not yet applied to a memtable: start → namespace.
     in_flight: Mutex<BTreeMap<u64, u32>>,
     /// Which namespaces are tracked, their latest records and their seals.
@@ -890,8 +892,7 @@ impl VectorIndexWal {
                 last_seq,
             }),
             tail: AtomicU64::new(tail),
-            durable_tail: AtomicU64::new(tail),
-            poisoned: Mutex::new(None),
+            rounds: CommitRounds::new(tail),
             in_flight: Mutex::new(BTreeMap::new()),
             tracking: Mutex::new(Tracking {
                 last_write: tracked,
@@ -992,7 +993,7 @@ impl VectorIndexWal {
         if let Err(e) = a.file.sync_data() {
             return Err(self.poison(e));
         }
-        self.durable_tail.fetch_max(position(a.segment_id, a.pos), Ordering::AcqRel);
+        self.rounds.advance(position(a.segment_id, a.pos));
         let next = a.segment_id + 1;
         a.file = Arc::new(create_segment(&self.dir, next)?);
         a.segment_id = next;
@@ -1007,26 +1008,32 @@ impl VectorIndexWal {
     /// Does no I/O when nothing was appended since the last sync. A failure
     /// poisons the log (see the module docs).
     pub(crate) fn sync(&self) -> Result<()> {
-        self.check_poisoned()?;
-        #[cfg(test)]
-        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            return Err(self.poison(std::io::Error::other("injected sync failure")));
-        }
-        let (file, tail) = {
-            let a = self.active.lock();
-            (Arc::clone(&a.file), position(a.segment_id, a.pos))
-        };
-        if tail <= self.durable_tail.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // Earlier segments were fsynced when they were sealed; the one at
-        // `tail` holds every append that returned before the snapshot.
-        if let Err(e) = file.sync_data() {
-            return Err(self.poison(e));
-        }
-        self.durable_tail.fetch_max(tail, Ordering::AcqRel);
-        Metrics::bump(&self.metrics.vector_wal_fsyncs);
-        Ok(())
+        // Every append that returned before this call ended at or below `end`.
+        let end = self.tail.load(Ordering::Acquire);
+        self.rounds
+            .commit(end, std::time::Duration::ZERO, || {
+                #[cfg(test)]
+                if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+                    return Err(Self::stopping("injected sync failure".into()));
+                }
+                // Earlier segments were fsynced when they were sealed; the one
+                // at `tail` holds every append made before the snapshot.
+                let (file, tail) = {
+                    let a = self.active.lock();
+                    (Arc::clone(&a.file), position(a.segment_id, a.pos))
+                };
+                file.sync_data().map_err(|e| Self::stopping(e.to_string()))?;
+                Metrics::bump(&self.metrics.vector_wal_fsyncs);
+                Ok(tail)
+            })
+            .map(|_| ())
+            .map_err(VectorIndexWalError::Poisoned)
+    }
+
+    /// Log that the log is stopping after a failed fsync; returns `why`.
+    fn stopping(why: String) -> String {
+        log::error!("[vector index WAL] fsync failed; appends and syncs are refused until the database is reopened: {why}");
+        why
     }
 
     /// `ns` is about to write a memtable to L0. If the namespace has records
@@ -1039,7 +1046,7 @@ impl VectorIndexWal {
     pub(crate) fn before_memtable_written(&self, ns: u32) -> Result<()> {
         let last = self.tracking.lock().last_write.get(&ns).copied();
         match last {
-            Some(end) if end > self.durable_tail.load(Ordering::Acquire) => {
+            Some(end) if end > self.rounds.durable() => {
                 Metrics::bump(&self.metrics.vector_wal_flush_syncs);
                 self.sync()
             }
@@ -1049,17 +1056,11 @@ impl VectorIndexWal {
 
     /// Stops the log after a failed fsync. Returns the error to report.
     fn poison(&self, e: std::io::Error) -> VectorIndexWalError {
-        let why = e.to_string();
-        log::error!("[vector index WAL] fsync failed; appends and syncs are refused until the database is reopened: {why}");
-        self.poisoned.lock().get_or_insert(why.clone());
-        VectorIndexWalError::Poisoned(why)
+        VectorIndexWalError::Poisoned(self.rounds.poison(Self::stopping(e.to_string())))
     }
 
     fn check_poisoned(&self) -> Result<()> {
-        match self.poisoned.lock().as_ref() {
-            Some(why) => Err(VectorIndexWalError::Poisoned(why.clone())),
-            None => Ok(()),
-        }
+        self.rounds.check_poisoned().map_err(VectorIndexWalError::Poisoned)
     }
 
     /// Reads every record from `start` (a record's position, or a segment's
@@ -1121,7 +1122,7 @@ impl VectorIndexWal {
 
     /// Every byte below this position is on stable storage.
     pub(crate) fn durable_tail(&self) -> u64 {
-        self.durable_tail.load(Ordering::Acquire)
+        self.rounds.durable()
     }
 
     /// Highest seq of any record appended since open, or found at open at or
@@ -1364,7 +1365,7 @@ impl VectorIndexWal {
     #[cfg(test)]
     pub(crate) fn power_loss_extent(&self) -> (PathBuf, u64) {
         let a = self.active.lock();
-        let (seg, byte) = split(self.durable_tail.load(Ordering::Acquire));
+        let (seg, byte) = split(self.durable_tail());
         let durable = if seg == a.segment_id { byte } else { 0 };
         (segment_path(&self.dir, a.segment_id), u64::from(durable.max(SEGMENT_HEADER_LEN)))
     }
@@ -1464,7 +1465,7 @@ impl VectorIndexWal {
                     safe_offset: VectorIndexWalPosition::of(safe),
                 })
                 .collect(),
-            stopped: self.poisoned.lock().clone(),
+            stopped: self.rounds.poisoned(),
         })
     }
 }
@@ -2311,6 +2312,106 @@ mod tests {
         wal.append(1, b"k", b"v", 9).unwrap();
         wal.sync().unwrap();
         assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_none());
+    }
+
+    /// Concurrent syncs share fsyncs (commit rounds, as in the main WAL), and
+    /// each still returns only once every append made before it is durable.
+    #[test]
+    fn concurrent_syncs_share_fsyncs() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let before = wal.metrics.vector_wal_fsyncs.load(Ordering::SeqCst);
+        let seq = AtomicU64::new(1);
+        std::thread::scope(|s| {
+            for t in 0..16u32 {
+                let (wal, seq) = (&wal, &seq);
+                s.spawn(move || {
+                    for i in 0..50u32 {
+                        let write = wal
+                            .append(t, format!("k{i}").as_bytes(), b"v", seq.fetch_add(1, Ordering::SeqCst))
+                            .unwrap();
+                        let end = write.end;
+                        drop(write);
+                        wal.sync().unwrap();
+                        assert!(wal.durable_tail() >= end, "a sync returned before its append was durable");
+                    }
+                });
+            }
+        });
+        let fsyncs = wal.metrics.vector_wal_fsyncs.load(Ordering::SeqCst) - before;
+        assert!(
+            fsyncs < 800,
+            "16 threads syncing concurrently never shared an fsync ({fsyncs} fsyncs for 800 syncs)"
+        );
+    }
+
+    /// Syncs that arrive while others are pending share one fsync: held at the
+    /// commit point together, then released, eight syncs cost one fsync, not
+    /// eight. (Without commit rounds each would fsync on its own, since none
+    /// sees another's fsync finish first.)
+    #[test]
+    fn syncs_waiting_together_share_one_fsync() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let before = wal.metrics.vector_wal_fsyncs.load(Ordering::SeqCst);
+        wal.rounds.freeze(true);
+        std::thread::scope(|s| {
+            let syncs: Vec<_> = (0..8u32)
+                .map(|t| {
+                    let wal = &wal;
+                    s.spawn(move || {
+                        drop(wal.append(t, b"k", b"v", u64::from(t) + 1).unwrap());
+                        wal.sync()
+                    })
+                })
+                .collect();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while wal.rounds.frozen_callers() < 8 {
+                assert!(std::time::Instant::now() < deadline, "the syncs never reached the commit point");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            wal.rounds.freeze(false);
+            for sync in syncs {
+                sync.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            wal.metrics.vector_wal_fsyncs.load(Ordering::SeqCst) - before,
+            1,
+            "eight waiting syncs should share one fsync"
+        );
+        assert_eq!(wal.durable_tail(), wal.tail());
+    }
+
+    /// A failed fsync fails every sync waiting on that round, and stops the log.
+    #[test]
+    fn a_failed_round_fails_every_waiting_sync() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        wal.rounds.freeze(true);
+        std::thread::scope(|s| {
+            let syncs: Vec<_> = (0..4u32)
+                .map(|t| {
+                    let wal = &wal;
+                    s.spawn(move || {
+                        drop(wal.append(t, b"k", b"v", u64::from(t) + 1).unwrap());
+                        wal.sync()
+                    })
+                })
+                .collect();
+            while wal.rounds.frozen_callers() < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            wal.fail_next_sync();
+            wal.rounds.freeze(false);
+            for sync in syncs {
+                assert!(
+                    matches!(sync.join().unwrap(), Err(VectorIndexWalError::Poisoned(_))),
+                    "a waiting sync succeeded"
+                );
+            }
+        });
+        assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_some());
     }
 
     /// Segments wholly below the cut are retired: open does not read them, so

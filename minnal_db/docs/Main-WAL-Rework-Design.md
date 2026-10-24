@@ -1,7 +1,8 @@
 # Main WAL rework: retire by cut, checksum frames, group commit — design note
 
 **Status:** built, 2026-10-24: A1, A2, B and C, with the crash testing in §13
-and the measurements in §14. Preallocated segments (§15) built after.
+and the measurements in §14. Preallocated segments (§15) built after; the vector index
+WAL's syncs coalesced the same way (§16).
 **Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
@@ -1094,4 +1095,52 @@ Open question: the criterion benchmark `write/put` still reports 2.32 ms per
 `put` with preallocation. It opens a fresh store for each batch, so it
 measures writes into new files; why that keeps the old cost is not yet
 understood. `benchmark.md` predates this change and needs a full refresh.
+
+## 16. The vector index WAL shares the commit rounds
+
+**Why.** The two logs should work the same way wherever they can. They
+already share a lot: append under a lock and fsync outside it, a segment
+fsynced as it is left, a CRC per record, a torn tail cut off at open, a failed
+fsync stopping the log, the sequence counter, and retirement by per-namespace
+offsets saved before L0 is registered. Their syncs still differ. The main WAL
+coalesces concurrent fsyncs into commit rounds (§6.1). The vector index WAL's
+`sync()` snapshots the tail and fsyncs, so concurrent callers — the vector
+worker's batch sync, partition maintenance's per-batch syncs
+(`ivf_split::sync_batch`), and the flush-time syncs of the prefix rule
+(`before_memtable_written`) — each issue their own fsync, even while another
+covering the same bytes is running.
+
+**Design.**
+
+- The round logic moves out of `Wal` into one small type, `CommitRounds`
+  (`db/commit_rounds.rs`): the durable position, whether a round is running,
+  how many wait, the condition variable, the poisoned state, and the test
+  hooks (freezing commits, failing the next fsync). Its `commit(end, delay,
+  round)` is §6.1's loop; `round` is the log's own step: take a snapshot of
+  its tail and active file under its lock, fsync the file outside it, and
+  return the position the fsync covers. A failed round poisons the rounds,
+  and with them the log.
+- The main WAL calls it per write, as now. The vector index WAL's `sync()`
+  calls it with `end` = the tail when `sync` is called, so its contract is
+  unchanged (every append that returned before the call is durable when it
+  returns), and concurrent syncs share one fsync. No commit delay: the vector
+  callers already batch.
+- Both logs read the durable position from their rounds (the vector index
+  WAL's `durable_tail`, which the prefix rule and the stats use, becomes
+  `rounds.durable()`), and both advance it when a segment is sealed.
+- Positions are each log's own: byte offsets in the main WAL,
+  `(segment_id << 32) | byte` in the vector index WAL. Both only grow, which
+  is all the rounds need.
+
+**Tests.** Concurrent syncs share fsyncs (`vector_wal_fsyncs` < syncs); a sync
+still makes every earlier append durable (the existing prefix-rule and crash
+tests); a failed round's fsync fails every sync waiting on it and poisons the
+log (`a_failed_fsync_stops_the_log_until_it_is_reopened`, plus a concurrent
+variant); every main-WAL test still passes on the shared type.
+
+**Not covered here:** preallocating the vector index WAL's segments and
+zeroing (rather than truncating) its torn tail. Its segments have a header,
+end markers and an open-time rule that tells a torn tail from corruption by
+which segment a bad frame is in; preallocation changes what the zeros past
+the tail mean to that rule, so it is a separate step.
 
