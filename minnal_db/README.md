@@ -260,10 +260,10 @@ The WAL is the safety net beneath every write. It is a single, global, append-on
 
 **Durability model (deliberate — do not "optimise" with group commit).** Every `put`/`delete` `fsync`s the WAL *before returning*, so each acknowledged write is durable against power loss the moment the call returns. The engine intentionally does **not** group-commit independent writes — that is, it never defers or batches their WAL `fsync`. Doing so would let a write be acknowledged before it reached stable storage, so a power loss in that window would silently lose a write the caller believed had succeeded. (Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL already holds a durable copy that recovery can replay.)
 
-Each WAL entry is length-prefixed and stored in a compact binary format. Once written, an entry never changes: the log is append-only.
+Each WAL entry is a **frame**: its length, a CRC32 of its body, then the body in a compact binary format. Once written, an entry never changes: the log is append-only.
 
 ```
-[size: 4B] [rkyv-serialized WalEntry]
+[size: 4B] [crc32(body): 4B] [body: rkyv-serialized WalEntry]
 
 WalEntry {
   operation:    Upsert | Delete
@@ -276,6 +276,8 @@ WalEntry {
 ```
 
 Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every entry not yet in an SSTable is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes and reconcile on recovery rather than committing them atomically.
+
+Recovery reads frames until the first one whose length, CRC or body is not valid: that is the end of the log (a record torn by a crash, or damaged), and open cuts the file off there. A checksum is needed because a changed byte inside a key or value still decodes.
 
 The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
 
@@ -410,7 +412,7 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 - **`LoggedWrite`** — the guard an append returns. While it is alive the record counts as *in flight* (appended, not yet in a memtable), so no seal can count it as covered.
 - **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker) and the next is started.
 - **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced.
-- **Torn tail** — a partly written last record after a crash. Opening the log cuts it off; only the last segment may have one.
+- **Torn tail** — a partly written last record after a crash, found by its length running past the data or its CRC not matching. Opening either log cuts it off (truncates the file there), so a later, shorter record cannot leave older valid-looking records behind it; only the last segment may have one.
 - **Ceiling** — when a namespace's memtable is sealed, how far into the vector index WAL its applied records reach: the tail, lowered to the oldest of its records still in flight.
 - **Safe offset** — per namespace, in either log: every one of its records below this position is in L0 files. Its replay starts here.
 - **Retired cut** — the lowest safe offset of any namespace that still has records above its own (capped by the oldest record still in flight). Records below it are retired; GC deletes segments that lie wholly below it. It is kept in the `retired_cut` marker file, written before the flush's L0 files are registered.

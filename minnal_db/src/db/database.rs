@@ -920,6 +920,9 @@ impl Database {
                 );
                 wal_metadata.tail = true_tail;
             }
+            // Cut off anything past the valid frames (a torn tail), so a later,
+            // shorter append cannot leave stale frames behind it.
+            wal.truncate_after(wal_metadata.tail)?;
         }
 
         let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);
@@ -1290,7 +1293,7 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.puts);
             crate::db::metrics::Metrics::bump(&m.wal_fsyncs);
-            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + 4);
+            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq));
@@ -1620,7 +1623,7 @@ impl Database {
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.deletes);
             crate::db::metrics::Metrics::bump(&m.wal_fsyncs);
-            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + 4);
+            crate::db::metrics::Metrics::add(&m.wal_bytes_appended, wal_pointer.size as u64 + crate::db::wal::FRAME_HEADER_LEN);
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq));
@@ -3230,6 +3233,9 @@ impl Database {
                 );
                 wal_metadata.tail = true_tail;
             }
+            // Cut off anything past the valid frames (a torn tail), so a later,
+            // shorter append cannot leave stale frames behind it.
+            wal.truncate_after(wal_metadata.tail)?;
         }
 
         let next_seq_start = wal.recover_sequence(wal_metadata.head, wal_metadata.tail, wal_metadata.last_sequence);

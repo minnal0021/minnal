@@ -42,6 +42,30 @@ pub(crate) const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 /// [`Wal::open_with_options_and_segment_size`].
 pub(crate) const MIN_SEGMENT_SIZE: u64 = 256;
 const WAL_METADATA_MAGIC: [u8; 4] = *b"WALM";
+
+/// Bytes before each frame's body: its length (u32) and the CRC32 of the body
+/// (u32), little-endian. A zero length marks the end of a segment.
+pub(crate) const FRAME_HEADER_LEN: u64 = 8;
+
+/// What [`Wal::read_frame`] found at a position.
+enum Frame {
+    /// No room for a header, or a zero length: the segment's records end here.
+    SegmentEnd,
+    /// A header whose body is short, fails its CRC or does not decode: a torn
+    /// or corrupt record. Nothing at or after it is part of the log.
+    Bad,
+    /// A valid frame whose body (in the caller's buffer) is this long.
+    Valid(u32),
+}
+
+/// The frame bytes for `body`: header, then the body.
+fn encode_frame(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN as usize + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
 const WAL_METADATA_VERSION: u32 = 1;
 
 /// Operation type for WAL entries
@@ -558,7 +582,7 @@ impl Wal {
         // Serialize the entry
         let entry_bytes = entry.to_bytes()?;
         let size = entry_bytes.len() as u32;
-        let entry_len = 4u64 + size as u64;
+        let entry_len = FRAME_HEADER_LEN + size as u64;
         let remaining = self.segment_size.saturating_sub(segment_offset);
         if entry_len > remaining {
             if remaining >= 4 {
@@ -571,15 +595,14 @@ impl Wal {
             file_arc = self.current_file_arc()?;
         }
 
-        // Write size header (4 bytes) + serialized entry
-        self.write_all_at(&file_arc, &size.to_le_bytes(), segment_offset)?;
-        self.write_all_at(&file_arc, &entry_bytes, segment_offset + 4)?;
+        // One write: header (length + CRC) and body.
+        self.write_all_at(&file_arc, &encode_frame(&entry_bytes), segment_offset)?;
         if sync {
             file_arc.sync_data()?;
         }
 
         let pointer = WalPointer::new(*tail, size);
-        *tail += 4 + size as u64;
+        *tail += entry_len;
 
         Ok(pointer)
     }
@@ -592,28 +615,11 @@ impl Wal {
 
         let segment_id = self.segment_id_for(pointer.offset);
         let segment_offset = self.segment_offset_for(pointer.offset);
-        let file = if segment_id == self.current_segment_id.load(Ordering::Acquire) {
-            &*handle.file
-        } else {
-            let file = self.open_segment_file(segment_id, false)?;
-            return self.read_entry_from_file(&file, segment_offset, pointer.size);
-        };
-
-        // Read size header
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let size = u32::from_le_bytes(size_buf);
-
-        // Verify size matches pointer
-        if size != pointer.size {
-            return Err(WalError::CorruptedLog);
+        if segment_id == self.current_segment_id.load(Ordering::Acquire) {
+            return self.read_entry_from_file(&handle.file, segment_offset, pointer.size);
         }
-
-        // Read entry bytes
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-
-        WalEntry::from_bytes(&entry_bytes)
+        let file = self.open_segment_file(segment_id, false)?;
+        self.read_entry_from_file(&file, segment_offset, pointer.size)
     }
 
     /// Segment ids covering `[head, tail)` whose files are **absent**.
@@ -647,10 +653,10 @@ impl Wal {
     /// - a **missing segment** is a hole to skip, not an error. WAL GC only
     ///   reclaims segments below the cut, which nothing replays, and aborting
     ///   on one would crash recovery;
-    /// - a **short or zero-length frame** is a torn/unwritten segment tail:
-    ///   advance to the next segment and keep going;
-    /// - a frame that **will not decode** ends the scan — `extract` returns
-    ///   `None` to say so.
+    /// - **no room for a header, or a zero length**, is the end of a segment's
+    ///   records: advance to the next segment and keep going;
+    /// - a frame whose body is **short, fails its CRC, or will not decode** ends
+    ///   the scan (`extract` returns `None` for the last).
     ///
     /// The body buffer is reused across frames, so a scan allocates once rather
     /// than per entry.
@@ -684,41 +690,21 @@ impl Wal {
                 continue;
             };
 
-            let segment_offset = self.segment_offset_for(offset);
-            let mut size_buf = [0u8; 4];
-            if self.read_exact_at(current_file, &mut size_buf, segment_offset).is_err() {
-                let next_segment = (segment_id + 1) * self.segment_size;
-                if next_segment > offset {
-                    offset = next_segment;
+            let size = match self.read_frame(current_file, self.segment_offset_for(offset), &mut entry_bytes) {
+                Frame::SegmentEnd => {
+                    offset = (segment_id + 1) * self.segment_size;
                     continue;
                 }
-                break;
-            }
-            let size = u32::from_le_bytes(size_buf);
-            if size == 0 {
-                offset = (segment_id + 1) * self.segment_size;
-                continue;
-            }
-
-            entry_bytes.resize(size as usize, 0);
-            if self
-                .read_exact_at(current_file, &mut entry_bytes[..size as usize], segment_offset + 4)
-                .is_err()
-            {
-                let next_segment = (segment_id + 1) * self.segment_size;
-                if next_segment > offset {
-                    offset = next_segment;
-                    continue;
-                }
-                break;
-            }
+                Frame::Bad => break,
+                Frame::Valid(size) => size,
+            };
 
             match extract(offset, &entry_bytes[..size as usize]) {
                 Some(value) => collected.push(value),
                 None => break,
             }
 
-            offset += 4 + size as u64;
+            offset += FRAME_HEADER_LEN + size as u64;
         }
 
         Ok(collected)
@@ -874,32 +860,28 @@ impl Wal {
             };
             let segment_offset = self.segment_offset_for(offset);
 
-            // A readable size header that is non-zero begins an entry. A zero or
-            // unreadable header means end-of-segment: either an explicit padding
-            // marker, or a sub-4-byte remainder left when an entry was rotated to
-            // the next segment without room for padding. In both cases the log
+            // No room for a header, or a zero length, ends this segment's
+            // records: an explicit padding marker, or a remainder too small for a
+            // frame left when an entry was rotated to the next segment. The log
             // continues in the next segment *iff* that segment file exists —
-            // otherwise we are at the true end.
-            let mut size_buf = [0u8; 4];
-            let header_ok = self.read_exact_at(&file, &mut size_buf, segment_offset).is_ok();
-            let size = if header_ok { u32::from_le_bytes(size_buf) } else { 0 };
-
-            if !header_ok || size == 0 {
-                if self.open_segment_file(segment_id + 1, false).is_ok() {
-                    offset = (segment_id + 1) * self.segment_size;
-                    continue;
+            // otherwise we are at the true end. A frame whose body is short,
+            // fails its CRC or does not decode is a torn or corrupt tail.
+            let mut body = Vec::new();
+            let size = match self.read_frame(&file, segment_offset, &mut body) {
+                Frame::SegmentEnd => {
+                    if self.open_segment_file(segment_id + 1, false).is_ok() {
+                        offset = (segment_id + 1) * self.segment_size;
+                        continue;
+                    }
+                    break; // no successor segment → true end of log
                 }
-                break; // no successor segment → true end of log
-            }
-
-            let mut entry_bytes = vec![0u8; size as usize];
-            if self.read_exact_at(&file, &mut entry_bytes, segment_offset + 4).is_err() {
-                break; // header present but body truncated → torn final append
-            }
-            if WalEntry::from_bytes(&entry_bytes).is_err() {
+                Frame::Bad => break,
+                Frame::Valid(size) => size,
+            };
+            if WalEntry::from_bytes(&body).is_err() {
                 break; // body present but not a valid entry → corrupt tail
             }
-            offset += 4 + size as u64;
+            offset += FRAME_HEADER_LEN + size as u64;
         }
         offset
     }
@@ -917,17 +899,67 @@ impl Wal {
         }
     }
 
-    #[allow(dead_code)]
     fn read_entry_from_file(&self, file: &File, segment_offset: u64, size: u32) -> Result<WalEntry> {
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let stored_size = u32::from_le_bytes(size_buf);
-        if stored_size != size {
-            return Err(WalError::CorruptedLog);
+        let mut body = Vec::new();
+        match self.read_frame(file, segment_offset, &mut body) {
+            Frame::Valid(stored) if stored == size => WalEntry::from_bytes(&body),
+            _ => Err(WalError::CorruptedLog),
         }
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-        WalEntry::from_bytes(&entry_bytes)
+    }
+
+    /// Read the frame at `segment_offset` of `file` into `body`. A frame is
+    /// valid only if its whole body is there, fits in the segment, and matches
+    /// its CRC; decoding the body is the caller's step.
+    fn read_frame(&self, file: &File, segment_offset: u64, body: &mut Vec<u8>) -> Frame {
+        let mut header = [0u8; FRAME_HEADER_LEN as usize];
+        if self.read_exact_at(file, &mut header, segment_offset).is_err() {
+            return Frame::SegmentEnd;
+        }
+        let size = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        if size == 0 {
+            return Frame::SegmentEnd;
+        }
+        if segment_offset + FRAME_HEADER_LEN + size as u64 > self.segment_size {
+            return Frame::Bad;
+        }
+        let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        body.resize(size as usize, 0);
+        if self.read_exact_at(file, body, segment_offset + FRAME_HEADER_LEN).is_err() || crc32fast::hash(body) != crc {
+            return Frame::Bad;
+        }
+        Frame::Valid(size)
+    }
+
+    /// Cut the log off at `tail`, the end of its valid frames found by
+    /// [`recover_tail`](Self::recover_tail): truncate the segment holding it and
+    /// remove any later segment files, then make that durable. Called at open,
+    /// before anything is appended.
+    ///
+    /// Without it, a later, shorter record written over a torn region leaves
+    /// older valid-looking frames behind it, and a second recovery would replay
+    /// them; a CRC does not catch those, since they were valid when written.
+    pub fn truncate_after(&self, tail: u64) -> Result<()> {
+        let segment_id = self.segment_id_for(tail);
+        let keep = self.segment_offset_for(tail);
+        let path = self.segment_path_for(segment_id);
+        let mut changed = false;
+        if let Ok(file) = OpenOptions::new().write(true).open(&path)
+            && file.metadata()?.len() > keep
+        {
+            file.set_len(keep)?;
+            file.sync_all()?;
+            changed = true;
+        }
+        let mut next = segment_id + 1;
+        while self.segment_path_for(next).exists() {
+            self.delete_segment_file(next)?;
+            next += 1;
+            changed = true;
+        }
+        if changed && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn current_file_arc(&self) -> Result<Arc<File>> {
@@ -1147,10 +1179,9 @@ mod tests {
                 let entry_bytes = entry.to_bytes()?;
                 let size = entry_bytes.len() as u32;
                 file.seek(SeekFrom::Start(offset))?;
-                file.write_all(&size.to_le_bytes())?;
-                file.write_all(&entry_bytes)?;
+                file.write_all(&encode_frame(&entry_bytes))?;
                 pointers.push(WalPointer::new(offset, size));
-                offset += 4 + size as u64;
+                offset += FRAME_HEADER_LEN + size as u64;
             }
 
             file.sync_all()?;
@@ -1566,6 +1597,37 @@ mod tests {
         }
         // Reconstruct from scratch across the rotated segments.
         assert_eq!(wal.recover_tail(0), tail);
+        Ok(())
+    }
+
+    /// A changed byte inside a value still decodes (rkyv checks structure, not
+    /// contents), so without a checksum replay would write the wrong value. The
+    /// frame's CRC rejects it, and recovery stops there.
+    #[test]
+    fn a_changed_byte_in_a_value_is_rejected_and_recovery_stops_there() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("crc.wal");
+        let wal = Wal::open(&path)?;
+        let mut tail = 0u64;
+        let first = wal.append_entry(&WalEntry::new_upsert(b"k1".to_vec(), b"value-one".to_vec()), &mut tail, false)?;
+        let end_of_first = tail;
+        let second = wal.append_entry(&WalEntry::new_upsert(b"k2".to_vec(), b"value-two".to_vec()), &mut tail, false)?;
+        wal.append_entry(&WalEntry::new_upsert(b"k3".to_vec(), b"value-three".to_vec()), &mut tail, false)?;
+
+        // Flip one byte of the second entry's value ("value-two" → "valuE-two").
+        let f = OpenOptions::new().read(true).write(true).open(&path)?;
+        let mut body = vec![0u8; second.size as usize];
+        f.read_exact_at(&mut body, second.offset + FRAME_HEADER_LEN)?;
+        let at = body.windows(9).position(|w| w == b"value-two").expect("value bytes in the body");
+        body[at + 4] = b'E';
+        assert!(WalEntry::from_bytes(&body).is_ok(), "setup: the changed body must still decode");
+        f.write_at(&body, second.offset + FRAME_HEADER_LEN)?;
+
+        assert_eq!(wal.recover_tail(0), end_of_first, "recovery must stop at the corrupt frame");
+        let scanned = wal.scan_entries(0, tail)?;
+        assert_eq!(scanned.len(), 1, "the scan must stop at the corrupt frame");
+        assert_eq!(scanned[0].0.offset, first.offset);
+        assert!(wal.read_entry(second).is_err(), "reading the corrupt frame must fail");
         Ok(())
     }
 }

@@ -3270,3 +3270,42 @@ fn recovery_replays_each_namespace_from_its_own_offset_then_retires_the_log() {
     let meta = db.wal_metadata.read().clone();
     assert_eq!((meta.cut, meta.safe.len()), (meta.tail, 0), "recovery should retire the whole log");
 }
+
+/// Open cuts the log off at its last valid frame. Without that, a later record
+/// the same size as a torn one ends exactly where an old, still-valid frame
+/// begins, and the next recovery replays that stale frame as if it were new.
+#[test]
+fn open_truncates_a_torn_tail_so_stale_frames_cannot_replay() {
+    let dir = TempDir::new().unwrap();
+    let (second, ns) = {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.create_namespace("ns").unwrap();
+        db.put_ns(ns, b"k1", b"v").unwrap();
+        let second = db.wal_metadata.read().tail;
+        db.put_ns(ns, b"k2", b"v").unwrap();
+        db.put_ns(ns, b"k3", b"v").unwrap();
+        db.mark_crashed();
+        (second, ns)
+    };
+    // Tear the second frame: change its CRC, so the log's valid frames end at k1.
+    let wal_path = dir.path().join("wal.log");
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+        let mut crc = [0u8; 4];
+        f.read_exact_at(&mut crc, second + 4).unwrap();
+        crc[0] ^= 0xFF;
+        f.write_at(&crc, second + 4).unwrap();
+    }
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(db.get_ns(ns, b"k1").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(db.get_ns(ns, b"k3").unwrap(), None, "k3 lies after the torn frame");
+        // Same size as k2's frame, so it ends where k3's stale frame began.
+        db.put_ns(ns, b"k4", b"v").unwrap();
+        db.mark_crashed();
+    }
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    assert_eq!(db.get_ns(ns, b"k4").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get_ns(ns, b"k3").unwrap(), None, "a stale frame past the old torn tail was replayed");
+}

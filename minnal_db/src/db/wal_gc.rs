@@ -518,7 +518,7 @@ mod tests {
         let mut pad_value_len = 1usize;
         loop {
             let pad_entry = WalEntry::new_upsert(b"wal_gc_pad_crash".to_vec(), vec![0u8; pad_value_len]);
-            let entry_len = 4u64 + pad_entry.to_bytes()?.len() as u64;
+            let entry_len = crate::db::wal::FRAME_HEADER_LEN + pad_entry.to_bytes()?.len() as u64;
             if entry_len > remaining && entry_len < segment_size {
                 db.simulate_crash_with_wal_entries(vec![pad_entry])?;
                 break;
