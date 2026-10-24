@@ -2064,6 +2064,18 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Delete a key logged in the vector index WAL instead of the main WAL —
+    /// durable after the next `AsyncDb::sync_vector_index_wal`. See
+    /// [`Database::delete_ns_logged`].
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn delete_logged(&self, key: Vec<u8>) -> Result<()> {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.delete_ns_logged(ns_id, &key))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     /// [`put`](Self::put) on the calling thread, for crate code that must stay
     /// synchronous (the doc store's schema store). Wrap a call made on a runtime
     /// thread in `support::run_blocking_pass`.
@@ -2148,6 +2160,20 @@ impl AsyncNamespace {
         let db = self.db.clone();
         let ns_id = self.ns_id;
         tokio::task::spawn_blocking(move || db.inner.merge_ns(ns_id, &key, &value, merge_fn))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// [`Self::merge`] whose resolved write skips the WAL — see
+    /// `Database::merge_ns_no_wal` for the crash-safety trade-off. The no-WAL
+    /// counterpart of `merge`, for data whose lost write repairs itself.
+    pub async fn merge_no_wal<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
+    {
+        let db = self.db.clone();
+        let ns_id = self.ns_id;
+        tokio::task::spawn_blocking(move || db.inner.merge_ns_no_wal(ns_id, &key, &value, merge_fn))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }

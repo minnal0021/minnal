@@ -1955,6 +1955,10 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
         self.inner.on_memtable_sealed(version);
     }
 
+    fn on_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()> {
+        self.inner.on_ro_memtable_flushing(version)
+    }
+
     // The vector index WAL retires records here, so the values they point at
     // must be on stable storage first, exactly as for the persisted event below.
     // The second fsync, before that event, then finds little or nothing to write.

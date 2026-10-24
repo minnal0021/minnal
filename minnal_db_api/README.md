@@ -1241,8 +1241,8 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
-| `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache). Vector payloads and partition-maintenance copies are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
-| `no_wal_deletes` | writes | Deletes written bypassing the WAL (`delete_no_wal` callers) | **No** |
+| `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache, embed-queue updates written by a no-WAL merge). Vector payloads and partition maintenance's writes are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
+| `no_wal_deletes` | writes | Deletes written bypassing every log: mostly the vector worker removing finished entries from the embed queue (a no-WAL merge), plus `delete_no_wal` callers | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
 | `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
@@ -1256,7 +1256,8 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `wal_segments_deleted` | gc | WAL segments reclaimed by GC | **No** |
 | `appends` | vector_index_wal | Records appended to the vector index WAL | **No** |
 | `bytes_appended` | vector_index_wal | Bytes appended to it, frames included | **No** |
-| `fsyncs` | vector_index_wal | Its fsyncs: one per batch of vector writes made durable | **No** |
+| `fsyncs` | vector_index_wal | Its fsyncs: one per batch of vector writes made durable (the vector worker's, or a partition-maintenance batch), or per memtable flush that found records not yet durable | **No** |
+| `flush_syncs` | vector_index_wal | Syncs a memtable flush asked for before writing its L0 files, because its namespace had records not yet durable in the log (so an L0 file never holds a write the log could lose). Usually far fewer than `fsyncs` | **No** |
 | `appends_per_fsync` | vector_index_wal | `appends / fsyncs` (derived): records made durable per fsync. `null` before the first fsync | **No** |
 | `gc_runs` | vector_index_wal | Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete | **No** |
 | `segments_deleted` | vector_index_wal | Its segments deleted by GC | **No** |
@@ -1332,8 +1333,10 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
 
 **`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
-vector worker writes its chunk and whole-document codes to so that one fsync per
-batch makes them durable. One log per database, shared by every namespace. A
+vector worker writes its chunk and whole-document codes to, and partition
+maintenance its per-document writes, so that one fsync per batch makes them
+durable. One log per database (`<db_path>/vector_index_wal/`), shared by every
+namespace. A
 record is **retired** once the memtable holding its write has been flushed to
 disk; restart replays only unretired records, and GC deletes segments that lie
 wholly below the **retired cut**. Each namespace's replay starts at its own

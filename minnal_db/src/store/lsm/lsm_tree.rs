@@ -43,16 +43,26 @@ struct WrittenLevel0File {
 ///
 /// 1. `on_memtable_sealed` — under the active memtable's write lock, so no
 ///    write can be applied into the next memtable meanwhile;
-/// 2. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
+/// 2. `on_ro_memtable_flushing` — before the first L0 file is written. At open
+///    L0 files are found by listing each bucket's directory, so a file on disk
+///    survives a crash whether or not it was registered: whatever must be
+///    durable before the memtable's records are (the vector index WAL's
+///    records, so that a crash keeps a prefix of that log) is made durable
+///    here. An error **vetoes the flush** with nothing written;
+/// 3. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
 ///    and **none is registered yet**: nothing can read or merge them, so no
 ///    merge can have dropped a tombstone they hold. The vector index WAL makes
 ///    its progress durable here (`db/vector_index_wal.rs`). An error **vetoes
 ///    the flush**: the files are removed, the memtable stays read-only and
 ///    unflushed, and a later flush retries it under the same version;
-/// 3. `on_ro_memtable_flushed_to_level0` — the files are registered and the
+/// 4. `on_ro_memtable_flushed_to_level0` — the files are registered and the
 ///    memtable is marked flushed. The main WAL marks entries persisted here.
 pub(crate) trait LsmFlushObserver: Send + Sync {
     fn on_memtable_sealed(&self, version: u64);
+    /// The memtable is about to be written to L0; nothing is on disk yet. An
+    /// error vetoes the flush. No default: a wrapping observer that forgot to
+    /// forward it would silently skip the vector index WAL's sync.
+    fn on_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()>;
     /// The memtable's L0 files are durable but not yet registered. An error
     /// keeps them from being registered. Default: no-op.
     fn on_ro_memtable_written(&self, _version: u64) -> std::io::Result<()> {
@@ -1319,6 +1329,13 @@ impl LSMTree {
         }
     }
 
+    fn notify_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()> {
+        match self.flush_observer.read().as_ref() {
+            Some(observer) => observer.on_ro_memtable_flushing(version),
+            None => Ok(()),
+        }
+    }
+
     fn notify_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
         match self.flush_observer.read().as_ref() {
             Some(observer) => observer.on_ro_memtable_written(version),
@@ -1568,6 +1585,10 @@ impl LSMTree {
         if ro_memtable.is_flushed_to_level0() {
             return Ok(());
         }
+
+        // Nothing is on disk yet, so a veto leaves nothing to undo: the
+        // memtable stays read-only and unflushed, and a later flush retries it.
+        self.notify_ro_memtable_flushing(ro_memtable.version()).map_err(LSMError::Io)?;
 
         let records = ro_memtable.records();
         let now_ms = std::time::SystemTime::now()
@@ -6053,6 +6074,11 @@ mod tests {
 
     impl LsmFlushObserver for EventLog {
         fn on_memtable_sealed(&self, _version: u64) {}
+        fn on_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()> {
+            let n = self.registered();
+            self.events.lock().push(("flushing", version, n));
+            Ok(())
+        }
         fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
             let n = self.registered();
             self.events.lock().push(("written", version, n));
@@ -6064,10 +6090,11 @@ mod tests {
         }
     }
 
-    // The vector index WAL makes its progress durable in `on_ro_memtable_written`
-    // and relies on two things: none of the memtable's L0 files is registered
-    // (mergeable) yet, and memtables arrive in version order even when several
-    // threads flush at once. Both are pinned here.
+    // The vector index WAL syncs in `on_ro_memtable_flushing`, makes its
+    // progress durable in `on_ro_memtable_written`, and relies on: the events
+    // come in that order, none of the memtable's L0 files is registered
+    // (mergeable) at either, and memtables arrive in version order even when
+    // several threads flush at once. All are pinned here.
     #[test]
     fn the_written_event_comes_before_registration_and_in_version_order() -> Result<()> {
         for round in 0..50 {
@@ -6108,21 +6135,28 @@ mod tests {
             }
             // 50 keys over 2 buckets: each memtable registers one file per bucket.
             let want: Vec<(&str, u64, usize)> = (0..3u64)
-                .flat_map(|v| [("written", v, 2 * v as usize), ("flushed", v, 2 * (v as usize + 1))])
+                .flat_map(|v| {
+                    [
+                        ("flushing", v, 2 * v as usize),
+                        ("written", v, 2 * v as usize),
+                        ("flushed", v, 2 * (v as usize + 1)),
+                    ]
+                })
                 .collect();
             assert_eq!(*log.events.lock(), want, "round {round}");
         }
         Ok(())
     }
 
-    /// Refuses the first `fail` written events, then accepts.
+    /// Refuses the first `fail` flushing or written events (`at_flushing`
+    /// picks which), then accepts.
     struct Veto {
         fail: std::sync::atomic::AtomicUsize,
+        at_flushing: bool,
     }
 
-    impl LsmFlushObserver for Veto {
-        fn on_memtable_sealed(&self, _version: u64) {}
-        fn on_ro_memtable_written(&self, _version: u64) -> std::io::Result<()> {
+    impl Veto {
+        fn refuse(&self) -> std::io::Result<()> {
             let left = self.fail.load(Ordering::SeqCst);
             if left == 0 {
                 return Ok(());
@@ -6130,13 +6164,31 @@ mod tests {
             self.fail.store(left - 1, Ordering::SeqCst);
             Err(std::io::Error::other("cannot record the flush"))
         }
+    }
+
+    impl LsmFlushObserver for Veto {
+        fn on_memtable_sealed(&self, _version: u64) {}
+        fn on_ro_memtable_flushing(&self, _version: u64) -> std::io::Result<()> {
+            if self.at_flushing { self.refuse() } else { Ok(()) }
+        }
+        fn on_ro_memtable_written(&self, _version: u64) -> std::io::Result<()> {
+            if self.at_flushing { Ok(()) } else { self.refuse() }
+        }
         fn on_ro_memtable_flushed_to_level0(&self, _version: u64) {}
     }
 
-    // A written event that fails must leave nothing registered and no file
-    // behind, and the memtable must stay readable and be flushed by a retry.
+    // A flushing or written event that fails must leave nothing registered and
+    // no file behind, and the memtable must stay readable and be flushed by a
+    // retry.
     #[test]
-    fn a_failed_written_event_undoes_the_flush_and_a_retry_completes_it() -> Result<()> {
+    fn a_failed_flush_event_undoes_the_flush_and_a_retry_completes_it() -> Result<()> {
+        for at_flushing in [true, false] {
+            a_failed_flush_event_undoes_the_flush(at_flushing)?;
+        }
+        Ok(())
+    }
+
+    fn a_failed_flush_event_undoes_the_flush(at_flushing: bool) -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(
             temp_dir.path(),
@@ -6147,6 +6199,7 @@ mod tests {
         )?;
         lsm.set_flush_observer(Some(Arc::new(Veto {
             fail: std::sync::atomic::AtomicUsize::new(1),
+            at_flushing,
         })));
         for i in 0..20u64 {
             lsm.insert_with_seq(format!("k{i:02}").as_bytes(), u128::from(i), i + 1)?;

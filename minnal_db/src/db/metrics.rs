@@ -99,6 +99,10 @@ pub struct Metrics {
     pub vector_wal_bytes_appended: AtomicU64,
     /// Vector index WAL fsyncs — one per `sync` that had anything to make durable.
     pub vector_wal_fsyncs: AtomicU64,
+    /// Vector index WAL syncs a memtable flush asked for because its namespace
+    /// had unsynced records (each also counts in `vector_wal_fsyncs` if it
+    /// fsynced).
+    pub vector_wal_flush_syncs: AtomicU64,
     /// Vector index WAL GC passes.
     pub vector_wal_gc_runs: AtomicU64,
     /// Vector index WAL segments deleted by GC.
@@ -179,6 +183,7 @@ impl Metrics {
             vector_wal_appends: g(&self.vector_wal_appends),
             vector_wal_bytes_appended: g(&self.vector_wal_bytes_appended),
             vector_wal_fsyncs: g(&self.vector_wal_fsyncs),
+            vector_wal_flush_syncs: g(&self.vector_wal_flush_syncs),
             vector_wal_gc_runs: g(&self.vector_wal_gc_runs),
             vector_wal_segments_deleted: g(&self.vector_wal_segments_deleted),
             vector_wal_pin_flushes: g(&self.vector_wal_pin_flushes),
@@ -228,6 +233,7 @@ impl Metrics {
         a(&self.vector_wal_appends, o.vector_wal_appends);
         a(&self.vector_wal_bytes_appended, o.vector_wal_bytes_appended);
         a(&self.vector_wal_fsyncs, o.vector_wal_fsyncs);
+        a(&self.vector_wal_flush_syncs, o.vector_wal_flush_syncs);
         a(&self.vector_wal_gc_runs, o.vector_wal_gc_runs);
         a(&self.vector_wal_segments_deleted, o.vector_wal_segments_deleted);
         a(&self.vector_wal_pin_flushes, o.vector_wal_pin_flushes);
@@ -275,6 +281,7 @@ pub struct MetricsSnapshot {
     pub vector_wal_appends: u64,
     pub vector_wal_bytes_appended: u64,
     pub vector_wal_fsyncs: u64,
+    pub vector_wal_flush_syncs: u64,
     pub vector_wal_gc_runs: u64,
     pub vector_wal_segments_deleted: u64,
     pub vector_wal_pin_flushes: u64,
@@ -321,6 +328,7 @@ impl MetricsSnapshot {
         self.vector_wal_appends += o.vector_wal_appends;
         self.vector_wal_bytes_appended += o.vector_wal_bytes_appended;
         self.vector_wal_fsyncs += o.vector_wal_fsyncs;
+        self.vector_wal_flush_syncs += o.vector_wal_flush_syncs;
         self.vector_wal_gc_runs += o.vector_wal_gc_runs;
         self.vector_wal_segments_deleted += o.vector_wal_segments_deleted;
         self.vector_wal_pin_flushes += o.vector_wal_pin_flushes;

@@ -11,8 +11,10 @@
 //! # Completion waits for durability
 //!
 //! The vector payloads go to the vector index WAL (durable only after its next
-//! sync) while the queue removal is WAL-backed (durable at once), so an entry is
-//! completed only after its vectors are synced. Written entries collect in a
+//! sync), and the queue removal skips the WAL (durable at the queue's next flush,
+//! which can come at any moment), so an entry is completed only after its
+//! vectors are synced. A removal a crash loses brings the entry back, and the
+//! document is embedded again. Written entries collect in a
 //! batch of up to [`COMPLETION_BATCH`]; each batch, and whatever is pending at the
 //! end of a pass, is made durable with one fsync of the vector index WAL
 //! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
@@ -586,6 +588,14 @@ impl VecIndexWorker {
     /// next pass redoes it. Each completion is conditional — the entry comes from
     /// this pass's snapshot, and the document may have been upserted or deleted
     /// since (see `vector_kv`'s conditional queue updates).
+    ///
+    /// Up to `config.concurrency` completions run at once. A completion can still
+    /// wait on the WAL — the cleanup when a document vanished mid-embed, and the
+    /// re-queue when it came back — and every WAL write in the database waits on
+    /// one lock held across an fsync, so one at a time a batch would hold one
+    /// place in that line against every concurrent REST writer. Entries in a
+    /// batch are distinct documents (the queue holds one entry per document), so
+    /// their completions are independent.
     async fn complete_written(&self, written: Vec<QueueEntry>) -> (usize, usize) {
         if let Err(e) = vector_kv::make_vector_writes_durable(&self.db).await {
             warn!(
@@ -595,9 +605,34 @@ impl VecIndexWorker {
             );
             return (0, written.len());
         }
+        let concurrency = self.config.concurrency.max(1);
+        let mut set: JoinSet<(QueueEntry, Result<crate::semantic_search::PostingDelta, crate::KVError>)> = JoinSet::new();
+        let mut pending = written.into_iter();
+        for entry in (&mut pending).take(concurrency) {
+            let db = self.db.clone();
+            set.spawn(async move {
+                let result = vector_kv::complete_embed(&db, &entry).await;
+                (entry, result)
+            });
+        }
         let (mut done, mut failed) = (0usize, 0usize);
-        for entry in written {
-            match vector_kv::complete_embed(&self.db, &entry).await {
+        while let Some(joined) = set.join_next().await {
+            if let Some(entry) = pending.next() {
+                let db = self.db.clone();
+                set.spawn(async move {
+                    let result = vector_kv::complete_embed(&db, &entry).await;
+                    (entry, result)
+                });
+            }
+            let (entry, result) = match joined {
+                Ok(joined) => joined,
+                Err(join_err) => {
+                    warn!("vec index worker: completion task panicked: {join_err}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            match result {
                 Ok(delta) => {
                     self.ctx.apply_posting_delta(&entry.namespace, &delta);
                     done += 1;

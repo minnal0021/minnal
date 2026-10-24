@@ -7,21 +7,89 @@ the main WAL's write path, or the doc store's API.
 
 ## Terms used here
 
+The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
+
+**Writes and logs**
+
 - **Main WAL** — the database's write-ahead log (`db/wal.rs`). Every ordinary
-  write appends one entry and fsyncs it before the call returns.
-- **No-WAL write** — `put_no_wal`: the value goes to the value log and the key's
-  pointer goes to the memtable, with no WAL entry. The pointer exists only in
-  memory until the memtable is flushed to a level-0 (L0) file.
+  write appends one entry and fsyncs it before the call returns, under one lock
+  for the whole database.
+- **Vector index WAL** — the log this note designs: one per database, in
+  `<db_path>/vector_index_wal/`, shared by every namespace.
+- **Logged write** — a write recorded in the vector index WAL instead of the
+  main WAL: `Database::put_ns_logged` / `delete_ns_logged`, called through a
+  namespace as `put_logged` / `delete_logged`. Appended and applied with no
+  fsync; durable at the next **sync** (`sync_vector_index_wal`), one fsync for
+  everything appended before it.
+- **No-WAL write** — `put_no_wal` (and `delete_no_wal`, `merge_no_wal`): the
+  value goes to the value log and the key's pointer goes to the memtable, with
+  no log entry at all. The pointer exists only in memory until the memtable is
+  flushed to a level-0 (L0) file.
+- **Sequence (seq)** — the global write counter every write draws from,
+  whichever log it uses; the highest seq for a key wins everywhere (memtable,
+  L0, L1, replay).
+- **Key stripe lock** (`db/key_locks.rs`) — 1,024 locks, each key hashed to one
+  (its *stripe*). Every write takes its key's stripe before anything else and
+  holds it until the write is applied, so one key's writes apply in seq order
+  whichever log they use.
+- **Barrier** — a point the worker (or maintenance) must not pass until its
+  earlier writes are durable; here, one sync of this log.
+
+**Memtables and flushes**
+
+- **Memtable** — a namespace's in-memory sorted buffer of recent writes.
+  **Seal:** turning a full (or force-flushed) memtable read-only, ready to
+  flush. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
+- **L0 / L1** — the LSM tree's on-disk levels. **Compaction** merges L0 files
+  into L1, and drops tombstones (the records deletes leave) there.
+- **Flush observer** (`LsmFlushObserver`) — how a namespace's LSM tree reports
+  each flush, in order: **sealed** (under the memtable's write lock),
+  **flushing** (before any L0 file is written), **written** (L0 files durable,
+  not yet registered, so nothing can merge them) and **flushed** (registered).
+
+**The log's own positions** (§5)
+
+- **Segment** — one file of the log, `{segment id}.log`; a full one is
+  **sealed** with an end marker and the next is started.
+- **Position** — `(segment id, byte)`; positions grow in log order.
+- **Tail / durable tail** — where the next record goes / below which everything
+  is fsynced.
+- **Torn tail** — a partly written last record after a crash; `open` cuts it off.
+- **In flight** — a record appended but not yet applied to its memtable. The
+  `LoggedWrite` guard an append returns keeps it in flight until dropped.
+- **Ceiling** — at a seal, how far the namespace's applied records reach: the
+  tail, lowered to the oldest of the namespace's records still in flight.
+- **Retired** — a record whose memtable is in L0 files, so replay must skip it.
+- **Safe offset** — per namespace: every one of its records below this position
+  is retired. Its replay starts here.
+- **Retired cut** — the lowest safe offset of any namespace that still has
+  records above its own, capped by the oldest record still in flight. Records
+  below it are retired for every namespace; GC deletes segments wholly below it.
+- **Marker** — the `retired_cut` file, holding the cut and each namespace's safe
+  offset above it. It is written at the *written* event, before the L0 files
+  are registered.
+- **Holding the cut** — a namespace whose unflushed records keep the cut from
+  moving. The WAL GC tick flushes such namespaces.
+- **Prefix rule** — what survives any crash is a prefix of the log, across all
+  namespaces: a sync makes a prefix durable, and a flush syncs the log before it
+  writes L0 files (§5).
+- **Poisoned** — the log after a failed fsync: it refuses appends and syncs
+  until the database is reopened (§6).
+
+**The vector side**
+
 - **Vector namespaces** — for a store `ns`: `{ns}_sparse_vector` (1-bit chunk
-  codes, keyed by posting and document), `{ns}_sparse_vector_meta` (which postings
-  hold the document's chunks, and the text hash) and `{ns}_dense_vector` (the
-  8-bit whole-document code).
+  codes, keyed by posting and document), `{ns}_sparse_vector_meta` (the
+  **meta**: which postings hold the document's chunks, and the text hash) and
+  `{ns}_dense_vector` (the 8-bit whole-document code).
+- **Posting** — a group of chunks with one centre, the unit search reads.
 - **Queue entry** — a document waiting in `system_pending_vec_index` to be
   embedded. Removing it ("completing" it) says the document's vectors are done.
-- **Flush** — writing a namespace's memtable to L0 files and fsyncing them.
-- **Seal** — turning a full (or force-flushed) memtable read-only, ready to flush.
-- **Sequence (seq)** — the global write counter every write draws from; the
-  highest seq for a key wins everywhere (memtable, L0, L1, replay).
+- **Partition maintenance** — splitting, merging and reassigning postings
+  (`ivf_split`). A **drain** empties a posting into others (a split or a merge
+  of postings), then **retires** it; a **reassign** moves chunks between active
+  postings. Each runs through a **journal** record that recovery **redoes**
+  after a crash.
 
 ## 1. The problem
 
@@ -88,19 +156,25 @@ embeddings are never logged: the namespaces hold codes, and replay rebuilds the
 namespaces, so it needs nothing else. Replay never re-encodes and does not
 depend on the partition's centres (each code carries its own `centre_id`).
 
-Not logged, and unchanged:
+Not logged:
 
-- The meta (`{ns}_sparse_vector_meta`) and every vector delete stay in the
-  **main WAL**. The meta must be durable before any key it lists is written, and
-  a lost delete would orphan an index entry (see `upsert_vectors`).
+- The worker's meta write (`{ns}_sparse_vector_meta`) and the worker's and
+  document deletes' vector deletes stay in the **main WAL**. The meta must be
+  durable before any key it lists is written, and a lost delete would orphan an
+  index entry (see `upsert_vectors`).
 - The query-embedding cache stays no-WAL: it is a cache.
 - The partition's centres and postings stay in the main WAL, the root posting
   written when a namespace enables semantic search included: they are small
   records, each durable on return.
 
-Partition maintenance's copies (split, merge and rebuild drains, and
-reassignment, `ivf_split`) are logged the same way, and their barrier before
-the deletes is the same one fsync (§9, step 6).
+Partition maintenance (split, merge and rebuild drains, and reassignment,
+`ivf_split`) logs **every** per-document write: the copies, the destination's
+meta, the drained posting's meta drop and key delete, and reassign's source
+meta and key shrink. One sync per batch of documents, before the batch
+releases their locks, makes them durable. Its writes span two namespaces (meta
+and chunk keys) whose order matters, which is safe because of the prefix rule
+in §5: whatever survives a crash is a prefix of the log. Design and measured
+gain: `Fewer-WAL-Fsyncs-Design.md`, Part 2.
 
 ### Why a separate log and not the main WAL
 
@@ -118,11 +192,12 @@ the deletes is the same one fsync (§9, step 6).
 
 ## 3. Write path
 
-For each vector write, inside `upsert_vectors`, in place of `put_no_wal`:
+For each logged write (`Database::put_ns_logged` / `delete_ns_logged`; the
+worker's `upsert_vectors` and partition maintenance call them):
 
 1. Take the key's stripe lock (as every write does).
 2. Allocate the write's seq.
-3. Append `(namespace id, key, value, seq)` to the vector index WAL, under its append
+3. Append `(namespace id, key, value or delete, seq)` to the vector index WAL, under its append
    lock, and register the append's offset as **in flight** (§5).
 4. Apply to the memtable with that seq (`put_to_storage` with a given seq).
 5. Clear the in-flight registration.
@@ -151,7 +226,9 @@ no-WAL flush tick does not need to flush them.
   in it is relied on.
 - **Header** per segment: magic, format version, segment id.
 - **Record:** length, CRC32 of the body, then the body: namespace id (u32), seq
-  (u64), key length and key, value length and value.
+  (u64), key length and key, value length and value. A **delete** has value
+  length `u32::MAX` and no value bytes; no put can be that long, since a record
+  must fit a segment. Replay applies a delete with its seq.
 - **Torn tail.** A record whose length runs past the end, or whose CRC fails, is
   the end of the log; everything after it in that segment is ignored. Only the
   last segment may end this way; a bad record in an earlier segment fails the
@@ -160,6 +237,18 @@ no-WAL flush tick does not need to flush them.
 The format is versioned so a later change can be rejected rather than misread.
 
 ## 5. Retirement: when a record is no longer needed
+
+**First, the prefix rule.** A sync makes a prefix of the log durable, and a torn
+tail drops only a suffix. A memtable written to L0 is another way a logged write
+reaches disk, so before a flush writes any L0 file, the log is synced if the
+namespace has records past the durable tail
+(`LsmFlushObserver::on_ro_memtable_flushing`, sent after the seal and before
+the first L0 file is written). L0 files
+are found at open by listing their directories, so this must happen before the
+files are written, not when they are registered. Then no L0 file holds a logged
+write the log could still lose, and what survives any crash is exactly a prefix
+of the log, across all namespaces. The sync is usually a no-op, since the
+writers sync each batch.
 
 A record is **retired** once the memtable holding its write has been flushed to
 L0: from then on the SSTables have it and replay must skip it. This is the main
@@ -298,8 +387,9 @@ Then the vector worker starts and finds the queue as the crash left it.
 `minnal_db/CLAUDE.md` warns that re-applying an old seq can bring back a deleted
 key: L1 drops tombstones, so if the key's later delete already reached L1, the
 old write wins again. The main WAL avoids this because its deletes are in the
-same log and replay alongside its puts. The vector writes' deletes are in the
-**main** WAL, so the vector index WAL has to avoid it by itself:
+same log and replay alongside its puts. A vector key's later writes can be in
+**either** log (the worker's and document deletes are in the main WAL,
+maintenance's in this one), so the vector index WAL has to avoid it by itself:
 
 - A later write to the same key (a delete of a stale chunk key, a re-embed)
   holds the key's stripe from seq allocation to apply, so it is applied after
@@ -420,6 +510,7 @@ per-namespace view reads 0), in `GET /admin/storage/ops-metrics`:
 |---|---|---|
 | `vector_wal_appends`, `vector_wal_bytes_appended` | records and bytes appended | 1 |
 | `vector_wal_fsyncs` | `sync` calls that fsynced | 1 |
+| `vector_wal_flush_syncs` | syncs a memtable flush asked for (the prefix rule, §5) | Fewer-WAL-Fsyncs Part 2 |
 | `vector_wal_gc_runs`, `vector_wal_segments_deleted` | GC passes, segments deleted | 2 |
 | `vector_wal_pin_flushes` | flushes of an idle namespace holding the cut back | 2 |
 | `vector_wal_records_replayed` | records replayed at open | 3 |

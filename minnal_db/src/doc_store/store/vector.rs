@@ -294,12 +294,12 @@ impl DocStore {
 
     /// Reconcile vector indexes across all semantic-search-enabled namespaces.
     ///
-    /// Enqueues any document that has neither a committed vector index entry nor
-    /// a pending queue entry — the `put` / `kv_put` crash window, plus the
-    /// `put_no_wal` vector-write window where a crash before the memtable flush
-    /// drops a just-indexed vector. A cheap count short-circuit skips namespaces
-    /// that are already fully covered, so a clean run is inexpensive. Returns the
-    /// number of documents re-enqueued and notifies the worker if any were.
+    /// Enqueues any document that has neither a complete vector index embedded
+    /// from its current text nor a pending queue entry — the `put` / `kv_put`
+    /// crash window, where a document was written but its embed enqueue was
+    /// lost, leaving it unindexed or with stale vectors. Reads every document
+    /// (see `reconcile_all_vector_indexes`). Returns the number of documents
+    /// re-enqueued and notifies the worker if any were.
     ///
     /// This same pass runs automatically as a background task on startup (see
     /// [`with_semantic_search`]); it is also exposed on demand over the admin
@@ -322,9 +322,9 @@ impl DocStore {
     /// re-enqueues documents whose committed vector bytes are **present yet corrupt**
     /// (fail to deserialize) — not just those missing a half.
     ///
-    /// This deserializes every entry and skips the count short-circuit, so it is a
-    /// full value-reading scan of every semantic-search namespace — run it in the
-    /// background, not on a latency-sensitive request path. Per-namespace failures
+    /// This deserializes every entry, so it is a full value-reading scan of
+    /// every semantic-search namespace — run it in the background, not on a
+    /// latency-sensitive request path. Per-namespace failures
     /// are logged here (`warn!` per namespace inside the pass, plus an `error!`
     /// summary when any failed). Returns the number of documents re-enqueued and
     /// notifies the worker if any were.

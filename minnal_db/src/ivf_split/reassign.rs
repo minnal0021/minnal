@@ -386,8 +386,9 @@ async fn select(
 
 /// For each document of `batch`, remove from each source key every chunk the
 /// rule moves and whose destination holds it: per document, the meta first
-/// (WAL, one write for all its sources), then each source key, rewritten or
-/// deleted (WAL). The caller holds every document's vector lock.
+/// (one write for all its sources), then each source key, rewritten or
+/// deleted; all logged in the vector index WAL and synced once at the end. The
+/// caller holds every document's vector lock.
 async fn shrink_sources(
     db: &AsyncDb,
     namespace: &str,
@@ -494,20 +495,22 @@ async fn shrink_sources(
         }
         if !delta.is_empty() {
             crash_point!();
-            meta_ns.put(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings)).await?;
+            meta_ns
+                .put_logged(doc.clone(), encode_sparse_meta(meta.text_hash, &meta.postings))
+                .await?;
             handle.snapshot().apply_delta(&delta);
         }
         for (src, remaining) in sources {
             let key = composite_key::encode(src, doc);
             crash_point!();
             if remaining.is_empty() {
-                sparse.delete(key).await?;
+                sparse.delete_logged(key).await?;
             } else {
-                sparse.put(key, VectorIndex::list_to_bytes(&remaining)).await?;
+                sparse.put_logged(key, VectorIndex::list_to_bytes(&remaining)).await?;
             }
         }
     }
-    Ok(())
+    sync_batch(db).await
 }
 
 #[cfg(test)]

@@ -1157,12 +1157,22 @@ enum Completion {
 }
 
 /// Remove `entry` from the queue only if the stored entry is still `entry`.
+///
+/// The removal skips the WAL (`merge_no_wal`), so it is durable only once the
+/// queue's memtable is flushed, on the LSM worker's next tick. Losing it is
+/// harmless: the entry comes back after the crash and the document is embedded
+/// again with the same text. Making it durable cost a WAL fsync per document,
+/// on the lock every client write waits for — a quarter of the worker's share
+/// of the WAL under ingestion. The vectors are durable before this runs
+/// ([`make_vector_writes_durable`]), so a removal that does reach disk never
+/// outlives the vectors it vouches for. Design note:
+/// `semantic_search/report/Fewer-WAL-Fsyncs-Design.md`, Part 1.
 async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     crash_point!();
     let expected = entry.clone();
     let result = queue_ns
-        .merge(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
+        .merge_no_wal(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
             let Some(existing) = existing else {
                 return Ok(None); // already gone (an admin removed it): nothing to do
             };
@@ -1201,7 +1211,8 @@ pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[Ve
 /// **Why completion waits for this.** [`upsert_vectors`] deletes stale cluster keys
 /// and writes the meta WAL-backed (durable at once), and writes the new keys and
 /// dense entry to the vector index WAL (durable only after this sync), and
-/// [`complete_embed`] removes the queue entry WAL-backed. Completing before the
+/// [`complete_embed`] removes the queue entry (no-WAL: durable at the queue's
+/// next flush, which can come at any moment). Completing before the
 /// sync would let a crash keep the completion and the deletes but lose the new
 /// vectors. A re-embedded document would then keep its *old* dense entry, which
 /// `has_complete_vector_index` accepts, so nothing would re-enqueue it: it would
@@ -2107,32 +2118,72 @@ mod queue_race_tests {
         assert_eq!(pending.text, "new text");
     }
 
-    /// A completion is durable: after a crash the finished entry does not come
-    /// back, and a failure's bookkeeping is replayed as written — replay applies
-    /// the merge's recorded result and never re-runs the conditional closure.
+    /// A completion skips the WAL: after a crash it is kept only if the queue
+    /// was flushed first, and otherwise the entry comes back exactly as it was
+    /// queued, to be embedded again. A failure's bookkeeping is WAL-backed and
+    /// replayed as written either way — replay applies the merge's recorded
+    /// result and never re-runs the conditional closure.
     #[tokio::test]
     async fn crash_replays_completion_and_failure_results() {
-        let dir = TempDir::new().unwrap();
-        {
+        for flushed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            {
+                let db = open_db(&dir).await;
+                enqueue_embed(&db, "docs", b"done", "a").await.unwrap();
+                let e = snapshot(&db, b"done").await;
+                finish_embed(&db, &e, &vectors_for(1.0)).await.unwrap();
+                enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
+                let f = snapshot(&db, b"failed").await;
+                record_queue_failure(&db, &f, "timeout").await.unwrap();
+                if flushed {
+                    db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await.unwrap();
+                }
+                db.crash().await;
+            }
             let db = open_db(&dir).await;
-            enqueue_embed(&db, "docs", b"done", "a").await.unwrap();
-            let e = snapshot(&db, b"done").await;
-            finish_embed(&db, &e, &vectors_for(1.0)).await.unwrap();
-            enqueue_embed(&db, "docs", b"failed", "b").await.unwrap();
-            let f = snapshot(&db, b"failed").await;
-            record_queue_failure(&db, &f, "timeout").await.unwrap();
-            db.crash().await;
+            let done = get_queue_entry(&db, "docs", b"done").await.unwrap();
+            if flushed {
+                assert!(done.is_none(), "a flushed completion survives replay");
+            } else {
+                let done = done.expect("an unflushed completion is lost, so the entry comes back");
+                assert_eq!((done.kind, done.text.as_str(), done.retry_count), (QueueEntryKind::Embed, "a", 0));
+            }
+            let failed = get_queue_entry(&db, "docs", b"failed").await.unwrap().expect("failed entry kept");
+            assert_eq!(
+                (failed.text.as_str(), failed.retry_count, failed.last_error.as_deref()),
+                ("b", 1, Some("timeout")),
+                "flushed: {flushed}"
+            );
         }
-        let db = open_db(&dir).await;
-        assert!(
-            get_queue_entry(&db, "docs", b"done").await.unwrap().is_none(),
-            "completion survives replay"
-        );
-        let failed = get_queue_entry(&db, "docs", b"failed").await.unwrap().expect("failed entry kept");
-        assert_eq!(
-            (failed.text.as_str(), failed.retry_count, failed.last_error.as_deref()),
-            ("b", 1, Some("timeout"))
-        );
+    }
+
+    /// A completion the crash loses must not hide a newer upsert: the upsert's
+    /// entry is WAL-backed and later by seq, so it is what replay leaves queued,
+    /// flushed completion or not.
+    #[tokio::test]
+    async fn a_lost_completion_never_hides_a_newer_upsert() {
+        for flushed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            {
+                let db = open_db(&dir).await;
+                put_doc(&db, b"x").await;
+                enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+                let e = snapshot(&db, b"x").await;
+                finish_embed(&db, &e, &vectors_for(1.0)).await.unwrap();
+                if flushed {
+                    db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await.unwrap();
+                }
+                enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+                db.crash().await;
+            }
+            let db = open_db(&dir).await;
+            let entry = get_queue_entry(&db, "docs", b"x").await.unwrap().expect("the newer upsert stays queued");
+            assert_eq!(
+                (entry.kind, entry.text.as_str()),
+                (QueueEntryKind::Embed, "new text"),
+                "flushed: {flushed}"
+            );
+        }
     }
 
     /// No race: the ordinary path still indexes and empties the queue.
@@ -2231,29 +2282,50 @@ mod queue_race_tests {
     /// still no-WAL in memory, so a crash kept the completion and the stale-key
     /// deletes but lost the new vectors: the document kept its old dense entry,
     /// lost its moved chunk, and looked complete to reconciliation.
+    ///
+    /// The completion now skips the WAL, so it survives the crash only if the
+    /// queue was flushed; both cases are checked. The new vectors must be on disk
+    /// in both, and if the entry came back it must ask for the new text.
     #[tokio::test]
     async fn crash_before_reembed_is_synced_keeps_new_vectors() {
-        let dir = TempDir::new().unwrap();
-        {
+        for flushed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            {
+                let db = open_db(&dir).await;
+                put_doc(&db, b"x").await;
+                enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
+                let first = snapshot(&db, b"x").await;
+                finish_embed(&db, &first, &vectors_for(1.0)).await.unwrap();
+                make_vector_writes_durable(&db).await.unwrap(); // old index on disk
+                enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
+                let second = snapshot(&db, b"x").await;
+                finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
+                if flushed {
+                    // The queue only: the completion reaches disk, the vectors
+                    // stay in the vector index WAL.
+                    db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await.unwrap();
+                }
+                db.crash().await; // crash: no vector namespace flushed after finish_embed
+            }
             let db = open_db(&dir).await;
-            put_doc(&db, b"x").await;
-            enqueue_embed(&db, "docs", b"x", "old text").await.unwrap();
-            let first = snapshot(&db, b"x").await;
-            finish_embed(&db, &first, &vectors_for(1.0)).await.unwrap();
-            make_vector_writes_durable(&db).await.unwrap(); // old index on disk
-            enqueue_embed(&db, "docs", b"x", "new text").await.unwrap();
-            let second = snapshot(&db, b"x").await;
-            finish_embed(&db, &second, &moved_vectors_for(2.0)).await.unwrap();
-            db.crash().await; // crash: nothing flushed after finish_embed returned
+            match get_queue_entry(&db, "docs", b"x").await.unwrap() {
+                None => assert!(flushed, "an unflushed completion cannot survive the crash"),
+                Some(entry) => {
+                    assert!(!flushed, "the flushed completion was lost");
+                    assert_eq!(entry.text, "new text", "the entry that came back must ask for the new text");
+                }
+            }
+            assert_eq!(
+                dense_tag(&db, b"x").await,
+                Some(2.0),
+                "the completed re-embed's dense vector was lost (flushed: {flushed})"
+            );
+            assert_eq!(
+                sparse_state(&db, b"x").await,
+                (vec![4], Some(vec![4])),
+                "the moved chunk must be present and listed (flushed: {flushed})"
+            );
         }
-        let db = open_db(&dir).await;
-        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(), "the re-embed was completed");
-        assert_eq!(dense_tag(&db, b"x").await, Some(2.0), "the completed re-embed's dense vector was lost");
-        assert_eq!(
-            sparse_state(&db, b"x").await,
-            (vec![4], Some(vec![4])),
-            "the moved chunk must be present and listed"
-        );
     }
 
     /// The worker writes a batch, flushes, then completes. A crash after the flush

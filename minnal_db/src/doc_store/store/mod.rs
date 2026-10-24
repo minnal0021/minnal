@@ -231,12 +231,11 @@ impl DocStore {
     ///   synchronously (low count, TTL-cached).
     /// - A one-shot **vector-index reconciliation** is spawned as a background
     ///   task: it re-enqueues any document missing both a committed vector index
-    ///   entry and a pending queue entry — closing the `put` / `kv_put` crash
-    ///   window and the `put_no_wal` vector-write window (a crash before the
-    ///   memtable flush drops a just-indexed vector). It runs asynchronously so
-    ///   startup is not blocked; if it fails it logs an error and the operator
-    ///   can re-run it via `POST /admin/indices/vector/reconcile`. A count
-    ///   short-circuit makes a clean boot cheap.
+    ///   entry embedded from its current text and a pending queue entry —
+    ///   closing the `put` / `kv_put` crash window (a document written but its
+    ///   embed enqueue lost). It runs asynchronously so startup is not blocked;
+    ///   if it fails it logs an error and the operator can re-run it via
+    ///   `POST /admin/indices/vector/reconcile`.
     ///
     /// Call [`shutdown_vec_index_worker`] for a clean stop before dropping the
     /// store.

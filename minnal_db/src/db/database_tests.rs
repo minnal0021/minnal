@@ -2870,6 +2870,141 @@ mod merge_tests {
 
         db.shutdown().unwrap();
     }
+
+    // ── merge_ns_no_wal ──────────────────────────────────────────────
+
+    /// The same results as `merge` — write, delete, abort, absent no-op — with
+    /// no WAL entry and no fsync for any of them.
+    #[test]
+    fn a_no_wal_merge_writes_like_merge_without_the_wal() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        db.put_ns(ns, b"doomed", b"value").unwrap();
+        let before = db.metrics_snapshot();
+
+        let written = db.merge_ns_no_wal(ns, b"counter", &5u64.to_le_bytes(), add).unwrap();
+        assert_eq!(written, Some(5u64.to_le_bytes().to_vec()));
+        db.merge_ns_no_wal(ns, b"counter", &2u64.to_le_bytes(), add).unwrap();
+        assert_eq!(db.get_ns(ns, b"counter").unwrap(), Some(7u64.to_le_bytes().to_vec()));
+
+        assert_eq!(db.merge_ns_no_wal(ns, b"doomed", b"", |_, _| Ok(None)).unwrap(), None);
+        assert_eq!(db.get_ns(ns, b"doomed").unwrap(), None, "the merge deleted the key");
+
+        let aborted = db.merge_ns_no_wal(ns, b"counter", b"", |_, _| Err(KVError::MergeAborted("no".into())));
+        assert!(matches!(aborted, Err(KVError::MergeAborted(_))));
+        assert_eq!(
+            db.get_ns(ns, b"counter").unwrap(),
+            Some(7u64.to_le_bytes().to_vec()),
+            "an abort writes nothing"
+        );
+        db.merge_ns_no_wal(ns, b"absent", b"", |_, _| Ok(None)).unwrap();
+
+        let after = db.metrics_snapshot();
+        assert_eq!(after.wal_fsyncs, before.wal_fsyncs, "a no-WAL merge must not fsync the WAL");
+        assert_eq!(after.merges - before.merges, 5);
+        assert_eq!(after.no_wal_puts - before.no_wal_puts, 2, "the two writing merges");
+        assert_eq!(
+            after.no_wal_deletes - before.no_wal_deletes,
+            1,
+            "only the delete of a present key writes a tombstone"
+        );
+        assert_eq!(after.puts, before.puts, "no WAL-backed put");
+        assert_eq!(after.deletes, before.deletes, "no WAL-backed delete");
+
+        db.shutdown().unwrap();
+    }
+
+    /// The stripe covers the read, the closure and the write, as for `merge`:
+    /// see `a_blind_put_cannot_land_in_the_middle_of_a_merge`.
+    #[test]
+    fn a_blind_put_cannot_land_in_the_middle_of_a_no_wal_merge() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+        let ns = DEFAULT_NAMESPACE_ID;
+        db.put_ns(ns, b"k", b"initial").unwrap();
+
+        std::thread::scope(|s| {
+            let merger = {
+                let db = Arc::clone(&db);
+                s.spawn(move || {
+                    db.merge_ns_no_wal(ns, b"k", b"", |existing, _| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let mut v = existing.unwrap_or(b"").to_vec();
+                        v.extend_from_slice(b"+merged");
+                        Ok(Some(v))
+                    })
+                    .unwrap();
+                })
+            };
+
+            std::thread::sleep(Duration::from_millis(50));
+            db.put_ns(ns, b"k", b"sentinel").unwrap();
+            merger.join().unwrap();
+        });
+
+        assert_eq!(
+            db.get_ns(ns, b"k").unwrap(),
+            Some(b"sentinel".to_vec()),
+            "the put was applied while the no-WAL merge held the key, so the merge overwrote it"
+        );
+
+        db.shutdown().unwrap();
+    }
+
+    /// A no-WAL merge is lost if the process dies before its memtable is
+    /// flushed, and kept once it is: the WAL-backed write it replaced replays
+    /// in the first case and not in the second.
+    #[test]
+    fn a_no_wal_merge_survives_a_crash_only_once_flushed() {
+        for flush in [false, true] {
+            let dir = TempDir::new().unwrap();
+            {
+                let db = Database::open(dir.path(), create_db_config()).unwrap();
+                let ns = db.create_namespace("queue").unwrap();
+                db.put_ns(ns, b"entry", b"queued").unwrap();
+                db.merge_ns_no_wal(ns, b"entry", b"", |_, _| Ok(None)).unwrap();
+                if flush {
+                    assert_eq!(db.flush_no_wal_memtables(), 1);
+                }
+                std::mem::forget(db);
+            }
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let ns = db.get_namespace_id("queue").unwrap();
+            let expected = if flush { None } else { Some(b"queued".to_vec()) };
+            assert_eq!(db.get_ns(ns, b"entry").unwrap(), expected, "flushed before the crash: {flush}");
+            std::mem::forget(db);
+        }
+    }
+
+    /// The one crash state a no-WAL completion depends on outside itself: its
+    /// tombstone is in L0 while the older WAL-backed put it removed still
+    /// replays (a crash between writing the L0 file and marking the put
+    /// persisted). The put replays with its own, lower seq, so the tombstone
+    /// must win.
+    #[test]
+    fn a_replayed_older_put_loses_to_a_flushed_no_wal_delete() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let ns = db.create_namespace("queue").unwrap();
+            db.put_ns(ns, b"entry", b"queued").unwrap();
+            db.merge_ns_no_wal(ns, b"entry", b"", |_, _| Ok(None)).unwrap();
+            assert_eq!(db.flush_no_wal_memtables(), 1);
+            // The put again, unpersisted, with a seq below the tombstone's.
+            db.simulate_crash_with_wal_entries(vec![WalEntry::new_upsert_ns(ns, b"entry".to_vec(), b"queued".to_vec()).with_sequence(1)])
+                .unwrap();
+            std::mem::forget(db);
+        }
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = db.get_namespace_id("queue").unwrap();
+        assert_eq!(
+            db.get_ns(ns, b"entry").unwrap(),
+            None,
+            "the replayed put came back over the newer tombstone in L0"
+        );
+        std::mem::forget(db);
+    }
 }
 
 /// Marking a range persisted must cost one fsync per WAL **segment**, not one

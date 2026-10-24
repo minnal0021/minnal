@@ -6,8 +6,21 @@
 //! appended here as it is applied, and one [`sync`](VectorIndexWal::sync) per
 //! completion batch makes the batch durable — one fsync of one sequential file
 //! instead of flushing three memtables. After a crash, the records not yet
-//! retired are replayed with their original seqs. Design:
+//! retired are replayed with their original seqs. Partition maintenance logs
+//! its per-document meta writes and key deletes here too. Design:
 //! `semantic_search/report/Vector-Index-WAL-Design.md`.
+//!
+//! # What survives a crash is a prefix of the log
+//!
+//! A sync makes a prefix durable, and a torn tail drops only a suffix. A
+//! namespace's memtable can also reach disk on its own, as L0 files; so before
+//! a flush writes any, the log is synced if the namespace has records past the
+//! durable tail ([`before_memtable_written`](VectorIndexWal::before_memtable_written)).
+//! An L0 file therefore never holds a logged write the log could still lose,
+//! and the logged writes that survive any crash are exactly a prefix of the
+//! log, across namespaces. Maintenance relies on it: its meta changes and key
+//! deletes live in different namespaces, and the prefix keeps them in program
+//! order.
 //!
 //! Segments, record format, append, `sync` and reading, plus **retirement**:
 //! a record is retired once the memtable holding its write is flushed to L0,
@@ -107,6 +120,9 @@
 //! body:  [ns_id u32][seq u64][key_len u32][key][value_len u32][value]
 //! ```
 //!
+//! A delete is a body whose `value_len` is `u32::MAX` and that has no value
+//! bytes (no put can be that long: a record must fit a segment).
+//!
 //! All integers are little-endian. Every segment but the last is **sealed**: it
 //! ends with the end marker, and space for the marker is reserved, so a record
 //! never fills a segment's last four bytes.
@@ -158,6 +174,8 @@ const FRAME_HEADER_LEN: u32 = 8;
 const END_MARKER_LEN: u32 = 4;
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
 const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
+/// The `value_len` of a delete record, which has no value bytes.
+const DELETE_VALUE_LEN: u32 = u32::MAX;
 
 /// The progress marker file, in the log's directory.
 const RETIRED_CUT_FILE: &str = "retired_cut";
@@ -226,7 +244,13 @@ pub(crate) struct RecordRef<'a> {
     pub ns_id: u32,
     pub seq: u64,
     pub key: &'a [u8],
-    pub value: &'a [u8],
+    /// The value of a put; `None` for a delete.
+    pub value: Option<&'a [u8]>,
+}
+
+/// The framed length of a record of `key` and `value` (`None`: a delete).
+fn frame_len_of(key: &[u8], value: Option<&[u8]>) -> u64 {
+    u64::from(FRAME_HEADER_LEN) + (BODY_FIXED_LEN + key.len() + value.map_or(0, <[u8]>::len)) as u64
 }
 
 /// Where an append landed: `[start, end)` (tests keep it past the registration).
@@ -508,8 +532,9 @@ fn create_segment(dir: &Path, segment_id: u64) -> Result<File> {
     Ok(file)
 }
 
-fn encode_frame(ns_id: u32, seq: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
-    let body_len = BODY_FIXED_LEN + key.len() + value.len();
+/// A record's frame; `value` `None` encodes a delete.
+fn encode_frame(ns_id: u32, seq: u64, key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
+    let body_len = BODY_FIXED_LEN + key.len() + value.map_or(0, <[u8]>::len);
     let mut buf = Vec::with_capacity(FRAME_HEADER_LEN as usize + body_len);
     buf.extend_from_slice(&(body_len as u32).to_le_bytes());
     buf.extend_from_slice(&[0u8; 4]); // crc, filled below
@@ -517,8 +542,13 @@ fn encode_frame(ns_id: u32, seq: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&seq.to_le_bytes());
     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
     buf.extend_from_slice(key);
-    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    buf.extend_from_slice(value);
+    match value {
+        Some(value) => {
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+        None => buf.extend_from_slice(&DELETE_VALUE_LEN.to_le_bytes()),
+    }
     let crc = crc32fast::hash(&buf[FRAME_HEADER_LEN as usize..]);
     buf[4..8].copy_from_slice(&crc.to_le_bytes());
     buf
@@ -535,15 +565,18 @@ fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
     let seq = u64::from_le_bytes(body[4..12].try_into().unwrap());
     let key_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
     let key_end = 16usize.checked_add(key_len).filter(|&e| e + 4 <= body.len()).ok_or_else(bad)?;
-    let value_len = u32::from_le_bytes(body[key_end..key_end + 4].try_into().unwrap()) as usize;
-    if key_end + 4 + value_len != body.len() {
-        return Err(bad());
-    }
+    let value_len = u32::from_le_bytes(body[key_end..key_end + 4].try_into().unwrap());
+    let rest = &body[key_end + 4..];
+    let value = match value_len {
+        DELETE_VALUE_LEN if rest.is_empty() => None,
+        n if n != DELETE_VALUE_LEN && n as usize == rest.len() => Some(rest),
+        _ => return Err(bad()),
+    };
     Ok(RecordRef {
         ns_id,
         seq,
         key: &body[16..key_end],
-        value: &body[key_end + 4..],
+        value,
     })
 }
 
@@ -727,7 +760,7 @@ impl VectorIndexWal {
                 return Ok(());
             }
             last_seq = last_seq.max(r.seq);
-            let end = at + u64::from(FRAME_HEADER_LEN) + (BODY_FIXED_LEN + r.key.len() + r.value.len()) as u64;
+            let end = at + frame_len_of(r.key, r.value);
             let e = last_write.entry(r.ns_id).or_insert(end);
             *e = (*e).max(end);
             Ok(())
@@ -898,7 +931,16 @@ impl VectorIndexWal {
     /// Records are in append order, which is not necessarily seq order: seqs
     /// are allocated before the append lock is taken.
     pub(crate) fn append(&self, ns_id: u32, key: &[u8], value: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
-        let frame_len = FRAME_HEADER_LEN as u64 + (BODY_FIXED_LEN + key.len() + value.len()) as u64;
+        self.append_record(ns_id, key, Some(value), seq)
+    }
+
+    /// Appends a delete of `key`, like [`append`](Self::append).
+    pub(crate) fn append_delete(&self, ns_id: u32, key: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
+        self.append_record(ns_id, key, None, seq)
+    }
+
+    fn append_record(&self, ns_id: u32, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<LoggedWrite<'_>> {
+        let frame_len = frame_len_of(key, value);
         if frame_len > self.max_frame_len() {
             return Err(VectorIndexWalError::RecordTooLarge {
                 len: frame_len,
@@ -985,6 +1027,24 @@ impl VectorIndexWal {
         self.durable_tail.fetch_max(tail, Ordering::AcqRel);
         Metrics::bump(&self.metrics.vector_wal_fsyncs);
         Ok(())
+    }
+
+    /// `ns` is about to write a memtable to L0. If the namespace has records
+    /// past the durable tail, syncs the log first, so the L0 files never hold a
+    /// record the log could still lose (see *What survives a crash is a prefix
+    /// of the log*). Every record in the memtable was appended before it was
+    /// applied, so before this call, and is covered by the namespace's latest
+    /// record. No I/O for a namespace that never appended, or whose records are
+    /// all durable.
+    pub(crate) fn before_memtable_written(&self, ns: u32) -> Result<()> {
+        let last = self.tracking.lock().last_write.get(&ns).copied();
+        match last {
+            Some(end) if end > self.durable_tail.load(Ordering::Acquire) => {
+                Metrics::bump(&self.metrics.vector_wal_flush_syncs);
+                self.sync()
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Stops the log after a failed fsync. Returns the error to report.
@@ -1404,7 +1464,7 @@ mod tests {
     use std::sync::atomic::Ordering::Relaxed;
     use tempfile::TempDir;
 
-    type Row = (u64, u32, u64, Vec<u8>, Vec<u8>);
+    type Row = (u64, u32, u64, Vec<u8>, Option<Vec<u8>>);
 
     fn open_at(dir: &Path, segment_size: u32) -> (VectorIndexWal, OpenReport) {
         VectorIndexWal::open(dir, segment_size, Arc::new(Metrics::default())).unwrap()
@@ -1413,7 +1473,7 @@ mod tests {
     fn rows_from(wal: &VectorIndexWal, start: u64) -> Vec<Row> {
         let mut rows = Vec::new();
         wal.for_each_from(start, |at, r| -> Result<()> {
-            rows.push((at, r.ns_id, r.seq, r.key.to_vec(), r.value.to_vec()));
+            rows.push((at, r.ns_id, r.seq, r.key.to_vec(), r.value.map(<[u8]>::to_vec)));
             Ok(())
         })
         .unwrap();
@@ -1437,7 +1497,7 @@ mod tests {
 
     fn expected(appended: &[Appended], range: std::ops::Range<u64>) -> Vec<Row> {
         range
-            .map(|i| (appended[i as usize].start, (i % 3) as u32, i + 1, key(i), value(i)))
+            .map(|i| (appended[i as usize].start, (i % 3) as u32, i + 1, key(i), Some(value(i))))
             .collect()
     }
 
@@ -1484,6 +1544,34 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_reads_back_as_a_delete_and_a_torn_one_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        let put = wal.append(1, b"k", b"v", 1).unwrap().appended();
+        let del = wal.append_delete(1, b"k", 2).unwrap().appended();
+        let empty = wal.append(1, b"e", b"", 3).unwrap().appended(); // an empty value is still a put
+        wal.sync().unwrap();
+        assert_eq!(del.end - del.start, u64::from(FRAME_HEADER_LEN) + BODY_FIXED_LEN as u64 + 1);
+        let want = vec![
+            (put.start, 1, 1, b"k".to_vec(), Some(b"v".to_vec())),
+            (del.start, 1, 2, b"k".to_vec(), None),
+            (empty.start, 1, 3, b"e".to_vec(), Some(vec![])),
+        ];
+        assert_eq!(rows_from(&wal, 0), want);
+        drop(wal);
+        let (wal, report) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        assert_eq!(report.last_seq, 3);
+        assert_eq!(rows_from(&wal, 0), want);
+        drop(wal);
+
+        // Torn inside the delete: it goes, with everything after it.
+        set_len(dir.path(), 0, u64::from(split(del.end).1) - 1);
+        let (wal, report) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
+        assert_eq!(report.tail, del.start);
+        assert_eq!(rows_from(&wal, 0), want[..1].to_vec());
+    }
+
+    #[test]
     fn reopen_finds_the_tail_and_the_highest_seq() {
         let dir = TempDir::new().unwrap();
         let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
@@ -1506,7 +1594,7 @@ mod tests {
         assert_eq!(more.start, last.end);
         let rows = rows_from(&wal, 0);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2], (more.start, 2, 11, b"c".to_vec(), b"z".to_vec()));
+        assert_eq!(rows[2], (more.start, 2, 11, b"c".to_vec(), Some(b"z".to_vec())));
     }
 
     #[test]
@@ -1560,7 +1648,7 @@ mod tests {
             let fresh = wal.append(9, b"new", b"v", 99).unwrap().appended();
             assert_eq!(fresh.start, appended[4].start);
             let mut want = expected(&appended, 0..4);
-            want.push((fresh.start, 9, 99, b"new".to_vec(), b"v".to_vec()));
+            want.push((fresh.start, 9, 99, b"new".to_vec(), Some(b"v".to_vec())));
             assert_eq!(rows_from(&wal, 0), want);
             drop(wal);
             let (wal, report) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
@@ -1741,7 +1829,7 @@ mod tests {
             .into_iter()
             .map(|(_, ns, seq, k, v)| {
                 assert_eq!(k, seq.to_le_bytes());
-                assert_eq!(v, vec![ns as u8; 30]);
+                assert_eq!(v, Some(vec![ns as u8; 30]));
                 seq
             })
             .collect();
@@ -2498,6 +2586,79 @@ mod tests {
         let db = reopen_db(&dir);
         assert_eq!(db.get_ns(ns, b"synced").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.get_ns(ns, b"unsynced").unwrap(), None, "a power loss takes what was never synced");
+    }
+
+    #[test]
+    fn a_logged_delete_replays_with_its_seq() {
+        let dir = TempDir::new().unwrap();
+        let ns = {
+            let db = reopen_db(&dir);
+            let ns = db.create_namespace("v").unwrap();
+            db.put_ns(ns, b"gone", b"1").unwrap();
+            db.put_ns(ns, b"back", b"1").unwrap();
+            db.delete_ns_logged(ns, b"gone").unwrap();
+            db.delete_ns_logged(ns, b"back").unwrap();
+            db.put_ns(ns, b"back", b"2").unwrap(); // newer than its logged delete
+            db.delete_ns_logged(ns, b"unsynced").unwrap();
+            db.sync_vector_index_wal().unwrap();
+            assert_eq!(db.get_ns(ns, b"gone").unwrap(), None);
+            db.mark_crashed();
+            ns
+        };
+        let db = reopen_db(&dir);
+        assert_eq!(db.metrics_snapshot().vector_wal_records_replayed, 3);
+        assert_eq!(db.get_ns(ns, b"gone").unwrap(), None, "the delete replays");
+        assert_eq!(db.get_ns(ns, b"back").unwrap(), Some(b"2".to_vec()), "a newer put beats it");
+    }
+
+    /// The prefix rule: a flush syncs the log before it writes L0 files. Here
+    /// a meta write logged to one namespace is followed by a key delete logged
+    /// to another, and only the second namespace is flushed before the crash.
+    /// Without the sync its L0 file would keep the delete while the log lost
+    /// the meta write before it.
+    #[test]
+    fn a_flush_syncs_the_log_so_a_crash_keeps_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let (meta, sparse) = {
+            let db = reopen_db(&dir);
+            let meta = db.create_namespace("v_sparse_vector_meta").unwrap();
+            let sparse = db.create_namespace("v_sparse_vector").unwrap();
+            db.put_ns(sparse, b"7|doc", b"codes").unwrap();
+            db.put_ns(meta, b"doc", b"lists 7").unwrap();
+            db.put_ns_logged(meta, b"doc", b"lists nothing").unwrap();
+            db.delete_ns_logged(sparse, b"7|doc").unwrap();
+            let before = db.metrics_snapshot();
+            db.get_store(sparse).unwrap().flush_memtable_to_level0().unwrap();
+            let after = db.metrics_snapshot();
+            assert_eq!(after.vector_wal_flush_syncs - before.vector_wal_flush_syncs, 1);
+            assert_eq!(after.vector_wal_fsyncs - before.vector_wal_fsyncs, 1);
+            // Nothing unsynced now: the next flush does not sync.
+            db.put_ns(sparse, b"8|doc", b"codes").unwrap();
+            db.get_store(sparse).unwrap().flush_memtable_to_level0().unwrap();
+            assert_eq!(db.metrics_snapshot().vector_wal_flush_syncs, after.vector_wal_flush_syncs);
+            db.mark_crashed();
+            (meta, sparse)
+        };
+        let db = reopen_db(&dir);
+        assert_eq!(db.get_ns(sparse, b"7|doc").unwrap(), None);
+        assert_eq!(
+            db.get_ns(meta, b"doc").unwrap(),
+            Some(b"lists nothing".to_vec()),
+            "the meta write logged before the delete survives with it"
+        );
+    }
+
+    #[test]
+    fn a_flush_of_a_namespace_that_never_logged_does_not_sync() {
+        let dir = TempDir::new().unwrap();
+        let db = reopen_db(&dir);
+        let logged = db.create_namespace("v").unwrap();
+        let plain = db.create_namespace("plain").unwrap();
+        db.put_ns_logged(logged, b"k", b"v").unwrap(); // unsynced
+        db.put_ns(plain, b"k", b"v").unwrap();
+        db.get_store(plain).unwrap().flush_memtable_to_level0().unwrap();
+        assert_eq!(db.metrics_snapshot().vector_wal_flush_syncs, 0);
+        assert!(db.vector_index_wal.durable_tail() < db.vector_index_wal.tail());
     }
 
     #[test]

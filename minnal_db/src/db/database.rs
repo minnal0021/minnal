@@ -564,6 +564,16 @@ impl LsmFlushObserver for LsmFlushObserverHub {
         self.trigger_compaction();
     }
 
+    // Before any L0 file is written: a namespace with records in the vector
+    // index WAL past its durable tail syncs it first, so no L0 file can hold a
+    // logged write the log could still lose.
+    fn on_ro_memtable_flushing(&self, _version: u64) -> std::io::Result<()> {
+        self.vector_index_wal.before_memtable_written(self.namespace_id).map_err(|e| match e {
+            crate::db::vector_index_wal::VectorIndexWalError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        })
+    }
+
     // Before the memtable's L0 files are registered, and through
     // `SyncValueLogBeforePersist`, so the values the retired records point at
     // are fsynced first. An error (the progress marker could not be written)
@@ -1287,10 +1297,16 @@ impl Database {
     /// where re-running the load is acceptable.
     pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        self.check_write_size(key, value)?;
         // Outermost write lock — see `put_ns`. No-WAL writes take it too, so a
         // merge is serialised against bulk loading as well as against `put`.
         let _stripe = self.key_locks.guard(namespace_id, key);
+        self.put_ns_no_wal_locked(namespace_id, key, value)
+    }
+
+    /// The body of [`Self::put_ns_no_wal`], for a caller already holding the
+    /// key's stripe ([`Self::merge_ns_no_wal`]).
+    fn put_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_write_size(key, value)?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_puts);
@@ -1309,10 +1325,10 @@ impl Database {
     /// recovery replays it with its original seq unless the memtable holding it
     /// was already written to L0.
     ///
-    /// For the vector worker's payloads (chunk codes, whole-document codes):
-    /// bulky, one durability barrier per batch rather than per write. Deletes
-    /// stay in the main WAL. Order, as on every write path: key stripe, seq,
-    /// append (registered as not yet applied), memtable apply, release.
+    /// For the vector worker's payloads (chunk codes, whole-document codes) and
+    /// partition maintenance's per-document writes: one durability barrier per
+    /// batch rather than per write. Order, as on every write path: key stripe,
+    /// seq, append (registered as not yet applied), memtable apply, release.
     pub fn put_ns_logged(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, value)?;
@@ -1331,6 +1347,26 @@ impl Database {
         kv_store
             .put_to_storage_seq(key, value, seq)
             .or_else(|_| kv_store.put_to_storage_seq(key, value, seq))?;
+        drop(logged);
+        Ok(())
+    }
+
+    /// Delete a key logged in the **vector index WAL** instead of the main WAL:
+    /// the counterpart of [`Self::put_ns_logged`], durable once a later
+    /// [`Self::sync_vector_index_wal`] returns. Replay applies it with its
+    /// original seq, as the main WAL replays a delete.
+    pub fn delete_ns_logged(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+        self.check_closed()?;
+        self.check_write_size(key, &[])?;
+        let _stripe = self.key_locks.guard(namespace_id, key);
+        let kv_store = self.get_store(namespace_id)?;
+        let seq = kv_store.alloc_seq();
+        let logged = self.vector_index_wal.append_delete(namespace_id, key, seq)?;
+        self.note_no_wal_index_exposure(namespace_id);
+        // One retry, as `put_ns_logged`.
+        kv_store
+            .delete_from_storage_seq(key, seq)
+            .or_else(|_| kv_store.delete_from_storage_seq(key, seq))?;
         drop(logged);
         Ok(())
     }
@@ -1354,9 +1390,15 @@ impl Database {
     /// concurrent same-key writes highest-sequence-wins like any other write.
     pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
         self.check_closed()?;
-        self.check_write_size(key, &[])?;
         // Outermost write lock — see `put_ns`.
         let _stripe = self.key_locks.guard(namespace_id, key);
+        self.delete_ns_no_wal_locked(namespace_id, key)
+    }
+
+    /// The body of [`Self::delete_ns_no_wal`], for a caller already holding the
+    /// key's stripe ([`Self::merge_ns_no_wal`]).
+    fn delete_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+        self.check_write_size(key, &[])?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
             crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
@@ -1436,6 +1478,53 @@ impl Database {
             None if existing.is_some() => {
                 let outcome = self.delete_ns_locked(namespace_id, key, Self::MERGE_OP_NAME)?;
                 Self::require_applied(outcome)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::merge_ns`] whose resolved write skips the WAL: the no-WAL
+    /// counterpart of `merge_ns`, as [`Self::put_ns_no_wal`] and
+    /// [`Self::delete_ns_no_wal`] are of `put_ns` and `delete_ns`.
+    ///
+    /// The read, the closure and the write run under the key's stripe, exactly
+    /// as in `merge_ns`, so the result is atomic against every other write to the
+    /// key; the closure contract, the abort and the absent → absent no-op are the
+    /// same. What differs is durability: the resolved put or delete appends no
+    /// WAL entry and costs no fsync, so it is lost if the process crashes before
+    /// the namespace's memtable is flushed (the LSM worker flushes no-WAL writes
+    /// on its next tick). It still draws a seq from the global counter, so it
+    /// resolves against concurrent writes to the key by seq.
+    ///
+    /// Only for data whose lost write repairs itself — the vector worker's queue
+    /// completions, where a lost removal brings the entry back and the document
+    /// is embedded again. Like the other no-WAL writes it is never replayed into
+    /// a field index (see [`Self::put_ns_no_wal`]).
+    pub fn merge_ns_no_wal<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
+    {
+        self.check_closed()?;
+        // Held across the read, the closure and the write: see `merge_ns`.
+        let _stripe = self.key_locks.guard(namespace_id, key);
+
+        let kv_store = self.get_store(namespace_id)?;
+        if let Some(m) = kv_store.metrics() {
+            crate::db::metrics::Metrics::bump(&m.merges);
+        }
+
+        let existing = kv_store.get(key)?;
+        let merged = merge_fn(existing.as_deref(), value)?;
+
+        match merged {
+            Some(new_value) => {
+                self.put_ns_no_wal_locked(namespace_id, key, &new_value)?;
+                Ok(Some(new_value))
+            }
+            // As in `merge_ns`: an absent key stays absent with no tombstone.
+            None if existing.is_some() => {
+                self.delete_ns_no_wal_locked(namespace_id, key)?;
                 Ok(None)
             }
             None => Ok(None),
@@ -2556,15 +2645,19 @@ impl Database {
                 skipped += 1;
                 return Ok(());
             };
-            match store
-                .replay_upsert(r.key, r.value, r.seq)
-                .or_else(|_| store.replay_upsert(r.key, r.value, r.seq))
-            {
+            let apply = || match r.value {
+                Some(value) => store.replay_upsert(r.key, value, r.seq),
+                None => store.replay_delete(r.key, r.seq),
+            };
+            match apply().or_else(|_| apply()) {
                 Ok(()) => replayed += 1,
                 Err(e) => {
-                    let entry = WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), r.value.to_vec())
-                        .with_sequence(r.seq)
-                        .with_op_name("vector_index_wal_replay");
+                    let entry = match r.value {
+                        Some(value) => WalEntry::new_upsert_ns(r.ns_id, r.key.to_vec(), value.to_vec()),
+                        None => WalEntry::new_delete_ns(r.ns_id, r.key.to_vec()),
+                    }
+                    .with_sequence(r.seq)
+                    .with_op_name("vector_index_wal_replay");
                     failed.push((entry, e.to_string()));
                 }
             }
