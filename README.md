@@ -99,7 +99,7 @@ Key design choices:
 |---|---|
 | Key storage | Single skip-list memtable → sharded L0/L1 SSTables (per-bucket LSM) |
 | Value storage | Sharded append-only value log, split into segment files (256 MiB by default) |
-| Durability | Write-ahead log (WAL), fsynced on every write before the call returns |
+| Durability | Write-ahead log (WAL): every write returns only once a WAL fsync covers it; concurrent writes share fsyncs (group commit) |
 | Concurrency | Reads run in parallel; value-log writes lock one bucket; every write takes the one WAL lock for its fsync; lock-free reclamation so readers never block a cleanup pass |
 | Serialization | Compact binary encoding for typed values, with a checksum on every record |
 | TTL | Native per-record expiry tracked in the value log |

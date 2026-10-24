@@ -227,6 +227,8 @@ never run ahead of it (a lost write).
 
 ## 2. How other systems log, and where minnal stands
 
+The minnal columns describe both logs as they were before this change.
+
 ### 2.1 RocksDB (embedded LSM, the closest relative)
 
 - **One log for the whole database**, shared by all column families (its
@@ -334,9 +336,9 @@ never run ahead of it (a lost write).
 4. **Segments grow as they are written.** Each `fdatasync` on a file that grew
    must also commit its new size. The trace counted about one device flush per
    fsync, so this does not double the flushes; whether it lengthens each one is
-   unmeasured.
+   measured in §15.
 
-Changes A, B and C fix 1, 2 and 3. Item 4 is measured before deciding (§10).
+Changes A, B and C fix 1, 2 and 3; §15 fixes 4.
 
 ## 3. Why per-write fsync is not what makes a write durable
 
@@ -862,8 +864,8 @@ lock during flushes, before and after), so its effect is not folded into C's.
 
 Separately, a microbenchmark of `fdatasync` after a small append on a growing
 file against a preallocated one, on the same drive: if preallocation saves
-more than a few percent per fsync, segments are preallocated (with
-`fallocate`, zero-filled, which keeps a zero length meaning "end of segment").
+more than a few percent per fsync, segments are preallocated (§15: sized up
+front, sparse, which keeps a zero length meaning "end of segment").
 
 ## 11. Steps
 
@@ -1037,12 +1039,10 @@ each client waits for its write before sending the next.
 **Preallocation** (microbenchmark, `fdatasync` after a 128-byte write, 3,000
 writes, same drive): on a file that grows with every write, 2.30 ms mean
 (p99 2.53 ms); on a preallocated file, 0.79 ms mean (p99 2.40 ms). The
-growing file pays for committing its new size on every fsync. That is a
-large enough saving to propose preallocating WAL segments (zero-filled, so a
-zero length still ends a segment's records), but it changes how segments
-are laid out, which recovery, open-time truncation and the power-loss
-model's coverage bookkeeping all depend on. So it is a separate design step
-for review, not part of this change.
+growing file pays for committing its new size on every fsync. Since that
+changes how segments are laid out, which recovery, open-time truncation and
+the power-loss model all depend on, it was designed and built as its own step
+(§15).
 
 ## 15. Preallocated segments
 

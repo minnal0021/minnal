@@ -228,7 +228,7 @@ max_capacity = 100_000         # skip-list capacity before flush
 num_buckets = 8                # value-log shards (fixed at DB creation)
 
 [sync]
-records_per_sync = 1_000       # value-log fsync cadence (the WAL is fsynced on every write)
+records_per_sync = 1_000       # value-log fsync cadence (every write still returns only once a WAL fsync covers it)
 
 [thresholds]
 value_log_waste_threshold = 30.0   # GC when >30% of value-log is stale

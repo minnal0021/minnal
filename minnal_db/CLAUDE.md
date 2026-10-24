@@ -25,7 +25,8 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/db/namespace_index.rs` | Per-namespace index registry, `ExtractorFn`, `RowIdFn`, `RowToKeyFn` |
 | `src/db/config.rs` | `DbConfig`, `SyncConfig`, `ThresholdConfig`, `ScheduledTaskConfig` |
 | `src/db/toml_config.rs` | TOML → `DbConfig` parser (`MinnalTomlConfig`) |
-| `src/db/wal.rs` | WAL segment structure, `WalEntry`, recovery |
+| `src/db/wal.rs` | WAL segments (preallocated), checksummed frames, `WalEntry`, `WalMetadata` (cut + per-namespace offsets), group commit (`Wal::commit`), recovery |
+| `src/db/power_loss_tests.rs` | Power-loss model (`Database::power_loss_image`), group-commit and preallocation tests, randomised power-loss stress, repeated-SIGKILL harness |
 | `src/db/vector_index_wal.rs` | The vector index WAL: the vector worker's payload writes, one fsync per batch (format and rules below, *WAL ownership*) |
 | `src/db/fail_log.rs` | Recovery fail-log writer — JSON files for entries that fail after retry |
 | `src/db/error.rs` | `KVError` — the single error type for all operations |
@@ -41,7 +42,8 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 Db::put(key, value)
   → Database::put
       → key stripe lock (outermost — see below)
-      → WAL append (fsynced)
+      → WAL append under the WAL lock (seq, frame), lock released
+      → commit round: wait until an fsync covers the entry (group commit)
       → Value log write → pointer
       → Memtable insert with pointer (best-effort w/ bounded retry; ERROR-logged
           if all retries fail — data IS durable in WAL and replayed on next startup)
@@ -57,7 +59,7 @@ WAL sees only the *result* — an ordinary `Upsert` or `Delete` tagged
 nothing re-runs the closure at replay (a closure cannot be serialised, and
 recovery runs long before user code could re-register one).
 
-Every write is a single-op WAL transaction — there is no batch/transaction primitive. The in-memory apply is best-effort with bounded retry (`Database::apply_with_retry`): once the WAL fsync succeeds the op is durable and the call returns `Ok` regardless of the apply outcome. Recovery **replays every entry at or above its namespace's saved safe offset (`WalMetadata::replay_from`) in global sequence order** (so writes to the same key resolve to the last writer), retries each once, and writes persistent failures to `fail_logs/<timestamp>.json`.
+Every write is a single-op WAL transaction — there is no batch/transaction primitive. The in-memory apply is best-effort with bounded retry (`Database::apply_with_retry`): once a WAL fsync covers the entry the op is durable and the call returns `Ok` regardless of the apply outcome. Recovery **replays every entry at or above its namespace's saved safe offset (`WalMetadata::replay_from`) in global sequence order** (so writes to the same key resolve to the last writer), retries each once, and writes persistent failures to `fail_logs/<timestamp>.json`.
 
 ## Concurrency & correctness invariants
 
@@ -72,8 +74,8 @@ These are load-bearing; preserve them when touching the store/GC paths:
   must read a key and write it back indivisibly: `wal_metadata` is global (running
   a user closure under it would stall every namespace) and the bucket lock is taken
   only *after* the WAL lock is released, so serialising on it would invert the
-  established order. Cost on `put`/`delete` is nil — those already serialise
-  globally on `wal_metadata.write()` across the fsync. TTL expiry takes it too
+  established order. Cost on `put`/`delete` is an uncontended mutex: each holds
+  its stripe across its append and its commit-round wait anyway. TTL expiry takes it too
   (`KVStore::expire_records_locked`, handed `key_locks.guard` by `run_ttl_pass`),
   and deletes by compare-and-set: only if the key still points at the record it
   judged expired, with its seq allocated after that check. Before, TTL sat outside
@@ -297,7 +299,7 @@ Note the cut's cap is *redundant by argument* — because registration happens u
 
 Measured before the fix (2026-08-02 stress run): **1 acknowledged write lost in 34,538**, and 4 lost in one round of `work/stress/repro/drop_loses_a_write.py`. A namespace drop is the trigger, because `forget_namespace` calls `try_advance_persisted()` the instant it removes a namespace — precisely when the set of namespaces reporting un-flushed writes can go empty while a survivor is mid-write. The tell-tale is that **recovery does not run at all** after the crash (`persisted == total` short-circuits it). Regression tests: `an_in_flight_write_holds_the_persisted_watermark_back`, `a_memtable_seal_does_not_claim_an_unapplied_write`, `the_cut_respects_the_barrier_even_when_no_seal_enforces_it`, `dropping_a_store_does_not_persist_a_survivors_in_flight_write`, `the_in_flight_barrier_is_released_when_the_write_finishes`.
 
-**Known remaining hole (pre-existing, not this bug):** if `apply_with_retry` exhausts its retries, `put_ns` still returns `Ok` and the barrier is released, so that entry can be marked persisted and skipped by recovery. It is ERROR-logged and written to the fail log, which is the operator's recovery path.
+**Known remaining hole (pre-existing, not this bug):** if `apply_with_retry` exhausts its retries, `put_ns` still returns `Ok` and the barrier is released, so the cut can pass that entry and recovery skips it. It is ERROR-logged and written to the fail log, which is the operator's recovery path.
 
 **WAL GC is gated on the index-replay watermark — do not reclaim a segment on the cut alone.** The field index is made durable by an inline in-memory update per write plus a periodic checkpoint recording the WAL offset it reflects; a crash is healed by replaying from that offset. Reclaiming on LSM persistence alone deleted the WAL that heals it, and the affected documents were then absent from the index **for the life of the database**, with queries silently returning incomplete results (measured: 10 segments reclaimed, 15 of ~360 writes still replayable). `garbage_collect_wal` now consults `index_replay_watermark_segment` = `min(checkpoint offset)` over **currently active** fields, via the shared `plan_wal_gc` that `has_deletable_wal_segments` also uses — keep those two agreeing or the worker either spins on segments GC refuses or skips the pass meant to fire the backstop. **The offsets are event-driven, not read from markers (A2, 2026-10-24):** `WalPersistObserver::field_consumers` holds each active field's position, added in `activate_field_index` (from its marker: `At(p)` → `Some(p)`, `Absent` → `None` = holds from 0 only once populated, `Unusable` → `Some(0)`), moved by `fields_checkpointed` only *after* `checkpoint_fields` made the markers durable, removed in `deactivate_field_index`, `drop_field_index` and `forget_namespace`. A consumer never removed pins the WAL for good. Guards: `a_checkpoint_whose_marker_fails_does_not_move_the_position`, `deactivating_or_dropping_a_field_stops_it_holding_the_wal`, `dropping_a_namespace_stops_its_fields_holding_the_wal`, `a_field_without_a_checkpoint_holds_the_wal_only_once_populated`.
 

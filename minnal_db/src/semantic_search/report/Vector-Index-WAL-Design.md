@@ -185,9 +185,9 @@ gain: `Fewer-WAL-Fsyncs-Design.md`, Part 2.
   own fsync. Embedding traffic stops queueing on the one lock every client write
   takes.
 - **Fsync per batch is natural.** No client waits on this log, so one fsync per
-  batch of completions is the design. The main WAL's rule (one fsync per
-  acknowledged write, no group commit) is about client acknowledgements and does
-  not apply.
+  batch of completions is the design. The main WAL's rule (each write returns
+  only once an fsync covers it) is about client acknowledgements and does not
+  apply.
 
 ## 3. Write path
 
@@ -614,9 +614,9 @@ above, so the full M5 run checks both.
   (with old seqs) into the same tail, the value log knows nothing of memtable
   boundaries for retirement, and it would change the value log's format and GC —
   more intrusive than a separate log.
-- **Make the vector writes WAL-backed.** Correct, but each write would take the
-  main WAL lock and fsync (~2.3 ms each, ~4 per document), adding embedding
-  traffic to the lock every client write waits on.
+- **Make the vector writes WAL-backed.** Correct, but each write would wait for
+  a main-WAL fsync (~4 per document), and the bulky codes would go into the log
+  every client write shares.
 
 ## Decisions (review, 2026-10-15)
 

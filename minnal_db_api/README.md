@@ -190,7 +190,8 @@ listen_addr = "0.0.0.0:8080"
 # ── tuning (optional) ──────────────────────────────────────────────────────
 
 [sync]
-records_per_sync = 1000        # fsync the value log every N writes (the WAL is fsynced on every write)
+records_per_sync = 1000        # fsync the value log every N writes (every write still returns only once a WAL fsync covers it)
+commit_delay_us = 0            # main-WAL commit delay; 0 = none (see config/sample.toml)
 
 [scheduled_tasks]
 value_log_gc_interval_secs   = 60
