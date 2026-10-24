@@ -48,11 +48,11 @@
 <rect class="surface" x="0" y="0" width="940" height="590" rx="14"/>
 <rect class="surface frame" x="0.5" y="0.5" width="939" height="589" rx="14" fill="none"/>
 <text class="t1" x="44" y="42" font-size="19" font-weight="700">WAL lifecycle: append → retire → reclaim</text>
-<text class="t2" x="44" y="64" font-size="13">Every write is durable in one shared log when it returns. Once a flush has put its keys in an SSTable, the cut moves past them and WAL GC can delete the segment.</text>
-<rect x="470" y="94" width="11" height="11" rx="3" fill="#eda100"/>
-<text class="t2" x="488" y="104" font-size="12">Above the cut: only the WAL holds it</text>
-<rect x="735.2" y="94" width="11" height="11" rx="3" fill="#3987e5"/>
-<text class="t2" x="753.2" y="104" font-size="12">Below the cut: also in an SSTable</text>
+<text class="t2" x="44" y="64" font-size="13">Every write is durable in one shared log when it returns. Once a flush puts its keys in an SSTable, the cut moves past them.</text>
+<rect x="420" y="94" width="11" height="11" rx="3" fill="#eda100"/>
+<text class="t2" x="438" y="104" font-size="12">Above the cut: only the WAL holds it</text>
+<rect x="685.2" y="94" width="11" height="11" rx="3" fill="#3987e5"/>
+<text class="t2" x="703.2" y="104" font-size="12">Below the cut: also in an SSTable</text>
 <text class="t3" x="44" y="104" font-size="12" letter-spacing="0.06em">WAL SEGMENTS</text>
 <g><animate attributeName="opacity" calcMode="discrete" values="1;0;0;0;0;0;0;0;0;0;0;0;0;0" keyTimes="0.00000;0.07143;0.14286;0.21429;0.28571;0.35714;0.42857;0.50000;0.57143;0.64286;0.71429;0.78571;0.85714;0.92857" dur="30.8s" repeatCount="indefinite"/><rect class="panel" x="44" y="118" width="270" height="80" rx="9"/><text class="t2 mono" x="58" y="138" font-size="11">wal.log</text><text class="ink-a" x="300" y="138" font-size="11" text-anchor="end">active</text><rect x="58" y="152" width="54" height="32" rx="5" fill="#eda100"/><rect class="empty" x="120" y="152" width="54" height="32" rx="5"/><rect class="empty" x="182" y="152" width="54" height="32" rx="5"/><rect class="empty" x="244" y="152" width="54" height="32" rx="5"/><path class="arrow" d="M 173.0 216 L 185.0 216 L 179.0 207 Z"/><text class="t3" x="179.0" y="230" font-size="11" text-anchor="middle">head: oldest segment on disk</text></g>
 <g><animate attributeName="opacity" calcMode="discrete" values="0;1;0;0;0;0;0;0;0;0;0;0;0;0" keyTimes="0.00000;0.07143;0.14286;0.21429;0.28571;0.35714;0.42857;0.50000;0.57143;0.64286;0.71429;0.78571;0.85714;0.92857" dur="30.8s" repeatCount="indefinite"/><rect class="panel" x="44" y="118" width="270" height="80" rx="9"/><text class="t2 mono" x="58" y="138" font-size="11">wal.log</text><text class="ink-a" x="300" y="138" font-size="11" text-anchor="end">active</text><rect x="58" y="152" width="54" height="32" rx="5" fill="#eda100"/><rect x="120" y="152" width="54" height="32" rx="5" fill="#eda100"/><rect class="empty" x="182" y="152" width="54" height="32" rx="5"/><rect class="empty" x="244" y="152" width="54" height="32" rx="5"/><path class="arrow" d="M 173.0 216 L 185.0 216 L 179.0 207 Z"/><text class="t3" x="179.0" y="230" font-size="11" text-anchor="middle">head: oldest segment on disk</text></g>

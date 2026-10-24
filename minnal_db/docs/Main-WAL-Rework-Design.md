@@ -24,7 +24,7 @@ The guarantee a caller gets does not change: a `put`, `delete` or `merge`
 returns only once its WAL record is on stable storage. The vector index WAL,
 the no-WAL writes and the doc store's API are unchanged.
 
-Section 1.2 explains how a flush retires WAL entries and how WAL GC works now.
+Section 1.2 explains how a flush retired WAL entries and how WAL GC worked before this change.
 Section 2 compares minnal's two logs with RocksDB, Milvus and turbopuffer; the
 three changes follow from that comparison.
 
@@ -77,7 +77,10 @@ segment, tail, torn tail, poisoned, flush observer and the rest) are defined in
   position of all WAL consumers, memtables and field indexes; WAL GC deletes
   segments wholly below it.
 
-## 1. The cost now
+## 1. Before this change
+
+This section describes the main WAL as it was before A, B and C; §13 says
+what was built.
 
 ### 1.1 One write
 

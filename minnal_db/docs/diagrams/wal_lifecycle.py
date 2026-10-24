@@ -67,9 +67,9 @@ def main():
     W, H = 940, 590
     out = [
         text(44, 42, "WAL lifecycle: append → retire → reclaim", "t1", 19, extra=' font-weight="700"'),
-        text(44, 64, "Every write is durable in one shared log when it returns. Once a flush has put its keys in an SSTable, "
-             "the cut moves past them and WAL GC can delete the segment.", "t2", 13),
-        legend(470, 104, [(AMBER, "Above the cut: only the WAL holds it"), (BLUE, "Below the cut: also in an SSTable")]),
+        text(44, 64, "Every write is durable in one shared log when it returns. Once a flush puts its keys in an "
+             "SSTable, the cut moves past them.", "t2", 13),
+        legend(420, 104, [(AMBER, "Above the cut: only the WAL holds it"), (BLUE, "Below the cut: also in an SSTable")]),
         text(44, 104, "WAL SEGMENTS", "t3", 12, extra=' letter-spacing="0.06em"'),
     ]
     box_w, gap, x0, y0 = 270, 20, 44, 118
