@@ -87,16 +87,16 @@ one or two feature names.
 
 ```toml
 # Lean KV engine + field indexing (default)
-minnal_db = "0.2"
+minnal_db = "0.3"
 
 # JSON document store, no vector dependencies
-minnal_db = { version = "0.2", features = ["doc-store"] }
+minnal_db = { version = "0.3", features = ["doc-store"] }
 
 # Document store + semantic search (full)
-minnal_db = { version = "0.2", features = ["doc-store", "semantic-search"] }
+minnal_db = { version = "0.3", features = ["doc-store", "semantic-search"] }
 
 # Raw KV + semantic search, without the document layer
-minnal_db = { version = "0.2", features = ["semantic-search"] }
+minnal_db = { version = "0.3", features = ["semantic-search"] }
 ```
 
 ---
@@ -572,7 +572,7 @@ Add the allocator to your binary's `Cargo.toml`:
 
 ```toml
 [dependencies]
-minnal_db = "0.2"
+minnal_db = "0.3"
 tikv-jemallocator = "0.7"
 ```
 
