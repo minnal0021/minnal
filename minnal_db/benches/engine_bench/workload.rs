@@ -6,7 +6,8 @@
 //! - `insert`: the ingestion stream in order, then new ids reusing its texts
 //!   with a fixed `" (copy)"` appended, so the set of texts the engine embeds is
 //!   finite and the replay table covers it. Inserts and deletes are equally
-//!   likely and each cell starts from the base's size (`runner::rebalance`), so
+//!   likely and each cell starts from the base's size (`runner::rebalance`; a
+//!   delete-only cell starts larger, so it has enough to delete), so
 //!   the inserted documents alive at once are a window of the most recent
 //!   inserts shorter than the stream: no text is in the store twice, except
 //!   briefly when a single-class insert cell outruns that margin (counted per

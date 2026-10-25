@@ -296,13 +296,32 @@ fn spawn_lag(target: &Arc<Target>, id: u64, acked: Instant) -> tokio::task::Join
     })
 }
 
+/// Deletes per second a delete-only cell's starting pool covers, for its whole
+/// warm-up and measurement. Deletes remove the deletable base and then earlier
+/// inserts, so a cell that starts at the base's size can delete only about
+/// `deletable` documents (10,000 in the FiQA data) before it runs out, and
+/// fast deletes do that within one cell. The fastest delete-only rate measured
+/// is about 120 a second; this leaves three times that.
+const DELETE_CELL_MAX_RATE: u64 = 400;
+
+/// Documents a cell starts with beyond the base: enough for a delete-only
+/// cell's deletes ([`DELETE_CELL_MAX_RATE`]), none for any other cell.
+fn extra_documents(cell: &Cell) -> i64 {
+    match cell.kind {
+        Kind::Single { class } if CLASSES[class] == "delete" => ((cell.warm_s + cell.measure_s) * DELETE_CELL_MAX_RATE) as i64,
+        _ => 0,
+    }
+}
+
 /// Bring the store back to the base's size, unmeasured, before a cell: a
 /// single-class insert or delete cell moves it by thousands, and later cells
-/// would otherwise run on a different store. Inserts or deletes in order, 16 at
-/// a time, as the load would; returns how many (+ inserted, - deleted).
+/// would otherwise run on a different store. A delete-only cell starts larger
+/// ([`extra_documents`]), so it cannot run out of documents to delete. Inserts
+/// or deletes in order, 16 at a time, as the load would; returns how many
+/// (+ inserted, - deleted).
 async fn rebalance(ctx: &Ctx, cell: &Cell) -> Result<i64, String> {
     let base = ctx.data.base.len();
-    let gap = ctx.cursors.lock().documents(base) - base as i64;
+    let gap = ctx.cursors.lock().documents(base) - (base as i64 + extra_documents(cell));
     if gap == 0 {
         return Ok(0);
     }
