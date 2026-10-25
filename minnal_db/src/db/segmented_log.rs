@@ -532,10 +532,30 @@ fn zero_past(file: &File, pos: u32, len: u32, segment_size: u32) -> Result<()> {
     Ok(())
 }
 
+/// Bytes a walk reads at a time: frames are parsed out of this window, so a
+/// run of small records costs one read per window rather than one or more per
+/// record.
+const READ_AHEAD: u32 = 64 * 1024;
+
+/// Make `buf` hold bytes `[pos, pos + need)` of `file`. `held` is the range it
+/// holds now; a miss reads `max(need, READ_AHEAD)` bytes from `pos`, never past
+/// `limit` (the caller has checked `need <= limit - pos`). Returns where `pos`
+/// is in `buf`.
+fn window(file: &File, buf: &mut Vec<u8>, held: &mut (u32, u32), pos: u32, need: u32, limit: u32) -> std::io::Result<usize> {
+    if pos < held.0 || pos + need > held.1 {
+        let len = need.max(READ_AHEAD).min(limit - pos);
+        buf.resize(len as usize, 0);
+        file.read_exact_at(&mut buf[..len as usize], u64::from(pos))?;
+        *held = (pos, pos + len);
+    }
+    Ok((pos - held.0) as usize)
+}
+
 /// Walks the frames of one segment from byte `start` up to byte `limit`,
 /// handing each body and its position to `f`. The one frame-parsing loop:
 /// opening and reading both use it, so the torn-tail and end-marker rules
-/// exist once.
+/// exist once. Reads ahead in [`READ_AHEAD`] windows (never past `limit`, so a
+/// reader bounded by the tail never reads a frame still being written).
 ///
 /// Every length is checked against the bytes left before anything is
 /// allocated for it (a corrupt length could otherwise ask for 4 GiB).
@@ -549,6 +569,8 @@ fn walk_segment<E>(
     mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
 ) -> std::result::Result<WalkEnd, E> {
     let io = |e: std::io::Error| lift(LogError::Io(e));
+    // The file bytes `buf` holds; empty to start (the buffer is reused).
+    let mut held = (0u32, 0u32);
     let mut pos = start;
     loop {
         if pos >= limit {
@@ -562,9 +584,8 @@ fn walk_segment<E>(
                 reason: format!("{left} bytes where a frame length belongs"),
             });
         }
-        let mut len_buf = [0u8; 4];
-        file.read_exact_at(&mut len_buf, u64::from(pos)).map_err(io)?;
-        let len = u32::from_le_bytes(len_buf);
+        let at = window(file, buf, &mut held, pos, left.min(FRAME_HEADER_LEN), limit).map_err(io)?;
+        let len = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         if len == 0 {
             return Ok(WalkEnd::Unwritten { pos });
         }
@@ -578,18 +599,17 @@ fn walk_segment<E>(
                 reason: format!("frame length {len} runs past the end ({left} bytes left)"),
             });
         }
-        let mut crc_buf = [0u8; 4];
-        file.read_exact_at(&mut crc_buf, u64::from(pos) + 4).map_err(io)?;
-        buf.resize(len as usize, 0);
-        file.read_exact_at(buf, u64::from(pos + FRAME_HEADER_LEN)).map_err(io)?;
-        if crc32fast::hash(buf) != u32::from_le_bytes(crc_buf) {
+        let at = window(file, buf, &mut held, pos, FRAME_HEADER_LEN + len, limit).map_err(io)?;
+        let crc = u32::from_le_bytes(buf[at + 4..at + 8].try_into().unwrap());
+        let body = &buf[at + FRAME_HEADER_LEN as usize..at + (FRAME_HEADER_LEN + len) as usize];
+        if crc32fast::hash(body) != crc {
             return Ok(WalkEnd::Torn {
                 pos,
                 bytes: FRAME_HEADER_LEN + len,
                 reason: "CRC mismatch".to_owned(),
             });
         }
-        f(position(segment_id, pos), buf)?;
+        f(position(segment_id, pos), body)?;
         pos += FRAME_HEADER_LEN + len;
     }
 }
@@ -1742,6 +1762,61 @@ mod tests {
         drop(log);
         open(dir.path(), FRESH).unwrap();
         assert!(!prep_path(dir.path(), 9).exists());
+    }
+
+    /// Records of every size — tiny, straddling a read-ahead window, larger
+    /// than a window — read back exactly, from the start and from a record in
+    /// the middle, and a reopen finds them all; a CRC failure inside a large
+    /// record of a sealed segment is still caught.
+    #[test]
+    fn records_read_back_across_read_ahead_windows() {
+        const BIG_SEGMENT: u32 = 1 << 20;
+        let open_big = |dir: &Path| {
+            let mut seen = Vec::new();
+            let (log, _) = SegmentedLog::open(dir, &FORMAT, BIG_SEGMENT, FRESH, |at, body| -> Result<()> {
+                seen.push((at, body.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            (log, seen)
+        };
+        let dir = TempDir::new().unwrap();
+        let (log, _) = open_big(dir.path());
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut appended: Records = Vec::new();
+        for i in 0..300u32 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let len = match i % 10 {
+                0 => 3 * READ_AHEAD as usize + (rng % 1000) as usize,
+                1..=3 => (READ_AHEAD as usize / 2) + (rng % 4096) as usize,
+                _ => 1 + (rng % 300) as usize,
+            };
+            let body: Vec<u8> = (0..len).map(|j| (j as u32 ^ i) as u8).collect();
+            let (start, _) = log.append(&[&body], |_, _| {}).unwrap();
+            appended.push((start, body));
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment() >= 3, "setup: the records should span segments");
+        assert_eq!(read_all(&log, segment_start(0)), appended);
+        let mid = appended.len() / 2;
+        assert_eq!(read_all(&log, appended[mid].0), appended[mid..].to_vec());
+        drop(log);
+        let (_, seen) = open_big(dir.path());
+        assert_eq!(seen, appended);
+
+        // Damage a large record in the first (sealed) segment, past its first
+        // read-ahead window.
+        let (at, body) = appended
+            .iter()
+            .find(|(at, b)| segment_of(*at) == 0 && b.len() > READ_AHEAD as usize)
+            .unwrap();
+        let f = OpenOptions::new().write(true).open(segment_path(dir.path(), 0)).unwrap();
+        let byte = u64::from(split(*at).1 + FRAME_HEADER_LEN) + body.len() as u64 - 10;
+        f.write_all_at(&[0xEE], byte).unwrap();
+        let why = corruption(SegmentedLog::open(dir.path(), &FORMAT, BIG_SEGMENT, FRESH, |_, _| Ok::<(), LogError>(())));
+        assert!(why.contains("segment 0") && why.contains("CRC"), "{why}");
     }
 
     /// A progress file round-trips with its extra bytes, and every kind of
