@@ -6,7 +6,7 @@
 //! GET  /admin/storage/ops-metrics                      → engine-wide operational counters (reads/writes/compaction/GC + read-path efficiency)
 //! GET  /admin/storage/ops-metrics/by-namespace         → the same counters, broken out per namespace
 //! GET  /admin/storage/stores/{ns}/ops-metrics          → operational counters for one namespace
-//! GET  /admin/storage/wal                             → WAL metadata snapshot
+//! GET  /admin/storage/wal                             → main WAL: bounds, cut, per-namespace progress, segments
 //! GET  /admin/storage/vector-index-wal                → vector index WAL: segments, tail, retired cut, namespaces holding it
 //! GET  /admin/storage/lsm                             → LSM manifest for every namespace
 //! GET  /admin/storage/value-log                       → per-namespace, per-bucket utilization + every segment file (like /wal)
@@ -149,7 +149,16 @@ pub struct WriteMetrics {
     no_wal_puts: u64,
     no_wal_deletes: u64,
     wal_bytes_appended: u64,
-    wal_fsyncs: u64,
+    /// WAL-backed writes; each returned once a WAL fsync covered it.
+    wal_writes: u64,
+    /// Main-WAL fsyncs issued by commit rounds (engine-global: `0` on
+    /// per-namespace views). Concurrent writes share one.
+    wal_commit_rounds: u64,
+    /// Writes those rounds covered (engine-global).
+    wal_commit_writes: u64,
+    /// `wal_commit_writes / wal_commit_rounds`: how many writes one fsync
+    /// covered on average. `null` before the first round.
+    writes_per_commit_round: Option<f64>,
     apply_failures: u64,
 }
 
@@ -274,7 +283,10 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             no_wal_puts: m.no_wal_puts,
             no_wal_deletes: m.no_wal_deletes,
             wal_bytes_appended: m.wal_bytes_appended,
-            wal_fsyncs: m.wal_fsyncs,
+            wal_writes: m.wal_writes,
+            wal_commit_rounds: m.wal_commit_rounds,
+            wal_commit_writes: m.wal_commit_writes,
+            writes_per_commit_round: (m.wal_commit_rounds > 0).then(|| m.wal_commit_writes as f64 / m.wal_commit_rounds as f64),
             apply_failures: m.apply_failures,
         },
         compaction: CompactionMetrics {
@@ -349,64 +361,11 @@ pub async fn ops_metrics_by_namespace(State(state): State<AppState>) -> impl Int
 
 // ── WAL ───────────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-pub struct WalSegmentStats {
-    segment_id: u64,
-    total_entries: u64,
-    persisted_entries: u64,
-    pending_entries: u64,
-}
-
-#[derive(Serialize)]
-pub struct WalResponse {
-    head: u64,
-    tail: u64,
-    total_entries: u64,
-    persisted_entries: u64,
-    pending_entries: u64,
-    total_gc_runs: u64,
-    total_bytes_reclaimed: u64,
-    /// Absolute segment id the per-segment counters start at; counters for
-    /// segments below this were reclaimed and trimmed.
-    base_segment_id: u64,
-    /// Number of tracked segments still carrying entries (the live window).
-    live_segments: usize,
-    /// Highest write sequence the WAL has observed (GC high-water mark).
-    last_sequence: u64,
-    segments: Vec<WalSegmentStats>,
-}
-
+/// `GET /admin/storage/wal` — the main WAL's state: bounds, the cut, the
+/// namespaces ahead of it and holding it, and each segment from the head to the
+/// tail (retired or live, and the bytes a restart would replay).
 pub async fn wal(State(state): State<AppState>) -> impl IntoResponse {
-    let m = state.store.wal_metadata();
-    let pending = m.total_entries.saturating_sub(m.persisted_entries);
-    // The per-segment vecs are dense from `base_segment_id`, so the real segment
-    // id is base + relative index (not the bare index).
-    let segments: Vec<WalSegmentStats> = m
-        .segment_total_entries
-        .iter()
-        .zip(m.segment_persisted_entries.iter())
-        .enumerate()
-        .map(|(i, (&total, &persisted))| WalSegmentStats {
-            segment_id: m.base_segment_id + i as u64,
-            total_entries: total,
-            persisted_entries: persisted,
-            pending_entries: total.saturating_sub(persisted),
-        })
-        .collect();
-    let live_segments = m.segment_total_entries.iter().filter(|&&t| t > 0).count();
-    Json(WalResponse {
-        head: m.head,
-        tail: m.tail,
-        total_entries: m.total_entries,
-        persisted_entries: m.persisted_entries,
-        pending_entries: pending,
-        total_gc_runs: m.total_gc_runs,
-        total_bytes_reclaimed: m.total_bytes_reclaimed,
-        base_segment_id: m.base_segment_id,
-        live_segments,
-        last_sequence: m.last_sequence,
-        segments,
-    })
+    Json(state.store.wal_stats())
 }
 
 /// `GET /admin/storage/vector-index-wal` — the vector index WAL's state, read
@@ -693,8 +652,7 @@ pub struct ValueLogShardInfo {
     waste_ratio_pct: f64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
-    /// Every segment file in this shard, newest id last — the same per-segment
-    /// breakdown `/admin/storage/wal` gives for WAL segments.
+    /// Every segment file in this shard, newest id last.
     segments: Vec<SegmentInfo>,
     /// Bytes the shard's segment files occupy on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -934,19 +892,19 @@ pub async fn trigger_gc(State(state): State<AppState>) -> impl IntoResponse {
 pub struct WalGCResponse {
     /// Bytes of WAL segment files deleted by this pass.
     bytes_reclaimed: u64,
-    /// WAL entries not yet persisted to an SSTable after the pass; they keep
-    /// their segments on disk.
-    unpersisted_entries: u64,
+    /// Bytes of WAL a restart would replay after the pass (from the cut to the
+    /// tail); the segments holding them stay on disk.
+    pending_bytes: u64,
 }
 
 pub async fn trigger_gc_wal(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     info!("admin: WAL GC triggered manually");
     match state.store.garbage_collect_wal().await {
-        Ok((bytes_reclaimed, unpersisted_entries)) => {
-            info!(bytes_reclaimed, unpersisted_entries, "admin: WAL GC complete");
+        Ok((bytes_reclaimed, pending_bytes)) => {
+            info!(bytes_reclaimed, pending_bytes, "admin: WAL GC complete");
             Ok(Json(WalGCResponse {
                 bytes_reclaimed,
-                unpersisted_entries,
+                pending_bytes,
             }))
         }
         Err(e) => Err((StatusCode::CONFLICT, Json(serde_json::json!({ "error": e.to_string() })))),

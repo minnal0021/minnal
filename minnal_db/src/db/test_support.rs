@@ -94,3 +94,16 @@ pub(crate) fn record_test_gap(db: &Database, ns: u32, field_id: FieldId) {
         )
         .unwrap();
 }
+
+/// Open a main WAL by hand as a database with no saved progress would.
+pub(crate) const FRESH_WAL: crate::db::segmented_log::OpenFrom = crate::db::segmented_log::OpenFrom { cut: None, furthest: 0 };
+
+/// The main WAL's saved metadata file in the database at `db_path`.
+pub(crate) fn wal_metadata_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    crate::db::layout::main_wal_dir(db_path).join(crate::db::wal::METADATA_FILE)
+}
+
+/// Main-WAL segment `segment_id`'s file in the database at `db_path`.
+pub(crate) fn wal_segment_path(db_path: &std::path::Path, segment_id: u64) -> std::path::PathBuf {
+    crate::db::segmented_log::segment_path(&crate::db::layout::main_wal_dir(db_path), segment_id)
+}

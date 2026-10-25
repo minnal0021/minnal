@@ -254,19 +254,21 @@ Batch reads (`get_multiple`, scans) group their pointers by bucket and read each
 
 ### Write-Ahead Log (WAL)
 
-*The terms this section and the next use (seal, flush, seq, stripe, retired cut and so on) are defined in [WAL terms](#wal-terms).*
+*The terms this section and the next use (seal, flush, seq, stripe, retired cut and so on) are defined in [WAL terms](#wal-terms). The design of both logs, with its rules and tests, is in [`docs/WAL-Architecture.md`](docs/WAL-Architecture.md).*
 
 The WAL is the safety net beneath every write. It is a single, global, append-only log shared by all namespaces, and its job is to make a write durable *before* it is acknowledged — bridging the gap between "the caller was told it succeeded" and "it has been flushed from the in-memory MemTable into a stable SSTable."
 
-**Durability model (deliberate — do not "optimise" with group commit).** Every `put`/`delete` `fsync`s the WAL *before returning*, so each acknowledged write is durable against power loss the moment the call returns. The engine intentionally does **not** group-commit independent writes — that is, it never defers or batches their WAL `fsync`. Doing so would let a write be acknowledged before it reached stable storage, so a power loss in that window would silently lose a write the caller believed had succeeded. (Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL already holds a durable copy that recovery can replay.)
+**Durability model.** Every `put`/`delete`/`merge` returns only once a WAL `fsync` that started after its entry was written has finished, so each acknowledged write is durable against power loss the moment the call returns. Concurrent writes **share** fsyncs (**group commit**): each appends its entry under the WAL lock and releases it, then waits for a **commit round** — one fsync, issued by whichever waiting writer finds no round running, that covers every entry appended before it started. A lone writer pays one fsync per write; under load one fsync covers many. No write is acknowledged early: the fsync is shared, not skipped or deferred. A failed fsync stops the WAL (**poisoned**): every writer in that round, and every later one, gets an error until the database is reopened. (`sync.commit_delay_us` can make a round's leader wait briefly for more writers when others are already waiting; it is 0 by default. Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL holds a durable copy until the entry is retired.)
 
-Each WAL entry is length-prefixed, checksummed, and stored in a compact binary format:
+Both logs — this one and the [vector index WAL](#vector-index-wal) — use one on-disk format, the **segmented log** (`db/segmented_log.rs`); they differ only in a four-byte magic and in what a record's body holds. A log is a directory of **segment files** `{segment_id:010}.log`. Each segment starts with a header naming the log, its format version and its own id, so a file from another log, or from another format version, fails loudly instead of being parsed. Each record is a **frame**: its length, a CRC32 of its body, then the body. Once written, a frame never changes: the log is append-only.
 
 ```
-[size: 4B] [rkyv-serialized WalEntry] [CRC32: 4B]
+segment: [magic "MWAL" | format_version u32 | segment_id u64]   ← 16-byte header
+         [frame] [frame] ... [end marker: u32 0xFFFF_FFFF]       ← every segment but the last
+         [zeros to the end of the file]                          ← unwritten space
+frame:   [size: 4B] [crc32(body): 4B] [body: rkyv-serialized WalEntry]
 
 WalEntry {
-  status:       Inserted | Persisted
   operation:    Upsert | Delete
   namespace_id: u32
   sequence:     u64   — global monotonic counter
@@ -276,30 +278,36 @@ WalEntry {
 }
 ```
 
-Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every un-persisted entry is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes and reconcile on recovery rather than committing them atomically.
+Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every entry not yet in an SSTable is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes and reconcile on recovery rather than committing them atomically.
+
+A segment is **sealed** with the end marker, and fsynced, before the next one is created, so only the last segment can ever hold bytes no fsync covered. That is what lets open tell a crash from damage. In the last segment, the first frame whose length or CRC is not valid is the end of the log (a record torn by a crash), and open zeroes the segment from there on. Anywhere else — a bad frame in a sealed segment, a sealed segment with no end marker, a missing segment between two that exist, a header naming another log — the log is damaged, and open fails rather than drop acknowledged writes. A checksum is needed because a changed byte inside a key or value still decodes, and a body that passes its checksum but does not decode is damage too.
+
+A **position** in either log is `(segment_id << 32) | byte`, so the segment size is not encoded in positions: it can change from one start to the next (`wal.segment_size_bytes`, at most 4 GiB; a record must fit one segment). The admin API shows positions as `{segment_id, byte}`.
 
 The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
 
-Physically, the WAL is split into **64 MB segment files** (`wal.log` is segment 0, `wal.log.seg000001` is segment 1, and so on). Once every entry in a segment is marked `Persisted` — meaning the data is safely in an L0 or L1 SSTable on disk — and every field index has checkpointed past it (field indexes rebuild themselves after a crash by replaying the WAL from their last checkpoint), the WAL garbage collector deletes the whole segment, decrements the global `total_entries`/`persisted_entries` counters, and advances the WAL head pointer past any consecutively deleted segments so a later startup scan never tries to open a file that is gone.
+The WAL knows how far it is no longer needed through its **cut**: every entry below that position is safely in an L0 or L1 SSTable on disk. Each namespace also has a **safe offset** — all of *its* entries below it are in SSTables — which can be ahead of the cut (the cut is the slowest namespace's). Both are kept in the WAL metadata file, saved by the flush that moves them, before the flush's L0 files become readable. Recovery replays each namespace's entries from its own safe offset (or the cut), and nothing below.
+
+Physically, the WAL is split into **64 MB segment files** in `<db_path>/wal/` (`0000000000.log` is segment 0, `0000000001.log` is segment 1, and so on). Each is created at its full size, so an fsync never has to commit a new file size, and every segment after a database's first is **zero-filled ahead**: once the active segment is half full, a background thread writes the next one in full with zeros (under a temporary `.prep` name, renamed into place when the log reaches it). An fsync into blocks that already hold data commits no block allocation either, so it costs about 0.7 ms whatever the write's size, against about 2.3 ms on a file that grows. (A new database's first segment is sparse: there, writes that start a new 4 KiB block still pay for allocating it.) Once a segment lies wholly below the cut, and every field index has checkpointed past it (field indexes rebuild themselves after a crash by replaying the WAL from their last checkpoint), the WAL garbage collector deletes the whole segment. The head — the first record still on disk — moves past it; at startup it is read from the oldest segment file, not saved.
 
 #### How WAL storage evolves over time
 
-The log grows with every write and shrinks in whole-segment steps, so its on-disk size is a sawtooth rather than a monotonic climb. The animation below follows entries through all three stages — appended (`Inserted`), covered by a memtable flush (`Persisted`), and reclaimed:
+The log grows with every write and shrinks in whole-segment steps, so its on-disk size is a sawtooth rather than a monotonic climb. The animation below follows entries through all three stages — appended (above the cut), retired by a memtable flush (below the cut), and reclaimed:
 
-![Animated diagram of the WAL lifecycle: entries are appended and fsynced, a memtable flush marks them persisted, and WAL GC deletes fully-persisted segments, keeping the on-disk log bounded](docs/wal-lifecycle.svg)
+![Animated diagram of the WAL lifecycle: entries are appended and fsynced, a memtable flush moves the cut past them, and WAL GC deletes segments wholly below the cut, keeping the on-disk log bounded](docs/wal-lifecycle.svg)
 
 Three rules set the shape of that curve:
 
-- **Only flushes shrink the log.** An entry stays `Inserted` — and its segment stays on disk — until *its* memtable is flushed to an L0 SSTable. Until then the WAL is the only durable copy of that write, so nothing about it can be reclaimed.
-- **Reclamation is per segment, never per entry.** A segment is deleted only when *every* entry in it is `Persisted`, which is why the size drops in 64 MB steps: one straggler entry pins the whole file. GC also skips the **active segment** — the tail the log is currently appending to is never reclaimed, even if all of its entries are persisted.
-- **The head only moves forward over contiguous deletions.** After deleting segments, GC advances `head` past the consecutively deleted ones, so recovery's `scan_entries(head, tail)` always starts at a file that still exists.
+- **Only flushes shrink the log.** An entry stays above the cut — and its segment stays on disk — until *its* memtable is flushed to an L0 SSTable, and every other namespace with older unflushed writes has flushed too. Until then the WAL is the only durable copy of that write, so nothing about it can be reclaimed.
+- **Reclamation is per segment, never per entry.** A segment is deleted only when it lies *wholly* below the cut, which is why the size drops in 64 MB steps: one straggler entry pins the whole file. GC also skips the **active segment** — the tail the log is currently appending to is never reclaimed, even if all of it is below the cut.
+- **Segments go oldest first.** GC deletes from the head up and advances `head` past what it deleted, so recovery's scan always starts at a file that still exists.
 
-The steady-state footprint therefore isn't "everything ever written" but roughly *the entries not yet flushed to L0, plus the active segment*. A large memtable (or a stalled flush) widens the sawtooth by holding more segments un-persisted; a database that stops writing settles at a single active segment once the last flush lands, with all earlier segments reclaimed.
+The steady-state footprint therefore isn't "everything ever written" but roughly *the entries not yet flushed to L0, plus the active segment*. A large memtable (or a stalled flush) widens the sawtooth by holding the cut back; a database that stops writing settles at a single active segment once the last flush lands, with all earlier segments reclaimed.
 
 
 #### One write, step by step
 
-A `put` (a `delete` is the same with no value) takes its key's stripe lock, then the WAL lock, and returns only once its WAL entry is on disk:
+A `put` (a `delete` is the same with no value) takes its key's stripe lock, then the WAL lock to append, and returns only once an fsync covers its WAL entry:
 
 ```mermaid
 sequenceDiagram
@@ -313,8 +321,9 @@ sequenceDiagram
     D->>K: lock the key's stripe
     D->>W: take the WAL lock
     Note over W: take the next seq<br/>(under the lock, so seq order = log order)
-    D->>W: append the entry, fsync
-    D->>W: release the WAL lock
+    D->>W: append the entry (no fsync yet), release the WAL lock
+    D->>W: wait for a commit round that covers the entry
+    Note over W: if no round is running, lead one:<br/>fsync the active segment for every writer waiting
     D->>M: apply (key → value pointer) with that seq
     D->>K: release the stripe
     D-->>C: Ok (the write is durable)
@@ -330,20 +339,22 @@ sequenceDiagram
     participant G as WAL GC (every 60 s)
     M->>F: memtable full: seal it (read-only)
     F->>W: sealed event: note how far this memtable reaches in the WAL
-    F->>F: write and fsync its L0 files, register them
-    F->>W: flushed event: its entries are now Persisted
-    G->>W: delete every segment whose entries are all Persisted
+    F->>F: write and fsync its L0 files (not yet readable)
+    F->>W: written event: move this namespace's safe offset and the cut, save them
+    F->>F: register the L0 files
+    G->>W: delete every segment wholly below the cut
 ```
 
-Only one writer holds the WAL lock at a time, and it holds it across the fsync. On the NVMe drive the benchmarks here were measured on, an fsync takes about 2.3 ms, so the whole database makes at most about 400 WAL-backed writes per second, however many clients write at once.
+The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, a single client's writes take about 0.75 ms each once the log is on zero-filled segments (measured: 0.73–0.75 ms per `put` for 128 B to 8 KiB values, about 1,350 a second); concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 
 ### Vector index WAL
 
-Semantic search (the `semantic-search` feature) writes a lot per document: each document's chunk codes and its whole-document code, plus the copies, rewrites and deletes partition maintenance makes as it splits and merges postings. These are large or frequent, and all of them can be made again (by re-embedding the document, or by redoing a maintenance step). Sending each one through the main WAL would cost one fsync on the global WAL lock per write. They go to a second log instead, the **vector index WAL** (`db/vector_index_wal.rs`):
+Semantic search (the `semantic-search` feature) writes a lot per document: each document's chunk codes and its whole-document code, plus the copies, rewrites and deletes partition maintenance makes as it splits and merges postings. These are large or frequent, and all of them can be made again (by re-embedding the document, or by redoing a maintenance step). Sending each one through the main WAL would make every one of them wait for a main-WAL fsync, and put their bulk in the log every client write shares. They go to a second log instead, the **vector index WAL** (`db/vector_index_wal.rs`):
 
 - **One per database**, shared by every namespace, in `<db_path>/vector_index_wal/`. Each record names its namespace.
 - **No fsync per write.** `Database::put_ns_logged` / `delete_ns_logged` (called through a namespace as `put_logged` / `delete_logged`) append the record and apply it to the memtable, and return. A later `sync_vector_index_wal` makes every record appended before it durable with one fsync. The vector worker syncs once per batch of up to 256 documents before it removes their queue entries; partition maintenance syncs once per batch of 16 documents.
 - **Its own lock.** Appends take the log's append lock only to write the bytes, and the fsync runs outside it. A client's main-WAL write never waits on this log.
+- **Syncs share fsyncs**, through the same commit rounds as the main WAL (`db/commit_rounds.rs`): when the vector worker, partition maintenance and a flush sync at once, one fsync covers them all.
 - **Same seq counter, same key stripe** as every other write, so writes to one key through either log apply in seq order, and the highest seq wins after a crash too.
 
 ```mermaid
@@ -366,7 +377,7 @@ sequenceDiagram
 
 **What survives a crash is a prefix of the log.** A sync makes everything before it durable, and a crash tears off only the end. A logged write can also reach disk another way: in its namespace's L0 files when the memtable is flushed. So before a flush writes any L0 file, it syncs the log if that namespace has records not yet durable. An L0 file never holds a logged write the log could still lose. Partition maintenance relies on this: it changes a document's meta (one namespace) before the document's chunk key (another), and after a crash the second never survives without the first.
 
-**Retirement: when a record is no longer needed.** A record is *retired* once the memtable holding its write is in L0 files, since replay would only repeat it. The log tracks this per namespace, through the same flush events the main WAL uses:
+**Retirement: when a record is no longer needed.** A record is *retired* once the memtable holding its write is in L0 files, since replay would only repeat it. The log tracks this per namespace, through the same flush events the main WAL uses (in the *written* event the main WAL saves its own progress first, and puts it back if this log's save fails):
 
 ```mermaid
 sequenceDiagram
@@ -391,31 +402,35 @@ The design and its measurements are in `src/semantic_search/report/Vector-Index-
 
 ### WAL terms
 
-- **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and fsyncs it before the call returns.
-- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here: about 2.3 ms each on the NVMe drive the benchmarks use.
-- **WAL lock** (`Database::wal_metadata`) — the one lock every main-WAL write holds across its append and fsync, so main-WAL writes run one at a time.
-- **Group commit** — letting several concurrent writers share one fsync. The main WAL does not do it (see *Durability model* above).
+- **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and returns only once an fsync covers it.
+- **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here, on the NVMe drive the benchmarks use: about 2.3 ms when the fsync must also commit file metadata (a new file size, or a newly allocated block), about 0.7 ms when it need not, as in a zero-filled WAL segment.
+- **WAL lock** (`Database::wal_metadata`) — the lock every main-WAL write takes to take its seq and append its entry, so seq order is log order. Inside it the append takes the log's own append lock, which is never contended (every main-WAL append already holds the WAL lock) and which a commit round takes briefly to read the tail. Both are released before the fsync.
+- **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
+- **Commit round** — one fsync and the callers it releases, in either log (`db/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
 - **Key stripe lock** (`db/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.
-- **Persisted** (main WAL) — an entry whose memtable has been flushed, so recovery skips it. WAL GC deletes a segment once all its entries are persisted and every field index has checkpointed past it.
+- **WAL consumer** (main WAL) — anything that needs the WAL from some position on, and reports by an event when that position moves: each namespace's memtables (moved by a flush) and each active field index (moved by its checkpoint). WAL GC keeps the log from the lowest of them.
+- **Segmented log** — the on-disk format and mechanics both logs share (`db/segmented_log.rs`): segment files with a header, checksummed frames, an end marker on every sealed segment, preallocation, commit rounds, and the rules open uses to tell a torn tail from damage.
+- **Position** — a place in a log, `(segment_id << 32) | byte`, in either log; shown as `{segment_id, byte}`.
+- **Cut** (main WAL) — every entry below this position is in an SSTable: the lowest safe offset of any namespace with unflushed writes, capped at the oldest write still in flight. WAL GC deletes segments wholly below it, once every field index has checkpointed past them. Saved, with each namespace's safe offset, in the WAL metadata file by the flush that moves it, before its L0 files are registered.
 - **No-WAL write** — `put_no_wal` / `delete_no_wal` / `merge_no_wal`: applied to the memtable with no log entry at all. It is durable only once its memtable is flushed (the LSM worker flushes such namespaces every tick, 60 s by default), and lost if the process dies first. Used only where losing it is harmless: the query-embedding cache, and the embed queue's completions.
 - **`merge` / `merge_no_wal`** — read a key, run a closure on its value, write the result back (or delete the key), all under the key's stripe. `merge` logs the result in the main WAL; `merge_no_wal` does not.
 - **Logged write** — `put_ns_logged` / `delete_ns_logged` (facade: `put_logged` / `delete_logged`): a write recorded in the vector index WAL instead of the main WAL, durable at the log's next sync.
 - **`LoggedWrite`** — the guard an append returns. While it is alive the record counts as *in flight* (appended, not yet in a memtable), so no seal can count it as covered.
-- **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker) and the next is started.
-- **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced.
-- **Torn tail** — a partly written last record after a crash. Opening the log cuts it off; only the last segment may have one.
+- **Segment** — one file of a log. Both logs are a series of segment files; a full one is **sealed** (closed with an end marker, and fsynced) and the next is started. Segments of both logs are created at their full size, and from a log's second segment on they are zero-filled ahead, so an fsync never has to commit a new file size or block allocation.
+- **Tail / durable tail** — the position the next record will be written at / the position below which everything is fsynced. In the main WAL the saved metadata never records a tail beyond the durable tail.
+- **Torn tail** — a partly written last record after a crash, found by its length running past the data or its CRC not matching. Opening either log cuts it off there by zeroing the rest of the segment, so a later, shorter record cannot leave older valid-looking records behind it; only the last segment may have one.
 - **Ceiling** — when a namespace's memtable is sealed, how far into the vector index WAL its applied records reach: the tail, lowered to the oldest of its records still in flight.
-- **Safe offset** — per namespace: every one of its records below this position is in L0 files. Its replay starts here.
+- **Safe offset** — per namespace, in either log: every one of its records below this position is in L0 files. Its replay starts here. (Like a field index's *checkpoint offset*, it is a position.)
 - **Retired cut** — the lowest safe offset of any namespace that still has records above its own (capped by the oldest record still in flight). Records below it are retired; GC deletes segments that lie wholly below it. It is kept in the `retired_cut` marker file, written before the flush's L0 files are registered.
 - **Holding the cut** — a namespace whose unflushed records keep the retired cut from moving. The WAL GC tick flushes such namespaces.
-- **Replay** — re-applying a log's unretired (vector index WAL) or not-persisted (main WAL) records at open, each with its original seq.
+- **Replay** — re-applying a log's records at open, each with its original seq: in either log, a namespace's records from its safe offset (or the cut) on.
 - **Prefix rule** — whatever survives a crash of the vector index WAL is a prefix of it: a flush syncs the log before writing L0 files.
-- **Poisoned** — the vector index WAL's state after a failed fsync: it refuses appends and syncs until the database is reopened.
-- **Flush observer** (`LsmFlushObserver`) — the hook through which a namespace's LSM tree reports each flush, in order: sealed, flushing (before any L0 file is written), written (files durable, not yet registered), flushed (registered). Both logs listen to it; the main WAL marks entries persisted at *flushed*, the vector index WAL syncs at *flushing* and retires at *written*.
+- **Poisoned** — either log's state after a failed fsync: it refuses writes until the database is reopened, since the kernel may have dropped the unwritten pages and a later fsync would not say so. The main WAL is also poisoned if a flush's saved progress cannot be put back after the flush was undone.
+- **Flush observer** (`LsmFlushObserver`) — the hook through which a namespace's LSM tree reports each flush, in order: sealed, flushing (before any L0 file is written), written (files durable, not yet registered), flushed (registered). Both logs listen to it: the vector index WAL syncs at *flushing*, and both save their progress at *written*, the main WAL first; if either save fails the flush is undone (and the main WAL puts its saved progress back).
 
 ### Sharding
 
@@ -425,7 +440,7 @@ Sharding is what lets MinnalDB do its slow work in parallel. Every storage compo
 - Compaction runs across 16 independent L1 SSTables at once.
 - Value-log writes take a **per-bucket lock** rather than one global value-log lock.
 
-Sharding does not parallelise durable writes, though. Every write appends to the one shared WAL and fsyncs it while holding the WAL lock, so writes from all threads and namespaces reach the disk one at a time. Write throughput is set by the drive's fsync latency, not by the bucket count (see [Performance](#performance)).
+Sharding does not parallelise durable writes, though. Every write appends to the one shared WAL and waits for an fsync that covers it; concurrent writes from all threads and namespaces share each fsync (group commit). Write throughput is set by the drive's fsync latency and how many writes share each fsync, not by the bucket count (see [Performance](#performance)).
 
 A key is assigned to a bucket by hashing its first eight bytes:
 
@@ -456,12 +471,12 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 
 1. The registry deletion is persisted **first**. From this moment the namespace is logically gone, and all of its files *and* WAL entries are unreferenced.
 2. Its `KVStore` is flushed, shut down, and dropped, releasing every open file handle.
-3. Its WAL entries are marked persisted, so WAL GC can reclaim those segments.
+3. It stops holding the WAL's cut back, so WAL GC can reclaim the segments its entries occupy.
 4. Its on-disk data directory and index files are deleted.
 
 The reason this order matters is recovery. The cleanup touches only the namespace's own files — **never the shared WAL or its metadata** — so recovery for surviving namespaces is unaffected. And because the registry deletion is made durable *before* any file is removed, a crash partway through cleanup simply leaves some unreferenced files behind (a harmless disk leak): on the next startup, recovery **skips any WAL entry whose namespace is absent from the registry**, so a dropped namespace can never be resurrected. The never-reused-ID guarantee is what makes this unambiguous — a leftover WAL entry pointing at a missing namespace can only mean that namespace was deleted, never that its ID was handed to something else.
 
-**The WAL leak self-heals — it never becomes permanent.** Step 3 (marking the namespace's WAL entries persisted) is only the *clean-shutdown* fast path; a crash before it runs leaves those entries un-persisted in the shared log. That is not a standing leak. Because un-persisted entries make `persisted_entries < total_entries`, the next startup always runs WAL recovery, and recovery's cleanup pass marks **every** scanned entry persisted — orphans from the dropped namespace included, with no per-namespace filter — and advances the persisted watermark to the WAL tail. So the orphan segments become fully persisted and WAL GC reclaims them on its next cycle. The dropped namespace's entries are pinned only across the single crash/restart boundary that immediately reclaims them, never indefinitely.
+**The WAL leak self-heals — it never becomes permanent.** A crash before step 3 leaves the dropped namespace's entries above the saved cut. That is not a standing leak: the next startup runs WAL recovery, which skips them (their namespace is gone) and then retires the whole log, moving the cut to the tail. WAL GC reclaims those segments on its next cycle.
 
 ### Background Workers
 
@@ -471,12 +486,12 @@ Everything expensive happens off the foreground path, on `tokio` tasks that run 
 |---|---|---|---|
 | `GCWorker` | Global (fans out per namespace) | Interval; per-namespace waste ratio > threshold | Compact each namespace's value log |
 | `LsmWorker` | Global (fans out per namespace) | Interval OR memtable seal | Flush L0, compact L0→L1 across namespaces |
-| `WalGcWorker` | Global | Interval | Remove fully-persisted WAL segments |
+| `WalGcWorker` | Global | Interval | Remove WAL segments wholly below the cut |
 | `TtlWorker` | Global (fans out per namespace) | Interval (default 1h) | Tombstone expired records in each TTL-enabled namespace |
 
 **On "Scope":** every worker is a **single** background task — one interval, one handle on `Database`. `GCWorker`, `LsmWorker`, and `TtlWorker` are global tasks that loop over the relevant namespaces on each tick (each namespace has its own value log / LSM tree, so the per-store *work* is still isolated). `TtlWorker` reads the per-namespace TTL configuration (`ttl` / `max_deletes_per_run`) from the persistent namespace registry and expires only the namespaces that have it — so a database with many TTL stores still runs just one timer task, not one per store, and the configuration is restored on restart.
 
-These workers don't poll blindly; they are driven by an **observer pattern** that fires on LSM events. When a memtable is sealed, `LsmFlushObserver` wakes the LSM worker. When that sealed table is flushed to L0, `WalPersistObserver` marks the corresponding WAL entries `Persisted`. An `LsmFlushObserverHub` coordinates the two so that the WAL is always updated before the LSM worker finishes — which is what lets WAL GC safely reclaim a segment the instant its data is durable in an SSTable.
+These workers don't poll blindly; they are driven by an **observer pattern** that fires on LSM events. When a memtable is sealed, `LsmFlushObserver` wakes the LSM worker. When that sealed table's L0 files are written, `WalPersistObserver` moves the namespace's safe offset and the cut and saves them, before the files are registered. An `LsmFlushObserverHub` coordinates the observers so that the WAL's progress is durable before the flush completes — which is what lets WAL GC safely reclaim a segment the instant its data is durable in an SSTable.
 
 ---
 
@@ -488,14 +503,15 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 <db_path>/
 ├── namespace_registry          # Namespace name → ID map, plus TTL settings (rkyv)
 │
-├── wal_metadata                # WAL head/tail/counters (CRC32-protected)
-├── wal_segment_size            # WAL segment size, fixed when the WAL is created
-├── wal.log                     # WAL segment 0 (64 MB)
-├── wal.log.seg000001           # WAL segment 1
-├── ...                         # (reclaimed segments are deleted)
+├── wal/                        # The main WAL
+│   ├── 0000000000.log          # Segments, 64 MB each, created at full size; reclaimed
+│   ├── ...                     #  ones are deleted, and the next is prepared as
+│   │                           #  NNNNNNNNNN.log.prep, zero-filled
+│   └── metadata                # Head, tail, cut + per-namespace offsets (CRC32-protected)
 │
 ├── vector_index_wal/           # The vector index WAL (semantic search only)
-│   ├── 0000000000.log          # Segments, 64 MiB each
+│   ├── 0000000000.log          # Segments, 64 MiB each, created at full size; the
+│   │                           #  next is prepared as NNNNNNNNNN.log.prep, zero-filled
 │   └── retired_cut             # Where replay starts, per namespace
 │
 ├── fail_logs/                  # Recovery fail-log files (one per recovery run)
@@ -538,9 +554,10 @@ A write is durable the moment the WAL `fsync` returns — everything after that 
 ```
 put(key, value)
         │
-        ├──► WAL.append(Upsert, Inserted)   ← fsynced on every single-op write,
-        │                                      so the write is crash-durable
-        │                                      before put() returns
+        ├──► WAL.append(Upsert)             ← put() returns only once a WAL
+        │                                      fsync covers it (one fsync shared
+        │                                      by concurrent writes), so the write
+        │                                      is crash-durable before it returns
         │
         ├──► ValueLog.append(value)          ← sharded by Murmur3(key)
         │         └─ returns u128 pointer
@@ -551,7 +568,7 @@ put(key, value)
         └──► fsync(value_log)                ← value-log durability cadence only
 ```
 
-> **On `fsync` cadence.** Each `put`/`delete` `fsync`s the WAL *individually* — that is what makes the operation durable on return — so `records_per_sync` governs only how often the **value log** is `fsync`ed, never the WAL.
+> **On `fsync` cadence.** Each `put`/`delete` returns only once a WAL `fsync` covers its entry — that is what makes the operation durable on return (concurrent writes share that fsync) — so `records_per_sync` governs only how often the **value log** is `fsync`ed, never the WAL.
 
 #### The merge path
 
@@ -610,7 +627,7 @@ Layer order is deliberately *not* the tie-breaker: value-log GC re-points a relo
 
 ## Compaction & Garbage Collection
 
-Three independent reclamation processes keep the on-disk footprint in check, each operating on a different structure: LSM compaction merges accumulated L0 files, value-log GC reclaims dead value bytes, and WAL GC drops segments whose data is safely persisted.
+Three independent reclamation processes keep the on-disk footprint in check, each operating on a different structure: LSM compaction merges accumulated L0 files, value-log GC reclaims dead value bytes, and WAL GC drops segments whose data is safely in SSTables.
 
 ### LSM Compaction (L0 → L1)
 
@@ -640,11 +657,11 @@ Two consequences worth stating plainly:
 
 WAL GC runs every 60s. Its job is simply to drop segments whose every entry is already safely in an SSTable:
 
-1. For each segment other than the current write segment, compare its `total_entries` against its `persisted_entries`.
-2. If every entry is `Persisted`, and every active field index has checkpointed past the segment, delete the segment file and subtract its counts from the global totals. A field index replays the WAL from its last checkpoint after a crash, so a segment it still needs is kept. If too many segments pile up waiting on an index (`thresholds.max_pinned_wal_segments`, default 32), GC deletes the oldest anyway and records a gap on the index, which the index health and repair endpoints then report and fix.
-3. Advance the WAL `head` past all consecutively deleted segments, so the next startup scan begins at a live file.
+1. Starting at the head, take each segment other than the current write segment that lies wholly below the cut.
+2. Keep those an active field index still needs: a field index replays the WAL from its last checkpoint after a crash. Each field's checkpoint reports its WAL position as it completes (and a field reports none once it is deactivated or dropped), so GC reads these positions from memory rather than from the checkpoint files. If too many segments pile up waiting on an index (`thresholds.max_pinned_wal_segments`, default 32), GC deletes the oldest anyway and records a gap on the index, which the index health and repair endpoints then report and fix.
+3. Delete the rest, oldest first, and advance the WAL `head` past them, so the next startup scan begins at a live file.
 
-An entry becomes `Persisted` the moment its key is flushed from the MemTable to an on-disk L0 file — that is, once a durable copy exists in the LSM and the WAL no longer needs to protect it. See [How WAL storage evolves over time](#how-wal-storage-evolves-over-time) for the resulting sawtooth in on-disk size.
+The cut moves past an entry once its key is flushed from the MemTable to an on-disk L0 file — once a durable copy exists in the LSM and the WAL no longer needs to protect it — and every namespace with older unflushed writes has flushed too. See [How WAL storage evolves over time](#how-wal-storage-evolves-over-time) for the resulting sawtooth in on-disk size.
 
 ---
 
@@ -654,23 +671,26 @@ The components above were each designed with one shared goal: surviving a crash 
 
 | Scenario | Protection |
 |---|---|
-| Process crash after `put()` | WAL is fsynced on every append; recovery replays the WAL on startup |
+| Process crash after `put()` | `put()` returns only once a WAL fsync covers its entry; recovery replays the WAL on startup |
 | Crash after `put()` returns, before in-memory apply | The op is durable in the WAL and replayed on next startup |
 | Crash mid-GC (value-log) | Nothing to repair: GC only unlinks a segment *after* the re-point is flushed to L0, so the durable LSM always points at a segment that still exists |
 | Corrupt metadata file | CRC32 mismatch is detected; the file is recovered or the error reported |
-| Crash between L0 flush and WAL mark-Persisted | WAL entries remain `Inserted` and are replayed on next open |
+| Lost or unreadable WAL metadata | The cut is unknown. With no L1 data yet (a new database, or a crash during its first flushes), the whole log is replayed and the damaged file kept as `wal/metadata.corrupt`. With L1 data, open fails: a replayed put could bring back a key deleted since, whose tombstone L1 compaction dropped. Restore `wal/metadata`; or, if every write is flushed, remove the `wal` directory (writes not yet in an SSTable are then lost) |
+| Damaged WAL segment (not the torn tail) | Open fails with a corruption error naming the segment and byte; nothing is cut or deleted. Restore the database from a backup |
+| Crash between writing L0 files and saving the WAL's progress | The files are not registered yet; the saved progress still covers those entries, so they are replayed on next open |
 | Recovery apply failure (transient error) | Each entry is retried once; persistent failures are written to a timestamped fail-log |
 
 **Startup recovery** runs these steps in order, reconstructing in-memory state from what's on disk and then replaying anything the WAL still holds:
 
 1. Load the namespace registry.
-2. Load WAL metadata and scan all WAL segments.
+2. Load the WAL metadata (the cut, each namespace's safe offset, and the sequence high-water mark), then open the WAL from its cut: check every segment from there on, find the tail (zeroing a torn one), and read each entry's sequence number. Segments below the cut are not read; the head is the oldest segment on disk. If the saved progress names positions past what survived a power loss, new writes start in a new segment, above all of them.
 3. Load the LSM manifest and reopen the L0/L1 SSTables.
 4. Open each bucket's value-log segments: reconcile the segment files on disk against the recorded inventory, and seed the segment-id allocator from `max(persisted high-water mark, highest existing id + 1)` so an id is never reused. A bucket whose metadata was lost has its live/garbage accounting recomputed exactly from the LSM's pointers.
 5. Replay the vector index WAL: every record at or above its namespace's safe offset, with its original seq. Then flush the namespaces it replayed into and record them as retired, before anything below can compact (see [Vector index WAL](#vector-index-wal)).
-6. Replay the WAL entries that aren't yet `Persisted`:
+6. Replay the WAL entries at or above their namespace's safe offset (or the cut):
    - Sort all eligible entries by sequence number and apply them in that one global order — so writes to the same key resolve to whichever was written last — retrying each once on failure.
-   - Any entry that fails both attempts is written to `fail_logs/<timestamp>.json` and marked `Persisted`, so WAL GC can still make progress.
+   - Any entry that fails both attempts is written to `fail_logs/<timestamp>.json`.
+   - Flush the replayed namespaces, then retire the whole log (cut = tail), so WAL GC can make progress.
 7. Spawn the background workers (GC, LSM compaction, WAL GC, TTL).
 
 There is deliberately **no value-log GC recovery step**. GC unlinks a segment only after its re-point is durable, so a crash can leave dead weight (a segment nothing points at) or an orphan, but never a dangling pointer — and the next GC pass reclaims both.
@@ -710,10 +730,12 @@ The knobs that most affect engine behaviour:
 | Key | Effect |
 |---|---|
 | `sharding.num_buckets` | Value-log / L1 shard count. **Fixed at creation** — it cannot change once data exists. |
+| `wal.segment_size_bytes` | Size each new WAL segment is created at (default 64 MiB; ≥ 64 KiB, ≤ 4 GiB). A record must fit one segment. **Not** fixed at creation — positions do not encode it. |
 | `value_log.segment_size_bytes` | Size at which a value-log segment is sealed (default 256 MiB; multiple of 4096, ≥ 64 KiB, ≤ 4 GiB). Bigger segments mean fewer files but coarser GC. **Not** fixed at creation — the size is not encoded in any pointer. |
 | `memtable.max_capacity` | SkipList entry limit before a flush is triggered. |
 | `lsm.compaction_threshold_percent` | How full the memtable gets before it is sealed and flushed. |
-| `sync.records_per_sync` | Value-log `fsync` cadence. The WAL is `fsync`ed on **every** write regardless. |
+| `sync.records_per_sync` | Value-log `fsync` cadence. Every write still returns only once a WAL `fsync` covers it. |
+| `sync.commit_delay_us` | Main-WAL commit delay in µs (default 0): before a commit round's fsync, its leader waits this long for more writers, only when others are already waiting. Measured: no gain at 1 ms, slower beyond. |
 | `thresholds.value_log_waste_threshold` | Waste ratio at which value-log GC **triggers** on a bucket. |
 | `thresholds.segment_gc_threshold` | Garbage ratio at which GC rewrites an individual **sealed segment** (default 10%). Keep it below the trigger: a segment under this threshold is left in place *with its garbage intact*, so setting the two equal makes garbage just under the trigger uncollectable. |
 | `recovery.fail_log_dir` | Where recovery fail-log JSON files are written (defaults to `<db_path>/fail_logs`). |
@@ -751,20 +773,20 @@ In short: on Apple Silicon, key comparison, field-index queries, and vector sear
 
 ### Expected throughput
 
-These are ballpark figures; treat them as orders of magnitude rather than guarantees. Only the *value log's* fsync cadence is configurable (`records_per_sync`). The WAL is fsynced on every write, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so write throughput is set by the drive's fsync latency, and no setting raises it.
+These are ballpark figures; treat them as orders of magnitude rather than guarantees. Only the *value log's* fsync cadence is configurable (`records_per_sync`). Every write waits for a WAL fsync, by design (see [Write-Ahead Log (WAL)](#write-ahead-log-wal)), so one writer's throughput is set by the drive's fsync latency. Concurrent writers share each fsync, so together they write faster than one.
 
 | Operation | Approximate throughput |
 |---|---|
-| `put` (small values) | ~400–500 ops/s on an NVMe drive without power-loss protection. This is the limit for the whole database, not per writer: writes fsync one at a time under the WAL lock. |
-| `delete` | ~400–500 ops/s — same fsync bound as `put` |
-| `merge` (small values) | ~400–500 ops/s — the read-modify-write and its per-key lock add ~0.5–0.7 µs, which is 0.03% of the fsync it pays anyway |
+| `put` (small values) | ~1,350 ops/s for one writer on an NVMe drive without power-loss protection (0.73–0.75 ms each for 128 B–8 KiB values, measured on zero-filled WAL segments): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
+| `delete` | ~1,350 ops/s for one writer — same fsync bound as `put` |
+| `merge` (small values) | ~1,350 ops/s for one writer — the read-modify-write and its per-key lock add ~0.5–0.7 µs, small next to the fsync it pays anyway |
 | `get` from memory | 1M–2.5M ops/s per thread |
 | `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
 | Range / prefix scan | Proportional to the number of results |
 
 Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs about 3,000 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
 
-**Every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
+**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
 
 ---
 

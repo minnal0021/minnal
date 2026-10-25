@@ -2599,7 +2599,7 @@ mod vector_upsert_tests {
         );
         assert_eq!(after.no_wal_puts - before.no_wal_puts, 0, "nothing takes the unlogged no-WAL path");
         assert_eq!(after.puts - before.puts, 1, "only the meta takes the WAL-backed put path");
-        assert_eq!(after.wal_fsyncs - before.wal_fsyncs, 1, "only the meta may add a main-WAL fsync");
+        assert_eq!(after.wal_writes - before.wal_writes, 1, "only the meta may add a main-WAL fsync");
         assert_eq!(after.vector_wal_fsyncs - before.vector_wal_fsyncs, 0, "logging does not fsync");
         for name in &vector_namespaces {
             assert!(

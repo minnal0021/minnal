@@ -25,6 +25,12 @@ pub enum KVError {
     VectorIndexWal(#[from] VectorIndexWalError),
     #[error("Database is closed")]
     DatabaseClosed,
+    /// The main WAL has stopped accepting writes until the database is
+    /// reopened, because what is on disk may no longer match what it reports
+    /// (a failed save of its retirement progress could not be rolled back).
+    /// Reopening runs recovery, which rebuilds the truth from the log and L0.
+    #[error("the WAL is stopped until the database is reopened: {0}")]
+    WalPoisoned(String),
     #[error("write too large: {0}")]
     WriteTooLarge(String),
     /// A [`merge`](crate::Db::merge) was committed to the WAL but could not be

@@ -1382,6 +1382,27 @@ impl LSMTree {
             .map_err(LSMError::Io)
     }
 
+    /// Whether the tree at `base_path` holds any L1 data, without opening it:
+    /// a non-empty `level1_{bucket}.dat`. L1 is where compaction drops
+    /// tombstones, so it is what a full WAL replay could contradict.
+    pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
+        let dir = Self::level1_dir_from(base_path);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("level1_") && name.ends_with(".dat") && entry.metadata()?.len() > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Level 1 directory path under base path
     fn level1_dir_from(base_path: &Path) -> PathBuf {
         base_path.join("level1")

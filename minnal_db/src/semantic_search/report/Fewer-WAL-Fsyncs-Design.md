@@ -1,7 +1,10 @@
 # Fewer main-WAL fsyncs per indexed document — design note
 
 **Status:** 2026-10-24. Part 1 is built (`5335516`). Part 2 is built as §8
-(§10 was considered and set aside); decisions in §13.
+(§10 was considered and set aside); decisions in §13. The measurements here
+were taken with the main WAL fsyncing one write at a time; it now uses group
+commit and preallocated segments (`minnal_db/docs/Main-WAL-Rework-Design.md`),
+which changes the fsync arithmetic in §1 and §14.
 **Scope:** two writes the vector side makes durable one fsync at a time, on the
 lock every client write waits for: the embed worker's queue removal (Part 1)
 and partition maintenance's per-document writes (Part 2). Nothing here changes
@@ -17,10 +20,11 @@ The ones this note leans on most:
 **The two logs and how writes reach them**
 
 - **Main WAL** — the database's write-ahead log (`db/wal.rs`). Every ordinary
-  write appends one entry and fsyncs it before the call returns. All such writes,
-  in every namespace, take one lock (`Database::wal_metadata`) that is held
-  across the fsync, so they run one at a time: about 400 a second here, where an
-  fsync takes about 2.3 ms.
+  write appends one entry and returns only once an fsync covers it. When this
+  note's measurements were taken, every such write in every namespace held one
+  lock (`Database::wal_metadata`) across its own fsync, so they ran one at a
+  time: about 400 a second here, where an fsync took about 2.3 ms. Concurrent
+  writes now share fsyncs (group commit; `Main-WAL-Rework-Design.md`).
 - **Vector index WAL** — a second log, one per database, in
   `<db_path>/vector_index_wal/` (`db/vector_index_wal.rs`, design in
   `Vector-Index-WAL-Design.md`). It has its own lock, so client writes never
@@ -269,8 +273,8 @@ completed by `D` (no-WAL, seq `d > p`).
 |---|---|---|
 | Before `D` | `P` replays | redone (as before) |
 | After `D`, before the queue memtable flushes | `D` is lost, `P` replays | redone: the same vectors are written again |
-| During the flush, before `P` is marked persisted | `P` replays with seq `p`, `D` is in L0 with seq `d` | `D` wins by seq: entry stays gone |
-| After the flush | `P` is persisted and not replayed | entry gone |
+| During the flush, before `P` is retired | `P` replays with seq `p`, `D` is in L0 with seq `d` | `D` wins by seq: entry stays gone |
+| After the flush | `P` is retired and not replayed | entry gone |
 | A newer upsert `P2` (WAL, seq > `d`) landed, then crash, `D` lost | `P` and `P2` replay | `P2` wins: the newer text is embedded |
 | A delete wrote `Clear` `T` (WAL, seq > `d`), then crash | `T` replays | the tombstone is processed again |
 
@@ -298,7 +302,7 @@ searchable throughout.
 
 New tests for `merge_no_wal` (in `db/`):
 
-- it appends no WAL entry and costs no fsync (`wal_fsyncs` unchanged);
+- it appends no WAL entry and costs no fsync (`wal_writes` unchanged);
 - abort writes nothing and draws no seq; absent → absent writes nothing;
 - it is atomic against a concurrent `put` to the same key (as the `merge` tests);
 - `crash()` before a flush loses it; after a flush keeps it;

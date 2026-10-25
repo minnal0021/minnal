@@ -1,56 +1,80 @@
-//! Write-Ahead Log (WAL) Module
+//! The main write-ahead log: every WAL-backed `put`, `delete` and `merge`.
 //!
-//! This module implements a write-ahead log for the MinnalDB.
-//! It provides:
-//! - Operation logging (UPSERT, DELETE) with status tracking
-//! - Sequential record writing with head/tail tracking
-//! - WAL metadata management
-//! - Garbage collection of persisted entries based on status
-//! - Atomic file swapping during GC
+//! The log itself is the shared segmented log (`db/segmented_log.rs`), with
+//! magic `MWAL`: segments, checksummed frames, positions
+//! `(segment_id << 32) | byte`, preallocation, group commit, the torn-tail and
+//! corruption rules, and deleting retired segments all live there, the same as
+//! for the vector index WAL. This module adds what is the main WAL's own:
+//!
+//! - the body, an rkyv [`WalEntry`] (operation, namespace, sequence, key,
+//!   value), whose validation runs on every read;
+//! - [`WalMetadata`], the saved retirement progress (the cut and each
+//!   namespace's safe offset) that recovery and WAL GC read, kept in the log's
+//!   directory as `metadata`;
+//! - the scans recovery, field-index replay and the backstop harvest use.
+//!
+//! What is retired, and when, is decided by `WalPersistObserver` in
+//! `database.rs`.
 
-use crc32fast::Hasher;
-use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
+use crate::db::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
-use std::io::Write;
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 
+/// Errors from the main WAL: the shared log's own errors, plus encoding a
+/// [`WalEntry`] or [`WalMetadata`].
 #[derive(Error, Debug)]
 pub enum WalError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Serialization error: {0}")]
+    /// From the segmented log (I/O, corruption, an oversized entry, or a
+    /// failed fsync that stopped the WAL).
+    #[error("main WAL: {0}")]
+    Log(#[from] LogError),
+    /// An entry or the metadata could not be encoded.
+    #[error("main WAL encoding: {0}")]
     Serialization(String),
-    #[error("WAL corrupted")]
-    CorruptedLog,
+    /// `wal.segment_size_bytes` is out of range.
+    #[error("invalid WAL segment size {0} bytes: must be at least {MIN_CONFIGURED_SEGMENT_SIZE} and at most {max}", max = u32::MAX)]
+    InvalidSegmentSize(u64),
+}
+
+impl From<std::io::Error> for WalError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Log(LogError::Io(e))
+    }
+}
+
+impl WalError {
+    /// Why the WAL stopped, if this is the error a stopped WAL returns.
+    pub fn poisoned(&self) -> Option<&str> {
+        match self {
+            Self::Log(LogError::Poisoned(why)) => Some(why),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
-/// Default WAL segment size (64 MiB). Also the size every pre-marker ("legacy")
-/// WAL was created at, so it is the fallback when no creation-time size is
-/// recorded — see `Database::resolve_wal_segment_size`.
-pub(crate) const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+/// This log's segments: magic `MWAL`, version 1 (bump it whenever
+/// [`WalEntry`]'s archived layout changes).
+pub(crate) static FORMAT: LogFormat = LogFormat {
+    name: "main WAL",
+    magic: *b"MWAL",
+    version: 1,
+};
 
-/// Floor for a WAL segment size. Matches the guard in
-/// [`Wal::open_with_options_and_segment_size`].
-pub(crate) const MIN_SEGMENT_SIZE: u64 = 256;
-const WAL_METADATA_MAGIC: [u8; 4] = *b"WALM";
-const WAL_METADATA_VERSION: u32 = 1;
+/// Default WAL segment size (64 MiB).
+pub const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Status of a WAL entry
-#[derive(Debug, Clone, Copy, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq)]
-pub enum WalEntryStatus {
-    /// Entry just written to WAL, not yet persisted to LSM or value store
-    Inserted,
-    /// Entry has been persisted to LSM and value store, safe to garbage collect
-    Persisted,
-}
+/// Smallest segment size a configuration may ask for (64 KiB, as the value
+/// log). A record must fit one segment, so a tiny segment would refuse writes.
+pub const MIN_CONFIGURED_SEGMENT_SIZE: u64 = 64 * 1024;
+
+/// The metadata file, in the log's directory.
+pub(crate) const METADATA_FILE: &str = "metadata";
 
 /// Operation type for WAL entries
 #[derive(Debug, Clone, Copy, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -59,21 +83,20 @@ pub enum WalOperationType {
     Delete,
 }
 
-/// A single WAL entry containing the operation, data, and status.
+/// A single WAL entry containing the operation and its data.
 ///
 /// The `namespace_id` identifies which KV store namespace this entry belongs to.
 /// The default namespace always has ID `0`.
 ///
 /// `sequence` is a global monotonic counter assigned at write time. Recovery
 /// replays entries in sequence order so the last writer to a key wins, exactly
-/// as it did live (see [`Wal::recover_sequence`]).
+/// as it did live.
 ///
 /// `op_name` is a caller-supplied label (e.g. `"document_write"`) that appears
 /// in the fail log when an entry cannot be applied after recovery retry.
 /// Empty string for unnamed writes.
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct WalEntry {
-    pub status: WalEntryStatus,
     pub operation: WalOperationType,
     pub namespace_id: u32,
     /// Global monotonic sequence number assigned at write time.
@@ -95,7 +118,6 @@ impl WalEntry {
 
     pub fn new_upsert_ns(namespace_id: u32, key: Vec<u8>, value: Vec<u8>) -> Self {
         Self {
-            status: WalEntryStatus::Inserted,
             operation: WalOperationType::Upsert,
             namespace_id,
             sequence: 0,
@@ -107,7 +129,6 @@ impl WalEntry {
 
     pub fn new_delete_ns(namespace_id: u32, key: Vec<u8>) -> Self {
         Self {
-            status: WalEntryStatus::Inserted,
             operation: WalOperationType::Delete,
             namespace_id,
             sequence: 0,
@@ -123,11 +144,6 @@ impl WalEntry {
         self
     }
 
-    pub fn with_status(mut self, status: WalEntryStatus) -> Self {
-        self.status = status;
-        self
-    }
-
     /// Set the operation name on this entry (used in fail-log output).
     pub fn with_op_name(mut self, name: impl Into<String>) -> Self {
         self.op_name = name.into();
@@ -136,21 +152,14 @@ impl WalEntry {
 
     /// Serialize the entry to bytes
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| WalError::Serialization(format!("Failed to serialize WAL entry: {}", e)))
-            .map(|buf| buf.to_vec())
+        self.archive().map(|buf| buf.to_vec())
     }
 
-    /// Read only the status field without copying key/value bytes.
-    ///
-    /// Used to filter entries before deciding whether full deserialization is needed.
-    pub fn peek_status(bytes: &[u8]) -> Result<WalEntryStatus> {
-        let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
-            .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
-        Ok(match archived.status {
-            ArchivedWalEntryStatus::Inserted => WalEntryStatus::Inserted,
-            ArchivedWalEntryStatus::Persisted => WalEntryStatus::Persisted,
-        })
+    /// The serialized entry in rkyv's own buffer, for the append path, which
+    /// copies it straight into the frame (one copy fewer than
+    /// [`to_bytes`](Self::to_bytes), under the WAL lock).
+    fn archive(&self) -> Result<impl std::ops::Deref<Target = [u8]>> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| WalError::Serialization(format!("Failed to serialize WAL entry: {}", e)))
     }
 
     /// Read only the namespace id and key, copying the key but never the value.
@@ -165,15 +174,17 @@ impl WalEntry {
         Ok((archived.namespace_id.into(), archived.key.to_vec()))
     }
 
+    /// Read only the sequence, copying nothing (`Wal::recover_sequence`).
+    fn peek_sequence(bytes: &[u8]) -> Result<u64> {
+        let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
+            .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
+        Ok(archived.sequence.to_native())
+    }
+
     /// Deserialize entry from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
             .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
-
-        let status = match archived.status {
-            ArchivedWalEntryStatus::Inserted => WalEntryStatus::Inserted,
-            ArchivedWalEntryStatus::Persisted => WalEntryStatus::Persisted,
-        };
 
         let operation = match archived.operation {
             ArchivedWalOperationType::Upsert => WalOperationType::Upsert,
@@ -181,7 +192,6 @@ impl WalEntry {
         };
 
         Ok(WalEntry {
-            status,
             operation,
             namespace_id: archived.namespace_id.into(),
             sequence: archived.sequence.to_native(),
@@ -192,17 +202,16 @@ impl WalEntry {
     }
 }
 
-/// Pointer to a WAL entry with status information
+/// Pointer to a WAL entry: where its frame starts and its body length.
 #[derive(Debug, Clone, Copy, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct WalPointer {
     pub offset: u64,
     pub size: u32,
-    pub status: WalEntryStatus,
 }
 
 impl WalPointer {
-    pub fn new(offset: u64, size: u32, status: WalEntryStatus) -> Self {
-        Self { offset, size, status }
+    pub fn new(offset: u64, size: u32) -> Self {
+        Self { offset, size }
     }
 
     /// Serialize the pointer to bytes
@@ -217,40 +226,55 @@ impl WalPointer {
         let archived = rkyv::access::<ArchivedWalPointer, rkyv::rancor::Error>(bytes)
             .map_err(|e| WalError::Serialization(format!("WAL pointer validation failed: {}", e)))?;
 
-        let status = match archived.status {
-            ArchivedWalEntryStatus::Inserted => WalEntryStatus::Inserted,
-            ArchivedWalEntryStatus::Persisted => WalEntryStatus::Persisted,
-        };
-
         Ok(WalPointer {
             offset: archived.offset.to_native(),
             size: archived.size.to_native(),
-            status,
         })
     }
 }
 
-/// Metadata for tracking WAL state
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+/// The main WAL's state in memory, and what its metadata file saves.
+///
+/// The file (`wal/metadata`) holds the **retirement progress** — the cut and
+/// each namespace's safe offset, in the shared progress-file format
+/// (`segmented_log::ProgressFile`, magic `WALM`) — plus the WAL GC counters
+/// and the sequence high-water mark. Recovery replays an entry only if it lies
+/// at or above its namespace's [`replay_from`](Self::replay_from), and WAL GC
+/// deletes segments wholly below [`cut`](Self::cut). It is saved by the flush
+/// that moves it, before that flush's L0 files are registered (see
+/// `WalPersistObserver::prepare_written` in `database.rs`).
+///
+/// `head` and `tail` are not saved: open derives them from the log (the oldest
+/// segment on disk, and the end of its valid frames).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WalMetadata {
-    pub head: u64,              // Offset where GC starts
-    pub tail: u64,              // Offset where new writes go
-    pub total_entries: u64,     // Total entries written
-    pub persisted_entries: u64, // Entries persisted to LSM
-    /// Absolute segment id that `segment_*_entries[0]` refers to. Counters for
-    /// segments below this have been reclaimed and trimmed, so the per-segment
-    /// vecs stay proportional to the live segment window rather than growing
-    /// with every segment ever created. Maintained equal to `head`'s segment.
-    pub base_segment_id: u64,
-    pub segment_total_entries: Vec<u64>,
-    pub segment_persisted_entries: Vec<u64>,
-    pub total_gc_runs: u64,         // Number of GC operations
-    pub total_bytes_reclaimed: u64, // Total bytes freed by GC
-    /// High-water mark for the global sequence number. Updated before any WAL
-    /// segment is deleted during GC so that recovery never misses the max
-    /// sequence even if the segment is gone.
+    /// The first record of the oldest segment on disk (WAL GC moves it).
+    /// Derived at open, not saved.
+    pub head: u64,
+    /// Where new writes go: the log's own tail, mirrored here under the WAL
+    /// lock for the readers of the cut. Derived at open, not saved.
+    pub tail: u64,
+    /// Every entry below this is in an SSTable. The lowest safe offset among
+    /// namespaces with unflushed writes, capped at the oldest in-flight write.
+    pub cut: u64,
+    /// Namespaces whose safe offset is above `cut`, sorted by namespace: each
+    /// one's writes below its offset are in L0 files too.
+    pub safe: Vec<(u32, u64)>,
+    /// WAL GC passes ever run.
+    pub total_gc_runs: u64,
+    /// Bytes of segment files ever deleted by WAL GC.
+    pub total_bytes_reclaimed: u64,
+    /// High-water mark for the global sequence number, updated on every save.
+    /// Open reads the log only from the cut, so this is what covers the
+    /// sequences of entries below it (their SSTables cover them too).
     pub last_sequence: u64,
 }
+
+/// The metadata file: the shared progress format, magic `WALM`.
+const METADATA_FORMAT: segmented_log::ProgressFile = segmented_log::ProgressFile { magic: *b"WALM" };
+/// The metadata file's extra bytes: `total_gc_runs`, `total_bytes_reclaimed`,
+/// `last_sequence`.
+const METADATA_EXTRA_LEN: usize = 24;
 
 impl Default for WalMetadata {
     fn default() -> Self {
@@ -259,698 +283,309 @@ impl Default for WalMetadata {
 }
 
 impl WalMetadata {
+    /// A log with nothing written and nothing retired: the head, the tail and
+    /// the cut all at the first record's position.
     pub fn new() -> Self {
+        let first = segmented_log::segment_start(0);
         Self {
-            head: 0,
-            tail: 0,
-            total_entries: 0,
-            persisted_entries: 0,
-            base_segment_id: 0,
-            segment_total_entries: Vec::new(),
-            segment_persisted_entries: Vec::new(),
+            head: first,
+            tail: first,
+            cut: first,
+            safe: Vec::new(),
             total_gc_runs: 0,
             total_bytes_reclaimed: 0,
             last_sequence: 0,
         }
     }
 
-    // ── Per-segment counters (addressed by absolute segment id) ──────────
-    //
-    // The dense `segment_*_entries` vecs start at `base_segment_id`, so all of
-    // these translate an absolute segment id to the relative slot. Segments
-    // below the base were reclaimed and trimmed; reads there return 0 and writes
-    // are ignored (you never write to an already-reclaimed segment).
-
-    #[inline]
-    fn segment_index(&self, segment_id: u64) -> Option<usize> {
-        segment_id.checked_sub(self.base_segment_id).map(|i| i as usize)
-    }
-
-    /// Entries recorded for `segment_id` (0 if trimmed/untracked).
-    pub fn segment_total(&self, segment_id: u64) -> u64 {
-        self.segment_index(segment_id)
-            .and_then(|i| self.segment_total_entries.get(i).copied())
-            .unwrap_or(0)
-    }
-
-    /// Persisted entries recorded for `segment_id` (0 if trimmed/untracked).
-    pub fn segment_persisted(&self, segment_id: u64) -> u64 {
-        self.segment_index(segment_id)
-            .and_then(|i| self.segment_persisted_entries.get(i).copied())
-            .unwrap_or(0)
-    }
-
-    /// Absolute segment ids that currently have counters (`base .. base+len`).
-    pub fn tracked_segments(&self) -> std::ops::Range<u64> {
-        self.base_segment_id..self.base_segment_id + self.segment_total_entries.len() as u64
-    }
-
-    /// Grow the dense vecs so `segment_id` is addressable; returns its relative
-    /// index, or `None` if it is below the trimmed base.
-    fn grow_to(&mut self, segment_id: u64) -> Option<usize> {
-        let idx = self.segment_index(segment_id)?;
-        while self.segment_total_entries.len() <= idx {
-            self.segment_total_entries.push(0);
-            self.segment_persisted_entries.push(0);
-        }
-        Some(idx)
-    }
-
-    pub fn add_segment_total(&mut self, segment_id: u64, n: u64) {
-        if let Some(idx) = self.grow_to(segment_id) {
-            self.segment_total_entries[idx] = self.segment_total_entries[idx].saturating_add(n);
+    /// The retirement progress alone.
+    pub(crate) fn progress(&self) -> segmented_log::Progress {
+        segmented_log::Progress {
+            cut: self.cut,
+            safe: self.safe.clone(),
         }
     }
 
-    pub fn add_segment_persisted(&mut self, segment_id: u64, n: u64) {
-        if let Some(idx) = self.grow_to(segment_id) {
-            // Clamp to the segment's total. Persisted entries are a subset of the
-            // total by construction, so this only ever fires if a caller
-            // double-counts — a defensive floor against the class of bug where an
-            // over-count would push persisted past total and wedge WAL GC.
-            let total = self.segment_total_entries[idx];
-            self.segment_persisted_entries[idx] = self.segment_persisted_entries[idx].saturating_add(n).min(total);
+    /// Where replay starts for namespace `ns`: its saved safe offset, or the
+    /// cut for a namespace not listed.
+    pub fn replay_from(&self, ns: u32) -> u64 {
+        self.progress().replay_from(ns)
+    }
+
+    /// The metadata file's bytes.
+    pub fn to_file_bytes(&self) -> Vec<u8> {
+        let mut extra = Vec::with_capacity(METADATA_EXTRA_LEN);
+        extra.extend_from_slice(&self.total_gc_runs.to_le_bytes());
+        extra.extend_from_slice(&self.total_bytes_reclaimed.to_le_bytes());
+        extra.extend_from_slice(&self.last_sequence.to_le_bytes());
+        METADATA_FORMAT.encode(&self.progress(), &extra)
+    }
+
+    /// Decode and check a metadata file (see `ProgressFile::decode`); any
+    /// damage is corruption. `head` and `tail` come back at the first record's
+    /// position, for open to set from the log.
+    pub fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
+        let (progress, extra) = METADATA_FORMAT.decode(bytes)?;
+        if extra.len() != METADATA_EXTRA_LEN {
+            return Err(LogError::Corruption(format!(
+                "the WAL metadata holds {} extra bytes, expected {METADATA_EXTRA_LEN}",
+                extra.len()
+            ))
+            .into());
         }
-    }
-
-    pub fn set_segment_persisted(&mut self, segment_id: u64, value: u64) {
-        if let Some(idx) = self.grow_to(segment_id) {
-            self.segment_persisted_entries[idx] = value;
-        }
-    }
-
-    /// Zero a reclaimed segment's counters (kept as a dense hole until trimmed).
-    pub fn clear_segment(&mut self, segment_id: u64) {
-        if let Some(idx) = self.segment_index(segment_id)
-            && idx < self.segment_total_entries.len()
-        {
-            self.segment_total_entries[idx] = 0;
-            self.segment_persisted_entries[idx] = 0;
-        }
-    }
-
-    /// Make both counter vecs the same length (defensive reconciliation).
-    pub fn reconcile_segment_lengths(&mut self) {
-        let n = self.segment_total_entries.len().max(self.segment_persisted_entries.len());
-        self.segment_total_entries.resize(n, 0);
-        self.segment_persisted_entries.resize(n, 0);
-    }
-
-    /// Reset all persisted counters to zero (rebuild paths recompute them).
-    pub fn reset_segment_persisted(&mut self) {
-        self.segment_persisted_entries.fill(0);
-    }
-
-    /// Drop counters for every segment below `segment_id` (reclaimed), bumping
-    /// the base so the dense vecs track only the live segment window instead of
-    /// growing with every segment ever created.
-    pub fn trim_segments_before(&mut self, segment_id: u64) {
-        let Some(drop) = self.segment_index(segment_id) else {
-            return;
-        };
-        let drop = drop.min(self.segment_total_entries.len());
-        if drop == 0 {
-            return;
-        }
-        self.segment_total_entries.drain(0..drop);
-        self.segment_persisted_entries.drain(0..drop);
-        self.base_segment_id += drop as u64;
-    }
-
-    /// Serialize metadata to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| WalError::Serialization(format!("Failed to serialize WAL metadata: {}", e)))
-            .map(|buf| buf.to_vec())
-    }
-
-    /// Deserialize metadata from bytes
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let min_size = std::mem::size_of::<ArchivedWalMetadata>();
-        if bytes.len() < min_size {
-            return Err(WalError::Serialization(format!("WAL metadata too small: {} < {}", bytes.len(), min_size)));
-        }
-        let archived = rkyv::access::<ArchivedWalMetadata, rkyv::rancor::Error>(bytes)
-            .map_err(|e| WalError::Serialization(format!("WAL metadata validation failed: {}", e)))?;
-        let segment_total_entries: Vec<u64> = archived.segment_total_entries.iter().map(|v| v.to_native()).collect();
-        let segment_persisted_entries: Vec<u64> = archived.segment_persisted_entries.iter().map(|v| v.to_native()).collect();
-        Ok(WalMetadata {
-            head: archived.head.to_native(),
-            tail: archived.tail.to_native(),
-            total_entries: archived.total_entries.to_native(),
-            persisted_entries: archived.persisted_entries.to_native(),
-            base_segment_id: archived.base_segment_id.to_native(),
-            segment_total_entries,
-            segment_persisted_entries,
-            total_gc_runs: archived.total_gc_runs.to_native(),
-            total_bytes_reclaimed: archived.total_bytes_reclaimed.to_native(),
-            last_sequence: archived.last_sequence.to_native(),
+        let word = |i: usize| u64::from_le_bytes(extra[i * 8..i * 8 + 8].try_into().unwrap());
+        Ok(Self {
+            cut: progress.cut,
+            safe: progress.safe,
+            total_gc_runs: word(0),
+            total_bytes_reclaimed: word(1),
+            last_sequence: word(2),
+            ..Self::new()
         })
     }
-
-    pub fn to_file_bytes(&self) -> Result<Vec<u8>> {
-        let payload = self.to_bytes()?;
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        let checksum = hasher.finalize();
-
-        let mut out = Vec::with_capacity(16 + payload.len());
-        out.extend_from_slice(&WAL_METADATA_MAGIC);
-        out.extend_from_slice(&WAL_METADATA_VERSION.to_le_bytes());
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
-    }
-
-    pub fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() >= 16 && bytes.get(0..4) == Some(&WAL_METADATA_MAGIC) {
-            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            if version != WAL_METADATA_VERSION {
-                return Err(WalError::Serialization(format!("Unsupported WAL metadata version: {}", version)));
-            }
-            let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-            let payload_end = 16usize.saturating_add(payload_len);
-            if bytes.len() < payload_end {
-                return Err(WalError::Serialization(format!(
-                    "WAL metadata payload truncated: {} < {}",
-                    bytes.len(),
-                    payload_end
-                )));
-            }
-            let payload = &bytes[16..payload_end];
-            let mut hasher = Hasher::new();
-            hasher.update(payload);
-            let actual = hasher.finalize();
-            if actual != checksum {
-                return Err(WalError::Serialization("WAL metadata checksum mismatch".to_string()));
-            }
-            return Self::from_bytes(payload);
-        }
-
-        Self::from_bytes(bytes)
-    }
 }
 
-#[derive(Debug)]
-struct WalHandle {
-    file: Arc<File>,
+/// The main WAL's state for operators, from [`Db::wal_stats`](crate::Db::wal_stats).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalStats {
+    /// The first record still on disk; segments below it were reclaimed.
+    pub head: LogPosition,
+    /// Where the next record goes.
+    pub tail: LogPosition,
+    /// Everything below it is fsynced.
+    pub durable_tail: LogPosition,
+    /// Every entry below this is in an SSTable; WAL GC reclaims segments
+    /// wholly below it.
+    pub cut: LogPosition,
+    /// Bytes of entries recovery would replay: from the cut to the tail.
+    pub pending_bytes: u64,
+    pub segment_size: u64,
+    /// Namespaces whose writes are in L0 further than the cut: recovery skips
+    /// their entries below `safe_offset`.
+    pub namespaces_ahead_of_cut: Vec<WalNamespaceProgress>,
+    /// Namespaces with writes not yet in an SSTable; the slowest of them
+    /// holds the cut.
+    pub namespaces_holding_cut: Vec<String>,
+    pub total_gc_runs: u64,
+    pub total_bytes_reclaimed: u64,
+    /// Highest write sequence handed out as of the last metadata save.
+    pub last_sequence: u64,
+    /// Every segment file on disk, oldest first.
+    pub segments: Vec<WalSegmentState>,
+    /// Set after a failed fsync, with its error: the WAL refuses writes until
+    /// the database is reopened. `None` while it works.
+    pub stopped: Option<String>,
 }
 
-impl WalHandle {
-    fn new(file: Arc<File>) -> Self {
-        Self { file }
-    }
+/// One namespace's saved progress, in [`WalStats`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalNamespaceProgress {
+    pub namespace: String,
+    pub safe_offset: LogPosition,
 }
 
-/// Write-Ahead Log Manager
-///
-/// Handles WAL file operations with head/tail tracking
+/// One WAL segment, in [`WalStats`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalSegmentState {
+    pub segment_id: u64,
+    /// Bytes of the segment file (segments are preallocated, so this is the
+    /// segment size it was created at, whatever it holds).
+    pub bytes: u64,
+    /// Wholly below the cut: nothing in it is replayed, and WAL GC may
+    /// delete it (unless a field index still needs it).
+    pub retired: bool,
+    /// Bytes of this segment recovery would replay.
+    pub pending_bytes: u64,
+}
+
+/// What [`Wal::open`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalOpenReport {
+    /// Position of the next append.
+    pub tail: u64,
+    /// Highest sequence of any entry at or above the cut (0 if none).
+    pub max_sequence: u64,
+    /// See `segmented_log::OpenReport::torn_bytes_dropped`.
+    pub torn_bytes_dropped: u64,
+}
+
+/// The main WAL: the shared segmented log, holding [`WalEntry`] bodies.
 pub struct Wal {
-    // WAL file handle stored behind an epoch/RCU atomic for lock-free swaps
-    handle: Atomic<WalHandle>,
-
-    // Path to the WAL file
-    path: PathBuf,
-
-    segment_size: u64,
-    current_segment_id: AtomicU64,
-
-    /// Segment fsyncs issued by the deferred entry-status path. See
-    /// [`status_sync_count`](Wal::status_sync_count).
-    status_syncs: AtomicU64,
-}
-
-/// Reclaims the current [`WalHandle`], and with it the open file descriptor.
-///
-/// **A crossbeam `Atomic` does not drop its pointee.** Reclamation there is
-/// always explicit — `rotate_to_segment` and `swap_file` hand each *replaced*
-/// handle to `Guard::defer_destroy`, but the handle still installed when the
-/// `Wal` itself goes away has no such owner, so without this impl every dropped
-/// `Wal` leaked its boxed handle and leaked the file open with it. Measured
-/// before this existed: a benchmark opening one `Wal` per iteration climbed past
-/// 450,000 open descriptors in ten seconds and died on `EMFILE`.
-///
-/// The reclamation here is **immediate**, not deferred, and that distinction is
-/// the point. `defer_destroy` only runs once the global epoch advances, so a
-/// workload that opens and drops WALs in a tight loop would pile the same
-/// descriptors up as *pending* garbage and exhaust the fd limit exactly as
-/// before. Dropping in place closes the file when the `Wal` dies.
-///
-/// This is sound because `Drop::drop` takes `&mut self`: no other thread can
-/// hold a `Shared` or `&WalHandle` borrowed from this `Wal` (both borrow
-/// `&self`), and a `Wal` behind an `Arc` reaches drop only after the last
-/// reference is gone. This mirrors the `Drop` pattern in `Atomic`'s own docs.
-impl Drop for Wal {
-    fn drop(&mut self) {
-        let handle = std::mem::replace(&mut self.handle, Atomic::null());
-        // SAFETY: we hold `&mut self`, so this pointer is unreachable from any
-        // other thread and is dropped exactly once. The pointer can be null if
-        // a previous drop already took it, hence `try_into_owned`.
-        unsafe {
-            if let Some(owned) = handle.try_into_owned() {
-                drop(owned);
-            }
-        }
-    }
+    log: SegmentedLog,
 }
 
 impl Wal {
-    fn segment_id_for(&self, offset: u64) -> u64 {
-        offset / self.segment_size
+    /// Opens the log in `dir` from its saved progress (`SegmentedLog::open`:
+    /// validation, the torn tail, a new segment when the progress names
+    /// positions past the tail), reading each entry at or above the cut for
+    /// the highest sequence. An entry that passes its CRC but does not decode
+    /// is corruption.
+    pub(crate) fn open(dir: &Path, segment_size: u32, from: OpenFrom) -> Result<(Self, WalOpenReport)> {
+        let mut max_sequence = 0u64;
+        let (log, report) = SegmentedLog::open(dir, &FORMAT, segment_size, from, |at, body| -> Result<()> {
+            max_sequence = max_sequence.max(WalEntry::peek_sequence(body).map_err(|e| undecodable(at, e))?);
+            Ok(())
+        })?;
+        Ok((
+            Self { log },
+            WalOpenReport {
+                tail: report.tail,
+                max_sequence,
+                torn_bytes_dropped: report.torn_bytes_dropped,
+            },
+        ))
     }
 
-    fn segment_offset_for(&self, offset: u64) -> u64 {
-        offset % self.segment_size
+    /// A configured segment size, checked: at least
+    /// [`MIN_CONFIGURED_SEGMENT_SIZE`], at most 4 GiB (positions keep the byte
+    /// within a segment in 32 bits).
+    pub fn validate_segment_size(size: u64) -> Result<u32> {
+        match u32::try_from(size) {
+            Ok(s) if size >= MIN_CONFIGURED_SEGMENT_SIZE => Ok(s),
+            _ => Err(WalError::InvalidSegmentSize(size)),
+        }
     }
 
-    fn segment_path_for(&self, segment_id: u64) -> PathBuf {
-        if segment_id == 0 {
-            return self.path.clone();
-        }
-        let base = self.path.to_string_lossy();
-        PathBuf::from(format!("{}.seg{:06}", base, segment_id))
+    /// Where the oldest segment on disk starts: the head.
+    pub(crate) fn head(&self) -> Result<u64> {
+        Ok(segmented_log::segment_start(self.log.oldest_segment()?.unwrap_or(0)))
     }
 
-    fn open_segment_file(&self, segment_id: u64, create: bool) -> Result<File> {
-        let path = self.segment_path_for(segment_id);
-        let is_new = create && !path.exists();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if create {
-            options.create(true);
-        }
-        let file = options.open(&path)?;
-        // A new segment's *name* must be durable before any write into it is
-        // acknowledged. Every append fsyncs the file's contents, but a file's
-        // directory entry is only durable once the directory is fsynced — until
-        // then a power loss can drop the whole segment, and every write
-        // acknowledged into it since the rotation with it. One fsync per segment.
-        if is_new && let Some(dir) = path.parent() {
-            File::open(dir)?.sync_all()?;
-        }
-        Ok(file)
+    /// Open (or create) a standalone log in `dir` with no saved progress: it
+    /// is read whole. For benchmarks and tools; a database opens its WAL from
+    /// its metadata. Returns the log and its tail.
+    #[doc(hidden)]
+    pub fn open_standalone(dir: &Path, segment_size: u32) -> Result<(Self, u64)> {
+        let (wal, report) = Self::open(dir, segment_size, OpenFrom { cut: None, furthest: 0 })?;
+        Ok((wal, report.tail))
     }
 
-    fn rotate_to_segment(&self, segment_id: u64) -> Result<()> {
-        let file = self.open_segment_file(segment_id, true)?;
-        let new_handle = WalHandle::new(Arc::new(file));
-        let guard = epoch::pin();
-        let old = self.handle.swap(Owned::new(new_handle), Ordering::AcqRel, &guard);
-        self.current_segment_id.store(segment_id, Ordering::Release);
-        unsafe {
-            guard.defer_destroy(old);
-        }
+    /// Append `entry` and move `tail` past it. Not durable until a
+    /// [`commit`](Self::commit) covering it returns. The caller holds the WAL
+    /// metadata write lock, which orders sequence allocation with appends.
+    pub fn append_entry(&self, entry: &WalEntry, tail: &mut u64) -> Result<WalPointer> {
+        let body = entry.archive()?;
+        let (start, end) = self.log.append(&[&body], |_, _| {})?;
+        *tail = end;
+        Ok(WalPointer::new(start, body.len() as u32))
+    }
+
+    /// Wait until every byte below `end` is durable: **group commit**
+    /// (`SegmentedLog::commit`). `delay` (C2): a leader with others already
+    /// waiting first sleeps this long, so more writes join its round; a lone
+    /// writer never waits. Returns `true` if this caller led a round (issued
+    /// an fsync). A failed fsync poisons the log: every writer in that round,
+    /// and every later one, gets the stopped error ([`WalError::poisoned`]).
+    pub fn commit(&self, end: u64, delay: Duration) -> Result<bool> {
+        Ok(self.log.commit(end, delay)?)
+    }
+
+    /// Make everything appended so far durable (shutdown, test helpers).
+    pub fn sync(&self) -> Result<()> {
+        self.log.sync()?;
         Ok(())
     }
 
-    fn write_all_at(&self, file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
-        while !buf.is_empty() {
-            let written = file.write_at(buf, offset)?;
-            if written == 0 {
-                return Err(std::io::Error::new(ErrorKind::WriteZero, "failed to write WAL"));
-            }
-            offset += written as u64;
-            buf = &buf[written..];
-        }
-        Ok(())
+    /// Every byte below this position is fsynced.
+    pub fn durable_tail(&self) -> u64 {
+        self.log.durable()
     }
 
-    fn read_exact_at(&self, file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-        while !buf.is_empty() {
-            let read = file.read_at(buf, offset)?;
-            if read == 0 {
-                return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
-            }
-            offset += read as u64;
-            let tmp = buf;
-            buf = &mut tmp[read..];
-        }
-        Ok(())
-    }
-
-    fn load_handle<'g>(&'g self, guard: &'g Guard) -> Result<&'g WalHandle> {
-        let shared = self.handle.load(Ordering::Acquire, guard);
-        unsafe { shared.as_ref().ok_or(WalError::CorruptedLog) }
-    }
-
-    /// Open or create a WAL with optional memory-mapping
-    ///
-    /// # Arguments
-    /// * `path` - Path to the WAL file
-    /// * `use_mmap` - If true, use memory-mapped I/O on Unix systems
-    pub fn open_with_options<P: AsRef<Path>>(path: P, use_mmap: bool) -> Result<Self> {
-        Self::open_with_options_and_segment_size(path, use_mmap, DEFAULT_SEGMENT_SIZE)
-    }
-
-    pub fn open_with_options_and_segment_size<P: AsRef<Path>>(path: P, _use_mmap: bool, segment_size: u64) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let is_new = !path.exists();
-        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
-        // As in `open_segment_file`: a newly created WAL file's name must be
-        // durable before the first write into it is acknowledged.
-        if is_new && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            File::open(dir)?.sync_all()?;
-        }
-
-        let handle = WalHandle::new(Arc::new(file));
-
-        Ok(Self {
-            handle: Atomic::new(handle),
-            path,
-            segment_size: segment_size.max(MIN_SEGMENT_SIZE),
-            current_segment_id: AtomicU64::new(0),
-            status_syncs: AtomicU64::new(0),
-        })
-    }
-
-    /// Open or create a WAL with default settings
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_options(path, false)
-    }
-
-    /// Append a WAL entry at the current tail position
-    /// Returns the WalPointer for the written entry
-    ///
-    /// `sync`: when `true`, calls `fdatasync` before returning so the entry is
-    /// durable on crash.  Pass `false` for test/batch scenarios where the caller
-    /// manages durability separately.
-    pub fn append_entry(&self, entry: &WalEntry, tail: &mut u64, sync: bool) -> Result<WalPointer> {
-        let mut segment_id = self.segment_id_for(*tail);
-        let mut segment_offset = self.segment_offset_for(*tail);
-        let mut file_arc = self.current_file_arc()?;
-        let current_segment = self.current_segment_id.load(Ordering::Acquire);
-        if current_segment != segment_id {
-            self.rotate_to_segment(segment_id)?;
-            file_arc = self.current_file_arc()?;
-        }
-
-        // Serialize the entry
-        let entry_bytes = entry.to_bytes()?;
-        let size = entry_bytes.len() as u32;
-        let entry_len = 4u64 + size as u64;
-        let remaining = self.segment_size.saturating_sub(segment_offset);
-        if entry_len > remaining {
-            if remaining >= 4 {
-                self.write_all_at(&file_arc, &0u32.to_le_bytes(), segment_offset)?;
-            }
-            segment_id += 1;
-            *tail = segment_id * self.segment_size;
-            segment_offset = 0;
-            self.rotate_to_segment(segment_id)?;
-            file_arc = self.current_file_arc()?;
-        }
-
-        // Write size header (4 bytes) + serialized entry
-        self.write_all_at(&file_arc, &size.to_le_bytes(), segment_offset)?;
-        self.write_all_at(&file_arc, &entry_bytes, segment_offset + 4)?;
-        if sync {
-            file_arc.sync_data()?;
-        }
-
-        let pointer = WalPointer::new(*tail, size, entry.status);
-        *tail += 4 + size as u64;
-
-        Ok(pointer)
-    }
-
-    /// Read a WAL entry from the given pointer
-    #[allow(dead_code)]
-    pub fn read_entry(&self, pointer: WalPointer) -> Result<WalEntry> {
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard)?;
-
-        let segment_id = self.segment_id_for(pointer.offset);
-        let segment_offset = self.segment_offset_for(pointer.offset);
-        let file = if segment_id == self.current_segment_id.load(Ordering::Acquire) {
-            &*handle.file
-        } else {
-            let file = self.open_segment_file(segment_id, false)?;
-            return self.read_entry_from_file(&file, segment_offset, pointer.size);
-        };
-
-        // Read size header
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let size = u32::from_le_bytes(size_buf);
-
-        // Verify size matches pointer
-        if size != pointer.size {
-            return Err(WalError::CorruptedLog);
-        }
-
-        // Read entry bytes
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-
-        WalEntry::from_bytes(&entry_bytes)
-    }
-
-    /// Update entry status in-place (for marking as persisted)
-    /// This is efficient with memory mapping
-    pub fn update_entry_status(&self, offset: u64, new_status: WalEntryStatus) -> Result<()> {
-        self.write_entry_status(offset, new_status, true)
-    }
-
-    /// As [`update_entry_status`](Self::update_entry_status), but **without** the
-    /// per-entry fsync. The caller must follow up with
-    /// [`sync_segment`](Self::sync_segment) for every segment it touched.
-    ///
-    /// This exists because marking a range persisted is a batch operation, and
-    /// fsyncing per entry made it cost one journal commit per WAL record: a
-    /// measured **57,735 entries in 218.9 s** (3.8 ms each) on the path that
-    /// value-log GC and LSM compaction both call, freezing every writer behind it.
-    ///
-    /// Deferring the fsync is safe, and strictly safer than the alternative it
-    /// replaces. The status byte is a *hint* that lets recovery skip an entry
-    /// whose data is already in an SSTable; losing the flip in a crash only means
-    /// recovery replays an entry it did not need to, which is idempotent
-    /// (highest-sequence-wins). The dangerous direction — the flip becoming
-    /// durable *before* the data it describes — is unaffected: the flip is only
-    /// issued after the L0 flush has fsynced, and deferring a write can never
-    /// make it land earlier.
-    pub fn update_entry_status_deferred(&self, offset: u64, new_status: WalEntryStatus) -> Result<()> {
-        self.write_entry_status(offset, new_status, false)
-    }
-
-    /// Every fsync issued to make entry-status flips durable, by either path.
-    ///
-    /// The guard on the batching: a persist sweep must cost one fsync per WAL
-    /// **segment**, not one per entry. Marking 57,735 entries persisted one
-    /// fsync at a time was measured at 218.9 s, during which every writer was
-    /// blocked behind the LSM locks the sweep runs under. Counting both paths is
-    /// deliberate — a regression that reinstated the per-entry fsync *and* kept
-    /// the batch one would be invisible to a counter that only saw the batch.
+    /// Position of the next append.
     #[cfg(test)]
-    pub(crate) fn status_sync_count(&self) -> u64 {
-        self.status_syncs.load(Ordering::Relaxed)
+    pub(crate) fn tail(&self) -> u64 {
+        self.log.tail()
     }
 
-    /// fsync one segment file, making every deferred status flip in it durable.
-    pub fn sync_segment(&self, segment_id: u64) -> Result<()> {
-        self.status_syncs.fetch_add(1, Ordering::Relaxed);
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard)?;
-        if segment_id == self.current_segment_id.load(Ordering::Acquire) {
-            handle.file.sync_data()?;
-        } else {
-            match self.open_segment_file(segment_id, false) {
-                Ok(file) => file.sync_data()?,
-                // Reclaimed by WAL GC while we were writing: nothing to make
-                // durable, and its entries are gone either way.
-                Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+    /// Why the log is stopped, if it is (a failed fsync).
+    pub(crate) fn poisoned(&self) -> Option<String> {
+        self.log.poisoned()
     }
 
-    fn write_entry_status(&self, offset: u64, new_status: WalEntryStatus, sync: bool) -> Result<()> {
-        // Read the entry
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard)?;
-        let segment_id = self.segment_id_for(offset);
-        let segment_offset = self.segment_offset_for(offset);
-        let file = if segment_id == self.current_segment_id.load(Ordering::Acquire) {
-            &*handle.file
-        } else {
-            let file = self.open_segment_file(segment_id, false)?;
-            return self.update_entry_status_in_file(&file, segment_offset, new_status, sync);
-        };
-
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let size = u32::from_le_bytes(size_buf);
-
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-
-        // Deserialize, update status, and re-serialize
-        let mut entry = WalEntry::from_bytes(&entry_bytes)?;
-        entry.status = new_status;
-        let updated_bytes = entry.to_bytes()?;
-
-        if updated_bytes.len() != size as usize {
-            return Err(WalError::CorruptedLog); // Status change caused size change
-        }
-
-        // Write back
-        self.write_all_at(file, &updated_bytes, segment_offset + 4)?; // Skip size header
-        if sync {
-            self.status_syncs.fetch_add(1, Ordering::Relaxed);
-            file.sync_data()?;
-        }
-
-        Ok(())
+    /// `Err(Poisoned)` once the log has been stopped.
+    pub fn check_poisoned(&self) -> Result<()> {
+        Ok(self.log.check_poisoned()?)
     }
 
-    /// Segment ids covering `[head, tail)` whose files are **absent**.
-    ///
-    /// A caller that scans this range gets no error for a missing segment —
-    /// [`scan_entries`](Self::scan_entries) deliberately treats one as a hole and
-    /// skips it, because aborting there would stall `mark_persisted_range` and
-    /// wedge WAL GC. That is correct for the LSM recovery path (those entries are
-    /// persisted by definition, which is why GC reclaimed them) but it means any
-    /// *other* consumer replaying this range is silently handed an incomplete
-    /// result. This reports the holes so such a consumer can say so.
-    ///
-    /// Presence is checked against the filesystem rather than inferred from
-    /// `WalMetadata`'s per-segment counters, which are trimmed and zeroed on
-    /// reclamation and so cannot distinguish "deleted" from "untracked".
-    ///
-    /// Note WAL GC reclaims fully-persisted segments **out of order** (see
-    /// `Database::garbage_collect_wal`), so a hole can sit in the middle of the
-    /// range while `WalMetadata::head` is still below it — comparing an offset
-    /// against `head` alone under-reports.
-    pub fn missing_segments(&self, head: u64, tail: u64) -> Vec<u64> {
-        if tail <= head {
-            return Vec::new();
-        }
-        let first = self.segment_id_for(head);
-        let last = self.segment_id_for(tail - 1);
-        (first..=last).filter(|&id| !self.segment_path_for(id).exists()).collect()
+    /// Stop the log: every waiting and later commit fails until reopen.
+    pub(crate) fn poison(&self, why: String) -> WalError {
+        self.log.poison(why).into()
     }
 
-    /// Walk the WAL frames in `[head, tail)`, handing each frame's **global
-    /// offset** and body bytes to `extract`, and collecting what it returns.
-    ///
-    /// The single frame-parsing loop every WAL scan goes through. Keeping it in
-    /// one place matters because the loop encodes three distinct recovery
-    /// judgements that must not drift apart between callers:
-    ///
-    /// - a **missing segment** is a hole to skip, not an error. WAL GC reclaims
-    ///   fully-persisted segments out of order, so a hole can sit mid-range;
-    ///   aborting would crash recovery and stall `mark_persisted_range`, and WAL
-    ///   GC could then never reclaim past it (unbounded WAL growth);
-    /// - a **short or zero-length frame** is a torn/unwritten segment tail:
-    ///   advance to the next segment and keep going;
-    /// - a frame that **will not decode** ends the scan — `extract` returns
-    ///   `None` to say so.
-    ///
-    /// The body buffer is reused across frames, so a scan allocates once rather
-    /// than per entry.
-    fn walk_frames<T>(&self, head: u64, tail: u64, mut extract: impl FnMut(u64, &[u8]) -> Option<T>) -> Result<Vec<T>> {
-        let mut collected = Vec::new();
-        let mut offset = head;
-        let mut entry_bytes = Vec::new();
-
-        // Open segments lazily as the scan crosses into them, so a missing one
-        // can be skipped rather than aborting the whole scan. `u64::MAX` forces
-        // an open on the first iteration.
-        let mut current_file: Option<File> = None;
-        let mut current_segment_id = u64::MAX;
-
-        while offset < tail {
-            let segment_id = self.segment_id_for(offset);
-            if segment_id != current_segment_id {
-                current_segment_id = segment_id;
-                current_file = match self.open_segment_file(segment_id, false) {
-                    Ok(file) => Some(file),
-                    // A missing segment is a "hole": WAL GC deleted a
-                    // fully-persisted segment out of segment order (e.g. a
-                    // dropped namespace persisted a trailing segment while an
-                    // earlier one stayed live — see `garbage_collect_wal`).
-                    // Skip the hole and keep scanning; aborting here would crash
-                    // recovery and stall `mark_persisted_range` (so WAL GC could
-                    // never reclaim past the hole — unbounded WAL growth).
-                    Err(WalError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => return Err(e),
-                };
-            }
-
-            let Some(current_file) = current_file.as_ref() else {
-                offset = (segment_id + 1) * self.segment_size;
-                continue;
-            };
-
-            let segment_offset = self.segment_offset_for(offset);
-            let mut size_buf = [0u8; 4];
-            if self.read_exact_at(current_file, &mut size_buf, segment_offset).is_err() {
-                let next_segment = (segment_id + 1) * self.segment_size;
-                if next_segment > offset {
-                    offset = next_segment;
-                    continue;
-                }
-                break;
-            }
-            let size = u32::from_le_bytes(size_buf);
-            if size == 0 {
-                offset = (segment_id + 1) * self.segment_size;
-                continue;
-            }
-
-            entry_bytes.resize(size as usize, 0);
-            if self
-                .read_exact_at(current_file, &mut entry_bytes[..size as usize], segment_offset + 4)
-                .is_err()
-            {
-                let next_segment = (segment_id + 1) * self.segment_size;
-                if next_segment > offset {
-                    offset = next_segment;
-                    continue;
-                }
-                break;
-            }
-
-            match extract(offset, &entry_bytes[..size as usize]) {
-                Some(value) => collected.push(value),
-                None => break,
-            }
-
-            offset += 4 + size as u64;
-        }
-
-        Ok(collected)
+    /// The segment a position lies in.
+    pub fn segment_of(&self, position: u64) -> u64 {
+        segmented_log::segment_of(position)
     }
 
-    /// Scan all entries from head to tail, filtering by status
-    pub fn scan_entries(&self, head: u64, tail: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
-        self.walk_frames(head, tail, |offset, body| {
-            let entry = WalEntry::from_bytes(body).ok()?;
-            Some((WalPointer::new(offset, body.len() as u32, entry.status), entry))
+    /// The size new segments are created at.
+    pub fn segment_size(&self) -> u64 {
+        u64::from(self.log.segment_size())
+    }
+
+    /// The segment appends go to; never deleted.
+    pub(crate) fn active_segment(&self) -> u64 {
+        self.log.active_segment()
+    }
+
+    /// Bytes of entries in `[from, to)` (frames only).
+    pub(crate) fn bytes_between(&self, from: u64, to: u64) -> u64 {
+        self.log.bytes_between(from, to)
+    }
+
+    /// Every segment on disk, `(segment_id, bytes)`, oldest first.
+    pub(crate) fn segments(&self) -> Result<Vec<(u64, u64)>> {
+        Ok(self.log.segments()?)
+    }
+
+    /// Segment ids from `start`'s segment through `end`'s, inclusive, whose
+    /// files are **absent**.
+    ///
+    /// A scan below the oldest segment skips the reclaimed ones (they are
+    /// retired, below the cut), which is right for recovery but means any
+    /// *other* consumer replaying that range — a field index replaying from its
+    /// checkpoint — is handed an incomplete result. This reports the holes so
+    /// such a consumer can say so.
+    pub fn missing_segments(&self, start: u64, end: u64) -> Vec<u64> {
+        self.log.missing_segments(start, end)
+    }
+
+    /// Delete every segment below `segment_id` (never the active one), oldest
+    /// first. Returns `(segments, bytes)` deleted.
+    pub(crate) fn delete_segments_below(&self, segment_id: u64) -> Result<(u64, u64)> {
+        Ok(self.log.delete_segments_below(segment_id)?)
+    }
+
+    /// Walk the entries in `[start, end)`, handing each one's position and
+    /// body to `extract`. The one loop every scan uses.
+    fn walk<T>(&self, start: u64, end: u64, mut extract: impl FnMut(u64, &[u8]) -> Result<T>) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        self.log.for_each(start, end, |at, body| -> Result<()> {
+            out.push(extract(at, body)?);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every entry in `[start, end)`, in log order.
+    pub fn scan_entries(&self, start: u64, end: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
+        self.walk(start, end, |at, body| {
+            let entry = WalEntry::from_bytes(body).map_err(|e| undecodable(at, e))?;
+            Ok((WalPointer::new(at, body.len() as u32), entry))
         })
     }
 
-    /// Scan `[head, tail)` for `(namespace_id, key)` pairs, **without
-    /// materialising any values**.
-    ///
-    /// The key-only counterpart of [`scan_entries`](Self::scan_entries), for
-    /// callers that need to know *which documents* a WAL range covers rather
-    /// than what was written to them. `scan_entries` returns whole `WalEntry`
-    /// values, so using it for that copies every document body in the range into
-    /// memory only to discard it — a range spanning a few segments can hold tens
-    /// of thousands of documents.
-    ///
-    /// Pairs are returned in WAL order, **with duplicates**: a key written five
-    /// times appears five times. Callers wanting a work list want
+    /// `(namespace_id, key)` of every entry in `[start, end)`, **without
+    /// materialising any values**, in log order and with duplicates: a key
+    /// written five times appears five times. Callers wanting a work list want
     /// [`scan_segment_keys`](Self::scan_segment_keys), which deduplicates.
-    pub fn scan_keys_in_entries(&self, head: u64, tail: u64) -> Result<Vec<(u32, Vec<u8>)>> {
-        self.walk_frames(head, tail, |_, body| WalEntry::peek_namespace_and_key(body).ok())
+    pub fn scan_keys_in_entries(&self, start: u64, end: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+        self.walk(start, end, |at, body| {
+            WalEntry::peek_namespace_and_key(body).map_err(|e| undecodable(at, e))
+        })
     }
 
-    /// Collect the distinct `(namespace_id, key)` pairs one WAL segment holds,
-    /// **without materialising any values**.
+    /// The distinct `(namespace_id, key)` pairs one segment holds, **without
+    /// materialising any values**, in first-seen order.
     ///
     /// This is the harvest that makes row-scoped index repair possible. When the
     /// backstop forces WAL GC to reclaim a segment an active field index still
@@ -958,22 +593,24 @@ impl Wal {
     /// affected documents exist *only* in that segment — a gap record holding a
     /// WAL range and segment ids cannot name them, and once the file is unlinked
     /// they are unrecoverable. So they are harvested here, immediately before the
-    /// unlink, and recorded as a repair worklist.
+    /// unlink, and recorded as a repair worklist. Both upserts and deletes are
+    /// included — a lost *delete* leaves a stale row in the index, which is just
+    /// as wrong as a missing one.
     ///
-    /// Built on [`scan_keys_in_entries`](Self::scan_keys_in_entries), so it
-    /// shares the one frame-parsing loop and never materialises a value.
-    ///
-    /// Results are deduplicated (a key written five times in the segment needs
-    /// repairing once) and returned in first-seen order. Both upserts and deletes
-    /// are included — a lost *delete* leaves a stale row in the index, which is
-    /// just as wrong as a missing one.
-    ///
-    /// A missing segment file yields an empty result rather than an error: GC may
-    /// have already reclaimed it, and failing here would abort the whole pass.
+    /// A segment already reclaimed yields an empty result rather than an error:
+    /// failing here would abort the whole GC pass.
     pub fn scan_segment_keys(&self, segment_id: u64) -> Result<Vec<(u32, Vec<u8>)>> {
-        let start = segment_id * self.segment_size;
-        let pairs = self.scan_keys_in_entries(start, start + self.segment_size)?;
-
+        if !self
+            .missing_segments(segmented_log::segment_start(segment_id), segmented_log::segment_start(segment_id) + 1)
+            .is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        let end = self
+            .log
+            .segment_end(segment_id)
+            .unwrap_or_else(|| segmented_log::segment_start(segment_id + 1));
+        let pairs = self.scan_keys_in_entries(segmented_log::segment_start(segment_id), end)?;
         let mut seen: std::collections::HashSet<(u32, Vec<u8>)> = std::collections::HashSet::with_capacity(pairs.len());
         let mut keys = Vec::with_capacity(pairs.len());
         for pair in pairs {
@@ -985,709 +622,127 @@ impl Wal {
         Ok(keys)
     }
 
-    /// Scan only INSERTED entries from head onwards (for GC)
-    #[allow(dead_code)]
-    pub fn scan_inserted_entries(&self, head: u64, tail: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
-        let all_entries = self.scan_entries(head, tail)?;
-        Ok(all_entries
-            .into_iter()
-            .filter(|(_, entry)| entry.status == WalEntryStatus::Inserted)
-            .collect())
+    /// Test hook: while `on`, every writer reaching [`commit`](Self::commit)
+    /// waits there, its entry appended but not yet fsynced — the state a power
+    /// loss would catch it in. Turning it off releases them.
+    #[cfg(test)]
+    pub(crate) fn freeze_commits(&self, on: bool) {
+        self.log.rounds.freeze(on);
     }
 
-    /// Get the current file reference
-    #[allow(dead_code)]
-    pub fn get_file(&self) -> Arc<File> {
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard).expect("WAL handle missing");
-        Arc::clone(&handle.file)
+    /// Test hook: how many writers are waiting in a frozen commit.
+    #[cfg(test)]
+    pub(crate) fn frozen_writers(&self) -> usize {
+        self.log.rounds.frozen_callers()
     }
 
-    /// Atomically swap the file (used during GC)
-    #[allow(dead_code)]
-    pub fn swap_file(&self, new_file: Arc<File>) -> Result<Arc<File>> {
-        let new_handle = WalHandle::new(new_file);
-        let guard = epoch::pin();
-        let old = self.handle.swap(Owned::new(new_handle), Ordering::AcqRel, &guard);
-        let old_handle = unsafe { old.as_ref().ok_or(WalError::CorruptedLog)? };
-        let old_file = Arc::clone(&old_handle.file);
-        // SAFETY: old is a valid Shared pointer from the same atomic and guard.
-        unsafe {
-            guard.defer_destroy(old);
-        }
-        Ok(old_file)
+    /// Test hook for the power-loss model (`SegmentedLog::power_loss_extents`).
+    #[cfg(test)]
+    pub(crate) fn power_loss_extents(&self) -> Vec<(PathBuf, u64)> {
+        self.log.power_loss_extents()
     }
 
-    /// Flush and sync the WAL to disk
-    pub fn sync(&self) -> Result<()> {
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard)?;
-        let mut file = handle.file.try_clone()?;
-        file.flush()?;
-        file.sync_all()?;
-
-        Ok(())
+    /// Test hook: make the next fsync of the log fail.
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync(&self) {
+        self.log.fail_next_sync();
     }
 
-    /// Get the path to the WAL file
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Test hook: make every fsync take at least `delay`.
+    #[cfg(test)]
+    pub(crate) fn set_fsync_delay(&self, delay: Duration) {
+        self.log.set_fsync_delay(delay);
     }
+}
 
-    pub fn segment_size(&self) -> u64 {
-        self.segment_size
-    }
-
-    /// Recover the next sequence number to use after a restart.
-    ///
-    /// Scans all WAL entries from `head` to `tail` to find the highest
-    /// `sequence` value, then returns `max(hint, max_in_wal) + 1`.
-    ///
-    /// `hint` should be `WalMetadata::last_sequence`. It acts as a floor that
-    /// protects against the case where GC has already deleted the segments that
-    /// held the highest-sequenced entries (GC updates `last_sequence` in
-    /// metadata **before** deleting any segment, so the hint is always ≥ the
-    /// maximum sequence in surviving segments).
-    pub fn recover_sequence(&self, head: u64, tail: u64, hint: u64) -> u64 {
-        let max_in_wal = if tail > head {
-            self.scan_entries(head, tail)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, e)| e.sequence)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        hint.max(max_in_wal).saturating_add(1)
-    }
-
-    /// Reconstruct the true tail offset by scanning forward from `start` (a
-    /// known entry-aligned offset, typically the persisted `WalMetadata::tail`)
-    /// following the self-describing entry framing until the first position that
-    /// is not a complete, valid entry: EOF, a torn final append, a corrupt
-    /// entry, or segment padding with no successor segment.
-    ///
-    /// WAL entries are fsynced on every write, but `WalMetadata` (which records
-    /// the tail) is only flushed periodically — so after a crash the persisted
-    /// tail can lag the durable end of the log. This recovers the real end so
-    /// recovery does not silently ignore fsynced entries. Passing `start = 0`
-    /// reconstructs the tail wholesale when the metadata was lost or corrupt.
-    pub fn recover_tail(&self, start: u64) -> u64 {
-        let mut offset = start;
-        loop {
-            let segment_id = self.segment_id_for(offset);
-            let file = match self.open_segment_file(segment_id, false) {
-                Ok(f) => f,
-                Err(_) => break, // no such segment file → end of log
-            };
-            let segment_offset = self.segment_offset_for(offset);
-
-            // A readable size header that is non-zero begins an entry. A zero or
-            // unreadable header means end-of-segment: either an explicit padding
-            // marker, or a sub-4-byte remainder left when an entry was rotated to
-            // the next segment without room for padding. In both cases the log
-            // continues in the next segment *iff* that segment file exists —
-            // otherwise we are at the true end.
-            let mut size_buf = [0u8; 4];
-            let header_ok = self.read_exact_at(&file, &mut size_buf, segment_offset).is_ok();
-            let size = if header_ok { u32::from_le_bytes(size_buf) } else { 0 };
-
-            if !header_ok || size == 0 {
-                if self.open_segment_file(segment_id + 1, false).is_ok() {
-                    offset = (segment_id + 1) * self.segment_size;
-                    continue;
-                }
-                break; // no successor segment → true end of log
-            }
-
-            let mut entry_bytes = vec![0u8; size as usize];
-            if self.read_exact_at(&file, &mut entry_bytes, segment_offset + 4).is_err() {
-                break; // header present but body truncated → torn final append
-            }
-            if WalEntry::from_bytes(&entry_bytes).is_err() {
-                break; // body present but not a valid entry → corrupt tail
-            }
-            offset += 4 + size as u64;
-        }
-        offset
-    }
-
-    pub fn segment_id_for_offset(&self, offset: u64) -> u64 {
-        self.segment_id_for(offset)
-    }
-
-    pub fn delete_segment_file(&self, segment_id: u64) -> Result<()> {
-        let path = self.segment_path_for(segment_id);
-        match std::fs::remove_file(&path) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(WalError::Io(e)),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn read_entry_from_file(&self, file: &File, segment_offset: u64, size: u32) -> Result<WalEntry> {
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let stored_size = u32::from_le_bytes(size_buf);
-        if stored_size != size {
-            return Err(WalError::CorruptedLog);
-        }
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-        WalEntry::from_bytes(&entry_bytes)
-    }
-
-    fn update_entry_status_in_file(&self, file: &File, segment_offset: u64, new_status: WalEntryStatus, sync: bool) -> Result<()> {
-        let mut size_buf = [0u8; 4];
-        self.read_exact_at(file, &mut size_buf, segment_offset)?;
-        let size = u32::from_le_bytes(size_buf);
-        let mut entry_bytes = vec![0u8; size as usize];
-        self.read_exact_at(file, &mut entry_bytes, segment_offset + 4)?;
-        let mut entry = WalEntry::from_bytes(&entry_bytes)?;
-        entry.status = new_status;
-        let updated_bytes = entry.to_bytes()?;
-        if updated_bytes.len() != size as usize {
-            return Err(WalError::CorruptedLog);
-        }
-        self.write_all_at(file, &updated_bytes, segment_offset + 4)?;
-        if sync {
-            self.status_syncs.fetch_add(1, Ordering::Relaxed);
-            file.sync_data()?;
-        }
-        Ok(())
-    }
-
-    fn current_file_arc(&self) -> Result<Arc<File>> {
-        let guard = epoch::pin();
-        let handle = self.load_handle(&guard)?;
-        Ok(Arc::clone(&handle.file))
-    }
+/// An entry at `at` that passed its CRC but does not decode: the CRC says
+/// these are the bytes written, so this is corruption (or a layout change
+/// without a version bump), never a torn tail.
+fn undecodable(at: u64, e: WalError) -> WalError {
+    WalError::Log(LogError::Corruption(format!(
+        "the entry at {at:#x} passes its CRC but does not decode: {e}"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom};
+    use crate::db::segmented_log::{SEGMENT_HEADER_LEN, segment_start};
     use tempfile::TempDir;
 
-    /// Open descriptors this process holds on files under `dir`.
-    ///
-    /// Deliberately scoped to one directory rather than counting all of
-    /// `/proc/self/fd`: cargo runs the tests in this module concurrently in a
-    /// single process, so a process-wide count picks up whatever the other
-    /// tests happen to have open and is useless as an assertion. Linux-only
-    /// because it resolves each descriptor to a path through `/proc/self/fd`;
-    /// macOS has no readlink-able equivalent (it needs `fcntl(F_GETPATH)`), and
-    /// a leak this coarse does not need per-platform coverage to be caught.
-    #[cfg(target_os = "linux")]
-    fn open_fds_under(dir: &std::path::Path) -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .expect("/proc/self/fd should be readable")
-            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-            .filter(|target| target.starts_with(dir))
-            .count()
+    const FRESH: OpenFrom = OpenFrom { cut: None, furthest: 0 };
+
+    fn open(dir: &Path, segment_size: u32) -> Result<(Wal, WalOpenReport)> {
+        Wal::open(dir, segment_size, FRESH)
     }
 
-    /// A dropped `Wal` must close its file.
-    ///
-    /// Regression test for a descriptor leak: `Wal::handle` is a
-    /// `crossbeam_epoch::Atomic`, which does **not** drop its pointee, so before
-    /// `impl Drop for Wal` existed every dropped `Wal` leaked the open file.
-    /// Counting descriptors rather than waiting for `EMFILE` keeps this
-    /// independent of the host's `ulimit -n` — on a machine with a 524k limit
-    /// the leak needs half a million iterations to surface as a failure.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dropping_a_wal_closes_its_file_descriptor() -> Result<()> {
-        let temp = TempDir::new()?;
-        let dir = temp.path().canonicalize()?;
-
-        const CYCLES: usize = 64;
-        for i in 0..CYCLES {
-            let wal = Wal::open(dir.join(format!("wal_{i}.log")))?;
-            wal.append_entry(&WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()), &mut 0, false)?;
-            drop(wal);
+    fn append(wal: &Wal, entries: impl IntoIterator<Item = WalEntry>) -> Result<(Vec<WalPointer>, u64)> {
+        let mut tail = wal.tail();
+        let mut pointers = Vec::new();
+        for e in entries {
+            pointers.push(wal.append_entry(&e, &mut tail)?);
         }
+        wal.commit(tail, Duration::ZERO)?;
+        Ok((pointers, tail))
+    }
 
-        let still_open = open_fds_under(&dir);
-        assert_eq!(
-            still_open, 0,
-            "dropping a Wal leaked its file descriptor: {still_open} of {CYCLES} WAL files are still open after being dropped"
-        );
-        Ok(())
+    fn upserts(n: u32) -> impl Iterator<Item = WalEntry> {
+        (0..n).map(|i| WalEntry::new_upsert_ns(i % 3, format!("k{i}").into_bytes(), vec![b'x'; 40]).with_sequence(u64::from(i) + 1))
     }
 
     #[test]
     fn test_wal_entry_serialization() -> Result<()> {
         let entry = WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec());
-        assert_eq!(entry.status, WalEntryStatus::Inserted);
 
         let bytes = entry.to_bytes()?;
         let restored = WalEntry::from_bytes(&bytes)?;
 
         assert_eq!(entry.key, restored.key);
         assert_eq!(entry.value, restored.value);
-        assert_eq!(entry.status, restored.status);
         Ok(())
     }
 
     #[test]
     fn test_wal_entry_delete_serialization() -> Result<()> {
         let entry = WalEntry::new_delete(b"key1".to_vec());
-        assert_eq!(entry.status, WalEntryStatus::Inserted);
 
         let bytes = entry.to_bytes()?;
         let restored = WalEntry::from_bytes(&bytes)?;
 
         assert_eq!(entry.key, restored.key);
         assert!(restored.value.is_none());
-        assert_eq!(entry.status, restored.status);
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_entry_status_update() -> Result<()> {
-        let entry = WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec());
-        let original_status = entry.status;
-        let updated = entry.clone().with_status(WalEntryStatus::Persisted);
-
-        assert_eq!(original_status, WalEntryStatus::Inserted);
-        assert_eq!(updated.status, WalEntryStatus::Persisted);
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_metadata_serialization() -> Result<()> {
-        let metadata = WalMetadata {
-            head: 0,
-            tail: 1024,
-            total_entries: 10,
-            persisted_entries: 8,
-            base_segment_id: 0,
-            segment_total_entries: vec![5, 5],
-            segment_persisted_entries: vec![4, 4],
-            total_gc_runs: 2,
-            total_bytes_reclaimed: 256,
-            last_sequence: 0,
-        };
-
-        let bytes = metadata.to_bytes()?;
-        let restored = WalMetadata::from_bytes(&bytes)?;
-
-        assert_eq!(metadata.head, restored.head);
-        assert_eq!(metadata.tail, restored.tail);
-        assert_eq!(metadata.total_entries, restored.total_entries);
-        assert_eq!(metadata.persisted_entries, restored.persisted_entries);
-        assert_eq!(metadata.segment_total_entries, restored.segment_total_entries);
-        assert_eq!(metadata.segment_persisted_entries, restored.segment_persisted_entries);
         Ok(())
     }
 
     #[test]
     fn test_wal_metadata_file_encoding() -> Result<()> {
         let metadata = WalMetadata {
-            head: 0,
+            head: 16,
             tail: 1024,
-            total_entries: 10,
-            persisted_entries: 8,
-            base_segment_id: 0,
-            segment_total_entries: vec![5, 5],
-            segment_persisted_entries: vec![4, 4],
+            cut: 300,
+            safe: vec![(2, 500), (7, 900)],
             total_gc_runs: 2,
             total_bytes_reclaimed: 256,
-            last_sequence: 0,
+            last_sequence: 41,
         };
 
-        let file_bytes = metadata.to_file_bytes()?;
+        let file_bytes = metadata.to_file_bytes();
         let restored = WalMetadata::from_file_bytes(&file_bytes)?;
 
-        assert_eq!(metadata.head, restored.head);
-        assert_eq!(metadata.tail, restored.tail);
-        assert_eq!(metadata.total_entries, restored.total_entries);
-        assert_eq!(metadata.persisted_entries, restored.persisted_entries);
-        assert_eq!(metadata.segment_total_entries, restored.segment_total_entries);
-        assert_eq!(metadata.segment_persisted_entries, restored.segment_persisted_entries);
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_append_and_read() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entry = WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec());
-
-        let pointer = wal.append_entry(&entry, &mut tail, false)?;
-        let read_entry = wal.read_entry(pointer)?;
-
-        assert_eq!(entry.key, read_entry.key);
-        assert_eq!(entry.value, read_entry.value);
-        assert_eq!(entry.status, read_entry.status);
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_multiple_entries() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entries = vec![
-            WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec()),
-            WalEntry::new_upsert(b"key2".to_vec(), b"value2".to_vec()),
-            WalEntry::new_delete(b"key1".to_vec()),
-        ];
-
-        let mut pointers = Vec::new();
-        for entry in &entries {
-            let pointer = wal.append_entry(entry, &mut tail, false)?;
-            pointers.push(pointer);
-        }
-
-        // Verify all entries
-        for (i, pointer) in pointers.iter().enumerate() {
-            let read_entry = wal.read_entry(*pointer)?;
-            assert_eq!(entries[i].key, read_entry.key);
-            assert_eq!(entries[i].value, read_entry.value);
-            assert_eq!(entries[i].status, read_entry.status);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_scan_entries() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entries = vec![
-            WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec()),
-            WalEntry::new_upsert(b"key2".to_vec(), b"value2".to_vec()),
-            WalEntry::new_delete(b"key1".to_vec()),
-        ];
-
-        for entry in &entries {
-            wal.append_entry(entry, &mut tail, false)?;
-        }
-
-        // Scan all entries
-        let scanned = wal.scan_entries(0, tail)?;
-        assert_eq!(scanned.len(), 3);
-
-        for (i, (_pointer, entry)) in scanned.iter().enumerate() {
-            assert_eq!(entries[i].key, entry.key);
-            assert_eq!(entries[i].value, entry.value);
-            assert_eq!(entries[i].status, entry.status);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_scan_inserted_entries() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entries = vec![
-            WalEntry::new_upsert(b"key1".to_vec(), b"value1".to_vec()),
-            WalEntry::new_upsert(b"key2".to_vec(), b"value2".to_vec()),
-            WalEntry::new_delete(b"key1".to_vec()),
-        ];
-
-        for entry in &entries {
-            wal.append_entry(entry, &mut tail, false)?;
-        }
-
-        // Scan only INSERTED entries
-        let inserted = wal.scan_inserted_entries(0, tail)?;
-        assert_eq!(inserted.len(), 3); // All should be INSERTED initially
-
-        // Now mark some as persisted and scan again
-        if let Some((pointer, _)) = inserted.first() {
-            wal.update_entry_status(pointer.offset, WalEntryStatus::Persisted)?;
-        }
-
-        let inserted_after = wal.scan_inserted_entries(0, tail)?;
-        assert_eq!(inserted_after.len(), 2); // One is persisted now
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_swap_file_concurrent_reads() -> Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::thread;
-        use std::time::Duration;
-
-        fn write_entries(file: &File, entries: &[WalEntry]) -> Result<Vec<WalPointer>> {
-            let mut pointers = Vec::with_capacity(entries.len());
-            let mut offset = 0u64;
-            let mut file = file.try_clone()?;
-            file.set_len(0)?;
-            file.sync_all()?;
-
-            for entry in entries {
-                let entry_bytes = entry.to_bytes()?;
-                let size = entry_bytes.len() as u32;
-                file.seek(SeekFrom::Start(offset))?;
-                file.write_all(&size.to_le_bytes())?;
-                file.write_all(&entry_bytes)?;
-                pointers.push(WalPointer::new(offset, size, entry.status));
-                offset += 4 + size as u64;
-            }
-
-            file.sync_all()?;
-            Ok(pointers)
-        }
-
-        let temp_dir = TempDir::new()?;
-        let wal_path_a = temp_dir.path().join("wal_a.log");
-        let wal_path_b = temp_dir.path().join("wal_b.log");
-
-        let mut entries = Vec::new();
-        for i in 0..100u32 {
-            let key = format!("key_{}", i).into_bytes();
-            let value = format!("value_{}", i).into_bytes();
-            entries.push(WalEntry::new_upsert(key, value));
-        }
-
-        let file_a = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&wal_path_a)?;
-        let file_b = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&wal_path_b)?;
-        let pointers = write_entries(&file_a, &entries)?;
-        write_entries(&file_b, &entries)?;
-
-        let wal = Arc::new(Wal::open_with_options(&wal_path_a, false)?);
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader_failed = Arc::new(AtomicBool::new(false));
-
-        let reader_wal = wal.clone();
-        let reader_stop = stop.clone();
-        let reader_failed_flag = reader_failed.clone();
-        let reader_pointers = pointers.clone();
-        let reader = thread::spawn(move || {
-            while !reader_stop.load(Ordering::Relaxed) {
-                for pointer in &reader_pointers {
-                    if reader_wal.read_entry(*pointer).is_err() {
-                        reader_failed_flag.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                }
-            }
-        });
-
-        for _ in 0..200 {
-            let new_file = OpenOptions::new().read(true).write(true).open(&wal_path_b)?;
-            wal.swap_file(Arc::new(new_file))?;
-            let new_file = OpenOptions::new().read(true).write(true).open(&wal_path_a)?;
-            wal.swap_file(Arc::new(new_file))?;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-        stop.store(true, Ordering::Relaxed);
-        let _ = reader.join();
-
-        assert!(!reader_failed.load(Ordering::Relaxed));
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_segment_rotation() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("test_rotate.wal"), false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..50u32 {
-            let key = format!("k{}", i).into_bytes();
-            let value = vec![b'x'; 40];
-            wal.append_entry(&WalEntry::new_upsert(key, value), &mut tail, false)?;
-        }
-
-        let scanned = wal.scan_entries(0, tail)?;
-        assert_eq!(scanned.len(), 50);
-        Ok(())
-    }
-
-    // Regression: WAL GC can delete a fully-persisted segment out of order
-    // (leaving a "hole"), so `scan_entries` must skip a missing middle segment
-    // instead of aborting. Aborting crashed recovery and stalled the persist
-    // watermark (unbounded WAL growth). See `scan_entries`.
-    #[test]
-    fn test_scan_entries_skips_deleted_middle_segment() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("hole.wal");
-        let wal = Wal::open_with_options_and_segment_size(&path, false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..60u32 {
-            wal.append_entry(&WalEntry::new_upsert(format!("k{i}").into_bytes(), vec![b'x'; 40]), &mut tail, false)?;
-        }
-        let full = wal.scan_entries(0, tail)?;
-        assert_eq!(full.len(), 60, "baseline: full scan sees every entry");
-
-        // Punch a hole: delete a middle segment (segment 0 stays live, so head
-        // is not advanced past the hole).
-        wal.delete_segment_file(1)?;
-
-        // The scan must succeed, skipping the hole and returning the entries
-        // from the surviving segments rather than erroring.
-        let scanned = wal.scan_entries(0, tail)?;
-        assert!(!scanned.is_empty(), "scan over a hole must still return surviving entries");
-        assert!(scanned.len() < 60, "the deleted segment's entries are gone");
-        // Every surviving offset must be outside the deleted segment.
-        for (ptr, _) in &scanned {
-            assert!(
-                !(256..512).contains(&ptr.offset),
-                "entry from deleted segment leaked: offset {}",
-                ptr.offset
-            );
-        }
-        Ok(())
-    }
-
-    /// `scan_keys_in_entries` and `scan_entries` share one frame-parsing loop, so
-    /// they must always agree on which entries a range contains — including over
-    /// a hole, where the recovery judgement "a missing segment is skipped, not an
-    /// error" lives. This is what stops the two drifting apart.
-    #[test]
-    fn key_only_scan_agrees_with_the_full_scan() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("keys.wal"), false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..60u32 {
-            wal.append_entry(
-                &WalEntry::new_upsert_ns(i % 3, format!("k{i}").into_bytes(), vec![b'x'; 40]),
-                &mut tail,
-                false,
-            )?;
-        }
-
-        let expect = |wal: &Wal, tail: u64| -> Result<Vec<(u32, Vec<u8>)>> {
-            Ok(wal.scan_entries(0, tail)?.into_iter().map(|(_, e)| (e.namespace_id, e.key)).collect())
-        };
-
+        // The progress and the counters are saved; the head and the tail are
+        // not (open derives them from the log).
+        assert_eq!((restored.cut, &restored.safe), (metadata.cut, &metadata.safe));
         assert_eq!(
-            wal.scan_keys_in_entries(0, tail)?,
-            expect(&wal, tail)?,
-            "baseline: same entries, same order"
+            (restored.total_gc_runs, restored.total_bytes_reclaimed, restored.last_sequence),
+            (2, 256, 41)
         );
+        assert_eq!((restored.head, restored.tail), (segment_start(0), segment_start(0)));
 
-        // ...and over a hole, so both paths make the same skip-don't-abort call.
-        wal.delete_segment_file(1)?;
-        let keys = wal.scan_keys_in_entries(0, tail)?;
-        assert_eq!(keys, expect(&wal, tail)?, "both scans must skip the hole identically");
-        assert!(keys.len() < 60, "the deleted segment's entries are gone");
+        let mut damaged = file_bytes.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(WalMetadata::from_file_bytes(&damaged).is_err(), "a checksum mismatch must be rejected");
         Ok(())
     }
-
-    /// `scan_segment_keys` covers exactly one segment and deduplicates, since a
-    /// key written repeatedly needs repairing once. `scan_keys_in_entries` does
-    /// not deduplicate — the raw WAL order is what a caller reading a range wants.
-    #[test]
-    fn segment_key_scan_is_scoped_and_deduplicated() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("dedupe.wal"), false, 256)?;
-
-        let mut tail = 0u64;
-        // The same key rewritten many times, plus a distinct one.
-        for _ in 0..8u32 {
-            wal.append_entry(&WalEntry::new_upsert(b"hot".to_vec(), vec![b'x'; 40]), &mut tail, false)?;
-        }
-        wal.append_entry(&WalEntry::new_upsert(b"cold".to_vec(), vec![b'x'; 40]), &mut tail, false)?;
-
-        let raw = wal.scan_keys_in_entries(0, tail)?;
-        assert_eq!(raw.len(), 9, "the range scan keeps every occurrence");
-
-        // Segment 0 only, deduplicated.
-        let seg0 = wal.scan_segment_keys(0)?;
-        let distinct: Vec<Vec<u8>> = seg0.iter().map(|(_, k)| k.clone()).collect();
-        assert!(distinct.len() < 9, "repeated keys collapse to one entry each, got {distinct:?}");
-        assert_eq!(
-            distinct.iter().filter(|k| k.as_slice() == b"hot").count(),
-            1,
-            "a key written eight times must appear once"
-        );
-        // Every key came from segment 0 alone.
-        let seg0_end = 256u64;
-        let in_segment_0: Vec<(u32, Vec<u8>)> = wal.scan_keys_in_entries(0, seg0_end)?;
-        for pair in &seg0 {
-            assert!(
-                in_segment_0.contains(pair),
-                "scan_segment_keys returned {pair:?} from outside its segment"
-            );
-        }
-
-        // A reclaimed segment yields nothing rather than an error — GC may have
-        // already unlinked it, and failing would abort the whole pass.
-        wal.delete_segment_file(0)?;
-        assert!(wal.scan_segment_keys(0)?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_wal_delete_segment_file() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("test_delete_segment.wal"), false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..50u32 {
-            let key = format!("k{}", i).into_bytes();
-            let value = vec![b'x'; 40];
-            wal.append_entry(&WalEntry::new_upsert(key, value), &mut tail, false)?;
-        }
-
-        let segment_path = temp_dir.path().join("test_delete_segment.wal.seg000001");
-        assert!(segment_path.exists());
-        wal.delete_segment_file(1)?;
-        assert!(!segment_path.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_segments_reports_a_hole_in_the_middle_of_the_range() -> Result<()> {
-        // WAL GC reclaims fully-persisted segments out of *segment* order, so a
-        // hole can sit in the middle of a replay window while `head` is still
-        // below it. `scan_entries` skips such a hole silently, which is why a
-        // consumer replaying the range needs this to know its result is partial.
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("holes.wal");
-        let wal = Wal::open_with_options_and_segment_size(&path, false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..50u32 {
-            let key = format!("k{}", i).into_bytes();
-            wal.append_entry(&WalEntry::new_upsert(key, vec![b'x'; 40]), &mut tail, false)?;
-        }
-        assert!(wal.segment_id_for_offset(tail - 1) >= 3, "test needs several segments, got {tail} bytes");
-
-        assert_eq!(wal.missing_segments(0, tail), Vec::<u64>::new(), "nothing deleted yet");
-
-        // Reclaim an interior segment, leaving 0 and everything above it in place.
-        wal.delete_segment_file(1)?;
-        assert_eq!(wal.missing_segments(0, tail), vec![1]);
-
-        // A window that does not cover the hole is unaffected.
-        let seg2_start = 2 * wal.segment_size();
-        assert_eq!(wal.missing_segments(seg2_start, tail), Vec::<u64>::new());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_segments_is_empty_for_an_empty_range() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("empty.wal"), false, 256)?;
-        assert_eq!(wal.missing_segments(0, 0), Vec::<u64>::new());
-        assert_eq!(wal.missing_segments(500, 100), Vec::<u64>::new(), "tail <= head");
-        Ok(())
-    }
-
-    // ── sequence number tests ────────────────────────────────────────────
 
     #[test]
     fn test_with_sequence_sets_field() {
@@ -1700,6 +755,7 @@ mod tests {
         let entry = WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).with_sequence(999);
         let restored = WalEntry::from_bytes(&entry.to_bytes()?)?;
         assert_eq!(restored.sequence, 999);
+        assert_eq!(WalEntry::peek_sequence(&entry.to_bytes()?)?, 999);
         Ok(())
     }
 
@@ -1711,150 +767,159 @@ mod tests {
         assert_eq!(WalEntry::new_delete_ns(1, b"k".to_vec()).sequence, 0);
     }
 
+    /// Entries written across segments read back in order and in full, and a
+    /// reopen finds the tail and the highest sequence above the cut.
     #[test]
-    fn test_recover_sequence_empty_wal() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-        // No entries: result must be hint + 1 when hint > 0, else 1.
-        assert_eq!(wal.recover_sequence(0, 0, 0), 1);
-        assert_eq!(wal.recover_sequence(0, 0, 50), 51);
-        Ok(())
-    }
-
-    #[test]
-    fn test_recover_sequence_from_wal_entries() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        for seq in [3u64, 7, 1, 5] {
-            let entry = WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).with_sequence(seq);
-            wal.append_entry(&entry, &mut tail, false)?;
+    fn entries_read_back_across_segments_and_after_a_reopen() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, report) = open(dir.path(), 512)?;
+        assert_eq!(report.tail, segment_start(0));
+        let (pointers, tail) = append(&wal, upserts(60))?;
+        assert!(wal.segment_of(tail) >= 3, "setup: the entries should span segments");
+        let scanned = wal.scan_entries(segment_start(0), tail)?;
+        assert_eq!(scanned.len(), 60);
+        for (i, ((pointer, entry), expected)) in scanned.iter().zip(&pointers).enumerate() {
+            assert_eq!(pointer.offset, expected.offset);
+            assert_eq!(entry.key, format!("k{i}").into_bytes());
+            assert_eq!(entry.namespace_id, i as u32 % 3);
         }
-
-        // max sequence written is 7, so next should be 8
-        assert_eq!(wal.recover_sequence(0, tail, 0), 8);
+        drop(wal);
+        let cut = pointers[40].offset;
+        let (wal, report) = Wal::open(
+            dir.path(),
+            512,
+            OpenFrom {
+                cut: Some(cut),
+                furthest: cut,
+            },
+        )?;
+        assert_eq!(report.tail, tail);
+        assert_eq!(report.max_sequence, 60);
+        assert_eq!(wal.scan_entries(cut, tail)?.len(), 20);
         Ok(())
     }
 
+    /// A changed byte inside a value still decodes (rkyv checks structure, not
+    /// contents), so without a checksum replay would write the wrong value.
+    /// The frame's CRC catches it: in the last segment it is the torn tail,
+    /// earlier it fails the open.
     #[test]
-    fn test_recover_sequence_hint_wins_when_higher() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entry = WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).with_sequence(10);
-        wal.append_entry(&entry, &mut tail, false)?;
-
-        // hint (20) > max in WAL (10): result should be 21
-        assert_eq!(wal.recover_sequence(0, tail, 20), 21);
+    fn a_changed_byte_in_a_value_is_caught_by_the_crc() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        let (pointers, _) = append(&wal, upserts(3))?;
+        drop(wal);
+        let seg0 = segmented_log::segment_path(dir.path(), 0);
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&seg0)?;
+        let second = pointers[1];
+        let at = u64::from(segmented_log::split(second.offset).1 + segmented_log::FRAME_HEADER_LEN);
+        let mut body = vec![0u8; second.size as usize];
+        f.read_exact_at(&mut body, at)?;
+        let i = body.windows(2).position(|w| w == b"xx").expect("value bytes in the body");
+        body[i] = b'X';
+        assert!(WalEntry::from_bytes(&body).is_ok(), "setup: the changed body must still decode");
+        f.write_all_at(&body, at)?;
+        let (wal, report) = open(dir.path(), 512)?;
+        assert_eq!(report.tail, second.offset, "the tail is cut at the damaged entry");
+        assert_eq!(wal.scan_entries(segment_start(0), wal.tail())?.len(), 1);
         Ok(())
     }
 
+    /// A body that passes its CRC but does not decode as an entry is
+    /// corruption, wherever it is.
     #[test]
-    fn test_recover_sequence_wal_wins_when_higher() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("test.wal"))?;
-
-        let mut tail = 0u64;
-        let entry = WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).with_sequence(100);
-        wal.append_entry(&entry, &mut tail, false)?;
-
-        // hint (5) < max in WAL (100): result should be 101
-        assert_eq!(wal.recover_sequence(0, tail, 5), 101);
+    fn an_undecodable_entry_is_corruption() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        let mut tail = wal.tail();
+        wal.append_entry(&WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()), &mut tail)?;
+        // Not an entry, but a well-formed frame.
+        let (_, end) = wal.log.append(&[b"not an rkyv entry"], |_, _| {})?;
+        wal.commit(end, Duration::ZERO)?;
+        assert!(matches!(
+            wal.scan_entries(segment_start(0), end),
+            Err(WalError::Log(LogError::Corruption(_)))
+        ));
+        drop(wal);
+        assert!(matches!(open(dir.path(), 512), Err(WalError::Log(LogError::Corruption(_)))));
         Ok(())
     }
 
+    /// The key-only scan and the full scan agree, entry for entry, and both
+    /// skip segments GC reclaimed below the oldest one.
     #[test]
-    fn test_recover_sequence_after_segment_rotation() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        // Small segment size to force rotation
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("test_seq_rotate.wal"), false, 256)?;
+    fn key_only_scan_agrees_with_the_full_scan() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        let (_, tail) = append(&wal, upserts(60))?;
+        let expect =
+            |wal: &Wal| -> Result<Vec<(u32, Vec<u8>)>> { Ok(wal.scan_entries(0, tail)?.into_iter().map(|(_, e)| (e.namespace_id, e.key)).collect()) };
+        assert_eq!(wal.scan_keys_in_entries(0, tail)?, expect(&wal)?);
+        wal.delete_segments_below(2)?;
+        let keys = wal.scan_keys_in_entries(0, tail)?;
+        assert_eq!(keys, expect(&wal)?, "both scans must skip reclaimed segments identically");
+        assert!(keys.len() < 60, "the reclaimed segments' entries are gone");
+        assert_eq!(wal.missing_segments(0, tail), vec![0, 1]);
+        Ok(())
+    }
 
-        let mut tail = 0u64;
-        let mut max_seq = 0u64;
-        for i in 0..30u64 {
-            let seq = i * 3 + 1;
-            max_seq = seq;
-            let entry = WalEntry::new_upsert(format!("key{}", i).into_bytes(), vec![b'x'; 40]).with_sequence(seq);
-            wal.append_entry(&entry, &mut tail, false)?;
+    /// `scan_segment_keys` covers exactly one segment and deduplicates; a
+    /// reclaimed segment yields nothing rather than an error.
+    #[test]
+    fn segment_key_scan_is_scoped_and_deduplicated() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        let hot = (0..8).map(|_| WalEntry::new_upsert(b"hot".to_vec(), vec![b'x'; 40]));
+        let (_, _) = append(&wal, hot.chain([WalEntry::new_upsert(b"cold".to_vec(), vec![b'x'; 40])]))?;
+        let (_, tail) = append(&wal, upserts(20))?;
+        assert!(wal.segment_of(tail) >= 1);
+        let seg0 = wal.scan_segment_keys(0)?;
+        assert_eq!(
+            seg0.iter().filter(|(_, k)| k == b"hot").count(),
+            1,
+            "a key written eight times appears once"
+        );
+        let in_segment_0 = wal.scan_keys_in_entries(segment_start(0), segment_start(1))?;
+        for pair in &seg0 {
+            assert!(in_segment_0.contains(pair), "{pair:?} came from outside segment 0");
         }
-
-        assert_eq!(wal.recover_sequence(0, tail, 0), max_seq + 1);
+        wal.delete_segments_below(1)?;
+        assert!(wal.scan_segment_keys(0)?.is_empty());
         Ok(())
     }
 
-    // ── tail reconstruction tests ─────────────────────────────────────────
-
+    /// The segment header names the log: a vector index WAL segment in the
+    /// main WAL's directory fails the open instead of being parsed.
     #[test]
-    fn test_recover_tail_empty_wal() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("rt.wal"))?;
-        assert_eq!(wal.recover_tail(0), 0);
+    fn a_segment_from_another_log_fails_the_open() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        append(&wal, upserts(3))?;
+        drop(wal);
+        let seg0 = segmented_log::segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&seg0)?;
+        bytes[..SEGMENT_HEADER_LEN as usize].copy_from_slice(&segmented_log::header_bytes(&crate::db::vector_index_wal::FORMAT, 0));
+        std::fs::write(&seg0, bytes)?;
+        match open(dir.path(), 512) {
+            Err(WalError::Log(LogError::Corruption(why))) => assert!(why.contains("main WAL"), "{why}"),
+            other => panic!("expected corruption, got {:?}", other.map(|_| ())),
+        }
         Ok(())
     }
 
+    /// An entry too large for a segment is refused before anything is written.
     #[test]
-    fn test_recover_tail_extends_past_stale_offset() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let wal = Wal::open(temp_dir.path().join("rt.wal"))?;
-
-        let mut tail = 0u64;
-        for i in 0..2u32 {
-            wal.append_entry(&WalEntry::new_upsert(format!("k{i}").into_bytes(), b"v".to_vec()), &mut tail, false)?;
-        }
-        let stale = tail; // pretend metadata was flushed here
-        for i in 2..6u32 {
-            wal.append_entry(&WalEntry::new_upsert(format!("k{i}").into_bytes(), b"v".to_vec()), &mut tail, false)?;
-        }
-
-        // From a stale (earlier) offset, reconstruction reaches the true end.
-        assert_eq!(wal.recover_tail(stale), tail);
-        // From the start, also reaches the true end.
-        assert_eq!(wal.recover_tail(0), tail);
-        // From the true end, no extension.
-        assert_eq!(wal.recover_tail(tail), tail);
-        // The recovered region is fully scannable.
-        assert_eq!(wal.scan_entries(stale, tail)?.len(), 4);
-        Ok(())
-    }
-
-    #[test]
-    fn test_recover_tail_stops_at_torn_entry() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rt.wal");
-        let wal = Wal::open(&path)?;
-
-        let mut tail = 0u64;
-        for i in 0..3u32 {
-            wal.append_entry(&WalEntry::new_upsert(format!("k{i}").into_bytes(), b"v".to_vec()), &mut tail, false)?;
-        }
-        let good_tail = tail;
-
-        // Simulate a crash mid-append: a size header claiming 100 bytes with only
-        // 10 bytes of body following it.
-        let f = OpenOptions::new().write(true).open(&path)?;
-        f.write_at(&100u32.to_le_bytes(), good_tail)?;
-        f.write_at(&[0xABu8; 10], good_tail + 4)?;
-        f.sync_all()?;
-
-        // Reconstruction must stop at the last complete entry, ignoring the torn one.
-        assert_eq!(wal.recover_tail(0), good_tail);
-        Ok(())
-    }
-
-    #[test]
-    fn test_recover_tail_across_segment_rotation() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        // Small segments to force rotation.
-        let wal = Wal::open_with_options_and_segment_size(temp_dir.path().join("rt.wal"), false, 256)?;
-
-        let mut tail = 0u64;
-        for i in 0..40u32 {
-            wal.append_entry(&WalEntry::new_upsert(format!("k{i}").into_bytes(), vec![b'x'; 40]), &mut tail, false)?;
-        }
-        // Reconstruct from scratch across the rotated segments.
-        assert_eq!(wal.recover_tail(0), tail);
+    fn an_entry_too_large_for_a_segment_is_refused() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (wal, _) = open(dir.path(), 512)?;
+        let mut tail = wal.tail();
+        let big = WalEntry::new_upsert(b"k".to_vec(), vec![0u8; 1024]);
+        assert!(matches!(
+            wal.append_entry(&big, &mut tail),
+            Err(WalError::Log(LogError::RecordTooLarge { .. }))
+        ));
+        assert_eq!(tail, segment_start(0));
         Ok(())
     }
 }

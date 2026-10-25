@@ -4,6 +4,10 @@
 //! index still needs to replay after a crash -- without that gate the index
 //! silently loses those documents for the life of the database (FR-001).
 //!
+//! The watermark comes from the WAL observer's field consumers, kept by events
+//! (activation, each checkpoint, deactivation and drops), not from reading
+//! checkpoint markers on each tick.
+//!
 //! Three properties here are load-bearing; see `minnal_db/CLAUDE.md`:
 //! the watermark is scoped to *active* fields, the pin drains by asking the
 //! checkpoint worker rather than by waiting for its timer, and the backstop
@@ -18,7 +22,8 @@ use log::{debug, error, warn};
 use crate::db::database::Database;
 use crate::db::error::Result;
 use crate::db::namespace::FieldId;
-use crate::db::wal::WalMetadata;
+use crate::db::segmented_log::{LogPosition, segment_start};
+use crate::db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
 /// What one WAL GC pass may reclaim, after the index-replay watermark has had
 /// its say. Produced by `Database::plan_wal_gc`.
@@ -35,14 +40,69 @@ struct WalGcPlan {
 }
 
 impl Database {
-    pub fn get_wal_gc_stats(&self) -> (u64, u64) {
-        let wal_metadata = self.wal_metadata.read();
-        (wal_metadata.total_entries, wal_metadata.persisted_entries)
+    /// Bytes of WAL recovery would replay: the entries from the cut to the tail.
+    pub fn wal_pending_bytes(&self) -> u64 {
+        let m = self.wal_metadata.read();
+        self.wal.bytes_between(m.cut, m.tail)
     }
 
-    /// Returns `true` when at least one non-current WAL segment is fully persisted
-    /// and ready to be deleted.  Entries in the active segment are not yet eligible
-    /// — they will be marked persisted after the next memtable flush or clean shutdown.
+    /// The main WAL's state for operators: bounds, cut, saved per-namespace
+    /// progress, and each segment on disk.
+    pub fn wal_stats(&self) -> WalStats {
+        // Read before the metadata, so the durable tail shown is never past
+        // the tail shown (both only grow).
+        let durable_tail = self.wal.durable_tail();
+        let m = self.wal_metadata.read().clone();
+        let name = |ns: u32| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned);
+        let cut_segment = self.wal.segment_of(m.cut);
+        let segments = self
+            .wal
+            .segments()
+            .unwrap_or_else(|e| {
+                warn!("[WAL] could not list the WAL's segment files for its stats: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(id, bytes)| WalSegmentState {
+                segment_id: id,
+                bytes,
+                retired: id < cut_segment,
+                pending_bytes: if id < cut_segment {
+                    0
+                } else {
+                    self.wal.bytes_between(m.cut.max(segment_start(id)), m.tail.min(segment_start(id + 1)))
+                },
+            })
+            .collect();
+        let mut holding: Vec<String> = self.wal_flush_observer.namespaces_with_unflushed().into_iter().map(name).collect();
+        holding.sort();
+        WalStats {
+            head: LogPosition::of(m.head),
+            tail: LogPosition::of(m.tail),
+            durable_tail: LogPosition::of(durable_tail),
+            cut: LogPosition::of(m.cut),
+            pending_bytes: self.wal.bytes_between(m.cut, m.tail),
+            segment_size: self.wal.segment_size(),
+            namespaces_ahead_of_cut: m
+                .safe
+                .iter()
+                .map(|&(ns, safe_offset)| WalNamespaceProgress {
+                    namespace: name(ns),
+                    safe_offset: LogPosition::of(safe_offset),
+                })
+                .collect(),
+            namespaces_holding_cut: holding,
+            total_gc_runs: m.total_gc_runs,
+            total_bytes_reclaimed: m.total_bytes_reclaimed,
+            last_sequence: m.last_sequence,
+            segments,
+            stopped: self.wal.poisoned(),
+        }
+    }
+
+    /// Returns `true` when at least one non-current WAL segment lies wholly
+    /// below the cut and is ready to be deleted. The active segment is never
+    /// eligible.
     ///
     /// Accounts for the index-replay watermark, so the worker does not call GC
     /// every tick for segments GC would only refuse. It deliberately still
@@ -52,60 +112,52 @@ impl Database {
     pub fn has_deletable_wal_segments(&self) -> bool {
         let watermark = self.index_replay_watermark_segment();
         let wal_metadata = self.wal_metadata.read();
-        if wal_metadata.tail == 0 {
-            return false;
-        }
-        let current = self.wal.segment_id_for_offset(wal_metadata.tail - 1);
-        let plan = self.plan_wal_gc(&wal_metadata, current, watermark);
+        let plan = self.plan_wal_gc(&wal_metadata, self.wal.active_segment(), watermark);
         !plan.reclaim.is_empty()
     }
 
-    /// The oldest WAL segment any **currently active** field index still needs in
-    /// order to replay after a crash, or `None` when nothing is pinned.
+    /// Every field index that holds the WAL right now, with the offset it
+    /// would replay from after a crash.
     ///
-    /// `min(checkpoint offset)` over active fields, mapped to its segment. Each
-    /// field already records its replay offset in its `checkpoint` marker, so
-    /// this needs no new per-entry or per-segment state — just one marker read
-    /// per active field, on a path that runs every 60 s.
-    ///
-    /// **Scoped to active fields on purpose.** Two kinds of inactive field would
-    /// otherwise pin the WAL without bound:
-    ///
-    /// - a **dropped** field, whose marker is frozen wherever it was last
-    ///   checkpointed. Step 1 of FR-001 deletes those markers, but a field can be
-    ///   inactive without being dropped (e.g. while rebuilding) and cleanup can
-    ///   itself be interrupted, so the filter stays;
-    /// - a field **being built for the first time**, which has no marker at all
-    ///   and so reads as "replay from 0". A new index is populated by a build,
-    ///   not by replay, so it is suppressed here exactly as `detect_replay_gap`
-    ///   suppresses it — otherwise every `add_index` on an established database
-    ///   would pin the entire WAL.
-    pub(crate) fn index_replay_watermark_segment(&self) -> Option<u64> {
-        let wal_tail = self.wal_metadata.read().tail;
-        if wal_tail == 0 {
-            return None;
+    /// Read from the WAL observer's field consumers, kept by events (activation,
+    /// the *checkpointed* event, deactivation and drops), so no checkpoint marker
+    /// is read here. Only active fields are consumers: a **dropped** or
+    /// deactivated field, whose marker is frozen wherever it was last
+    /// checkpointed, would otherwise pin the WAL without bound. A field with no
+    /// checkpoint yet holds the WAL from 0 only once its index has entries: a
+    /// **first build** is populated from the stored documents, not by replay,
+    /// and is suppressed here exactly as `detect_replay_gap` suppresses it —
+    /// otherwise every `add_index` on an established database would pin the
+    /// entire WAL.
+    fn field_replay_offsets(&self) -> Vec<(u32, FieldId, u64)> {
+        let consumers = self.wal_flush_observer.field_consumers();
+        if consumers.is_empty() {
+            return Vec::new();
         }
-        let fields = self.registry.read().all_indexed_fields();
-        if fields.is_empty() {
-            return None;
-        }
-
         let stores = self.stores.read();
-        let mut watermark: Option<u64> = None;
-        for (ns_id, field_id) in fields {
-            let Some(store) = stores.get(&ns_id) else { continue };
-            let ns_index = store.namespace_index.read();
-            // Not activated → not replayed into → nothing to pin for.
-            let Some(entry) = ns_index.get(field_id) else { continue };
+        consumers
+            .into_iter()
+            .filter_map(|((ns_id, field_id), position)| match position {
+                Some(offset) => Some((ns_id, field_id, offset)),
+                None => {
+                    let store = stores.get(&ns_id)?;
+                    let ns_index = store.namespace_index.read();
+                    let populated = ns_index.get(field_id).is_some_and(|e| e.index.read().distinct_count() > 0);
+                    populated.then_some((ns_id, field_id, 0))
+                }
+            })
+            .collect()
+    }
 
-            let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-            if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                continue;
-            }
-            let segment = self.wal.segment_id_for_offset(state.replay_offset());
-            watermark = Some(watermark.map_or(segment, |w: u64| w.min(segment)));
-        }
-        watermark
+    /// The oldest WAL segment any **currently active** field index still needs in
+    /// order to replay after a crash, or `None` when nothing is pinned: the
+    /// lowest of [`field_replay_offsets`](Self::field_replay_offsets), mapped to
+    /// its segment.
+    pub(crate) fn index_replay_watermark_segment(&self) -> Option<u64> {
+        self.field_replay_offsets()
+            .into_iter()
+            .map(|(_, _, offset)| self.wal.segment_of(offset))
+            .min()
     }
 
     /// Harvest the keys held by segments the backstop is about to reclaim, and
@@ -128,24 +180,11 @@ impl Database {
     /// very outage the backstop exists to prevent.
     fn record_backstop_gaps(&self, forced: &[u64], wal_tail: u64) {
         // Which active fields needed each reclaimed segment, by checkpoint offset.
-        let mut affected: Vec<(u32, FieldId, u64)> = Vec::new();
-        {
-            let fields = self.registry.read().all_indexed_fields();
-            let stores = self.stores.read();
-            for (ns_id, field_id) in fields {
-                let Some(store) = stores.get(&ns_id) else { continue };
-                let ns_index = store.namespace_index.read();
-                let Some(entry) = ns_index.get(field_id) else { continue };
-                let state = self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail);
-                // Same suppression as the watermark: a never-checkpointed empty
-                // index is populated by a build, not by replay, so it loses
-                // nothing when a segment goes.
-                if state == crate::db::index_manager::CheckpointState::Absent && entry.index.read().distinct_count() == 0 {
-                    continue;
-                }
-                affected.push((ns_id, field_id, self.wal.segment_id_for_offset(state.replay_offset())));
-            }
-        }
+        let affected: Vec<(u32, FieldId, u64, u64)> = self
+            .field_replay_offsets()
+            .into_iter()
+            .map(|(ns_id, field_id, offset)| (ns_id, field_id, offset, self.wal.segment_of(offset)))
+            .collect();
         if affected.is_empty() {
             return;
         }
@@ -165,7 +204,7 @@ impl Database {
 
         let cap = Self::GAP_KEY_WORKLIST_CAP;
         let detected_at_ms = crate::db::kv_store::current_epoch_millis();
-        for (ns_id, field_id, field_segment) in affected {
+        for (ns_id, field_id, from, field_segment) in affected {
             // A field checkpointed past every reclaimed segment lost nothing.
             if !forced.iter().any(|&s| s >= field_segment) {
                 continue;
@@ -185,7 +224,7 @@ impl Database {
                 namespace_id: ns_id,
                 field_id,
                 cause: crate::db::index_manager::GapCause::BackstopReclaim,
-                from: self.index_manager.read_checkpoint(ns_id, field_id, wal_tail),
+                from,
                 to: wal_tail,
                 missing_segments: forced.to_vec(),
                 detected_at_ms,
@@ -197,26 +236,19 @@ impl Database {
         }
     }
 
-    /// Decide which fully-persisted, non-current WAL segments this GC pass may
+    /// Decide which retired, non-current WAL segments this GC pass may
     /// reclaim, given the index-replay watermark.
     ///
     /// Pure and side-effect free so `has_deletable_wal_segments` and
     /// `garbage_collect_wal` cannot disagree about what is reclaimable — if they
     /// did, the worker would either spin on segments GC refuses or skip the pass
     /// that is meant to fire the backstop.
+    ///
+    /// A segment is retired when it lies wholly below the cut: every entry in it
+    /// is in an SSTable and recovery never reads it. Segments are reclaimed only
+    /// from the head up, so what is left is always one contiguous run.
     fn plan_wal_gc(&self, wal_metadata: &WalMetadata, current_segment_id: u64, watermark: Option<u64>) -> WalGcPlan {
-        let ready: Vec<u64> = wal_metadata
-            .tracked_segments()
-            .take_while(|&s| s < current_segment_id)
-            .filter(|&s| {
-                let total = wal_metadata.segment_total(s);
-                // `>=` rather than `==`: a fully-persisted segment has
-                // persisted == total; accepting `>` too keeps GC unwedged if a
-                // persisted counter is ever over-reported, instead of stranding
-                // the segment forever.
-                total > 0 && wal_metadata.segment_persisted(s) >= total
-            })
-            .collect();
+        let ready: Vec<u64> = (self.wal.segment_of(wal_metadata.head)..current_segment_id.min(self.wal.segment_of(wal_metadata.cut))).collect();
 
         let Some(watermark) = watermark else {
             return WalGcPlan {
@@ -230,7 +262,7 @@ impl Database {
 
         // Backstop: past the cap, reclaim the oldest pinned segments anyway
         // rather than let a wedged checkpoint worker grow the WAL without bound.
-        // `tracked_segments` is ascending, so `partition` keeps `pinned` ascending
+        // `ready` is ascending, so `partition` keeps `pinned` ascending
         // and `take` picks the oldest. This knowingly strands part of a field
         // index — see `ThresholdConfig::max_pinned_wal_segments`.
         let cap = self.config.threshold_config.max_pinned_wal_segments as usize;
@@ -254,8 +286,7 @@ impl Database {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            let (total, persisted) = self.get_wal_gc_stats();
-            return Ok((0, total.saturating_sub(persisted)));
+            return Ok((0, self.wal_pending_bytes()));
         }
 
         struct WalGcGuard<'a>(&'a AtomicBool);
@@ -266,30 +297,20 @@ impl Database {
         }
         let _guard = WalGcGuard(&self.wal_gc_in_progress);
 
-        // Compute the watermark BEFORE taking the metadata write lock: it reads
-        // the registry, the stores and each active field's checkpoint marker, and
-        // holding the WAL metadata lock across all of that would widen the
-        // window against every writer for no benefit. A tail that advances in
-        // between only makes the watermark more conservative (a stale, smaller
-        // tail can make a marker read as `Unusable`, which pins from 0), never
-        // less.
+        // The watermark comes from the field consumers kept in memory by the
+        // checkpoint events; positions only move forward, so one read a moment
+        // before the metadata snapshot is at worst more conservative.
         let watermark = self.index_replay_watermark_segment();
 
-        let mut wal_metadata = self.wal_metadata.write();
-        let current_segment_id = if wal_metadata.tail == 0 {
-            0
-        } else {
-            self.wal.segment_id_for_offset(wal_metadata.tail - 1)
-        };
+        // Plan from a snapshot: the cut only moves forward and only this pass
+        // moves the head, so a plan made now stays valid, and no lock is held
+        // across the file deletes below.
+        let snapshot = self.wal_metadata.read().clone();
+        // No sequence high-water mark needs saving first: every metadata save
+        // records one, and the save that moved the cut past these segments
+        // came after their entries were written.
+        let plan = self.plan_wal_gc(&snapshot, self.wal.active_segment(), watermark);
 
-        // Persist the current sequence high-water mark BEFORE deleting any segment.
-        // This ensures recover_sequence always finds a hint >= the max sequence
-        // in any segment that survives, even if those segments are later deleted.
-        wal_metadata.last_sequence = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
-
-        let mut bytes_reclaimed = 0u64;
-        let mut segments_deleted = 0u64;
-        let plan = self.plan_wal_gc(&wal_metadata, current_segment_id, watermark);
         if !plan.forced.is_empty() {
             // The backstop is about to reclaim segments at least one active field
             // index still needed. Harvest the affected keys FIRST: they exist only
@@ -302,42 +323,27 @@ impl Database {
                 self.config.threshold_config.max_pinned_wal_segments,
                 plan.forced.len(),
             );
-            let wal_tail = wal_metadata.tail;
-            self.record_backstop_gaps(&plan.forced, wal_tail);
+            self.record_backstop_gaps(&plan.forced, snapshot.tail);
         }
-        for segment_id in plan.reclaim {
-            let total = wal_metadata.segment_total(segment_id);
-            let persisted = wal_metadata.segment_persisted(segment_id);
-            if self.wal.delete_segment_file(segment_id).is_ok() {
-                bytes_reclaimed = bytes_reclaimed.saturating_add(self.wal.segment_size());
-                segments_deleted += 1;
-                wal_metadata.total_entries = wal_metadata.total_entries.saturating_sub(total);
-                wal_metadata.persisted_entries = wal_metadata.persisted_entries.saturating_sub(persisted);
-                wal_metadata.clear_segment(segment_id);
-            }
-        }
+        // `reclaim` is one contiguous run from the head up (ready segments are
+        // a run, the free ones its lower part and the forced ones the oldest of
+        // the rest), so it is everything below its last segment.
+        let (segments_deleted, bytes_reclaimed) = match plan.reclaim.last() {
+            Some(&last) => self.wal.delete_segments_below(last + 1)?,
+            None => (0, 0),
+        };
+        let new_head = match self.wal.segments()?.first() {
+            Some(&(oldest, _)) => segment_start(oldest).max(snapshot.head),
+            None => snapshot.head,
+        };
 
-        // Advance head past all consecutively deleted/empty segments so that a
-        // subsequent scan_entries(head, tail) never tries to open a deleted file.
-        // Segments with segment_total == 0 were either deleted in this run or in
-        // a previous one; either way their files are gone.
-        let head_segment = wal_metadata.head / self.wal.segment_size();
-        let first_live = (head_segment..=current_segment_id)
-            .find(|&sid| sid == current_segment_id || wal_metadata.segment_total(sid) > 0)
-            .unwrap_or(current_segment_id);
-        let new_head = first_live * self.wal.segment_size();
-        if new_head > wal_metadata.head {
-            wal_metadata.head = new_head;
-        }
-        // Trim per-segment counters below the new head so the dense vecs track
-        // only the live segment window instead of growing with every segment
-        // ever created (keeps `base_segment_id == head`'s segment).
-        wal_metadata.trim_segments_before(first_live);
-
-        wal_metadata.total_gc_runs = wal_metadata.total_gc_runs.saturating_add(1);
-        wal_metadata.total_bytes_reclaimed = wal_metadata.total_bytes_reclaimed.saturating_add(bytes_reclaimed);
-        let remaining = wal_metadata.total_entries.saturating_sub(wal_metadata.persisted_entries);
-        drop(wal_metadata);
+        let remaining = {
+            let mut wal_metadata = self.wal_metadata.write();
+            wal_metadata.head = wal_metadata.head.max(new_head);
+            wal_metadata.total_gc_runs = wal_metadata.total_gc_runs.saturating_add(1);
+            wal_metadata.total_bytes_reclaimed = wal_metadata.total_bytes_reclaimed.saturating_add(bytes_reclaimed);
+            self.wal.bytes_between(wal_metadata.cut, wal_metadata.tail)
+        };
         self.flush_wal_metadata_internal()?;
 
         crate::db::metrics::Metrics::bump(&self.metrics.wal_gc_runs);
@@ -428,23 +434,21 @@ mod tests {
         db.flush_namespaces_pinning_wal();
 
         let pinning = db.wal_flush_observer.namespaces_with_unflushed();
-        let meta = db.wal_metadata.read();
-        let (total, persisted) = (meta.total_entries, meta.persisted_entries);
-        drop(meta);
+        let meta = db.wal_metadata.read().clone();
 
         assert!(
-            pinning.is_empty() && persisted == total,
-            "a dropped namespace still pins the watermark: pinning={pinning:?}, \
-             persisted={persisted} total={total} (WAL GC's gate is persisted >= total)"
+            pinning.is_empty() && meta.cut == meta.tail,
+            "a dropped namespace still pins the cut: pinning={pinning:?}, cut={} tail={}",
+            meta.cut,
+            meta.tail
         );
     }
 
     #[test]
     fn test_wal_gc_eligible_after_namespace_drop() {
-        // Regression test: WAL entries for a dropped namespace must be marked
-        // persisted on drop so that WAL GC can reclaim the segments they occupy.
-        // Previously, removing a namespace left its WAL entries as Inserted forever,
-        // blocking GC for any segment that contained those entries.
+        // Regression test: a dropped namespace's WAL entries must stop holding
+        // the cut, so that WAL GC can reclaim the segments they occupy. Recovery
+        // skips them anyway (their namespace is gone from the registry).
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
@@ -452,21 +456,12 @@ mod tests {
         db.put_ns(ns_id, b"k1", b"v1").unwrap();
         db.put_ns(ns_id, b"k2", b"v2").unwrap();
 
-        let (total_before, persisted_before) = db.get_wal_gc_stats();
-        assert!(total_before >= 2, "expected at least 2 WAL entries");
+        let pending_before = db.wal_pending_bytes();
+        assert!(pending_before > 0, "expected the two writes to be pending");
 
         db.remove_namespace("temp").unwrap();
 
-        let (total_after, persisted_after) = db.get_wal_gc_stats();
-        // After dropping the namespace, the persisted count must have increased
-        // to cover the entries we just wrote, so GC is not blocked on them.
-        assert!(
-            persisted_after > persisted_before,
-            "persisted count should increase after namespace drop (before={}, after={})",
-            persisted_before,
-            persisted_after,
-        );
-        assert_eq!(total_after, total_before, "total entry count should be unchanged");
+        assert_eq!(db.wal_pending_bytes(), 0, "the dropped namespace's entries still hold the cut");
 
         db.shutdown().unwrap();
     }
@@ -478,8 +473,7 @@ mod tests {
 
         db.put(b"key", b"value").unwrap();
 
-        let (total, _persisted) = db.get_wal_gc_stats();
-        assert!(total >= 1);
+        assert!(db.wal_pending_bytes() >= 1);
 
         db.shutdown().unwrap();
     }
@@ -497,28 +491,7 @@ mod tests {
 
         db.flush_all_namespaces()?;
 
-        let segment_size = db.wal.segment_size();
-        let mut tail = db.wal_metadata.read().tail;
-        let mut remaining = segment_size.saturating_sub(tail % segment_size);
-        if remaining == segment_size {
-            db.put(b"wal_gc_pad", b"pad")?;
-            db.flush_all_namespaces()?;
-            tail = db.wal_metadata.read().tail;
-            remaining = segment_size.saturating_sub(tail % segment_size);
-        }
-
-        let mut pad_value_len = 1usize;
-        loop {
-            let pad_entry = WalEntry::new_upsert(b"wal_gc_pad_crash".to_vec(), vec![0u8; pad_value_len]);
-            let entry_len = 4u64 + pad_entry.to_bytes()?.len() as u64;
-            if entry_len > remaining && entry_len < segment_size {
-                db.simulate_crash_with_wal_entries(vec![pad_entry])?;
-                break;
-            }
-            pad_value_len = pad_value_len.saturating_add(8);
-        }
-
-        let segment1_path = temp_dir.path().join("wal.log.seg000001");
+        let segment1_path = wal_segment_path(temp_dir.path(), 1);
         assert!(segment1_path.exists());
 
         let crash_entries = (0..3u32)
@@ -533,38 +506,31 @@ mod tests {
         Ok(())
     }
 
-    // Regression: the per-segment counter vecs must be trimmed as segments are
-    // reclaimed, so the wal_metadata file stays proportional to the *live*
-    // segment window instead of growing ~16 bytes for every segment ever created.
+    // The WAL metadata holds positions, not per-segment state, so it stays the
+    // same size however many segments are created and reclaimed, and its head
+    // follows GC.
     #[test]
-    fn test_wal_gc_trims_segment_counters_so_metadata_stays_bounded() -> Result<()> {
+    fn test_wal_gc_keeps_the_metadata_small_and_moves_the_head() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
 
-        let mut max_vec_len = 0usize;
-        // Many write→persist→GC rounds create and reclaim far more segments than
-        // are ever live at once.
+        let mut max_len = 0usize;
         for round in 0..50u32 {
             for i in 0..10u32 {
                 db.put(format!("k{}_{}", round, i).as_bytes(), &[b'v'; 32])?;
             }
             db.flush_all_namespaces()?;
             db.garbage_collect_wal()?;
-            max_vec_len = max_vec_len.max(db.wal_metadata.read().segment_total_entries.len());
+            max_len = max_len.max(std::fs::metadata(wal_metadata_path(temp_dir.path()))?.len() as usize);
         }
 
-        let m = db.wal_metadata.read();
-        // The base advanced as old segments were reclaimed and trimmed...
+        let m = db.wal_metadata.read().clone();
         assert!(
-            m.base_segment_id > 10,
-            "base_segment_id should advance as segments are reclaimed, got {}",
-            m.base_segment_id
+            db.wal.segment_of(m.head) > 10,
+            "the head should follow the reclaimed segments, got {:#x}",
+            m.head
         );
-        // ...while the counter vecs stayed bounded by the live window rather than
-        // growing to ~= total segments ever created (base + len).
-        assert!(max_vec_len <= 8, "segment counter vec should stay bounded, peaked at {}", max_vec_len);
-        assert_eq!(m.segment_total_entries.len(), m.segment_persisted_entries.len());
-        drop(m);
+        assert!(max_len <= 256, "the metadata file should stay small, peaked at {max_len} bytes");
         db.shutdown()?;
         Ok(())
     }
@@ -583,10 +549,10 @@ mod tests {
         db.flush_all_namespaces()?;
 
         let wal_dir_bytes = |dir: &std::path::Path| -> u64 {
-            std::fs::read_dir(dir)
+            std::fs::read_dir(crate::db::layout::main_wal_dir(dir))
                 .unwrap()
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("wal.log.seg"))
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
                 .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
                 .sum()
         };
@@ -639,10 +605,7 @@ mod tests {
         db.flush_all_namespaces()?;
 
         let wal_tail = db.wal_metadata.read().tail;
-        assert!(
-            db.wal.segment_id_for_offset(wal_tail - 1) > 1,
-            "test needs several WAL segments, tail is {wal_tail}"
-        );
+        assert!(db.wal.segment_of(wal_tail) > 1, "test needs several WAL segments, tail is {wal_tail}");
         assert!(
             db.wal.missing_segments(checkpoint_offset, wal_tail).is_empty(),
             "no segment should be missing before GC runs"
@@ -707,7 +670,7 @@ mod tests {
         // A real checkpoint: this is the offset the field would replay from.
         db.run_index_checkpoint()?;
         let checkpoint_offset = db.wal_metadata.read().tail;
-        let watermark_segment = db.wal.segment_id_for_offset(checkpoint_offset);
+        let watermark_segment = db.wal.segment_of(checkpoint_offset);
         assert!(watermark_segment > 1, "test needs segments below the watermark, got {watermark_segment}");
 
         for i in 200..600u32 {
@@ -716,10 +679,7 @@ mod tests {
         db.flush_all_namespaces()?;
 
         let wal_tail = db.wal_metadata.read().tail;
-        assert!(
-            db.wal.segment_id_for_offset(wal_tail - 1) > 1,
-            "test needs several WAL segments, tail is {wal_tail}"
-        );
+        assert!(db.wal.segment_of(wal_tail) > 1, "test needs several WAL segments, tail is {wal_tail}");
 
         db.garbage_collect_wal()?;
 
@@ -737,7 +697,7 @@ mod tests {
 
         // And the pin is not "reclaim nothing": segments below the watermark are
         // still collected, so retention is bounded by the checkpoint, not frozen.
-        let head_segment = db.wal.segment_id_for_offset(db.wal_metadata.read().head);
+        let head_segment = db.wal.segment_of(db.wal_metadata.read().head);
         assert!(
             head_segment > 0 && head_segment <= watermark_segment,
             "segments below the watermark should be reclaimed and reclamation should stop at it \
@@ -882,7 +842,7 @@ mod tests {
         db.flush_all_namespaces()?;
 
         let wal_tail = db.wal_metadata.read().tail;
-        let total_segments = db.wal.segment_id_for_offset(wal_tail - 1);
+        let total_segments = db.wal.segment_of(wal_tail);
         assert!(total_segments > 4, "test needs more segments than the cap, got {total_segments}");
 
         // The worker must still be told there is work, or the backstop could
@@ -893,12 +853,8 @@ mod tests {
         assert!(reclaimed > 0, "the backstop should have reclaimed the oldest pinned segments");
 
         // Pinned retention is now bounded by the cap rather than unbounded...
-        let pinned_after = db
-            .wal_metadata
-            .read()
-            .tracked_segments()
-            .filter(|&s| s >= db.wal.segment_id_for_offset(checkpoint_offset) && s < db.wal.segment_id_for_offset(wal_tail - 1))
-            .count();
+        let (lo, hi) = (db.wal.segment_of(checkpoint_offset), db.wal.segment_of(wal_tail));
+        let pinned_after = (hi - lo) as usize - db.wal.missing_segments(segment_start(lo), segment_start(hi - 1)).len();
         assert!(
             pinned_after <= 2,
             "pinned segments should be capped at max_pinned_wal_segments, got {pinned_after}"
@@ -933,22 +889,12 @@ mod tests {
             let (bytes_reclaimed, _) = db.garbage_collect_wal()?;
             assert!(bytes_reclaimed > 0, "expected segments to be GC'd");
 
-            let (total, persisted) = db.get_wal_gc_stats();
-            assert_eq!(
-                total.saturating_sub(persisted),
-                0,
-                "pending should be 0 immediately after GC (total={total}, persisted={persisted})"
-            );
+            assert_eq!(db.wal_pending_bytes(), 0, "pending should be 0 immediately after GC");
         }
 
         {
             let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256)?;
-            let (total, persisted) = db.get_wal_gc_stats();
-            assert_eq!(
-                total.saturating_sub(persisted),
-                0,
-                "pending should still be 0 after reopen (total={total}, persisted={persisted})"
-            );
+            assert_eq!(db.wal_pending_bytes(), 0, "pending should still be 0 after reopen");
         }
 
         Ok(())
@@ -967,19 +913,7 @@ mod tests {
 
         let seq_before_gc = db.next_seq.load(Ordering::Relaxed).saturating_sub(1);
 
-        {
-            let wal_metadata = db.wal_metadata.read();
-            let tail = wal_metadata.tail;
-            let head = wal_metadata.head;
-            drop(wal_metadata);
-            db.wal_flush_observer.mark_persisted_range(head, tail);
-        }
-        {
-            let mut wal_metadata = db.wal_metadata.write();
-            for i in 0..wal_metadata.segment_total_entries.len() {
-                wal_metadata.segment_persisted_entries[i] = wal_metadata.segment_total_entries[i];
-            }
-        }
+        db.flush_all_namespaces()?;
 
         db.garbage_collect_wal()?;
 
@@ -989,6 +923,171 @@ mod tests {
             "last_sequence ({}) must be >= highest written seq ({}) after GC",
             last_seq,
             seq_before_gc
+        );
+        Ok(())
+    }
+
+    // ── Field indexes as WAL consumers (A2) ──────────────────────────────────
+    //
+    // A field index needs the WAL from its last checkpoint; its position is
+    // kept by events (activation, the checkpointed event, deactivate, drop)
+    // rather than read from its marker on each GC tick.
+
+    /// The field's consumer position, if it is one.
+    fn consumer(db: &Database, ns: u32, field: FieldId) -> Option<Option<u64>> {
+        db.wal_flush_observer
+            .field_consumers()
+            .into_iter()
+            .find(|(k, _)| *k == (ns, field))
+            .map(|(_, p)| p)
+    }
+
+    #[test]
+    fn a_checkpoint_moves_its_fields_position_and_releases_the_wal_below_it() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        db.run_index_checkpoint()?;
+        let first = consumer(&db, ns, field).expect("an active field is a consumer").expect("checkpointed");
+
+        for i in 0..400u32 {
+            db.put(format!("k{i:04}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+        db.flush_all_namespaces()?;
+        db.garbage_collect_wal()?;
+        assert_eq!(
+            db.wal.segment_of(db.wal_metadata.read().head),
+            0,
+            "the field's position holds every segment above it"
+        );
+
+        db.run_index_checkpoint()?;
+        let second = consumer(&db, ns, field).unwrap().unwrap();
+        assert!(second > first, "the checkpointed event should move the position ({first} -> {second})");
+        db.garbage_collect_wal()?;
+        assert!(
+            db.wal.segment_of(db.wal_metadata.read().head) > 0,
+            "segments below the new position should be reclaimed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deactivating_or_dropping_a_field_stops_it_holding_the_wal() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let a = activate_named_index(&db, ns, "a");
+        let b = activate_named_index(&db, ns, "b");
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, a).is_some() && consumer(&db, ns, b).is_some());
+
+        db.deactivate_field_index(ns, a)?;
+        assert!(consumer(&db, ns, a).is_none(), "a deactivated field still holds the WAL");
+        db.drop_field_index(ns, b)?;
+        assert!(consumer(&db, ns, b).is_none(), "a dropped field still holds the WAL");
+        assert_eq!(db.index_replay_watermark_segment(), None);
+
+        // A checkpoint after the fact does not bring them back.
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, a).is_none() && consumer(&db, ns, b).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_a_namespace_stops_its_fields_holding_the_wal() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = db.create_namespace("doomed")?;
+        let field = activate_status_index(&db, ns);
+        db.run_index_checkpoint()?;
+        assert!(consumer(&db, ns, field).is_some());
+        db.remove_namespace("doomed")?;
+        assert!(consumer(&db, ns, field).is_none(), "a dropped namespace's field still holds the WAL");
+        Ok(())
+    }
+
+    /// A field with no checkpoint yet is populated by a build, not by replay,
+    /// so it holds nothing while its index is empty; once it has entries and
+    /// still no checkpoint, it holds the WAL from 0.
+    #[test]
+    fn a_field_without_a_checkpoint_holds_the_wal_only_once_populated() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        assert_eq!(consumer(&db, ns, field), Some(None), "no checkpoint yet");
+        assert_eq!(db.index_replay_watermark_segment(), None, "an empty first build must not pin the WAL");
+
+        db.put(b"k", br#"{"status":"active"}"#)?;
+        assert_eq!(
+            db.index_replay_watermark_segment(),
+            Some(0),
+            "a populated field without a checkpoint replays from 0"
+        );
+
+        db.run_index_checkpoint()?;
+        assert!(matches!(consumer(&db, ns, field), Some(Some(p)) if p > 0));
+        Ok(())
+    }
+
+    /// Reopening rebuilds the consumers from the markers when the fields are
+    /// activated again, so the field watermark is the one before the close.
+    #[test]
+    fn reopening_restores_the_field_positions_from_their_markers() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let (field, before) = {
+            let db = Database::open(temp_dir.path(), create_db_config())?;
+            let field = activate_status_index(&db, DEFAULT_NAMESPACE_ID);
+            for i in 0..50u32 {
+                db.put(format!("k{i}").as_bytes(), br#"{"status":"active"}"#)?;
+            }
+            db.run_index_checkpoint()?;
+            let before = consumer(&db, DEFAULT_NAMESPACE_ID, field).unwrap();
+            db.shutdown()?;
+            (field, before)
+        };
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        assert!(consumer(&db, DEFAULT_NAMESPACE_ID, field).is_none(), "not a consumer until activated");
+        let again = activate_status_index(&db, DEFAULT_NAMESPACE_ID);
+        assert_eq!(again, field);
+        let after = consumer(&db, DEFAULT_NAMESPACE_ID, field).unwrap();
+        assert!(after >= before, "the reopened position {after:?} is behind the saved one {before:?}");
+        Ok(())
+    }
+
+    /// The checkpointed event fires only once the marker is durable. A
+    /// checkpoint whose marker cannot be written leaves the position where it
+    /// was: moved anyway, WAL GC could delete segments a crash would send the
+    /// field back to.
+    #[test]
+    fn a_checkpoint_whose_marker_fails_does_not_move_the_position() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new()?;
+        let db = Database::open(temp_dir.path(), create_db_config())?;
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field = activate_status_index(&db, ns);
+        db.put(b"k0", br#"{"status":"active"}"#)?;
+        db.run_index_checkpoint()?;
+        let before = consumer(&db, ns, field).unwrap();
+        for i in 1..50u32 {
+            db.put(format!("k{i}").as_bytes(), br#"{"status":"active"}"#)?;
+        }
+
+        // The marker is written as `checkpoint.tmp` then renamed in the field's
+        // directory; a read-only directory fails exactly that step.
+        let dir = db.index_manager.field_path(ns, field);
+        let original = std::fs::metadata(&dir)?.permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        let result = db.run_index_checkpoint();
+        std::fs::set_permissions(&dir, original)?;
+
+        assert!(result.is_err(), "setup: the marker write should fail");
+        assert_eq!(
+            consumer(&db, ns, field).unwrap(),
+            before,
+            "a failed checkpoint moved the field's position"
         );
         Ok(())
     }

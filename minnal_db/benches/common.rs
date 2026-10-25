@@ -37,12 +37,12 @@ pub fn bench_tempdir() -> TempDir {
 
 /// Config tuned for benchmarking: background workers effectively disabled.
 ///
-/// **This does not disable fsync, and no config can.** `SyncConfig` carries only
-/// `records_per_sync`, which paces the *value log*; `Database::put_ns` passes
-/// `sync = true` to the WAL append unconditionally, so every `put`, `delete` and
-/// `merge` measured here pays a WAL fsync. That is deliberate engine behaviour
-/// (`minnal_db/CLAUDE.md` → "Per-write WAL fsync is deliberate — do NOT add
-/// group-commit"), so write benchmarks are storage-latency-bound and their
+/// **This does not disable fsync, and no config can.** `SyncConfig`'s
+/// `records_per_sync` paces only the *value log*, and every `put`, `delete` and
+/// `merge` returns only once a WAL fsync covers it. Concurrent writers share
+/// fsyncs (group commit), but these benchmarks write from one thread, so each
+/// write measured here pays its own WAL fsync: write benchmarks are
+/// storage-latency-bound and their
 /// absolute numbers say more about the disk than about the code.
 pub fn bench_config() -> DbConfig {
     DbConfig::new(
@@ -130,6 +130,32 @@ impl Drop for AutoCloseStore {
             let _ = store.shutdown();
         }
     }
+}
+
+/// A store already in its steady state for writes: opened once, with the
+/// default WAL segment size (so segments rotate at a running database's rate),
+/// and its WAL moved past its first segment onto zero-filled ones
+/// (`minnal_db/docs/WAL-Architecture.md`, *On disk*) by writing 1 MiB values
+/// under `warm:` keys. A new database's first segment is sparse, so there a
+/// write that starts a new 4 KiB block also pays for allocating it.
+///
+/// `_value_len` is the size the case writes; the warm-up does not depend on it.
+///
+/// **Open the store once per case and time writes in `b.iter`.** Criterion's
+/// `iter_batched*` calls its setup once per *iteration*, so a setup that opens
+/// a store times one write into a brand-new database every iteration: new
+/// file blocks every time, about 2.3 ms on the benchmark drive whatever the
+/// engine does. The `first_write_into_new_db` cases measure exactly that, on
+/// purpose.
+pub fn steady_store(dir: &Path, _value_len: usize) -> AutoCloseStore {
+    let store = AutoCloseStore(Some(Db::open_with_config(dir, bench_config()).expect("failed to open Db")));
+    let value = vec![0x5Au8; 1 << 20];
+    let mut i = 0u64;
+    while store.store().wal_stats().tail.segment_id == 0 {
+        store.store().put(&make_key("warm:", i), &value).unwrap();
+        i += 1;
+    }
+    store
 }
 
 /// Generate a key with a given prefix and zero-padded sequence number.

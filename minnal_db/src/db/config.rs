@@ -10,25 +10,45 @@ use std::time::Duration;
 /// * `records_per_sync = 1` — sync after every single write.
 /// * Any other value N — sync every N writes.
 ///
-/// This is a throughput knob, not a durability one. The WAL is fsynced after
-/// every write regardless, and holds each value until it is marked persisted;
+/// This is a throughput knob, not a durability one. Every write returns only once
+/// a WAL fsync covers it, and the WAL holds each value until it is retired;
 /// before that happens — whenever a memtable reaches L0, at GC, on shutdown, and
 /// whenever a value-log segment is sealed — the value log is fsynced
 /// unconditionally. So no setting here can lose an acknowledged write.
+///
+/// `commit_delay_us` is the main WAL's optional **commit delay**: before a
+/// commit round's fsync, its leader waits this long so more concurrent writes
+/// can share it, but only when another write is already waiting for a round
+/// (a lone writer never waits). Default 0: rounds already form under load
+/// without one, and a delay lowers throughput when clients wait for each write
+/// before sending the next.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub records_per_sync: usize,
+    pub commit_delay_us: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { records_per_sync: 1000 }
+        Self {
+            records_per_sync: 1000,
+            commit_delay_us: 0,
+        }
     }
 }
 
 impl SyncConfig {
     pub fn new(records_per_sync: usize) -> Self {
-        Self { records_per_sync }
+        Self {
+            records_per_sync,
+            commit_delay_us: 0,
+        }
+    }
+
+    /// Set the main WAL's commit delay (see the type's docs).
+    pub fn with_commit_delay_us(mut self, commit_delay_us: u64) -> Self {
+        self.commit_delay_us = commit_delay_us;
+        self
     }
 }
 
@@ -330,14 +350,12 @@ pub struct DbConfig {
     pub num_buckets: usize,
     /// Maximum number of entries (including tombstones) in the in-memory skip list.
     pub skip_list_capacity: usize,
-    /// WAL segment size in bytes (default 64 MiB).
+    /// Size of each new main-WAL segment in bytes (default 64 MiB, at most
+    /// 4 GiB).
     ///
-    /// **Fixed at creation.** Unlike [`segment_size_bytes`](Self::segment_size_bytes)
-    /// for the value log, a WAL segment id is `offset / wal_segment_size`, so this
-    /// cannot change once the WAL holds data — a different size would map stored
-    /// offsets to the wrong segment files. It is honoured only for a brand-new WAL
-    /// and then recorded in a `wal_segment_size` marker; on an existing WAL the
-    /// recorded size wins and a differing config value is ignored with a warning.
+    /// Not fixed at creation: a WAL position is `(segment_id << 32) | byte`, so
+    /// the size is not encoded in positions, existing segments keep the size
+    /// they were created at, and new ones use whatever is configured now.
     pub wal_segment_size: u64,
     /// Size at which a value-log segment is sealed and a new one opened
     /// (default 256 MiB).
@@ -373,7 +391,7 @@ impl Default for DbConfig {
             lsm_config: LSMConfig::default(),
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
-            wal_segment_size: 64 * 1024 * 1024,
+            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
             segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
@@ -395,7 +413,7 @@ impl DbConfig {
             lsm_config,
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
-            wal_segment_size: 64 * 1024 * 1024,
+            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
             segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,

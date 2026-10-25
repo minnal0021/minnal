@@ -190,7 +190,8 @@ listen_addr = "0.0.0.0:8080"
 # ── tuning (optional) ──────────────────────────────────────────────────────
 
 [sync]
-records_per_sync = 1000        # fsync the value log every N writes (the WAL is fsynced on every write)
+records_per_sync = 1000        # fsync the value log every N writes (every write still returns only once a WAL fsync covers it)
+commit_delay_us = 0            # main-WAL commit delay; 0 = none (see config/sample.toml)
 
 [scheduled_tasks]
 value_log_gc_interval_secs   = 60
@@ -1244,7 +1245,10 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `no_wal_puts` | writes | Upserts written bypassing every log (`skip_wal`, the query-embedding cache, embed-queue updates written by a no-WAL merge). Vector payloads and partition maintenance's writes are not counted here: they go to the vector index WAL (`vector_index_wal.appends`) | **No** |
 | `no_wal_deletes` | writes | Deletes written bypassing every log: mostly the vector worker removing finished entries from the embed queue (a no-WAL merge), plus `delete_no_wal` callers | **No** |
 | `wal_bytes_appended` | writes | Total bytes appended to the WAL | **No** |
-| `wal_fsyncs` | writes | WAL fsyncs (one per WAL-backed write — durability cost) | **No** |
+| `wal_writes` | writes | WAL-backed writes; each returned once a WAL fsync covered it | **No** |
+| `wal_commit_rounds` | writes | Main-WAL fsyncs issued by commit rounds (engine-wide only). Concurrent writes share one, so this is the WAL's durability cost | **No** |
+| `wal_commit_writes` | writes | Writes those rounds covered (engine-wide only) | **No** |
+| `writes_per_commit_round` | writes | `wal_commit_writes / wal_commit_rounds`: writes covered by one fsync on average; `null` before the first round | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
 | `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
 | `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
@@ -1276,7 +1280,7 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 > of them before any user request arrives — they are **regenerated, not persisted**.
 > In particular WAL replay does one `lsm.get` per replayed entry (bumping
 > `lookups`), and startup vector-index reconciliation re-enqueues missing docs via
-> the normal write path (bumping `puts` / `wal_fsyncs` / `wal_bytes_appended`). So
+> the normal write path (bumping `puts` / `wal_writes` / `wal_bytes_appended`). So
 > a non-zero reading right after a restart is expected and reflects startup
 > activity, not pre-restart totals — `lookups` in particular jumps with the size of
 > the WAL replay. Vector-search corruption counters
@@ -1318,19 +1322,45 @@ restart = **Yes**), except the explicitly-flagged in-memory ones.
 | `total_gc_runs` | Value-log GC passes ever run (persisted in metadata) |
 | `total_bytes_reclaimed` | Bytes ever reclaimed by value-log GC (persisted) |
 
-**`GET /admin/storage/wal`** — WAL metadata:
+**`GET /admin/storage/wal`** — the main WAL. Every entry below the **cut** is
+already in an SSTable, so a restart replays only the bytes from the cut to the
+tail, and WAL GC deletes segments wholly below the cut.
 
 | Field | Meaning |
 |-------|---------|
-| `head`, `tail` | WAL byte offsets of the live window |
-| `total_entries` | Entries currently tracked |
-| `persisted_entries` | Entries already applied + persisted |
-| `pending_entries` | `total − persisted` (replayed on next open) |
+| `head`, `tail` | Positions `{segment_id, byte}` of the first entry still on disk and of the next write |
+| `durable_tail` | Everything below it is fsynced (equal to `tail` whenever no write is waiting for its fsync) |
+| `cut` | Every entry below this position is in an SSTable |
+| `pending_bytes` | Bytes of entries from the cut to the tail: what a restart would replay |
+| `segment_size` | Bytes each new WAL segment file is created at |
+| `namespaces_ahead_of_cut[]` | `{namespace, safe_offset}` (`safe_offset` a position): namespaces whose writes are in SSTables past the cut; a restart skips their entries below `safe_offset` |
+| `namespaces_holding_cut[]` | Namespaces with writes not yet in an SSTable; the slowest holds the cut, and the WAL GC tick flushes them |
 | `total_gc_runs`, `total_bytes_reclaimed` | WAL GC activity (persisted) |
-| `base_segment_id` | Absolute id the per-segment counters start at (lower segments trimmed) |
-| `live_segments` | Tracked segments still carrying entries |
-| `last_sequence` | Highest write sequence the WAL has observed |
-| `segments[]` | Per-segment `{segment_id, total_entries, persisted_entries, pending_entries}` |
+| `last_sequence` | Highest write sequence handed out as of the last metadata save (every flush and WAL GC pass saves it): a restart's sequence counter starts above it |
+| `segments[]` | Each segment file on disk: `{segment_id, bytes, retired, pending_bytes}`. A segment is created at its full size, so `bytes` is that size whatever it holds; `retired` means wholly below the cut |
+| `stopped` | `null` normally. After a failed fsync of the WAL, the error: every write is refused until the server restarts |
+
+After creating a KV store and writing three keys to it (none flushed yet):
+
+```json
+{
+  "head": {"segment_id": 0, "byte": 16},
+  "tail": {"segment_id": 0, "byte": 396},
+  "durable_tail": {"segment_id": 0, "byte": 396},
+  "cut": {"segment_id": 0, "byte": 16},
+  "pending_bytes": 380,
+  "segment_size": 67108864,
+  "namespaces_ahead_of_cut": [],
+  "namespaces_holding_cut": ["session-cache", "system_schema"],
+  "total_gc_runs": 0,
+  "total_bytes_reclaimed": 0,
+  "last_sequence": 0,
+  "segments": [{"segment_id": 0, "bytes": 67108864, "retired": false, "pending_bytes": 380}],
+  "stopped": null
+}
+```
+
+Positions are `{segment_id, byte}` in both logs; a segment's records start at byte 16, after its header.
 
 **`GET /admin/storage/vector-index-wal`** — the vector index WAL, the log the
 vector worker writes its chunk and whole-document codes to, and partition
@@ -1344,12 +1374,12 @@ wholly below the **retired cut**. Each namespace's replay starts at its own
 
 | Field | Meaning |
 |-------|---------|
-| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first |
+| `segments[]` | Every segment file, `{segment_id, bytes}`, oldest first. A segment is created at its full size (64 MiB), so `bytes` is that size whatever it holds |
 | `segment_count`, `disk_bytes` | Number of segment files and their total size |
 | `tail` | Where the next record goes |
 | `durable_tail` | Everything below it is fsynced |
 | `retired_cut` | Records below it are retired |
-| `unretired_bytes` | Bytes at or above the retired cut (segment headers excluded): what a restart would replay |
+| `unretired_bytes` | Bytes of records at or above the retired cut (segment headers and end markers excluded): what a restart would replay |
 | `last_sequence` | Highest write sequence of a record appended since the server started, or found then at or above the retired cut (0 if none) |
 | `holding_cut[]` | Namespaces with records no flush has covered yet, `{namespace, safe_offset}`; the WAL GC tick flushes them (sealing the memtable even when it is empty), which releases them |
 | `stopped` | `null` normally. After a failed fsync of the log, the error: the log then refuses appends and syncs until the server restarts, and vector indexing stops (documents stay queued) |
@@ -1358,9 +1388,9 @@ On a database whose vector worker has written nothing:
 
 ```json
 {
-  "segments": [{"segment_id": 0, "bytes": 16}],
+  "segments": [{"segment_id": 0, "bytes": 67108864}],
   "segment_count": 1,
-  "disk_bytes": 16,
+  "disk_bytes": 67108864,
   "tail": {"segment_id": 0, "byte": 16},
   "durable_tail": {"segment_id": 0, "byte": 16},
   "retired_cut": {"segment_id": 0, "byte": 0},
@@ -1499,18 +1529,19 @@ curl -X POST http://localhost:8080/admin/storage/gc
 #### `POST /admin/storage/gc/wal`
 
 Run WAL garbage collection now instead of waiting for the next tick. It deletes
-the WAL segments whose entries are all persisted to SSTables (never the segment
-being written), keeping any a field index still needs to replay.
+the WAL segments wholly below the cut, whose entries are all in SSTables (never
+the segment being written), keeping any a field index still needs to replay.
 
 ```bash
 curl -X POST http://localhost:8080/admin/storage/gc/wal
-# → {"bytes_reclaimed": 67108864, "unpersisted_entries": 12}
+# → {"bytes_reclaimed": 67108864, "pending_bytes": 1840}
 ```
 
 `bytes_reclaimed` is the size of the segment files deleted by this pass.
-`unpersisted_entries` is the number of WAL entries not yet persisted to an
-SSTable; their segments stay until a memtable flush persists them. If a WAL GC
-pass is already running, this one reclaims nothing and reports `0`.
+`pending_bytes` is what a restart would replay (from the cut to the tail); the
+segments holding those bytes stay until a memtable flush moves the cut past
+them. If a WAL GC pass is already running, this one reclaims nothing and
+reports `0` for `bytes_reclaimed`.
 
 ---
 
@@ -2327,8 +2358,8 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 ```
 {db_path}/
   namespace_registry          ← namespace name → id map, plus TTL settings
-  wal.log, wal.log.seg*       ← the shared write-ahead log (64 MiB segments)
-  wal_metadata, wal_segment_size
+  wal/                        ← the main write-ahead log: {segment_id}.log segments (64 MiB), metadata
+  vector_index_wal/           ← the vector index WAL: {segment_id}.log segments, retired_cut
   fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
     config.json               ← namespace settings

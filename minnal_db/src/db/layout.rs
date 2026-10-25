@@ -20,8 +20,8 @@
 //!       {field_id}/       ← field index: bitmap blob, keymap, checkpoint, gap.json
 //!       rowmap/           ← dense row-ID map sidecar
 //!       no_wal_pending    ← marker: uncheckpointed no-WAL writes (FR-001)
-//!   wal.log, wal.log.seg* ← shared write-ahead log segments, plus wal_metadata
-//!   vector_index_wal/     ← the vector index WAL's segments ({segment_id}.log)
+//!   wal/                  ← the main WAL's segments ({segment_id}.log) and metadata
+//!   vector_index_wal/     ← the vector index WAL's segments ({segment_id}.log) and retired_cut
 //!   fail_logs/            ← recovery failures
 //! ```
 
@@ -41,6 +41,24 @@ pub(crate) fn namespace_data_dir(db_path: &Path, name: &str) -> PathBuf {
     db_path.join(format!("{NAMESPACE_DIR_PREFIX}{name}"))
 }
 
+/// Every namespace data directory under `db_path` (`ns_*`), whether or not
+/// the registry still lists it.
+pub(crate) fn namespace_data_dirs(db_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    let entries = match std::fs::read_dir(db_path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(NAMESPACE_DIR_PREFIX) && entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 /// The index subtree root: `{db_path}/index`.
 pub(crate) fn index_root(db_path: &Path) -> PathBuf {
     db_path.join(INDEX_DIR)
@@ -56,6 +74,15 @@ pub(crate) fn index_root(db_path: &Path) -> PathBuf {
 /// `namespace_index_dir(&index_root(db_path), ns_id)`.
 pub(crate) fn namespace_index_dir(index_root: &Path, ns_id: u32) -> PathBuf {
     index_root.join(ns_id.to_string())
+}
+
+/// Name of the main WAL's directory at the database root.
+const MAIN_WAL_DIR: &str = "wal";
+
+/// The main WAL's directory: `{db_path}/wal`, holding its segments and its
+/// `metadata` (the saved retirement progress).
+pub(crate) fn main_wal_dir(db_path: &Path) -> PathBuf {
+    db_path.join(MAIN_WAL_DIR)
 }
 
 /// Name of the vector index WAL's directory at the database root.
@@ -78,6 +105,7 @@ mod tests {
         let root = Path::new("/db");
         assert_eq!(namespace_data_dir(root, "users"), Path::new("/db/ns_users"));
         assert_eq!(index_root(root), Path::new("/db/index"));
+        assert_eq!(main_wal_dir(root), Path::new("/db/wal"));
         assert_eq!(namespace_index_dir(&index_root(root), 7), Path::new("/db/index/7"));
         assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }

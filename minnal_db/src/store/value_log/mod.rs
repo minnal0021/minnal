@@ -886,6 +886,15 @@ impl ValueLog {
         Ok(())
     }
 
+    /// Test hook for the power-loss model: the active segment's file and how
+    /// many of its bytes are fsynced. Every sealed segment was fsynced as it
+    /// was sealed.
+    #[cfg(test)]
+    pub(crate) fn power_loss_extent(&self) -> (PathBuf, u64) {
+        let inner = self.inner.read();
+        (Self::segment_path(&self.dir, self.bucket, inner.active_id), inner.synced_offset)
+    }
+
     /// Bytes appended to this bucket that are not yet known to be on stable
     /// storage. Zero after [`sync`](Self::sync) with no appends since.
     #[cfg(test)]

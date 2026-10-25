@@ -94,12 +94,16 @@ fn default_compaction_threshold_percent() -> usize {
 pub struct SyncSection {
     #[serde(default = "default_records_per_sync")]
     pub records_per_sync: usize,
+    /// The main WAL's commit delay in microseconds (`SyncConfig`); default 0.
+    #[serde(default)]
+    pub commit_delay_us: u64,
 }
 
 impl Default for SyncSection {
     fn default() -> Self {
         Self {
             records_per_sync: default_records_per_sync(),
+            commit_delay_us: 0,
         }
     }
 }
@@ -236,7 +240,7 @@ impl Default for WalSection {
 }
 
 fn default_wal_segment_size_bytes() -> u64 {
-    64 * 1024 * 1024
+    crate::db::wal::DEFAULT_SEGMENT_SIZE as u64
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,7 +307,7 @@ impl MinnalTomlConfig {
                 .with_index_blob_backpressure_bytes(self.thresholds.index_blob_backpressure_bytes)
                 .with_index_overlay_bytes(self.thresholds.index_overlay_soft_bytes, self.thresholds.index_overlay_hard_bytes)
                 .with_max_pinned_wal_segments(self.thresholds.max_pinned_wal_segments),
-            sync_config: SyncConfig::new(self.sync.records_per_sync),
+            sync_config: SyncConfig::new(self.sync.records_per_sync).with_commit_delay_us(self.sync.commit_delay_us),
             scheduled_task_config: ScheduledTaskConfig {
                 value_log_gc_interval: Duration::from_secs(self.scheduled_tasks.value_log_gc_interval_secs),
                 wal_gc_interval: Duration::from_secs(self.scheduled_tasks.wal_gc_interval_secs),

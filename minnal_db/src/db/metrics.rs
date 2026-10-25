@@ -66,8 +66,9 @@ pub struct Metrics {
     pub no_wal_puts: AtomicU64,
     pub no_wal_deletes: AtomicU64,
     pub wal_bytes_appended: AtomicU64,
-    /// WAL fsyncs (one per WAL-backed write — durability cost).
-    pub wal_fsyncs: AtomicU64,
+    /// WAL-backed writes (each returns once an fsync covers it; concurrent
+    /// writes share fsyncs, see `wal_commit_rounds`).
+    pub wal_writes: AtomicU64,
     /// In-memory applies that failed after retry (data still durable in the WAL).
     pub apply_failures: AtomicU64,
 
@@ -91,6 +92,12 @@ pub struct Metrics {
     pub vlog_gc_bytes_rewritten: AtomicU64,
     pub wal_gc_runs: AtomicU64,
     pub wal_segments_deleted: AtomicU64,
+    /// Main-WAL fsyncs issued by commit rounds (engine-global). Each covers
+    /// every write appended before it started.
+    pub wal_commit_rounds: AtomicU64,
+    /// Writes that waited for a commit round (engine-global);
+    /// `wal_commit_writes / wal_commit_rounds` is the average round size.
+    pub wal_commit_writes: AtomicU64,
 
     // ── Vector index WAL (engine-global: only the database's own instance) ──
     /// Records appended to the vector index WAL.
@@ -167,7 +174,7 @@ impl Metrics {
             no_wal_puts: g(&self.no_wal_puts),
             no_wal_deletes: g(&self.no_wal_deletes),
             wal_bytes_appended: g(&self.wal_bytes_appended),
-            wal_fsyncs: g(&self.wal_fsyncs),
+            wal_writes: g(&self.wal_writes),
             apply_failures: g(&self.apply_failures),
             memtable_flushes: g(&self.memtable_flushes),
             l0_l1_compactions: g(&self.l0_l1_compactions),
@@ -180,6 +187,8 @@ impl Metrics {
             vlog_gc_bytes_rewritten: g(&self.vlog_gc_bytes_rewritten),
             wal_gc_runs: g(&self.wal_gc_runs),
             wal_segments_deleted: g(&self.wal_segments_deleted),
+            wal_commit_rounds: g(&self.wal_commit_rounds),
+            wal_commit_writes: g(&self.wal_commit_writes),
             vector_wal_appends: g(&self.vector_wal_appends),
             vector_wal_bytes_appended: g(&self.vector_wal_bytes_appended),
             vector_wal_fsyncs: g(&self.vector_wal_fsyncs),
@@ -220,7 +229,7 @@ impl Metrics {
         a(&self.no_wal_puts, o.no_wal_puts);
         a(&self.no_wal_deletes, o.no_wal_deletes);
         a(&self.wal_bytes_appended, o.wal_bytes_appended);
-        a(&self.wal_fsyncs, o.wal_fsyncs);
+        a(&self.wal_writes, o.wal_writes);
         a(&self.apply_failures, o.apply_failures);
         a(&self.memtable_flushes, o.memtable_flushes);
         a(&self.l0_l1_compactions, o.l0_l1_compactions);
@@ -230,6 +239,8 @@ impl Metrics {
         a(&self.vlog_gc_duration_ms, o.vlog_gc_duration_ms);
         a(&self.wal_gc_runs, o.wal_gc_runs);
         a(&self.wal_segments_deleted, o.wal_segments_deleted);
+        a(&self.wal_commit_rounds, o.wal_commit_rounds);
+        a(&self.wal_commit_writes, o.wal_commit_writes);
         a(&self.vector_wal_appends, o.vector_wal_appends);
         a(&self.vector_wal_bytes_appended, o.vector_wal_bytes_appended);
         a(&self.vector_wal_fsyncs, o.vector_wal_fsyncs);
@@ -265,7 +276,7 @@ pub struct MetricsSnapshot {
     pub no_wal_puts: u64,
     pub no_wal_deletes: u64,
     pub wal_bytes_appended: u64,
-    pub wal_fsyncs: u64,
+    pub wal_writes: u64,
     pub apply_failures: u64,
     pub memtable_flushes: u64,
     pub l0_l1_compactions: u64,
@@ -278,6 +289,8 @@ pub struct MetricsSnapshot {
     pub vlog_gc_bytes_rewritten: u64,
     pub wal_gc_runs: u64,
     pub wal_segments_deleted: u64,
+    pub wal_commit_rounds: u64,
+    pub wal_commit_writes: u64,
     pub vector_wal_appends: u64,
     pub vector_wal_bytes_appended: u64,
     pub vector_wal_fsyncs: u64,
@@ -312,7 +325,7 @@ impl MetricsSnapshot {
         self.no_wal_puts += o.no_wal_puts;
         self.no_wal_deletes += o.no_wal_deletes;
         self.wal_bytes_appended += o.wal_bytes_appended;
-        self.wal_fsyncs += o.wal_fsyncs;
+        self.wal_writes += o.wal_writes;
         self.apply_failures += o.apply_failures;
         self.memtable_flushes += o.memtable_flushes;
         self.l0_l1_compactions += o.l0_l1_compactions;
@@ -325,6 +338,8 @@ impl MetricsSnapshot {
         self.vlog_gc_bytes_rewritten += o.vlog_gc_bytes_rewritten;
         self.wal_gc_runs += o.wal_gc_runs;
         self.wal_segments_deleted += o.wal_segments_deleted;
+        self.wal_commit_rounds += o.wal_commit_rounds;
+        self.wal_commit_writes += o.wal_commit_writes;
         self.vector_wal_appends += o.vector_wal_appends;
         self.vector_wal_bytes_appended += o.vector_wal_bytes_appended;
         self.vector_wal_fsyncs += o.vector_wal_fsyncs;

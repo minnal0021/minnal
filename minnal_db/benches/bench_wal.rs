@@ -14,17 +14,33 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use minnal_db::db::wal::{Wal, WalEntry};
+use minnal_db::db::wal::{DEFAULT_SEGMENT_SIZE, Wal, WalEntry};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Bytes of appends one WAL receives before the next is opened. Half the
-/// default 64 MiB segment, so no case rotates mid-run and times a segment
-/// creation it did not ask for.
-const WAL_BYTES_PER_RUN: usize = 32 * 1024 * 1024;
+/// Bytes of appends one WAL receives before the next is opened. Under half
+/// the default 64 MiB segment (less the warm-up's first record), so no case
+/// rotates mid-run or overlaps the background zero-fill of the next segment,
+/// which starts once a segment is half full.
+const WAL_BYTES_PER_RUN: usize = 24 * 1024 * 1024;
 
-/// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`.
+/// Open a WAL in `dir` and move it past its first segment, so the timed
+/// appends land where a running database's do: in a segment zero-filled ahead
+/// of use. A new log's first segment is sparse, so there a write that starts
+/// a new 4 KiB block also pays for allocating it (a database's first writes;
+/// `write/first_put_into_new_db` measures that). Returns the WAL and its tail.
+fn warm_wal(dir: &std::path::Path) -> (Wal, u64) {
+    let (wal, mut tail) = Wal::open_standalone(dir, DEFAULT_SEGMENT_SIZE).unwrap();
+    let filler = WalEntry::new_upsert(b"warm".to_vec(), vec![0u8; 1 << 20]);
+    while wal.segment_of(tail) == 0 {
+        wal.append_entry(&filler, &mut tail).unwrap();
+    }
+    wal.commit(tail, Duration::ZERO).unwrap();
+    (wal, tail)
+}
+
+/// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`; with
+/// `sync`, each append is committed (one fsync each: a lone writer's rounds).
 ///
 /// Appends go into an already-open WAL, so the number is the append alone.
 /// Every `per_wal` appends the WAL is dropped and a fresh one opened, outside
@@ -39,12 +55,14 @@ fn time_appends(iters: u64, per_wal: u64, sync: bool, make_entry: impl Fn() -> W
     while done < iters {
         let n = per_wal.min(iters - done);
         let temp = bench_tempdir();
-        let wal = Wal::open(temp.path().join("wal.log")).unwrap();
-        let mut tail = 0u64;
+        let (wal, mut tail) = warm_wal(&temp.path().join("wal"));
         let start = Instant::now();
         for _ in 0..n {
             let entry = make_entry();
-            black_box(wal.append_entry(&entry, &mut tail, sync)).unwrap();
+            black_box(wal.append_entry(&entry, &mut tail)).unwrap();
+            if sync {
+                wal.commit(tail, Duration::ZERO).unwrap();
+            }
         }
         elapsed += start.elapsed();
         done += n;
@@ -123,15 +141,14 @@ fn bench_wal_scan(c: &mut Criterion) {
 
     for &(num_entries, value_size) in &[(1_000u64, 128usize), (1_000, 4_096), (5_000, 128)] {
         let temp = bench_tempdir();
-        let wal = Wal::open(temp.path().join("wal.log")).expect("failed to open WAL");
+        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), DEFAULT_SEGMENT_SIZE).expect("failed to open WAL");
         let value = vec![0xEFu8; value_size];
-        let mut tail = 0u64;
 
         // Pre-populate
         for i in 0..num_entries {
             let key = format!("scan_key_{:010}", i).into_bytes();
             let entry = WalEntry::new_upsert(key, value.clone());
-            wal.append_entry(&entry, &mut tail, false).unwrap();
+            wal.append_entry(&entry, &mut tail).unwrap();
         }
         wal.sync().unwrap();
 
@@ -158,24 +175,19 @@ fn bench_full_put_throughput(c: &mut Criterion) {
 
     let value_size = 512usize;
     let value = vec![0xABu8; value_size];
-    const BATCH: usize = 1_000;
+    // One store, already in its steady state (see `steady_store`): a store
+    // per iteration would time a first write into a new database instead.
+    let temp = bench_tempdir();
+    let store = steady_store(temp.path(), value_size);
 
     // Full path: Db::put (WAL + value log + LSM)
     group.throughput(Throughput::Elements(1));
     group.bench_function("db_put_with_wal", |b| {
-        b.iter_batched_ref(
-            || {
-                let temp = bench_tempdir();
-                let store = AutoCloseStore::open(temp.path());
-                (store, AtomicU64::new(0), temp)
-            },
-            |(store, counter, _temp)| {
-                let seq = counter.fetch_add(1, Ordering::Relaxed);
-                let key = make_key("wal_put:", seq);
-                black_box(store.store().put(&key, &value)).unwrap();
-            },
-            criterion::BatchSize::NumIterations(BATCH as u64),
-        );
+        let mut seq = 0u64;
+        b.iter(|| {
+            seq += 1;
+            black_box(store.store().put(&make_key("wal_put:", seq), &value)).unwrap();
+        });
     });
 
     group.finish();

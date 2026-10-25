@@ -20,7 +20,9 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
   main WAL: `Database::put_ns_logged` / `delete_ns_logged`, called through a
   namespace as `put_logged` / `delete_logged`. Appended and applied with no
   fsync; durable at the next **sync** (`sync_vector_index_wal`), one fsync for
-  everything appended before it.
+  everything appended before it. Concurrent syncs share one fsync, through the
+  same commit rounds as the main WAL (`minnal_db/docs/Main-WAL-Rework-Design.md`
+  §16).
 - **No-WAL write** — `put_no_wal` (and `delete_no_wal`, `merge_no_wal`): the
   value goes to the value log and the key's pointer goes to the memtable, with
   no log entry at all. The pointer exists only in memory until the memtable is
@@ -66,8 +68,9 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
   records above its own, capped by the oldest record still in flight. Records
   below it are retired for every namespace; GC deletes segments wholly below it.
 - **Marker** — the `retired_cut` file, holding the cut and each namespace's safe
-  offset above it. It is written at the *written* event, before the L0 files
-  are registered.
+  offset above it, in the progress-file format both logs share
+  (`segmented_log::ProgressFile`, `minnal_db/docs/WAL-Architecture.md`). It is
+  written at the *written* event, before the L0 files are registered.
 - **Holding the cut** — a namespace whose unflushed records keep the cut from
   moving. The WAL GC tick flushes such namespaces.
 - **Prefix rule** — what survives any crash is a prefix of the log, across all
@@ -178,17 +181,16 @@ gain: `Fewer-WAL-Fsyncs-Design.md`, Part 2.
 
 ### Why a separate log and not the main WAL
 
-- **The main WAL does not change.** Its write path, lock, fsync-per-write rule,
-  persisted watermark and GC stay as they are; only recovery reads one more
-  log. All new logic lives in one module, so a fault in it cannot reach ordinary
+- **The main WAL keeps its own write path.** Its lock, fsync and GC are its
+  own; recovery reads one more log, and a flush saves both logs' progress. All new logic lives in one module, so a fault in it cannot reach ordinary
   writes.
 - **No contention with client writes.** The vector index WAL has its own lock and its
   own fsync. Embedding traffic stops queueing on the one lock every client write
   takes.
 - **Fsync per batch is natural.** No client waits on this log, so one fsync per
-  batch of completions is the design. The main WAL's rule (one fsync per
-  acknowledged write, no group commit) is about client acknowledgements and does
-  not apply.
+  batch of completions is the design. The main WAL's rule (each write returns
+  only once an fsync covers it) is about client acknowledgements and does not
+  apply.
 
 ## 3. Write path
 
@@ -221,18 +223,26 @@ no-WAL flush tick does not need to flush them.
 
 ## 4. Record and file format
 
-- **Segments.** `vector_index_wal/{segment id}.log`, each up to a fixed size (64 MiB),
-  appended in order. A new segment's directory entry is fsynced before anything
-  in it is relied on.
+- **Segments.** `vector_index_wal/{segment id}.log`, each a fixed size (64 MiB),
+  appended in order. A segment is created at its full size, and from the
+  log's second segment on it is zero-filled ahead in the background (as
+  `{segment id}.log.prep`, renamed into place when the log reaches it), so a
+  sync commits no new file size or block allocation. A new segment's header
+  and directory entry are fsynced before anything in it is relied on.
 - **Header** per segment: magic, format version, segment id.
+- **End of a segment's records.** A full segment is sealed with an end marker:
+  a length of `0xFFFF_FFFF`, which no record can have. A length of 0 is
+  unwritten space: the records end there.
 - **Record:** length, CRC32 of the body, then the body: namespace id (u32), seq
   (u64), key length and key, value length and value. A **delete** has value
   length `u32::MAX` and no value bytes; no put can be that long, since a record
   must fit a segment. Replay applies a delete with its seq.
 - **Torn tail.** A record whose length runs past the end, or whose CRC fails, is
-  the end of the log; everything after it in that segment is ignored. Only the
-  last segment may end this way; a bad record in an earlier segment fails the
-  open, as a corrupt main WAL does.
+  the end of the log, as is unwritten space. Open zeroes everything after the
+  end in that segment before any append, so records a power loss kept beyond
+  a lost one can never follow new records. Only the last segment may end this
+  way; a bad record, or unwritten space before the end marker, in an earlier
+  segment fails the open, as a corrupt main WAL does.
 
 The format is versioned so a later change can be rejected rather than misread.
 
@@ -427,8 +437,9 @@ no meta.
 | recovery, after its flush and marker | replayed records in L0 and retired | not replayed again; later compactions cannot bring a deleted key back |
 
 Power loss differs from a process kill: unsynced appends vanish. The crash
-simulation (`AsyncDb::crash`) must model that by truncating the vector index WAL to its
-last `sync`, or the tests cannot see a missing fsync. (The same blind spot hid
+simulation (`AsyncDb::crash`) must model that by cutting each segment of the
+vector index WAL back to what an fsync actually covered, or the tests cannot
+see a missing fsync. (The same blind spot hid
 no-WAL writes until 2026-10-11.)
 
 **Mutation checks** — each must make a test fail, or the test is not guarding
@@ -499,8 +510,7 @@ durable tail, the retired cut, the unretired bytes between them (what a restart
 would replay), the last seq appended, and the namespaces holding the cut back
 with their `safe_offset` (why the log is not shrinking). Positions are shown as
 `{segment_id, byte}`. It is a separate endpoint because
-the main WAL's response counts entries and persisted entries, which this log
-does not have. After a failed fsync it also reports `stopped`, with the error
+the two logs have different segment layouts and stopping rules. After a failed fsync it also reports `stopped`, with the error
 (the log refuses appends until the database is reopened, §6).
 
 Counters since startup, engine-wide only (as the main WAL's GC counters are; a
@@ -608,7 +618,7 @@ above, so the full M5 run checks both.
   L0 files. Superseded by this design.
 - **A conditional completion record in the main WAL** ("remove entry E, valid
   only if the vector namespaces flushed past seq S"). No forced flushes, but it
-  needs a cross-namespace pin in the main WAL's persisted watermark and GC — new
+  needs a cross-namespace pin in the main WAL's cut and GC — new
   rules in the most sensitive code. Rejected for that reason.
 - **The value log as the WAL** (WiscKey's approach). No-WAL values already go to
   the value log; only the key's pointer is memory-only. Recovery could rebuild
@@ -616,14 +626,16 @@ above, so the full M5 run checks both.
   (with old seqs) into the same tail, the value log knows nothing of memtable
   boundaries for retirement, and it would change the value log's format and GC —
   more intrusive than a separate log.
-- **Make the vector writes WAL-backed.** Correct, but each write would take the
-  main WAL lock and fsync (~2.3 ms each, ~4 per document), adding embedding
-  traffic to the lock every client write waits on.
+- **Make the vector writes WAL-backed.** Correct, but each write would wait for
+  a main-WAL fsync (~4 per document), and the bulky codes would go into the log
+  every client write shares.
 
 ## Decisions (review, 2026-10-15)
 
-1. **Code location:** `db/vector_index_wal.rs` holds the log (format, append,
-   sync, observer, GC); `database.rs` calls it at open and from the GC tick.
+1. **Code location:** `db/vector_index_wal.rs` holds the log (record body,
+   observer, retirement, replay) on the segmented log shared with the main WAL
+   (`db/segmented_log.rs`: segments, frames, append, sync, open, GC);
+   `database.rs` calls it at open and from the GC tick.
    `minnal_db/CLAUDE.md`'s WAL-ownership rule names both files.
 2. **Fsync policy:** one `sync` per completion batch; no time bound.
 3. **Segment size:** 64 MiB, as the main WAL.

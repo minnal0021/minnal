@@ -551,9 +551,9 @@ Database::open()
   ├── 3. Load namespace schemas from config.json
   ├── 4. Open KVStores
   └── 5. recover_from_wal()                       ← data-layer recovery
-        ├── Scan WAL head→tail; replay un-persisted Upsert/Delete into the KVStore
+        ├── Scan WAL cut→tail; replay each namespace's Upsert/Delete from its safe offset
         ├── Flush and compact affected stores
-        └── Mark entries Persisted, flush WAL metadata
+        └── Retire the whole log (cut = tail), save the WAL metadata
 
 Per indexed namespace:
   RowMap::open()                                  ← row-map recovery

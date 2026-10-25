@@ -22,7 +22,6 @@ use minnal_db::{
 };
 use std::hint::black_box;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Wrapper that calls `Db::shutdown()` on drop to release file handles promptly.
@@ -105,30 +104,24 @@ impl BenchValue {
     }
 }
 
+/// One writer's typed `put` of a fresh key, in the steady state: one store per
+/// value size, its WAL already on zero-filled segments (see `steady_store`).
 fn bench_put_typed(c: &mut Criterion) {
     let mut group = c.benchmark_group("typed/put");
     group.measurement_time(Duration::from_secs(10));
 
-    const BATCH: usize = 2_000;
-
     for value_size in [128usize, 4_096] {
         let value = BenchValue::new(value_size);
+        let temp = bench_tempdir();
+        let store = steady_store(temp.path(), value_size);
 
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("value_size", format!("{value_size}B")), &value_size, |b, _| {
-            b.iter_batched_ref(
-                || {
-                    let temp = bench_tempdir();
-                    let db = AutoCloseDb::open(temp.path());
-                    (db, AtomicU64::new(0), temp)
-                },
-                |(db, counter, _temp)| {
-                    let seq = counter.fetch_add(1, Ordering::Relaxed);
-                    let key = BenchKey::new(seq);
-                    black_box(db.db().put_typed(&key, &value)).unwrap();
-                },
-                criterion::BatchSize::NumIterations(BATCH as u64),
-            );
+            let mut seq = 0u64;
+            b.iter(|| {
+                seq += 1;
+                black_box(store.store().put_typed(&BenchKey::new(seq), &value)).unwrap();
+            });
         });
     }
     group.finish();
@@ -168,31 +161,29 @@ fn bench_get_typed(c: &mut Criterion) {
     group.finish();
 }
 
+/// One writer's typed `delete`, in the steady state: one store, its WAL already
+/// on zero-filled segments, with `POOL` keys written first. Past the first
+/// `POOL` deletes the keys are already gone; a delete still writes its WAL
+/// entry and tombstone, which is what this measures.
 fn bench_delete_typed(c: &mut Criterion) {
+    const POOL: u64 = 2_000;
     let mut group = c.benchmark_group("typed/delete");
     group.measurement_time(Duration::from_secs(10));
 
-    const BATCH: usize = 2_000;
+    let temp = bench_tempdir();
+    let store = steady_store(temp.path(), 128);
+    let value = BenchValue::new(128);
+    for seq in 0..POOL {
+        store.store().put_typed(&BenchKey::new(seq), &value).unwrap();
+    }
 
     group.throughput(Throughput::Elements(1));
     group.bench_function("delete", |b| {
-        b.iter_batched_ref(
-            || {
-                let temp = bench_tempdir();
-                let db = AutoCloseDb::open(temp.path());
-                let value = BenchValue::new(128);
-                for seq in 0..BATCH as u64 {
-                    db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-                }
-                (db, AtomicU64::new(0), temp)
-            },
-            |(db, counter, _temp)| {
-                let seq = counter.fetch_add(1, Ordering::Relaxed);
-                let key = BenchKey::new(seq);
-                black_box(db.db().delete_typed(&key)).unwrap();
-            },
-            criterion::BatchSize::NumIterations(BATCH as u64),
-        );
+        let mut seq = 0u64;
+        b.iter(|| {
+            seq = (seq + 1) % POOL;
+            black_box(store.store().delete_typed(&BenchKey::new(seq))).unwrap();
+        });
     });
     group.finish();
 }

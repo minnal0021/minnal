@@ -230,6 +230,12 @@ struct BucketGCResult {
 type BatchReadWithRetries = (Vec<Option<Vec<u8>>>, Vec<usize>);
 
 impl KVStore {
+    /// Whether the namespace whose data directory is `base_path` holds any L1
+    /// data, without opening it (see `LSMTree::has_level1_data`).
+    pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
+        crate::store::lsm::lsm_tree::LSMTree::has_level1_data(&base_path.join("lsm"))
+    }
+
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
     /// See `DbConfig::verify_checksums_on_read`.
     pub fn set_verify_checksums_on_read(&self, verify: bool) {
@@ -1934,17 +1940,18 @@ impl KVStore {
     }
 }
 
-/// Makes a store's value log durable before any WAL entry is marked persisted.
+/// Makes a store's value log durable before any WAL entry is retired.
 ///
 /// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
 /// cadence), which is safe only while the WAL still holds the value. When a
-/// memtable reaches L0, `on_ro_memtable_flushed_to_level0` lets the WAL
-/// observer mark its entries persisted — recovery then skips them and WAL GC
-/// deletes them — so the value-log records those SSTable entries point at must
-/// be on stable storage first. Without this, a power loss after the flush lost
-/// up to `records_per_sync` acknowledged values (and any segment sealed since
-/// its last fsync) with nothing left to replay them from. If the fsync fails the
-/// event is withheld: the entries stay un-persisted and recovery replays them.
+/// memtable's L0 files are written, `on_ro_memtable_written` lets both WALs
+/// retire its entries — recovery then skips them and WAL GC deletes them — so
+/// the value-log records those SSTable entries point at must be on stable
+/// storage first. Without this, a power loss after the flush lost up to
+/// `records_per_sync` acknowledged values (and any segment sealed since its
+/// last fsync) with nothing left to replay them from. If the fsync fails the
+/// flush is undone: the entries stay replayable and the memtable is flushed
+/// again later.
 struct SyncValueLogBeforePersist {
     inner: Arc<dyn LsmFlushObserver>,
     logs: Vec<Arc<crate::store::value_log::ValueLog>>,
@@ -1959,11 +1966,9 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
         self.inner.on_ro_memtable_flushing(version)
     }
 
-    // The vector index WAL retires records here, so the values they point at
-    // must be on stable storage first, exactly as for the persisted event below.
-    // The second fsync, before that event, then finds little or nothing to write.
-    // A failed fsync vetoes the flush: the files are not registered and the
-    // memtable is flushed again later.
+    // Both WALs retire records here, so the values they point at must be on
+    // stable storage first. A failed fsync vetoes the flush: the files are not
+    // registered and the memtable is flushed again later.
     fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
         for log in &self.logs {
             if let Err(e) = log.sync() {
@@ -1975,12 +1980,6 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
-        for log in &self.logs {
-            if let Err(e) = log.sync() {
-                error!("value-log fsync failed before marking memtable {version} persisted; its WAL entries stay replayable: {e:?}");
-                return;
-            }
-        }
         self.inner.on_ro_memtable_flushed_to_level0(version);
     }
 }

@@ -248,9 +248,10 @@ pub use db::stats::GCStats;
 /// snapshot, returned by [`Db::ops_metrics`].
 pub use db::metrics::{Metrics, MetricsSnapshot};
 
+pub use db::segmented_log::LogPosition;
 /// Snapshot of WAL state returned by [`Db::wal_metadata`].
 pub use db::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
-pub use db::wal::WalMetadata;
+pub use db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
 /// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].
 pub use store::lsm::lsm_manifest::LsmManifest;

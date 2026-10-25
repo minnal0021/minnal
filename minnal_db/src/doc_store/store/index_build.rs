@@ -731,10 +731,12 @@ mod tests {
     #[tokio::test]
     async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
         let db_dir = TempDir::new().unwrap();
-        // Small WAL segments, so the documents' segments are reclaimable.
+        // The smallest WAL segments a configuration allows, and documents
+        // large enough to fill several, so the documents' segments are
+        // reclaimable.
         let config = || {
             let mut c = crate::doc_store::test_db_config();
-            c.wal_segment_size = 4096;
+            c.wal_segment_size = crate::db::wal::MIN_CONFIGURED_SEGMENT_SIZE;
             c
         };
         let n = 300u64;
@@ -743,7 +745,7 @@ mod tests {
             store.create(make_schema("ns", vec![])).await.unwrap();
             for i in 0..n {
                 store
-                    .put("ns", DocId::U64(i), serde_json::json!({"status": "active", "pad": "x".repeat(40)}))
+                    .put("ns", DocId::U64(i), serde_json::json!({"status": "active", "pad": "x".repeat(800)}))
                     .await
                     .unwrap();
             }

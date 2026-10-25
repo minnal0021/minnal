@@ -1,14 +1,14 @@
-"""Generates ../wal-lifecycle.svg: how WAL segments fill, get persisted, and are reclaimed.
+"""Generates ../wal-lifecycle.svg: how WAL segments fill, are retired by the cut, and are reclaimed.
 
     python3 minnal_db/docs/diagrams/wal_lifecycle.py
 
 The picture is driven by a small simulation of the real rules:
-- a put appends an Inserted entry to the active segment, opening a new segment
-  when the active one is full;
-- a memtable flush marks every entry written so far Persisted (its keys are now
-  in an SSTable);
-- WAL GC deletes any segment that is not the active one and whose entries are
-  all Persisted; the head is the oldest segment still on disk.
+- a put appends an entry to the active segment, opening a new segment when the
+  active one is full; the log is never written anywhere else;
+- a memtable flush moves the cut to the end of what it wrote (its keys are now
+  in an SSTable); every entry below the cut is retired;
+- WAL GC deletes any segment that is not the active one and lies wholly below
+  the cut; the head is the oldest segment still on disk.
 """
 
 from pathlib import Path
@@ -16,44 +16,47 @@ from pathlib import Path
 from anim import AMBER, BLUE, GREY, Anim, caption, document, esc, legend, text
 
 SLOTS = 4  # entries per segment, for the drawing (real segments are 64 MB)
-NAMES = ["wal.log", "wal.log.seg000001", "wal.log.seg000002"]
+NAMES = ["wal/0000000000.log", "wal/0000000001.log", "wal/0000000002.log"]
 
 SCRIPT = [
-    ("put", "put() appends entry 1 to <tspan class='ink-a'>wal.log</tspan> and fsyncs before returning."),
-    ("put", "More writes append to the same segment. Each is fsynced on its own."),
-    ("put", "Every entry is <tspan class='ink-a'>Inserted</tspan>: the WAL is the only durable copy of these writes."),
+    ("put", "put() appends entry 1 to segment <tspan class='ink-a'>0000000000.log</tspan> and returns once an fsync covers it."),
+    ("put", "More writes append to the same segment. Concurrent ones share one fsync."),
+    ("put", "Every entry is <tspan class='ink-a'>above the cut</tspan>: the WAL is the only durable copy of these writes."),
     ("put", "The segment is now full."),
-    ("put", "The next write opens wal.log.seg000001, which becomes the active segment."),
+    ("put", "The next write seals it with an end marker, fsyncs it, and opens 0000000001.log."),
     ("put", "Nothing can be reclaimed yet: every entry is still needed for crash recovery."),
-    ("flush", "A memtable flush writes these keys to an SSTable, so their entries become <tspan class='ink-b'>Persisted</tspan>."),
-    ("GC", "WAL GC deletes wal.log: every entry in it is Persisted and it is not the active segment."),
+    ("flush", "A memtable flush writes these keys to an SSTable and moves the cut past them: they are <tspan class='ink-b'>retired</tspan>."),
+    ("GC", "WAL GC deletes 0000000000.log: it lies wholly below the cut and it is not the active segment."),
     ("put", "New writes keep appending to the active segment."),
-    ("put", "seg000001 is full again, holding a mix of Persisted and Inserted entries."),
-    ("put", "The next write opens seg000002."),
-    ("GC", "GC finds nothing to delete: seg000001 still has Inserted entries, and seg000002 is active."),
-    ("flush", "The next flush persists the remaining entries."),
-    ("GC", "GC deletes seg000001. The active segment is never deleted, even when all of it is Persisted."),
+    ("put", "0000000001.log is full again: the cut runs through it."),
+    ("put", "The next write seals it and opens 0000000002.log."),
+    ("GC", "GC finds nothing to delete: 0000000001.log has entries above the cut, and 0000000002.log is active."),
+    ("flush", "The next flush moves the cut to the end of the log."),
+    ("GC", "GC deletes 0000000001.log. The active segment is never deleted, even when all of it is retired."),
 ]
 
 
 def simulate():
-    segs = []  # each: {"entries": [...], "deleted": bool}
+    segs = []  # each: {"first": index of its first entry, "count": n, "deleted": bool}
+    written = 0  # entries appended so far
+    cut = 0  # every entry with a lower index is retired
     states = []
     for op, _ in SCRIPT:
         live = [s for s in segs if not s["deleted"]]
         if op == "put":
-            if not live or len(live[-1]["entries"]) == SLOTS:
-                segs.append({"entries": [], "deleted": False})
-            segs[-1]["entries"].append("I")
+            if not live or live[-1]["count"] == SLOTS:
+                segs.append({"first": written, "count": 0, "deleted": False})
+            segs[-1]["count"] += 1
+            written += 1
         elif op == "flush":
-            for s in live:
-                s["entries"] = ["P"] * len(s["entries"])
+            cut = written
         elif op == "GC":
             active = live[-1]
             for s in live:
-                if s is not active and all(e == "P" for e in s["entries"]):
+                if s is not active and s["first"] + s["count"] <= cut:
                     s["deleted"] = True
-        states.append([(tuple(s["entries"]), s["deleted"]) for s in segs])
+        # "P" below the cut (retired), "I" above it.
+        states.append([(tuple("P" if s["first"] + k < cut else "I" for k in range(s["count"])), s["deleted"]) for s in segs])
     return states
 
 
@@ -63,10 +66,10 @@ def main():
     anim = Anim(n, 2.2)
     W, H = 940, 590
     out = [
-        text(44, 42, "WAL lifecycle: append → persist → reclaim", "t1", 19, extra=' font-weight="700"'),
-        text(44, 64, "Every write is fsynced into one shared log. Once a flush has put its keys in an SSTable, "
-             "WAL GC can delete the segment.", "t2", 13),
-        legend(470, 104, [(AMBER, "Inserted: only the WAL holds it"), (BLUE, "Persisted: also in an SSTable")]),
+        text(44, 42, "WAL lifecycle: append → retire → reclaim", "t1", 19, extra=' font-weight="700"'),
+        text(44, 64, "Every write is durable in one shared log when it returns. Once a flush puts its keys in an "
+             "SSTable, the cut moves past them.", "t2", 13),
+        legend(420, 104, [(AMBER, "Above the cut: only the WAL holds it"), (BLUE, "Below the cut: also in an SSTable")]),
         text(44, 104, "WAL SEGMENTS", "t3", 12, extra=' letter-spacing="0.06em"'),
     ]
     box_w, gap, x0, y0 = 270, 20, 44, 118
@@ -145,7 +148,7 @@ def main():
         return (sum(len(e) for e in segs), sum(e.count("P") for e in segs), len(segs))
 
     out.append(text(44, 500, "entries on disk", "t3 mono", 11))
-    out.append(text(260, 500, "of which Persisted", "t3 mono", 11))
+    out.append(text(260, 500, "of which below the cut", "t3 mono", 11))
     out.append(text(476, 500, "segment files", "t3 mono", 11))
     out.append(anim.states([counters(s) for s in range(n)], lambda v: (
         text(44, 524, v[0], "t1 mono", 18, extra=' font-weight="700"')
@@ -154,9 +157,9 @@ def main():
     out.append(text(44, 566, "Illustrative: 4 entries per segment; real segments are 64 MB. "
                     "With field indexes, GC also waits until each index has checkpointed past a segment.", "t3", 10))
 
-    svg = document(W, H, "Animated diagram: WAL entries are appended and fsynced, become Persisted when a memtable "
-                         "flush writes their keys to an SSTable, and whole segments are deleted by WAL GC once "
-                         "every entry is Persisted; the active segment is never deleted.", "\n".join(out))
+    svg = document(W, H, "Animated diagram: WAL entries are appended and fsynced, are retired when a memtable "
+                         "flush writes their keys to an SSTable and moves the cut past them, and whole segments "
+                         "below the cut are deleted by WAL GC; the active segment is never deleted.", "\n".join(out))
     Path(__file__).resolve().parent.parent.joinpath("wal-lifecycle.svg").write_text(svg)
 
 
