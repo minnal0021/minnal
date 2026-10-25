@@ -18,10 +18,26 @@ use minnal_db::db::wal::{DEFAULT_SEGMENT_SIZE, Wal, WalEntry};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-/// Bytes of appends one WAL receives before the next is opened. Half the
-/// default 64 MiB segment, so no case rotates mid-run and times a segment
-/// creation it did not ask for.
-const WAL_BYTES_PER_RUN: usize = 32 * 1024 * 1024;
+/// Bytes of appends one WAL receives before the next is opened. Under half
+/// the default 64 MiB segment (less the warm-up's first record), so no case
+/// rotates mid-run or overlaps the background zero-fill of the next segment,
+/// which starts once a segment is half full.
+const WAL_BYTES_PER_RUN: usize = 24 * 1024 * 1024;
+
+/// Open a WAL in `dir` and move it past its first segment, so the timed
+/// appends land where a running database's do: in a segment zero-filled ahead
+/// of use. A new log's first segment is sparse, so there a write that starts
+/// a new 4 KiB block also pays for allocating it (a database's first writes;
+/// `write/first_put_into_new_db` measures that). Returns the WAL and its tail.
+fn warm_wal(dir: &std::path::Path) -> (Wal, u64) {
+    let (wal, mut tail) = Wal::open_standalone(dir, DEFAULT_SEGMENT_SIZE).unwrap();
+    let filler = WalEntry::new_upsert(b"warm".to_vec(), vec![0u8; 1 << 20]);
+    while wal.segment_of(tail) == 0 {
+        wal.append_entry(&filler, &mut tail).unwrap();
+    }
+    wal.commit(tail, Duration::ZERO).unwrap();
+    (wal, tail)
+}
 
 /// Time `iters` appends of `make_entry()` with Criterion's `iter_custom`; with
 /// `sync`, each append is committed (one fsync each: a lone writer's rounds).
@@ -39,7 +55,7 @@ fn time_appends(iters: u64, per_wal: u64, sync: bool, make_entry: impl Fn() -> W
     while done < iters {
         let n = per_wal.min(iters - done);
         let temp = bench_tempdir();
-        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), DEFAULT_SEGMENT_SIZE).unwrap();
+        let (wal, mut tail) = warm_wal(&temp.path().join("wal"));
         let start = Instant::now();
         for _ in 0..n {
             let entry = make_entry();
