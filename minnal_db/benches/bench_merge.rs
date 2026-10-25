@@ -134,11 +134,12 @@ fn seed_set(seed: u64) -> Vec<u8> {
 // key that exists) are different amounts of work; matching them is what makes the
 // comparison mean anything. `bench_write.rs` covers put-to-a-fresh-key.
 
-/// A fresh store with `CYCLE_POOL` keys under `prefix`, each holding `value`.
-/// The `TempDir` is returned so it outlives the store.
+/// A store in its steady state for writes (`steady_store`) with `count` keys
+/// under `prefix`, each holding `value`. The `TempDir` is returned so it
+/// outlives the store.
 fn populated(prefix: &str, value: &[u8], count: u64) -> (tempfile::TempDir, AutoCloseStore) {
     let temp = bench_tempdir();
-    let store = AutoCloseStore::open(temp.path());
+    let store = steady_store(temp.path(), value.len());
     for i in 0..count {
         store.store().put(&make_key(prefix, i), value).unwrap();
     }
