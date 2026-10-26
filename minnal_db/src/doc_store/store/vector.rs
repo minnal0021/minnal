@@ -269,6 +269,14 @@ impl DocStore {
         ctx.for_namespace(&self.db, namespace, ns_id, &settings).await.ok().map(|ns| ns.partition)
     }
 
+    /// Record a write to a semantic-search store's document until the returned
+    /// guard drops (see [`InFlightWrites`]). Taken before the write's queue entry
+    /// and held until its document write returns; the drop wakes the worker.
+    #[cfg(feature = "semantic-search")]
+    pub(super) fn begin_vector_write(&self, namespace: &str, key: &[u8]) -> InFlightWrite {
+        self.in_flight.begin(namespace, key, self.notify.clone())
+    }
+
     /// For an upsert whose embedding text is empty: clear the document's vectors
     /// and any pending embed of its older text — but only if it has some, so a
     /// bulk load of documents without embedding text pays no extra writes.
@@ -752,7 +760,8 @@ impl DocumentText {
 
 /// Read what `namespace`'s document `key` holds now: its embedding text, built
 /// as a write builds it (the schema's embedding fields for a document store, the
-/// value itself for a KV store). The caller holds [`vector_kv::lock_doc_write`].
+/// value itself for a KV store). The caller has seen no write to it in progress
+/// ([`InFlightWrites`]).
 #[cfg(feature = "semantic-search")]
 pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace: &str, key: &[u8]) -> Result<DocumentText, DocStoreError> {
     // `list_namespaces` first: resolving a dropped namespace would recreate it.
@@ -1277,6 +1286,119 @@ mod tests {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "the entry was never rewritten: {entry:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        store.shutdown_vec_index_worker().await;
+    }
+
+    /// A write in progress is recorded until its guard drops, however the write
+    /// ends: counted per concurrent write, and removed when a request's future is
+    /// dropped mid-write (a client disconnect). A leaked entry would make the
+    /// worker skip its document for good.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_write_in_progress_is_forgotten_however_it_ends() {
+        let in_flight = Arc::new(InFlightWrites::default());
+        let a = in_flight.begin("ns", b"x", None);
+        let b = in_flight.begin("ns", b"x", None);
+        assert!(in_flight.contains("ns", b"x"));
+        assert!(!in_flight.contains("ns", b"y") && !in_flight.contains("other", b"x"));
+        drop(a);
+        assert!(in_flight.contains("ns", b"x"), "the second write is still in progress");
+        drop(b);
+        assert!(!in_flight.contains("ns", b"x"));
+
+        // A request cancelled mid-write: its future is dropped at an await.
+        let tracker = Arc::clone(&in_flight);
+        let write = async move {
+            let _writing = tracker.begin("ns", b"x", None);
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), write).await.is_err());
+        assert!(!in_flight.contains("ns", b"x"), "a cancelled write left its entry behind");
+    }
+
+    /// The race the in-progress check closes. A writer queues new text and the
+    /// worker embeds and completes it before the writer's document write lands;
+    /// a reindex holding an older snapshot then queues the old text. Checked
+    /// while the write is in progress, the old text would match the document
+    /// and be embedded, and the new document would be left with stale vectors.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_stale_entry_waits_for_a_write_in_progress() {
+        use crate::doc_store::vec_index_worker::{EntryCheck, check_entry};
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();
+        parent.put(b"x".to_vec(), b"old".to_vec()).await.unwrap();
+
+        let writing = store.begin_vector_write("sem_kv", b"x");
+        vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "new").await.unwrap();
+        let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
+        vector_kv::finish_embed(&store.db, &entry, &race_vectors()).await.unwrap(); // completed early
+        vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "old").await.unwrap(); // the reindex's snapshot
+        let stale = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
+        assert_eq!(
+            check_entry(&store.db, &store.schemas, &store.in_flight, &stale).await.unwrap(),
+            EntryCheck::InProgress
+        );
+
+        parent.put(b"x".to_vec(), b"new".to_vec()).await.unwrap(); // the write lands
+        drop(writing);
+        assert_eq!(
+            check_entry(&store.db, &store.schemas, &store.in_flight, &stale).await.unwrap(),
+            EntryCheck::Rewritten
+        );
+        let fixed = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
+        assert_eq!(fixed.text, "new");
+        assert_eq!(
+            check_entry(&store.db, &store.schemas, &store.in_flight, &fixed).await.unwrap(),
+            EntryCheck::Proceed
+        );
+    }
+
+    /// The running worker leaves an entry alone while its document has a write
+    /// in progress, and checks it once the write ends (the guard's drop wakes it).
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_worker_skips_a_document_with_a_write_in_progress() {
+        use crate::semantic_search::service::SemanticSearchConfig;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        store
+            .db
+            .namespace("sem_kv".to_string())
+            .await
+            .unwrap()
+            .put(b"x".to_vec(), b"on disk".to_vec())
+            .await
+            .unwrap();
+
+        let ctx = SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        });
+        let store = store.with_semantic_search(ctx);
+        let writing = store.begin_vector_write("sem_kv", b"x");
+        vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "being written").await.unwrap();
+        store.notify.as_ref().unwrap().notify_one(); // a pass while the write is in progress
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
+        assert_eq!(
+            (entry.text.as_str(), entry.retry_count),
+            ("being written", 0),
+            "touched while in progress"
+        );
+
+        drop(writing); // the write ends without its document write landing
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
+            if entry.as_ref().is_some_and(|e| e.text == "on disk") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never checked after the write ended: {entry:?}");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         store.shutdown_vec_index_worker().await;

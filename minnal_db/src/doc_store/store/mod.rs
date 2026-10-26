@@ -109,6 +109,10 @@ pub struct DocStore {
     vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Writes in progress per store, which a drop waits for.
     writes: Arc<WriteGate>,
+    /// Documents of semantic-search stores with a write in progress, which the
+    /// vector worker skips (see [`InFlightWrites`]).
+    #[cfg(feature = "semantic-search")]
+    in_flight: Arc<InFlightWrites>,
 }
 
 impl DocStore {
@@ -161,6 +165,8 @@ impl DocStore {
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
+            #[cfg(feature = "semantic-search")]
+            in_flight: Arc::default(),
         };
 
         admin::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas).await?;
@@ -247,6 +253,7 @@ impl DocStore {
             Arc::clone(&self.db),
             Arc::clone(&ctx),
             Arc::clone(&self.schemas),
+            Arc::clone(&self.in_flight),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );

@@ -40,37 +40,27 @@ impl DocStore {
         let value_bytes = schema.value_type.serialize_value(value)?;
         let ns = self.store_ns(namespace).await?;
 
-        // The vector-queue op first, then the value, as separate single ops under
-        // the key's write lock (see kv_put docs).
+        // The vector-queue op first, then the value, as separate single ops, with
+        // the key marked as being written until the value write returns (see
+        // kv_put docs).
         #[cfg(feature = "semantic-search")]
-        let mut queued = false;
-        #[cfg(feature = "semantic-search")]
-        let _doc = match &self.notify {
-            Some(_) if schema.is_semantic_search_enabled() => {
-                let guard = vector_kv::lock_doc_write(namespace, &key_bytes).await;
-                match value.as_str() {
-                    Some(text) if !text.is_empty() => {
-                        vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?;
-                        queued = true;
-                    }
-                    // No embedding text any more: drop the vectors, and any pending
-                    // embed, of the older value.
-                    _ => self.clear_doc_vectors_if_any(namespace, &key_bytes).await?,
-                }
-                Some(guard)
+        let _writing = if self.notify.is_some() && schema.is_semantic_search_enabled() {
+            let writing = self.begin_vector_write(namespace, &key_bytes);
+            match value.as_str() {
+                Some(text) if !text.is_empty() => vector_kv::enqueue_embed(&self.db, namespace, &key_bytes, text).await?,
+                // No embedding text any more: drop the vectors, and any pending
+                // embed, of the older value.
+                _ => self.clear_doc_vectors_if_any(namespace, &key_bytes).await?,
             }
-            _ => None,
+            Some(writing)
+        } else {
+            None
         };
 
         if skip_wal {
             ns.put_no_wal(key_bytes, value_bytes).await?;
         } else {
             ns.put(key_bytes, value_bytes).await?;
-        }
-
-        #[cfg(feature = "semantic-search")]
-        if queued && let Some(notify) = &self.notify {
-            notify.notify_one();
         }
 
         Ok(())
@@ -111,7 +101,7 @@ impl DocStore {
     /// `semantic_search_enabled = true`, the key is removed from the vector index
     /// first (a `Clear` tombstone in the queue, then the vectors — see
     /// [`DocStore::clear_doc_vectors`]), then the KV value is deleted.  Each is a
-    /// separate single-op write, under the key's write lock; ordering derived data
+    /// separate single-op write, with the key marked as being written; ordering derived data
     /// before the value means a crash between them leaves a value with a `Clear`
     /// tombstone, never an orphaned vector. The worker compares the tombstone with
     /// the store, finds the value still there, and re-embeds it.
@@ -122,7 +112,7 @@ impl DocStore {
 
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
-            let _doc = vector_kv::lock_doc_write(namespace, &key_bytes).await;
+            let _writing = self.begin_vector_write(namespace, &key_bytes);
             self.clear_doc_vectors(namespace, &key_bytes).await?;
             let ns = self.store_ns(namespace).await?;
             ns.delete(key_bytes).await?;

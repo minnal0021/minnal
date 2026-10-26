@@ -1098,6 +1098,7 @@ mod with_service {
             std::sync::Arc::clone(&store.db),
             std::sync::Arc::clone(&ctx),
             std::sync::Arc::clone(&store.schemas),
+            std::sync::Arc::clone(&store.in_flight),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             store.vector_index_config.clone(),
         );

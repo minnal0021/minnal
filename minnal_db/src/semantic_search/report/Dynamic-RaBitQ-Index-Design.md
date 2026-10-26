@@ -480,7 +480,7 @@ short-circuit, which could not see stale vectors).
 
 **Superseded since: rows 2–4 above.** Recovery no longer scans the documents.
 Every write queues its embed before it writes the document, and the worker
-checks each entry against the document under a per-document write lock, so the
+checks each entry against the document whenever no write to it is in progress, so the
 queue alone lists every document whose vectors may be out of date. Startup and
 on-demand reconciliation, `enqueue_embed_if_absent`, the vanished-document
 cleanup in `complete_embed` and the worker's startup-pass signal were removed.

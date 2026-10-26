@@ -27,9 +27,9 @@ impl DocStore {
     // Vector-index writes are decoupled from the write path.  When semantic
     // search is configured (`self.notify` is Some) and the namespace schema
     // has `semantic_search_enabled = true`, a pending-embed queue entry is
-    // written before the document, under the document's write lock — the
-    // background VecIndexWorker processes it asynchronously (see `vector_kv`'s
-    // *Queue first*).
+    // written before the document, with the document marked as being written
+    // (`InFlightWrites`) — the background VecIndexWorker processes it
+    // asynchronously (see `vector_kv`'s *Queue first*).
 
     /// Insert or replace a document.
     ///
@@ -55,15 +55,13 @@ impl DocStore {
         let value = serde_json::to_vec(&doc).map_err(|e| DocStoreError::InvalidId(e.to_string()))?;
 
         #[cfg(feature = "semantic-search")]
-        if let Some(notify) = &self.notify
-            && schema.is_semantic_search_enabled()
-        {
+        if self.notify.is_some() && schema.is_semantic_search_enabled() {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
             let ns = self.store_ns(namespace).await?;
             // The queue op first, then the document, as separate single ops
-            // under the document's write lock (no cross-namespace atomicity
-            // needed: the worker checks the entry against the document).
-            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
+            // (no cross-namespace atomicity needed: the worker checks the entry
+            // against the document once this write is no longer in progress).
+            let _writing = self.begin_vector_write(namespace, &key);
             if text.is_empty() {
                 // No embedding text any more: drop the vectors, and any pending
                 // embed, of the document's older text.
@@ -72,9 +70,6 @@ impl DocStore {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
             }
             ns.put(key.clone(), value).await?;
-            if !text.is_empty() {
-                notify.notify_one();
-            }
             return Ok(());
         }
 
@@ -102,21 +97,16 @@ impl DocStore {
         let ns = self.store_ns(namespace).await?;
 
         #[cfg(feature = "semantic-search")]
-        if let Some(notify) = &self.notify
-            && schema.is_semantic_search_enabled()
-        {
+        if self.notify.is_some() && schema.is_semantic_search_enabled() {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
             // As in `put`: the queue op first, then the document.
-            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
+            let _writing = self.begin_vector_write(namespace, &key);
             if text.is_empty() {
                 self.clear_doc_vectors_if_any(namespace, &key).await?;
             } else {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
             }
             ns.put_no_wal(key, value).await?;
-            if !text.is_empty() {
-                notify.notify_one();
-            }
             return Ok(());
         }
 
@@ -130,7 +120,7 @@ impl DocStore {
     /// `semantic_search_enabled = true`, the document is removed from the vector
     /// index first (a `Clear` tombstone in the queue, then the vectors — see
     /// [`DocStore::clear_doc_vectors`]), then the document is deleted.  Each is a
-    /// separate single-op write, under the document's write lock; ordering derived
+    /// separate single-op write, with the document marked as being written; ordering derived
     /// data before the document means a crash between them leaves a document with
     /// a `Clear` tombstone, never an orphaned vector. The worker compares the
     /// tombstone with the document, finds it still there, and re-embeds it.
@@ -143,7 +133,7 @@ impl DocStore {
         let schema = self.load_schema(namespace)?;
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
-            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
+            let _writing = self.begin_vector_write(namespace, &key);
             self.clear_doc_vectors(namespace, &key).await?;
             let ns = self.store_ns(namespace).await?;
             ns.delete(key).await?;

@@ -267,7 +267,6 @@ impl DocStore {
         }
         let key = id.to_bytes();
         let ns = self.store_ns(namespace).await?;
-        let _doc = vector_kv::lock_doc_write(namespace, &key).await;
         let value = match ns.get(key.clone()).await? {
             Some(v) => v,
             None => return Ok(VectorReindexOutcome::NotFound),
@@ -301,7 +300,6 @@ impl DocStore {
         }
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
         let ns = self.store_ns(namespace).await?;
-        let _doc = vector_kv::lock_doc_write(namespace, &key_bytes).await;
         let value = match ns.get(key_bytes.clone()).await? {
             Some(v) => v,
             None => return Ok(VectorReindexOutcome::NotFound),

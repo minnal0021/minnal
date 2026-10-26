@@ -456,7 +456,7 @@ The search path guards against this by fetching each hit's document and dropping
 
 #### Crash recovery: the queue comes first
 
-Writing a document and queuing its embed job are two separate writes, so a crash can fall between them. Every write therefore queues **first** and writes the document second, under a per-document write lock (`vector_kv::lock_doc_write`):
+Writing a document and queuing its embed job are two separate writes, so a crash can fall between them. Every write therefore queues **first** and writes the document second, and marks the document as being written from before the first write until the second returns (`InFlightWrites`, below):
 
 | Operation | First write | Second write |
 |---|---|---|
@@ -465,12 +465,14 @@ Writing a document and queuing its embed job are two separate writes, so a crash
 
 A crash between the two writes leaves a queue entry that does **not** describe the document: an embed of text the store never received, or a `Clear` for a document that is still there. It never leaves a changed document with nothing queued. So the queue alone lists every document whose vectors may be out of date, and recovery is the worker draining it, as it does after every start. Nothing scans the documents, so restart cost does not grow with the corpus.
 
-Before acting on an entry, the worker takes the same lock, reads the document's current embedding text and compares (`vector_kv::check_entry_against_document`):
+Before acting on an entry, the worker checks whether a write to its document is in progress. If one is, it skips the entry: that write's own queue entry describes where the document is going, and the write wakes the worker when it ends. Otherwise it reads the document's current embedding text and compares (`vector_kv::check_entry_against_document`):
 
 - An `Embed` entry describes the document if its text is the document's text. A `Clear` entry describes it if the document is absent or has no embedding text.
 - If the entry does not describe the document, it is rewritten to describe it (an `Embed` of the document's text, or a `Clear`) with a fresh retry count, and carried out on the next pass. The rewrite is conditional on the entry being unchanged, so it never replaces a newer write's entry.
 
-The lock is what makes a mismatch mean "a write was cut short". Without it, the worker could read the document between a live writer's two writes, rewrite the writer's new entry back to the old text, and the new document would never be embedded. The check also corrects entries that a bulk re-index (`reindex-all`) enqueued from an older snapshot of a document.
+Skipping documents with a write in progress is what makes a mismatch mean "a write was cut short". Without it, the worker could read the document between a live writer's two writes and rewrite the writer's new entry back to the old text. Or it could embed a re-index's older snapshot after completing the writer's entry but before the writer's document write landed. Either way the new document would be left with the wrong vectors. With it, the check also corrects entries that a bulk re-index (`reindex-all`) enqueued from an older snapshot of a document.
+
+**`InFlightWrites` is not a lock.** Nothing waits on it: a write adds its document (a 64-bit hash of store and key, with a count for concurrent writes) and removes it when the write returns, errors or is cancelled. The worker only looks. Reads never touch it, and stores without semantic search never use it. It holds about 16 bytes per write in progress, and nothing once writes finish.
 
 Crash tests: `vector_kv::crash_audit_tests` crashes before every write of an upsert, a delete, a re-embed racing a delete, and a stale re-index entry, under five flush patterns, then restarts with the worker alone and checks the vectors match the store. With the check disabled, every scenario fails.
 

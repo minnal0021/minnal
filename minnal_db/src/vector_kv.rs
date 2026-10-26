@@ -28,8 +28,8 @@
 //! retry always converges to a correct final state.
 //!
 //! ## Write (upsert) sequence
-//! 1. Caller queues the embed ([`enqueue_embed`]), then writes the document,
-//!    both under `lock_doc_write` (see *Queue first* below).
+//! 1. Caller queues the embed ([`enqueue_embed`]), then writes the document
+//!    (see *Queue first* below).
 //! 2. The worker obtains fresh `VectorIndex` entries from the embedding service.
 //! 3. [`upsert_vectors`] is called:
 //!    a. Sparse: reads old cluster IDs from `_sparse_vector_meta`, deletes stale keys.
@@ -37,8 +37,7 @@
 //!    c. Dense: overwrites `doc_id` key in `_dense_vector`.
 //!
 //! ## Delete sequence
-//! 1. Caller writes a `Clear` tombstone to the queue ([`clear_vectors`]), under
-//!    `lock_doc_write`.
+//! 1. Caller writes a `Clear` tombstone to the queue ([`clear_vectors`]).
 //! 2. [`delete_vector`] is called:
 //!    a. Reads cluster IDs from `_sparse_vector_meta`, deletes all sparse composite keys.
 //!    b. Deletes `doc_id` from `_dense_vector`.
@@ -50,10 +49,13 @@
 //! the **queue entry first** and the document second. A crash between them leaves
 //! a queue entry describing a write that never landed, never a changed document
 //! with nothing queued. Before acting on an entry the worker compares it with the
-//! document under the same lock ([`check_entry_against_document`]): an entry that
-//! does not describe the document is rewritten to describe it. So the queue alone
-//! lists every document whose vectors may be out of date, and recovery after a
-//! crash is draining it; nothing scans the documents.
+//! document ([`check_entry_against_document`]), but only when no write to that
+//! document is in progress (the document store tracks them, without locking:
+//! `doc_store::store::InFlightWrites`). An entry that does not describe the
+//! document is then a write cut short, or a re-index entry from an older
+//! snapshot, and is rewritten to describe it. So the queue alone lists every
+//! document whose vectors may be out of date, and recovery after a crash is
+//! draining it; nothing scans the documents.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -633,30 +635,6 @@ pub(crate) async fn lock_docs_vectors<'d>(namespace: &str, docs: impl IntoIterat
     guards
 }
 
-/// Serialise a document's write pair — its queue entry, then the document — with
-/// the worker's check of an entry against the document
-/// ([`check_entry_against_document`]).
-///
-/// Every document-store write to a semantic-search store holds this across both
-/// writes, and the worker holds it while it reads the document and compares. So
-/// the worker never sees a write half done: under the lock, an entry that does not
-/// describe the document can only be left by a write a crash (or an error) cut
-/// short, and rewriting it from the document is right. Without the lock the worker
-/// could read the document between a writer's two writes, rewrite the writer's
-/// new entry back to the old text, and the writer's document would then never be
-/// embedded.
-///
-/// Separate stripes from [`lock_doc_vectors`], which [`delete_vector`] takes
-/// inside a write holding this one: order is always this lock, then that one.
-#[cfg_attr(not(feature = "doc-store"), allow(dead_code))] // only the document store writes documents
-pub(crate) async fn lock_doc_write(namespace: &str, doc_id_bytes: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
-    DOC_WRITE_STRIPES[doc_vector_stripe(namespace, doc_id_bytes)].lock().await
-}
-
-#[cfg_attr(not(feature = "doc-store"), allow(dead_code))]
-static DOC_WRITE_STRIPES: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
-    std::sync::LazyLock::new(|| (0..DOC_VECTOR_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect());
-
 /// Delete the quantised vector for a document from the vector KV store.
 ///
 /// No-op if no vector entry exists for `doc_id_bytes` (the document was never
@@ -943,8 +921,8 @@ fn decode_queue_key(key: &[u8]) -> Option<(&str, &[u8])> {
 ///
 /// Every enqueue is WAL-backed, including the bulk re-index paths: the queue is
 /// the durable record of what still needs (re-)indexing and must survive a crash
-/// on every path. A document write calls this **before** writing the document,
-/// under `lock_doc_write` (see *Queue first* in the module docs).
+/// on every path. A document write calls this **before** writing the document
+/// (see *Queue first* in the module docs).
 pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<(), crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     crash_point!();
@@ -1248,13 +1226,13 @@ pub async fn record_queue_failure(db: &AsyncDb, entry: &QueueEntry, error: &str)
 /// the document; when it does not, the worker leaves it for the next pass, which
 /// finds the rewritten entry.
 ///
-/// `current` is the document's embedding text, read by the caller **while holding
-/// `lock_doc_write`** and still holding it now: `None` when the document is
-/// absent or has no embedding text. An `Embed` entry describes the document when
-/// its text is `current`; a `Clear` entry when `current` is `None`.
+/// `current` is the document's embedding text, read by the caller **after**
+/// seeing that no write to the document is in progress: `None` when the document
+/// is absent or has no embedding text. An `Embed` entry describes the document
+/// when its text is `current`; a `Clear` entry when `current` is `None`.
 ///
-/// Under the lock no write is half done, so a mismatch is a write cut short by a
-/// crash or an error after its queue entry: an upsert whose document never landed
+/// With no write in progress, none is half done, so a mismatch is a write cut
+/// short by a crash or an error after its queue entry: an upsert whose document never landed
 /// (the entry holds text the document does not), or a delete whose document
 /// delete never ran (a `Clear` for a document that is still there). The entry is
 /// rewritten to the document's state — an `Embed` of `current`, or a `Clear` —
@@ -3780,9 +3758,8 @@ mod crash_audit_tests {
     // ── What the document store does ──
 
     /// A document write, in `DocStore::put`'s order: the embed entry first, then
-    /// the document (WAL), under the document's write lock.
+    /// the document (WAL).
     async fn put_doc(db: &AsyncDb, doc: &[u8], text: &str) -> Result<(), crate::KVError> {
-        let _write = lock_doc_write(NS, doc).await;
         enqueue_embed(db, NS, doc, text).await?;
         crash_point!();
         db.namespace(NS.to_string()).await?.put(doc.to_vec(), text.as_bytes().to_vec()).await
@@ -3791,15 +3768,14 @@ mod crash_audit_tests {
     /// A document delete, in `DocStore::delete`'s order: the tombstone and the
     /// vectors first (`clear_vectors`), then the document (WAL).
     async fn delete_doc(db: &AsyncDb, doc: &[u8]) -> Result<(), crate::KVError> {
-        let _write = lock_doc_write(NS, doc).await;
         clear_vectors(db, NS, doc).await?;
         crash_point!();
         db.namespace(NS.to_string()).await?.delete(doc.to_vec()).await
     }
 
     /// The vector worker draining the queue: each entry is checked against its
-    /// document under the write lock, then carried out; a rewritten entry is
-    /// carried out on the next pass.
+    /// document (no write is in progress here: the scenarios run one step at a
+    /// time), then carried out; a rewritten entry is carried out on the next pass.
     async fn worker_pass(db: &AsyncDb) -> Result<(), crate::KVError> {
         for _ in 0..4 {
             let entries = list_queue_entries(db).await?;
@@ -3807,13 +3783,10 @@ mod crash_audit_tests {
                 break;
             }
             for entry in entries {
-                {
-                    let _write = lock_doc_write(NS, &entry.doc_id_bytes).await;
-                    let current = db.namespace(NS.to_string()).await?.get(entry.doc_id_bytes.clone()).await?;
-                    let current = current.map(|b| String::from_utf8(b).unwrap());
-                    if !check_entry_against_document(db, &entry, current.as_deref()).await? {
-                        continue;
-                    }
+                let current = db.namespace(NS.to_string()).await?.get(entry.doc_id_bytes.clone()).await?;
+                let current = current.map(|b| String::from_utf8(b).unwrap());
+                if !check_entry_against_document(db, &entry, current.as_deref()).await? {
+                    continue;
                 }
                 match entry.kind {
                     QueueEntryKind::Embed => finish_embed(db, &entry, &vectors_for_text(&entry.text)).await?,
