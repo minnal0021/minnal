@@ -22,6 +22,22 @@
 //! the same text's vectors again is harmless. See
 //! `vector_kv::make_vector_writes_durable` for what completing first used to lose.
 //!
+//! # Checked against the document
+//!
+//! Every write queues its entry *before* it writes the document (see
+//! `vector_kv`'s *Queue first*), so a crash or error between the two leaves an
+//! entry that does not describe the document: an embed of text the store never
+//! received, or a `Clear` for a document whose delete never ran. Before acting on
+//! an entry the worker reads the document and compares
+//! ([`vector_kv::check_entry_against_document`]), but only when no write to the
+//! document is in progress ([`InFlightWrites`]; nothing waits on it). An entry
+//! whose document has a write in progress is skipped: that write's own entry and
+//! wake-up bring it back. Otherwise no write is half done, and an entry that does
+//! not describe the document (a write cut short, or a re-index entry from an
+//! older snapshot) is rewritten to describe it and carried out on the next pass.
+//! That is the whole of crash recovery for the vector index: the worker drains
+//! the queue; nothing scans the documents.
+//!
 //! # Lifecycle
 //!
 //! [`VecIndexWorker::start`] spawns the task and returns a
@@ -67,7 +83,7 @@ use tokio::task::JoinSet;
 
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::schema_store::SchemaStore;
-use crate::doc_store::store::{NamespaceSemantics, SemanticSearchContext};
+use crate::doc_store::store::{DocumentText, InFlightWrites, NamespaceSemantics, SemanticSearchContext, document_text};
 use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
@@ -86,6 +102,48 @@ enum Processed {
     Done,
     /// Skipped: the namespace is being dropped, and the drop removes the entry.
     Dropped,
+    /// The entry did not describe its document and was rewritten (or replaced
+    /// meanwhile); the next pass carries out what is queued now.
+    Rewritten,
+    /// A write to the document is in progress; skipped, and that write's drop
+    /// wakes the worker again.
+    InProgress,
+}
+
+/// What [`check_entry`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EntryCheck {
+    /// The entry describes its document: carry it out.
+    Proceed,
+    /// The entry was rewritten to describe its document (or replaced meanwhile).
+    Rewritten,
+    /// A write to the document is in progress: leave the entry for now.
+    InProgress,
+    /// The document's store is gone: leave the entry to the drop.
+    StoreGone,
+}
+
+/// Compare `entry` with what its document holds now (see the module docs),
+/// rewriting it when it does not describe the document. The document is read
+/// only after `in_flight` shows no write to it in progress, so none is half done.
+pub(crate) async fn check_entry(
+    db: &AsyncDb,
+    schemas: &SchemaStore,
+    in_flight: &InFlightWrites,
+    entry: &QueueEntry,
+) -> Result<EntryCheck, DocStoreError> {
+    if in_flight.contains(&entry.namespace, &entry.doc_id_bytes) {
+        return Ok(EntryCheck::InProgress);
+    }
+    let current = document_text(db, schemas, &entry.namespace, &entry.doc_id_bytes).await?;
+    if matches!(current, DocumentText::StoreGone) {
+        return Ok(EntryCheck::StoreGone);
+    }
+    Ok(if vector_kv::check_entry_against_document(db, entry, current.as_text()).await? {
+        EntryCheck::Proceed
+    } else {
+        EntryCheck::Rewritten
+    })
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -135,24 +193,11 @@ pub struct VecIndexWorkerHandle {
     shutdown: Arc<AtomicBool>,
     notify: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
-    startup_pass: tokio::sync::watch::Receiver<bool>,
     /// The partition maintenance task, which this worker wakes; stopped with it.
     maintenance: Option<crate::doc_store::ivf_maintenance::MaintenanceHandle>,
 }
 
 impl VecIndexWorkerHandle {
-    /// Becomes `true` once the worker has made one pass over the queue it found
-    /// at startup (the work a crash left behind), or found it empty.
-    ///
-    /// Startup reconciliation waits for this. A delete interrupted by a crash
-    /// leaves the document, no vectors and a `Clear` tombstone; reconciliation
-    /// never overwrites a tombstone, so run before the tombstone is processed it
-    /// skipped the document, and the tombstone's removal then left it unindexed
-    /// until the next restart (crash-audit test `delete_survives_a_crash_anywhere`).
-    pub fn startup_pass(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.startup_pass.clone()
-    }
-
     /// Signal the worker to stop and await its exit.
     pub async fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -184,10 +229,11 @@ pub(crate) struct VecIndexWorker {
     /// Every store's schema: each entry is embedded with its namespace's
     /// model, dimension and chunking, read from its schema.
     schemas: Arc<SchemaStore>,
+    /// Documents with a write in progress, which the worker skips.
+    in_flight: Arc<InFlightWrites>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     config: Arc<VectorIndexConfig>,
-    startup_pass: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl VecIndexWorker {
@@ -201,27 +247,26 @@ impl VecIndexWorker {
         db: Arc<AsyncDb>,
         ctx: Arc<SemanticSearchContext>,
         schemas: Arc<SchemaStore>,
+        in_flight: Arc<InFlightWrites>,
         notify: Arc<Notify>,
         config: VectorIndexConfig,
     ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (pass_tx, pass_rx) = tokio::sync::watch::channel(false);
         let maintenance = crate::doc_store::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas));
         let worker = VecIndexWorker {
             db,
             ctx,
             schemas,
+            in_flight,
             notify: Arc::clone(&notify),
             shutdown: Arc::clone(&shutdown),
             config: Arc::new(config),
-            startup_pass: Arc::new(pass_tx),
         };
         let task = tokio::spawn(async move { worker.run().await });
         VecIndexWorkerHandle {
             shutdown,
             notify,
             task: Some(task),
-            startup_pass: pass_rx,
             maintenance: Some(maintenance),
         }
     }
@@ -232,7 +277,6 @@ impl VecIndexWorker {
         crate::doc_store::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schemas).await;
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
-        self.startup_pass.send_replace(true); // also covers an empty queue
         info!("vec index worker ready");
 
         loop {
@@ -406,6 +450,8 @@ impl VecIndexWorker {
             let mut any_failed = false;
             let mut indexed_count = 0usize;
             let mut failed_count = 0usize;
+            let mut rewritten_count = 0usize;
+            let mut in_progress_count = 0usize;
             // Embed entries whose vectors are written but not yet durable.
             let mut written: Vec<QueueEntry> = Vec::new();
 
@@ -452,6 +498,15 @@ impl VecIndexWorker {
                             doc_id_display(&entry.doc_id_bytes),
                         );
                     }
+                    Ok((_, Ok(Processed::InProgress))) => in_progress_count += 1,
+                    Ok((entry, Ok(Processed::Rewritten))) => {
+                        rewritten_count += 1;
+                        debug!(
+                            "vec index worker: ns='{}' doc='{}': the entry did not match the document; rewritten for the next pass",
+                            entry.namespace,
+                            doc_id_display(&entry.doc_id_bytes),
+                        );
+                    }
                     Ok((entry, Ok(Processed::Done))) => {
                         indexed_count += 1;
                         debug!(
@@ -491,9 +546,6 @@ impl VecIndexWorker {
                 any_failed |= failed > 0;
             }
 
-            // The first pass over the startup queue is done (see `startup_pass`).
-            self.startup_pass.send_replace(true);
-
             // Per-pass completion summary visible at INFO level.
             info!(
                 "vec index worker: pass complete — indexed={indexed_count} failed={failed_count} \
@@ -509,12 +561,20 @@ impl VecIndexWorker {
                 return;
             }
 
+            // Nothing moved but entries whose document has a write in progress:
+            // re-scanning now would spin until those writes finish. Each one wakes
+            // the worker when it does (its `InFlightWrite` drop).
+            if in_progress_count > 0 && indexed_count + failed_count + rewritten_count == 0 {
+                return;
+            }
+
             // Loop: re-scan so any entries that arrived while we were processing
             // this batch are also picked up without waiting for the next notify.
         }
     }
 
-    /// Carry out one queue entry.
+    /// Carry out one queue entry, after checking it against its document
+    /// ([`check_against_document`](Self::check_against_document)).
     ///
     /// **Embed:** embed `text`, quantise it with both multi-bit (single embedding)
     /// and single-bit (chunked embeddings), and write the vectors. The entry is
@@ -524,6 +584,11 @@ impl VecIndexWorker {
     ///
     /// **Clear:** delete the document's vectors and remove the tombstone.
     async fn process_one(&self, entry: &QueueEntry, semantics: Option<&Result<Arc<NamespaceSemantics>, String>>) -> Result<Processed, DocStoreError> {
+        // First, and whatever the namespace's settings: the check needs only the
+        // queue and the document.
+        if let Some(skip) = self.check_against_document(entry).await? {
+            return Ok(skip);
+        }
         match entry.kind {
             QueueEntryKind::Embed => {
                 let ns = match semantics {
@@ -579,6 +644,17 @@ impl VecIndexWorker {
                 Ok(Processed::Done)
             }
         }
+    }
+
+    /// [`check_entry`] for the worker: `None` when the entry describes its
+    /// document and should be carried out; otherwise what to report instead.
+    async fn check_against_document(&self, entry: &QueueEntry) -> Result<Option<Processed>, DocStoreError> {
+        Ok(match check_entry(&self.db, &self.schemas, &self.in_flight, entry).await? {
+            EntryCheck::Proceed => None,
+            EntryCheck::Rewritten => Some(Processed::Rewritten),
+            EntryCheck::InProgress => Some(Processed::InProgress),
+            EntryCheck::StoreGone => Some(Processed::Dropped),
+        })
     }
 
     /// Make a batch of written embed entries durable, then complete each one.

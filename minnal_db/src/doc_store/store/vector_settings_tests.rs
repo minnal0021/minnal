@@ -1098,10 +1098,12 @@ mod with_service {
             std::sync::Arc::clone(&store.db),
             std::sync::Arc::clone(&ctx),
             std::sync::Arc::clone(&store.schemas),
+            std::sync::Arc::clone(&store.in_flight),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             store.vector_index_config.clone(),
         );
-        let _ = worker.startup_pass().wait_for(|done| *done).await;
+        // A worker always makes its startup pass before it can see the
+        // shutdown, so the pass has run once `shutdown` returns.
         worker.shutdown().await;
         ctx.end_drop("g");
         let entries: Vec<_> = vector_kv::list_queue_entries(&store.db)

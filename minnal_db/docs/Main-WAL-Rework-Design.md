@@ -292,7 +292,7 @@ The minnal columns describe both logs as they were before this change.
 | Log reclaimed by | all column families past it; forced flushes | per-channel checkpoint | index cursor | per-entry statuses and counts; field-index pin | per-namespace safe offsets and a retired cut; forced flushes |
 | Log written in place | never | never | never | **yes**: each entry's status is rewritten when it is retired | never |
 | Vector index in a log | — | no, rebuilt from segments | no, built from the log | — | yes (the quantised codes) |
-| Atomic multi-namespace write | `WriteBatch` | per message | per write | none: ordered single writes, reconciled later | none |
+| Atomic multi-namespace write | `WriteBatch` | per message | per write | none: ordered single writes, ordered so a crash between them is recoverable | none |
 
 ### 2.5 What minnal gets right, so-so and wrong
 
@@ -325,8 +325,9 @@ The minnal columns describe both logs as they were before this change.
   vector-index-WAL fsync takes 3.56 ms instead of 2.34 ms
   (`Fewer-WAL-Fsyncs-Design.md`, §14).
 - *No multi-namespace batch.* It keeps the engine small; the price is one fsync
-  per namespace a logical operation touches, and reconciliation code for the
-  gaps between them.
+  per namespace a logical operation touches, and a write order chosen so a
+  crash between them is recoverable (the document store queues a document's
+  embed before writing the document).
 
 **Wrong.**
 

@@ -295,17 +295,14 @@ You cannot amend an indexed field's declaration directly — drop the index firs
 
 When a store has `semantic_search_enabled = true`, embedding happens **asynchronously** and never blocks a write:
 
-1. A `PUT`/upsert writes the document (or KV value) first, then enqueues a pending-embed marker in a durable system queue as a separate write. The request returns immediately — it does not contact the embedding service.
+1. A `PUT`/upsert enqueues a pending-embed marker in a durable system queue first, then writes the document (or KV value) as a separate write. The request returns immediately — it does not contact the embedding service.
 2. A background worker drains the queue: it calls the embedding service, writes the quantised `VectorIndex` to the companion namespaces (`{ns}_sparse_vector`, `{ns}_dense_vector`, `{ns}_sparse_vector_meta`), then removes the queue entry. The worker is idempotent and retries failures with back-off (`[vector_index]` config); the vector index is **eventually consistent** with the store.
 
 **Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
 
-**Reconciliation.** Because writing the document and queuing its embed job are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any such document, self-healing the gap automatically — no manual intervention needed. It runs two ways:
+**Crash recovery.** Writing the document and queuing its embed job are two separate steps, so the queue entry always comes first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the stored document and rewrites it to match. Deletes follow the same rule: the vectors go first, the document last. After a restart the worker just drains the queue; nothing scans the documents, so no manual step is needed. Details: [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
 
-- **Automatically on startup** — a fast, presence-only check that skips namespaces already fully covered, so a clean boot is cheap.
-- **On demand**, via [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) — a slower but more thorough pass that also catches corrupted (not just missing) vector-index entries.
-
-To force a full rebuild of one namespace regardless, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all). For the exact crash windows this closes, see [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
+To re-embed every document of one namespace (for example after corruption), use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
 
 Requires the external embedding service. Each store names its model in its schema (`vector_index.embedding_model`, default `gemma`), and the server asks the service for that model on every embedding request. Enabling semantic search probes the service and fails with `422` if it does not serve the model at the store's dimension; at startup the same probe only logs an error. No centroid file is needed: each store grows its own IVF partition from its documents (see [`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition)).
 
@@ -1279,8 +1276,9 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 > wired in *before* recovery, so the work the engine does on the way up bumps some
 > of them before any user request arrives — they are **regenerated, not persisted**.
 > In particular WAL replay does one `lsm.get` per replayed entry (bumping
-> `lookups`), and startup vector-index reconciliation re-enqueues missing docs via
-> the normal write path (bumping `puts` / `wal_writes` / `wal_bytes_appended`). So
+> `lookups`), and the vector worker's first pass over what a crash left queued
+> writes through the normal write path (bumping `puts` / `wal_writes` /
+> `wal_bytes_appended`). So
 > a non-zero reading right after a restart is expected and reflects startup
 > activity, not pre-restart totals — `lookups` in particular jumps with the size of
 > the WAL replay. Vector-search corruption counters
@@ -1627,7 +1625,6 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/attribute/{field}/repair` | `200` | Repair a field index that is missing updates |
 | `GET` | `/admin/indices/vector/corruption-metrics` | `200` | Per-namespace counts of vector entries skipped during search due to corrupt bytes (all namespaces) |
 | `GET` | `/admin/indices/{ns}/vector/corruption-metrics` | `200` | Corrupt-skip counts for a single namespace |
-| `POST` | `/admin/indices/vector/reconcile` | `202` | Background validating reconcile: re-enqueue docs missing **or with corrupt** vectors (all namespaces); `409` if already running |
 | `GET` | `/admin/indices/{ns}/progress` | `200` | Index progress for one namespace |
 | `POST` | `/admin/indices/{ns}/attribute/reindex-all` | `202` | Drop + rebuild all field indices |
 | `DELETE` | `/admin/indices/{ns}/attribute/drop-all` | `202` | Drop all field indices (no rebuild) |
@@ -1769,7 +1766,7 @@ curl -X DELETE http://localhost:8080/admin/indices/vector/query-cache
 
 Counts of vector-index entries that search **skipped because their bytes failed to deserialize** (corruption or a write-path bug), **broken down per namespace**. In-memory and monotonically increasing since startup (reset on restart) — sample twice to compute a rate, or alert on a non-zero/rising value. Split by pass: `sparse_corrupt_skipped` (Pass 1), `dense_corrupt_skipped` (Pass 2), plus their `total`. A namespace that has never recorded a corruption is omitted; an empty object means none have.
 
-A rising value means stored vectors are corrupt and queries are silently degraded; run the validating [`POST /admin/indices/vector/reconcile`](#post-adminindicesvectorreconcile) to re-embed the affected documents.
+A rising value means stored vectors are corrupt and queries are silently degraded; re-index the affected namespace with [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all) to re-embed its documents.
 
 ```bash
 curl http://localhost:8080/admin/indices/vector/corruption-metrics
@@ -1792,21 +1789,6 @@ curl http://localhost:8080/admin/indices/products/vector/corruption-metrics
 ```json
 { "sparse_corrupt_skipped": 2, "dense_corrupt_skipped": 0, "total_corrupt_skipped": 2 }
 ```
-
----
-
-#### `POST /admin/indices/vector/reconcile`
-
-**Validating** vector-index reconciliation across **every** semantic-search-enabled namespace. Re-enqueues any document whose committed vector index is missing a half (the sparse-meta or dense entry) **or is present but corrupt** — i.e. the stored bytes fail to deserialize — as well as documents left un-enqueued by the write-then-enqueue crash window. Unlike the cheap presence-only pass that runs at startup, this **deserializes every entry**, so it cannot use the count short-circuit and performs a full value-reading scan.
-
-Because that scan can take a long time on a large corpus, the endpoint **returns `202 Accepted` immediately and runs the pass in the background.** The re-enqueued count and any per-namespace failures are written to the server log (`info!` on completion, `warn!`/`error!` on failure); the async worker then embeds and indexes the re-enqueued documents. Overlapping runs are rejected with **`409 Conflict`** so the expensive scan cannot stack. A presence-only reconcile still runs automatically on startup.
-
-```bash
-curl -i -X POST http://localhost:8080/admin/indices/vector/reconcile
-# HTTP/1.1 202 Accepted    (or 409 if one is already running)
-```
-
-Watch the server log for `vector reconcile (validating) complete` and the re-enqueued count. To force a full rebuild of a single namespace regardless of current index state, use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all) instead.
 
 ---
 
@@ -1951,7 +1933,7 @@ Returns `404` when `{field}` has no active index in `{ns}` (unknown field, or st
 
 #### `POST /admin/indices/{ns}/vector/reindex-all`
 
-Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build). Returns `202 Accepted`.
+Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build). Returns `202 Accepted`. The store is read 1,000 documents at a time, so memory stays bounded on any store size; the vector entry of `GET /stores/{ns}/indices` shows the count enqueued so far (`total`). Writes may continue meanwhile: the worker checks every entry against its document before embedding, so a document changed during the reindex is embedded with its current text.
 
 ```bash
 curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all

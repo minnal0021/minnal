@@ -24,9 +24,9 @@ use crate::doc_store::schema_store::{SchemaStore, StoredSchema};
 use std::sync::Arc;
 
 use crate::{AsyncDb, AsyncNamespace, DbConfig, FieldId};
-use log::{debug, info};
 #[cfg(feature = "semantic-search")]
-use log::{error, warn};
+use log::warn;
+use log::{debug, info};
 
 use crate::doc_store::error::{DocStoreError, SchemaError};
 use crate::doc_store::hex::hex_to_bytes;
@@ -66,7 +66,7 @@ pub use types::*;
 #[allow(unused_imports)]
 use helpers::*;
 #[cfg(feature = "semantic-search")]
-use vector::reconcile_all_vector_indexes;
+pub(crate) use vector::{DocumentText, document_text};
 
 // ── DocStore ──────────────────────────────────────────────────────────────────
 
@@ -109,6 +109,10 @@ pub struct DocStore {
     vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Writes in progress per store, which a drop waits for.
     writes: Arc<WriteGate>,
+    /// Documents of semantic-search stores with a write in progress, which the
+    /// vector worker skips (see [`InFlightWrites`]).
+    #[cfg(feature = "semantic-search")]
+    in_flight: Arc<InFlightWrites>,
 }
 
 impl DocStore {
@@ -161,6 +165,8 @@ impl DocStore {
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
+            #[cfg(feature = "semantic-search")]
+            in_flight: Arc::default(),
         };
 
         admin::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas).await?;
@@ -229,13 +235,10 @@ impl DocStore {
     ///   parameters from [`with_vector_index_config`] (or built-in defaults).
     /// - `search_semantic` / `kv_search_semantic` still embed query text
     ///   synchronously (low count, TTL-cached).
-    /// - A one-shot **vector-index reconciliation** is spawned as a background
-    ///   task: it re-enqueues any document missing both a committed vector index
-    ///   entry embedded from its current text and a pending queue entry —
-    ///   closing the `put` / `kv_put` crash window (a document written but its
-    ///   embed enqueue lost). It runs asynchronously so startup is not blocked;
-    ///   if it fails it logs an error and the operator can re-run it via
-    ///   `POST /admin/indices/vector/reconcile`.
+    /// - The worker first drains whatever a crash left queued. Every write queues
+    ///   its embed before it writes the document, so that queue lists every
+    ///   document whose vectors may be out of date; nothing scans the documents
+    ///   at startup (see `vector_kv`'s *Queue first*).
     ///
     /// Call [`shutdown_vec_index_worker`] for a clean stop before dropping the
     /// store.
@@ -250,41 +253,10 @@ impl DocStore {
             Arc::clone(&self.db),
             Arc::clone(&ctx),
             Arc::clone(&self.schemas),
+            Arc::clone(&self.in_flight),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
-
-        // Spawn a one-shot startup reconciliation: re-enqueue any document whose
-        // vector index was never committed — including the `put_no_wal` window
-        // where a crash before the memtable flush drops a just-indexed vector.
-        // Runs in the background so it never blocks startup; on failure it logs
-        // an error and leaves recovery to the manual admin endpoint.
-        {
-            let db = Arc::clone(&self.db);
-            let schemas = Arc::clone(&self.schemas);
-            let notify = Arc::clone(&notify);
-            let mut startup_pass = handle.startup_pass();
-            tokio::spawn(async move {
-                // After the worker's first pass over what a crash left queued: see
-                // `VecIndexWorkerHandle::startup_pass`. (A worker gone before then
-                // drops the sender; reconcile anyway.)
-                let _ = startup_pass.wait_for(|done| *done).await;
-                info!("startup vector-index reconciliation: scanning for documents missing a vector index");
-                let outcome = reconcile_all_vector_indexes(&db, &schemas, false).await;
-                if outcome.failed > 0 {
-                    error!(
-                        "startup vector-index reconciliation did not fully complete ({} namespace(s) failed, {} doc(s) re-enqueued); \
-                         re-run it manually via POST /admin/indices/vector/reconcile",
-                        outcome.failed, outcome.reenqueued
-                    );
-                } else {
-                    info!("startup vector-index reconciliation complete: {} doc(s) re-enqueued", outcome.reenqueued);
-                }
-                if outcome.reenqueued > 0 {
-                    notify.notify_one();
-                }
-            });
-        }
 
         self.semantic_ctx = Some(ctx);
         self.notify = Some(notify);

@@ -28,18 +28,34 @@
 //! retry always converges to a correct final state.
 //!
 //! ## Write (upsert) sequence
-//! 1. Caller writes the document to the doc store.
-//! 2. Caller obtains fresh `VectorIndex` entries from the embedding service.
+//! 1. Caller queues the embed ([`enqueue_embed`]), then writes the document
+//!    (see *Queue first* below).
+//! 2. The worker obtains fresh `VectorIndex` entries from the embedding service.
 //! 3. [`upsert_vectors`] is called:
 //!    a. Sparse: reads old cluster IDs from `_sparse_vector_meta`, deletes stale keys.
 //!    b. Sparse: writes new composite keys to `_sparse_vector`, updates meta.
 //!    c. Dense: overwrites `doc_id` key in `_dense_vector`.
 //!
 //! ## Delete sequence
-//! 1. Caller deletes the document from the doc store.
+//! 1. Caller writes a `Clear` tombstone to the queue ([`clear_vectors`]).
 //! 2. [`delete_vector`] is called:
 //!    a. Reads cluster IDs from `_sparse_vector_meta`, deletes all sparse composite keys.
 //!    b. Deletes `doc_id` from `_dense_vector`.
+//! 3. Caller deletes the document from the doc store.
+//!
+//! ## Queue first
+//!
+//! The queue entry and the document are separate writes, so every writer writes
+//! the **queue entry first** and the document second. A crash between them leaves
+//! a queue entry describing a write that never landed, never a changed document
+//! with nothing queued. Before acting on an entry the worker compares it with the
+//! document ([`check_entry_against_document`]), but only when no write to that
+//! document is in progress (the document store tracks them, without locking:
+//! `doc_store::store::InFlightWrites`). An entry that does not describe the
+//! document is then a write cut short, or a re-index entry from an older
+//! snapshot, and is rewritten to describe it. So the queue alone lists every
+//! document whose vectors may be out of date, and recovery after a crash is
+//! draining it; nothing scans the documents.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -366,8 +382,8 @@ fn bytes_to_f32_vec_list(bytes: &[u8], expected_dim: usize) -> Option<Vec<Vec<f3
 // Format: `text_hash (8B BE u64) ‖ count (2B BE u16) ‖ [cluster_id (4B BE)] × count`
 //
 // The meta is a document's index record: which clusters hold its chunks (the only
-// way to find them again for a delete) and which text its vectors were embedded
-// from (so reconciliation can tell stale vectors from current ones).
+// way to find them again for a delete) and a hash of the text its vectors were
+// embedded from.
 
 /// Stable 64-bit FNV-1a hash of the text a document's vectors were embedded from.
 /// Stored in the meta; never `std`'s `DefaultHasher`, whose output may change
@@ -390,6 +406,7 @@ impl SparseMeta {
         self.postings.iter().map(|&(id, _)| id)
     }
 
+    #[cfg(test)]
     fn cluster_ids(&self) -> Vec<u32> {
         self.posting_ids().collect()
     }
@@ -445,7 +462,7 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 ///
 /// `vector_indexes` is the combined list of SingleBit and MultiBit quantised entries
 /// for the document, as returned by `embed_document`, and `text` is the text they
-/// were embedded from (its hash goes in the meta; see [`has_complete_vector_index`]).
+/// were embedded from (its hash goes in the meta).
 ///
 /// **Write order is load-bearing (crash safety).** The meta is the only record of
 /// which clusters hold the document's chunks, so it must list every key that can be
@@ -472,9 +489,8 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// WAL instead (`put_logged`, no fsync), and are durable once the caller's
 /// [`make_vector_writes_durable`] returns; the worker completes an entry only
 /// after that. A crash before it can lose them, but the entry is then still
-/// queued and redone, and vector-index reconciliation treats a partial index as
-/// not-indexed (see [`has_complete_vector_index`]). The stale-cluster `delete`s
-/// remain WAL-backed — they are tiny key-only tombstones.
+/// queued and redone. The stale-cluster `delete`s remain WAL-backed — they are
+/// tiny key-only tombstones.
 ///
 /// Returns how the document's entries moved between postings, for the
 /// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
@@ -649,39 +665,6 @@ pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
     Ok(delta)
 }
 
-/// Return `true` only if a document has a **complete, current** committed vector
-/// index: the sparse meta record **and** the dense entry, embedded from `text` (the
-/// document's current embedding text).
-///
-/// The text check catches stale vectors. A document write and its embed enqueue
-/// are separate writes, so a crash between them saves the new text with no queue
-/// entry for it; the old vectors would otherwise look complete forever. The meta
-/// records the hash of the text its vectors came from, and a mismatch reads as
-/// incomplete, so reconciliation re-embeds (crash-audit test
-/// `reembed_survives_a_crash_anywhere`).
-///
-/// A normally-indexed document always has both: the embed pipeline emits chunked
-/// SingleBit entries (sparse) *and* a whole-doc MultiBit entry (dense). Requiring
-/// both — rather than either — means reconciliation re-enqueues a document whose
-/// index is only *partially* committed (e.g. a crash that flushed the sparse side
-/// but lost the no-WAL dense write, or vice versa) instead of skipping it as
-/// "indexed". The re-embed regenerates the missing half idempotently.
-///
-/// Used by startup reconciliation to skip documents that are already fully indexed.
-pub async fn has_complete_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
-    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    let current = sparse_meta_ns
-        .get(doc_id_bytes.to_vec())
-        .await?
-        .and_then(|b| decode_sparse_meta(&b))
-        .is_some_and(|meta| meta.text_hash == text_hash(text));
-    if !current {
-        return Ok(false);
-    }
-    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
-    Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
-}
-
 /// Return `true` if a document has **any** vector-index state that clearing it
 /// would have to remove: a sparse meta record, a dense entry, or a queue entry.
 ///
@@ -698,52 +681,6 @@ pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &
     }
     let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
     Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
-}
-
-/// Like [`has_complete_vector_index`], but also verifies the committed bytes
-/// **deserialize** — catching entries that are present but corrupt, which the
-/// presence-only check counts as indexed.
-///
-/// Reads and deserializes the sparse-meta, every sparse composite entry, and the
-/// dense entry for `doc_id_bytes`. Returns `false` if any is missing, undecodable,
-/// or fails [`VectorIndex::list_from_bytes`], so the *validating* reconcile pass
-/// re-enqueues the document (a re-embed regenerates both halves idempotently).
-///
-/// Substantially more expensive than [`has_complete_vector_index`] — it value-reads
-/// and deserializes per entry rather than checking key presence — so only the
-/// on-demand validating reconcile (`reconcile_all_vector_indexes(.., check_bytes=true)`)
-/// uses it; the cheap startup pass keeps the presence check.
-pub async fn has_valid_vector_index(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
-    // Sparse meta: present, decodable, and embedded from the current text.
-    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? else {
-        return Ok(false);
-    };
-    let Some(meta) = decode_sparse_meta(&meta_bytes) else {
-        return Ok(false);
-    };
-    if meta.text_hash != text_hash(text) {
-        return Ok(false);
-    }
-    let cluster_ids = meta.cluster_ids();
-
-    // Each sparse composite entry: present and deserializes.
-    let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-    for cluster_id in &cluster_ids {
-        let Some(bytes) = sparse_ns.get(composite_key::encode(*cluster_id, doc_id_bytes)).await? else {
-            return Ok(false);
-        };
-        if VectorIndex::list_from_bytes(&bytes).is_err() {
-            return Ok(false);
-        }
-    }
-
-    // Dense: present and deserializes.
-    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
-    let Some(dense_bytes) = dense_ns.get(doc_id_bytes.to_vec()).await? else {
-        return Ok(false);
-    };
-    Ok(VectorIndex::list_from_bytes(&dense_bytes).is_ok())
 }
 
 // ── KV-backed VectorKvStore ───────────────────────────────────────────────────
@@ -982,10 +919,10 @@ fn decode_queue_key(key: &[u8]) -> Option<(&str, &[u8])> {
 /// that only the latest `text` is embedded (deduplication).  The entry is
 /// written with `retry_count = 0`.
 ///
-/// Every enqueue is WAL-backed, including the bulk re-index paths: the vector
-/// index itself is written no-WAL ([`upsert_vectors`]), so the queue is the
-/// durable source of truth for what still needs (re-)indexing and must survive
-/// a crash on every path.
+/// Every enqueue is WAL-backed, including the bulk re-index paths: the queue is
+/// the durable record of what still needs (re-)indexing and must survive a crash
+/// on every path. A document write calls this **before** writing the document
+/// (see *Queue first* in the module docs).
 pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<(), crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     crash_point!();
@@ -996,30 +933,6 @@ pub async fn enqueue_embed(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], t
         )
         .await?;
     Ok(())
-}
-
-/// Enqueue an embed for a document **only if it has no queue entry at all**;
-/// returns whether it enqueued. Atomic (a `merge` under the key's stripe).
-///
-/// For callers that decide from a snapshot — reconciliation — and so must never
-/// overwrite what a live write queued since: a newer text (the snapshot's would
-/// win and leave stale vectors) or a `Clear` tombstone (the deleted document
-/// would be embedded again).
-pub async fn enqueue_embed_if_absent(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8], text: &str) -> Result<bool, crate::KVError> {
-    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    let entry = encode_queue_value(QueueEntryKind::Embed, text, 0, None);
-    crash_point!();
-    let result = queue_ns
-        .merge(queue_key(namespace, doc_id_bytes), Vec::new(), move |existing, _| match existing {
-            Some(_) => Err(crate::KVError::MergeAborted("a queue entry already exists".into())),
-            None => Ok(Some(entry)),
-        })
-        .await;
-    match result {
-        Ok(_) => Ok(true),
-        Err(crate::KVError::MergeAborted(_)) => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 /// Update an existing queue entry's retry count and last error (durable single-op write).
@@ -1110,6 +1023,33 @@ pub async fn queued_namespaces(db: &AsyncDb) -> Result<std::collections::BTreeSe
         .iter()
         .filter_map(|key| decode_queue_key(key).map(|(namespace, _)| namespace.to_owned()))
         .collect())
+}
+
+/// The key prefix every queue entry of `namespace` starts with, for paging
+/// through one namespace's entries with [`queue_page`].
+pub fn queue_prefix(namespace: &str) -> Vec<u8> {
+    queue_key(namespace, &[])
+}
+
+/// One page of at most `limit` queue entries with keys in `[start, end)`, and the
+/// key the next page starts at (`None` after the last page). Unlike
+/// [`list_queue_entries`], memory is bounded by the page.
+pub async fn queue_page(
+    db: &AsyncDb,
+    start: Vec<u8>,
+    end: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<QueueEntry>, Option<Vec<u8>>), crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let (pairs, next) = queue_ns.scan(Some(start), end, limit).await?;
+    let entries = pairs
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let (namespace, doc_id_bytes) = decode_queue_key(&key)?;
+            Some(decode_queue_value(&value)?.into_entry(namespace, doc_id_bytes))
+        })
+        .collect();
+    Ok((entries, next))
 }
 
 /// Look up a single pending embedding queue entry by namespace and document ID.
@@ -1214,9 +1154,9 @@ pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[Ve
 /// [`complete_embed`] removes the queue entry (no-WAL: durable at the queue's
 /// next flush, which can come at any moment). Completing before the
 /// sync would let a crash keep the completion and the deletes but lose the new
-/// vectors. A re-embedded document would then keep its *old* dense entry, which
-/// `has_complete_vector_index` accepts, so nothing would re-enqueue it: it would
-/// stay indexed under its old text, minus the chunks whose clusters changed. With
+/// vectors. A re-embedded document would then keep its *old* dense entry with
+/// nothing queued to replace it: it would stay indexed under its old text, minus
+/// the chunks whose clusters changed. With
 /// completion after this barrier, a crash before it leaves the queue entry in
 /// place and the restarted worker redoes it. Regression test:
 /// `crash_before_reembed_is_synced_keeps_new_vectors`.
@@ -1229,43 +1169,10 @@ pub async fn make_vector_writes_durable(db: &AsyncDb) -> Result<(), crate::KVErr
 /// the document was cleared while it was being embedded, the vectors just written
 /// are removed again.
 pub async fn complete_embed(db: &AsyncDb, entry: &QueueEntry) -> Result<PostingDelta, crate::KVError> {
-    // The vectors just written must belong to a document that still exists. A
-    // delete normally leaves a `Clear` tombstone that the completion below sees,
-    // but an entry written from a snapshot (reconciliation) can land after that
-    // tombstone was already processed, and would otherwise index a deleted
-    // document for good. The cleanup runs **before** the completion: the other
-    // way round, a crash between the two kept the completion and the vectors,
-    // with nothing left to remove them (crash-audit test
-    // `embedding_a_vanished_document_survives_a_crash_anywhere`). A delete landing
-    // after this check leaves a tombstone for the next pass. (`list_namespaces`
-    // first: resolving a dropped namespace would recreate it.)
-    let doc_exists = |db: &AsyncDb| {
-        let (ns, doc) = (entry.namespace.clone(), entry.doc_id_bytes.clone());
-        let db = db.clone();
-        async move {
-            if !db.list_namespaces().iter().any(|(name, _)| *name == ns) {
-                return Ok::<_, crate::KVError>(None);
-            }
-            Ok(Some(db.namespace(ns).await?.get(doc).await?.is_some()))
-        }
-    };
-    let vanished = doc_exists(db).await? == Some(false);
-    let mut delta = PostingDelta::default();
-    if vanished {
-        delta = delete_vector(db, &entry.namespace, &entry.doc_id_bytes).await?;
-    }
     match complete_entry(db, entry).await? {
-        Completion::Superseded => {}
-        Completion::Cleared => delta.extend(process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?),
-        // Re-created with the same text between the check and the completion: its
-        // vectors were just removed, so queue it again.
-        Completion::Done => {
-            if vanished && doc_exists(db).await? == Some(true) {
-                enqueue_embed_if_absent(db, &entry.namespace, &entry.doc_id_bytes, &entry.text).await?;
-            }
-        }
+        Completion::Done | Completion::Superseded => Ok(PostingDelta::default()),
+        Completion::Cleared => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await,
     }
-    Ok(delta)
 }
 
 /// Process a [`QueueEntryKind::Clear`] tombstone: delete the document's vectors,
@@ -1310,6 +1217,55 @@ pub async fn record_queue_failure(db: &AsyncDb, entry: &QueueEntry, error: &str)
     match result {
         Ok(written) => Ok(written.as_deref().and_then(decode_queue_value).map(|v| v.retry_count)),
         Err(crate::KVError::MergeAborted(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Compare a queue entry with what its document holds now, and rewrite the entry
+/// when it does not describe the document. Returns whether the entry describes
+/// the document; when it does not, the worker leaves it for the next pass, which
+/// finds the rewritten entry.
+///
+/// `current` is the document's embedding text, read by the caller **after**
+/// seeing that no write to the document is in progress: `None` when the document
+/// is absent or has no embedding text. An `Embed` entry describes the document
+/// when its text is `current`; a `Clear` entry when `current` is `None`.
+///
+/// With no write in progress, none is half done, so a mismatch is a write cut
+/// short by a crash or an error after its queue entry: an upsert whose document never landed
+/// (the entry holds text the document does not), or a delete whose document
+/// delete never ran (a `Clear` for a document that is still there). The entry is
+/// rewritten to the document's state — an `Embed` of `current`, or a `Clear` —
+/// with a fresh retry count. The rewrite is conditional on the entry still being
+/// `entry`, so a newer entry is never replaced. It also corrects an entry
+/// enqueued from an older snapshot of the document (a bulk re-index).
+pub async fn check_entry_against_document(db: &AsyncDb, entry: &QueueEntry, current: Option<&str>) -> Result<bool, crate::KVError> {
+    let describes = match (entry.kind, current) {
+        (QueueEntryKind::Embed, Some(text)) => text == entry.text,
+        (QueueEntryKind::Clear, None) => true,
+        _ => false,
+    };
+    if describes {
+        return Ok(true);
+    }
+    let rewritten = match current {
+        Some(text) => encode_queue_value(QueueEntryKind::Embed, text, 0, None),
+        None => encode_queue_value(QueueEntryKind::Clear, "", 0, None),
+    };
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let expected = entry.clone();
+    crash_point!();
+    let result = queue_ns
+        .merge(queue_key(&entry.namespace, &entry.doc_id_bytes), Vec::new(), move |existing, _| {
+            match existing.and_then(decode_queue_value) {
+                Some(v) if v.is(&expected) => Ok(Some(rewritten)),
+                // Replaced or removed meanwhile: leave the newer state alone.
+                _ => Err(crate::KVError::MergeAborted(ABORT_SUPERSEDED.into())),
+            }
+        })
+        .await;
+    match result {
+        Ok(_) | Err(crate::KVError::MergeAborted(_)) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1954,7 +1910,7 @@ mod queue_race_tests {
         finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
 
         assert!(
-            !has_complete_vector_index(&db, "docs", b"x", "text").await.unwrap() && dense_tag(&db, b"x").await.is_none(),
+            !has_any_vector_state(&db, "docs", b"x").await.unwrap() && dense_tag(&db, b"x").await.is_none(),
             "a deleted doc must not keep vectors written by an embed that was in flight"
         );
     }
@@ -2204,38 +2160,67 @@ mod queue_race_tests {
         assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none());
     }
 
-    /// Vectors for a document that no longer exists must not survive. An entry
-    /// written from a snapshot (reconciliation) can land after the delete's
-    /// `Clear` tombstone was already processed, so nothing else would remove them.
+    /// An entry for a document that no longer exists (a bulk re-index enqueued it
+    /// from an older snapshot, or an upsert's document write never landed) is
+    /// rewritten to a `Clear`, before anything is embedded.
     #[tokio::test]
-    async fn embedding_a_deleted_document_leaves_no_vectors() {
+    async fn an_entry_for_a_missing_document_becomes_a_clear() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await; // "docs" exists, but no document "gone" in it
         enqueue_embed(&db, "docs", b"gone", "stale text").await.unwrap();
-        let in_flight = snapshot(&db, b"gone").await;
-        finish_embed(&db, &in_flight, &vectors_for(1.0)).await.unwrap();
-        assert_eq!(dense_tag(&db, b"gone").await, None, "vectors of a deleted document were kept");
+        let entry = snapshot(&db, b"gone").await;
+        assert!(!check_entry_against_document(&db, &entry, None).await.unwrap());
+        let rewritten = snapshot(&db, b"gone").await;
+        assert_eq!(rewritten.kind, QueueEntryKind::Clear);
+        assert!(check_entry_against_document(&db, &rewritten, None).await.unwrap());
+        process_clear(&db, "docs", b"gone").await.unwrap();
         assert!(!has_any_vector_state(&db, "docs", b"gone").await.unwrap(), "no vector state may remain");
     }
 
-    /// Reconciliation enqueues from a snapshot, so it must never overwrite what a
-    /// live write queued since: newer text, or a delete's `Clear` tombstone (which
-    /// would re-index a deleted document).
+    /// An entry that describes the document is left alone; one that does not is
+    /// rewritten to the document's state, with a fresh retry count.
     #[tokio::test]
-    async fn enqueue_if_absent_never_overwrites_a_newer_entry_or_a_tombstone() {
+    async fn an_entry_is_rewritten_to_what_the_document_holds() {
         let dir = TempDir::new().unwrap();
         let db = open_db(&dir).await;
 
-        enqueue_embed(&db, "docs", b"a", "newer text").await.unwrap();
-        assert!(!enqueue_embed_if_absent(&db, "docs", b"a", "snapshot text").await.unwrap());
-        assert_eq!(snapshot(&db, b"a").await.text, "newer text");
+        enqueue_embed(&db, "docs", b"a", "text").await.unwrap();
+        let entry = snapshot(&db, b"a").await;
+        assert!(check_entry_against_document(&db, &entry, Some("text")).await.unwrap());
+        assert_eq!(snapshot(&db, b"a").await.text, "text");
 
-        clear_vectors(&db, "docs", b"b").await.unwrap(); // a delete's tombstone
-        assert!(!enqueue_embed_if_absent(&db, "docs", b"b", "snapshot text").await.unwrap());
-        assert_eq!(snapshot(&db, b"b").await.kind, QueueEntryKind::Clear);
+        // An upsert whose document write never landed: the entry holds new text.
+        enqueue_embed(&db, "docs", b"b", "never written").await.unwrap();
+        let entry = snapshot(&db, b"b").await;
+        record_queue_failure(&db, &entry, "boom").await.unwrap();
+        let entry = snapshot(&db, b"b").await;
+        assert!(!check_entry_against_document(&db, &entry, Some("on disk")).await.unwrap());
+        let rewritten = snapshot(&db, b"b").await;
+        assert_eq!(
+            (rewritten.kind, rewritten.text.as_str(), rewritten.retry_count),
+            (QueueEntryKind::Embed, "on disk", 0)
+        );
 
-        assert!(enqueue_embed_if_absent(&db, "docs", b"c", "text").await.unwrap(), "absent: enqueue");
-        assert_eq!(snapshot(&db, b"c").await.text, "text");
+        // A delete whose document delete never ran: a `Clear` for a live document.
+        clear_vectors(&db, "docs", b"c").await.unwrap();
+        let entry = snapshot(&db, b"c").await;
+        assert!(!check_entry_against_document(&db, &entry, Some("still here")).await.unwrap());
+        let rewritten = snapshot(&db, b"c").await;
+        assert_eq!((rewritten.kind, rewritten.text.as_str()), (QueueEntryKind::Embed, "still here"));
+    }
+
+    /// The rewrite is conditional: an entry replaced since it was read is newer
+    /// than the check, and is left alone.
+    #[tokio::test]
+    async fn a_newer_entry_is_never_rewritten() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"a", "old").await.unwrap();
+        let stale = snapshot(&db, b"a").await;
+        enqueue_embed(&db, "docs", b"a", "newer").await.unwrap();
+        assert!(!check_entry_against_document(&db, &stale, None).await.unwrap());
+        let kept = snapshot(&db, b"a").await;
+        assert_eq!((kept.kind, kept.text.as_str()), (QueueEntryKind::Embed, "newer"));
     }
 
     // ── Completion waits for durability (design doc M0-1) ──
@@ -2280,8 +2265,8 @@ mod queue_race_tests {
     /// A re-embed must be durable before its queue entry is completed. The worker
     /// used to complete it (WAL-backed, durable at once) while the new vectors were
     /// still no-WAL in memory, so a crash kept the completion and the stale-key
-    /// deletes but lost the new vectors: the document kept its old dense entry,
-    /// lost its moved chunk, and looked complete to reconciliation.
+    /// deletes but lost the new vectors: the document kept its old dense entry and
+    /// lost its moved chunk, with nothing queued to repair it.
     ///
     /// The completion now skips the WAL, so it survives the crash only if the
     /// queue was flushed; both cases are checked. The new vectors must be on disk
@@ -3715,8 +3700,8 @@ pub(crate) mod eval_indexing {
 // patterns: before the crash, some vector namespaces may already have been
 // flushed by their own memtable filling up, independently of the others. The
 // database is then dropped without shutting down, reopened, and put through what
-// production runs after a restart (reconciliation, then the worker draining the
-// queue), and every invariant is checked.
+// production runs after a restart (the worker draining the queue), and every
+// invariant is checked.
 
 #[cfg(test)]
 mod crash_audit_tests {
@@ -3772,11 +3757,12 @@ mod crash_audit_tests {
 
     // ── What the document store does ──
 
-    /// A document write: the document (WAL), then its embed entry.
+    /// A document write, in `DocStore::put`'s order: the embed entry first, then
+    /// the document (WAL).
     async fn put_doc(db: &AsyncDb, doc: &[u8], text: &str) -> Result<(), crate::KVError> {
+        enqueue_embed(db, NS, doc, text).await?;
         crash_point!();
-        db.namespace(NS.to_string()).await?.put(doc.to_vec(), text.as_bytes().to_vec()).await?;
-        enqueue_embed(db, NS, doc, text).await
+        db.namespace(NS.to_string()).await?.put(doc.to_vec(), text.as_bytes().to_vec()).await
     }
 
     /// A document delete, in `DocStore::delete`'s order: the tombstone and the
@@ -3787,23 +3773,25 @@ mod crash_audit_tests {
         db.namespace(NS.to_string()).await?.delete(doc.to_vec()).await
     }
 
-    /// One worker pass over the whole queue, as the vector worker runs it.
+    /// The vector worker draining the queue: each entry is checked against its
+    /// document (no write is in progress here: the scenarios run one step at a
+    /// time), then carried out; a rewritten entry is carried out on the next pass.
     async fn worker_pass(db: &AsyncDb) -> Result<(), crate::KVError> {
-        for entry in list_queue_entries(db).await? {
-            match entry.kind {
-                QueueEntryKind::Embed => finish_embed(db, &entry, &vectors_for_text(&entry.text)).await?,
-                QueueEntryKind::Clear => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?,
-            };
-        }
-        Ok(())
-    }
-
-    /// Startup reconciliation: enqueue (if absent) every document whose vector
-    /// index is not complete.
-    async fn reconcile(db: &AsyncDb) -> Result<(), crate::KVError> {
-        for (doc, text) in db.namespace(NS.to_string()).await?.iter().await? {
-            if !has_complete_vector_index(db, NS, &doc, "text").await? {
-                enqueue_embed_if_absent(db, NS, &doc, std::str::from_utf8(&text).unwrap()).await?;
+        for _ in 0..4 {
+            let entries = list_queue_entries(db).await?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                let current = db.namespace(NS.to_string()).await?.get(entry.doc_id_bytes.clone()).await?;
+                let current = current.map(|b| String::from_utf8(b).unwrap());
+                if !check_entry_against_document(db, &entry, current.as_deref()).await? {
+                    continue;
+                }
+                match entry.kind {
+                    QueueEntryKind::Embed => finish_embed(db, &entry, &vectors_for_text(&entry.text)).await?,
+                    QueueEntryKind::Clear => process_clear(db, &entry.namespace, &entry.doc_id_bytes).await?,
+                };
             }
         }
         Ok(())
@@ -3898,11 +3886,9 @@ mod crash_audit_tests {
                 };
                 db.flush_namespaces(names).await.unwrap();
                 db.crash().await; // crash: unflushed no-WAL writes are lost
-                // Restart, in production's order: drain the queue left by the
-                // crash, then reconcile, then process what reconciliation queued.
+                // Restart: the worker drains the queue the crash left. Nothing
+                // scans the documents.
                 let db = open(&dir).await;
-                worker_pass(&db).await.unwrap();
-                reconcile(&db).await.unwrap();
                 worker_pass(&db).await.unwrap();
                 if let Err(e) = check(&db, docs).await {
                     failures.push(format!("crash before write {n}, flushed {flushed:?}: {e}"));
@@ -3978,20 +3964,36 @@ mod crash_audit_tests {
         assert_clean("delete racing a re-embed", failures);
     }
 
-    /// Reconciliation enqueues from a snapshot; its entry can land after the
-    /// document's delete was fully processed, so the worker embeds a document
-    /// that no longer exists and must remove what it wrote.
+    /// A bulk re-index enqueues from a snapshot; its entry can land after the
+    /// document's delete was fully processed. The worker must not index a
+    /// document that no longer exists.
     #[tokio::test]
-    async fn embedding_a_vanished_document_survives_a_crash_anywhere() {
+    async fn a_stale_entry_for_a_deleted_document_survives_a_crash_anywhere() {
         fn stale(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
             Box::pin(async move {
                 delete_doc(db, b"x").await?;
                 worker_pass(db).await?;
-                enqueue_embed_if_absent(db, NS, b"x", "old text").await?; // reconciliation's stale snapshot
+                enqueue_embed(db, NS, b"x", "old text").await?; // the re-index's stale snapshot
                 worker_pass(db).await
             })
         }
         let failures = audit(index_old, stale, &[b"x"]).await;
-        assert_clean("embedding a vanished document", failures);
+        assert_clean("a stale entry for a deleted document", failures);
+    }
+
+    /// A re-embed and a delete back to back, each cut short by the crash at every
+    /// point: the queue alone must bring the index back to the document.
+    #[tokio::test]
+    async fn reembed_then_delete_survives_a_crash_anywhere() {
+        fn both(db: &AsyncDb) -> Pin<Box<dyn Future<Output = Result<(), crate::KVError>> + '_>> {
+            Box::pin(async move {
+                put_doc(db, b"x", "new text").await?;
+                delete_doc(db, b"x").await?;
+                put_doc(db, b"y", "other text").await?;
+                worker_pass(db).await
+            })
+        }
+        let failures = audit(index_old, both, &[b"x", b"y"]).await;
+        assert_clean("re-embed then delete", failures);
     }
 }

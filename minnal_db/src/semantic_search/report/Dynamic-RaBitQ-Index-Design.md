@@ -478,6 +478,15 @@ short-circuit, which could not see stale vectors).
 
 **Status: passed.**
 
+**Superseded since: rows 2–4 above.** Recovery no longer scans the documents.
+Every write queues its embed before it writes the document, and the worker
+checks each entry against the document whenever no write to it is in progress, so the
+queue alone lists every document whose vectors may be out of date. Startup and
+on-demand reconciliation, `enqueue_embed_if_absent`, the vanished-document
+cleanup in `complete_embed` and the worker's startup-pass signal were removed.
+The crash audit now restarts with the worker alone. See
+`Semantic-Search-Architecture.md`, *Crash recovery: the queue comes first*.
+
 ---
 
 ## M1 — Rotation
@@ -1572,7 +1581,7 @@ record.
 | 6. Delete | Per doc, under the lock: remove P from the doc's meta, then delete `P‖doc`. Rescan P; it must be empty | WAL | `Copied` |
 | 7. Retire | Mark P `Retired`; publish the snapshot | WAL | `Done` |
 
-**Recovery** runs at open, before the vector worker and reconciliation start.
+**Recovery** runs at open, before the vector worker starts.
 It finishes every record that is not `Done`, in `op_id` order:
 
 | Last durable state | Recovery |
@@ -1619,9 +1628,9 @@ moves the entries the plan selects from neighbouring postings.
    snapshot and then waits until every insert (and search) that entered before
    it has left, so once it returns no insert that routed with the old snapshot
    is still writing to P, and no new insert or search ever waits for it.
-5. **Recovery comes first.** Reconciliation treats `Draining` and `Retired`
-   postings as part of the journal's work: an entry under a retired prefix is
-   moved, not reported as an orphan.
+5. **Recovery comes first.** `Draining` and `Retired` postings are part of
+   the journal's work: an entry under a retired prefix is moved, not reported
+   as an orphan.
 
 Search tolerates the intermediate states: duplicates during a move score the
 same (MaxSim takes each document's maximum), and holes cannot occur.
@@ -2161,13 +2170,14 @@ index (`_embedding.chunks[3] has 767 values, expected 768`):
 
 **Durability and the write path.** A supplied vector is the only copy, so it is
 written **WAL-backed** (unlike codes and the service-sourced vectors of
-`stored`, which can be regenerated). The order mirrors today's: the document,
-then its raw vectors, then a queue entry of a new kind, `Encode`, which tells
-the worker to quantise from `{ns}_raw_vector` instead of calling the service.
+`stored`, which can be regenerated). The order mirrors today's, queue first: a
+queue entry of a new kind, `Encode`, which tells the worker to quantise from
+`{ns}_raw_vector` instead of calling the service, then the raw vectors, then the
+document.
 The worker writes codes, flushes and completes exactly as for `Embed` (M0-1).
-The meta's hash covers the supplied vectors instead of the text, so
-reconciliation detects stale codes the same way, and re-encodes from the stored
-vectors instead of re-embedding. A later write without an embedding (in an
+The worker's check of an entry against its document covers the supplied
+vectors instead of the text, so an interrupted write is detected the same way,
+and re-encoded from the stored vectors instead of re-embedded. A later write without an embedding (in an
 `either` namespace) replaces the stored vectors with the service's.
 
 **Deletion** removes the raw vectors with the codes (the meta superset rule
@@ -2197,8 +2207,8 @@ the Pass-2 rerank the gain will be smaller. Both optional strategies are planned
   is within 1 pt nDCG@10 of exact dense scoring at the default probes, with its
   latency measured against two-pass; every validation rule has a test at its
   edge; a crash at every step of the write path (the M0-2 audit) leaves no
-  document without its vectors and no orphaned raw vector; reconciliation
-  re-encodes stale codes without calling the service.
+  document without its vectors and no orphaned raw vector; an interrupted
+  write is re-encoded without calling the service.
 
 ## M4 — Rebuild from codes, then remove the files
 

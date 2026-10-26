@@ -278,7 +278,7 @@ WalEntry {
 }
 ```
 
-Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every entry not yet in an SSTable is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes and reconcile on recovery rather than committing them atomically.
+Every write is a **single-op transaction**: one `put` or `delete` is one WAL append, and a single append is inherently atomic, so every entry not yet in an SSTable is replayed on recovery. There is no multi-op batch/transaction type — secondary structures (field index, vector index) are derived and reconstructable, so higher layers order independent single-op writes so that a crash between them leaves something recovery can finish (the document store, for example, queues a document's embed job before writing the document), rather than committing them atomically.
 
 A segment is **sealed** with the end marker, and fsynced, before the next one is created, so only the last segment can ever hold bytes no fsync covered. That is what lets open tell a crash from damage. In the last segment, the first frame whose length or CRC is not valid is the end of the log (a record torn by a crash), and open zeroes the segment from there on. Anywhere else — a bad frame in a sealed segment, a sealed segment with no end marker, a missing segment between two that exist, a header naming another log — the log is damaged, and open fails rather than drop acknowledged writes. A checksum is needed because a changed byte inside a key or value still decodes, and a body that passes its checksum but does not decode is damage too.
 
