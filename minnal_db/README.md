@@ -677,6 +677,7 @@ The components above were each designed with one shared goal: surviving a crash 
 | Corrupt metadata file | CRC32 mismatch is detected; the file is recovered or the error reported |
 | Lost or unreadable WAL metadata | The cut is unknown. With no L1 data yet (a new database, or a crash during its first flushes), the whole log is replayed and the damaged file kept as `wal/metadata.corrupt`. With L1 data, open fails: a replayed put could bring back a key deleted since, whose tombstone L1 compaction dropped. Restore `wal/metadata`; or, if every write is flushed, remove the `wal` directory (writes not yet in an SSTable are then lost) |
 | Damaged WAL segment (not the torn tail) | Open fails with a corruption error naming the segment and byte; nothing is cut or deleted. Restore the database from a backup |
+| Crash while a flush writes an L0 file | The file is written under a temporary name (`{stamp}.dat.tmp`) and renamed only once complete and fsynced, so it never appears half-written; open deletes the temporary, and its entries, not yet retired from the WAL, are replayed |
 | Crash between writing L0 files and saving the WAL's progress | The files are not registered yet; the saved progress still covers those entries, so they are replayed on next open |
 | Recovery apply failure (transient error) | Each entry is retried once; persistent failures are written to a timestamped fail-log |
 

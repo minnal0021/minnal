@@ -196,6 +196,10 @@ fn sstable_header_bytes() -> [u8; SSTABLE_DATA_START as usize] {
     header
 }
 
+/// Suffix of a Level-0 file being written (`{stamp}.dat.tmp`), renamed to
+/// `{stamp}.dat` once complete; see `write_level0_file_for_records`.
+const LEVEL0_TMP_SUFFIX: &str = ".dat.tmp";
+
 /// Verify that `file` begins with a header this build can read.
 ///
 /// Returns [`LSMError::Corruption`] for a truncated header, a bad magic (which is
@@ -1478,17 +1482,28 @@ impl LSMTree {
             for entry in std::fs::read_dir(&dir)? {
                 let entry = entry?;
                 let path = entry.path();
+                if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(LEVEL0_TMP_SUFFIX)) {
+                    // A flush killed before its rename. It never reported itself
+                    // written, so its WAL entries were never retired: replay
+                    // restores its records.
+                    warn!(
+                        "removing unfinished Level-0 file {} (a flush interrupted before its rename)",
+                        path.display()
+                    );
+                    std::fs::remove_file(&path)?;
+                    continue;
+                }
                 if path.extension().map(|ext| ext == "dat").unwrap_or(false) {
-                    // L0 files are written in place (no temp+rename, unlike L1), so a
-                    // crash mid-flush can leave one too short to hold a header. That is
-                    // incomplete crash debris, not a format mismatch: skip it entirely
-                    // rather than registering it, or every later scan would fail header
-                    // validation on it. Its records are still in the WAL — the flush marks
-                    // them persisted only after the file is durable — so replay restores
-                    // them, exactly as it already does for a torn *tail* (which the frame
-                    // loop has always truncated silently). A file long enough to have a
-                    // header still goes through validation, so a pre-header database is
-                    // rejected rather than quietly skipped.
+                    // L0 files are now renamed into place once complete (above), so a
+                    // crash no longer leaves a `.dat` too short to hold a header; one
+                    // can still come from a build that wrote L0 in place. Such a file
+                    // is crash debris, not a format mismatch: skip it rather than
+                    // register it, or every later scan would fail header validation on
+                    // it. Its records are still in the WAL — the flush marks them
+                    // persisted only after the file is durable — so replay restores
+                    // them. A file long enough to have a header still goes through
+                    // validation, so a pre-header database is rejected rather than
+                    // quietly skipped, and a `.dat` cut inside a frame fails the open.
                     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < SSTABLE_DATA_START {
                         warn!("skipping incomplete Level-0 file {} (shorter than an SSTable header)", path.display());
                         continue;
@@ -1687,28 +1702,47 @@ impl LSMTree {
 
         // Level 0 files are named by timestamp/version, not by a global sequence.
         let level0_path = level0_dir.join(format!("{}.dat", timestamp_ms));
+        // Written under a temporary name and renamed once complete and fsynced, as
+        // L1 is, so a `.dat` file is always whole. Written in place, a process
+        // killed mid-flush left a `.dat` cut anywhere, even inside a frame, and the
+        // next open failed on it (`UnexpectedEof`, or a frame longer than its file):
+        // the database would not open again until the file was removed by hand.
+        // Open deletes leftover temporaries (`load_existing_level0_files`).
+        let tmp_path = level0_dir.join(format!("{timestamp_ms}{LEVEL0_TMP_SUFFIX}"));
 
-        let mut file = std::fs::File::create(&level0_path)?;
-        file.write_all(&sstable_header_bytes())?;
-        for (i, entry) in bucket_records.into_iter().enumerate() {
-            if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
-                index.push(entry.key.clone(), offset);
+        let write = || -> Result<()> {
+            let file = std::fs::File::create(&tmp_path)?;
+            let mut out = std::io::BufWriter::new(&file);
+            out.write_all(&sstable_header_bytes())?;
+            for (i, entry) in bucket_records.into_iter().enumerate() {
+                if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
+                    index.push(entry.key.clone(), offset);
+                }
+                let key_prefix = key_prefix_of(&entry.key);
+                let entry_obj = SStableEntry {
+                    key: entry.key,
+                    key_prefix,
+                    value: entry.value,
+                    tombstone: entry.tombstone,
+                    seq: entry.seq,
+                };
+                let payload = encode_sstable_entry(&entry_obj)?;
+                out.write_all(&(payload.len() as u32).to_le_bytes())?;
+                out.write_all(&payload)?;
+                offset += 4 + payload.len() as u64;
             }
-            let key_prefix = key_prefix_of(&entry.key);
-            let entry_obj = SStableEntry {
-                key: entry.key,
-                key_prefix,
-                value: entry.value,
-                tombstone: entry.tombstone,
-                seq: entry.seq,
-            };
-            let payload = encode_sstable_entry(&entry_obj)?;
-            file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            file.write_all(&payload)?;
-            offset += 4 + payload.len() as u64;
+            out.flush()?;
+            drop(out);
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &level0_path)?;
+            Ok(())
+        };
+        let written = write();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
         }
-        file.sync_all()?;
-        // Make the new file's directory entry durable too. `sync_all` on the file
+        written?;
+        // Make the new file's directory entry durable too (the rename's, here). `sync_all` on the file
         // covers its contents, not its name: until the directory is fsynced a power
         // loss can drop the file entirely — after the flush observer has already
         // let its WAL entries be marked persisted, leaving nothing to replay. A
@@ -4677,7 +4711,8 @@ mod tests {
         let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
         let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
         let torn = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
-        // A crash between `File::create` and the header write leaves 0 bytes.
+        // What a build that wrote L0 in place left after a crash between
+        // `File::create` and the header write: 0 bytes.
         std::fs::write(&torn, b"")?;
 
         let lsm = match LSMTree::open(temp_dir.path(), test_lsm_config()) {
@@ -4692,6 +4727,43 @@ mod tests {
             "the torn file's records are gone from L0 (WAL replay restores them)"
         );
         lsm.scan_prefix(b"")?;
+        Ok(())
+    }
+
+    /// A process killed while a flush writes an L0 file leaves it cut anywhere,
+    /// including inside a frame's body (a kill can land mid-`write`). The file
+    /// is written under a temporary name and renamed only once complete, so what
+    /// a kill leaves is a `.dat.tmp`: open removes it, and since its flush never
+    /// retired its WAL entries, replay restores its records. Written in place,
+    /// it was a torn `.dat` that failed every later open (found by
+    /// `acknowledged_writes_survive_repeated_kills`, ~1 kill in 800).
+    #[test]
+    fn test_open_removes_a_level0_file_a_kill_left_unfinished() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        {
+            let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+            lsm.insert_with_seq(b"k", 0xBBBB, 2)?;
+            lsm.flush_memtable_to_level0()?;
+        }
+        let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+        let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
+        let done = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
+        assert_eq!(done.extension().unwrap(), "dat", "a finished flush leaves only `.dat` files");
+        // The state a kill mid-flush leaves: the temporary, cut inside a frame body.
+        let torn = dir.join(format!("{}{LEVEL0_TMP_SUFFIX}", done.file_stem().unwrap().to_string_lossy()));
+        std::fs::rename(&done, &torn)?;
+        let cut = SSTABLE_DATA_START + 4 + 3;
+        assert!(std::fs::metadata(&torn)?.len() > cut, "setup: the frame must be longer than the cut");
+        std::fs::OpenOptions::new().write(true).open(&torn)?.set_len(cut)?;
+
+        let lsm = match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+            Ok(lsm) => lsm,
+            Err(e) => panic!("open must remove an unfinished L0 file, not fail: {e:?}"),
+        };
+        assert!(!torn.exists(), "the unfinished file was not removed");
+        assert_eq!(lsm.get(b"k")?, None, "its records are not in L0 (WAL replay restores them)");
+        lsm.scan_prefix(b"")?;
+        lsm.compact_all()?;
         Ok(())
     }
 
