@@ -288,12 +288,12 @@ Adding an index to a namespace that already has documents triggers a background 
 
 When `semantic_search_enabled` is `true` and an embedding field is declared, every `put` (or `kv_put`) call automatically:
 1. Extracts the nominated text field from the JSON document.
-2. Writes the document, then enqueues a `(namespace, doc_id, text)` entry in a durable system-wide vector-index queue (`system_pending_vec_index` KV namespace) as a separate single-op write. A crash between the two leaves the document un-indexed but never acked-but-lost — startup reconciliation re-enqueues it (see below).
+2. Enqueues a `(namespace, doc_id, text)` entry in a durable system-wide vector-index queue (`system_pending_vec_index` KV namespace), then writes the document, as two separate single-op writes (see *Crash recovery* below).
 3. A background `VecIndexWorker` drains the queue: it calls the embedding service, quantises the result, writes the `VectorIndex` to the companion stores, then removes the queue entry. The worker is idempotent, so a crash between those writes simply re-processes the entry.
 
 Document writes return immediately without blocking on the embedding service. Vector index entries may lag slightly behind the most recent writes. If the embedding service is temporarily unavailable, entries are retried with configurable back-off (see `[vector_index]` below).
 
-**Reconciliation.** Because the document write and its embed enqueue are two separate steps, a crash between them can leave a document that never gets indexed. A reconciliation pass finds and re-enqueues any document that's missing its vector index, self-healing the gap automatically — it runs on every startup, and can also be triggered on demand via `POST /admin/indices/vector/reconcile`. For the exact crash windows it closes, see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#forward-reconciliation-startup--on-demand).
+**Crash recovery.** Because the queue entry and the document are two separate writes, every write queues first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the document and rewrites it to match what the document holds. So after a crash the worker only drains the queue; nothing scans the documents. Details: [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
 
 ### Layer 5 — REST API (`minnal_db_api`)
 

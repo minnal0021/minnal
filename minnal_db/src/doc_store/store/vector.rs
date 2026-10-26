@@ -1,5 +1,4 @@
-//! Vector-index queue administration, bulk (re)indexing, and cross-namespace
-//! reconciliation.
+//! Vector-index queue administration and bulk (re)indexing.
 
 use super::*;
 
@@ -292,59 +291,6 @@ impl DocStore {
         vector_kv::list_queue_entries(&self.db).await.map(|e| e.len()).unwrap_or(0)
     }
 
-    /// Reconcile vector indexes across all semantic-search-enabled namespaces.
-    ///
-    /// Enqueues any document that has neither a complete vector index embedded
-    /// from its current text nor a pending queue entry — the `put` / `kv_put`
-    /// crash window, where a document was written but its embed enqueue was
-    /// lost, leaving it unindexed or with stale vectors. Reads every document
-    /// (see `reconcile_all_vector_indexes`). Returns the number of documents
-    /// re-enqueued and notifies the worker if any were.
-    ///
-    /// This same pass runs automatically as a background task on startup (see
-    /// [`with_semantic_search`]); it is also exposed on demand over the admin
-    /// REST API (`POST /admin/indices/vector/reconcile`) so an operator can
-    /// re-run it — e.g. if the startup pass logged a failure.
-    ///
-    /// [`with_semantic_search`]: DocStore::with_semantic_search
-    #[cfg(feature = "semantic-search")]
-    pub async fn reconcile_vector_indexes(&self) -> usize {
-        let outcome = reconcile_all_vector_indexes(&self.db, &self.schemas, false).await;
-        if outcome.reenqueued > 0
-            && let Some(notify) = &self.notify
-        {
-            notify.notify_one();
-        }
-        outcome.reenqueued
-    }
-
-    /// Like [`reconcile_vector_indexes`](Self::reconcile_vector_indexes), but also
-    /// re-enqueues documents whose committed vector bytes are **present yet corrupt**
-    /// (fail to deserialize) — not just those missing a half.
-    ///
-    /// This deserializes every entry, so it is a full value-reading scan of
-    /// every semantic-search namespace — run it in the background, not on a
-    /// latency-sensitive request path. Per-namespace failures
-    /// are logged here (`warn!` per namespace inside the pass, plus an `error!`
-    /// summary when any failed). Returns the number of documents re-enqueued and
-    /// notifies the worker if any were.
-    #[cfg(feature = "semantic-search")]
-    pub async fn validate_and_reconcile_vector_indexes(&self) -> usize {
-        let outcome = reconcile_all_vector_indexes(&self.db, &self.schemas, true).await;
-        if outcome.failed > 0 {
-            error!(
-                "validating vector-index reconcile did not fully complete: {} namespace(s) failed, {} doc(s) re-enqueued",
-                outcome.failed, outcome.reenqueued
-            );
-        }
-        if outcome.reenqueued > 0
-            && let Some(notify) = &self.notify
-        {
-            notify.notify_one();
-        }
-        outcome.reenqueued
-    }
-
     /// Return the live count of documents that have a committed vector index
     /// entry in `{namespace}_sparse_vector_meta`.
     ///
@@ -518,8 +464,6 @@ impl DocStore {
 
     /// Re-enqueue every document in `namespace` for vector indexing.
     ///
-    /// The operation is a point-in-time snapshot of the doc store:
-    ///
     /// 1. Rejects with [`DocStoreError::VecReindexInProgress`] when a
     ///    previous `index_all` reindex is still running.
     /// 2. All **exhausted** queue entries for the namespace (those whose
@@ -527,12 +471,18 @@ impl DocStore {
     ///    don't block processing.
     /// 3. Every document whose embedding fields produce non-empty text is
     ///    enqueued with `retry_count = 0`.  Documents already in the queue
-    ///    with a lower retry count are overwritten (natural deduplication
-    ///    — only the latest text is kept).
+    ///    are overwritten (natural deduplication — only the latest text is
+    ///    kept).
     /// 4. A reindex record is written to
     ///    `{db_path}/index/{ns_id}/vector_reindex.json` so the progress API
     ///    can track this reindex across server restarts.
     /// 5. The vector-index worker is notified to start processing immediately.
+    ///
+    /// The documents and the queue are read a page of `REINDEX_PAGE` (1,000) at a
+    /// time, so memory stays bounded however large the store is. Writes go on
+    /// meanwhile, so a page can enqueue a document's older text; the worker
+    /// checks every entry against its document before embedding
+    /// ([`vector_kv::check_entry_against_document`]) and corrects it.
     ///
     /// Returns [`DocStoreError::SemanticSearchNotEnabled`] when the namespace
     /// does not have semantic search configured.
@@ -544,11 +494,27 @@ impl DocStore {
                 namespace: namespace.to_owned(),
             });
         }
-
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
+        self.reindex_vectors(namespace, ns_id, "index_all", |value| {
+            let doc = serde_json::from_slice::<serde_json::Value>(value).ok()?;
+            Some(build_embedding_text(&doc, &schema.embedding_fields)).filter(|t| !t.is_empty())
+        })
+        .await
+    }
 
+    /// The body of [`index_all`](Self::index_all) and
+    /// [`kv_index_all`](Self::kv_index_all): `text_of` turns a stored value into
+    /// its embedding text (`None`: nothing to embed).
+    #[cfg(feature = "semantic-search")]
+    async fn reindex_vectors(
+        &self,
+        namespace: &str,
+        ns_id: u32,
+        label: &str,
+        text_of: impl Fn(&[u8]) -> Option<String>,
+    ) -> Result<ReindexStats, DocStoreError> {
         // 409 guard: one reindex of a namespace enqueues at a time. Held until
         // this function returns, however it returns.
         let reindex_path = vec_reindex_path(&self.db_path, ns_id);
@@ -560,69 +526,59 @@ impl DocStore {
         // if the process crashes before we finish enqueueing.
         let started_at_ms = now_ms();
         std::fs::create_dir_all(reindex_path.parent().unwrap())?;
-        write_vec_reindex(
-            &reindex_path,
-            &VecReindexProgress {
-                status: "running".to_owned(),
-                started_at_ms,
-                completed_at_ms: None,
-                total_enqueued: 0,
-                exhausted_cleared: 0,
-                error: None,
-                enqueue_done: false,
-            },
-        );
+        let record = |enqueued: usize, exhausted_cleared: usize, enqueue_done: bool| VecReindexProgress {
+            status: "running".to_owned(),
+            started_at_ms,
+            completed_at_ms: None,
+            total_enqueued: enqueued,
+            exhausted_cleared,
+            error: None,
+            enqueue_done,
+        };
+        write_vec_reindex(&reindex_path, &record(0, 0, false));
 
         let max_retries = self.vector_index_config.max_retries;
-
-        info!(
-            "index_all: namespace='{}' scanning pending queue for exhausted entries (max_retries={})",
-            namespace, max_retries
-        );
-
-        // Collect exhausted entries to clear.
-        let all_queue = vector_kv::list_queue_entries(&self.db).await?;
-        let total_queue = all_queue.len();
-        let exhausted: Vec<_> = all_queue
-            .into_iter()
-            .filter(|e| e.namespace == namespace && e.retry_count >= max_retries)
-            .collect();
-        let exhausted_cleared = exhausted.len();
-        info!(
-            "index_all: namespace='{}' queue scan done — total_queue={} exhausted_to_clear={}",
-            namespace, total_queue, exhausted_cleared
-        );
-
-        // Scan all documents in the namespace.
-        info!("index_all: namespace='{}' scanning all documents", namespace);
-        let ns = self.store_ns(namespace).await?;
-        let all_docs = ns.iter().await?;
-        let total_docs = all_docs.len();
-        info!("index_all: namespace='{}' document scan done — total_docs={}", namespace, total_docs);
-
-        // Clear exhausted entries (durable single-op deletes), then enqueue every
-        // document whose embedding fields produce non-empty text. Enqueues are
-        // WAL-backed: with the vector index itself written no-WAL, the queue is the
-        // durable source of truth for what still needs (re-)indexing, so every
-        // enqueue must survive a crash.
+        let mut exhausted_cleared = 0usize;
         let mut enqueued = 0usize;
         let mut skipped_empty_text = 0usize;
+
+        // Clear exhausted entries (durable single-op deletes), then enqueue every
+        // document with embedding text. Enqueues are WAL-backed: the queue is the
+        // durable record of what still needs (re-)indexing, so every enqueue must
+        // survive a crash.
         let commit_result: Result<(), DocStoreError> = async {
-            for entry in &exhausted {
-                vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
+            info!("{label}: namespace='{namespace}' clearing exhausted queue entries (max_retries={max_retries})");
+            let prefix = vector_kv::queue_prefix(namespace);
+            let end = prefix_upper_bound(&prefix);
+            let mut cursor = Some(prefix);
+            while let Some(start) = cursor.take() {
+                let (page, next) = vector_kv::queue_page(&self.db, start, end.clone(), REINDEX_PAGE).await?;
+                for entry in page.iter().filter(|e| e.retry_count >= max_retries) {
+                    vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
+                    exhausted_cleared += 1;
+                }
+                cursor = next;
             }
-            for (key, value) in &all_docs {
-                let doc = match serde_json::from_slice::<serde_json::Value>(value) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let text = build_embedding_text(&doc, &schema.embedding_fields);
-                if !text.is_empty() {
-                    self.check_not_dropping(namespace)?;
-                    vector_kv::enqueue_embed(&self.db, namespace, key, &text).await?;
-                    enqueued += 1;
-                } else {
-                    skipped_empty_text += 1;
+
+            info!("{label}: namespace='{namespace}' enqueueing documents, {REINDEX_PAGE} per page");
+            let ns = self.store_ns(namespace).await?;
+            let mut cursor: Option<Vec<u8>> = None;
+            loop {
+                let (page, next) = ns.scan(cursor.take(), None, REINDEX_PAGE).await?;
+                for (key, value) in &page {
+                    match text_of(value) {
+                        Some(text) => {
+                            self.check_not_dropping(namespace)?;
+                            vector_kv::enqueue_embed(&self.db, namespace, key, &text).await?;
+                            enqueued += 1;
+                        }
+                        None => skipped_empty_text += 1,
+                    }
+                }
+                write_vec_reindex(&reindex_path, &record(enqueued, exhausted_cleared, false));
+                match next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
                 }
             }
             Ok(())
@@ -630,8 +586,8 @@ impl DocStore {
         .await;
 
         info!(
-            "index_all: namespace='{}' enqueue done — enqueued={} skipped_empty_text={}",
-            namespace, enqueued, skipped_empty_text
+            "{label}: namespace='{namespace}' enqueue done — enqueued={enqueued} skipped_empty_text={skipped_empty_text} \
+             exhausted_cleared={exhausted_cleared}"
         );
 
         if let Err(e) = commit_result {
@@ -639,43 +595,21 @@ impl DocStore {
                 &reindex_path,
                 &VecReindexProgress {
                     status: "failed".to_owned(),
-                    started_at_ms,
                     completed_at_ms: Some(now_ms()),
-                    total_enqueued: 0,
-                    exhausted_cleared,
                     error: Some(e.to_string()),
-                    enqueue_done: false,
+                    ..record(enqueued, exhausted_cleared, false)
                 },
             );
             return Err(e);
         }
 
-        // Update reindex record with the final enqueued count; status stays
-        // "running" until the worker finishes (tracked via queue depth).
-        write_vec_reindex(
-            &reindex_path,
-            &VecReindexProgress {
-                status: "running".to_owned(),
-                started_at_ms,
-                completed_at_ms: None,
-                total_enqueued: enqueued,
-                exhausted_cleared,
-                error: None,
-                enqueue_done: true,
-            },
-        );
-
-        info!("index_all: namespace='{}' batch committed", namespace);
+        // The final count; status stays "running" until the worker finishes
+        // (tracked via queue depth).
+        write_vec_reindex(&reindex_path, &record(enqueued, exhausted_cleared, true));
 
         if let Some(notify) = &self.notify {
             notify.notify_one();
-            info!("index_all: namespace='{}' worker notified", namespace);
         }
-
-        info!(
-            "index_all: namespace='{}' enqueued={} exhausted_cleared={}",
-            namespace, enqueued, exhausted_cleared,
-        );
 
         Ok(ReindexStats { exhausted_cleared, enqueued })
     }
@@ -713,130 +647,17 @@ impl DocStore {
                 namespace: namespace.to_owned(),
             });
         }
-
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-
-        // 409 guard: one reindex of a namespace enqueues at a time. Held until
-        // this function returns, however it returns.
-        let reindex_path = vec_reindex_path(&self.db_path, ns_id);
-        let _write = self.writes.enter(namespace)?;
-        let _claim = ReindexClaim::take(&self.vec_reindexing, namespace)?;
-        self.check_not_dropping(namespace)?;
-
-        let started_at_ms = now_ms();
-        std::fs::create_dir_all(reindex_path.parent().unwrap())?;
-        write_vec_reindex(
-            &reindex_path,
-            &VecReindexProgress {
-                status: "running".to_owned(),
-                started_at_ms,
-                completed_at_ms: None,
-                total_enqueued: 0,
-                exhausted_cleared: 0,
-                error: None,
-                enqueue_done: false,
-            },
-        );
-
-        let max_retries = self.vector_index_config.max_retries;
-
-        info!(
-            "kv_index_all: namespace='{}' scanning pending queue for exhausted entries (max_retries={})",
-            namespace, max_retries
-        );
-        let all_queue = vector_kv::list_queue_entries(&self.db).await?;
-        let exhausted: Vec<_> = all_queue
-            .into_iter()
-            .filter(|e| e.namespace == namespace && e.retry_count >= max_retries)
-            .collect();
-        let exhausted_cleared = exhausted.len();
-        info!(
-            "kv_index_all: namespace='{}' queue scan done — exhausted_to_clear={}",
-            namespace, exhausted_cleared
-        );
-
-        info!("kv_index_all: namespace='{}' scanning all KV entries", namespace);
-        let ns = self.store_ns(namespace).await?;
-        let all_entries = ns.iter().await?;
-        info!("kv_index_all: namespace='{}' scan done — total_entries={}", namespace, all_entries.len());
-
-        // Clear exhausted entries (durable single-op deletes), then enqueue every
-        // entry with non-empty text. Enqueues are WAL-backed: the queue is the
-        // durable source of truth for the no-WAL vector index — see index_all for
-        // the rationale.
-        let mut enqueued = 0usize;
-        let mut skipped_empty_text = 0usize;
-        let commit_result: Result<(), DocStoreError> = async {
-            for entry in &exhausted {
-                vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await?;
-            }
-            for (key, value_bytes) in &all_entries {
-                match std::str::from_utf8(value_bytes) {
-                    Ok(text) if !text.is_empty() => {
-                        self.check_not_dropping(namespace)?;
-                        vector_kv::enqueue_embed(&self.db, namespace, key, text).await?;
-                        enqueued += 1;
-                    }
-                    _ => {
-                        skipped_empty_text += 1;
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        info!(
-            "kv_index_all: namespace='{}' enqueue done — enqueued={} skipped_empty_text={}",
-            namespace, enqueued, skipped_empty_text
-        );
-
-        if let Err(e) = commit_result {
-            write_vec_reindex(
-                &reindex_path,
-                &VecReindexProgress {
-                    status: "failed".to_owned(),
-                    started_at_ms,
-                    completed_at_ms: Some(now_ms()),
-                    total_enqueued: 0,
-                    exhausted_cleared,
-                    error: Some(e.to_string()),
-                    enqueue_done: false,
-                },
-            );
-            return Err(e);
-        }
-
-        write_vec_reindex(
-            &reindex_path,
-            &VecReindexProgress {
-                status: "running".to_owned(),
-                started_at_ms,
-                completed_at_ms: None,
-                total_enqueued: enqueued,
-                exhausted_cleared,
-                error: None,
-                enqueue_done: true,
-            },
-        );
-
-        if let Some(notify) = &self.notify {
-            notify.notify_one();
-            info!("kv_index_all: namespace='{}' worker notified", namespace);
-        }
-
-        info!(
-            "kv_index_all: namespace='{}' enqueued={} exhausted_cleared={}",
-            namespace, enqueued, exhausted_cleared
-        );
-
-        Ok(ReindexStats { exhausted_cleared, enqueued })
+        self.reindex_vectors(namespace, ns_id, "kv_index_all", |value| {
+            std::str::from_utf8(value).ok().filter(|t| !t.is_empty()).map(str::to_owned)
+        })
+        .await
     }
 }
 
-// ── Vector-index reconciliation ────────────────────────────────────────────────
+// ── Reindex claims ────────────────────────────────────────────────────────────
 
 /// This process's claim on reindexing one namespace: present in
 /// `DocStore::vec_reindexing` while held, removed on drop (also on an early return
@@ -898,175 +719,64 @@ impl Drop for ReindexClaim {
     }
 }
 
-/// Reconcile vector indexes across every semantic-search-enabled namespace.
-///
-/// For each such namespace, enqueue any document that has **neither** a
-/// committed vector index entry **nor** a pending queue entry — i.e. the
-/// `put` / `kv_put` crash window (document durably written, embed enqueue lost).
-/// This is the vector-index analogue of how field indices self-heal on startup
-/// via WAL replay: the difference is the work is routed into the async embedding
-/// queue rather than rebuilt inline, and the [`VecIndexWorker`] drains it when
-/// the embedding service is available.
-///
-/// Returns the total number of documents re-enqueued.  Errors on individual
-/// namespaces are logged and skipped so one bad namespace cannot abort the rest.
-///
-/// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
-/// Outcome of a [`reconcile_all_vector_indexes`] pass.
+/// Rows a vector reindex reads per page (documents, and queue entries while it
+/// clears exhausted ones): enough to amortise each page's LSM read, small enough
+/// that a page of large documents stays a few MB.
 #[cfg(feature = "semantic-search")]
-/// `pub(super)` so the parent's startup path can read the outcome; it was a
-/// file-private type before the split.
-pub(super) struct ReconcileOutcome {
-    /// Documents re-enqueued for embedding across all namespaces.
-    pub(super) reenqueued: usize,
-    /// Number of namespaces whose reconciliation failed (each is also logged
-    /// individually via `warn!`).  Non-zero means the pass did not fully
-    /// complete and should be re-run.
-    pub(super) failed: usize,
+pub(crate) const REINDEX_PAGE: usize = 1_000;
+
+// ── What a document holds now ─────────────────────────────────────────────────
+
+/// What a document (or KV value) holds now, for the vector worker's check of a
+/// queue entry against it ([`vector_kv::check_entry_against_document`]).
+#[cfg(feature = "semantic-search")]
+pub(crate) enum DocumentText {
+    /// The store is gone (dropped, or being dropped): leave the entry to the drop.
+    StoreGone,
+    /// The document is absent, or has no embedding text: it must have no vectors.
+    Nothing,
+    /// The document's embedding text.
+    Text(String),
 }
 
-/// Reconcile every semantic-search namespace's vector index.
-///
-/// With `check_bytes == false` (the cheap, default pass used at startup and by the
-/// presence-only reconcile) a document is "indexed" when both companion halves are
-/// **present** and were embedded from its **current** text
-/// ([`vector_kv::has_complete_vector_index`]). With `check_bytes == true` (the
-/// on-demand *validating* pass) it also deserializes each entry
-/// ([`vector_kv::has_valid_vector_index`]) to catch present-but-corrupt vectors.
-///
-/// Both passes read every document: there is no count short-circuit any more. It
-/// skipped a namespace whenever its meta and dense counts covered its keys, but a
-/// crash between a document write and its embed enqueue leaves stale vectors that
-/// change no count, so the shortcut would have kept them for good. Both passes run
-/// in the background.
 #[cfg(feature = "semantic-search")]
-/// `pub(super)`: called from the parent module's construction path.
-pub(super) async fn reconcile_all_vector_indexes(db: &AsyncDb, schemas: &SchemaStore, check_bytes: bool) -> ReconcileOutcome {
-    let mut reenqueued = 0usize;
-    let mut failed = 0usize;
-
-    for schema in schemas.docs() {
-        if !schema.is_semantic_search_enabled() {
-            continue;
-        }
-        match reconcile_doc_namespace_vectors(db, &schema, check_bytes).await {
-            Ok(n) => reenqueued += n,
-            Err(e) => {
-                failed += 1;
-                warn!("vec reconcile: doc namespace '{}' failed: {e}", schema.namespace);
-            }
+impl DocumentText {
+    /// The text the document's vectors must be embedded from, if any.
+    pub(crate) fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(t) => Some(t),
+            Self::StoreGone | Self::Nothing => None,
         }
     }
-
-    for schema in schemas.kvs() {
-        if !schema.is_semantic_search_enabled() {
-            continue;
-        }
-        match reconcile_kv_namespace_vectors(db, &schema, check_bytes).await {
-            Ok(n) => reenqueued += n,
-            Err(e) => {
-                failed += 1;
-                warn!("vec reconcile: kv namespace '{}' failed: {e}", schema.namespace);
-            }
-        }
-    }
-
-    ReconcileOutcome { reenqueued, failed }
 }
 
-/// Reconcile one document-store namespace.  See [`reconcile_all_vector_indexes`].
+/// Read what `namespace`'s document `key` holds now: its embedding text, built
+/// as a write builds it (the schema's embedding fields for a document store, the
+/// value itself for a KV store). The caller holds [`vector_kv::lock_doc_write`].
 #[cfg(feature = "semantic-search")]
-async fn reconcile_doc_namespace_vectors(db: &AsyncDb, schema: &DocStoreSchema, check_bytes: bool) -> Result<usize, DocStoreError> {
-    let namespace = &schema.namespace;
-    let ns = db.namespace(namespace.clone()).await?;
-    let all_docs = ns.iter().await?;
-
-    let mut enqueued = 0usize;
-    for (key, value) in &all_docs {
-        if vector_kv::get_queue_entry(db, namespace, key).await?.is_some() {
-            continue;
-        }
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(value) else {
-            continue;
-        };
-        let text = build_embedding_text(&doc, &schema.embedding_fields);
-        if text.is_empty() {
-            continue;
-        }
-        let indexed = if check_bytes {
-            vector_kv::has_valid_vector_index(db, namespace, key, &text).await?
-        } else {
-            vector_kv::has_complete_vector_index(db, namespace, key, &text).await?
-        };
-        if indexed {
-            continue;
-        }
-        // Re-read the document rather than trusting the snapshot, and enqueue
-        // only if nothing is queued: a write or delete since the snapshot queued
-        // newer work (or a `Clear` tombstone) that must not be overwritten.
-        let Some(current) = ns.get(key.clone()).await? else {
-            continue; // deleted since the snapshot
-        };
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&current) else {
-            continue;
-        };
-        let text = build_embedding_text(&doc, &schema.embedding_fields);
-        if !text.is_empty() && vector_kv::enqueue_embed_if_absent(db, namespace, key, &text).await? {
-            enqueued += 1;
-        }
+pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace: &str, key: &[u8]) -> Result<DocumentText, DocStoreError> {
+    // `list_namespaces` first: resolving a dropped namespace would recreate it.
+    let Some(schema) = schemas.get(namespace) else {
+        return Ok(DocumentText::StoreGone);
+    };
+    if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
+        return Ok(DocumentText::StoreGone);
     }
-
-    if enqueued > 0 {
-        info!(
-            "vec reconcile: doc namespace '{}' re-enqueued {} missing document(s)",
-            namespace, enqueued
-        );
-    }
-    Ok(enqueued)
-}
-
-/// Reconcile one KV-store namespace.  See [`reconcile_all_vector_indexes`].
-#[cfg(feature = "semantic-search")]
-async fn reconcile_kv_namespace_vectors(db: &AsyncDb, schema: &KvStoreSchema, check_bytes: bool) -> Result<usize, DocStoreError> {
-    let namespace = &schema.namespace;
-    let ns = db.namespace(namespace.clone()).await?;
-    let all_entries = ns.iter().await?;
-
-    let mut enqueued = 0usize;
-    for (key, value_bytes) in &all_entries {
-        if vector_kv::get_queue_entry(db, namespace, key).await?.is_some() {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(value_bytes) else {
-            continue;
-        };
-        if text.is_empty() {
-            continue;
-        }
-        let indexed = if check_bytes {
-            vector_kv::has_valid_vector_index(db, namespace, key, text).await?
-        } else {
-            vector_kv::has_complete_vector_index(db, namespace, key, text).await?
-        };
-        if indexed {
-            continue;
-        }
-        // As for documents: re-read, and enqueue only if nothing is queued.
-        let Some(current) = ns.get(key.clone()).await? else {
-            continue;
-        };
-        if let Ok(text) = std::str::from_utf8(&current)
-            && !text.is_empty()
-            && vector_kv::enqueue_embed_if_absent(db, namespace, key, text).await?
-        {
-            enqueued += 1;
-        }
-    }
-
-    if enqueued > 0 {
-        info!("vec reconcile: kv namespace '{}' re-enqueued {} missing entry(ies)", namespace, enqueued);
-    }
-    Ok(enqueued)
+    let Some(value) = db.namespace(namespace.to_owned()).await?.get(key.to_vec()).await? else {
+        return Ok(DocumentText::Nothing);
+    };
+    let text = match schema {
+        StoredSchema::Doc(schema) => match serde_json::from_slice::<serde_json::Value>(&value) {
+            Ok(doc) => build_embedding_text(&doc, &schema.embedding_fields),
+            Err(_) => String::new(),
+        },
+        StoredSchema::Kv(_) => String::from_utf8(value).unwrap_or_default(),
+    };
+    Ok(if text.is_empty() {
+        DocumentText::Nothing
+    } else {
+        DocumentText::Text(text)
+    })
 }
 
 /// Cached query embeddings a recall check reads at most (about 3 KB each at 768
@@ -1194,8 +904,6 @@ mod tests {
         assert_eq!(entries[0].doc_id_bytes, b"doc2");
     }
 
-    // ── Vector-index reconciliation ─────────────────────────────────────────
-
     /// Without the `semantic-search` feature, creating a semantic-search-enabled
     /// store must be rejected at runtime rather than silently ignored.
     #[cfg(not(feature = "semantic-search"))]
@@ -1241,81 +949,6 @@ mod tests {
             vector_index: None,
         };
         store.create(schema).await.unwrap();
-    }
-
-    /// Helper: commit a *complete* vector index (sparse meta + dense) for a doc,
-    /// simulating a fully-indexed document. Reconciliation skips only documents
-    /// that have both halves, so tests asserting "already indexed → skip" must
-    /// write both.
-    #[cfg(feature = "semantic-search")]
-    async fn commit_complete_index(store: &DocStore, namespace: &str, key: &[u8]) {
-        let doc = store
-            .db
-            .namespace(namespace.to_owned())
-            .await
-            .unwrap()
-            .get(key.to_vec())
-            .await
-            .unwrap()
-            .unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&doc).unwrap();
-        let text = build_embedding_text(&doc, &store.load_schema(namespace).unwrap().embedding_fields);
-        commit_index_for_text(store, namespace, key, &text).await;
-    }
-
-    /// Like [`commit_complete_index`], for vectors embedded from `text`.
-    #[cfg(feature = "semantic-search")]
-    async fn commit_index_for_text(store: &DocStore, namespace: &str, key: &[u8], text: &str) {
-        use crate::semantic_search::index::vector_index::QuantisationStyle;
-        let sparse = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
-        let dense = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.4, 0.0, 0.02, vec![]);
-        crate::vector_kv::upsert_vectors(&store.db, namespace, key, text, &[sparse, dense])
-            .await
-            .unwrap();
-    }
-
-    /// A crash between a document write and its embed enqueue saves the new text
-    /// with no queue entry, while the old vectors stay. Reconciliation must see
-    /// that the vectors came from other text and re-embed.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_reembeds_vectors_of_stale_text() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-        store.put("sem", DocId::U64(1), serde_json::json!({"title": "new"})).await.unwrap();
-        let key = DocId::U64(1).to_bytes();
-        vector_kv::remove_queue_entry(&store.db, "sem", &key).await.unwrap(); // the lost enqueue
-        commit_index_for_text(&store, "sem", &key, "title: old").await; // the old text's vectors
-
-        assert_eq!(store.reconcile_vector_indexes().await, 1, "stale vectors must be re-embedded");
-        let pending = store.list_queue_entries().await;
-        assert_eq!(pending.len(), 1);
-        assert_ne!(pending[0].text, "title: old");
-    }
-
-    /// Documents written through the crash window (doc present, but no queue
-    /// entry and no vector index) must be re-enqueued by reconciliation.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_enqueues_missing_docs() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        // No SemanticSearchContext is attached, so put() does NOT enqueue —
-        // this is exactly the crash window (doc durable, embed marker lost).
-        for i in 1u64..=3 {
-            store
-                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
-                .await
-                .unwrap();
-        }
-        assert_eq!(store.pending_vector_index_count().await, 0, "no enqueue happened on write");
-
-        let reconciled = store.reconcile_vector_indexes().await;
-        assert_eq!(reconciled, 3, "all three missing docs must be re-enqueued");
-        assert_eq!(store.pending_vector_index_count().await, 3);
     }
 
     /// A single-document vector reindex enqueues exactly that document, reports
@@ -1372,269 +1005,6 @@ mod tests {
         ));
     }
 
-    /// Reconciliation must skip documents that already have a pending queue
-    /// entry, and must be idempotent on a second run.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_skips_queued_and_is_idempotent() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        store.put("sem", DocId::U64(1), serde_json::json!({"title": "hello"})).await.unwrap();
-        store.put("sem", DocId::U64(2), serde_json::json!({"title": "world"})).await.unwrap();
-
-        // First pass enqueues both missing docs.
-        assert_eq!(store.reconcile_vector_indexes().await, 2);
-        assert_eq!(store.pending_vector_index_count().await, 2);
-
-        // Second pass is a no-op: both docs are already queued.
-        assert_eq!(store.reconcile_vector_indexes().await, 0);
-        assert_eq!(store.pending_vector_index_count().await, 2);
-    }
-
-    /// Reconciliation must skip documents that already have a committed vector
-    /// index entry.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_skips_already_indexed() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        let key = DocId::U64(1).to_bytes();
-        store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
-
-        // Simulate a complete committed vector index (sparse meta + dense) for doc 1.
-        commit_complete_index(&store, "sem", &key).await;
-
-        // Doc 1 is already indexed → reconciliation must not enqueue it.
-        assert_eq!(store.reconcile_vector_indexes().await, 0);
-        assert_eq!(store.pending_vector_index_count().await, 0);
-    }
-
-    /// The validating reconcile must NOT re-enqueue a document whose committed
-    /// vectors are present *and* deserialize (no false positives on healthy docs).
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_validating_reconcile_skips_valid_complete_index() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        let key = DocId::U64(1).to_bytes();
-        store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
-        commit_complete_index(&store, "sem", &key).await;
-
-        assert_eq!(
-            store.validate_and_reconcile_vector_indexes().await,
-            0,
-            "valid index must not be re-enqueued"
-        );
-        assert_eq!(store.pending_vector_index_count().await, 0);
-    }
-
-    /// A document whose committed vector bytes are *present but corrupt* is skipped
-    /// by the presence-only reconcile (both halves exist) yet re-enqueued by the
-    /// validating reconcile (the bytes fail to deserialize). Covers both the dense
-    /// and a sparse composite entry.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_validating_reconcile_reenqueues_present_but_corrupt() {
-        // Corrupt dense.
-        {
-            let db_dir = TempDir::new().unwrap();
-            let store = open_fresh(db_dir.path()).await;
-            create_semantic_schema(&store, "sem").await;
-            let key = DocId::U64(1).to_bytes();
-            store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
-            commit_complete_index(&store, "sem", &key).await;
-
-            // Overwrite the dense entry with bytes that are present but undeserializable.
-            let dense_ns = store.db.namespace(crate::vector_kv::dense_vectors_ns("sem")).await.unwrap();
-            dense_ns.put(key.clone(), b"not valid rkyv bytes".to_vec()).await.unwrap();
-
-            assert_eq!(store.reconcile_vector_indexes().await, 0, "presence check sees both halves → skips");
-            assert_eq!(store.pending_vector_index_count().await, 0);
-            assert_eq!(
-                store.validate_and_reconcile_vector_indexes().await,
-                1,
-                "corrupt dense must be re-enqueued"
-            );
-            assert_eq!(store.pending_vector_index_count().await, 1);
-        }
-
-        // Corrupt a sparse composite entry (commit_complete_index assigns cluster 1).
-        {
-            let db_dir = TempDir::new().unwrap();
-            let store = open_fresh(db_dir.path()).await;
-            create_semantic_schema(&store, "sem").await;
-            let key = DocId::U64(1).to_bytes();
-            store.put("sem", DocId::U64(1), serde_json::json!({"title": "indexed"})).await.unwrap();
-            commit_complete_index(&store, "sem", &key).await;
-
-            let sparse_ns = store.db.namespace(crate::vector_kv::sparse_vectors_ns("sem")).await.unwrap();
-            sparse_ns
-                .put(crate::semantic_search::composite_key::encode(1, &key), b"garbage".to_vec())
-                .await
-                .unwrap();
-
-            assert_eq!(store.reconcile_vector_indexes().await, 0, "presence check skips");
-            assert_eq!(
-                store.validate_and_reconcile_vector_indexes().await,
-                1,
-                "corrupt sparse must be re-enqueued"
-            );
-            assert_eq!(store.pending_vector_index_count().await, 1);
-        }
-    }
-
-    /// KV-store namespaces are reconciled too: a string value written without a
-    /// queue entry or vector index must be re-enqueued.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_kv_namespace() {
-        use crate::doc_store::schema::{KvKeyType, KvStoreSchema, KvValueType};
-
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-
-        let schema = KvStoreSchema {
-            store_type: StoreType::Kv,
-            namespace: "kv".to_owned(),
-            ns_id: None,
-            key_type: KvKeyType::Str,
-            value_type: KvValueType::Str,
-            semantic_search_enabled: true,
-            vector_index: None,
-        };
-        store.create_kv(schema).await.unwrap();
-
-        store
-            .kv_put("kv", &serde_json::json!("k1"), &serde_json::json!("some text"))
-            .await
-            .unwrap();
-        assert_eq!(store.pending_vector_index_count().await, 0, "no enqueue on write (no ctx)");
-
-        assert_eq!(store.reconcile_vector_indexes().await, 1);
-        assert_eq!(store.pending_vector_index_count().await, 1);
-    }
-
-    /// A partially indexed namespace: the missing document is enqueued and the
-    /// indexed one is left alone.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_partial_index_not_short_circuited() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        // Doc 1 is indexed; doc 2 is written but missing (the crash window).
-        store.put("sem", DocId::U64(1), serde_json::json!({"title": "one"})).await.unwrap();
-        store.put("sem", DocId::U64(2), serde_json::json!({"title": "two"})).await.unwrap();
-        commit_complete_index(&store, "sem", &DocId::U64(1).to_bytes()).await;
-
-        // Doc 2 enqueued, doc 1 skipped.
-        assert_eq!(store.reconcile_vector_indexes().await, 1);
-        let pending = store.list_queue_entries().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].doc_id_bytes, DocId::U64(2).to_bytes());
-    }
-
-    /// A *partially* committed index counts as not-indexed: a doc with only the
-    /// sparse side (dense write lost) and a doc with only the dense side (sparse
-    /// write lost) must both be re-enqueued so the re-embed regenerates the
-    /// missing half. Guards the `meta AND dense` tightening in
-    /// [`vector_kv::has_complete_vector_index`] — under the old OR semantics
-    /// either of these would have been skipped as "indexed".
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_partial_index_is_reenqueued() {
-        use crate::semantic_search::index::vector_index::QuantisationStyle;
-
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        store
-            .put("sem", DocId::U64(1), serde_json::json!({"title": "sparse only"}))
-            .await
-            .unwrap();
-        store.put("sem", DocId::U64(2), serde_json::json!({"title": "dense only"})).await.unwrap();
-
-        // Doc 1: only the sparse meta committed — the dense write was lost.
-        let key1 = DocId::U64(1).to_bytes();
-        let sparse = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::SingleBit, 0.4, 0.0, 0.02, vec![]);
-        crate::vector_kv::upsert_vectors(&store.db, "sem", &key1, "text", &[sparse])
-            .await
-            .unwrap();
-
-        // Doc 2: only the dense entry committed — the sparse write was lost.
-        let key2 = DocId::U64(2).to_bytes();
-        let dense = crate::semantic_search::VectorIndex::new(1, QuantisationStyle::MultiBit { number_of_bits: 8 }, 0.4, 0.0, 0.02, vec![]);
-        crate::vector_kv::upsert_vectors(&store.db, "sem", &key2, "text", &[dense]).await.unwrap();
-
-        // Both indexes are incomplete → both re-enqueued.
-        assert_eq!(store.reconcile_vector_indexes().await, 2);
-        let mut got: Vec<Vec<u8>> = store.list_queue_entries().await.into_iter().map(|e| e.doc_id_bytes).collect();
-        got.sort();
-        let mut want = vec![DocId::U64(1).to_bytes(), DocId::U64(2).to_bytes()];
-        want.sort();
-        assert_eq!(got, want);
-    }
-
-    /// Regression for the in-flight enqueue race: a live write that enqueues a
-    /// document *while* the reconciliation pass is mid-scan must not produce a
-    /// duplicate queue entry. The embed queue is keyed by `(namespace, doc_id)`,
-    /// so a concurrent reconciliation re-enqueue and an in-flight write collapse
-    /// to a single entry. This is the invariant that keeps the queue bounded by
-    /// the number of distinct docs — without it, a racing writer could grow the
-    /// queue unboundedly and feed the worker an endless re-index loop.
-    ///
-    /// The assertion holds for every interleaving (idempotent-by-key enqueue),
-    /// so the test is deterministic despite running the two paths concurrently.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test]
-    async fn test_reconcile_inflight_enqueue_does_not_duplicate() {
-        let db_dir = TempDir::new().unwrap();
-        let store = open_fresh(db_dir.path()).await;
-        create_semantic_schema(&store, "sem").await;
-
-        // Five docs written through the crash window (durable, but no enqueue).
-        for i in 1u64..=5 {
-            store
-                .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
-                .await
-                .unwrap();
-        }
-
-        // Race a live enqueue for every doc against the reconciliation pass: each
-        // direct enqueue stands in for a write that lands while reconciliation is
-        // scanning the same key. Both paths target the same queue key per doc.
-        let keys: Vec<Vec<u8>> = (1u64..=5).map(|i| DocId::U64(i).to_bytes()).collect();
-        let live = async {
-            for (i, key) in keys.iter().enumerate() {
-                crate::vector_kv::enqueue_embed(&store.db, "sem", key, &format!("live {}", i + 1))
-                    .await
-                    .unwrap();
-            }
-        };
-        let (_, _reconciled) = tokio::join!(live, store.reconcile_vector_indexes());
-
-        // Idempotent by doc-id: exactly one entry per doc, never doubled —
-        // regardless of how the live enqueues and the reconcile pass interleaved.
-        assert_eq!(
-            store.pending_vector_index_count().await,
-            5,
-            "concurrent enqueue + reconcile must not duplicate queue entries"
-        );
-
-        // The queue is converging, not looping: a follow-up reconcile is a clean
-        // no-op because every doc now has a pending entry.
-        assert_eq!(store.reconcile_vector_indexes().await, 0);
-        assert_eq!(store.pending_vector_index_count().await, 5);
-    }
-
     // ── Queue races through the store's write paths (R3, R4) ─────────────────
 
     #[cfg(feature = "semantic-search")]
@@ -1653,67 +1023,6 @@ mod tests {
         schema.semantic_search_enabled = true;
         store.create_kv(schema).await.unwrap();
         store
-    }
-
-    /// Cost of a startup reconciliation pass over a FiQA-sized KV store (57,600
-    /// entries, three 1-bit chunks and an 8-bit dense entry each), now that every
-    /// pass reads every document instead of short-circuiting on counts.
-    /// `MINNAL_RECONCILE_DOCS` overrides the size. Run with `--ignored --nocapture`.
-    #[cfg(feature = "semantic-search")]
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
-    async fn reconcile_cost_on_a_fiqa_sized_store() {
-        use crate::semantic_search::index::vector_index::QuantisationStyle;
-        let n: usize = std::env::var("MINNAL_RECONCILE_DOCS").ok().and_then(|v| v.parse().ok()).unwrap_or(57_600);
-        let db_dir = TempDir::new().unwrap();
-        let store = open_kv_semantic(&db_dir).await;
-        let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();
-        for i in 0..n {
-            let key = format!("{i:08}").into_bytes();
-            let text = format!("document {i} about markets, rates and portfolio risk");
-            parent.put(key.clone(), text.clone().into_bytes()).await.unwrap();
-            let mut vis = vec![crate::semantic_search::VectorIndex::new(
-                1,
-                QuantisationStyle::MultiBit { number_of_bits: 8 },
-                0.1,
-                0.2,
-                0.01,
-                vec![0u64; 96],
-            )];
-            for c in 0..3u32 {
-                vis.push(crate::semantic_search::VectorIndex::new(
-                    10 + (i as u32 + c) % 256,
-                    QuantisationStyle::SingleBit,
-                    0.0,
-                    0.2,
-                    0.01,
-                    vec![0u64; 12],
-                ));
-            }
-            vector_kv::upsert_vectors(&store.db, "sem_kv", &key, &text, &vis).await.unwrap();
-        }
-        store.db.shutdown().await.unwrap();
-        drop(store);
-        let store = open_fresh(db_dir.path()).await;
-        let t = std::time::Instant::now();
-        let mut counts = 0usize;
-        for ns in [
-            "sem_kv".to_string(),
-            vector_kv::sparse_vectors_meta_ns("sem_kv"),
-            vector_kv::dense_vectors_ns("sem_kv"),
-        ] {
-            counts += store.db.namespace(ns).await.unwrap().keys().await.unwrap().len();
-        }
-        let shortcut = t.elapsed();
-        let t = std::time::Instant::now();
-        let reenqueued = store.reconcile_vector_indexes().await;
-        let full = t.elapsed();
-        assert_eq!(reenqueued, 0);
-        eprintln!(
-            "\n=== reconcile cost, {n} entries ===\n  old count shortcut (3 key scans, {counts} keys): {:.2} s\n  full pass (read every entry, check meta text hash and dense): {:.2} s",
-            shortcut.as_secs_f64(),
-            full.as_secs_f64()
-        );
     }
 
     /// Cost of the open-time drop sweep's queue scan when a crash mid bulk-load
@@ -1818,6 +1127,43 @@ mod tests {
         assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, "running");
     }
 
+    /// A reindex reads the store a page at a time: every entry is enqueued across
+    /// page boundaries, and exhausted entries are cleared from every page of the
+    /// queue, without touching another store's entries.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_reindex_covers_every_page() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();
+        let n = REINDEX_PAGE * 2 + 7;
+        for i in 0..n {
+            parent
+                .put(format!("{i:06}").into_bytes(), format!("text {i}").into_bytes())
+                .await
+                .unwrap();
+        }
+        parent.put(b"empty".to_vec(), Vec::new()).await.unwrap(); // nothing to embed
+        // Exhausted entries spread over more than one queue page, and one of
+        // another store, which must stay.
+        let max = store.vector_index_max_retries();
+        for (ns, key) in [("sem_kv", "000000"), ("sem_kv", "001500"), ("other", "x")] {
+            vector_kv::enqueue_embed(&store.db, ns, key.as_bytes(), "stale").await.unwrap();
+            for _ in 0..max {
+                let e = vector_kv::get_queue_entry(&store.db, ns, key.as_bytes()).await.unwrap().unwrap();
+                vector_kv::record_queue_failure(&store.db, &e, "boom").await.unwrap();
+            }
+        }
+
+        let stats = store.kv_index_all("sem_kv").await.unwrap();
+        assert_eq!((stats.enqueued, stats.exhausted_cleared), (n, 2));
+        let queued = vector_kv::list_queue_entries(&store.db).await.unwrap();
+        assert_eq!(queued.iter().filter(|e| e.namespace == "sem_kv" && e.retry_count == 0).count(), n);
+        assert!(queued.iter().any(|e| e.namespace == "other"), "another store's entry was removed");
+        let progress = store.vec_reindex_progress("sem_kv").await.unwrap();
+        assert_eq!((progress.total_enqueued, progress.exhausted_cleared), (n, 2));
+    }
+
     /// A reindex interrupted by a crash mid-enqueue is reported as failed and does
     /// not block a new one.
     #[cfg(feature = "semantic-search")]
@@ -1855,14 +1201,12 @@ mod tests {
     }
 
     /// A delete interrupted by a crash leaves the document, no vectors and a
-    /// `Clear` tombstone. At the next start the worker processes the tombstone,
-    /// and startup reconciliation, which must run after that and never overwrites
-    /// a tombstone, then queues the surviving document for embedding again. Run
-    /// concurrently, reconciliation could see the tombstone, skip the document,
-    /// and leave it unindexed until the next restart.
+    /// `Clear` tombstone. The worker compares the tombstone with the document,
+    /// finds the document still there, and turns the tombstone into an embed of
+    /// its text, so the surviving document is indexed again.
     #[cfg(feature = "semantic-search")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_reconciliation_runs_after_the_crash_queue_is_processed() {
+    async fn a_delete_cut_short_by_a_crash_is_redone_as_an_embed() {
         use crate::semantic_search::service::SemanticSearchConfig;
         let db_dir = TempDir::new().unwrap();
         let store = open_kv_semantic(&db_dir).await;
@@ -1901,6 +1245,50 @@ mod tests {
         store.shutdown_vec_index_worker().await;
     }
 
+    /// An upsert interrupted by a crash after its queue entry leaves an entry for
+    /// text the store never received. The worker rewrites it to the text the
+    /// store holds, so the vectors end up matching the value, not the lost write.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upsert_cut_short_by_a_crash_embeds_what_the_store_holds() {
+        use crate::semantic_search::service::SemanticSearchConfig;
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        store
+            .db
+            .namespace("sem_kv".to_string())
+            .await
+            .unwrap()
+            .put(b"x".to_vec(), b"on disk".to_vec())
+            .await
+            .unwrap();
+        vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "never written").await.unwrap(); // its value write was lost
+
+        let ctx = SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        });
+        let store = store.with_semantic_search(ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
+            if entry.as_ref().is_some_and(|e| e.text == "on disk") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the entry was never rewritten: {entry:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        store.shutdown_vec_index_worker().await;
+    }
+
+    /// The dense entry of `key` in `sem_kv`, if any.
+    #[cfg(feature = "semantic-search")]
+    async fn dense_entry(store: &DocStore, key: &[u8]) -> Option<Vec<u8>> {
+        let dense = store.db.namespace(vector_kv::dense_vectors_ns("sem_kv")).await.unwrap();
+        dense.get(key.to_vec()).await.unwrap()
+    }
+
     /// R3 through the real delete path: deleting a key whose older value is being
     /// embedded leaves no vectors once that embed completes.
     #[cfg(feature = "semantic-search")]
@@ -1933,18 +1321,11 @@ mod tests {
             .unwrap();
         let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
         vector_kv::finish_embed(&store.db, &entry, &race_vectors()).await.unwrap();
-        assert!(
-            vector_kv::has_complete_vector_index(&store.db, "sem_kv", b"x", "some text")
-                .await
-                .unwrap()
-        );
+        assert!(dense_entry(&store, b"x").await.is_some());
 
         store.kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("")).await.unwrap();
 
-        assert!(
-            !vector_kv::has_complete_vector_index(&store.db, "sem_kv", b"x", "text").await.unwrap(),
-            "vectors of the old text must be gone"
-        );
+        assert!(dense_entry(&store, b"x").await.is_none(), "vectors of the old text must be gone");
         let pending = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().expect("tombstone");
         assert_eq!(pending.kind, vector_kv::QueueEntryKind::Clear);
     }

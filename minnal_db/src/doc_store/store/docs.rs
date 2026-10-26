@@ -27,8 +27,9 @@ impl DocStore {
     // Vector-index writes are decoupled from the write path.  When semantic
     // search is configured (`self.notify` is Some) and the namespace schema
     // has `semantic_search_enabled = true`, a pending-embed queue entry is
-    // written atomically with the document — the background VecIndexWorker
-    // processes it asynchronously.
+    // written before the document, under the document's write lock — the
+    // background VecIndexWorker processes it asynchronously (see `vector_kv`'s
+    // *Queue first*).
 
     /// Insert or replace a document.
     ///
@@ -36,12 +37,13 @@ impl DocStore {
     /// to JSON bytes before storage.
     ///
     /// When semantic search is configured and the namespace has
-    /// `semantic_search_enabled = true`, the document is written first, then a
-    /// pending embedding queue entry is enqueued.  The background
+    /// `semantic_search_enabled = true`, a pending embedding queue entry is
+    /// enqueued first, then the document is written.  The background
     /// `VecIndexWorker` processes the queue entry asynchronously — the vector
     /// index is eventually consistent with the document store.  A crash between
-    /// the two writes leaves the document un-indexed until reconciliation
-    /// re-enqueues it.
+    /// the two writes leaves a queue entry for text the store never received;
+    /// the worker compares the entry with the document and embeds what the
+    /// document holds.
     pub async fn put(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         debug!("put namespace='{}' id={:?}", namespace, id);
         let _write = self.writes.enter(namespace)?;
@@ -57,16 +59,20 @@ impl DocStore {
             && schema.is_semantic_search_enabled()
         {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
-            // Write the document first, then the vector-queue op as a separate
-            // single op (no cross-namespace atomicity needed).
             let ns = self.store_ns(namespace).await?;
-            ns.put(key.clone(), value).await?;
+            // The queue op first, then the document, as separate single ops
+            // under the document's write lock (no cross-namespace atomicity
+            // needed: the worker checks the entry against the document).
+            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
             if text.is_empty() {
                 // No embedding text any more: drop the vectors, and any pending
                 // embed, of the document's older text.
                 self.clear_doc_vectors_if_any(namespace, &key).await?;
             } else {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
+            }
+            ns.put(key.clone(), value).await?;
+            if !text.is_empty() {
                 notify.notify_one();
             }
             return Ok(());
@@ -81,8 +87,9 @@ impl DocStore {
     ///
     /// The document write skips the WAL for throughput.  When semantic search
     /// is configured, the pending embedding queue entry is **WAL-backed** even
-    /// on this path, so the worker can recover pending jobs after a crash and
-    /// index any documents that survived the no-WAL write.
+    /// on this path and written first, so after a crash the worker finds it and
+    /// indexes what the store holds: the document if it survived the no-WAL
+    /// write, nothing if it did not.
     pub async fn put_no_wal(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
@@ -93,21 +100,27 @@ impl DocStore {
         let value = serde_json::to_vec(&doc).map_err(|e| DocStoreError::InvalidId(e.to_string()))?;
 
         let ns = self.store_ns(namespace).await?;
-        ns.put_no_wal(key.clone(), value).await?;
 
         #[cfg(feature = "semantic-search")]
         if let Some(notify) = &self.notify
             && schema.is_semantic_search_enabled()
         {
             let text = build_embedding_text(&doc, &schema.embedding_fields);
+            // As in `put`: the queue op first, then the document.
+            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
             if text.is_empty() {
                 self.clear_doc_vectors_if_any(namespace, &key).await?;
             } else {
                 vector_kv::enqueue_embed(&self.db, namespace, &key, &text).await?;
+            }
+            ns.put_no_wal(key, value).await?;
+            if !text.is_empty() {
                 notify.notify_one();
             }
+            return Ok(());
         }
 
+        ns.put_no_wal(key, value).await?;
         Ok(())
     }
 
@@ -117,9 +130,10 @@ impl DocStore {
     /// `semantic_search_enabled = true`, the document is removed from the vector
     /// index first (a `Clear` tombstone in the queue, then the vectors — see
     /// [`DocStore::clear_doc_vectors`]), then the document is deleted.  Each is a
-    /// separate single-op write; ordering derived data before the document means a
-    /// crash between them leaves an un-indexed document (reconciliation cleans it
-    /// up), never an orphaned vector.
+    /// separate single-op write, under the document's write lock; ordering derived
+    /// data before the document means a crash between them leaves a document with
+    /// a `Clear` tombstone, never an orphaned vector. The worker compares the
+    /// tombstone with the document, finds it still there, and re-embeds it.
     pub async fn delete(&self, namespace: &str, id: DocId) -> Result<(), DocStoreError> {
         debug!("delete namespace='{}' id={:?}", namespace, id);
         let _write = self.writes.enter(namespace)?;
@@ -129,6 +143,7 @@ impl DocStore {
         let schema = self.load_schema(namespace)?;
         #[cfg(feature = "semantic-search")]
         if schema.is_semantic_search_enabled() {
+            let _doc = vector_kv::lock_doc_write(namespace, &key).await;
             self.clear_doc_vectors(namespace, &key).await?;
             let ns = self.store_ns(namespace).await?;
             ns.delete(key).await?;

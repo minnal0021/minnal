@@ -375,7 +375,7 @@ and split into two groups:
 - `/admin/storage/*` — storage-engine diagnostics (health, value-log/LSM stats)
   and GC / compaction / index-checkpoint triggers.
 - `/admin/indices/*` — index build progress, vector-queue inspection, and bulk
-  reindex / reconcile operations.
+  reindex operations.
 
 Every endpoint is documented in the
 [Admin Storage](minnal_db_api/README.md#admin-storage-api) and

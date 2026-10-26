@@ -49,10 +49,6 @@ pub struct AppState {
     pub attr_index_ops: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Tracks namespaces whose vector index is currently being dropped (background cleanup).
     pub vec_index_cleanup: Arc<parking_lot::Mutex<HashSet<String>>>,
-    /// Set while a (background) vector-index reconcile/validate pass is running, so
-    /// the on-demand endpoint can reject overlapping runs instead of stacking
-    /// expensive full scans.
-    pub vec_reconcile_running: Arc<std::sync::atomic::AtomicBool>,
     /// Set while a (background) index checkpoint (field-index flush + compaction)
     /// is running, so the on-demand endpoint can reject overlapping runs instead
     /// of stacking expensive flush/compaction passes.
@@ -209,7 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: Instant::now(),
         attr_index_ops: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         vec_index_cleanup: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-        vec_reconcile_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
@@ -255,8 +250,8 @@ async fn shutdown_signal() {
 
     // The handler stays installed, so without this a second Ctrl-C would be
     // swallowed while a slow shutdown runs. Forcing exit is crash-equivalent:
-    // WAL-backed writes replay at the next start; no-WAL vector payloads not
-    // yet flushed are re-embedded by reconciliation.
+    // WAL-backed writes replay at the next start, and vector work not yet
+    // completed is still queued and is redone by the vector worker.
     tokio::spawn(async {
         if tokio::signal::ctrl_c().await.is_ok() {
             error!("second Ctrl-C — exiting without a clean shutdown");

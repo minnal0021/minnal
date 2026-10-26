@@ -443,8 +443,7 @@ retrying; only vector *indexing* falls behind, while semantic *queries* error.
 Both storage layers are driven the same way. You build a `SemanticSearchConfig`
 naming the embedding service and hand it to the store as a
 `SemanticSearchContext`. Attach it once, at startup — it is also what spawns the
-embed-worker, the partition maintenance task and the one-shot reconciliation
-pass.
+embed-worker and the partition maintenance task.
 
 ```rust
 use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSpec};
@@ -461,8 +460,8 @@ let config = SemanticSearchConfig {
     ..Default::default()
 };
 
-// `with_semantic_search` also starts the background embed-worker, the partition
-// maintenance and a one-shot startup reconciliation, so attach it once, up front.
+// `with_semantic_search` also starts the background embed-worker and the
+// partition maintenance, so attach it once, up front.
 let store = DocStore::open("/tmp/sem")
     .await?
     .with_semantic_search(SemanticSearchContext::new(config));

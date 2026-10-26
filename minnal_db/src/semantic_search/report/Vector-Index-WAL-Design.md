@@ -419,8 +419,7 @@ maintenance's in this one), so the vector index WAL has to avoid it by itself:
 ## 8. Crash points and tests
 
 Every crash point below gets a test in the style of `vector_kv`'s crash audits
-(`crash_point!` countdown, then reopen, worker pass, reconciliation, worker
-pass), and each test checks the same invariants: every completed document has
+(`crash_point!` countdown, then reopen and a worker pass), and each test checks the same invariants: every completed document has
 its vectors; no document is indexed that is deleted; no chunk key is listed by
 no meta.
 
