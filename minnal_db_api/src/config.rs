@@ -516,7 +516,7 @@ pub struct VectorIndexSection {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Maximum number of concurrent embedding calls the worker keeps in flight
-    /// at once.  Default: 4.
+    /// at once.  Default: 6.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
 }
@@ -538,7 +538,7 @@ fn default_max_retries() -> u32 {
     5
 }
 fn default_concurrency() -> usize {
-    4
+    6
 }
 
 /// Semantic-search settings that belong to the server: how to reach the

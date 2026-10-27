@@ -279,8 +279,8 @@ max_retries = 5
 # Maximum number of concurrent embedding calls the worker keeps in flight at
 # once.  Entries from different namespaces are interleaved (round-robin) before
 # being fed into this concurrency pool, so no single namespace starves others.
-# Default: 4.
-concurrency = 4
+# Default: 6.
+concurrency = 6
 
 # [semantic_search] — the embedding service and the allowed models
 #

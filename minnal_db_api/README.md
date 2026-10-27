@@ -55,8 +55,7 @@ cargo build --release -p minnal_db_api
 The binary is at `target/release/minnal_db_api`.
 It uses jemalloc as its memory allocator, which the first build compiles
 from source (it needs a C compiler and `make`). Under concurrent load jemalloc is
-faster than the system allocator and holds far less memory; see
-[benchmark.md → Choosing the memory allocator](../minnal_db/benchmark.md#choosing-the-memory-allocator).
+faster than the system allocator and holds far less memory.
 
 ### 2 — Start the server
 
@@ -219,7 +218,7 @@ segment_size_bytes = 268435456 # 256 MiB per value-log segment file
 [vector_index]
 retry_wait_secs = 2            # seconds to wait before retrying after an embedding failure
 max_retries     = 5            # max attempts per queue entry before it needs manual removal
-concurrency     = 4            # max concurrent embedding calls in flight
+concurrency     = 6            # max concurrent embedding calls in flight
 ```
 
 The config file path is resolved in this order:
@@ -2302,7 +2301,7 @@ minnal_tools bulk_load --kv [--no-wal] [--schema <schema.json>] <url> <namespace
 | Flag                | Description                                                  |
 |---------------------|-------------------------------------------------------------|
 | `--kv`              | Load a KV store instead of a document store. |
-| `--schema <file>`   | Import the schema (`POST /admin/stores/import`) before loading. An existing store is reused, so re-runs are safe. The schema's `namespace` must match the `namespace` argument. Without this flag the namespace must already exist. |
+| `--schema <file>`   | Import the schema (`POST /admin/stores/import`) before loading. An existing store is reused, so re-runs are safe. The schema's `namespace` must match the `namespace` argument, and its `store_type` must match the store kind (`--kv` for `"kv"`). Without this flag the namespace must already exist. |
 | `--no-wal`          | Append `?skip_wal=true` to each write for maximum throughput. Data written this way is **unrecoverable on a crash** — only use when re-running the load is acceptable (e.g. an initial import from a source of truth). |
 
 The tool first calls `GET /stores` to confirm the namespace exists and resolve its `key_type` (after importing the schema if `--schema` was given), then `PUT`s each document. The `id_field` value is parsed according to the store's `key_type` — UUID string for `uuid`, integer (number or numeric string) for `u64`/`u128`, JSON string of 1–50 UTF-8 bytes for `str`. String keys are percent-encoded into the request URL, so they may contain spaces and other reserved characters. The id field is **not** removed from the stored document.
@@ -2327,8 +2326,7 @@ Output:
 ```
 namespace 'users' found  key_type=Uuid
 id_field='id'
-  1000 documents loaded…
-done  loaded=2  skipped=0  total=2  elapsed=0.05s
+done  loaded=2 documents  skipped=0  total=2  elapsed=0.05s
 ```
 
 Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT` are skipped with a warning and counted in `skipped`; valid lines continue to be processed. When there are any failures, the offending lines and their reasons are written to a sibling `<data>.errors` file.

@@ -131,8 +131,8 @@ store is reused.
 ```bash
 ./work/bin/run_tool.sh bulk_load --schema ./work/sample_data/jobs-mini-schema.json \
   http://localhost:8080 jobs jobId ./work/sample_data/jobs-mini.jsonl
-# → schema imported — store 'jobs' created
-# → done  loaded=10  skipped=0  total=10  elapsed=…s
+# → schema imported — doc store 'jobs' created
+# → done  loaded=10 documents  skipped=0  total=10  elapsed=…s
 ```
 
 **4. Query the store**
@@ -251,7 +251,7 @@ retry_wait_secs = 5
 # Max embedding attempts per queue entry; exhausted entries need manual removal.
 max_retries = 5
 # Max concurrent embedding calls in flight at once (entries are round-robin across namespaces).
-concurrency = 4
+concurrency = 6
 
 [semantic_search]
 # The embedding service. Each store names its own model in its schema
@@ -310,9 +310,9 @@ into a one-step "fresh server → populated store" load:
 | `bulk_load --kv --schema …`     | `POST /admin/stores/import` | Yes — imports the schema first, then loads | Fresh server → populated KV store in one step |
 | `bulk_load --kv` (no `--schema`) | —          | No — the namespace must already exist | Adding more rows to a KV store you created earlier |
 
-When `--schema` is given, the tool validates that the schema's `key_type` matches
-the selected store kind — e.g. passing `--kv` with a document schema (`u64` /
-`u128` / `uuid` / `str`) fails fast with a clear message, and vice versa.
+When `--schema` is given, the tool checks that the schema's `store_type` matches
+the selected store kind — e.g. passing `--kv` with a document schema
+(`"store_type": "doc"`) fails fast with a clear message, and vice versa.
 
 **Document stores** (default) — each line becomes one document; `id_field` names
 the field holding the document ID:

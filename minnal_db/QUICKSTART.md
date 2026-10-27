@@ -546,20 +546,9 @@ store.shutdown().await?; // stops the embed-worker cleanly
 **Use jemalloc in the program that embeds `minnal_db`.** Every request
 allocates and frees short-lived buffers, from many threads at once. The system
 allocator on Linux, glibc `malloc`, holds on to much of what it frees, and the
-same work ran slower with it. Under 16 concurrent clients, measured in the
-engine benchmark, switching the same binary to jemalloc gave:
-
-| | glibc `malloc` | jemalloc |
-|---|---:|---:|
-| Operations per second | 412 | 444 |
-| Semantic search, median / p99 | 33 / 91 ms | 23 / 61 ms |
-| Resident memory after the load | 5.2 GiB | 1.3 GiB |
-| Highest resident memory over the whole run | 5.7 GiB | 2.7 GiB |
-
-Search quality and write latency were unchanged. The full comparison,
-including glibc's tuning options, is in
-[benchmark.md → Choosing the memory allocator](benchmark.md#choosing-the-memory-allocator).
-The `minnal_db_api` server already uses jemalloc.
+same work ran slower with it. Under concurrent load jemalloc served reads
+faster and kept far less memory resident; search quality and write latency
+were unchanged. The `minnal_db_api` server already uses jemalloc.
 
 `minnal_db` is a library, so it does not choose an allocator for you: Rust
 lets only the final program set one. You set it in your binary crate, the one
@@ -617,12 +606,16 @@ system about ten seconds after they are freed (`dirty_decay_ms:10000`), and it
 does so while the program allocates, so a program that goes idle keeps them
 until it is busy again. `background_thread:true` makes a jemalloc thread return
 them on time even when the program is idle. `dirty_decay_ms:1000` returns them
-sooner, at some CPU cost. The comparison above used the defaults.
+sooner, at some CPU cost. Options are comma-separated, for example:
+
+```sh
+_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000 ./target/release/my_app
+```
 
 ### Staying on glibc
 
 If you cannot change the allocator, glibc's own settings help only a little.
 `GLIBC_TUNABLES=glibc.malloc.arena_max=8` caps the number of memory regions it
-spreads threads over. That cut resident memory to 2 GiB in the benchmark, but
-also halved throughput, because threads then wait for each other's locks. Treat
-any glibc setting as something to measure on your own workload first.
+spreads threads over. It lowers resident memory, but costs throughput, because
+threads then wait for each other's locks. Treat any glibc setting as something
+to measure on your own workload first.

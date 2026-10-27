@@ -17,9 +17,9 @@ use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServic
 use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
 use tracing::{error, info};
 
-/// jemalloc, not the system allocator: with 16 concurrent clients, glibc malloc
-/// kept about 5 GB of freed memory resident and searches took 40% longer at the
-/// median (`minnal_db/benchmark.md`, "Choosing the memory allocator").
+/// jemalloc, not the system allocator: under concurrent load glibc malloc keeps
+/// much of the memory it frees resident, and searches ran slower with it
+/// (`minnal_db/QUICKSTART.md`, "Choosing a memory allocator").
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

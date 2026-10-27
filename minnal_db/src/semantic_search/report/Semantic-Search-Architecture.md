@@ -399,7 +399,7 @@ The embedding service being unreachable is **never fatal**:
 - **Clear tombstones.** Deletes, and upserts whose embedding text is now empty, write a `Clear` entry *before* deleting the vectors synchronously. The worker retires it by deleting the vectors again (idempotent) and removing it, unless a re-upsert has replaced it meanwhile. An empty-text upsert of a document that never had vectors or a pending entry writes nothing.
 - **On failure:** increments the entry's `retry_count`, persists it, and logs a `WARN` with namespace, doc-id, attempt number, and whether the budget is now exhausted.
 
-The worker's behaviour is tuned by the `[vector_index]` TOML section: `concurrency` (default `4`), `max_retries` (default `5`), and `retry_wait_secs` (default `2`, slept after any pass containing a failure).
+The worker's behaviour is tuned by the `[vector_index]` TOML section: `concurrency` (default `6`), `max_retries` (default `5`), and `retry_wait_secs` (default `2`, slept after any pass containing a failure).
 
 ### Retry & exhaustion
 
