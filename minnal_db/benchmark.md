@@ -22,7 +22,6 @@ to other hardware much better than the raw microseconds do.
 | A field-index range query over 100,000 rows | 56–132 µs | [Field-index queries](#field-index-queries) |
 | A semantic search over 5,000 documents | 2.0–5.7 ms, excluding the embedding call | [Semantic search](#semantic-search) |
 | The whole engine under load, 1 to 16 clients | 349 to 1,440 operations per second; searches 4.6 to 18.7 ms at the median; documents searchable 11–22 ms after their write (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
-| jemalloc instead of glibc `malloc`, 16 clients (measured at an earlier commit) | 8% more operations, searches 28% faster at the median, a quarter of the resident memory | [Choosing the memory allocator](#choosing-the-memory-allocator) |
 
 The one number that shapes the write path: **a write costs 0.74 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
@@ -500,7 +499,7 @@ index.
   handlers make (`get`, `put`, `delete`, `scan_range`, `query_resolved`,
   `search_semantic`, `search_semantic_filtered`). There is no HTTP, no JSON
   encoding of replies and no network. The memory allocator is jemalloc, as in
-  the API server ([Choosing the memory allocator](#choosing-the-memory-allocator)).
+  the API server.
 - **Every background worker runs**: memtable flushes, LSM compaction, value-log
   GC, WAL GC, the vector index WAL's GC, field-index checkpoints (every
   1.75 s), the vector-index worker (up to 4 embedding calls in flight) and
@@ -690,101 +689,3 @@ python3 minnal_db/docs/benchmarks/engine/plot.py OUT_DIR minnal_db/docs/benchmar
 
 It needs gnuplot. `cargo bench` without a command skips this benchmark, so the Criterion report
 above does not run it.
-
-### Choosing the memory allocator
-
-Every request allocates and frees short-lived buffers, from many threads at
-once. So the *memory allocator*, the code behind every allocation and free,
-matters to both speed and memory use. A Rust program uses the system allocator
-(glibc `malloc` on Linux) unless the binary names another one. `minnal_db` is a
-library and leaves that choice to the program that embeds it. The API server
-(`minnal_db_api`) uses jemalloc. The
-[Embedded Quickstart](QUICKSTART.md#7-choosing-a-memory-allocator) shows how to
-switch an application.
-
-This comparison was measured at commit `1007dbd` on 2026-10-18, when every
-write still waited for its own fsync, so its absolute numbers are lower than
-those in [Latency by number of clients](#latency-by-number-of-clients); the
-difference between the two allocators is what it shows. Two builds of
-`engine_bench` were compared on the same starting database and the same
-operations. The only difference was the allocator: glibc `malloc` 2.43
-or jemalloc 5.3 (`tikv-jemallocator` 0.7).
-
-| | glibc `malloc` | **jemalloc** |
-|---|---:|---:|
-| Operations per second, 16 clients | 412 | **444** |
-| Operations per second, soak (4 clients) | 280 | **292** |
-| `search` p50 / p99, 16 clients (ms) | 33 / 91 | **23 / 61** |
-| `filtered_search` p50 / p99, 16 clients (ms) | 34 / 96 | **25 / 63** |
-| `field_query` p99, 16 clients (ms) | 28 | **23** |
-| `get` p99, 16 clients (ms) | 1.8 | **0.8** |
-| `insert` p50, 16 clients (ms) | 72 | 73 |
-| Share of CPU time in the allocator's own code | 1.7% | 1.1% |
-| Share of CPU time in the kernel | 45% | **20%** |
-| Resident memory after the 16-client cell (GiB) | 5.2 | **1.3** |
-| Resident memory at the end of the soak (GiB) | 5.7 | **2.4** |
-| Highest resident memory during the run (GiB) | 5.7 | **2.7** |
-
-Search quality at rest after the run (nDCG):
-
-| | @10 | @20 | @30 | @40 | @50 | @100 |
-|---|---:|---:|---:|---:|---:|---:|
-| glibc `malloc` | 0.506 | 0.533 | 0.542 | 0.549 | 0.554 | 0.569 |
-| jemalloc | 0.506 | 0.534 | 0.542 | 0.550 | 0.555 | 0.569 |
-
-What the numbers show:
-
-- **glibc keeps what it frees.** It spreads threads over many memory regions
-  (*arenas*; up to eight per core), and memory freed into an arena mostly stays
-  there, resident, for the next allocation from that arena. After the
-  16-client cell, glibc's own account showed 1.1 GiB in use and 4.7 GiB freed
-  but still held. jemalloc hands unused pages back to the operating system over
-  about ten seconds, so resident memory follows what is actually in use.
-- **Reads are faster with jemalloc.** With 16 clients the median search is 28%
-  faster and its p99 33% faster; `get`'s p99 halves. Throughput rises 8% at
-  16 clients and 4% in the soak.
-- **The difference is not in the allocator's own code.** Both spend under 2% of
-  their CPU time there. With glibc, 45% of the CPU samples were in the kernel,
-  against 20% with jemalloc. The kernel's symbols were not readable on this
-  machine, so where that kernel time goes has not been established.
-- **Writes are unchanged.** The `insert`, `update` and `delete` medians at
-  16 clients differ by less than 3% between the two allocators. Writes were set by
-  the fsync, not the allocator.
-- **Search quality is unchanged** at every cutoff.
-
-mimalloc (`mimalloc` 0.1.52) was also tried, at commit `7ebb872` with the same
-plan. It landed between the two on every measure (409 operations per second at
-16 clients, `search` p50 38 ms, highest resident memory 4.0 GiB), so it was not
-measured further.
-
-Tuning glibc does not close the gap. Measured at commit `4537a9b` with the same
-plan, limiting it to 8 arenas (`GLIBC_TUNABLES=glibc.malloc.arena_max=8`) cut
-resident memory to 2 GiB but **halved** throughput (153 operations per second
-at 16 clients), because threads then queue for the shared arenas' locks. A
-larger per-thread cache (`glibc.malloc.tcache_count=1024`) used more memory
-(8–8.5 GiB) and was slower (361 operations per second).
-
-How these numbers were made. Code at commit `01ea124`, on 2026-10-18, with the
-machine under [Setup](#setup). Each allocator ran a shortened plan once:
-single-operation cells of 5 seconds, 8 and 16 clients for 3 minutes each, and a
-10-minute soak with 4 clients. Every cell was valid. Both ran under
-`perf record` (499 samples per second, frame pointers on), which costs each the
-same; it is one reason the throughput here is a little below that in
-[Latency by number of clients](#latency-by-number-of-clients). The CPU shares
-are weighted by sample period. Repeated runs of one build have agreed within
-1% on this machine, far less than the differences above. Resident memory
-includes about 0.9 GiB held by the benchmark's replay table, which an
-application does not have.
-
-The benchmark uses jemalloc, as the API server does. To repeat a comparison,
-build it with another allocator:
-
-```sh
-RUSTFLAGS='--cfg minnal_bench_alloc="system"' \
-    cargo bench -p minnal_db --features doc-store,semantic-search --bench engine_bench -- run CONFIG.json
-```
-
-`"system"` selects glibc `malloc` and `"mimalloc"` selects mimalloc. The
-allocator is recorded in `run.json` and named in the report. glibc's own
-account of memory in use and freed but held is reported only for the system
-allocator.

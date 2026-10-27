@@ -55,8 +55,7 @@ cargo build --release -p minnal_db_api
 The binary is at `target/release/minnal_db_api`.
 It uses jemalloc as its memory allocator, which the first build compiles
 from source (it needs a C compiler and `make`). Under concurrent load jemalloc is
-faster than the system allocator and holds far less memory; see
-[benchmark.md → Choosing the memory allocator](../minnal_db/benchmark.md#choosing-the-memory-allocator).
+faster than the system allocator and holds far less memory.
 
 ### 2 — Start the server
 

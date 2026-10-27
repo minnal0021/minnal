@@ -93,7 +93,8 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 │ • LSM tree (keys)    │  │ • append-only        │  │ • ids never reused   │
 │ • value log (values) │  │ • 64 MB segments     │  │ • TTL settings       │
 │                      │  │ • CRC-checked        │  │                      │
-│                      │  │ • fsync per write    │  │                      │
+│                      │  │ • durable on return  │  │                      │
+│                      │  │ • group commit       │  │                      │
 └──────────────────────┘  └──────────────────────┘  └──────────────────────┘
             │
             ├────────────────────────────────────────────┐
