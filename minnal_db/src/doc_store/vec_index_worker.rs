@@ -166,7 +166,7 @@ pub struct VectorIndexConfig {
     /// removed manually via the admin API.  Default: 5.
     pub max_retries: u32,
     /// Maximum number of concurrent embedding calls in flight at once.
-    /// Default: 4.
+    /// Default: 6.
     pub concurrency: usize,
 }
 
@@ -175,7 +175,7 @@ impl Default for VectorIndexConfig {
         Self {
             retry_wait_secs: 2,
             max_retries: 5,
-            concurrency: 4,
+            concurrency: 6,
         }
     }
 }
@@ -775,7 +775,7 @@ mod tests {
         let cfg = VectorIndexConfig::default();
         assert_eq!(cfg.retry_wait_secs, 2);
         assert_eq!(cfg.max_retries, 5);
-        assert_eq!(cfg.concurrency, 4);
+        assert_eq!(cfg.concurrency, 6);
     }
 
     #[test]

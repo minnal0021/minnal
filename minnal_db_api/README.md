@@ -218,7 +218,7 @@ segment_size_bytes = 268435456 # 256 MiB per value-log segment file
 [vector_index]
 retry_wait_secs = 2            # seconds to wait before retrying after an embedding failure
 max_retries     = 5            # max attempts per queue entry before it needs manual removal
-concurrency     = 4            # max concurrent embedding calls in flight
+concurrency     = 6            # max concurrent embedding calls in flight
 ```
 
 The config file path is resolved in this order:

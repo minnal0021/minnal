@@ -251,7 +251,7 @@ retry_wait_secs = 5
 # Max embedding attempts per queue entry; exhausted entries need manual removal.
 max_retries = 5
 # Max concurrent embedding calls in flight at once (entries are round-robin across namespaces).
-concurrency = 4
+concurrency = 6
 
 [semantic_search]
 # The embedding service. Each store names its own model in its schema
