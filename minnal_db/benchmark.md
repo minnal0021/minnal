@@ -659,8 +659,9 @@ The data and the starting database are built once.
        http://127.0.0.1:PORT fiqa id DATA_DIR/base.jsonl
    ```
 
-   Stop the server. Its database and schema directories are the snapshot that
-   `CONFIG.json` names; every run works on a fresh copy of it.
+   Stop the server. Its database directory (which holds the store's schema too)
+   is the snapshot that `CONFIG.json` names; every run works on a fresh copy of
+   it.
 
 Then:
 
