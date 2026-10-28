@@ -357,5 +357,36 @@
         "\\1 chunks/per document"
       ]
     ]
+  },
+  {
+    "file": "pass1_search.png",
+    "title": "Semantic search over 100,000 documents on disk, by share of postings read",
+    "ylabel": "Mean latency, ms",
+    "unit": "ms",
+    "scale": "linear",
+    "zero_based": true,
+    "cases": [
+      "pass1_search/.*"
+    ],
+    "group_by": "/(\\d+)$",
+    "color_by": "pass1_search/(grouped|scattered)/",
+    "legend": {
+      "grouped": "a posting's values adjacent",
+      "scattered": "values spread over the log"
+    },
+    "relabel": [
+      [
+        "^pass1_search/\\w+/184$",
+        "18% of/postings"
+      ],
+      [
+        "^pass1_search/\\w+/750$",
+        "73% of/postings"
+      ],
+      [
+        "^pass1_search/\\w+/1024$",
+        "every/posting"
+      ]
+    ]
   }
 ]
