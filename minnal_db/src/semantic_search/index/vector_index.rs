@@ -43,6 +43,14 @@ impl SparseScan {
         })
     }
 
+    /// Entry `i` in key order as `(cluster_id, doc_id_bytes, raw_rkyv_bytes)`,
+    /// or `None` if its key is not a composite key. Panics if `i >= len()`.
+    pub fn get(&self, i: usize) -> Option<(u32, &[u8], &[u8])> {
+        let (_, key, raw) = self.0.get(i);
+        let (cluster_id, doc_id) = crate::semantic_search::composite_key::decode(key)?;
+        Some((cluster_id, doc_id, raw))
+    }
+
     /// The number of entries.
     pub fn len(&self) -> usize {
         self.0.len()

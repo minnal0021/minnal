@@ -41,11 +41,6 @@ use std::collections::HashMap;
 const MAX_CONCURRENT_SCORING: usize = 2;
 static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCORING);
 
-/// One fetched Pass-1 entry, borrowed from the scan result:
-/// `(cluster_id, per-query-vector estimators for that cluster, doc_id, raw rkyv bytes)`.
-/// One probed Pass-1 entry: its posting, document id and archived chunk codes.
-type SparseEntryRef<'a> = (u32, &'a [u8], &'a [u8]);
-
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
 /// The default probe settings: each query reads its 256 nearest postings
@@ -360,6 +355,45 @@ fn maxsim_score(per_query_maxes: &[f32]) -> f32 {
     per_query_maxes.iter().map(|&m| if m == f32::NEG_INFINITY { 0.0 } else { m }).sum()
 }
 
+/// A Pass-1 entry's document id as a sort key, for grouping entries by document.
+///
+/// `head` is the id's first 16 bytes, big-endian and zero-padded. With `len` it
+/// orders and identifies any id of up to 16 bytes (every `u64`, `u128` and `uuid`
+/// key) as integers, in the ids' byte order; longer ids (`str` keys) compare
+/// their bytes only when the heads tie.
+#[derive(Clone, Copy, Default)]
+struct DocOrder {
+    head: u128,
+    len: u32,
+    /// The entry's position in the scan.
+    entry: u32,
+}
+
+impl DocOrder {
+    fn new(doc_id: &[u8], entry: usize) -> Self {
+        let mut head = [0u8; 16];
+        let n = doc_id.len().min(16);
+        head[..n].copy_from_slice(&doc_id[..n]);
+        Self {
+            head: u128::from_be_bytes(head),
+            len: doc_id.len() as u32,
+            entry: entry as u32,
+        }
+    }
+
+    /// Byte order of the two ids, reading their bytes (through `doc_id_of`) only
+    /// when both are longer than `head` and their heads tie.
+    fn cmp_by<'a>(&self, other: &Self, doc_id_of: impl Fn(u32) -> &'a [u8]) -> std::cmp::Ordering {
+        self.head.cmp(&other.head).then_with(|| {
+            if self.len > 16 && other.len > 16 {
+                doc_id_of(self.entry).cmp(doc_id_of(other.entry))
+            } else {
+                self.len.cmp(&other.len)
+            }
+        })
+    }
+}
+
 /// Render a document id (raw key bytes) as a lowercase hex string for log context.
 fn doc_id_hex(doc_id: &[u8]) -> String {
     use std::fmt::Write;
@@ -457,11 +491,11 @@ where
             .as_deref()
     };
 
-    // Flatten every probed entry into one list so rayon splits the *entries*, not the
-    // clusters: IVF clusters are heavily skewed (one cluster can hold a third of a
-    // corpus), and splitting by cluster left that cluster's scan on a single thread.
-    // Entries are borrowed from `sparse_by_cluster`'s buffers; nothing is copied.
-    let entries: Vec<SparseEntryRef<'_>> = sparse_by_cluster.iter().collect();
+    // Rayon splits the *entries* (by position in the scan), not the clusters: IVF
+    // clusters are heavily skewed (one cluster can hold a third of a corpus), and
+    // splitting by cluster left that cluster's scan on a single thread. Entries are
+    // read in place from `sparse_by_cluster`'s buffers; nothing is copied or listed.
+    let n_entries = sparse_by_cluster.len();
 
     // Score each entry into its own row of a flat `n_query`-wide matrix: row[i] is
     // max_j ⟨q_i, d_j⟩ over that entry's chunks. Rows start at NEG_INFINITY so an
@@ -469,13 +503,18 @@ where
     // Skipped entries (filtered, corrupt, wrong style, empty) are marked in `kept`.
     // Scoring reads each entry zero-copy from its rkyv archive (packed words copied
     // into a per-worker reused buffer), so no per-entry or per-doc allocation.
-    let mut entry_maxes = vec![f32::NEG_INFINITY; entries.len() * n_query];
-    let mut kept = vec![false; entries.len()];
+    let mut entry_maxes = vec![f32::NEG_INFINITY; n_entries * n_query];
+    let mut kept = vec![false; n_entries];
+    let mut doc_orders = vec![DocOrder::default(); n_entries];
     entry_maxes
         .par_chunks_mut(n_query)
         .zip(kept.par_iter_mut())
-        .zip(entries.par_iter())
-        .for_each_init(Vec::<u64>::new, |words_buf, ((row, kept), &(cluster_id, doc_id, raw_bytes))| {
+        .zip(doc_orders.par_iter_mut())
+        .enumerate()
+        .for_each_init(Vec::<u64>::new, |words_buf, (i, ((row, kept), doc_order))| {
+            let Some((cluster_id, doc_id, raw_bytes)) = sparse_by_cluster.get(i) else {
+                return;
+            };
             if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) {
                 return;
             }
@@ -537,31 +576,43 @@ where
                 scored_any = true;
             }
             *kept = scored_any;
+            *doc_order = DocOrder::new(doc_id, i);
         });
 
     #[cfg(test)]
     test_hooks::note_estimator_centres(namespace, centre_estimators.built());
 
     // Group entries by document (a document's chunks can sit in several probed
-    // clusters) by sorting entry indices on doc_id, then fold each group's rows
-    // with an element-wise max and collapse it to S(q, d). Sorting borrowed keys
-    // replaces a per-document HashMap entry — and its key/row allocations — per
-    // worker, plus the cross-worker merge of those maps.
-    let mut order: Vec<usize> = (0..entries.len()).filter(|&i| kept[i]).collect();
-    order.par_sort_unstable_by(|&a, &b| entries[a].1.cmp(entries[b].1));
+    // clusters) by sorting the kept entries' `DocOrder`s, then fold each group's
+    // rows with an element-wise max and collapse it to S(q, d). Sorting replaces a
+    // per-document HashMap entry — and its key/row allocations — per worker, plus
+    // the cross-worker merge of those maps. The sort keys are contiguous integers:
+    // a comparator that looked each doc id up in the scan (a random read per side
+    // of every comparison) cost more than scoring every entry.
+    let doc_id_of = |entry: u32| sparse_by_cluster.get(entry as usize).map_or(&[][..], |(_, doc_id, _)| doc_id);
+    let mut order: Vec<DocOrder> = doc_orders
+        .into_iter()
+        .zip(&kept)
+        .filter(|(_, kept)| **kept)
+        .map(|(order, _)| order)
+        .collect();
+    order.par_sort_unstable_by(|a, b| a.cmp_by(b, doc_id_of));
     let mut doc_maxes = vec![f32::NEG_INFINITY; n_query];
-    let mut sparse_ranked: Vec<(&[u8], f32)> = order
-        .chunk_by(|&a, &b| entries[a].1 == entries[b].1)
+    // Each document as (its first entry, S(q, d)); its id is looked up only if it
+    // survives the cut below, not for every probed document.
+    let mut sparse_ranked: Vec<(u32, f32)> = order
+        .chunk_by(|a, b| a.cmp_by(b, doc_id_of).is_eq())
         .map(|group| {
             doc_maxes.fill(f32::NEG_INFINITY);
-            for &i in group {
+            for order in group {
+                let i = order.entry as usize;
                 for (doc_max, &entry_max) in doc_maxes.iter_mut().zip(&entry_maxes[i * n_query..(i + 1) * n_query]) {
                     if entry_max > *doc_max {
                         *doc_max = entry_max;
                     }
                 }
             }
-            (entries[group[0]].1, maxsim_score(&doc_maxes))
+            (group[0].entry, maxsim_score(&doc_maxes))
         })
         .collect();
 
@@ -583,11 +634,10 @@ where
     // ── Pass 2: dense multi-bit re-ranking ───────────────────────────────────
 
     // Fetch all dense entries in one batch operation (single blocking task in production).
-    let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|(doc_id, _)| doc_id.to_vec()).collect();
+    let dense_doc_ids: Vec<Vec<u8>> = sparse_ranked.iter().map(|&(entry, _)| doc_id_of(entry).to_vec()).collect();
 
     // Pass 1 is done with the scanned entries. They sit in a few large buffers
     // (`SparseScan`), so freeing them is a few frees, not two per entry.
-    drop(entries);
     drop(pass1_permit);
     drop(sparse_by_cluster);
 
@@ -2124,6 +2174,43 @@ mod tests {
     }
 
     // ── ColBERT MaxSim pass-1 tests ───────────────────────────────────────────
+
+    /// Grouping by `DocOrder` must sort and group exactly as comparing the ids'
+    /// bytes does, or Pass 1 would split a document or merge two: ids of 0–40
+    /// bytes, many sharing a 16-byte head, with zero bytes where padding sits.
+    #[test]
+    fn doc_order_sorts_and_groups_as_the_id_bytes_do() {
+        let mut s = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let shared = [7u8; 16];
+        let ids: Vec<Vec<u8>> = (0..4_000)
+            .map(|_| {
+                let len = (next() % 41) as usize;
+                let mut id: Vec<u8> = (0..len).map(|_| (next() % 3) as u8).collect();
+                if next() % 2 == 0 {
+                    let n = len.min(16);
+                    id[..n].copy_from_slice(&shared[..n]);
+                }
+                id
+            })
+            .collect();
+        let doc_id_of = |entry: u32| ids[entry as usize].as_slice();
+        let mut orders: Vec<DocOrder> = ids.iter().enumerate().map(|(i, id)| DocOrder::new(id, i)).collect();
+        orders.sort_by(|a, b| a.cmp_by(b, doc_id_of));
+        let sorted: Vec<&[u8]> = orders.iter().map(|o| doc_id_of(o.entry)).collect();
+        let mut expected: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        expected.sort();
+        assert_eq!(sorted, expected);
+        for pair in orders.windows(2) {
+            let same = pair[0].cmp_by(&pair[1], doc_id_of).is_eq();
+            assert_eq!(same, doc_id_of(pair[0].entry) == doc_id_of(pair[1].entry));
+        }
+    }
 
     #[test]
     fn maxsim_score_sums_positive_maxima() {
