@@ -273,6 +273,73 @@ pub(crate) fn packed_ip_best(packed: &[u64], q: &[f32], dim: usize) -> f32 {
     packed_ip_scalar(packed, q, dim)
 }
 
+// ── Bit-plane (2- or 4-bit chunk code × f32) dot product ─────────────────────
+//
+// A bit-plane code stores `bits` planes of `dim.div_ceil(64)` words each, plane
+// `j` holding bit `j` of every dimension's code. `Σ code[i] · q[i]` is
+// `Σ_j 2^j · Σ_{i: bit j of code[i]} q[i]`.
+
+/// `Σ_j 2^j · packed_ip(plane_j, q)` for a code of `bits` planes, plane by
+/// plane: the reference every faster form must agree with.
+fn bit_planes_ip_per_plane(packed: &[u64], q: &[f32], dim: usize, bits: usize) -> f32 {
+    let words = dim.div_ceil(64);
+    packed
+        .chunks_exact(words)
+        .take(bits)
+        .enumerate()
+        .map(|(j, plane)| (1u32 << j) as f32 * packed_ip_best(plane, q, dim))
+        .sum()
+}
+
+/// One pass for every plane: each 16 dimensions of `q` are loaded once and added,
+/// under each plane's 16-bit mask, into that plane's accumulator. Requires `dim`
+/// to be a multiple of 64 and `1 <= bits <= 4`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn bit_planes_ip_avx512(packed: &[u64], q: &[f32], dim: usize, bits: usize) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let words = dim / 64;
+        let q_ptr = q.as_ptr();
+        let mut acc = [_mm512_setzero_ps(); 4];
+        for w in 0..words {
+            for g in 0..4 {
+                let v = _mm512_loadu_ps(q_ptr.add(w * 64 + g * 16));
+                for (j, a) in acc.iter_mut().enumerate().take(bits) {
+                    let m: __mmask16 = ((packed[j * words + w] >> (g * 16)) & 0xFFFF) as u16;
+                    *a = _mm512_mask_add_ps(*a, m, *a, v);
+                }
+            }
+        }
+        let mut total = _mm512_setzero_ps();
+        for (j, a) in acc.iter().enumerate().take(bits) {
+            total = _mm512_fmadd_ps(*a, _mm512_set1_ps((1u32 << j) as f32), total);
+        }
+        _mm512_reduce_add_ps(total)
+    }
+}
+
+/// `Σ code[i] · q[i]` for a bit-plane code `bits` wide (see
+/// [`QuantisationStyle::BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes)).
+/// `packed` must hold `bits` planes of `dim.div_ceil(64)` words. Selects the
+/// fused AVX-512F kernel when the CPU has it and the shape fits (768 dimensions
+/// do), and otherwise sums [`packed_ip_best`] over the planes.
+#[allow(unreachable_code)]
+pub(crate) fn bit_planes_ip_best(packed: &[u64], q: &[f32], dim: usize, bits: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if dim.is_multiple_of(64)
+            && (1..=4).contains(&bits)
+            && packed.len() >= bits * (dim / 64)
+            && q.len() >= dim
+            && is_x86_feature_detected!("avx512f")
+        {
+            return unsafe { bit_planes_ip_avx512(packed, q, dim, bits) };
+        }
+    }
+    bit_planes_ip_per_plane(packed, q, dim, bits)
+}
+
 // ── Multi-bit (u8 × f32) dot product ─────────────────────────────────────────
 //
 // Each packed u64 word stores 8 quantised u8 values (one per dimension, LE).
@@ -488,6 +555,33 @@ pub(crate) fn multi_bit_dot_best(packed: &[u64], q: &[f32], dim: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_planes_kernel_matches_plane_by_plane() {
+        for (dim, seed) in [(64usize, 1u64), (768, 2), (1024, 3), (96, 4), (100, 5)] {
+            for bits in [2usize, 4] {
+                let (_, q) = make_packed_and_query(dim, seed);
+                let words = dim.div_ceil(64);
+                let mut state = seed ^ 0x5151;
+                let packed: Vec<u64> = (0..words * bits)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    })
+                    .collect();
+                let fast = bit_planes_ip_best(&packed, &q, dim, bits);
+                let reference: f32 = (0..bits)
+                    .map(|j| (1u32 << j) as f32 * reference_packed_ip(&packed[j * words..(j + 1) * words], &q, dim))
+                    .sum();
+                assert!(
+                    (fast - reference).abs() <= 1e-3 * (1.0 + reference.abs()),
+                    "dim {dim} bits {bits}: {fast} vs {reference}"
+                );
+            }
+        }
+    }
 
     fn make_packed_and_query(dim: usize, seed: u64) -> (Vec<u64>, Vec<f32>) {
         let mut state = seed ^ 0x853c49e6748fea9b;

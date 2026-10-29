@@ -198,12 +198,7 @@ impl Pass1Estimator {
         match self {
             Self::Single(e) => e.estimate_from_parts(query_embedding, packed_vector, scaling_factor),
             Self::Planes { estimator, bits } => {
-                let dim = query_embedding.len();
-                let words = dim.div_ceil(64);
-                let mut dot = 0.0f32;
-                for (j, plane) in packed_vector.chunks_exact(words).take(*bits).enumerate() {
-                    dot += (1u32 << j) as f32 * crate::semantic_search::simd::packed_ip_best(plane, query_embedding, dim);
-                }
+                let dot = crate::semantic_search::simd::bit_planes_ip_best(packed_vector, query_embedding, query_embedding.len(), *bits);
                 let query_addition_factor = dot + estimator.0.scaled_query_sum;
                 let estimated_distance = -estimator.0.query_to_centroid_dot_product + addition_factor + (scaling_factor * query_addition_factor);
                 1.0 - estimated_distance

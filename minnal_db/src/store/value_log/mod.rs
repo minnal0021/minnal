@@ -202,6 +202,10 @@ fn read_exact_or_corrupt(file: &File, buf: &mut [u8], offset: u64) -> Result<()>
     })
 }
 
+/// One segment's share of a batch read: its records in offset order, and the
+/// runs read with one `pread` each, as `(first record, past the last, end byte)`.
+type PlannedSegment = (u32, Vec<(usize, ValueLocation)>, Vec<(usize, usize, u64)>);
+
 /// Largest gap a batch read spans to read two records with one `pread`. The
 /// gap holds the earlier record's key (about 12 bytes for a vector entry) and
 /// whatever records lie between them.
@@ -1011,7 +1015,6 @@ impl ValueLog {
     /// `out` in front of its value. A large prefix scan reads tens of thousands of
     /// small values, so this saves an allocation, a copy and a free per value.
     pub fn read_values_batch_into(&self, entries: &[(usize, ValueLocation)], out: &mut Vec<u8>) -> Vec<(usize, Option<std::ops::Range<usize>>)> {
-        out.reserve(entries.iter().map(|(_, loc)| ValueRecordHeader::SIZE + loc.value_len as usize).sum());
         let mut ranges = Vec::with_capacity(entries.len());
         let mut by_segment: HashMap<u32, Vec<(usize, ValueLocation)>> = HashMap::new();
         for &(idx, loc) in entries {
@@ -1021,19 +1024,18 @@ impl ValueLog {
             }
             by_segment.entry(loc.segment_id).or_default().push((idx, loc));
         }
+        // In file order, records that sit close together are read with one
+        // `pread` per run instead of one each: a posting's values are usually
+        // adjacent, since a split or rebuild copies them together. The runs are
+        // planned before anything is read so `out` can be sized once: a run
+        // also reads the gaps between its records, so the records' own sizes
+        // undercount it, and growing a buffer of tens of megabytes copies all of
+        // it (12% of a 4-bit Pass-1 search before this).
+        let mut planned: Vec<PlannedSegment> = Vec::with_capacity(by_segment.len());
+        let mut total = 0usize;
         for (segment_id, mut group) in by_segment {
-            let file = match self.segment_file(segment_id) {
-                Ok(file) => file,
-                // Reclaimed mid-batch: the caller re-resolves these keys.
-                Err(_) => {
-                    ranges.extend(group.into_iter().map(|(idx, _)| (idx, None)));
-                    continue;
-                }
-            };
-            // In file order, records that sit close together are read with one
-            // `pread` per run instead of one each: a posting's values are usually
-            // adjacent, since a split or rebuild copies them together.
             group.sort_unstable_by_key(|(_, loc)| loc.rec_offset);
+            let mut runs = Vec::new();
             let mut run_start = 0;
             while run_start < group.len() {
                 let mut run_end = run_start + 1;
@@ -1046,13 +1048,29 @@ impl ValueLog {
                     end = record_end(group[run_end].1);
                     run_end += 1;
                 }
+                total += (end - group[run_start].1.rec_offset as u64) as usize;
+                runs.push((run_start, run_end, end));
+                run_start = run_end;
+            }
+            planned.push((segment_id, group, runs));
+        }
+        out.reserve(total);
+        for (segment_id, group, runs) in planned {
+            let file = match self.segment_file(segment_id) {
+                Ok(file) => file,
+                // Reclaimed mid-batch: the caller re-resolves these keys.
+                Err(_) => {
+                    ranges.extend(group.into_iter().map(|(idx, _)| (idx, None)));
+                    continue;
+                }
+            };
+            for (run_start, run_end, end) in runs {
                 let run = &group[run_start..run_end];
                 if run.len() == 1 || !self.read_run_into(&file, run, end, out, &mut ranges) {
                     for &(idx, loc) in run {
                         self.read_record_into(&file, idx, loc, out, &mut ranges);
                     }
                 }
-                run_start = run_end;
             }
         }
         ranges
