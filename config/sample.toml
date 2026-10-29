@@ -336,7 +336,7 @@ embedding_service_url = "http://localhost:8001"
 # A store's vectors are partitioned into postings. A store starts with one
 # posting; a posting that grows past twice the target is split in two by a
 # background task (SPFresh's LIRE protocol: balanced 2-means on the postings'
-# 1-bit codes, the new centres being the means of their members). Every key
+# chunk codes, the new centres being the means of their members). Every key
 # but `threads` is a default copied into a store's schema.
 # ---------------------------------------------------------------------------
 [semantic_search.maintenance]

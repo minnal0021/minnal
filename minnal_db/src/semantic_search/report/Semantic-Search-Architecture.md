@@ -86,13 +86,13 @@ Before storage, embeddings are compressed using **RaBitQ** (`quantisation/rabitq
 
 The result is stored in the **dense namespace** (`{ns}_dense_vector`) keyed directly by `doc_id`. For 768-dimensional embeddings at 8 bits, each entry compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction.
 
-### SingleBit (sparse, sliding-window chunks)
+### Chunk codes (sparse, sliding-window chunks)
 
 1. The document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`).
 2. The embedding service returns one embedding per chunk.
-3. Each chunk embedding is routed to its nearest IVF posting and quantised to 1 bit per dimension, as a residual against that posting's centre.
+3. Each chunk embedding is routed to its nearest IVF posting and quantised as a residual against that posting's centre, at the store's **Pass-1 width** (`vector_index.quantisation.pass1_bits`): **1 bit** per dimension by default (`SingleBit`, a sign per dimension), or **2 or 4 bits** (`BitPlanes`: the multi-bit quantiser's code stored as bit planes, plane `j` holding bit `j` of every dimension).
 
-The result is stored in the **sparse namespace** (`{ns}_sparse_vector`) under composite keys `[posting_id (4B BE) ‖ doc_id]`. For 768-dimensional embeddings, a SingleBit entry is ~96 bytes — a 32× reduction versus f32, enabling fast first-pass scans of the probed postings.
+The result is stored in the **sparse namespace** (`{ns}_sparse_vector`) under composite keys `[posting_id (4B BE) ‖ doc_id]`. For 768-dimensional embeddings a chunk code is 96 bytes at 1 bit (a 32× reduction versus f32), 192 at 2 bits and 384 at 4 bits. The width is chosen when semantic search is enabled and fixed after that; wider codes place chunks better and give Pass 1 a better candidate list, at the cost of search latency and storage ([§3.4](#34-parameters), *Choosing a Pass-1 width*).
 
 A third companion namespace, **`{ns}_sparse_vector_meta`**, records which postings hold each document's chunks, and how many. Delete and upsert use it to clean up stale composite keys, and each posting's size is counted from it when the partition loads; search never consults it.
 
@@ -104,11 +104,11 @@ All quantised entries share the same `VectorIndex` struct:
 |---|---|
 | `cluster_id` | The IVF posting this entry is filed under (its key prefix) |
 | `centre_id` | The centre the code was encoded against. A code is always decoded through it, never through the posting it is filed under, so maintenance can move a code between postings without re-encoding it |
-| `packed_vector` | Packed bit codes (96 bytes SingleBit, ~768 bytes 8-bit MultiBit) |
+| `packed_vector` | Packed codes (768 dimensions: 96 bytes `SingleBit`, 192 or 384 bytes 2- or 4-bit `BitPlanes`, 768 bytes 8-bit `MultiBit`) |
 | `addition_factor` | Scalar correction coefficient for distance estimation |
 | `scaling_factor` | Scalar correction coefficient for distance estimation |
 | `error_bound` | Theoretical max deviation of estimated dot product from true dot product |
-| `quantisation_style` | `SingleBit` or `MultiBit { number_of_bits }` |
+| `quantisation_style` | `SingleBit` or `BitPlanes { number_of_bits }` (chunk codes), `MultiBit { number_of_bits }` (whole-document codes) |
 
 **Random rotation.** As in the RaBitQ paper, codes are computed in a randomly rotated space: before quantising, the residual is rotated by one orthogonal transform `P`, seeded per store (`vector_index.quantisation.rotation_seed`) (`semantic_search/quantisation/rotation.rs`, a fast Walsh–Hadamard-based rotation that handles 768 dimensions without padding), and each query is rotated once per search before it meets the codes. Rotation preserves inner products, so the estimators' formulas are unchanged; only their inputs are rotated. Cluster probing and the query-to-centroid term stay in the original space. The rotation is part of the stored format, so `embedding_dim` must be even and at least 8.
 
@@ -122,7 +122,7 @@ The design follows LIRE (Lightweight Incremental REbalancing), the update protoc
 
 ### 3.1 Terms
 
-- **Chunk**: the **embedding** of one sliding-window piece of a document's text (§2, *SingleBit*), stored as a 1-bit code. In this section "chunk" always means that embedding, never the text: partitioning groups embeddings, and the text is not stored in the index. A document has one chunk per window, and its chunks can sit in different postings.
+- **Chunk**: the **embedding** of one sliding-window piece of a document's text (§2, *Chunk codes*), stored as a code of 1, 2 or 4 bits per dimension (the store's Pass-1 width). In this section "chunk" always means that embedding, never the text: partitioning groups embeddings, and the text is not stored in the index. A document has one chunk per window, and its chunks can sit in different postings.
 - **Posting**: one group of chunks. Every chunk is in exactly one posting. A posting is stored as a key prefix: its chunks live under `posting_id ‖ doc_id` keys in `{ns}_sparse_vector`, so reading a posting is one prefix scan.
 - **Entry**: one such key. It holds all of one document's chunks in that posting. Search cost is counted in entries read.
 - **Centre**: a vector stored in the store's centre table (`{ns}_ivf_centres`). Each posting has a **routing centre**: new chunks go to the posting whose centre is nearest, and a query reads the postings nearest to it. Each chunk code is also encoded *against* a centre (it stores the chunk's difference from that centre); that is the code's `centre_id`.
@@ -157,7 +157,7 @@ enable semantic search
 
 **Insert.** A chunk's embedding is compared with every active posting's routing centre, filed under the nearest, and encoded against that posting's centre. If the posting is now over the split limit, the write wakes the maintenance task.
 
-**Split.** The maintenance task rebuilds an approximate vector for every chunk of the posting from its 1-bit code (its *reconstruction*), then divides the posting in two with balanced 2-means (two-group k-means with a penalty that keeps the halves of similar size). The two halves become new postings whose centres are the **means** of their members; the old posting is retired. If the smaller half would be at or under the merge limit, the split is refused and the posting stays whole until its contents change (see [§3.5](#35-design-choices-and-trade-offs)).
+**Split.** The maintenance task rebuilds an approximate vector for every chunk of the posting from its code (its *reconstruction*; finer at 2 and 4 bits), then divides the posting in two with balanced 2-means (two-group k-means with a penalty that keeps the halves of similar size). The two halves become new postings whose centres are the **means** of their members; the old posting is retired. If the smaller half would be at or under the merge limit, the split is refused and the posting stays whole until its contents change (see [§3.5](#35-design-choices-and-trade-offs)).
 
 **Reassign.** A split moves two centres, so some chunks nearby are now in the wrong posting. After each split, the task checks the chunks of the two halves and of the `reassign_range` (64) postings nearest the old centre. A chunk in one of the halves is a candidate if the old centre is nearer to it than its new one; a chunk in a neighbouring posting is a candidate if a new centre is nearer to it than both the old centre and its own posting's centre (SPFresh's two conditions). Each candidate moves to its nearest active posting, which may be where it already is.
 
@@ -192,6 +192,43 @@ Every store owns its partition settings: they are copied into its schema (`vecto
 
 The `split_*` settings are the values of SPFresh's reference implementation (SPTAG); at the default target a posting being split holds far fewer than 1,000 chunks, so every chunk takes part in every iteration. Two server-only settings sit under `[semantic_search.maintenance]`: `threads` (default 2, 1–64: stores maintained at once) and `rebuild_threads` (default 2, 1 or 2: a rebuild's k-means threads).
 
+#### Choosing a Pass-1 width
+
+A store's chunk codes are 1 bit per dimension by default, or 2 or 4 bits
+(`vector_index.quantisation.pass1_bits`, chosen when semantic search is enabled
+and fixed for the store's life: changing it means a new store, since every chunk
+would have to be embedded again). A wider code reconstructs the chunk more
+closely, so maintenance files more chunks in their nearest posting and Pass 1
+ranks its candidates better. It also makes every entry read larger.
+
+Measured with `vector_bench` on FiQA (57,600 documents, 172,998 chunks) at the
+default 256 probes, gemma / qwen:
+
+| | 1 bit | 2 bits | 4 bits |
+|---|---:|---:|---:|
+| Chunks in their nearest posting (grown / after a rebuild) | 90–91% / 91–92% | 94–95% / 96–97% | 97–98% / 99% |
+| Pass-1 recall (exact top 1,000 among Pass 1's 1,000) | 0.82 / 0.84 | 0.91 / 0.92 | 0.95 / 0.96 |
+| ANN recall@100 | 0.986 / 0.988 | 0.988 / 0.991 | 0.989 / 0.991 |
+| nDCG@10 | 0.476 / 0.592 | 0.475 / 0.592 | 0.474 / 0.592 |
+| Search p50 | 4.4 ms | 4.7–4.8 ms | 5.4–5.6 ms |
+| Pass-1 storage per chunk | 142 B | 238 B | 430 B |
+
+On SciFact and FiQA, nDCG and recall@10 are the same at every width (every paired
+difference within ±0.003, its 95% interval including zero, from 64 probes up):
+Pass 2 rescores the candidates and recovers what a coarse Pass 1 ranks low. So:
+
+| Width | Choose it when |
+|---|---|
+| **1** (default) | Ranked document retrieval where Pass 2 decides the final order; large stores where Pass-1 storage matters |
+| **2** | Pass 1's candidate list itself matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or stores that are rebuilt often (a FiQA rebuild took 95 s against 145 s at 1 bit). +7–9% search latency, 1.7× Pass-1 storage |
+| **4** | Placement matters most: near-duplicate or entity matching, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. +25% search latency, 3× Pass-1 storage, +20–25% indexing time |
+
+Since the width is fixed, try it on a sample: build a test store at each width
+and compare the recall check (§3.7) and search latency at the store's
+`max_probes`. The full measurements are in
+[`Pass1-Latency-And-Code-Width-Design.md`](Pass1-Latency-And-Code-Width-Design.md),
+*Part B as built*.
+
 ### 3.5 Design choices and trade-offs
 
 Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the gemma and qwen embedding models, in three insertion orders (file order, random order, and topic by topic). "Static k-means" is a partition fitted once on all the full-precision vectors, with the same number of postings: a strong fixed baseline.
@@ -201,7 +238,7 @@ Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the ge
 | **Grow from one posting**, no seeding phase | Searchable from the first document; nothing to prepare; handles growth, topic drift and deletes the same way | Postings are placed one split at a time, so the partition trails static k-means. On FiQA recall@10 is 0.4–1.0 points behind at a 5% read share; on SciFact 0.9–1.8. Seeding with k-means on the first floats gained at most 0.3 points, for about 90 MB of staged floats |
 | **Target 128 chunks** | More recall per millisecond than 256 (FiQA: 0.971 against about 0.966 at 3.7 ms) | About twice as many postings, so twice the probes to read the same entries (603 against 293 at 70,000 entries, about 3.5 µs each: p50 14.9 ms against 13.8 ms) and more splits while indexing |
 | **Mean centres**, not SPFresh's medoid (the member nearest the mean) | With 1-bit codes a medoid is one member's noisy reconstruction, and the partition fragments (FiQA: 12,000–24,000 postings, recall@10 0.58–0.69 at a 1% read). The mean averages the noise away, and beat the medoid even on exact vectors | None measured |
-| **1-bit codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 20 MB of codes instead of 530 MB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors; 2-bit codes would add at most about a point at read shares of 2% or less |
+| **Codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 20 MB of 1-bit codes instead of 530 MB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors, so at 1 bit about 9–10% of chunks end up outside their nearest posting (1–3% at 4 bits). On SciFact and FiQA this changed neither nDCG nor recall@10 (*Choosing a Pass-1 width*) |
 | **Codes keep their centre** when moved | No re-encoding, no embedding calls, no compounding error (re-encoding from a 1-bit code measured 0.861 against 0.918) | A moved code is a little less precise than a fresh encode against its new posting's centre. This is reported as *centre drift*; no ranking cost from it has been measured |
 | **No replicas** (each chunk in one posting) | One write per chunk; SPFresh's 4–5 copies per chunk cost 15–20 key moves per insert | None measured: replicated partitions lost to unreplicated ones of the same size |
 | **Reassignment over 64 neighbours** | SciFact's gap to static k-means at a 5% read narrowed from up to 3.5 points to under 2; when topics arrive one at a time, recall@10 at a 1% read rose by up to 10 points | About 2 key moves per inserted chunk (1.9–2.2 in random order, up to 2.8 topic by topic); FiQA indexing (embedding excluded) 47 s against 35 s without it, about 0.2 ms per document beside an embedding call of about 100 ms |
@@ -218,14 +255,14 @@ Deletes do not wear the partition down. Deleting half the documents at random, o
 
 | SPFresh | minnal | Why |
 |---|---|---|
-| Postings hold full vectors | Postings hold 1-bit codes; maintenance works on their reconstructions | No float copy of the store |
+| Postings hold full vectors | Postings hold 1-, 2- or 4-bit codes; maintenance works on their reconstructions | No float copy of the store |
 | A split's centres are medoids | The means of the two halves | Medoids of noisy reconstructions fragment the partition |
 | Up to 8 replicas per vector | One posting per chunk | Replicas did not pay at equal entries read |
 | Merges are found lazily, when a search probes a small posting | Merges are found eagerly, when a write or delete leaves a posting small | Maintenance sees every size change; a small posting costs a probe on every query reaching it |
 | A split always writes both halves | A split whose smaller half is at or under the merge limit is refused | Without it, eager merges and splits undo each other in a loop |
 | A posting that will not split is truncated | It is kept whole and tried again when it changes | minnal never drops data |
 | Nearest centres found by an approximate graph | Every centre scanned exactly | Microseconds at this scale |
-| A moved vector keeps its value | A moved code keeps its `centre_id`; only its key changes | Re-encoding a 1-bit code compounds its error |
+| A moved vector keeps its value | A moved code keeps its `centre_id`; only its key changes | Re-encoding a code compounds its error |
 | — | Optional error-bound gate on move decisions | Uses the `error_bound` every code already stores |
 
 ### 3.7 Watching the partition
@@ -255,7 +292,7 @@ Raw query text
                       queries are not chunked)
   → cache it (TTL configurable; default 1 day)
 
-Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
+Pass 1 — Sparse (chunk codes, 1, 2 or 4 bits), ColBERT MaxSim over document chunks:
   rank every posting by the distance of q to its routing centre; take the
     max_probes nearest
     (several query vectors → union of their posting sets)
@@ -266,7 +303,7 @@ Pass 1 — Sparse (SingleBit), ColBERT MaxSim over document chunks:
   flatten every probed entry (cluster, d, chunks) into one list
   for each entry (rayon parallel over ENTRIES, not clusters):
     apply doc_filter (RoaringBitmap predicate) — skip if fails
-    row[entry][i] = max_j SingleBitEstimator(q_i, d_j)   ← best chunk in this entry
+    row[entry][i] = max_j Pass1Estimator(q_i, d_j)   ← best chunk in this entry
   sort kept entry indices by doc_id; for each run of one document's entries:
     per_vector_max[i] = max over the run of row[entry][i]
     S(q, d) = Σ_i per_vector_max[i]              (= max_j ⟨q, d_j⟩ for one vector)
@@ -313,7 +350,7 @@ second. Rules for changing it are in `CLAUDE.md` → *Concurrency: the scoring g
 
 ### Why two passes?
 
-- **SingleBit** entries are very compact and cluster-contiguous in storage, making prefix-scan over a cluster fast. The 1-bit score is coarse but sufficient to narrow the candidate set from millions to ~1000.
+- **Chunk codes** are compact (1 bit per dimension by default) and cluster-contiguous in storage, making prefix-scan over a cluster fast. The 1-bit score is coarse but sufficient to narrow the candidate set from millions to ~1000; 2- and 4-bit codes rank those candidates better at a higher scan cost (§3.4, *Choosing a Pass-1 width*).
 - **MultiBit** entries are stored directly by `doc_id` for O(1) lookup, and their higher-precision scores produce final ranked results with low quantisation error.
 
 ### ColBERT MaxSim aggregation (Pass 1)
@@ -348,14 +385,14 @@ Companion KVStore namespaces per semantic-search-enabled store (`vector_kv.rs`):
 
 | Namespace | Key | Value |
 |---|---|---|
-| `{ns}_sparse_vector` | `posting_id (4B BE u32) ‖ doc_id` | rkyv `Vec<VectorIndex>` (SingleBit only) |
+| `{ns}_sparse_vector` | `posting_id (4B BE u32) ‖ doc_id` | rkyv `Vec<VectorIndex>` (chunk codes: `SingleBit`, or `BitPlanes` at 2 or 4 bits) |
 | `{ns}_sparse_vector_meta` | `doc_id` | `text_hash (8B) ‖ n (2B BE) ‖ n × (posting_id (4B BE) ‖ chunks (2B BE))` |
 | `{ns}_dense_vector` | `doc_id` | rkyv `Vec<VectorIndex>` (MultiBit only) |
 | `{ns}_ivf_centres` | `centre_id (4B BE)` | the centre, `f32` × D; append-only |
 | `{ns}_ivf_postings` | `posting_id (4B BE)` | routing centre, `centre_id`, state (`Active`, `Draining`, `Retired`), parent, origin |
 | `{ns}_ivf_journal` | operation id (8B BE) | a maintenance operation in progress (split, reassignment, merge, rebuild) |
 
-`_sparse_vector` uses a composite key with a posting prefix so a `scan_prefix(posting_id)` efficiently retrieves all SingleBit vectors in a posting. `_sparse_vector_meta` is a reverse lookup used to find and delete stale sparse keys when a document is updated or deleted, and its chunk counts give each posting's exact size; its text hash records which text the vectors came from. `_dense_vector` is keyed directly by `doc_id` for O(1) fetch in Pass 2. The three `_ivf_` namespaces hold the store's partition and are WAL-backed: unlike codes, they cannot be regenerated by re-embedding.
+`_sparse_vector` uses a composite key with a posting prefix so a `scan_prefix(posting_id)` efficiently retrieves all chunk codes in a posting. `_sparse_vector_meta` is a reverse lookup used to find and delete stale sparse keys when a document is updated or deleted, and its chunk counts give each posting's exact size; its text hash records which text the vectors came from. `_dense_vector` is keyed directly by `doc_id` for O(1) fetch in Pass 2. The three `_ivf_` namespaces hold the store's partition and are WAL-backed: unlike codes, they cannot be regenerated by re-embedding.
 
 ---
 
@@ -502,7 +539,8 @@ Everything that shapes one store's index lives in its schema's `vector_index`. `
 | `embedding_model` | `gemma` | Model requested from the service on every request (`/embedding/{model}/…`). Fixed once set. |
 | `embedding_dim` | `768` | Dimension of the vectors the service returns. Fixed once set. |
 | `chunking.window_size` / `sliding_size` | `4` / `2` | Sentences per document chunk, and the step between chunks (queries are not chunked). Fixed once set. |
-| `quantisation` | 1 / 8 bits, zero Pass-2 centre | Code widths and the rotation seed; read-only. |
+| `quantisation.pass1_bits` | `1` | Bits per dimension of chunk (Pass-1) codes: 1, 2 or 4. Chosen when semantic search is enabled; fixed once set (see *Choosing a Pass-1 width*, §3.4). |
+| `quantisation` (other fields) | 8 bits, zero Pass-2 centre | Pass-2 width and centre, read-only; the rotation seed, fixed once set. |
 | `search.max_probes` | `256` | Pass 1 reads the nearest this many postings (every posting of a store with fewer). |
 | `search.min_probes` | `1` | Floor on postings read, for requests that lower `max_probes`. |
 | `search.first_pass_top_k` | `1000` | Candidates kept after Pass 1 for dense re-ranking. |
@@ -540,7 +578,7 @@ measured on frozen BEIR embeddings by the vector bench
 | Embedding service client + two-pass search | `minnal_db/src/semantic_search/service/mod.rs` |
 | RaBitQ quantisation (encode + decode) | `minnal_db/src/semantic_search/quantisation/rabitq/mod.rs` |
 | `VectorIndex` struct + `VectorKvStore` trait | `minnal_db/src/semantic_search/index/vector_index.rs` |
-| Distance estimators (SingleBit, MultiBit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
+| Distance estimators (Pass 1 at any width, Pass 2 multi-bit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
 | A store's partition (postings, centres, routing epoch) + choosing the postings a search reads | `minnal_db/src/semantic_search/cluster/layout.rs` |
 | Split, reassignment, merge, rebuild and their journal | `minnal_db/src/ivf_split.rs`, `minnal_db/src/ivf_split/` |
 | Recall check and partition history | `minnal_db/src/ivf_split/recall_check.rs`, `ivf_split/history.rs` |

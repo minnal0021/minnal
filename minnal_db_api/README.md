@@ -568,8 +568,9 @@ this many), `min_probes` (a floor for requests that lower `max_probes`),
 `skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
 and `split_lambda_factor`. What each one does, its default and its allowed range
 are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
-The embedding model, dimension and chunking are fixed once semantic search is
-enabled and cannot be changed here. A value out of range returns `400`; a store
+The embedding model, dimension, chunking and Pass-1 code width
+(`quantisation.pass1_bits`) are fixed once semantic search is enabled and cannot
+be changed here. A value out of range returns `400`; a store
 without semantic search returns `422`. Read the current values with
 `GET /stores/{ns}/schema`.
 
@@ -2025,7 +2026,7 @@ Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
 
 #### `POST /admin/indices/{ns}/vector/rebuild`
 
-Re-cluster the store's partition from its stored 1-bit codes: k-means over every
+Re-cluster the store's partition from its stored chunk codes: k-means over every
 chunk, then each chunk moves to its nearest new posting, and the usual splits
 and merges follow. No embedding request is made and no code is re-encoded.
 Searches and writes continue throughout; a crash part-way is finished at the
@@ -2345,7 +2346,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
     config.json               ← namespace settings
     lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
-  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [posting_id ‖ doc_id] (Pass 1)
+  ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)
   ns_{namespace}_sparse_vector_meta/ ← each document's postings and chunk counts, used to clean up on update and delete
   ns_{namespace}_ivf_centres/        ← the store's IVF centres

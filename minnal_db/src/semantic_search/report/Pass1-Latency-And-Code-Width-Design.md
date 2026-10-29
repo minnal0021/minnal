@@ -1,14 +1,14 @@
 # Pass-1 latency and code width
 
-Status: Part A built and measured (see *Part A as built*); Parts B and C are
-proposals, for review.
+Status: Parts A and B built and measured (see *Part A as built* and *Part B as
+built*); Part C is a proposal, deferred.
 
 This document covers two linked changes to Pass 1 of semantic search:
 
 - **Part A** makes Pass 1 faster without changing any stored format.
-- **Part B** lets a namespace choose 1-, 2-, 4- or 8-bit chunk codes for
-  Pass 1 when it is created, trading storage for better estimates and better
-  partition maintenance.
+- **Part B** lets a namespace choose 1-, 2- or 4-bit chunk codes for Pass 1
+  when semantic search is enabled on it (1 bit by default), trading search
+  latency and storage for better chunk placement and Pass-1 recall.
 - **Part C** is a layout change (contiguous per-posting blocks) to take up if
   Parts A and B leave the scan as the main cost.
 
@@ -25,8 +25,15 @@ Part B is designed so that wider codes do not undo it.
 - **Entry**: one stored record in `{ns}_sparse_vector`, keyed
   `posting_id (4 bytes) ‖ doc_id`. Its value is an rkyv list of that
   document's chunk codes in that posting (usually one chunk).
-- **Code width**: bits stored per dimension of a chunk code. Pass 1 uses 1 bit
-  today; Pass 2 uses 8.
+- **Code width**: bits stored per dimension of a chunk code. Pass 1 uses 1, 2
+  or 4 (the namespace's `pass1_bits`); Pass 2 uses 8.
+- **Placement**: whether a chunk is filed in the posting nearest its
+  full-precision embedding. Maintenance (splits, reassignment, rebuilds) moves
+  chunks using their codes, never the embedding, so a coarse code can leave a
+  chunk in a farther posting, where a search finds it only if it probes that
+  posting too.
+- **Pass-1 recall**: the share of the exact top 1,000 documents (by best
+  chunk, full precision) among the 1,000 candidates Pass 1 hands to Pass 2.
 - **L1, L0**: the two on-disk levels of a namespace's LSM tree. Keys and value
   pointers live there; the values themselves live in the **value log**.
 - **Bucket**: the store shards both the LSM and the value log into buckets by
@@ -256,114 +263,145 @@ per-entry frame CRC and key copies), the cross-bucket merge (4.4 ms, one
 thread), the value-log reads (4.2 ms) and Pass 2 (1.5 ms). Part C would remove
 the first three for postings held in memory.
 
-## Part B — Pass-1 code width of 1, 2, 4 or 8 bits
+## Part B — Pass-1 code width of 1, 2 or 4 bits
 
 ### B1. The setting
 
-`vector_index.quantisation.pass1_bits` already exists in every namespace's
-schema and is fixed for the namespace's life. Today `check_bits` accepts only
-1. It will accept **1, 2, 4 or 8**, set when semantic search is first enabled
-on the namespace (store creation, or a later enable) and read-only afterwards,
-as it is now. The default stays 1. KV stores take the same field through the
-shared `vector_settings` code.
+`vector_index.quantisation.pass1_bits` is **1** (the default), **2** or **4**.
+It is chosen when semantic search is first enabled on a store (store creation,
+or a later enable) and fixed for the store's life, like the model and the
+chunking: a dropped and re-enabled vector index keeps it. Using another width
+means a new store, because every chunk would have to be embedded again: a wider
+code cannot be made from a narrower one, and the embeddings are not kept. KV
+stores take the same field.
 
-Changing the width of an existing namespace means dropping its vector index
-and enabling it again, which re-embeds every document. No conversion between
-widths is offered: a narrower code can be cut from a wider one, but a wider
-one needs the embedding.
+```json
+"vector_index": { "quantisation": { "pass1_bits": 4 } }
+```
 
 ### B2. Encoding
 
-- **1 bit**: unchanged (`QuantisationStyle::SingleBit`).
-- **2, 4, 8 bits**: the existing multi-bit RaBitQ quantiser
-  (`quantise(embedding, centre, bits)`), which Pass 2 already uses, applied to
-  the chunk embedding against its posting's centre, stored as
-  `QuantisationStyle::MultiBit { number_of_bits }`. `VectorIndex` already
-  carries the style, so no new record type is needed.
-- Search rejects a sparse entry whose style is not the namespace's width, as it
-  rejects a non-`SingleBit` entry today.
-
-Storage per chunk at 768 dimensions:
-
-| Width | Code bytes | Entry with fields and value-log record | musics_200k (210k chunks) | 1M chunks |
-|---|---:|---:|---:|---:|
-| 1 bit | 96 | ~180 B | ~38 MB | ~180 MB |
-| 2 bits | 192 | ~276 B | ~58 MB | ~276 MB |
-| 4 bits | 384 | ~468 B | ~98 MB | ~468 MB |
-| 8 bits | 768 | ~852 B | ~179 MB | ~852 MB |
-
-(Measured at 1 bit: 38 MB of value log for 208k entries. Wider rows add the
-code bytes only.)
+- **1 bit**: a sign per dimension (`QuantisationStyle::SingleBit`), 64
+  dimensions per word.
+- **2 and 4 bits**: the multi-bit RaBitQ quantiser Pass 2 uses, applied to the
+  chunk against its posting's centre, stored as **bit planes**
+  (`QuantisationStyle::BitPlanes { number_of_bits }`): plane `j` holds bit `j`
+  of every dimension's code, packed like a 1-bit code, and the planes follow
+  one another. A code takes `bits × dimensions / 8` bytes (192 or 384 at 768
+  dimensions).
+- The style is stored in every code, and it is also how the write path tells a
+  chunk code (`SingleBit` or `BitPlanes`, to `{ns}_sparse_vector`) from a
+  whole-document code (`MultiBit`, to `{ns}_dense_vector`). `BitPlanes` comes
+  after the existing styles, so stored 1-bit and 8-bit entries read as before.
+- Search skips, and counts as corrupt, any chunk code whose style is not the
+  namespace's width.
 
 ### B3. Scoring
 
-Scoring is 0.9 ms at 1 bit and 161k entries, so compute is not the limit at
-any width. **Bytes are.** At 8 bits, 1,024 probes read about 134 MB of values
-per search, and copying that out of the page cache alone costs on the order of
-10 ms. So:
+The bit-plane layout reuses the 1-bit kernel: the code's dot product with the
+query is `Σ_j 2^j · ⟨plane_j, q⟩`, one AVX-512 1-bit pass per plane, in the
+multi-bit estimate. A 1-bit search runs exactly the code it ran before; its
+results are identical, query by query, to a build without wider codes. A
+quantised query with integer dot products (AVX-512 VNNI) was not built:
+scoring is a small share of a search, and what costs time at wider widths is
+reading more bytes (B5).
 
-- the scan must read less (fewer probes, which is what wider codes should buy;
-  see B5), and
-- Part C's in-place block scan becomes worthwhile at 4 and 8 bits, where it
-  avoids copying the codes out of the page cache at all.
+### B4. Partition maintenance
 
-For the scoring itself:
+Splits (2-means), rebuilds (k-means) and the recall check reconstruct each
+chunk from its code (`reconstruct_code`): `c + s·(2b − 1)` at 1 bit, and
+`c − s·(u + c_b)` for a bit-plane code with per-dimension value `u` and shift
+`c_b = −(2^(b−1) − 0.5)`. Reassignment decides from per-byte lookup tables
+without reconstructing; for bit planes it sums one table pass per plane. Its
+test (`the_scorer_decides_as_the_reconstruction_does`) checks it against the
+reconstruction at 1, 2 and 4 bits. Codes still keep the centre they were
+encoded against when moved, and maintenance still makes no embedding calls.
 
-- **2, 4, 8 bits** start with the existing multi-bit estimator
-  (`MultiBitQuanDotProductEstimator`, float query). If it shows in the profile,
-  quantise the rotated query once per search to 8-bit integers and use
-  AVX-512 VNNI integer dot products (`vpdpbusd`: 64 byte-multiplies per
-  instruction, 12 instructions per 768-dimension code), behind the existing
-  runtime dispatch (`simd::*_best`) with the scalar fallback. The measured CPU
-  has AVX-512 VNNI and VPOPCNTDQ. Query quantisation adds a small estimation
-  error, so it goes through the same quality gate as the width itself.
-- **1 bit** keeps the float path. A 4-bit quantised query with popcount over
-  bit planes (the RaBitQ paper's method) is an option if scoring ever matters
-  at 1 bit; today it is 3% of the search.
+### Part B as built, and what it measured
 
-### B4. Partition maintenance on wider codes
+Measured with `vector_bench` (frozen embeddings through the production write
+path and search; partition grown from one posting with maintenance running)
+on SciFact (5,183 documents, 22,787 chunks) and FiQA (57,600 documents,
+172,998 chunks), with gemma and qwen. Grown runs twice, alternating widths;
+rebuild runs once (`MINNAL_BENCH_REBUILD=1`, k-means on the codes after
+indexing). Commit `2ab19bf`; a build from `main` at 1 bit gave identical
+per-query results and latency.
 
-Splits, reassignment and rebuilds decide where chunks go from code
-reconstructions (`reconstruct_single_bit`), because maintenance makes no
-embedding calls. At 1 bit those reconstructions are coarse: on `musics_200k`,
-13% of sampled chunks are not in their nearest posting (2nd nearest 8.6%, 3rd
-to 16th 4.8%). Codes of 4 or 8 bits reconstruct the chunk almost exactly, so
-maintenance at those widths places chunks where a fresh embedding would.
+**Placement**: chunks in their nearest posting (in one of the 2 nearest).
 
-Needed:
+| Store | Partition | 1 bit | 2 bits | 4 bits |
+|---|---|---:|---:|---:|
+| FiQA gemma | grown | 89.6% (95.9%) | 94.1% (98.1%) | 97.1% (99.2%) |
+| FiQA gemma | rebuilt | 91.0% (97.0%) | 96.2% (99.1%) | 98.7% (99.7%) |
+| FiQA qwen | grown | 91.0% (96.8%) | 95.0% (98.5%) | 97.5% (99.3%) |
+| FiQA qwen | rebuilt | 92.4% (97.6%) | 96.7% (99.2%) | 98.9% (99.8%) |
+| SciFact gemma | grown | 91.0% (96.3%) | 94.5% (97.8%) | 97.6% (99.7%) |
+| SciFact qwen | grown | 90.5% (95.6%) | 95.5% (98.1%) | 98.8% (99.8%) |
 
-- `reconstruct_multi_bit` for splits' 2-means and rebuild k-means.
-- The reassignment `Scorer` decides without reconstructing, using per-byte
-  lookup tables that assume 1-bit signs (`SignDot`). For 2 and 4 bits the same
-  idea works with tables over 4 or 2 dimensions per byte; for 8 bits,
-  reconstruct and compute directly. Its correctness test
-  (`the_scorer_decides_as_the_reconstruction_does`) is extended to each width.
-- Measure maintenance cost at each width on FiQA indexing, the established
-  benchmark (`vector_bench`, background workers running).
+**Search, FiQA, 256 probes** (the default `max_probes`), grown partition:
 
-### B5. Where the latency gain from wider codes must come from
+| | 1 bit | 2 bits | 4 bits |
+|---|---:|---:|---:|
+| Pass-1 recall, gemma / qwen | 0.824 / 0.841 | 0.905 / 0.920 | 0.952 / 0.964 |
+| ANN recall@100, gemma / qwen | 0.986 / 0.988 | 0.988 / 0.991 | 0.989 / 0.991 |
+| ANN recall@10, gemma / qwen | 0.994 / 0.996 | 0.993 / 0.997 | 0.993 / 0.997 |
+| nDCG@10, gemma / qwen | 0.4760 / 0.5916 | 0.4745 / 0.5919 | 0.4741 / 0.5919 |
+| Search p50, gemma / qwen (ms) | 4.36 / 4.41 | 4.65 / 4.82 | 5.44 / 5.55 |
+| Search p50 at 512 probes (ms) | 6.99 / 7.14 | 7.71 / 7.89 | 9.33 / 9.82 |
 
-A wider code does not by itself rank better. A study at 2 bits found Pass-1
-recall up from 0.806 to 0.900 but the same exact top 100 and the same nDCG
-(`pass1-recall-study.md`): Pass 2 already corrects Pass 1's order. Wider codes
-cost more bytes per entry read, so any gain must come from reading fewer
-entries:
+(ANN recall@k: the share of the exact top k, full-precision two-pass ranking,
+in the index's top k.)
 
-1. **Fewer probes for the same result.** Better placement (B4) and better
-   estimates should let a smaller `max_probes` reach the overlap with a full
-   read that 1 bit needs more probes for. Measured with the recall check
-   (`GET /admin/indices/{ns}/vector/recall-check`, same seed per width) and,
-   on `musics_200k`, with the entity-resolution sweep
-   (`work/search_quality/er_probes/`).
-2. **A smaller first-pass cut.** If Pass 1's order is closer to exact,
-   `first_pass_top_k` can drop below 1,000, which shrinks Pass 2's fetch.
-3. **Possibly no Pass 2 at 8 bits** for stores that only need chunk-level
-   MaxSim. Pass 2 scores the whole-document embedding, a different signal from
-   the best chunk, so this is a per-store question to measure, not a default.
+**Cost**:
 
-If none of these show a gain on the gate datasets, wider codes are only worth
-it where placement matters (stores like `musics_200k`), and the default stays
-1 bit.
+| | 1 bit | 2 bits | 4 bits |
+|---|---:|---:|---:|
+| Pass-1 storage per chunk (key, code, factors, value-log record) | 142 B | 238 B | 430 B |
+| FiQA Pass-1 index | 23.4 MiB | 39.3 MiB | 70.9 MiB |
+| FiQA indexing, gemma / qwen (s) | 41 / 39 | 43 / 42 | 49 / 49 |
+| FiQA rebuild, gemma / qwen (s) | 145 / 138 | 95 / 93 | 113 / 110 |
+
+What the numbers say:
+
+- **Placement and Pass-1 recall improve at every width**, on both datasets and
+  both models. At 4 bits about a third as many chunks are misplaced as at 1
+  bit, and Pass 1 keeps 95–96% of the exact top 1,000 instead of 82–84%.
+- **nDCG and the top 10 do not change.** From 64 probes up, every paired
+  nDCG difference against 1 bit, at every cutoff from 10 to 100, is within
+  ±0.003 and its 95% interval includes zero. Pass 2 rescores the 1,000
+  candidates with the whole-document code and recovers what a coarse Pass 1
+  ranks too low. Below 32 probes the differences are larger but go both ways
+  (SciFact qwen at 8 probes: −0.029 at 2 bits, −0.018 at 4).
+- **Recall@100 improves slightly** (0.2–0.5 points), the end-to-end effect of
+  the better candidate list.
+- **Better placement does not let a search read fewer postings** on these
+  stores: recall at a given probe count is the same at every width.
+- **Searches are slower** by the extra bytes: +7–9% at 2 bits and +25% at 4
+  bits at 256 probes, growing with the probe count.
+- **Rebuilds are faster** at 2 and 4 bits: k-means converges in fewer
+  iterations on finer reconstructions.
+
+A separate sweep on the frozen embeddings (`vector_bench_pass1_width`: fixed
+partition, every probe count and a first-pass cut of 1,000 or 300) agrees: the
+same probe count reaches a full read's nDCG at every width; at a cut of 300
+the 2-bit code stayed within 0.001 nDCG of a full read on FiQA qwen, where 1
+bit did not.
+
+### Choosing a width
+
+1 bit is the default and the right choice for most stores. A wider code buys
+better Pass-1 output at the price of search latency and Pass-1 storage:
+
+| Width | Choose it when | Costs (FiQA, 256 probes) |
+|---|---|---|
+| **1** (default) | Ranked retrieval of documents, where Pass 2 decides the final order: the top results are the same at every width. Large stores where Pass-1 storage matters | — |
+| **2** | Pass 1's own candidate list matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or anything that uses the candidates directly. Stores that are rebuilt often | +7–9% search latency; 1.7× Pass-1 storage |
+| **4** | Chunk placement matters most: near-duplicate or entity matching where one chunk must be found, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. The most accurate Pass 1 | +25% search latency; 3× Pass-1 storage; +20–25% indexing time |
+
+The width cannot be changed later, so measure on a sample first: build a test
+store at each width and compare the recall check
+(`GET /admin/indices/{ns}/vector/recall-check`) and search latency at the
+store's `max_probes`.
 
 ## Part C — contiguous per-posting blocks (if still needed)
 
@@ -389,7 +427,7 @@ path without changing what is stored.
 - A memory budget (a new server setting, for example
   `[semantic_search] pass1_block_cache_bytes`), evicting least-recently-probed
   postings. A probed posting without a block takes the Part A path.
-- Memory for `musics_200k`: about 25 MB at 1 bit, about 170 MB at 8 bits.
+- Memory for `musics_200k`: about 25 MB at 1 bit, about 85 MB at 4 bits.
 
 Costs and risks: a write-heavy namespace rebuilds blocks often (one posting's
 block per write, built on the next probe), and a rebuild of the partition
@@ -410,9 +448,8 @@ budget cannot hold the probed postings of a real workload.
   `vector_bench` on SciFact and FiQA for stores of ordinary text.
 - **Quality (Part B, and A4 if it changes any order)**: `vector_bench` on
   SciFact and FiQA with gemma and qwen, nDCG at 10, 20, 30, 40, 50 and 100,
-  paired per query. Also Pass-1 recall, recall-check overlap at several probe
-  counts, chunk placement (`probe_tool placement`), and the entity-resolution
-  sweep on `musics_200k`.
+  paired per query, plus Pass-1 recall, ANN recall and chunk placement
+  (`MINNAL_BENCH_PASS1_BITS`, the placement table in its report).
 - **Storage and indexing cost (Part B)**: bytes per chunk, index size, FiQA
   indexing time with maintenance.
 - **Correctness**: the existing scan, crash-audit and concurrency tests, plus
@@ -423,15 +460,17 @@ budget cannot hold the probed postings of a real workload.
 
 1. A1 and A2 (the two largest costs, independent of each other). Measure.
 2. A3 and A4. Measure.
-3. Part B behind `pass1_bits`, with 1 bit unchanged. Gate each width.
-4. Part C1 only if, after 1–3, the scan is still most of a search, or 4- and
-   8-bit stores need it.
+3. Part B behind `pass1_bits`, with 1 bit unchanged. Measure each width.
+4. Part C1 only if, after 1–3, the scan is still most of a search, or 4-bit
+   stores need it.
 
-## Decisions needed
+## Decisions
 
-1. Start with Part A as described, before any format work?
-2. Widths 1, 2, 4 and 8, default 1, fixed at creation, no conversion: agreed?
-3. For integer scoring of 2/4/8-bit codes: accept a quantised query, subject
-   to the nDCG gate?
-4. Part C1: acceptable in principle (a memory budget for derived blocks), and
-   what default budget?
+1. Part A first, before any format work.
+2. Pass-1 widths 1, 2 and 4 (no 8), default 1, chosen when semantic search is
+   enabled and fixed after that, no conversion between widths. Offered as an
+   explicit trade-off (*Choosing a width*).
+3. Scoring of 2- and 4-bit codes uses the float multi-bit estimate over bit
+   planes; a quantised query (integer dot products) is added only if scoring
+   shows up in a profile, and only if it passes the nDCG gate.
+4. Part C1 deferred: after Parts A and B the scan is not yet the case for it.
