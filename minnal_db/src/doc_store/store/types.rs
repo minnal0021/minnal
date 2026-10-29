@@ -578,6 +578,7 @@ impl SemanticSearchContext {
             window_size: settings.window_size as usize,
             sliding_size: settings.sliding_size as usize,
             number_of_bits_for_dense_quantisation: settings.pass2_bits as usize,
+            pass1_bits: settings.pass1_bits as usize,
             probe: probe_settings(&settings.search),
             first_pass_sparse_search_top_k: settings.search.first_pass_top_k as usize,
             top_k_results: settings.search.top_k as usize,

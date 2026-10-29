@@ -114,6 +114,30 @@ pub fn pack_bytes(bytes: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+/// Pack multi-bit codes (one value below `2^bits` per dimension) as `bits` bit
+/// planes: plane `j` is `pack_bits` of bit `j` of every code, and the planes are
+/// concatenated lowest bit first, `codes.len().div_ceil(64)` words each. The
+/// layout of [`QuantisationStyle::BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes).
+pub fn pack_bit_planes(codes: &[u8], bits: usize) -> Vec<u64> {
+    let words = codes.len().div_ceil(64);
+    let mut packed = vec![0u64; words * bits];
+    for (i, &code) in codes.iter().enumerate() {
+        for j in 0..bits {
+            if (code >> j) & 1 == 1 {
+                packed[j * words + i / 64] |= 1u64 << (i % 64);
+            }
+        }
+    }
+    packed
+}
+
+/// The code of dimension `i` in a [`pack_bit_planes`] layout of `dim` dimensions.
+#[inline]
+pub fn bit_plane_code(packed: &[u64], dim: usize, bits: usize, i: usize) -> u8 {
+    let words = dim.div_ceil(64);
+    (0..bits).fold(0u8, |code, j| code | ((((packed[j * words + i / 64] >> (i % 64)) & 1) as u8) << j))
+}
+
 /// Unpack a byte-packed `Vec<u64>` back to `Vec<u8>` of length `dim`.
 #[allow(dead_code)]
 pub fn unpack_bytes(packed: &[u64], dim: usize) -> Vec<u8> {
@@ -124,7 +148,20 @@ pub fn unpack_bytes(packed: &[u64], dim: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_bits, subtract_inplace, unpack_bits};
+    use super::{bit_plane_code, pack_bit_planes, pack_bits, subtract_inplace, unpack_bits};
+
+    #[test]
+    fn bit_planes_round_trip_at_every_width() {
+        for bits in [2usize, 4] {
+            for dim in [1usize, 63, 64, 65, 768] {
+                let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % (1 << bits)) as u8).collect();
+                let packed = pack_bit_planes(&codes, bits);
+                assert_eq!(packed.len(), dim.div_ceil(64) * bits);
+                let back: Vec<u8> = (0..dim).map(|i| bit_plane_code(&packed, dim, bits, i)).collect();
+                assert_eq!(back, codes, "bits {bits} dim {dim}");
+            }
+        }
+    }
 
     #[test]
     fn subtracts_element_wise() {

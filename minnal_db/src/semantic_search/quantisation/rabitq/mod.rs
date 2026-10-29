@@ -213,18 +213,63 @@ pub fn reconstruct_single_bit_into(vi: &VectorIndex, rotated_centre: &[f32], out
     true
 }
 
+/// The reconstruction of a chunk code of any Pass-1 width, in the rotated space:
+/// [`reconstruct_single_bit`] for a 1-bit code, and for a
+/// [`BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes) code of `b`
+/// bits `Pᵀc − scaling_factor · (u + c_b)`, with `u` the dimension's code and
+/// `c_b = −(2^(b−1) − 0.5)` the shift Pass 1's multi-bit estimate applies. The
+/// estimate of `⟨x, q⟩` is this vector's inner product with `q` plus a constant per
+/// code (`1 − addition_factor`, the part of the residual's projection on the
+/// centre the code does not carry), so ranking chunks for one query, or a chunk
+/// against several centres, sees what search sees. `None` for any other style or
+/// a code that does not match the centre's dimension.
+pub fn reconstruct_code(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<f32>> {
+    let mut out = Vec::new();
+    reconstruct_code_into(vi, rotated_centre, &mut out).then_some(out)
+}
+
+/// [`reconstruct_code`] into `out` (cleared first). `false` where that returns
+/// `None`.
+pub fn reconstruct_code_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut Vec<f32>) -> bool {
+    use crate::semantic_search::index::vector_index::QuantisationStyle;
+    use crate::semantic_search::quantisation::rabitq::quantisation_support::bit_plane_code;
+    match vi.quantisation_style {
+        QuantisationStyle::SingleBit => reconstruct_single_bit_into(vi, rotated_centre, out),
+        QuantisationStyle::BitPlanes { number_of_bits: bits } => {
+            out.clear();
+            let dim = rotated_centre.len();
+            if !(MIN_MULTI_BIT_QUANTISATION_BITS..=MAX_MULTI_BIT_QUANTISATION_BITS).contains(&bits)
+                || vi.packed_vector.len() < dim.div_ceil(64) * bits
+            {
+                return false;
+            }
+            let shift = -(((1u32 << (bits - 1)) as f32) - 0.5);
+            let s = vi.scaling_factor;
+            out.extend(
+                rotated_centre
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| c - s * (bit_plane_code(&vi.packed_vector, dim, bits, i) as f32 + shift)),
+            );
+            true
+        }
+        QuantisationStyle::MultiBit { .. } => false,
+    }
+}
+
 pub fn index_embedding_to_cluster(
     embedding: &[f32],
     cluster: &Cluster,
     style: crate::semantic_search::index::vector_index::QuantisationStyle,
 ) -> VectorIndex {
     use crate::semantic_search::index::vector_index::QuantisationStyle;
-    use crate::semantic_search::quantisation::rabitq::quantisation_support::{pack_bits, pack_bytes};
+    use crate::semantic_search::quantisation::rabitq::quantisation_support::{pack_bit_planes, pack_bits, pack_bytes};
     let n_bits = style.number_of_bits();
     let quantisation = quantise(embedding, &cluster.centroid, n_bits);
     let packed = match &style {
         QuantisationStyle::SingleBit => pack_bits(&quantisation.quantised_embedding),
         QuantisationStyle::MultiBit { .. } => pack_bytes(&quantisation.quantised_embedding),
+        QuantisationStyle::BitPlanes { number_of_bits } => pack_bit_planes(&quantisation.quantised_embedding, *number_of_bits),
     };
     VectorIndex::new(
         cluster.cluster_id,
@@ -1036,5 +1081,72 @@ mod tests {
         assert!(reconstruct_single_bit(&multi, &centre.centroid).is_none());
         let vi = index_embedding_to_cluster(&q, &centre, QuantisationStyle::SingleBit);
         assert!(reconstruct_single_bit(&vi, &[0.0; 128]).is_none());
+    }
+
+    #[test]
+    fn a_bit_plane_code_scores_as_the_byte_code_and_reconstructs_what_it_scores() {
+        use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, Pass1Estimator};
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let dim: usize = 96;
+        let mut state = 0xb17_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (1u64 << 31) as f32 - 0.5
+        };
+        let centre = Cluster::new(1, (0..dim).map(|_| next()).collect());
+        let queries: Vec<Vec<f32>> = (0..4).map(|_| (0..dim).map(|_| next()).collect()).collect();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+        for (bits, min_cos) in [(2usize, 0.93), (4, 0.99)] {
+            let (mut cos, mut errs) = (Vec::new(), Vec::new());
+            for _ in 0..500 {
+                let x: Vec<f32> = centre.centroid.iter().map(|&c| c + next()).collect();
+                let planes = index_embedding_to_cluster(&x, &centre, QuantisationStyle::BitPlanes { number_of_bits: bits });
+                let bytes = index_embedding_to_cluster(&x, &centre, QuantisationStyle::MultiBit { number_of_bits: bits });
+                assert_eq!(planes.packed_vector.len(), dim.div_ceil(64) * bits, "tight packing");
+                assert_eq!(
+                    (planes.addition_factor, planes.scaling_factor, planes.error_bound),
+                    (bytes.addition_factor, bytes.scaling_factor, bytes.error_bound)
+                );
+                let xh = reconstruct_code(&planes, &centre.centroid).unwrap();
+                for q in &queries {
+                    let p1 = Pass1Estimator::with_query_sum(bits, 1, q, &centre.centroid, Pass1Estimator::query_sum(q)).estimate_from_parts(
+                        q,
+                        &planes.packed_vector,
+                        planes.addition_factor,
+                        planes.scaling_factor,
+                    );
+                    let mb = MultiBitQuanDotProductEstimator::new(1, q, &centre.centroid, bits).estimate_from_parts(
+                        q,
+                        &bytes.packed_vector,
+                        bytes.addition_factor,
+                        bytes.scaling_factor,
+                    );
+                    // The same estimate as the byte layout ...
+                    assert!((p1 - mb).abs() < 1e-4, "{bits} bits: planes {p1} vs bytes {mb}");
+                    // ... and the reconstruction's inner product plus the code's constant.
+                    let via_xh = dot(&xh, q) + f64::from(1.0 - planes.addition_factor);
+                    assert!(
+                        (f64::from(p1) - via_xh).abs() < 1e-3,
+                        "{bits} bits: estimate {p1} vs reconstruction {via_xh}"
+                    );
+                    errs.push(f64::from(p1) - dot(&x, q));
+                }
+                let r: Vec<f32> = x.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+                let rh: Vec<f32> = xh.iter().zip(&centre.centroid).map(|(a, c)| a - c).collect();
+                cos.push(dot(&r, &rh) / (dot(&r, &r).sqrt() * dot(&rh, &rh).sqrt()));
+            }
+            let n = errs.len() as f64;
+            let mean = errs.iter().sum::<f64>() / n;
+            let sd = (errs.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / n).sqrt();
+            assert!(mean.abs() < 4.0 * sd / n.sqrt(), "{bits} bits: bias {mean} vs sd {sd}");
+            let mean_cos = cos.iter().sum::<f64>() / cos.len() as f64;
+            assert!(mean_cos > min_cos, "{bits} bits: direction kept {mean_cos}");
+        }
+        // A byte-layout code, or a centre of the wrong size: no reconstruction.
+        let x: Vec<f32> = centre.centroid.iter().map(|&c| c + next()).collect();
+        let bytes = index_embedding_to_cluster(&x, &centre, QuantisationStyle::MultiBit { number_of_bits: 4 });
+        assert!(reconstruct_code(&bytes, &centre.centroid).is_none());
+        let planes = index_embedding_to_cluster(&x, &centre, QuantisationStyle::BitPlanes { number_of_bits: 4 });
+        assert!(reconstruct_code(&planes, &vec![0.0; 2 * dim]).is_none());
     }
 }

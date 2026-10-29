@@ -371,7 +371,7 @@ async fn sample_queries(
                 let code = &codes[r as usize];
                 if let Some(q) = ivf
                     .rotated_centre(code.centre_id)
-                    .and_then(|c| reconstruct_single_bit(code, c))
+                    .and_then(|c| reconstruct_code(code, c))
                     .map(|x| ivf.unrotate(&x))
                     .and_then(normalised)
                 {

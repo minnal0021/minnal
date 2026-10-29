@@ -87,7 +87,7 @@ use crate::AsyncDb;
 use crate::semantic_search::cluster::split::{SplitParams, SplitRng, balanced_two_means};
 use crate::semantic_search::index::composite_key;
 use crate::semantic_search::index::vector_index::VectorIndex;
-use crate::semantic_search::quantisation::rabitq::{reconstruct_single_bit, reconstruct_single_bit_into};
+use crate::semantic_search::quantisation::rabitq::{reconstruct_code, reconstruct_code_into};
 use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
 use crate::vector_kv::{
     decode_posting, decode_sparse_meta, encode_posting, encode_sparse_meta, f32s_to_bytes, ivf_centres_ns, ivf_journal_ns, ivf_postings_ns,
@@ -417,16 +417,15 @@ fn posting_of(ivf: &NamespaceIvf, id: u32) -> Option<Posting> {
 // ── Geometry, all in the rotated space codes live in ──
 
 /// The reconstruction of `code`, or `None` for a code that cannot be
-/// reconstructed (its centre is unknown, or it is not 1-bit).
+/// reconstructed (its centre is unknown, or it is not a Pass-1 code).
 fn reconstruct(ivf: &NamespaceIvf, code: &VectorIndex) -> Option<Vec<f32>> {
-    reconstruct_single_bit(code, ivf.rotated_centre(code.centre_id)?)
+    reconstruct_code(code, ivf.rotated_centre(code.centre_id)?)
 }
 
 /// [`reconstruct`] into `buf`, for loops over many codes. `false` for a code
 /// that cannot be reconstructed.
 fn reconstruct_into(ivf: &NamespaceIvf, code: &VectorIndex, buf: &mut Vec<f32>) -> bool {
-    ivf.rotated_centre(code.centre_id)
-        .is_some_and(|c| reconstruct_single_bit_into(code, c, buf))
+    ivf.rotated_centre(code.centre_id).is_some_and(|c| reconstruct_code_into(code, c, buf))
 }
 
 /// Squared Euclidean distance (SIMD). Maintenance compares millions of these
