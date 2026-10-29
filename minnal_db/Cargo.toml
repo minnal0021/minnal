@@ -118,6 +118,11 @@ name = "bench_distance_estimation"
 harness = false
 required-features = ["semantic-search"]
 
+[[bench]]
+name = "bench_pass1_search"
+harness = false
+required-features = ["semantic-search"]
+
 # In-process engine benchmark under background load (not Criterion): does
 # nothing without a command, so `cargo bench` over every suite skips it.
 [[bench]]

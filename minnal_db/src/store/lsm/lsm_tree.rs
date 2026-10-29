@@ -396,18 +396,9 @@ impl<'a> FrameReader<'a> {
 ///   input is a handful of pre-sorted runs, which the sort merges);
 /// * a sorted two-way merge then resolves a key present in both by seq, `newer`
 ///   winning a tie.
-fn merge_scan_layers(l1_keys: &[Vec<u8>], mut l1: Vec<PackedScanEntry>, newer: ScanMap) -> PrefixScanKeys {
+fn merge_scan_layers(l1_keys: &[Vec<u8>], l1: Vec<PackedScanEntry>, newer: ScanMap) -> PrefixScanKeys {
     let key = |e: &PackedScanEntry| &l1_keys[e.0][e.1..e.2];
-    l1.sort_by(|a, b| key(a).cmp(key(b)));
-    // `later` is removed when it repeats `kept`'s key; keep whichever is newer.
-    l1.dedup_by(|later, kept| {
-        let same = key(later) == key(kept);
-        if same && seq_newer_or_eq(later.4, kept.4) {
-            kept.3 = later.3;
-            kept.4 = later.4;
-        }
-        same
-    });
+    let l1 = merge_l1_runs(&l1, key);
 
     let key_bytes = l1.iter().map(|e| e.2 - e.1).sum::<usize>() + newer.keys().map(Vec::len).sum::<usize>();
     let mut out = PrefixScanKeys::with_capacity(l1.len() + newer.len(), key_bytes);
@@ -433,6 +424,103 @@ fn merge_scan_layers(l1_keys: &[Vec<u8>], mut l1: Vec<PackedScanEntry>, newer: S
         }
     }
     out
+}
+
+/// Merge a scan's L1 entries into key order, one entry per key (the newest, as
+/// `seq_newer_or_eq` decides; the later entry on a tie).
+///
+/// A scan's L1 entries arrive as one run per bucket, each in key order (an
+/// SSTable is sorted). Runs are found where the order steps down, and merged
+/// directly, taking the smallest head at each step. Sorting the whole set
+/// instead was most of a large scan's time: 6–7 ms of a 160k-entry scan, moving
+/// every entry through several merge passes. Heads are the keys' first 16 bytes
+/// as integers (`key_head`), so the bytes are read only when two heads tie. Input
+/// in more than `MAX_MERGED_RUNS` runs is stable-sorted instead, which bounds the
+/// cost of an input far from sorted.
+fn merge_l1_runs<'a>(l1: &[PackedScanEntry], key: impl Fn(&PackedScanEntry) -> &'a [u8]) -> Vec<PackedScanEntry> {
+    let heads: Vec<u128> = l1.iter().map(|e| key_head(key(e))).collect();
+    let order = |i: usize, j: usize| heads[i].cmp(&heads[j]).then_with(|| key(&l1[i]).cmp(key(&l1[j])));
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0;
+    for i in 1..=l1.len() {
+        if i == l1.len() || order(i - 1, i).is_gt() {
+            runs.push(start..i);
+            start = i;
+        }
+    }
+    if runs.len() <= MAX_MERGED_RUNS {
+        return merge_runs(l1, &runs, &order);
+    }
+    let mut sorted: Vec<usize> = (0..l1.len()).collect();
+    sorted.sort_by(|&i, &j| order(i, j));
+    merge_runs_in(l1, &sorted, &order)
+}
+
+/// Most runs [`merge_l1_runs`] merges directly; a scan has one per bucket.
+const MAX_MERGED_RUNS: usize = 64;
+
+/// Keep the newest of each key's entries, visiting `l1` in `sorted` order (key
+/// order, input order among equal keys).
+fn merge_runs_in(l1: &[PackedScanEntry], sorted: &[usize], order: &impl Fn(usize, usize) -> std::cmp::Ordering) -> Vec<PackedScanEntry> {
+    let mut out: Vec<PackedScanEntry> = Vec::with_capacity(sorted.len());
+    let mut last: Option<usize> = None;
+    for &i in sorted {
+        if let Some(l) = last
+            && order(l, i).is_eq()
+        {
+            let kept = out.last_mut().expect("`last` names the entry just pushed");
+            if seq_newer_or_eq(l1[i].4, kept.4) {
+                kept.3 = l1[i].3;
+                kept.4 = l1[i].4;
+            }
+            continue;
+        }
+        out.push(l1[i]);
+        last = Some(i);
+    }
+    out
+}
+
+/// Merge `runs` of `l1` (each in key order by `order`) into one, keeping the
+/// newest copy of each key (the later run on a tie).
+fn merge_runs(l1: &[PackedScanEntry], runs: &[std::ops::Range<usize>], order: &impl Fn(usize, usize) -> std::cmp::Ordering) -> Vec<PackedScanEntry> {
+    let mut next: Vec<usize> = runs.iter().map(|r| r.start).collect();
+    let mut out: Vec<PackedScanEntry> = Vec::with_capacity(runs.iter().map(|r| r.len()).sum());
+    let mut last: Option<usize> = None;
+    loop {
+        let mut best: Option<usize> = None;
+        for (r, run) in runs.iter().enumerate() {
+            if next[r] < run.end && best.is_none_or(|b| order(next[r], next[b]).is_lt()) {
+                best = Some(r);
+            }
+        }
+        let Some(b) = best else { break };
+        let i = next[b];
+        next[b] += 1;
+        // A key in more than one run: keep whichever copy is newer.
+        if let Some(l) = last
+            && order(l, i).is_eq()
+        {
+            let kept = out.last_mut().expect("`last` names the entry just pushed");
+            if seq_newer_or_eq(l1[i].4, kept.4) {
+                kept.3 = l1[i].3;
+                kept.4 = l1[i].4;
+            }
+            continue;
+        }
+        out.push(l1[i]);
+        last = Some(i);
+    }
+    out
+}
+
+/// A key's first 16 bytes as a big-endian integer, zero-padded: comparing heads,
+/// then the keys on a tie, is the keys' byte order.
+fn key_head(key: &[u8]) -> u128 {
+    let mut head = [0u8; 16];
+    let n = key.len().min(16);
+    head[..n].copy_from_slice(&key[..n]);
+    u128::from_be_bytes(head)
 }
 
 /// Open a **registered** Level-0 file — one reachable from `level0_files` — for a
@@ -3008,6 +3096,71 @@ impl LSMTree {
         Ok(())
     }
 
+    /// Visit every entry of `bucket`'s L1 file whose key starts with one of
+    /// `sorted_ids` (4-byte big-endian prefixes, ascending), in key order, with one
+    /// forward cursor over the file.
+    ///
+    /// Each prefix's seek point comes from the sparse index, all read under one
+    /// lock before any I/O, and the cursor jumps only when that point lies past it.
+    /// When the prefixes are close together, as when a search probes most
+    /// postings, the jumps vanish and this is one sequential read. Calling
+    /// [`for_each_l1_entry_in_range`](Self::for_each_l1_entry_in_range) per prefix
+    /// started a fresh reader (and an `fstat` and a seek check) for every prefix,
+    /// which dominated a search probing hundreds of postings.
+    ///
+    /// Keys shorter than 4 bytes have no prefix id and are skipped, as the L0 and
+    /// memtable passes of [`scan_prefixes`](Self::scan_prefixes) skip them.
+    fn for_each_l1_entry_in_prefixes(
+        &self,
+        bucket: usize,
+        file: &File,
+        sorted_ids: &[u32],
+        mut visit: impl FnMut(&ArchivedSStableEntry),
+    ) -> Result<()> {
+        debug_assert!(sorted_ids.windows(2).all(|w| w[0] < w[1]), "prefixes must be sorted and distinct");
+        let starts: Vec<u64> = {
+            let index = self.sstable_indexes[bucket].read();
+            sorted_ids
+                .iter()
+                .map(|id| index.as_ref().map(|i| i.block_start(&id.to_be_bytes())).unwrap_or(0))
+                .collect()
+        };
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut frames = FrameReader::new(file, SSTABLE_DATA_START);
+        let mut next = 0usize;
+        'prefixes: while next < sorted_ids.len() {
+            let wanted = sorted_ids[next];
+            if starts[next] > frames.offset() && Self::valid_scan_start(file, starts[next], file_len, &wanted.to_be_bytes()) {
+                frames.seek(starts[next]);
+            }
+            while let Some(body) = frames.next_frame(file_len)? {
+                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
+                let Some(prefix) = archived.key.as_slice().get(..4) else {
+                    continue;
+                };
+                let id = u32::from_be_bytes(prefix.try_into().unwrap());
+                if id < wanted {
+                    continue;
+                }
+                while next < sorted_ids.len() && sorted_ids[next] < id {
+                    next += 1;
+                }
+                if next == sorted_ids.len() {
+                    break 'prefixes;
+                }
+                if sorted_ids[next] == id {
+                    visit(archived);
+                    continue;
+                }
+                // `id` lies between two requested prefixes: jump to the next one if
+                // its block starts past the cursor, else keep reading.
+                continue 'prefixes;
+            }
+            break;
+        }
+        Ok(())
+    }
+
     /// Scan prefix within a specific SSTable bucket using key_prefix for efficiency.
     ///
     /// Returns matching entries as `(key, Option<pointer>)` ordered **L1 (oldest)
@@ -3196,16 +3349,12 @@ impl LSMTree {
                         s.spawn(move || -> Result<(Vec<u8>, Vec<PackedScanEntry>)> {
                             let mut keys = Vec::new();
                             let mut entries = Vec::new();
-                            for &prefix_id in sorted_ids {
-                                let start = prefix_id.to_be_bytes();
-                                let end = prefix_id.checked_add(1).map(u32::to_be_bytes);
-                                self.for_each_l1_entry_in_range(bucket, file, &start, end.as_ref().map(|e| e.as_slice()), None, |archived| {
-                                    let val = (!archived.tombstone).then(|| archived.value.to_native());
-                                    let key_start = keys.len();
-                                    keys.extend_from_slice(archived.key.as_slice());
-                                    entries.push((0, key_start, keys.len(), val, archived.seq.to_native()));
-                                })?;
-                            }
+                            self.for_each_l1_entry_in_prefixes(bucket, file, sorted_ids, |archived| {
+                                let val = (!archived.tombstone).then(|| archived.value.to_native());
+                                let key_start = keys.len();
+                                keys.extend_from_slice(archived.key.as_slice());
+                                entries.push((0, key_start, keys.len(), val, archived.seq.to_native()));
+                            })?;
                             Ok((keys, entries))
                         })
                     })
@@ -6667,6 +6816,138 @@ mod tests {
         // A cluster id past every key's range → min/max skip → empty.
         let none: std::collections::HashSet<u32> = [u32::MAX].into_iter().collect();
         assert!(lsm.scan_prefixes(&none)?.is_empty());
+        Ok(())
+    }
+
+    /// `merge_scan_layers` sorts by `key_head` and then the key; that must be the
+    /// keys' byte order, including keys that are prefixes of others, zero bytes
+    /// where padding sits, and keys on both sides of 16 bytes.
+    #[test]
+    fn key_head_then_key_is_byte_order() {
+        let mut s = 0x1d87_2b41_ee3a_9f05_u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut keys: Vec<Vec<u8>> = (0..5_000).map(|_| (0..next() % 24).map(|_| (next() % 3) as u8).collect()).collect();
+        let mut by_head = keys.clone();
+        by_head.sort_by(|a, b| key_head(a).cmp(&key_head(b)).then_with(|| a.cmp(b)));
+        keys.sort();
+        assert_eq!(by_head, keys);
+    }
+
+    /// The run merge must equal sorting every entry and keeping the newest copy
+    /// of each key: keys of 0–23 bytes (many sharing a 16-byte head) in 8 runs,
+    /// with the same key in several runs at different seqs, and the same entries
+    /// shuffled.
+    #[test]
+    fn merging_l1_runs_equals_sorting_and_keeping_the_newest() {
+        let mut s = 0x5851_f42d_4c95_7f2d_u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for total in [1_000usize, 60_000] {
+            let mut buffers: Vec<Vec<u8>> = Vec::new();
+            let mut entries: Vec<PackedScanEntry> = Vec::new();
+            for run in 0..8usize {
+                let mut keys: Vec<Vec<u8>> = (0..total / 8)
+                    .map(|_| {
+                        let len = (next() % 24) as usize;
+                        let mut k: Vec<u8> = (0..len).map(|_| (next() % 4) as u8).collect();
+                        if next() % 2 == 0 && len > 16 {
+                            k[..16].fill(1);
+                        }
+                        k
+                    })
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                let mut buffer = Vec::new();
+                for k in keys {
+                    let start = buffer.len();
+                    buffer.extend_from_slice(&k);
+                    let seq = next() % 1_000;
+                    entries.push((run, start, buffer.len(), Some(seq as u128), seq));
+                }
+                buffers.push(buffer);
+            }
+            let key = |e: &PackedScanEntry| &buffers[e.0][e.1..e.2];
+            let merged: Vec<(Vec<u8>, u64)> = merge_l1_runs(&entries, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
+
+            let mut reference: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+            for e in &entries {
+                let seq = reference.entry(key(e).to_vec()).or_insert(e.4);
+                if e.4 > *seq {
+                    *seq = e.4;
+                }
+            }
+            let reference: Vec<(Vec<u8>, u64)> = reference.into_iter().collect();
+            assert_eq!(merged, reference, "{total} entries");
+
+            // In random order the input breaks into far more than `MAX_MERGED_RUNS`
+            // runs, which takes the sorting path; it must give the same result.
+            let mut shuffled = entries.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let merged: Vec<(Vec<u8>, u64)> = merge_l1_runs(&shuffled, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
+            assert_eq!(merged, reference, "{total} entries, shuffled");
+        }
+    }
+
+    /// One cursor per L1 file must return exactly each probed prefix's keys for
+    /// any probe set: sparse or dense, adjacent or far apart, prefixes with no
+    /// keys, postings that span several sparse-index blocks, and keys too short to
+    /// have a prefix (which no layer returns).
+    #[test]
+    fn scan_prefixes_over_l1_matches_a_reference_for_any_probe_set() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
+        let mut s = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let n_clusters = 300u32;
+        let mut truth: std::collections::BTreeMap<Vec<u8>, u128> = std::collections::BTreeMap::new();
+        for cid in 0..n_clusters {
+            // 0–80 keys per cluster, so a cluster can span up to five
+            // `SAMPLE_INTERVAL`-entry blocks per bucket or have no keys at all.
+            for did in 0..(next() % 81) as u32 {
+                let key = u32_prefixed_key(cid, did);
+                let value = (cid as u128) << 32 | did as u128;
+                lsm.insert(&key, value)?;
+                truth.insert(key, value);
+            }
+        }
+        // Three bytes: no prefix id, never returned. Four bytes: prefix 5 alone.
+        lsm.insert(&[0u8, 0, 1], 1)?;
+        lsm.insert(&[0u8, 0, 0, 5], 2)?;
+        truth.insert(vec![0, 0, 0, 5], 2);
+        lsm.flush_and_compact_all()?;
+        lsm.purge_ro_memtables_for_test();
+
+        for density in [1u64, 5, 50, 90, 100] {
+            for _ in 0..5 {
+                let ids: std::collections::HashSet<u32> = (0..n_clusters + 5).filter(|_| next() % 100 < density).collect();
+                if ids.is_empty() {
+                    continue;
+                }
+                let expected: Vec<(Vec<u8>, u128)> = truth
+                    .iter()
+                    .filter(|(k, _)| ids.contains(&u32::from_be_bytes(k[..4].try_into().unwrap())))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                assert_eq!(lsm.scan_prefixes(&ids)?.to_pairs(), expected, "density {density}%");
+            }
+        }
         Ok(())
     }
 

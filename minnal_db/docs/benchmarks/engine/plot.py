@@ -7,7 +7,7 @@ Reads RUN_DIR/cells/closed-NN-rK.json (every client count, every repeat) and
 the single-operation cells, and writes to OUT_DIR:
 
   engine_throughput.png   operations per second by number of clients
-  engine_latency.png      one panel per operation: p50, p75, p95 and p99
+  engine_latency.png      one panel per operation: p50, p90, p95 and p99
                           latency by number of clients
   engine_latency.md       the same figures as Markdown tables, p99.9 included
 
@@ -24,8 +24,8 @@ import sys
 import tempfile
 
 OPS = ["get", "scan", "field_query", "search", "filtered_search", "insert", "update", "delete"]
-PCTS = [("p50_ms", "p50"), ("p75_ms", "p75"), ("p95_ms", "p95"), ("p99_ms", "p99")]
-TABLE_PCTS = PCTS + [("p999_ms", "p99.9")]
+PCTS = [("p50_ms", "p50"), ("p90_ms", "p90"), ("p95_ms", "p95"), ("p99_ms", "p99")]
+TABLE_PCTS = [("p50_ms", "p50"), ("p75_ms", "p75"), ("p90_ms", "p90"), ("p95_ms", "p95"), ("p99_ms", "p99"), ("p999_ms", "p99.9")]
 # Colour-blind-separable, one colour per percentile on every panel.
 COLOURS = ["#2a78d6", "#1baf7a", "#eb6834", "#a13cb3"]
 BAR = "#2a78d6"

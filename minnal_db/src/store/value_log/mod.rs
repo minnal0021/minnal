@@ -202,6 +202,17 @@ fn read_exact_or_corrupt(file: &File, buf: &mut [u8], offset: u64) -> Result<()>
     })
 }
 
+/// Largest gap a batch read spans to read two records with one `pread`. The
+/// gap holds the earlier record's key (about 12 bytes for a vector entry) and
+/// whatever records lie between them.
+const MERGED_READ_MAX_GAP: u64 = 512;
+
+/// Where the bytes a read of the record at `loc` needs end: its header and value
+/// (the key that follows is not read).
+fn record_end(loc: ValueLocation) -> u64 {
+    loc.rec_offset as u64 + ValueRecordHeader::SIZE as u64 + loc.value_len as u64
+}
+
 /// 36 bytes, followed by the value bytes and then the key bytes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValueRecordHeader {
@@ -1010,28 +1021,92 @@ impl ValueLog {
             }
             by_segment.entry(loc.segment_id).or_default().push((idx, loc));
         }
-        for (segment_id, group) in by_segment {
-            match self.segment_file(segment_id) {
-                Ok(file) => {
-                    for (idx, loc) in group {
-                        let start = out.len();
-                        out.resize(start + ValueRecordHeader::SIZE + loc.value_len as usize, 0);
-                        let read = read_exact_or_corrupt(&file, &mut out[start..], loc.rec_offset as u64)
-                            .and_then(|()| self.check_record(&out[start..], loc));
-                        match read {
-                            Ok((value, _)) => ranges.push((idx, Some(start + value.start..start + value.end))),
-                            Err(_) => {
-                                out.truncate(start);
-                                ranges.push((idx, None));
-                            }
-                        }
+        for (segment_id, mut group) in by_segment {
+            let file = match self.segment_file(segment_id) {
+                Ok(file) => file,
+                // Reclaimed mid-batch: the caller re-resolves these keys.
+                Err(_) => {
+                    ranges.extend(group.into_iter().map(|(idx, _)| (idx, None)));
+                    continue;
+                }
+            };
+            // In file order, records that sit close together are read with one
+            // `pread` per run instead of one each: a posting's values are usually
+            // adjacent, since a split or rebuild copies them together.
+            group.sort_unstable_by_key(|(_, loc)| loc.rec_offset);
+            let mut run_start = 0;
+            while run_start < group.len() {
+                let mut run_end = run_start + 1;
+                let mut end = record_end(group[run_start].1);
+                while run_end < group.len() {
+                    let next = group[run_end].1.rec_offset as u64;
+                    if next < end || next - end > MERGED_READ_MAX_GAP {
+                        break;
+                    }
+                    end = record_end(group[run_end].1);
+                    run_end += 1;
+                }
+                let run = &group[run_start..run_end];
+                if run.len() == 1 || !self.read_run_into(&file, run, end, out, &mut ranges) {
+                    for &(idx, loc) in run {
+                        self.read_record_into(&file, idx, loc, out, &mut ranges);
                     }
                 }
-                // Reclaimed mid-batch: the caller re-resolves these keys.
-                Err(_) => ranges.extend(group.into_iter().map(|(idx, _)| (idx, None))),
+                run_start = run_end;
             }
         }
         ranges
+    }
+
+    /// Read `run` (records of one segment in offset order, ending at byte `end`)
+    /// with one `pread` into `out` and push each record's value range. Returns
+    /// `false`, with `out` and `ranges` unchanged, if the read fails, so the
+    /// caller can fall back to reading each record alone.
+    fn read_run_into(
+        &self,
+        file: &File,
+        run: &[(usize, ValueLocation)],
+        end: u64,
+        out: &mut Vec<u8>,
+        ranges: &mut Vec<(usize, Option<std::ops::Range<usize>>)>,
+    ) -> bool {
+        let first = run[0].1.rec_offset as u64;
+        let base = out.len();
+        out.resize(base + (end - first) as usize, 0);
+        if read_exact_or_corrupt(file, &mut out[base..], first).is_err() {
+            out.truncate(base);
+            return false;
+        }
+        for &(idx, loc) in run {
+            let start = base + (loc.rec_offset as u64 - first) as usize;
+            let len = ValueRecordHeader::SIZE + loc.value_len as usize;
+            match self.check_record(&out[start..start + len], loc) {
+                Ok((value, _)) => ranges.push((idx, Some(start + value.start..start + value.end))),
+                Err(_) => ranges.push((idx, None)),
+            }
+        }
+        true
+    }
+
+    /// Read one record into `out` and push its value range (`None` on failure).
+    fn read_record_into(
+        &self,
+        file: &File,
+        idx: usize,
+        loc: ValueLocation,
+        out: &mut Vec<u8>,
+        ranges: &mut Vec<(usize, Option<std::ops::Range<usize>>)>,
+    ) {
+        let start = out.len();
+        out.resize(start + ValueRecordHeader::SIZE + loc.value_len as usize, 0);
+        let read = read_exact_or_corrupt(file, &mut out[start..], loc.rec_offset as u64).and_then(|()| self.check_record(&out[start..], loc));
+        match read {
+            Ok((value, _)) => ranges.push((idx, Some(start + value.start..start + value.end))),
+            Err(_) => {
+                out.truncate(start);
+                ranges.push((idx, None));
+            }
+        }
     }
 
     // ── GC support ────────────────────────────────────────────────────────
@@ -1283,6 +1358,61 @@ mod tests {
         }
         assert_ne!(log.inner.read().active_id, first, "setup: the tail must have rolled");
         assert_eq!(log.unsynced_bytes(), in_new_tail);
+        Ok(())
+    }
+
+    /// A batch read merges nearby records into one `pread` per run; every value it
+    /// returns must still be exactly what a single read of that record returns,
+    /// for adjacent records, records with gaps above and below the merge limit,
+    /// records in several segments, repeated positions and a pointer that names
+    /// no record (which fails alone without taking its run down with it).
+    #[test]
+    fn batch_reads_return_what_single_reads_do() -> Result<()> {
+        let dir = TempDir::new()?;
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        let mut s = 0x853c_49e6_748f_ea9b_u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Values of 1–2,000 bytes cross the merge gap both ways and roll several segments.
+        let mut locs = Vec::new();
+        for i in 0..600u64 {
+            let len = 1 + (next() % 2_000) as usize;
+            let value: Vec<u8> = (0..len).map(|j| (i as usize * 31 + j) as u8).collect();
+            locs.push((log.append(&i.to_be_bytes(), &value, meta(i + 1), false)?, value));
+        }
+        assert!(log.inner.read().active_id > 2, "setup: records must span several segments");
+
+        for density in [100u64, 60, 10, 1] {
+            // Which record each batch position reads; the batch's index is the position.
+            let mut records: Vec<usize> = (0..locs.len()).filter(|_| next() % 100 < density).collect();
+            if let Some(&first) = records.first() {
+                records.push(first); // the same record twice
+            }
+            let mut batch: Vec<(usize, ValueLocation)> = records.iter().enumerate().map(|(pos, &r)| (pos, locs[r].0)).collect();
+            // A pointer into the middle of a real record names no record.
+            let bogus = batch.len();
+            let mut bad = locs[3].0;
+            bad.rec_offset += 1;
+            batch.push((bogus, bad));
+
+            let mut out = Vec::new();
+            let results = log.read_values_batch_into(&batch, &mut out);
+            assert_eq!(results.len(), batch.len());
+            for (pos, range) in results {
+                if pos == bogus {
+                    assert!(range.is_none(), "a pointer to no record must fail");
+                    continue;
+                }
+                let range = range.expect("a real record must read");
+                let expected = &locs[records[pos]].1;
+                assert_eq!(&out[range], expected.as_slice(), "density {density}%, position {pos}");
+                assert_eq!(&log.read_value(batch[pos].1)?, expected);
+            }
+        }
         Ok(())
     }
 

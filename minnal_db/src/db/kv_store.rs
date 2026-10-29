@@ -98,14 +98,19 @@ impl PrefixScan {
 
     /// `(prefix_id, key, value)` for every entry, in key order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], &[u8])> + '_ {
-        self.entries.iter().map(|(key, buffer, value)| {
-            let key = self.keys.key(*key);
-            (
-                u32::from_be_bytes(key[..4].try_into().unwrap()),
-                key,
-                &self.values[*buffer][value.clone()],
-            )
-        })
+        (0..self.entries.len()).map(|i| self.get(i))
+    }
+
+    /// Entry `i` in key order as `(prefix_id, key, value)`, for callers that
+    /// visit entries by position (in parallel, say). Panics if `i >= len()`.
+    pub fn get(&self, i: usize) -> (u32, &[u8], &[u8]) {
+        let (key, buffer, value) = &self.entries[i];
+        let key = self.keys.key(*key);
+        (
+            u32::from_be_bytes(key[..4].try_into().unwrap()),
+            key,
+            &self.values[*buffer][value.clone()],
+        )
     }
 }
 
@@ -1212,7 +1217,9 @@ impl KVStore {
         }
 
         let mut values: Vec<Vec<u8>> = Vec::new();
-        let mut entries = Vec::with_capacity(keys.len());
+        // Each key's value as (buffer, range), placed by key index, so the result
+        // comes out in key order without sorting.
+        let mut slots: Vec<Option<(usize, std::ops::Range<usize>)>> = vec![None; keys.len()];
         let mut retry: Vec<usize> = Vec::new();
         std::thread::scope(|s| {
             let handles: Vec<_> = bucket_work
@@ -1233,7 +1240,7 @@ impl KVStore {
                     Ok((buffer, ranges)) => {
                         for (idx, range) in ranges {
                             match range {
-                                Some(range) => entries.push((idx, values.len(), range)),
+                                Some(range) => slots[idx] = Some((values.len(), range)),
                                 None => retry.push(idx),
                             }
                         }
@@ -1246,11 +1253,15 @@ impl KVStore {
 
         for idx in retry {
             if let Some(value) = self.get(keys.key(idx))? {
-                entries.push((idx, values.len(), 0..value.len()));
+                slots[idx] = Some((values.len(), 0..value.len()));
                 values.push(value);
             }
         }
-        entries.sort_unstable_by_key(|(idx, _, _)| *idx);
+        let entries = slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.map(|(buffer, range)| (idx, buffer, range)))
+            .collect();
         Ok(PrefixScan { keys, values, entries })
     }
 
