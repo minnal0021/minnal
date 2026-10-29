@@ -43,6 +43,7 @@
 mod code_width;
 mod exact;
 mod frozen;
+mod pass1_width;
 mod study;
 
 use std::collections::{HashMap, HashSet};
