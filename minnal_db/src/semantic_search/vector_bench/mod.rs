@@ -38,7 +38,9 @@
 //! evaluates on the survivors. `MINNAL_BENCH_REBUILD=1` then rebuilds the
 //! partition from its codes (M4) before the evaluation, its k-means on
 //! `MINNAL_BENCH_REBUILD_THREADS` (2) threads. `MINNAL_BENCH_TRACE` prints maintenance
-//! counters after every batch.
+//! counters after every batch. `MINNAL_BENCH_PASS1_BITS` (1 | 2 | 4) sets the
+//! namespace's Pass-1 code width; the report adds where maintenance placed the
+//! chunks (*Placement*), after growing and, with a rebuild, after it.
 
 mod code_width;
 mod exact;
@@ -58,7 +60,7 @@ use tokio::sync::Semaphore;
 use super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
-use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
+use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, Pass1Estimator};
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
 use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
 use crate::semantic_search::service::{DEFAULT_PROBE, SemanticSearchConfig, index_embeddings, search};
@@ -89,6 +91,59 @@ const ESTIMATOR_RANDOM: usize = 25;
 const SEED: u64 = 42;
 /// nDCG cutoffs reported beside nDCG@10 (and gated on by `vector_bench_compare`).
 const NDCG_CUTOFFS: [usize; 6] = [10, 20, 30, 40, 50, 100];
+/// The neighbourhoods placement is reported at.
+const PLACEMENT_K: [usize; 4] = [1, 2, 4, 16];
+
+fn one() -> usize {
+    1
+}
+
+/// [`Placement`] of the namespace's chunks under `ivf`, read from its keys.
+/// Deleted documents hold no keys and are not counted.
+async fn placement(db: &AsyncDb, ivf: &crate::semantic_search::NamespaceIvf, frozen: &Frozen) -> Placement {
+    use rayon::prelude::*;
+    let rows = db.namespace(sparse_vectors_ns(NS)).await.unwrap().scan_prefix(Vec::new()).await.unwrap();
+    let mut stored: HashMap<usize, HashMap<u32, usize>> = HashMap::new();
+    for (k, v) in &rows {
+        let (posting, doc) = crate::semantic_search::composite_key::decode(k).unwrap();
+        let d = u64::from_be_bytes(doc.try_into().unwrap()) as usize;
+        *stored.entry(d).or_default().entry(posting).or_default() += VectorIndex::access_list(v).unwrap().len();
+    }
+    drop(rows);
+    let kmax = *PLACEMENT_K.last().unwrap();
+    let per_doc: Vec<(usize, Vec<usize>)> = stored
+        .into_par_iter()
+        .map(|(d, held)| {
+            let ranked: Vec<Vec<u32>> = frozen
+                .chunk_rows(d)
+                .map(|c| ivf.probe(&[frozen.chunk(c).to_vec()], kmax).remove(0))
+                .collect();
+            let within = PLACEMENT_K
+                .iter()
+                .map(|&k| {
+                    let mut left = held.clone();
+                    ranked
+                        .iter()
+                        .filter(|r| {
+                            r.iter().take(k).find(|p| left.get(p).is_some_and(|&n| n > 0)).is_some_and(|p| {
+                                *left.get_mut(p).unwrap() -= 1;
+                                true
+                            })
+                        })
+                        .count()
+                })
+                .collect();
+            (ranked.len(), within)
+        })
+        .collect();
+    let chunks: usize = per_doc.iter().map(|(n, _)| n).sum();
+    Placement {
+        chunks,
+        within: (0..PLACEMENT_K.len())
+            .map(|i| per_doc.iter().map(|(_, w)| w[i]).sum::<usize>() as f64 / chunks.max(1) as f64)
+            .collect(),
+    }
+}
 
 // ── Result types (serialised; `vector_bench_compare` reads them back) ──────────
 
@@ -163,6 +218,19 @@ struct Footprint {
     sparse_keys: usize,
 }
 
+/// Where maintenance filed the chunks, judged by their full-precision
+/// embeddings: the share of chunks filed in one of their `k` nearest postings
+/// (production probe order), for `k` in [`PLACEMENT_K`]. A document's chunks are
+/// matched to its stored entries within the document (stored codes do not say
+/// which chunk they are), each chunk to the nearest of its `k` postings that
+/// still holds an unmatched entry of the document; at `k = 1` this is exact.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Placement {
+    chunks: usize,
+    /// Share within the `k` nearest, per [`PLACEMENT_K`].
+    within: Vec<f64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct QueryResultRow {
     ndcg10: f64,
@@ -215,6 +283,14 @@ struct BenchResult {
     docs_per_second: f64,
     footprint: Footprint,
     partition: Partition,
+    /// Pass-1 code width (`MINNAL_BENCH_PASS1_BITS`).
+    #[serde(default = "one")]
+    pass1_bits: usize,
+    /// Placement of the final partition, and before the rebuild when there was one.
+    #[serde(default)]
+    placement: Placement,
+    #[serde(default)]
+    placement_before_rebuild: Option<Placement>,
     estimator_pass1: ErrorStats,
     estimator_pass2: ErrorStats,
     settings: Vec<Setting>,
@@ -401,7 +477,13 @@ fn error_stats(errors: &[(f32, f32)]) -> ErrorStats {
 /// Builds codes and estimators the way indexing and `search()` do (rotated codes and
 /// query terms, ⟨q, c⟩ unrotated); a milestone that changes that wiring (centres)
 /// must change it here too.
-fn estimator_errors<L: IvfLayout + ?Sized>(frozen: &Frozen, gt: &GroundTruth, index: &L, dense_bits: usize) -> (ErrorStats, ErrorStats) {
+fn estimator_errors<L: IvfLayout + ?Sized>(
+    frozen: &Frozen,
+    gt: &GroundTruth,
+    index: &L,
+    pass1_bits: usize,
+    dense_bits: usize,
+) -> (ErrorStats, ErrorStats) {
     let nq = frozen.n_queries();
     let step = (nq / ESTIMATOR_QUERIES).max(1);
     let mut rng = SEED;
@@ -422,10 +504,15 @@ fn estimator_errors<L: IvfLayout + ?Sized>(frozen: &Frozen, gt: &GroundTruth, in
         let rq = index.rotate(q);
         for c in chunks {
             let x = frozen.chunk(c);
-            let vi = index_embedding_rotated(index, x, QuantisationStyle::SingleBit).unwrap();
+            let vi = index_embedding_rotated(index, x, QuantisationStyle::pass1(pass1_bits)).unwrap();
             let centroid = index.centre(vi.centre_id).expect("the code's own centre");
-            let sum = SingleBitQuanDotProductEstimator::query_sum(&rq);
-            let est = SingleBitQuanDotProductEstimator::with_query_sum(vi.centre_id, q, centroid, sum).estimate_distance(&rq, &vi);
+            let sum = Pass1Estimator::query_sum(&rq);
+            let est = Pass1Estimator::with_query_sum(pass1_bits, vi.centre_id, q, centroid, sum).estimate_from_parts(
+                &rq,
+                &vi.packed_vector,
+                vi.addition_factor,
+                vi.scaling_factor,
+            );
             sparse_err.push((est - dot(q, x), vi.error_bound));
         }
         let mut docs: Vec<usize> = gt.final_ranking[qi].iter().take(ESTIMATOR_TOP).map(|&d| d as usize).collect();
@@ -508,6 +595,7 @@ async fn vector_bench() {
     let config = Arc::new(SemanticSearchConfig {
         model_name: model.clone(),
         embedding_service_url: std::env::var("MINNAL_EMBED_URL").unwrap_or_else(|_| SemanticSearchConfig::default().embedding_service_url),
+        pass1_bits: env_or("MINNAL_BENCH_PASS1_BITS", "1").parse().unwrap(),
         ..SemanticSearchConfig::default()
     });
     let dataset_dir = beir_root.join(&dataset);
@@ -684,7 +772,13 @@ async fn vector_bench() {
         recall_check_report("before rebuild", &db, &handle, &config, &frozen).await;
     }
     // ── Rebuild from the codes (M4), timed on its own ──
-    let rebuild = if env_or("MINNAL_BENCH_REBUILD", "0") == "1" {
+    let rebuilding = env_or("MINNAL_BENCH_REBUILD", "0") == "1";
+    let placement_before_rebuild = if rebuilding {
+        Some(placement(&db, &handle.snapshot(), &frozen).await)
+    } else {
+        None
+    };
+    let rebuild = if rebuilding {
         let params = crate::ivf_split::rebuild::RebuildParams {
             postings: None,
             threads: env_or("MINNAL_BENCH_REBUILD_THREADS", "2").parse().unwrap(),
@@ -777,7 +871,8 @@ async fn vector_bench() {
         assert_eq!(ivf.posting_entries(posting), Some(n as u64), "entry count of posting {posting}");
     }
 
-    let (estimator_pass1, estimator_pass2) = estimator_errors(&frozen, &gt, &*ivf, config.number_of_bits_for_dense_quantisation);
+    let placement = placement(&db, &ivf, &frozen).await;
+    let (estimator_pass1, estimator_pass2) = estimator_errors(&frozen, &gt, &*ivf, config.pass1_bits, config.number_of_bits_for_dense_quantisation);
 
     // ── Search sweep ──
     let store = DbVectorStore::new(&db, NS).await.unwrap();
@@ -914,6 +1009,9 @@ async fn vector_bench() {
         docs_per_second: frozen.n_docs() as f64 / index_seconds,
         footprint,
         partition,
+        pass1_bits: config.pass1_bits,
+        placement,
+        placement_before_rebuild,
         estimator_pass1,
         estimator_pass2,
         settings,
@@ -965,8 +1063,30 @@ fn render(r: &BenchResult) -> String {
         f.sparse_meta_bytes as f64 / 1048576.0,
         f.dense_bytes as f64 / 1048576.0
     );
+    let _ = writeln!(
+        md,
+        "Placement ({}-bit chunk codes): share of {} chunks filed in one of their k nearest postings, by full-precision embedding.\n",
+        r.pass1_bits, r.placement.chunks
+    );
+    let _ = writeln!(
+        md,
+        "| Partition | {} |\n|---|{}",
+        PLACEMENT_K.iter().map(|k| format!("k = {k}")).collect::<Vec<_>>().join(" | "),
+        "---:|".repeat(PLACEMENT_K.len())
+    );
+    let mut placements = Vec::new();
+    if let Some(p) = &r.placement_before_rebuild {
+        placements.push(("grown, before the rebuild", p));
+    }
+    placements.push((if r.partition.rebuilt { "after the rebuild" } else { "grown" }, &r.placement));
+    for (name, p) in placements {
+        let cells: Vec<String> = p.within.iter().map(|w| format!("{:.1}%", w * 100.0)).collect();
+        let _ = writeln!(md, "| {name} | {} |", cells.join(" | "));
+    }
+    let _ = writeln!(md);
+    let pass1_name = format!("Pass 1 ({}-bit chunks)", r.pass1_bits);
     let _ = writeln!(md, "| Estimator | Pairs | RMSE | Bias | Within error bound |\n|---|---:|---:|---:|---:|");
-    for (name, e) in [("Pass 1 (1-bit chunks)", &r.estimator_pass1), ("Pass 2 (dense)", &r.estimator_pass2)] {
+    for (name, e) in [(pass1_name.as_str(), &r.estimator_pass1), ("Pass 2 (dense)", &r.estimator_pass2)] {
         let _ = writeln!(
             md,
             "| {name} | {} | {:.5} | {:+.5} | {:.1}% |",
