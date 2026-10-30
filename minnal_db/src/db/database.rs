@@ -772,6 +772,17 @@ pub(crate) struct WriteOutcome {
     pub(crate) applied: bool,
 }
 
+/// What [`Database::lookup_open_store`] found for a namespace name.
+pub(crate) enum OpenStoreLookup {
+    /// Registered, and its store is open.
+    Open(u32, Arc<KVStore>),
+    /// No namespace has this name.
+    Absent,
+    /// Registered, but its store is not in the store map: being opened by
+    /// `create_namespace`, or being removed.
+    NotReady,
+}
+
 // ── Database coordinator ───────────────────────────────────────────────
 
 /// The main database coordinator that manages:
@@ -1792,6 +1803,22 @@ impl Database {
     /// Get a namespace ID by name
     pub fn get_namespace_id(&self, name: &str) -> Option<u32> {
         self.registry.read().get_id(name)
+    }
+
+    /// `name`'s id and open store, from the registry and the store map alone:
+    /// two in-memory reads that never wait. The one state it cannot answer is a
+    /// namespace whose name is published but whose store `create_namespace` is
+    /// still opening (or `remove_namespace` is taking down); that is
+    /// [`OpenStoreLookup::NotReady`], and [`get_store`](Self::get_store) resolves
+    /// it by waiting on `namespace_create_lock`.
+    pub(crate) fn lookup_open_store(&self, name: &str) -> OpenStoreLookup {
+        let Some(ns_id) = self.get_namespace_id(name) else {
+            return OpenStoreLookup::Absent;
+        };
+        match self.stores.read().get(&ns_id) {
+            Some(store) => OpenStoreLookup::Open(ns_id, Arc::clone(store)),
+            None => OpenStoreLookup::NotReady,
+        }
     }
 
     /// Check if a namespace exists

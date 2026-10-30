@@ -39,6 +39,24 @@ use std::collections::HashMap;
 /// costs little throughput: 2 measured best (119 qps vs 108–110 for 1, 4 and 8, p99
 /// 333 ms vs 1.1 s with no bound). The bound is process-wide because the pool is.
 const MAX_CONCURRENT_SCORING: usize = 2;
+
+/// Fewest 1-bit Pass-1 entries one rayon task scores, a few tens of microseconds
+/// of work. Wider codes cost about their width more per entry, so a task takes
+/// this many divided by the width (1,024 at 4 bits): 4,096 at every width cost
+/// 4-bit searches 4–6% of their latency, from too few tasks to spread over.
+///
+/// Without a floor rayon splits a search's work into as many tasks as it has
+/// threads and splits again on every steal, so each search woke the whole pool,
+/// and woken workers spin and yield before they sleep. At 16 clients that was
+/// ~1.1 million wake-ups a second across 32 threads, about ten cores of
+/// spinning, and every other thread (a `get` waiting to run, say) waited for a
+/// core. A floor keeps a small search to a few tasks; a large one still spreads
+/// over the pool.
+const MIN_ONE_BIT_ENTRIES_PER_TASK: usize = 4_096;
+
+/// Fewest Pass-2 candidates one rayon task scores (about a microsecond each), for
+/// the reason given at [`MIN_ONE_BIT_ENTRIES_PER_TASK`].
+const MIN_CANDIDATES_PER_TASK: usize = 64;
 static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCORING);
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
@@ -522,6 +540,7 @@ where
         .zip(kept.par_iter_mut())
         .zip(doc_orders.par_iter_mut())
         .enumerate()
+        .with_min_len(MIN_ONE_BIT_ENTRIES_PER_TASK / pass1_bits)
         .for_each_init(Vec::<u64>::new, |words_buf, (i, ((row, kept), doc_order))| {
             let Some((cluster_id, doc_id, raw_bytes)) = sparse_by_cluster.get(i) else {
                 return;
@@ -685,6 +704,7 @@ where
     let scored: Vec<HeapEntry> = dense_doc_ids
         .into_par_iter()
         .zip(dense_raw.into_par_iter())
+        .with_min_len(MIN_CANDIDATES_PER_TASK)
         .map_init(Vec::<u64>::new, |words_buf, (doc_id, opt_bytes)| {
             let raw_bytes = opt_bytes?;
             let list = match VectorIndex::access_list(&raw_bytes) {
