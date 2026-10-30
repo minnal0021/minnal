@@ -11,7 +11,8 @@
 //! | `{ns}_ivf_centres`        | `centre_id (4B BE)`            | `f32 LE × D` (seeded once, append-only)  |
 //! | `{ns}_ivf_postings`       | `posting_id (4B BE)`           | `centre_id ‖ state (1B) ‖ routing f32 LE × D` |
 //!
-//! The sparse namespace stores chunked single-bit embeddings keyed by IVF cluster, enabling
+//! The sparse namespace stores the chunk codes (the namespace's Pass-1 width: 1, 2 or 4 bits
+//! per dimension) keyed by IVF cluster, enabling
 //! fast first-pass scans by cluster prefix.  The meta namespace tracks which clusters each
 //! document's chunks were assigned to, used only by delete/upsert to clean up stale keys.
 //! The dense namespace stores the full-precision multi-bit embedding keyed directly by

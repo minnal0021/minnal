@@ -399,6 +399,7 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 | `attributes` | array            | no       | Non-indexed field declarations       |
 | `semantic_search_enabled` | bool | no      | Embed documents for semantic search (default `false`) |
 | `embedding_fields` | array of strings | with semantic search | The `str` fields whose text is embedded |
+| `vector_index` | object | no | Vector-index settings; any omitted field takes its default (below) |
 
 **Index spec:**
 
@@ -434,6 +435,49 @@ curl -X POST http://localhost:8080/stores \
   }'
 # → 201 Created
 ```
+
+**Example with semantic search.** `vector_index` is optional; whatever it leaves
+out takes its default, and the filled-in object is saved in the schema
+(`GET /stores/{ns}/schema` shows it). This store chooses 2-bit chunk codes and
+fewer probes:
+
+```bash
+curl -X POST http://localhost:8080/stores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "articles",
+    "store_type": "doc",
+    "key_type": "u64",
+    "indices": [],
+    "attributes": [
+      {"name": "title", "attr_type": "str"},
+      {"name": "body",  "attr_type": "str"}
+    ],
+    "semantic_search_enabled": true,
+    "embedding_fields": ["title", "body"],
+    "vector_index": {
+      "embedding_model": "gemma",
+      "quantisation": {"pass1_bits": 2},
+      "search": {"max_probes": 128}
+    }
+  }'
+# → 201 Created
+```
+
+| `vector_index` field | Default | Can change later? |
+|---|---|---|
+| `embedding_model`, `embedding_dim` | `gemma`, 768 | no |
+| `chunking.window_size`, `chunking.sliding_size` | 4, 2 (sentences per chunk, sentences between chunk starts) | no |
+| `quantisation.pass1_bits` | 1 (allowed: 1, 2, 4 bits per dimension of the chunk codes) | no |
+| `search.max_probes`, `min_probes`, `first_pass_top_k`, `top_k` | 256, 1, 1000, 100 | yes, with `update_vector_search` |
+| `maintenance.*` | see the architecture doc | yes, with `update_vector_search` |
+
+Wider chunk codes make the first search pass rank its candidates better and
+keep chunks in their nearest partition, at the cost of more storage (1.7× at
+2 bits, 3× at 4) and, at 4 bits, slower searches; how to choose is in
+[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
+The fixed settings are kept if the vector index is dropped, and re-enabling it
+(`enable_vector_index`) with a different value for one of them returns `409`.
 
 ---
 
@@ -580,7 +624,7 @@ without semantic search returns `422`. Read the current values with
 | `update_attribute`        | `name`, `attr_type`      |
 | `remove_attribute`        | `name`                   |
 | `add_embedding_attribute` | `name`                   |
-| `enable_vector_index`     | `fields` (non-empty)     |
+| `enable_vector_index`     | `fields` (non-empty); optional `vector_index` |
 | `update_vector_search`    | `search` and/or `maintenance` |
 
 `add_attribute`, `update_attribute` and `add_embedding_attribute` accept an optional `"description"` string.

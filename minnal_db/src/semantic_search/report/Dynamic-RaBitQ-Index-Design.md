@@ -1,7 +1,11 @@
 # Dynamic RaBitQ index: design and milestones
 
-**Status:** M0–M4 done; M5 (system benchmark) next ·
-branch `dynamic-rabitq-index` · 2026-10-11
+**Status:** M0–M4 done (merged to `main` 2026-10-18). This document records how
+the index was designed, built and measured, milestone by milestone. For the
+index as it works now, and the settings in force, read
+`Semantic-Search-Architecture.md` (§3 for the partition, §8 for the settings);
+the chunk-code width (1, 2 or 4 bits) is in
+`Pass1-Latency-And-Code-Width-Design.md`.
 
 **Goal.** Remove the pre-trained centroid files. Each namespace should build and
 maintain its own IVF partition as documents arrive. Search quality (nDCG, recall)
@@ -649,6 +653,10 @@ partition moves yet: postings are seeded from the model's centroid file, so
 M2a's results can be checked byte-for-byte against M1.
 
 ### M2a — The namespace owns its vector-index settings
+
+> The settings below are as M2a built them. Search now takes `min_probes` /
+> `max_probes` instead of `n_probes`, and `pass1_bits` can be 1, 2 or 4 (fixed
+> once set); `Semantic-Search-Architecture.md` §8 has the current table.
 
 **Change.** Every setting that shapes a namespace's vector index, or how it is
 searched, moves out of the engine config into one `vector_index` object in

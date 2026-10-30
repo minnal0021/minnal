@@ -90,7 +90,7 @@ pub enum QuantisationStyle {
     /// `i` is bit `i % 64` of word `i / 64` of the plane), and the planes follow
     /// one another, lowest bit first. Same quantiser and factors as
     /// [`MultiBit`](Self::MultiBit); only the layout differs, so the dot product
-    /// with a query is `Σ_j 2^j · ⟨plane_j, q⟩`, one 1-bit kernel per plane.
+    /// with a query is `Σ_j 2^j · ⟨plane_j, q⟩`, every plane scored in one pass.
     /// Added after `MultiBit` so stored 1-bit and 8-bit entries keep their
     /// discriminants.
     BitPlanes {
@@ -275,7 +275,7 @@ impl VectorIndex {
     ///
     /// Use [`list_from_bytes`] to round-trip.  The format is an rkyv-encoded
     /// `Vec<VectorIndex>`; a single-element list is the multi-bit case, a
-    /// multi-element list is the single-bit (multi-chunk) case.
+    /// multi-element list is the chunk-code (multi-chunk) case.
     ///
     /// [`list_from_bytes`]: VectorIndex::list_from_bytes
     pub fn list_to_bytes(list: &[Self]) -> Vec<u8> {

@@ -210,7 +210,8 @@ default 256 probes, gemma / qwen:
 | Pass-1 recall (exact top 1,000 among Pass 1's 1,000) | 0.82 / 0.84 | 0.91 / 0.92 | 0.95 / 0.96 |
 | ANN recall@100 | 0.986 / 0.988 | 0.988 / 0.991 | 0.989 / 0.991 |
 | nDCG@10 | 0.476 / 0.592 | 0.475 / 0.592 | 0.474 / 0.592 |
-| Search p50 | 4.4 ms | 4.7–4.8 ms | 5.4–5.6 ms |
+| Search p50 | 4.1 ms | 3.9 ms | 4.3 ms |
+| Search p50 at 512 probes | 5.7–5.9 ms | 5.9 ms | 7.0 ms |
 | Pass-1 storage per chunk | 142 B | 238 B | 430 B |
 
 On SciFact and FiQA, nDCG and recall@10 are the same at every width (every paired
@@ -220,8 +221,8 @@ Pass 2 rescores the candidates and recovers what a coarse Pass 1 ranks low. So:
 | Width | Choose it when |
 |---|---|
 | **1** (default) | Ranked document retrieval where Pass 2 decides the final order; large stores where Pass-1 storage matters |
-| **2** | Pass 1's candidate list itself matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or stores that are rebuilt often (a FiQA rebuild took 95 s against 145 s at 1 bit). +7–9% search latency, 1.7× Pass-1 storage |
-| **4** | Placement matters most: near-duplicate or entity matching, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. +25% search latency, 3× Pass-1 storage, +20–25% indexing time |
+| **2** | Pass 1's candidate list itself matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or stores that are rebuilt often (a FiQA rebuild took 95 s against 145 s at 1 bit). Search latency within 4% of 1 bit, 1.7× Pass-1 storage |
+| **4** | Placement matters most: near-duplicate or entity matching, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. +4–5% search latency at 256 probes (+20% at 512), 3× Pass-1 storage, +20% indexing time |
 
 Since the width is fixed, try it on a sample: build a test store at each width
 and compare the recall check (§3.7) and search latency at the store's
@@ -238,7 +239,7 @@ Measured on SciFact (5,183 documents, about 23,000 chunks) and FiQA, with the ge
 | **Grow from one posting**, no seeding phase | Searchable from the first document; nothing to prepare; handles growth, topic drift and deletes the same way | Postings are placed one split at a time, so the partition trails static k-means. On FiQA recall@10 is 0.4–1.0 points behind at a 5% read share; on SciFact 0.9–1.8. Seeding with k-means on the first floats gained at most 0.3 points, for about 90 MB of staged floats |
 | **Target 128 chunks** | More recall per millisecond than 256 (FiQA: 0.971 against about 0.966 at 3.7 ms) | About twice as many postings, so twice the probes to read the same entries (603 against 293 at 70,000 entries, about 3.5 µs each: p50 14.9 ms against 13.8 ms) and more splits while indexing |
 | **Mean centres**, not SPFresh's medoid (the member nearest the mean) | With 1-bit codes a medoid is one member's noisy reconstruction, and the partition fragments (FiQA: 12,000–24,000 postings, recall@10 0.58–0.69 at a 1% read). The mean averages the noise away, and beat the medoid even on exact vectors | None measured |
-| **Codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 20 MB of 1-bit codes instead of 530 MB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors, so at 1 bit about 9–10% of chunks end up outside their nearest posting (1–3% at 4 bits). On SciFact and FiQA this changed neither nDCG nor recall@10 (*Choosing a Pass-1 width*) |
+| **Codes for maintenance**, no stored floats | No float copy of the store (FiQA: about 23 MiB of 1-bit codes, 39 or 71 MiB at 2 or 4 bits, instead of about 506 MiB of floats). A k-means on 1-bit reconstructions matched one on floats (recall@10 0.978 against 0.976) | Each split decides from approximate vectors, so at 1 bit about 9–10% of chunks end up outside their nearest posting (1–3% at 4 bits). On SciFact and FiQA this changed neither nDCG nor recall@10 (*Choosing a Pass-1 width*) |
 | **Codes keep their centre** when moved | No re-encoding, no embedding calls, no compounding error (re-encoding from a 1-bit code measured 0.861 against 0.918) | A moved code is a little less precise than a fresh encode against its new posting's centre. This is reported as *centre drift*; no ranking cost from it has been measured |
 | **No replicas** (each chunk in one posting) | One write per chunk; SPFresh's 4–5 copies per chunk cost 15–20 key moves per insert | None measured: replicated partitions lost to unreplicated ones of the same size |
 | **Reassignment over 64 neighbours** | SciFact's gap to static k-means at a 5% read narrowed from up to 3.5 points to under 2; when topics arrive one at a time, recall@10 at a 1% read rose by up to 10 points | About 2 key moves per inserted chunk (1.9–2.2 in random order, up to 2.8 topic by topic); FiQA indexing (embedding excluded) 47 s against 35 s without it, about 0.2 ms per document beside an embedding call of about 100 ms |
@@ -322,13 +323,16 @@ Pass 2 — Dense (MultiBit):
 
 ### Where a query's time goes
 
-Almost all of a warm query's time goes into Pass 1's sparse scan: merging the
-LSM layers for each probed cluster, then one value-log read per entry, then
-decoding and scoring. Pass 2 is small and roughly fixed, since it re-scores a
+Almost all of a warm query's time goes into Pass 1's sparse scan: reading each
+probed posting from the LSM layers (in parallel, by groups of postings), then
+reading the entries' values from the value log (one read covers a run of
+adjacent entries, and a posting's entries are mostly adjacent), then decoding
+and scoring. Pass 2 is small and roughly fixed, since it re-scores a
 capped candidate set. So latency follows **how many sparse entries the probed
-postings hold**, which `max_probes` caps. On FiQA (57,638 documents,
+postings hold**, which `max_probes` caps, times the bytes per entry, which
+the Pass-1 width sets. On FiQA (57,638 documents,
 173,000 chunks, about 960 postings) with the default of 256 postings, a search
-reads 28% of the entries and takes about 6.4 ms, excluding the embedding call,
+reads 28% of the entries and takes about 4.1 ms, excluding the embedding call,
 within 0.001 nDCG of a full read at every cutoff from 10 to 100.
 
 That makes small, on-topic postings the main lever: they find more of the right
@@ -562,7 +566,7 @@ document. It needs no embedding service.
 cargo test -p minnal_db --no-default-features --features doc-store,semantic-search --lib real_kv_search_profile --release -- --ignored --nocapture
 ```
 
-Pass-1 sparse-scan I/O is 54–88% of `search()` at 8 chunks per document and
+Pass-1 sparse-scan I/O is 49–76% of `search()` at 8 chunks per document and
 grows roughly linearly with the entries scanned. The SIMD dot products are a
 minority of the cost. Pass 2 re-scores a fixed `first_pass_top_k` candidates, so
 its share shrinks as more is read. Recall and nDCG against entries read are
@@ -611,7 +615,7 @@ The reference implementation (`ExtraDynamicSearcher.h` for the update protocol, 
 
 ### RaBitQ
 
-The 1-bit and multi-bit codes (§2), their error bound, and the random rotation they are computed in come from RaBitQ:
+The chunk and whole-document codes (§2), their error bound, and the random rotation they are computed in come from RaBitQ:
 
 > **RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search**
 > Jianyang Gao, Cheng Long

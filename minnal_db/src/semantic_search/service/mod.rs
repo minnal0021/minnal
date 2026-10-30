@@ -114,11 +114,11 @@ pub struct SemanticSearchConfig {
     /// How far the document chunk window advances, in sentences. Default: 2.
     pub sliding_size: usize,
 
-    /// How many postings the first-pass sparse (single-bit) search probes
+    /// How many postings the first-pass sparse (chunk-code) search probes
     /// ([`ProbeSettings`]). Default: the 256 nearest.
     pub probe: ProbeSettings,
 
-    /// Candidates retained after the first-pass sparse (single-bit) search before dense re-ranking.
+    /// Candidates retained after the first-pass sparse (chunk-code) search before dense re-ranking.
     /// Default: 1000.
     pub first_pass_sparse_search_top_k: usize,
 
@@ -176,7 +176,7 @@ pub struct QueryEmbeddings {
     pub dense: Vec<f32>,
 }
 
-/// Fetch embeddings for a document and produce both multi-bit and single-bit quantised indexes.
+/// Fetch embeddings for a document and produce its whole-document code and its chunk codes.
 ///
 /// Chunking now happens here (the service no longer chunks). A **single** batch
 /// call embeds one ordered payload list:
@@ -184,7 +184,8 @@ pub struct QueryEmbeddings {
 /// - **payload\[0\]** — the whole document text → 1 raw embedding → quantised as
 ///   `MultiBit { number_of_bits }` → 1 [`VectorIndex`] (the dense entry).
 /// - **payload\[1..\]** — [`chunk_document`](crate::semantic_search::chunking::chunk_document)'s N
-///   sliding-window chunks → N raw embeddings → each quantised as `SingleBit` and
+///   sliding-window chunks → N raw embeddings → each quantised at the Pass-1 width
+///   (`config.pass1_bits`, [`QuantisationStyle::pass1`]) and
 ///   independently assigned to its nearest IVF cluster → N [`VectorIndex`].
 ///
 /// **Ordering is load-bearing.** The service is contracted to return embeddings
@@ -192,7 +193,7 @@ pub struct QueryEmbeddings {
 /// the remainder are the chunk (sparse) vectors. Folding both into one batch is
 /// one round trip and one GPU batch of `N+1` (vs. two batches, one of size 1).
 ///
-/// Returns the multi-bit entry first, followed by the single-bit entries. The
+/// Returns the multi-bit entry first, followed by the chunk entries. The
 /// combined list can be passed directly to `upsert_vectors`; the storage
 /// layer groups by `(style, cluster_id)`.
 pub async fn embed_document<L: IvfLayout + ?Sized>(
@@ -458,7 +459,7 @@ where
     let rotated_sparse: Vec<Vec<f32>> = query_sparse_embeddings.iter().map(|q| layout.rotate(q)).collect();
     let rotated_dense = layout.rotate(query_dense_embedding);
 
-    // ── Pass 1: sparse single-bit scan ───────────────────────────────────────
+    // ── Pass 1: sparse chunk-code scan ───────────────────────────────────────
 
     // Each Pass-1 query vector's nearest clusters (max_probes of them), then
     // their union (in production there is one vector). The per-vector rankings

@@ -247,7 +247,8 @@ pub struct DocStoreSchema {
     /// chunking, code widths and search defaults (see
     /// [`super::vector_settings`]). Filled in with defaults the first time
     /// semantic search is enabled. Kept when the vector index is dropped: the
-    /// model, dimension and chunking are fixed for the namespace's life.
+    /// model, dimension, chunking and Pass-1 code width are fixed for the
+    /// namespace's life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index: Option<VectorIndexSpec>,
 }

@@ -3275,13 +3275,15 @@ impl LSMTree {
     ///
     /// Each layer is read once for the whole prefix set rather than once per prefix:
     ///
-    /// * **L1** — one scoped thread per bucket whose key span overlaps the requested
-    ///   ids. Each seeks to every requested prefix through the sparse index and
-    ///   reads just that range with a buffered frame reader
-    ///   ([`for_each_l1_entry_in_range`](Self::for_each_l1_entry_in_range)), so a
-    ///   probe of a few clusters out of a large L1 reads only those clusters.
-    /// * **L0** — one scoped thread per bucket holding L0 files; each file is read
-    ///   end to end (L0 has no sparse index) and filtered to the prefix set.
+    /// * **L1** — the sorted ids are split into contiguous groups, one scoped thread
+    ///   per group (as many as the buckets whose key span overlaps them). Each
+    ///   thread seeks to every id of its group through each bucket's sparse index
+    ///   ([`for_each_l1_entry_in_prefixes`](Self::for_each_l1_entry_in_prefixes))
+    ///   and merges the buckets' key-sorted runs itself, so the groups' outputs
+    ///   follow one another in key order.
+    /// * **L0** — one scoped thread per bucket holding L0 files; a file whose key
+    ///   range misses every id is skipped, the rest are seeked per id through
+    ///   their sparse index and read only within the requested ranges.
     /// * **Memtables** — the active one is range-iterated per prefix; read-only ones
     ///   are filtered.
     ///

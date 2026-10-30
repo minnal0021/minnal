@@ -326,7 +326,8 @@ on SciFact (5,183 documents, 22,787 chunks) and FiQA (57,600 documents,
 172,998 chunks), with gemma and qwen. Grown runs twice, alternating widths;
 rebuild runs once (`MINNAL_BENCH_REBUILD=1`, k-means on the codes after
 indexing). Commit `2ab19bf`; a build from `main` at 1 bit gave identical
-per-query results and latency.
+per-query results. Search latency and indexing time are from commit
+`1b7e83e` (grown runs, twice each), whose results and placement match.
 
 **Placement**: chunks in their nearest posting (in one of the 2 nearest).
 
@@ -347,8 +348,8 @@ per-query results and latency.
 | ANN recall@100, gemma / qwen | 0.986 / 0.988 | 0.988 / 0.991 | 0.989 / 0.991 |
 | ANN recall@10, gemma / qwen | 0.994 / 0.996 | 0.993 / 0.997 | 0.993 / 0.997 |
 | nDCG@10, gemma / qwen | 0.4760 / 0.5916 | 0.4745 / 0.5919 | 0.4741 / 0.5919 |
-| Search p50, gemma / qwen (ms) | 4.36 / 4.41 | 4.65 / 4.82 | 5.44 / 5.55 |
-| Search p50 at 512 probes (ms) | 6.99 / 7.14 | 7.71 / 7.89 | 9.33 / 9.82 |
+| Search p50, gemma / qwen (ms) | 4.11 / 4.07 | 3.94 / 3.94 | 4.29 / 4.25 |
+| Search p50 at 512 probes (ms) | 5.85 / 5.70 | 5.88 / 5.88 | 7.04 / 6.98 |
 
 (ANN recall@k: the share of the exact top k, full-precision two-pass ranking,
 in the index's top k.)
@@ -359,7 +360,7 @@ in the index's top k.)
 |---|---:|---:|---:|
 | Pass-1 storage per chunk (key, code, factors, value-log record) | 142 B | 238 B | 430 B |
 | FiQA Pass-1 index | 23.4 MiB | 39.3 MiB | 70.9 MiB |
-| FiQA indexing, gemma / qwen (s) | 41 / 39 | 43 / 42 | 49 / 49 |
+| FiQA indexing, gemma / qwen (s) | 42 / 40 | 44 / 42 | 50 / 49 |
 | FiQA rebuild, gemma / qwen (s) | 145 / 138 | 95 / 93 | 113 / 110 |
 
 What the numbers say:
@@ -377,8 +378,10 @@ What the numbers say:
   the better candidate list.
 - **Better placement does not let a search read fewer postings** on these
   stores: recall at a given probe count is the same at every width.
-- **Searches are slower** by the extra bytes: +7–9% at 2 bits and +25% at 4
-  bits at 256 probes, growing with the probe count.
+- **Search latency barely changes at 2 bits and grows with the probe count at
+  4**: at 256 probes a 2-bit search is within 4% of a 1-bit one and a 4-bit
+  search 4–5% slower; at 512 probes, +1–3% and +20–22%. The wider codes are
+  more bytes to read, and the read is most of a search.
 - **Rebuilds are faster** at 2 and 4 bits: k-means converges in fewer
   iterations on finer reconstructions.
 
@@ -396,8 +399,8 @@ better Pass-1 output at the price of search latency and Pass-1 storage:
 | Width | Choose it when | Costs (FiQA, 256 probes) |
 |---|---|---|
 | **1** (default) | Ranked retrieval of documents, where Pass 2 decides the final order: the top results are the same at every width. Large stores where Pass-1 storage matters | — |
-| **2** | Pass 1's own candidate list matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or anything that uses the candidates directly. Stores that are rebuilt often | +7–9% search latency; 1.7× Pass-1 storage |
-| **4** | Chunk placement matters most: near-duplicate or entity matching where one chunk must be found, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. The most accurate Pass 1 | +25% search latency; 3× Pass-1 storage; +20–25% indexing time |
+| **2** | Pass 1's own candidate list matters: a small `first_pass_top_k`, long result lists (recall@100 and beyond), or anything that uses the candidates directly. Stores that are rebuilt often | Search latency within 4% of 1 bit; 1.7× Pass-1 storage |
+| **4** | Chunk placement matters most: near-duplicate or entity matching where one chunk must be found, short records whose chunk and document are nearly the same text, stores where misplaced chunks cost many extra probes. The most accurate Pass 1 | +4–5% search latency (+20% at 512 probes); 3× Pass-1 storage; +20% indexing time |
 
 The width cannot be changed later, so measure on a sample first: build a test
 store at each width and compare the recall check

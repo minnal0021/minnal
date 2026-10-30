@@ -12,7 +12,7 @@
 //!   posting: `min_i D(x̂, c_Pi) < D(x̂, c_P)` and `< D(x̂, c_cur)`.
 //!
 //! A candidate moves to its nearest active posting, unless that is where it is.
-//! `x̂` is the chunk's reconstruction from its 1-bit code; with
+//! `x̂` is the chunk's reconstruction from its code; with
 //! `skip_uncertain_moves` every comparison must win by more than the code's
 //! error allows (see `nearer`).
 //!

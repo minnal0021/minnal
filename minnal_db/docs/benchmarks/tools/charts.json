@@ -366,25 +366,25 @@
     "scale": "linear",
     "zero_based": true,
     "cases": [
-      "pass1_search/.*"
+      "pass1_search_.*"
     ],
     "group_by": "/(\\d+)$",
-    "color_by": "pass1_search/(grouped|scattered)/",
+    "color_by": "pass1_search_(grouped|scattered)/",
     "legend": {
       "grouped": "a posting's values adjacent",
       "scattered": "values spread over the log"
     },
     "relabel": [
       [
-        "^pass1_search/\\w+/184$",
+        "^pass1_search_\\w+/184$",
         "18% of/postings"
       ],
       [
-        "^pass1_search/\\w+/750$",
+        "^pass1_search_\\w+/750$",
         "73% of/postings"
       ],
       [
-        "^pass1_search/\\w+/1024$",
+        "^pass1_search_\\w+/1024$",
         "every/posting"
       ]
     ]

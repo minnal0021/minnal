@@ -84,8 +84,8 @@ The ones this note leans on most:
 
 **Partition maintenance** (`ivf_split.rs`)
 
-- **Chunk** — one sentence window of a document; its 1-bit code is what Pass 1
-  of search scores.
+- **Chunk** — one sentence window of a document; its code (1 bit per dimension
+  by default) is what Pass 1 of search scores.
 - **Posting** — a group of chunks with one centre, the unit search reads. A
   store's postings are its **partition**. Postings are *active* (searched and
   written), *draining* (being emptied; still searched) or *retired* (empty, no

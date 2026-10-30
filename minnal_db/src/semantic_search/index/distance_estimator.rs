@@ -141,8 +141,8 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
 /// estimator for [`SingleBit`](crate::semantic_search::QuantisationStyle::SingleBit)
 /// codes, and the multi-bit estimator over bit planes for
 /// [`BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes) codes, whose
-/// dot product is `Σ_j 2^j · ⟨plane_j, q⟩` computed with the 1-bit kernel per
-/// plane. A 1-bit search runs exactly the code it ran before wider codes existed.
+/// dot product is `Σ_j 2^j · ⟨plane_j, q⟩`, computed for every plane in one
+/// pass (`simd::bit_planes_ip_best`).
 #[derive(Clone, Debug)]
 pub enum Pass1Estimator {
     /// 1-bit codes.
