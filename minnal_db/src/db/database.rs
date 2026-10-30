@@ -1488,7 +1488,7 @@ impl Database {
     /// Returns the value that was written, or `None` for the delete and no-op
     /// cases — or [`KVError::MergeNotApplied`] if the write was committed to the
     /// WAL but did not reach the in-memory store, so its result is not readable
-    /// (see [`Self::require_applied`]).
+    /// (see `require_applied`).
     ///
     /// # Durability and the WAL
     ///
@@ -2341,7 +2341,7 @@ impl Database {
     /// 3. delete `index/{ns_id}/{field_id}/`.
     ///
     /// A crash anywhere in that sequence leaves the drop *recorded*, so
-    /// [`complete_interrupted_field_drops`](Self::complete_interrupted_field_drops)
+    /// `complete_interrupted_field_drops`
     /// finishes it at the next open. The reverse order — files first — would
     /// leave a live-looking field with no data, which reads as `Absent` + empty
     /// and is suppressed by `detect_replay_gap` as a normal first build: a

@@ -468,7 +468,7 @@ impl IndexManager {
 
     /// Record a gap for a field, merging into any record already there.
     ///
-    /// Written through [`write_atomic_durable`](crate::support::write_atomic_durable)
+    /// Written through `write_atomic_durable`
     /// — a gap record that did not survive the crash it describes would be
     /// worthless.
     ///

@@ -209,7 +209,8 @@ pub struct IndexBuildProgress {
     pub error: Option<String>,
 }
 
-/// Handle returned by [`DocStore::add_index`] or [`DocStore::resume_pending_builds`].
+/// Handle returned by [`DocStore::add_index`](crate::doc_store::DocStore::add_index) or
+/// [`DocStore::resume_pending_builds`](crate::doc_store::DocStore::resume_pending_builds).
 ///
 /// Use [`progress`] to poll status or [`wait`] to block until complete.
 ///
@@ -246,7 +247,7 @@ impl IndexBuildHandle {
 
 // ── SemanticSearchContext ─────────────────────────────────────────────────────
 
-/// Semantic-search configuration attached to a [`DocStore`].
+/// Semantic-search configuration attached to a [`DocStore`](crate::doc_store::DocStore).
 ///
 /// When present, writes to namespaces with `semantic_search_enabled = true`
 /// enqueue a pending embedding job instead of calling the embedding service
@@ -254,7 +255,8 @@ impl IndexBuildHandle {
 /// asynchronously, making the write path independent of embedding service
 /// availability.
 ///
-/// Construct once at startup and attach via [`DocStore::with_semantic_search`].
+/// Construct once at startup and attach via
+/// [`DocStore::with_semantic_search`](crate::doc_store::DocStore::with_semantic_search).
 ///
 /// It holds what is engine-wide: the embedding service settings, the defaults
 /// a namespace's vector-index settings start from, and optionally the models
@@ -610,7 +612,8 @@ impl NamespaceSemantics {
 // ── ReindexStats ─────────────────────────────────────────────────────────────
 
 /// Outcome of a single-document vector reindex
-/// ([`DocStore::reindex_doc_vector`] / [`DocStore::kv_reindex_doc_vector`]).
+/// ([`DocStore::reindex_doc_vector`](crate::doc_store::DocStore::reindex_doc_vector) /
+/// [`DocStore::kv_reindex_doc_vector`](crate::doc_store::DocStore::kv_reindex_doc_vector)).
 #[cfg(feature = "semantic-search")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorReindexOutcome {
@@ -622,7 +625,7 @@ pub enum VectorReindexOutcome {
     SkippedEmptyText,
 }
 
-/// Result of a [`DocStore::index_all`] call.
+/// Result of a `DocStore::index_all` call.
 #[derive(Debug, Clone, Copy)]
 pub struct ReindexStats {
     /// Number of exhausted queue entries (retry_count ≥ max_retries) that were

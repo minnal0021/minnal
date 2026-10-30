@@ -177,11 +177,14 @@ pub enum SchemaAmendment {
         vector_index: Option<VectorIndexSpec>,
     },
     /// Enable the namespace's (single) vector index over **one or more**
-    /// embedding fields in a single call.  Each name is declared as a `str`
-    /// attribute and registered as an embedding field, and
-    /// `semantic_search_enabled` is set.  Fails if a vector index is already
-    /// present (drop it first), if `fields` is empty, or if any name conflicts
-    /// with an existing index/attribute or is duplicated within the list.
+    /// embedding fields in a single call.  Each name is registered as an
+    /// embedding field and declared as a `str` attribute unless it already is
+    /// one, and `semantic_search_enabled` is set.  Fails if a vector index is
+    /// already present (drop it first), if `fields` is empty, or if any name is
+    /// an index field, an attribute of another type, or duplicated within the
+    /// list.  An existing `str` attribute is accepted because dropping a vector
+    /// index keeps its fields as attributes: re-enabling over the same fields
+    /// must work.
     ///
     /// This is the post-create way to (re)create a multi-field vector index:
     /// `DELETE /stores/{ns}/indices/vector` then enable with the full field set.
@@ -490,18 +493,20 @@ impl DocStoreSchema {
                     if indexed.contains(name.as_str()) {
                         return Err(SchemaError::EmbeddingFieldConflict { field: name.clone() });
                     }
-                    if self.attributes.iter().any(|a| &a.name == name) {
-                        return Err(SchemaError::DuplicateFieldName { field: name.clone() });
+                    if self.attributes.iter().any(|a| &a.name == name && a.attr_type != AttributeType::Str) {
+                        return Err(SchemaError::EmbeddingFieldNotString { field: name.clone() });
                     }
                 }
                 let settled = vector_settings::settle(self.vector_index.as_ref(), vector_index.as_ref(), &IndexDefaults::default())?;
                 self.vector_index = Some(settled);
                 for name in fields {
-                    self.attributes.push(AttributeDef {
-                        name: name.clone(),
-                        attr_type: AttributeType::Str,
-                        description: None,
-                    });
+                    if !self.attributes.iter().any(|a| a.name == name) {
+                        self.attributes.push(AttributeDef {
+                            name: name.clone(),
+                            attr_type: AttributeType::Str,
+                            description: None,
+                        });
+                    }
                     self.embedding_fields.push(name);
                 }
                 self.semantic_search_enabled = true;
@@ -1242,6 +1247,44 @@ mod tests {
         assert!(s.attributes.iter().any(|a| a.name == "title" && a.attr_type == AttributeType::Str));
         assert!(s.attributes.iter().any(|a| a.name == "body"));
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_reuses_an_existing_string_attribute() {
+        // A dropped vector index leaves its fields as plain attributes; enabling
+        // it again over the same fields must not declare them twice.
+        let mut s = valid_schema();
+        s.attributes.push(AttributeDef {
+            name: "body".to_owned(),
+            attr_type: AttributeType::Str,
+            description: Some("kept".to_owned()),
+        });
+        s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["body".to_owned(), "title".to_owned()],
+            vector_index: None,
+        })
+        .unwrap();
+        assert_eq!(s.embedding_fields, vec!["body", "title"]);
+        let bodies: Vec<_> = s.attributes.iter().filter(|a| a.name == "body").collect();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].description.as_deref(), Some("kept"));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn amendment_enable_vector_index_rejects_an_attribute_of_another_type() {
+        let mut s = valid_schema();
+        s.attributes.push(AttributeDef {
+            name: "count".to_owned(),
+            attr_type: AttributeType::Int,
+            description: None,
+        });
+        let result = s.apply_amendment(SchemaAmendment::EnableVectorIndex {
+            fields: vec!["count".to_owned()],
+            vector_index: None,
+        });
+        assert!(matches!(result, Err(SchemaError::EmbeddingFieldNotString { field }) if field == "count"));
+        assert!(!s.semantic_search_enabled && s.embedding_fields.is_empty());
     }
 
     #[test]

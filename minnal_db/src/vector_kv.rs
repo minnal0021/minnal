@@ -20,7 +20,7 @@
 //!
 //! Query-embedding caching uses a single system-wide TTL namespace
 //! (`system_qemb_cache`) shared across all doc-store namespaces — see
-//! [`SYSTEM_QUERY_EMB_CACHE_NS`].
+//! `SYSTEM_QUERY_EMB_CACHE_NS`.
 //!
 //! # Failure & idempotency
 //!
@@ -482,7 +482,7 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// The MultiBit entry (at most one) is written directly to `{ns}_dense_vector` by doc_id.
 ///
 /// Each write is a standalone single-op write — the vector index is a derived
-/// structure that the [`VecIndexWorker`] (re)builds idempotently from the queue,
+/// structure that the `VecIndexWorker` (re)builds idempotently from the queue,
 /// so it needs no cross-namespace atomicity with the document write.
 ///
 /// The quantised payloads skip the main WAL: they are bulky and reconstructable
@@ -496,8 +496,6 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 ///
 /// Returns how the document's entries moved between postings, for the
 /// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
-///
-/// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
 pub async fn upsert_vectors(
     db: &AsyncDb,
     namespace: &str,
@@ -995,10 +993,8 @@ pub async fn clear_queue_for(db: &AsyncDb, namespace: &str) -> Result<usize, cra
 
 /// Return all pending embedding queue entries.
 ///
-/// Called by the [`VecIndexWorker`] on startup (crash recovery) and after
+/// Called by the `VecIndexWorker` on startup (crash recovery) and after
 /// each wake-up signal.  Returns an empty list when the queue is empty.
-///
-/// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
 pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     let entries = queue_ns.iter().await?;

@@ -32,7 +32,7 @@ impl Database {
     ///
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
-    /// Unindexed fields in the predicate produce a [`KVError::Query`]
+    /// Unindexed fields in the predicate produce a [`KVError::Query`](crate::KVError::Query)
     /// carrying a [`crate::index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;

@@ -781,7 +781,7 @@ impl Db {
     ///
     /// Row-scoped when the gap named the affected keys, a full rebuild
     /// otherwise. Does not re-put documents. See
-    /// [`FieldRepairOutcome`](crate::FieldRepairOutcome).
+    /// [`FieldRepairOutcome`].
     pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
         self.inner.repair_field_index(namespace_id, field_id)
     }

@@ -585,9 +585,11 @@ curl -X PATCH http://localhost:8080/stores/users/schema \
 
 So the post-create workflow to **change which fields are embedded** is: drop the
 vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
-`enable_vector_index` with the new field set. Like `add_embedding_attribute`, it
-returns `409` if a vector index already exists, and `400` if `fields` is empty,
-contains duplicates, or names an existing index/attribute.
+`enable_vector_index` with the new field set. A field that is already a `str`
+attribute (as the old embedding fields are after the drop) becomes an
+embedding field; any other name is added as a `str` attribute. It returns `409`
+if a vector index already exists, and `400` if `fields` is empty, contains
+duplicates, or names an index field or an attribute of another type.
 
 **Change search or partition settings:** once semantic search is enabled, the
 store owns its search settings (`vector_index.search`) and the settings that

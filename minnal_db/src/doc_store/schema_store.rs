@@ -1,6 +1,6 @@
 //! Store schemas: persisted in the `system_schema` namespace, served from memory.
 //!
-//! Every schema the doc store reads comes from [`SchemaStore`], and nothing else
+//! Every schema the doc store reads comes from `SchemaStore`, and nothing else
 //! touches `system_schema`. The key is the store's name and the value its schema
 //! as JSON (the same JSON export and import use).
 //!
@@ -8,7 +8,7 @@
 //! persists the schema (a WAL-backed put or delete, durable on return), then
 //! swaps the cached copy under the map's write lock. So the cache always holds
 //! what is on disk, in the order it was written, and a read-modify-write
-//! ([`SchemaStore::update_doc`], [`SchemaStore::update_kv`]) cannot lose a
+//! (`SchemaStore::update_doc`, `SchemaStore::update_kv`) cannot lose a
 //! concurrent update. Readers clone an `Arc` under the read lock and never wait
 //! for an fsync. `writer` is never held across an `.await`.
 

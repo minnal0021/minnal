@@ -320,7 +320,7 @@ impl SegmentStats {
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
 pub struct ValueLogMetadata {
     /// High-water mark of segment ids handed out, so ids stay unique for the life of
-    /// the database across restarts too — see [`ValueLog::open`].
+    /// the database across restarts too — see `ValueLog::open`.
     pub next_segment_id: u64,
     pub active_segment_id: u32,
     pub segments: Vec<SegmentStats>,
