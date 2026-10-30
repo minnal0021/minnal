@@ -453,7 +453,8 @@ where
     );
 
     // Fetch all probed clusters in a single batch operation: one blocking task, which
-    // spawns a scoped thread per overlapping L1 bucket and then one per value-log bucket.
+    // spawns one scoped thread per group of postings (as many groups as overlapping
+    // L1 buckets) and then one per value-log bucket.
     let sparse_by_cluster = kv_store.scan_sparse_clusters_batch(&probe_clusters).await?;
 
     // Everything from here to the dense fetch is CPU work, mostly on the rayon pool.

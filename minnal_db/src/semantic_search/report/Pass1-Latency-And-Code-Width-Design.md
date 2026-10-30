@@ -1,7 +1,8 @@
 # Pass-1 latency and code width
 
 Status: Parts A and B built and measured (see *Part A as built* and *Part B as
-built*); Part C is a proposal, deferred.
+built*), and the scan's merge moved onto its workers (*Merging on the scan's
+workers*); Part C is a proposal, deferred.
 
 This document covers two linked changes to Pass 1 of semantic search:
 
@@ -402,6 +403,53 @@ The width cannot be changed later, so measure on a sample first: build a test
 store at each width and compare the recall check
 (`GET /admin/indices/{ns}/vector/recall-check`) and search latency at the
 store's `max_probes`.
+
+## Merging on the scan's workers, and seeking in L0
+
+Two changes to the LSM scan (`LSMTree::scan_prefixes`), with no format change.
+
+**Where the time went.** A profile of the Criterion scan (1,024 postings, keys
+scattered in the value log, 1-bit codes) put about 92% of the scan's CPU on the
+calling thread and only about 8% on the per-bucket reading threads. About half
+of the calling thread's time was the merge of the buckets' results into one key
+order. A posting's keys (`posting id ‖ document id`) are hashed to buckets by
+their first 8 bytes, so every posting is spread over every bucket, and the
+buckets' sorted runs had to be merged entry by entry on one thread.
+
+**Merging on the workers.** The probed posting ids are split into contiguous
+groups, one worker per group (as many groups as overlapping buckets). Each worker
+reads its group's postings from every bucket and merges those runs itself.
+Groups are ascending, disjoint ranges of ids, so the workers' outputs follow one
+another in key order and need no merge after them. Seeks per posting are
+unchanged.
+
+**Seeking in L0.** L0 files were read whole on every scan. L0 is merged into L1
+only once it holds a tenth of L1's entries, and under the engine benchmark's
+standard mix at 16 clients the sparse namespace's L0 averaged 19% of L1's bytes
+(peak 43%). Each L0 file is now skipped when its key range misses every probed
+posting, and otherwise read with the same per-posting cursor as L1, seeking
+through the file's sparse index.
+
+**Measured** (`bench_pass1_search`, 100,000 documents, 8 buckets, everything in
+L1, so the L0 change does not show here; mean ms, same machine and build
+settings):
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| Scan, scattered, 184 postings | 1.11 | 0.88 | −21% |
+| Scan, scattered, 750 postings | 3.43 | 2.37 | −31% |
+| Scan, scattered, 1,024 postings | 4.73 | 3.11 | −34% |
+| Scan, grouped, 1,024 postings | 4.59 | 2.93 | −36% |
+| Search, scattered, 184 postings | 2.97 | 2.72 | −9% |
+| Search, scattered, 750 postings | 6.59 | 5.43 | −18% |
+| Search, scattered, 1,024 postings | 8.40 | 6.94 | −17% |
+| Search, scattered, 1,024 postings, 4-bit codes | 9.96 | 8.52 | −15% |
+
+Results are unchanged: `scan_prefixes_over_l1_and_l0_matches_a_reference_for_any_probe_set`
+compares every probe set against a reference with keys in L1 alone and with
+rewrites and deletes in three L0 files above it, and
+`scan_prefixes_seeks_through_level0_files` checks that one posting of a large
+L0 file is found by seeking (it fails if the hints are ignored).
 
 ## Part C — contiguous per-posting blocks (if still needed)
 
