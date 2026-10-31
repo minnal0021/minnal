@@ -1352,7 +1352,12 @@ impl LSMTree {
             sstable_files_vec.push(Arc::new(RwLock::new(Arc::new(file))));
 
             let mut metadata = Vec::new();
-            let mut bloom = None;
+            // An empty L1 file gets an empty filter, which rejects every key: a
+            // miss then stops here instead of reading the file's size and trying
+            // to read it (two system calls per miss on a store with nothing on
+            // disk). A file whose metadata fails to load keeps no filter and is
+            // scanned.
+            let mut bloom = (file_len == 0).then(|| Arc::new(BloomFilter::build([], 0)));
             let mut index = None;
             if file_len > 0
                 && let Ok((meta, built_bloom, built_index, file_max_seq)) = Self::load_metadata_from_file(&level1_path)
@@ -2580,7 +2585,8 @@ impl LSMTree {
             }
             let mut metadata_guard = self.sstable_metadata[bucket_idx].write();
             metadata_guard.clear();
-            *self.sstable_blooms[bucket_idx].write() = None;
+            // Empty filter, as at open: every lookup in this bucket's L1 is a miss.
+            *self.sstable_blooms[bucket_idx].write() = Some(Arc::new(BloomFilter::build([], 0)));
             *self.sstable_indexes[bucket_idx].write() = None;
         } else {
             let temp_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.tmp", bucket));
@@ -6057,6 +6063,48 @@ mod tests {
         assert!(m.l0_bloom_rejects > 0, "no L0 file was ever skipped by range/bloom");
         assert!(m.seq_prunes > 0, "no SSTable was ever skipped by max-seq");
         assert!(m.l0_probes > 0 && m.l1_probes > 0, "the slow path never read L0 and L1");
+        Ok(())
+    }
+
+    /// A miss on a bucket whose L1 file is empty is settled by its (empty) bloom
+    /// filter, without touching the file: at open, after a compaction that
+    /// empties the bucket, and after a reopen. A compaction that fills the
+    /// bucket again replaces the filter, so its keys are found.
+    #[test]
+    fn a_miss_on_an_empty_l1_never_reads_the_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        let metrics = Arc::new(Metrics::default());
+        lsm.set_metrics(Arc::clone(&metrics));
+        let probes = |lsm: &LSMTree| -> Result<u64> {
+            for i in 0..20 {
+                assert_eq!(lsm.get(format!("absent_{i}").as_bytes())?, None);
+            }
+            Ok(metrics.snapshot().l1_probes)
+        };
+
+        lsm.insert_with_seq(b"key_a", 7, 10)?;
+        assert_eq!(probes(&lsm)?, 0, "a fresh store read its empty L1 files");
+
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        assert_eq!(lsm.get(b"key_a")?, Some(7), "the compacted key is found through the new filter");
+        lsm.delete_with_seq(b"key_a", 11)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        assert_eq!(lsm.get(b"key_a")?, None);
+        assert!(
+            lsm.sstable_metadata.iter().all(|m| m.read().is_empty()),
+            "the delete did not empty L1, so this does not test an emptied bucket"
+        );
+        let before = metrics.snapshot().l1_probes;
+        assert_eq!(probes(&lsm)?, before, "an L1 emptied by compaction was read");
+
+        drop(lsm);
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        lsm.set_metrics(Arc::clone(&metrics));
+        let before = metrics.snapshot().l1_probes;
+        assert_eq!(probes(&lsm)?, before, "a reopened empty L1 was read");
         Ok(())
     }
 
