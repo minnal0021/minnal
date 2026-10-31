@@ -1343,15 +1343,19 @@ pub(crate) fn id_from_key(k: &[u8]) -> Option<u32> {
 }
 
 /// `0xB2 ‖ centre_id (4B BE) ‖ state (1B) ‖ parent_id (4B BE, u32::MAX = none)
-/// ‖ origin (1B) ‖ routing centroid (f32 LE × D)`.
+/// ‖ origin (1B) ‖ routing centroid (f32 LE × D)`. A retired posting is written
+/// without its routing centroid (11 bytes, not ~3 KB at 768 dimensions):
+/// nothing routes to or probes it, and no retired posting becomes active again.
 pub(crate) fn encode_posting(p: &crate::semantic_search::Posting) -> Vec<u8> {
-    let mut v = Vec::with_capacity(11 + p.routing_centroid.len() * 4);
+    use crate::semantic_search::PostingState;
+    let centroid: &[f32] = if p.state == PostingState::Retired { &[] } else { &p.routing_centroid };
+    let mut v = Vec::with_capacity(11 + centroid.len() * 4);
     v.push(POSTING_ROW_V2);
     v.extend_from_slice(&p.centre_id.to_be_bytes());
     v.push(p.state as u8);
     v.extend_from_slice(&p.parent_id.unwrap_or(u32::MAX).to_be_bytes());
     v.push(p.origin as u8);
-    v.extend(f32s_to_bytes(&p.routing_centroid));
+    v.extend(f32s_to_bytes(centroid));
     v
 }
 
@@ -1661,6 +1665,20 @@ mod ivf_store_tests {
             ..p.clone()
         };
         assert_eq!(decode_posting(5, &encode_posting(&root)), Some(root));
+        // A retired posting drops its routing centroid.
+        let retired = Posting {
+            state: PostingState::Retired,
+            ..p.clone()
+        };
+        let row = encode_posting(&retired);
+        assert_eq!(row.len(), 11);
+        assert_eq!(
+            decode_posting(5, &row),
+            Some(Posting {
+                routing_centroid: Vec::new(),
+                ..retired
+            })
+        );
         // centre_id ‖ state ‖ centroid, as seeded before M3.
         let mut old = 9u32.to_be_bytes().to_vec();
         old.push(0);

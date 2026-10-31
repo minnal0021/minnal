@@ -41,6 +41,21 @@ impl DocStore {
         Ok((settings.maintenance, summary, postings))
     }
 
+    /// Every IVF centre of `namespace` (document or KV store) with the postings
+    /// that name it, from memory; with `codes` also how many chunk codes decode
+    /// against each, which reads every chunk code. No centre vectors are
+    /// returned.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_centres(&self, namespace: &str, codes: bool) -> Result<Vec<crate::ivf_split::health::CentreHealth>, DocStoreError> {
+        let Some(ctx) = &self.semantic_ctx else {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        };
+        self.schemas.require_semantic_search(namespace)?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
+        let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
+        Ok(crate::ivf_split::health::centre_health(&self.db, namespace, &ns.partition, codes).await?)
+    }
+
     /// Check whether `namespace`'s searches miss what a full read finds, the
     /// signal for a rebuild (FR-007): sample real queries from the query-embedding
     /// cache, or stored chunks when fewer than 20 are cached (no embedding call

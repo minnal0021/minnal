@@ -1682,7 +1682,8 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/reindex-failed` | `200` | Reset exhausted queue entries |
 | `DELETE` | `/admin/indices/{ns}/vector/drop-all` | `202` | Clear all vector index data |
 | `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
-| `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated) |
+| `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated, filterable by state) |
+| `GET` | `/admin/indices/{ns}/vector/centres` | `200` | Every IVF centre's metadata and, with `codes=true`, how many chunk codes use it (cursor-paginated) |
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
@@ -2067,6 +2068,43 @@ Every posting, retired ones included, with its size, state (`active`,
 or `seed` for a store created before partitions grew by themselves).
 Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
 `sort` (`id`, `entries`, `chunks`, `drift`) and `order` (`asc`, `desc`).
+`state` (`active`, `draining`, `retired`) lists only postings in that state, and
+`matched` is how many there are. A retired posting holds no chunks; it is kept
+as a small record (its id, centre, parent and origin) so the split tree stays
+complete and its id is never handed out again.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/postings?state=active&sort=chunks'
+```
+
+---
+
+#### `GET /admin/indices/{ns}/vector/centres`
+
+Every centre of the store's partition, without its vector: the postings that
+name it as theirs, the most live of their states (`active`, `draining`,
+`retired`, or `none` when no posting names it), how that posting was created,
+and the centre's norm. A centre is what a chunk code is encoded against, and a
+code keeps its centre when a split or rebuild moves it to another posting, so a
+retired posting's centre usually stays in use.
+
+With `codes=true` each centre also has `codes` (chunk codes encoded against it)
+and `code_postings` (the postings those codes are filed under), and `unused`
+counts the centres that no posting that is not retired names and no code uses —
+the ones that could be reclaimed. This reads every chunk code of the store
+(about half a second for 170,000 chunks). Without it, everything comes from
+memory.
+
+Cursor-paginated like the posting list; sorted by `sort` (`id`, `codes`, which
+implies `codes=true`, or `postings`) and `order`, filtered by `state`.
+`by_state` counts every centre.
+
+```bash
+curl 'http://localhost:8080/admin/indices/products/vector/centres?codes=true&state=retired&sort=codes&order=asc'
+# → {"centres": 1893, "by_state": {"active": 946, "retired": 947}, "unused": 23,
+#    "matched": 947, "results": [{"centre_id": 37, "state": "retired", "postings": [37],
+#    "created_by": "split", "norm": 0.633, "codes": 0, "code_postings": 0}, ...], "next_cursor": null}
+```
 
 ---
 
