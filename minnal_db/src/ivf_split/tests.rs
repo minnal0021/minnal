@@ -55,11 +55,16 @@ pub(super) async fn handle(db: &AsyncDb) -> PartitionHandle {
 /// Index a document as the vector worker does: route and write under the
 /// routing epoch, against the current snapshot.
 async fn index_doc(db: &AsyncDb, h: &PartitionHandle, d: u64, chunks: &[Vec<f32>]) -> Result<(), crate::KVError> {
+    index_doc_at(db, h, d, chunks, 1).await
+}
+
+/// [`index_doc`] with chunk codes `bits` wide.
+async fn index_doc_at(db: &AsyncDb, h: &PartitionHandle, d: u64, chunks: &[Vec<f32>], bits: usize) -> Result<(), crate::KVError> {
     let _epoch = h.read_epoch().await;
     let ivf = h.snapshot();
     let mut codes: Vec<VectorIndex> = chunks
         .iter()
-        .map(|c| index_embedding_rotated(&*ivf, c, QuantisationStyle::SingleBit).unwrap())
+        .map(|c| index_embedding_rotated(&*ivf, c, QuantisationStyle::pass1(bits)).unwrap())
         .collect();
     codes.push(index_embedding_zero_centred(
         &*ivf,
@@ -73,11 +78,16 @@ async fn index_doc(db: &AsyncDb, h: &PartitionHandle, d: u64, chunks: &[Vec<f32>
 
 /// A namespace of `docs` documents (three chunks each), all in the root.
 pub(super) async fn setup(dir: &TempDir, docs: u64) -> AsyncDb {
+    setup_at(dir, docs, 1).await
+}
+
+/// [`setup`] with chunk codes `bits` wide.
+async fn setup_at(dir: &TempDir, docs: u64, bits: usize) -> AsyncDb {
     let db = open(dir).await;
     init_ivf(&db, NS, DIM).await.unwrap();
     let h = handle(&db).await;
     for d in 0..docs {
-        index_doc(&db, &h, d, &doc_chunks(d, false)).await.unwrap();
+        index_doc_at(&db, &h, d, &doc_chunks(d, false), bits).await.unwrap();
     }
     db.flush_namespaces(crate::vector_kv::companion_namespaces(NS)).await.unwrap();
     db
@@ -565,14 +575,19 @@ const DELETED: [u64; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 /// The state just before the maintenance a scenario is about, and the chunks
 /// each document must end with.
 pub(super) async fn prepare(dir: &TempDir, scenario: Scenario) -> (AsyncDb, BTreeMap<Vec<u8>, usize>) {
-    let db = setup(dir, 20).await;
+    prepare_at(dir, scenario, 1).await
+}
+
+/// [`prepare`] with chunk codes `bits` wide.
+async fn prepare_at(dir: &TempDir, scenario: Scenario, bits: usize) -> (AsyncDb, BTreeMap<Vec<u8>, usize>) {
+    let db = setup_at(dir, 20, bits).await;
     let h = handle(&db).await;
     maintain_partition(&db, NS, &h, &settings(40)).await.unwrap();
     let mut want = expected(20);
     match scenario {
         Scenario::Reassign => {
             for d in 20..40 {
-                index_doc(&db, &h, d, &doc_chunks(d, true)).await.unwrap();
+                index_doc_at(&db, &h, d, &doc_chunks(d, true), bits).await.unwrap();
                 want.insert(doc_id(d), 3);
             }
         }
@@ -613,10 +628,16 @@ async fn spread(db: &AsyncDb, h: &PartitionHandle) -> f64 {
 
 #[tokio::test]
 async fn reassign_moves_chunks_to_a_nearer_posting() {
+    for bits in [1, 2, 4] {
+        reassign_moves_chunks_to_a_nearer_posting_at(bits).await;
+    }
+}
+
+async fn reassign_moves_chunks_to_a_nearer_posting_at(bits: usize) {
     let mut spreads = Vec::new();
     for range in [0, 64] {
         let dir = TempDir::new().unwrap();
-        let (db, want) = prepare(&dir, Scenario::Reassign).await;
+        let (db, want) = prepare_at(&dir, Scenario::Reassign, bits).await;
         let h = handle(&db).await;
         let report = maintain_partition(&db, NS, &h, &full(40, 0, range)).await.unwrap();
         assert!(report.splits >= 2, "{report:?}");
@@ -631,7 +652,7 @@ async fn reassign_moves_chunks_to_a_nearer_posting() {
     }
     assert!(
         spreads[1] < spreads[0],
-        "reassigning over the neighbours brings chunks nearer their centres: {spreads:?}"
+        "{bits} bits: reassigning over the neighbours brings chunks nearer their centres: {spreads:?}"
     );
 }
 
@@ -662,13 +683,13 @@ async fn deletes_merge_small_postings_and_never_the_last() {
 #[tokio::test]
 async fn reassign_and_merge_survive_a_crash_before_any_write() {
     let mut failures = Vec::new();
-    for scenario in [Scenario::Reassign, Scenario::Merge] {
+    for (scenario, bits) in [(Scenario::Reassign, 1), (Scenario::Merge, 1), (Scenario::Reassign, 4)] {
         let template = TempDir::new().unwrap();
-        let (db, want) = prepare(&template, scenario).await;
+        let (db, want) = prepare_at(&template, scenario, bits).await;
         db.shutdown().await.unwrap();
         let (writes, f) = crash_audit(template.path(), &want, Audited::Maintain, scenario_ops(scenario));
-        assert!(writes > 10, "{scenario:?} must cover a whole run ({writes} writes)");
-        failures.extend(f.into_iter().map(|e| format!("{scenario:?}: {e}")));
+        assert!(writes > 10, "{scenario:?} at {bits} bits must cover a whole run ({writes} writes)");
+        failures.extend(f.into_iter().map(|e| format!("{scenario:?} at {bits} bits: {e}")));
     }
     assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
 }
@@ -890,8 +911,14 @@ fn rebuild_params(postings: usize) -> rebuild::RebuildParams {
 /// share postings with 0 and 1. A rebuild into four gives each its own.
 #[tokio::test]
 async fn a_rebuild_fits_postings_to_the_chunks_they_hold() {
+    for bits in [1, 2, 4] {
+        a_rebuild_fits_postings_to_the_chunks_they_hold_at(bits).await;
+    }
+}
+
+async fn a_rebuild_fits_postings_to_the_chunks_they_hold_at(bits: usize) {
     let dir = TempDir::new().unwrap();
-    let (db, want) = prepare(&dir, Scenario::Reassign).await;
+    let (db, want) = prepare_at(&dir, Scenario::Reassign, bits).await;
     let h = handle(&db).await;
     let before = spread(&db, &h).await;
     let ops = full(1000, 0, 0); // nothing splits or merges afterwards
@@ -925,12 +952,19 @@ async fn a_rebuild_fits_postings_to_the_chunks_they_hold() {
 /// after reopening and recovering, every invariant holds.
 #[tokio::test]
 async fn a_rebuild_survives_a_crash_before_any_write() {
-    let template = TempDir::new().unwrap();
-    let (db, want) = prepare(&template, Scenario::Reassign).await;
-    db.shutdown().await.unwrap();
-    let (writes, failures) = crash_audit(template.path(), &want, Audited::Rebuild, full(40, 3, 8));
-    assert!(writes > 40, "the scenario must cover a whole rebuild ({writes} writes)");
-    assert!(failures.is_empty(), "{} failure(s):\n  {}", failures.len(), failures.join("\n  "));
+    for bits in [1, 4] {
+        let template = TempDir::new().unwrap();
+        let (db, want) = prepare_at(&template, Scenario::Reassign, bits).await;
+        db.shutdown().await.unwrap();
+        let (writes, failures) = crash_audit(template.path(), &want, Audited::Rebuild, full(40, 3, 8));
+        assert!(writes > 40, "{bits} bits: the scenario must cover a whole rebuild ({writes} writes)");
+        assert!(
+            failures.is_empty(),
+            "{bits} bits: {} failure(s):\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
 }
 
 /// Re-embeds and deletes racing a rebuild: no chunk is lost or orphaned and

@@ -425,8 +425,9 @@ which serves the **gemma** and **qwen** models.
 Everything that shapes a store's vector index lives in its schema's
 `vector_index`: the model (`embedding_model`, default `"gemma"`, sent on every
 request to the service), its dimension (`embedding_dim`, default 768), how
-documents are chunked, and the search defaults. The model, dimension and
-chunking are fixed once semantic search is enabled. There is no centroid file to
+documents are chunked, the Pass-1 code width (`quantisation.pass1_bits`: 1 bit
+per dimension by default, or 2 or 4), and the search defaults. The model,
+dimension, chunking and Pass-1 width are fixed once semantic search is enabled. There is no centroid file to
 download: each store starts with one IVF posting and grows its own partition as
 documents arrive, splitting postings that grow too large and merging ones that
 deletes empty, in the background.

@@ -72,7 +72,10 @@ impl SparseScan {
 ///   is the sign of the residual.  Packed via `pack_bits` (64 dims per `u64`).
 /// - [`MultiBit`][QuantisationStyle::MultiBit]: multi-bit quantisation — each dimension
 ///   encoded with `number_of_bits` bits (> 1; typical values 4–8).
-///   Packed via `pack_bytes` (8 bytes per `u64`).
+///   Packed via `pack_bytes` (8 bytes per `u64`). Whole-document (Pass-2) codes.
+/// - [`BitPlanes`][QuantisationStyle::BitPlanes]: the multi-bit code of a chunk
+///   (Pass 1) at 2 or 4 bits, stored as bit planes so it takes `number_of_bits`
+///   bits per dimension. Packed via `pack_bit_planes`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum QuantisationStyle {
     /// 1-bit RaBitQ — each dimension encoded as its sign bit.
@@ -82,6 +85,18 @@ pub enum QuantisationStyle {
         /// Bits per dimension (> 1; typical values 4–8).
         number_of_bits: usize,
     },
+    /// A multi-bit chunk code stored as `number_of_bits` bit planes: plane `j`
+    /// holds bit `j` of every dimension's code, 64 dimensions per word (dimension
+    /// `i` is bit `i % 64` of word `i / 64` of the plane), and the planes follow
+    /// one another, lowest bit first. Same quantiser and factors as
+    /// [`MultiBit`](Self::MultiBit); only the layout differs, so the dot product
+    /// with a query is `Σ_j 2^j · ⟨plane_j, q⟩`, every plane scored in one pass.
+    /// Added after `MultiBit` so stored 1-bit and 8-bit entries keep their
+    /// discriminants.
+    BitPlanes {
+        /// Bits per dimension (2 or 4 for Pass-1 codes).
+        number_of_bits: usize,
+    },
 }
 
 impl QuantisationStyle {
@@ -89,8 +104,23 @@ impl QuantisationStyle {
     pub fn number_of_bits(&self) -> usize {
         match self {
             Self::SingleBit => 1,
-            Self::MultiBit { number_of_bits } => *number_of_bits,
+            Self::MultiBit { number_of_bits } | Self::BitPlanes { number_of_bits } => *number_of_bits,
         }
+    }
+
+    /// The style of a chunk (Pass-1) code `bits` wide: [`SingleBit`](Self::SingleBit)
+    /// at 1 bit, [`BitPlanes`](Self::BitPlanes) otherwise.
+    pub fn pass1(bits: usize) -> Self {
+        if bits == 1 {
+            Self::SingleBit
+        } else {
+            Self::BitPlanes { number_of_bits: bits }
+        }
+    }
+
+    /// Whether this is a chunk (Pass-1) code, stored in the sparse namespace.
+    pub fn is_pass1(&self) -> bool {
+        matches!(self, Self::SingleBit | Self::BitPlanes { .. })
     }
 }
 
@@ -245,7 +275,7 @@ impl VectorIndex {
     ///
     /// Use [`list_from_bytes`] to round-trip.  The format is an rkyv-encoded
     /// `Vec<VectorIndex>`; a single-element list is the multi-bit case, a
-    /// multi-element list is the single-bit (multi-chunk) case.
+    /// multi-element list is the chunk-code (multi-chunk) case.
     ///
     /// [`list_from_bytes`]: VectorIndex::list_from_bytes
     pub fn list_to_bytes(list: &[Self]) -> Vec<u8> {
@@ -294,6 +324,9 @@ impl ArchivedVectorIndex {
         match self.quantisation_style {
             ArchivedQuantisationStyle::SingleBit => QuantisationStyle::SingleBit,
             ArchivedQuantisationStyle::MultiBit { number_of_bits } => QuantisationStyle::MultiBit {
+                number_of_bits: number_of_bits.to_native() as usize,
+            },
+            ArchivedQuantisationStyle::BitPlanes { number_of_bits } => QuantisationStyle::BitPlanes {
                 number_of_bits: number_of_bits.to_native() as usize,
             },
         }

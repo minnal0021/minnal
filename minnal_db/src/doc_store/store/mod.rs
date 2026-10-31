@@ -75,7 +75,7 @@ pub(crate) use vector::{DocumentText, document_text};
 /// A document store manager backed by a `minnal_db` database.
 ///
 /// Each logical document store is one minnal_db namespace whose schema is kept
-/// in the `system_schema` namespace and cached in memory ([`SchemaStore`]).
+/// in the `system_schema` namespace and cached in memory (`SchemaStore`).
 /// `DocStore` owns the `AsyncDb` instance.
 pub struct DocStore {
     db: Arc<AsyncDb>,

@@ -5,13 +5,14 @@
 //!
 //! | Internal namespace        | Key                            | Value                                    |
 //! |---------------------------|--------------------------------|------------------------------------------|
-//! | `{ns}_sparse_vector`      | `cluster_id (4B BE) ‖ doc_id`  | rkyv `Vec<VectorIndex>` (SingleBit only) |
+//! | `{ns}_sparse_vector`      | `cluster_id (4B BE) ‖ doc_id`  | rkyv `Vec<VectorIndex>` (chunk codes: SingleBit or BitPlanes) |
 //! | `{ns}_sparse_vector_meta` | `doc_id`                       | `count (2B BE u16) ‖ [cluster_id (4B BE)]×N` |
 //! | `{ns}_dense_vector`       | `doc_id`                       | rkyv `Vec<VectorIndex>` (MultiBit only)  |
 //! | `{ns}_ivf_centres`        | `centre_id (4B BE)`            | `f32 LE × D` (seeded once, append-only)  |
 //! | `{ns}_ivf_postings`       | `posting_id (4B BE)`           | `centre_id ‖ state (1B) ‖ routing f32 LE × D` |
 //!
-//! The sparse namespace stores chunked single-bit embeddings keyed by IVF cluster, enabling
+//! The sparse namespace stores the chunk codes (the namespace's Pass-1 width: 1, 2 or 4 bits
+//! per dimension) keyed by IVF cluster, enabling
 //! fast first-pass scans by cluster prefix.  The meta namespace tracks which clusters each
 //! document's chunks were assigned to, used only by delete/upsert to clean up stale keys.
 //! The dense namespace stores the full-precision multi-bit embedding keyed directly by
@@ -19,7 +20,7 @@
 //!
 //! Query-embedding caching uses a single system-wide TTL namespace
 //! (`system_qemb_cache`) shared across all doc-store namespaces — see
-//! [`SYSTEM_QUERY_EMB_CACHE_NS`].
+//! `SYSTEM_QUERY_EMB_CACHE_NS`.
 //!
 //! # Failure & idempotency
 //!
@@ -460,7 +461,8 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 
 /// Write the quantised vector index for a document to the vector KV store.
 ///
-/// `vector_indexes` is the combined list of SingleBit and MultiBit quantised entries
+/// `vector_indexes` is the combined list of chunk (Pass-1: `SingleBit` or
+/// `BitPlanes`) and whole-document (`MultiBit`) quantised entries
 /// for the document, as returned by `embed_document`, and `text` is the text they
 /// were embedded from (its hash goes in the meta).
 ///
@@ -475,12 +477,12 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 /// `delete_racing_a_reembed_survives_a_crash_anywhere`). The meta is one small
 /// record per document, so its fsync is negligible beside the embedding call.
 ///
-/// SingleBit entries are written to `{ns}_sparse_vector` (keyed by cluster prefix),
+/// Chunk entries are written to `{ns}_sparse_vector` (keyed by cluster prefix),
 /// with stale cluster keys cleaned up via `{ns}_sparse_vector_meta`.
 /// The MultiBit entry (at most one) is written directly to `{ns}_dense_vector` by doc_id.
 ///
 /// Each write is a standalone single-op write — the vector index is a derived
-/// structure that the [`VecIndexWorker`] (re)builds idempotently from the queue,
+/// structure that the `VecIndexWorker` (re)builds idempotently from the queue,
 /// so it needs no cross-namespace atomicity with the document write.
 ///
 /// The quantised payloads skip the main WAL: they are bulky and reconstructable
@@ -494,8 +496,6 @@ pub(crate) fn decode_sparse_meta(bytes: &[u8]) -> Option<SparseMeta> {
 ///
 /// Returns how the document's entries moved between postings, for the
 /// namespace's entry counts ([`crate::semantic_search::NamespaceIvf::apply_delta`]).
-///
-/// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
 pub async fn upsert_vectors(
     db: &AsyncDb,
     namespace: &str,
@@ -525,13 +525,13 @@ pub async fn upsert_vectors(
         return Ok(PostingDelta::default());
     }
 
-    // ── Sparse (SingleBit) and the meta ──────────────────────────────────────
+    // ── Sparse (Pass-1 chunk codes) and the meta ─────────────────────────────
     // The meta is written even when there are no chunks: it also records which
     // text the vectors came from.
     let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
     let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     let mut new_cluster_groups: std::collections::BTreeMap<u32, Vec<VectorIndex>> = std::collections::BTreeMap::new();
-    for vi in vector_indexes.iter().filter(|vi| vi.quantisation_style == QuantisationStyle::SingleBit) {
+    for vi in vector_indexes.iter().filter(|vi| vi.quantisation_style.is_pass1()) {
         new_cluster_groups.entry(vi.cluster_id).or_default().push(vi.clone());
     }
     let new_postings: Vec<(u32, u32)> = new_cluster_groups.iter().map(|(&id, v)| (id, v.len() as u32)).collect();
@@ -993,10 +993,8 @@ pub async fn clear_queue_for(db: &AsyncDb, namespace: &str) -> Result<usize, cra
 
 /// Return all pending embedding queue entries.
 ///
-/// Called by the [`VecIndexWorker`] on startup (crash recovery) and after
+/// Called by the `VecIndexWorker` on startup (crash recovery) and after
 /// each wake-up signal.  Returns an empty list when the queue is empty.
-///
-/// [`VecIndexWorker`]: crate::doc_store::vec_index_worker::VecIndexWorker
 pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     let entries = queue_ns.iter().await?;

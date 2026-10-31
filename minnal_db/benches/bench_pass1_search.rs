@@ -3,7 +3,10 @@
 //!
 //!   cargo bench -p minnal_db --features semantic-search --bench bench_pass1_search
 //!
-//! The store holds `N_DOCS` documents with one 1-bit chunk code each, filed under
+//! `MINNAL_BENCH_PASS1_BITS` (1, 2 or 4; default 1) sets the chunk code width;
+//! its group names then end in `@{bits}b`.
+//!
+//! The store holds `N_DOCS` documents with one chunk code each, filed under
 //! the nearest of `N_POSTINGS` centres, plus one 8-bit whole-document code each,
 //! written the way production stores them (`{ns}_sparse_vector` keyed
 //! `posting ‖ doc_id`, `{ns}_dense_vector` keyed `doc_id`) and compacted into L1.
@@ -59,6 +62,11 @@ struct Corpus {
     query: Vec<f32>,
 }
 
+/// Chunk code width, from `MINNAL_BENCH_PASS1_BITS`.
+fn pass1_bits() -> usize {
+    std::env::var("MINNAL_BENCH_PASS1_BITS").map_or(1, |b| b.parse().expect("bench: MINNAL_BENCH_PASS1_BITS"))
+}
+
 fn corpus() -> Corpus {
     let mut next = prng(0x6d69_6e6e_616c_0001);
     let mut vector = || {
@@ -71,7 +79,7 @@ fn corpus() -> Corpus {
     let docs = (0..N_DOCS)
         .map(|_| {
             let emb = vector();
-            let sparse = index_embedding_rotated(&index, &emb, QuantisationStyle::SingleBit).expect("bench: route");
+            let sparse = index_embedding_rotated(&index, &emb, QuantisationStyle::pass1(pass1_bits())).expect("bench: route");
             let posting = sparse.cluster_id;
             let dense = index_embedding_rotated(&index, &emb, QuantisationStyle::MultiBit { number_of_bits: 8 }).expect("bench: route");
             (posting, VectorIndex::list_to_bytes(&[sparse]), VectorIndex::list_to_bytes(&[dense]))
@@ -148,6 +156,8 @@ fn bench_pass1(c: &mut Criterion) {
         })
         .collect();
     let no_filter: Option<fn(&[u8]) -> bool> = None;
+    let bits = pass1_bits();
+    let suffix = if bits == 1 { String::new() } else { format!("@{bits}b") };
 
     for layout in ["grouped", "scattered"] {
         let dir = tempfile::TempDir::new().expect("bench: tempdir");
@@ -156,7 +166,7 @@ fn bench_pass1(c: &mut Criterion) {
         let stored = rt.block_on(store.scan_sparse_clusters_batch(&probe_sets[2])).expect("bench: scan").len();
         assert_eq!(stored, N_DOCS, "bench store must hold every document");
 
-        let mut group = c.benchmark_group(format!("pass1_scan/{layout}"));
+        let mut group = c.benchmark_group(format!("pass1_scan/{layout}{suffix}"));
         group.measurement_time(Duration::from_secs(10));
         for (probes, ids) in PROBES.iter().zip(&probe_sets) {
             let entries = rt.block_on(store.scan_sparse_clusters_batch(ids)).expect("bench: scan").len();
@@ -167,13 +177,14 @@ fn bench_pass1(c: &mut Criterion) {
         }
         group.finish();
 
-        let mut group = c.benchmark_group(format!("pass1_search/{layout}"));
+        let mut group = c.benchmark_group(format!("pass1_search/{layout}{suffix}"));
         group.measurement_time(Duration::from_secs(10));
         for &probes in &PROBES {
             let config = SemanticSearchConfig {
                 probe: ProbeSettings::fixed(probes),
                 first_pass_sparse_search_top_k: 1_000,
                 top_k_results: 10,
+                pass1_bits: bits,
                 ..SemanticSearchConfig::default()
             };
             group.bench_with_input(BenchmarkId::from_parameter(probes), &config, |b, config| {

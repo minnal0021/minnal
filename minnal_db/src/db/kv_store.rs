@@ -746,7 +746,7 @@ impl KVStore {
     /// re-run other fields' extractors, or trigger any vector re-embedding. Use
     /// it to repair a single document's entry in one field index.
     ///
-    /// Returns [`FieldReindexOutcome`]: `Reindexed` on success, `KeyNotFound`
+    /// Returns [`FieldReindexOutcome`](crate::FieldReindexOutcome): `Reindexed` on success, `KeyNotFound`
     /// when the key has no value, `FieldNotActive` when `field_id` has no live
     /// index in this namespace.
     ///
@@ -1190,7 +1190,7 @@ impl KVStore {
     /// Scan multiple 4-byte BE cluster prefixes and resolve their values.
     ///
     /// Collects every live `(key, pointer)` for the whole prefix set in one
-    /// [`LSMTree::scan_prefixes`] call (one pass per layer, not one per prefix), then
+    /// `LSMTree::scan_prefixes` call (one pass per layer, not one per prefix), then
     /// resolves the pointers against the value log with one scoped thread per bucket,
     /// each reading its values into one buffer. Each value is its own `pread` (in
     /// key order, not file order); the reads are not coalesced, so the syscall count

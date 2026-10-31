@@ -52,7 +52,7 @@
 //! is **required, not laziness**. A `MAP_SHARED` mapping is written back by the
 //! kernel whenever it likes, with no inter-page ordering, so after a crash the
 //! file can hold entries for ids at or past the marker's `next_id`, or a
-//! half-finished [`rehash`](RowMap::rehash). Unlike `keybytes`/`idarray` — which
+//! half-finished `rehash`. Unlike `keybytes`/`idarray` — which
 //! are append-only, so the marker's length is a clean cut and anything past it
 //! is an ignorable torn tail — scattered hash positions give no such cut, and a
 //! stale entry is indistinguishable from a good one.

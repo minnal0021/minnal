@@ -399,6 +399,7 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 | `attributes` | array            | no       | Non-indexed field declarations       |
 | `semantic_search_enabled` | bool | no      | Embed documents for semantic search (default `false`) |
 | `embedding_fields` | array of strings | with semantic search | The `str` fields whose text is embedded |
+| `vector_index` | object | no | Vector-index settings; any omitted field takes its default (below) |
 
 **Index spec:**
 
@@ -434,6 +435,49 @@ curl -X POST http://localhost:8080/stores \
   }'
 # → 201 Created
 ```
+
+**Example with semantic search.** `vector_index` is optional; whatever it leaves
+out takes its default, and the filled-in object is saved in the schema
+(`GET /stores/{ns}/schema` shows it). This store chooses 2-bit chunk codes and
+fewer probes:
+
+```bash
+curl -X POST http://localhost:8080/stores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "namespace": "articles",
+    "store_type": "doc",
+    "key_type": "u64",
+    "indices": [],
+    "attributes": [
+      {"name": "title", "attr_type": "str"},
+      {"name": "body",  "attr_type": "str"}
+    ],
+    "semantic_search_enabled": true,
+    "embedding_fields": ["title", "body"],
+    "vector_index": {
+      "embedding_model": "gemma",
+      "quantisation": {"pass1_bits": 2},
+      "search": {"max_probes": 128}
+    }
+  }'
+# → 201 Created
+```
+
+| `vector_index` field | Default | Can change later? |
+|---|---|---|
+| `embedding_model`, `embedding_dim` | `gemma`, 768 | no |
+| `chunking.window_size`, `chunking.sliding_size` | 4, 2 (sentences per chunk, sentences between chunk starts) | no |
+| `quantisation.pass1_bits` | 1 (allowed: 1, 2, 4 bits per dimension of the chunk codes) | no |
+| `search.max_probes`, `min_probes`, `first_pass_top_k`, `top_k` | 256, 1, 1000, 100 | yes, with `update_vector_search` |
+| `maintenance.*` | see the architecture doc | yes, with `update_vector_search` |
+
+Wider chunk codes make the first search pass rank its candidates better and
+keep chunks in their nearest partition, at the cost of more storage (1.7× at
+2 bits, 3× at 4) and, at 4 bits, slower searches; how to choose is in
+[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
+The fixed settings are kept if the vector index is dropped, and re-enabling it
+(`enable_vector_index`) with a different value for one of them returns `409`.
 
 ---
 
@@ -541,9 +585,11 @@ curl -X PATCH http://localhost:8080/stores/users/schema \
 
 So the post-create workflow to **change which fields are embedded** is: drop the
 vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
-`enable_vector_index` with the new field set. Like `add_embedding_attribute`, it
-returns `409` if a vector index already exists, and `400` if `fields` is empty,
-contains duplicates, or names an existing index/attribute.
+`enable_vector_index` with the new field set. A field that is already a `str`
+attribute (as the old embedding fields are after the drop) becomes an
+embedding field; any other name is added as a `str` attribute. It returns `409`
+if a vector index already exists, and `400` if `fields` is empty, contains
+duplicates, or names an index field or an attribute of another type.
 
 **Change search or partition settings:** once semantic search is enabled, the
 store owns its search settings (`vector_index.search`) and the settings that
@@ -568,8 +614,9 @@ this many), `min_probes` (a floor for requests that lower `max_probes`),
 `skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
 and `split_lambda_factor`. What each one does, its default and its allowed range
 are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
-The embedding model, dimension and chunking are fixed once semantic search is
-enabled and cannot be changed here. A value out of range returns `400`; a store
+The embedding model, dimension, chunking and Pass-1 code width
+(`quantisation.pass1_bits`) are fixed once semantic search is enabled and cannot
+be changed here. A value out of range returns `400`; a store
 without semantic search returns `422`. Read the current values with
 `GET /stores/{ns}/schema`.
 
@@ -579,7 +626,7 @@ without semantic search returns `422`. Read the current values with
 | `update_attribute`        | `name`, `attr_type`      |
 | `remove_attribute`        | `name`                   |
 | `add_embedding_attribute` | `name`                   |
-| `enable_vector_index`     | `fields` (non-empty)     |
+| `enable_vector_index`     | `fields` (non-empty); optional `vector_index` |
 | `update_vector_search`    | `search` and/or `maintenance` |
 
 `add_attribute`, `update_attribute` and `add_embedding_attribute` accept an optional `"description"` string.
@@ -2025,7 +2072,7 @@ Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
 
 #### `POST /admin/indices/{ns}/vector/rebuild`
 
-Re-cluster the store's partition from its stored 1-bit codes: k-means over every
+Re-cluster the store's partition from its stored chunk codes: k-means over every
 chunk, then each chunk moves to its nearest new posting, and the usual splits
 and merges follow. No embedding request is made and no code is re-encoded.
 Searches and writes continue throughout; a crash part-way is finished at the
@@ -2345,7 +2392,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
     config.json               ← namespace settings
     lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
-  ns_{namespace}_sparse_vector/      ← 1-bit chunk embeddings, keyed by [posting_id ‖ doc_id] (Pass 1)
+  ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)
   ns_{namespace}_sparse_vector_meta/ ← each document's postings and chunk counts, used to clean up on update and delete
   ns_{namespace}_ivf_centres/        ← the store's IVF centres

@@ -200,6 +200,35 @@ fn test_concurrent_first_use_of_a_namespace_does_not_race() {
     );
 }
 
+/// `lookup_open_store` answers from memory and reports the creation window
+/// instead of guessing: a name with no namespace is `Absent`, a created one is
+/// `Open` with the id and store `get_store` gives, and a name the registry has
+/// published before its store is in the store map (the window
+/// `test_concurrent_first_use_of_a_namespace_does_not_race` describes) is
+/// `NotReady`, never `Absent`. `AsyncDb::existing_namespace` relies on that to
+/// send only the window to the blocking path.
+#[test]
+fn lookup_open_store_reports_the_creation_window_as_not_ready() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+
+    assert!(matches!(db.lookup_open_store("missing"), OpenStoreLookup::Absent));
+
+    let id = db.create_namespace("ready").unwrap();
+    match db.lookup_open_store("ready") {
+        OpenStoreLookup::Open(found, store) => {
+            assert_eq!(found, id);
+            assert!(Arc::ptr_eq(&store, &db.get_store(id).unwrap()));
+        }
+        _ => panic!("a created namespace must be open"),
+    }
+
+    // The middle of `create_namespace`: the name is published, the store not yet.
+    let half = db.registry.write().create("half").unwrap();
+    assert!(matches!(db.lookup_open_store("half"), OpenStoreLookup::NotReady));
+    assert_eq!(db.get_namespace_id("half"), Some(half));
+}
+
 /// Regression: activating the same field index from several threads must not
 /// kill the process.
 ///

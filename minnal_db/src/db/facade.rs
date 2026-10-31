@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::config::DbConfig;
-use crate::db::database::Database;
+use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::index_manager::FieldIndexHealth;
@@ -781,7 +781,7 @@ impl Db {
     ///
     /// Row-scoped when the gap named the affected keys, a full rebuild
     /// otherwise. Does not re-put documents. See
-    /// [`FieldRepairOutcome`](crate::FieldRepairOutcome).
+    /// [`FieldRepairOutcome`].
     pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
         self.inner.repair_field_index(namespace_id, field_id)
     }
@@ -1521,11 +1521,23 @@ impl AsyncDb {
     }
 
     /// Async [`Db::existing_namespace`].
+    ///
+    /// Answered on the calling task: the lookup is two in-memory reads. A trip to
+    /// the blocking pool and back cost more than the read that followed it (half
+    /// of a slow document `get` under load). Only a namespace whose store is not
+    /// in the store map yet takes the blocking path, where
+    /// [`Db::existing_namespace`] waits on the namespace-creation lock.
     pub async fn existing_namespace(&self, name: String) -> Result<Option<AsyncNamespace>> {
-        let db = self.inner.clone();
-        let found = tokio::task::spawn_blocking(move || db.existing_namespace(&name).map(|ns| (ns.ns_id, Arc::clone(&ns.store))))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?;
+        let found = match self.inner.inner.lookup_open_store(&name) {
+            OpenStoreLookup::Open(ns_id, store) => Some((ns_id, store)),
+            OpenStoreLookup::Absent => None,
+            OpenStoreLookup::NotReady => {
+                let db = self.inner.clone();
+                tokio::task::spawn_blocking(move || db.existing_namespace(&name).map(|ns| (ns.ns_id, Arc::clone(&ns.store))))
+                    .await
+                    .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+            }
+        };
         Ok(found.map(|(ns_id, store)| AsyncNamespace {
             ns_id,
             store,

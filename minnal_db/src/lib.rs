@@ -272,7 +272,7 @@ pub use store::value_log::ValueLogMetadata;
 /// [`Db::value_log_physical_stats`].
 pub use store::value_log::sharded::ShardPhysicalStats;
 
-/// Per-page value-log garbage breakdown, returned by [`Db::value_log_page_stats`].
+/// Per-page value-log garbage breakdown, returned by [`Db::value_log_segment_stats`].
 pub use store::value_log::SegmentStats;
 
 // ── Document store (folded layer) ─────────────────────────────────────────────

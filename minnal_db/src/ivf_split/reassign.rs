@@ -12,7 +12,7 @@
 //!   posting: `min_i D(x̂, c_Pi) < D(x̂, c_P)` and `< D(x̂, c_cur)`.
 //!
 //! A candidate moves to its nearest active posting, unless that is where it is.
-//! `x̂` is the chunk's reconstruction from its 1-bit code; with
+//! `x̂` is the chunk's reconstruction from its code; with
 //! `skip_uncertain_moves` every comparison must win by more than the code's
 //! error allows (see `nearer`).
 //!
@@ -83,17 +83,45 @@ impl SignDot {
     }
 
     fn dot(&self, packed: &[u64]) -> f64 {
+        f64::from(2.0 * self.set(packed) - self.total)
+    }
+
+    /// `⟨b, v⟩` for the bits `b` of one plane: the sum of `v` over the set bits.
+    fn set(&self, packed: &[u64]) -> f32 {
         let mut set = 0.0f32;
         for (j, t) in self.tables.iter().enumerate() {
             set += t[((packed[j / 8] >> (8 * (j % 8))) & 0xff) as usize];
         }
-        f64::from(2.0 * set - self.total)
+        set
+    }
+
+    /// `⟨x̂ − c, v⟩` for a code's reconstruction `x̂` against its own centre `c`
+    /// ([`reconstruct_code`](crate::semantic_search::quantisation::rabitq::reconstruct_code)),
+    /// without reconstructing it: `s⟨σ, v⟩` for a 1-bit code, and for a bit-plane
+    /// code `−s(Σ_j 2^j⟨b_j, v⟩ + c_b Σv)`, one table pass per plane. The code must
+    /// match the dimension (checked by the caller).
+    fn residual_dot(&self, code: &VectorIndex, dim: usize) -> f64 {
+        use crate::semantic_search::index::vector_index::QuantisationStyle;
+        let s = f64::from(code.scaling_factor);
+        match code.quantisation_style {
+            QuantisationStyle::BitPlanes { number_of_bits: bits } => {
+                let words = dim.div_ceil(64);
+                let planes: f64 = (0..bits)
+                    .map(|j| f64::from(1u32 << j) * f64::from(self.set(&code.packed_vector[j * words..])))
+                    .sum();
+                let shift = -(f64::from(1u32 << (bits - 1)) - 0.5);
+                -s * (planes + shift * f64::from(self.total))
+            }
+            _ => s * self.dot(&code.packed_vector),
+        }
     }
 }
 
 /// Distances from a code's reconstruction to a few fixed centres, without
-/// reconstructing it. With `x̂ = c + s·σ` (its own centre `c`, scale `s`, signs
-/// `σ`), `D(x̂, t) − ‖x̂‖² = ‖t‖² − 2⟨c, t⟩ − 2s⟨σ, t⟩`: comparing that *score*
+/// reconstructing it. With `x̂` its reconstruction against its own centre `c`
+/// (`c + s·σ` at 1 bit, `c − s·(u + c_b)` for bit planes),
+/// `D(x̂, t) − ‖x̂‖² = ‖t‖² − 2⟨c, t⟩ − 2⟨x̂ − c, t⟩`, the last term from per-byte
+/// tables (`SignDot::residual_dot`): comparing that *score*
 /// across targets is comparing distances. `⟨c, t⟩` is cached per (own centre,
 /// target), since a scope's codes share few centres. Targets are keyed by
 /// centre id.
@@ -113,7 +141,7 @@ impl<'a> Scorer<'a> {
     }
 
     /// `D(x̂, t) − ‖x̂‖²` for target centre `t`, or `None` if a centre is unknown.
-    /// The code must be 1-bit and match the dimension (checked by the caller).
+    /// The code must be a Pass-1 code matching the dimension (checked by the caller).
     fn score(&self, code: &VectorIndex, t: u32) -> Option<f64> {
         let target = {
             let mut targets = self.targets.lock();
@@ -140,7 +168,7 @@ impl<'a> Scorer<'a> {
                 d
             }
         };
-        Some(target.0 - 2.0 * (own + f64::from(code.scaling_factor) * target.1.dot(&code.packed_vector)))
+        Some(target.0 - 2.0 * (own + target.1.residual_dot(code, self.ivf.dim())))
     }
 
     /// Whether centre `a` is nearer to the code than centre `b`, as
@@ -185,13 +213,12 @@ impl<'a> Rule<'a> {
     /// reconstructing it (`Scorer`); only a candidate is reconstructed, to find
     /// its nearest active posting.
     fn decide(&self, ivf: &NamespaceIvf, src: u32, src_centre: &[f32], code: &VectorIndex, x: &mut Vec<f32>) -> (bool, Option<u32>) {
-        use crate::semantic_search::index::vector_index::QuantisationStyle;
         let dim = src_centre.len();
         let Some(src_c) = ivf.posting_infos().get(&src).map(|i| i.centre_id) else {
             return (false, None);
         };
-        if code.quantisation_style != QuantisationStyle::SingleBit
-            || code.packed_vector.len() < dim.div_ceil(64)
+        if !code.quantisation_style.is_pass1()
+            || code.packed_vector.len() < dim.div_ceil(64) * code.quantisation_style.number_of_bits()
             || ivf.rotated_centre(code.centre_id).is_none_or(|c| c.len() != dim)
         {
             return (false, None);
@@ -548,6 +575,7 @@ mod tests {
         let ivf = h.snapshot();
         let mut checked = 0;
         let mut candidates = 0;
+        let mut plane_candidates = 0;
         for (&p, info) in ivf.posting_infos() {
             if info.state != PostingState::Retired {
                 continue;
@@ -577,8 +605,9 @@ mod tests {
                         }
                     }
                 }
-                // Random codes too: random signs and scales, own centres drawn
-                // from every centre, filed under every active posting.
+                // Random codes too, at every Pass-1 width: random bits and scales
+                // (negative for bit planes, as the multi-bit quantiser makes them),
+                // own centres drawn from every centre, filed under every active posting.
                 let centres = crate::semantic_search::IvfLayout::centre_ids(&*ivf);
                 let active = ivf.active_centres();
                 let mut state = 11u64 ^ u64::from(p);
@@ -586,29 +615,39 @@ mod tests {
                     state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                     state >> 11
                 };
-                for _ in 0..2000 {
-                    let (src, centre) = active[next() as usize % active.len()];
-                    let code = VectorIndex {
-                        cluster_id: src,
-                        centre_id: centres[next() as usize % centres.len()],
-                        quantisation_style: crate::semantic_search::index::vector_index::QuantisationStyle::SingleBit,
-                        addition_factor: 0.0,
-                        scaling_factor: (next() % 1000) as f32 / 4000.0,
-                        error_bound: (next() % 1000) as f32 / 20000.0,
-                        packed_vector: vec![next() ^ (next() << 40); centre.len().div_ceil(64)],
-                    };
-                    let fast = rule.decide(&ivf, src, centre, &code, &mut x);
-                    assert_eq!(
-                        fast,
-                        rule.decide_reconstructed(&ivf, src, centre, &code),
-                        "random code, split of {p}, gate {gate}"
-                    );
-                    checked += 1;
-                    candidates += usize::from(fast.0);
+                for bits in [1usize, 2, 4] {
+                    let style = crate::semantic_search::QuantisationStyle::pass1(bits);
+                    for _ in 0..2000 {
+                        let (src, centre) = active[next() as usize % active.len()];
+                        let scale = (next() % 1000) as f32 / 4000.0;
+                        let code = VectorIndex {
+                            cluster_id: src,
+                            centre_id: centres[next() as usize % centres.len()],
+                            quantisation_style: style.clone(),
+                            addition_factor: 0.0,
+                            scaling_factor: if bits == 1 { scale } else { -scale / (1 << bits) as f32 },
+                            error_bound: (next() % 1000) as f32 / 20000.0,
+                            packed_vector: (0..centre.len().div_ceil(64) * bits).map(|_| next() ^ (next() << 40)).collect(),
+                        };
+                        let fast = rule.decide(&ivf, src, centre, &code, &mut x);
+                        assert_eq!(
+                            fast,
+                            rule.decide_reconstructed(&ivf, src, centre, &code),
+                            "random {bits}-bit code, split of {p}, gate {gate}"
+                        );
+                        checked += 1;
+                        candidates += usize::from(fast.0);
+                        if bits > 1 {
+                            plane_candidates += usize::from(fast.0);
+                        }
+                    }
                 }
             }
         }
-        assert!(checked > 4000 && candidates > 10, "{checked} decisions, {candidates} candidates");
+        assert!(
+            checked > 4000 && candidates > 10 && plane_candidates > 10,
+            "{checked} decisions, {candidates} candidates ({plane_candidates} of bit-plane codes)"
+        );
         db.shutdown().await.unwrap();
     }
 }

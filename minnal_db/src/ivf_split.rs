@@ -17,7 +17,7 @@
 //! A split and a merge both **drain** one posting: mark it `Draining` so nothing
 //! new is routed to it, copy each chunk to where it belongs, delete the
 //! originals, and retire it. They differ only in where a chunk goes
-//! ([`DrainRule`]). A reassignment moves chunks between active postings, so its
+//! (`DrainRule`). A reassignment moves chunks between active postings, so its
 //! source keys shrink instead of going away.
 //!
 //! The store has no transactions, so every operation is a sequence of
@@ -39,7 +39,7 @@
 //!
 //! Every per-document write (meta and keys, both namespaces) is logged in the
 //! vector index WAL, and each batch syncs it before releasing its documents'
-//! locks ([`sync_batch`]). The journal records, centres and postings are
+//! locks (`sync_batch`). The journal records, centres and postings are
 //! main-WAL writes, durable on return. A crash keeps a prefix of the vector
 //! index WAL (a flush syncs it before writing L0 files), so the orders below
 //! hold across the two namespaces exactly as if each write were durable on
@@ -70,7 +70,7 @@
 //!    unfinished: a new handle needs recovery, and so does one after any
 //!    maintenance error; [`ensure_recovered`] runs it before the partition is
 //!    handed out, and every maintenance entry point before it starts
-//!    ([`prepare`]). An operation started on top of an unfinished one would
+//!    (`prepare`). An operation started on top of an unfinished one would
 //!    take ids the unfinished one already used.
 //! 7. **A dropped namespace is never written.** Maintenance resolves namespaces
 //!    with get-or-create, so a write after a drop brings them back; the drop
@@ -87,7 +87,7 @@ use crate::AsyncDb;
 use crate::semantic_search::cluster::split::{SplitParams, SplitRng, balanced_two_means};
 use crate::semantic_search::index::composite_key;
 use crate::semantic_search::index::vector_index::VectorIndex;
-use crate::semantic_search::quantisation::rabitq::{reconstruct_single_bit, reconstruct_single_bit_into};
+use crate::semantic_search::quantisation::rabitq::{reconstruct_code, reconstruct_code_into};
 use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
 use crate::vector_kv::{
     decode_posting, decode_sparse_meta, encode_posting, encode_sparse_meta, f32s_to_bytes, ivf_centres_ns, ivf_journal_ns, ivf_postings_ns,
@@ -417,16 +417,15 @@ fn posting_of(ivf: &NamespaceIvf, id: u32) -> Option<Posting> {
 // ── Geometry, all in the rotated space codes live in ──
 
 /// The reconstruction of `code`, or `None` for a code that cannot be
-/// reconstructed (its centre is unknown, or it is not 1-bit).
+/// reconstructed (its centre is unknown, or it is not a Pass-1 code).
 fn reconstruct(ivf: &NamespaceIvf, code: &VectorIndex) -> Option<Vec<f32>> {
-    reconstruct_single_bit(code, ivf.rotated_centre(code.centre_id)?)
+    reconstruct_code(code, ivf.rotated_centre(code.centre_id)?)
 }
 
 /// [`reconstruct`] into `buf`, for loops over many codes. `false` for a code
 /// that cannot be reconstructed.
 fn reconstruct_into(ivf: &NamespaceIvf, code: &VectorIndex, buf: &mut Vec<f32>) -> bool {
-    ivf.rotated_centre(code.centre_id)
-        .is_some_and(|c| reconstruct_single_bit_into(code, c, buf))
+    ivf.rotated_centre(code.centre_id).is_some_and(|c| reconstruct_code_into(code, c, buf))
 }
 
 /// Squared Euclidean distance (SIMD). Maintenance compares millions of these

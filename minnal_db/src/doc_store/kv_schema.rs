@@ -144,7 +144,7 @@ fn decode_int_key(bytes: [u8; 8]) -> i64 {
 impl KvKeyType {
     /// Serialize a JSON value as raw key bytes for storage in minnal_db.
     ///
-    /// Int keys use an order-preserving encoding ([`encode_int_key`]: big-endian
+    /// Int keys use an order-preserving encoding (`encode_int_key`: big-endian
     /// with the sign bit flipped) so that byte order matches numeric order,
     /// negatives included, enabling range scans. Str keys are stored
     /// verbatim after validation through [`StrKey`], which bounds them to

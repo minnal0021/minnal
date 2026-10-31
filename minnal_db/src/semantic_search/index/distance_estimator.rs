@@ -137,6 +137,76 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
     }
 }
 
+/// The Pass-1 estimator for a chunk code of the namespace's width: the 1-bit
+/// estimator for [`SingleBit`](crate::semantic_search::QuantisationStyle::SingleBit)
+/// codes, and the multi-bit estimator over bit planes for
+/// [`BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes) codes, whose
+/// dot product is `Σ_j 2^j · ⟨plane_j, q⟩`, computed for every plane in one
+/// pass (`simd::bit_planes_ip_best`).
+#[derive(Clone, Debug)]
+pub enum Pass1Estimator {
+    /// 1-bit codes.
+    Single(SingleBitQuanDotProductEstimator),
+    /// Bit-plane codes `bits` wide.
+    Planes {
+        /// The multi-bit estimator, its query sum scaled for `bits`.
+        estimator: MultiBitQuanDotProductEstimator,
+        /// Bits per dimension.
+        bits: usize,
+    },
+}
+
+impl Pass1Estimator {
+    /// `Σ query_embedding`, the query-only term; compute it once per query vector
+    /// and pass it to [`with_query_sum`](Self::with_query_sum).
+    pub fn query_sum(query_embedding: &[f32]) -> f32 {
+        SingleBitQuanDotProductEstimator::query_sum(query_embedding)
+    }
+
+    /// An estimator for codes `bits` wide encoded against `centroid`.
+    pub fn with_query_sum(bits: usize, cluster_id: u32, query_embedding: &[f32], centroid: &[f32], query_sum: f32) -> Self {
+        if bits == 1 {
+            Self::Single(SingleBitQuanDotProductEstimator::with_query_sum(
+                cluster_id,
+                query_embedding,
+                centroid,
+                query_sum,
+            ))
+        } else {
+            let cb: f32 = -((1i32 << (bits - 1)) as f32 - 0.5);
+            Self::Planes {
+                estimator: MultiBitQuanDotProductEstimator::with_scaled_query_sum(cluster_id, query_embedding, centroid, cb * query_sum),
+                bits,
+            }
+        }
+    }
+
+    /// Packed words a bit-plane code needs for `dim` dimensions; one with fewer is
+    /// corrupt and must not be scored (its planes would be cut short). 0 for 1-bit
+    /// codes, which the 1-bit kernel reads as they are, as it always has.
+    pub fn packed_words(&self, dim: usize) -> usize {
+        match self {
+            Self::Single(_) => 0,
+            Self::Planes { bits, .. } => dim.div_ceil(64) * bits,
+        }
+    }
+
+    /// Estimate `⟨x, q⟩` from a code's packed words and factors. `packed_vector`
+    /// must hold at least [`packed_words`](Self::packed_words) words.
+    #[inline]
+    pub fn estimate_from_parts(&self, query_embedding: &[f32], packed_vector: &[u64], addition_factor: f32, scaling_factor: f32) -> f32 {
+        match self {
+            Self::Single(e) => e.estimate_from_parts(query_embedding, packed_vector, scaling_factor),
+            Self::Planes { estimator, bits } => {
+                let dot = crate::semantic_search::simd::bit_planes_ip_best(packed_vector, query_embedding, query_embedding.len(), *bits);
+                let query_addition_factor = dot + estimator.0.scaled_query_sum;
+                let estimated_distance = -estimator.0.query_to_centroid_dot_product + addition_factor + (scaling_factor * query_addition_factor);
+                1.0 - estimated_distance
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

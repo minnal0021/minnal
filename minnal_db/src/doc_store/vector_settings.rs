@@ -54,8 +54,11 @@ pub const DEFAULT_SLIDING_SIZE: u32 = 2;
 /// Rotation seed a new namespace gets (the same value as
 /// `semantic_search::cluster::DEFAULT_ROTATION_SEED`, pinned together by a test).
 pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
-/// Code width of Pass-1 (chunk) codes. Read-only.
+/// Default code width of Pass-1 (chunk) codes.
 pub const PASS1_BITS: u8 = 1;
+/// The Pass-1 code widths a namespace can choose when it first enables semantic
+/// search; fixed for the namespace's life after that, like the chunking.
+pub const PASS1_WIDTHS: [u8; 3] = [1, 2, 4];
 /// Code width of Pass-2 (whole-document) codes. Read-only.
 pub const PASS2_BITS: u8 = 8;
 /// What Pass-2 codes are encoded against. Read-only: only the zero centre
@@ -161,11 +164,14 @@ pub struct ChunkingSpec {
     pub sliding_size: Option<u32>,
 }
 
-/// Code widths of the two passes. Read-only today.
+/// Code widths of the two passes. `pass1_bits` is chosen when semantic search is
+/// first enabled and fixed after that; `pass2_bits` is read-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuantisationSpec {
-    /// Bits per dimension of Pass-1 (chunk) codes.
+    /// Bits per dimension of Pass-1 (chunk) codes: 1 (default), 2 or 4. Fixed once
+    /// set; changing it needs a new store (or namespace), since every chunk would
+    /// have to be embedded again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass1_bits: Option<u8>,
     /// Bits per dimension of Pass-2 (whole-document) codes.
@@ -246,7 +252,7 @@ pub struct VectorIndexSettings {
     pub window_size: u32,
     /// Sentences the chunk window advances by.
     pub sliding_size: u32,
-    /// Pass-1 code width (always [`PASS1_BITS`]).
+    /// Pass-1 code width, one of [`PASS1_WIDTHS`]; fixed once set.
     pub pass1_bits: u8,
     /// Pass-2 code width (always [`PASS2_BITS`]).
     pub pass2_bits: u8,
@@ -495,10 +501,10 @@ pub fn format_seed(seed: u64) -> String {
 }
 
 fn check_bits(pass1: u8, pass2: u8) -> Result<(), SchemaError> {
-    if pass1 != PASS1_BITS {
+    if !PASS1_WIDTHS.contains(&pass1) {
         return Err(invalid(
             "quantisation.pass1_bits",
-            format!("is read-only and must be {PASS1_BITS}, got {pass1}"),
+            format!("must be one of {PASS1_WIDTHS:?}, got {pass1}"),
         ));
     }
     if pass2 != PASS2_BITS {
@@ -914,12 +920,19 @@ mod tests {
     }
 
     #[test]
-    fn bits_are_read_only() {
+    fn pass1_bits_take_the_supported_widths_and_pass2_bits_are_read_only() {
         assert!(spec(r#"{"quantisation":{"pass1_bits":1,"pass2_bits":8}}"#).resolve().is_ok());
-        assert_eq!(
-            err_field(spec(r#"{"quantisation":{"pass1_bits":2}}"#).resolve()),
-            "quantisation.pass1_bits"
-        );
+        for bits in PASS1_WIDTHS {
+            let s = spec(&format!(r#"{{"quantisation":{{"pass1_bits":{bits}}}}}"#)).resolve().unwrap();
+            assert_eq!(s.pass1_bits, bits);
+        }
+        for bits in [0, 3, 5, 8] {
+            assert_eq!(
+                err_field(spec(&format!(r#"{{"quantisation":{{"pass1_bits":{bits}}}}}"#)).resolve()),
+                "quantisation.pass1_bits",
+                "{bits}"
+            );
+        }
         assert_eq!(
             err_field(spec(r#"{"quantisation":{"pass2_bits":4}}"#).resolve()),
             "quantisation.pass2_bits"

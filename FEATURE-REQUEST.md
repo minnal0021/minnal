@@ -1043,7 +1043,7 @@ what a full read would find a search reaches within its probe budget.
 **The recall check.** It samples real queries' embeddings from the
 query-embedding cache (`system_qemb_cache`, the namespace's model and dimension
 only, one bounded page read). With fewer than 20 cached it samples stored chunks
-instead, each chunk's 1-bit reconstruction back in the original space and
+instead, each chunk's reconstruction from its code back in the original space and
 normalised; `query_source` says which. Either way it needs no embedding
 service. Each query runs through the production search
 twice: with the namespace's settings, and with every posting probed. The source
@@ -1192,9 +1192,9 @@ patch.
 #### Out of scope
 
 - Re-encoding codes onto their current posting's centre, which would make most
-  centres collectable. It needs the original vectors, or a re-encode from 1-bit
-  reconstructions, which M3-pre measured to lose accuracy (0.861 against
-  0.918).
+  centres collectable. It needs the original vectors, or a re-encode from
+  reconstructions, which M3-pre measured to lose accuracy at 1 bit (0.861
+  against 0.918).
 
 ### Acceptance criteria
 

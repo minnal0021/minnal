@@ -119,7 +119,7 @@ impl DocStore {
     /// When semantic search is configured and the namespace has
     /// `semantic_search_enabled = true`, the document is removed from the vector
     /// index first (a `Clear` tombstone in the queue, then the vectors — see
-    /// [`DocStore::clear_doc_vectors`]), then the document is deleted.  Each is a
+    /// `DocStore::clear_doc_vectors`), then the document is deleted.  Each is a
     /// separate single-op write, with the document marked as being written; ordering derived
     /// data before the document means a crash between them leaves a document with
     /// a `Clear` tombstone, never an orphaned vector. The worker compares the

@@ -10,8 +10,8 @@
 //! for. It prefers **real queries**: the caller passes cached query embeddings
 //! (the doc store reads them from the query-embedding cache), and the check
 //! samples them. With fewer than [`MIN_GIVEN_QUERIES`] it falls back to **stored
-//! chunks**, sampled uniformly over chunks, each turned into a query: its 1-bit
-//! reconstruction, back in the original space and normalised. Each query is
+//! chunks**, sampled uniformly over chunks, each turned into a query: its
+//! reconstruction from its code, back in the original space and normalised. Each query is
 //! searched twice through the production [`search`]:
 //!
 //! - with the namespace's own settings;
@@ -105,7 +105,7 @@ pub enum RecallVerdict {
 pub enum QuerySource {
     /// Real queries' embeddings (the query-embedding cache).
     CachedQueries,
-    /// Stored chunks' 1-bit reconstructions.
+    /// Stored chunks' reconstructions from their codes.
     StoredChunks,
 }
 
@@ -371,7 +371,7 @@ async fn sample_queries(
                 let code = &codes[r as usize];
                 if let Some(q) = ivf
                     .rotated_centre(code.centre_id)
-                    .and_then(|c| reconstruct_single_bit(code, c))
+                    .and_then(|c| reconstruct_code(code, c))
                     .map(|x| ivf.unrotate(&x))
                     .and_then(normalised)
                 {

@@ -876,12 +876,13 @@ mod with_service {
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
         assert!(!vector_kv::ivf_exists(&store.db, "g").await.unwrap(), "gone with the data");
 
-        // Re-enabling starts again from a root.
+        // Re-enabling over the same field (still an attribute after the drop)
+        // starts again from a root.
         store
             .amend(
                 "g",
                 SchemaAmendment::EnableVectorIndex {
-                    fields: vec!["body".into()],
+                    fields: vec!["text".into()],
                     vector_index: None,
                 },
             )

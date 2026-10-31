@@ -81,8 +81,8 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
 
 **The vector side**
 
-- **Vector namespaces** — for a store `ns`: `{ns}_sparse_vector` (1-bit chunk
-  codes, keyed by posting and document), `{ns}_sparse_vector_meta` (the
+- **Vector namespaces** — for a store `ns`: `{ns}_sparse_vector` (chunk codes,
+  1 bit per dimension by default, keyed by posting and document), `{ns}_sparse_vector_meta` (the
   **meta**: which postings hold the document's chunks, and the text hash) and
   `{ns}_dense_vector` (the 8-bit whole-document code).
 - **Posting** — a group of chunks with one centre, the unit search reads.

@@ -198,16 +198,16 @@ Each document write triggers a **single embedding service call** that embeds one
 
 1. **MultiBit (dense)** — one embedding for the entire document, quantised to 8 bits per dimension. Stored in a `{ns}_dense_vector` companion namespace keyed directly by `doc_id`. At 8 bits, a 768-dimensional embedding compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction with high recall fidelity.
 
-2. **SingleBit (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension. Stored in a `{ns}_sparse_vector` namespace under composite keys `[posting_id (4 bytes) || doc_id]`. At 1 bit, each chunk entry is ~96 bytes — a 32× reduction, enabling fast posting prefix scans over large corpora.
+2. **Chunk codes (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension by default. Stored in a `{ns}_sparse_vector` namespace under composite keys `[posting_id (4 bytes) || doc_id]`. At 1 bit, each chunk code is 96 bytes — a 32× reduction, enabling fast posting prefix scans over large corpora. A store can choose 2 or 4 bits instead (`vector_index.quantisation.pass1_bits`, fixed once semantic search is enabled): chunks are placed in the right posting more often and Pass 1 hands a better candidate list to Pass 2, at the cost of storage (1.7× at 2 bits, 3× at 4) and, at 4 bits, slower searches. On SciFact and FiQA the final ranking was the same at every width; see [*Choosing a Pass-1 width*](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
 
 A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each document's sparse chunks, and how many, used for stale-key cleanup on delete and upsert and to count each posting's size.
 
 #### Two-Pass Search
 
-**Pass 1 — Sparse (SingleBit):**
+**Pass 1 — Sparse (chunk codes):**
 1. The query text is embedded **once, whole** (or fetched from the `system_qemb_cache` TTL namespace; TTL configurable via `query_embedding_cache_ttl_secs`, default 1 day). Queries are not chunked — this one vector is used by both passes.
 2. The `max_probes` postings nearest the query vector by Euclidean distance are chosen (every posting, when the namespace has fewer).
-3. All SingleBit (document-chunk) entries for the probed postings are scanned from `{ns}_sparse_vector`.
+3. All chunk-code entries for the probed postings are scanned from `{ns}_sparse_vector`.
 4. An optional attribute-predicate filter is applied per candidate (only in this pass) — non-matching documents are excluded.
 5. Candidates are scored with **ColBERT MaxSim** (see [Acknowledgements](#colbertv2)), which for the single query vector is each document's best-matching chunk: `max_j ⟨q, d_j⟩` across all probed postings.
 6. The top `first_pass_top_k` candidates (a store search setting, default 1,000) are retained.
@@ -314,7 +314,7 @@ The layered architecture above produces a specific set of capabilities. The tabl
 | **SIMD-accelerated prefix scan** | `scan_prefix` merges across all storage layers, using a stored key fingerprint and file-level bounds to skip work before falling back to a SIMD-accelerated byte comparison. See [Prefix scan with SIMD acceleration](#prefix-scan-with-simd-acceleration) above. |
 | **RoaringBitmap field indices** | Compressed, SIMD-accelerated bitmap indices for `str`, `int`, and `bool` predicates. |
 | **Restartable index builds** | Checkpoint files track progress; interrupted builds resume automatically on startup. |
-| **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact 1-bit chunk embeddings (32× compression vs f32) over the nearest IVF postings for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
+| **IVF + RaBitQ two-pass vector search** | Sparse first pass scans compact chunk embeddings (1 bit per dimension by default, 32× compression vs f32; 2 or 4 bits per store) over the nearest IVF postings for fast candidate selection; dense second pass re-ranks using multi-bit whole-doc embeddings (4× compression) for high-precision scoring. |
 | **Async vector indexing** | Document writes enqueue a pending embedding job and return immediately. A background worker (round-robin across namespaces, bounded concurrency) drains the queue and retries on failure. Configurable retry budget and concurrency under `[vector_index]`. |
 | **Quantisation error bounds** | Per-document `error_bound` field gives a theoretical guarantee on the dot-product estimate. |
 | **Filtered semantic search** | Combine ANN scoring with an index predicate in a single request. |
@@ -404,7 +404,7 @@ The reference C++ implementation of RaBitQ, which informed the multi-bit quantis
 
 ### ColBERTv2
 
-Pass 1 scores a document by ColBERT's late-interaction MaxSim: each query vector is matched against every one of the document's vectors, and the best match counts. ColBERTv2 also showed that a multi-vector index stays small when each vector is stored as its nearest centroid plus a low-bit residual; minnal's 1-bit chunk codes are likewise encoded relative to their posting's centre. minnal applies both ideas to sentence-window chunk embeddings rather than to per-token embeddings, and embeds the query as a single vector, so MaxSim picks each document's best-matching chunk.
+Pass 1 scores a document by ColBERT's late-interaction MaxSim: each query vector is matched against every one of the document's vectors, and the best match counts. ColBERTv2 also showed that a multi-vector index stays small when each vector is stored as its nearest centroid plus a low-bit residual; minnal's chunk codes (1 bit per dimension by default) are likewise encoded relative to their posting's centre. minnal applies both ideas to sentence-window chunk embeddings rather than to per-token embeddings, and embeds the query as a single vector, so MaxSim picks each document's best-matching chunk.
 
 > **ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction**
 > Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, Matei Zaharia
@@ -413,7 +413,7 @@ Pass 1 scores a document by ColBERT's late-interaction MaxSim: each query vector
 
 ### PLAID
 
-PLAID is the retrieval engine for ColBERTv2 indexes. It finds candidates through the centroids nearest the query and scores them cheaply from compressed data, so that only a short list gets the full, more expensive score. minnal's two-pass search has the same shape: Pass 1 scores the 1-bit codes in the probed postings to choose candidates, and Pass 2 rescores only those. Unlike PLAID, Pass 2 rescores a separate 8-bit whole-document vector rather than decompressing the first pass's vectors.
+PLAID is the retrieval engine for ColBERTv2 indexes. It finds candidates through the centroids nearest the query and scores them cheaply from compressed data, so that only a short list gets the full, more expensive score. minnal's two-pass search has the same shape: Pass 1 scores the chunk codes in the probed postings to choose candidates, and Pass 2 rescores only those. Unlike PLAID, Pass 2 rescores a separate 8-bit whole-document vector rather than decompressing the first pass's vectors.
 
 > **PLAID: An Efficient Engine for Late Interaction Retrieval**
 > Keshav Santhanam, Omar Khattab, Christopher Potts, Matei Zaharia
@@ -426,7 +426,7 @@ The reference implementation of ColBERTv2 and PLAID is available at:
 
 ### SPFresh
 
-The way each store grows and maintains its own IVF partition is SPFresh's LIRE (Lightweight Incremental REbalancing) protocol: a posting that grows too large is split, the nearby vectors the split leaves misplaced are reassigned, and postings that shrink too small are merged, all in place while the index keeps serving reads and writes. minnal follows LIRE's split, reassignment and merge rules and uses the parameters of its reference implementation, SPTAG. It works on 1-bit codes instead of full vectors, uses mean centres instead of medoids, and keeps no replicas; the full list of differences, and why, is in [Semantic-Search-Architecture.md §3.6](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#36-where-minnal-differs-from-spfresh).
+The way each store grows and maintains its own IVF partition is SPFresh's LIRE (Lightweight Incremental REbalancing) protocol: a posting that grows too large is split, the nearby vectors the split leaves misplaced are reassigned, and postings that shrink too small are merged, all in place while the index keeps serving reads and writes. minnal follows LIRE's split, reassignment and merge rules and uses the parameters of its reference implementation, SPTAG. It works on the chunk codes (1 bit per dimension by default) instead of full vectors, uses mean centres instead of medoids, and keeps no replicas; the full list of differences, and why, is in [Semantic-Search-Architecture.md §3.6](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#36-where-minnal-differs-from-spfresh).
 
 > **SPFresh: Incremental In-Place Update for Billion-Scale Vector Search**
 > Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, Mao Yang
