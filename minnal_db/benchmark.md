@@ -58,7 +58,7 @@ ran. So more writers mean more writes per fsync, not a queue for the disk.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-42 |
 | Rust | 1.99.1 |
-| Code | commit `1b7e83e` |
+| Code | commit `1b7e83e`; [Reads](#reads) at commit `fcf5172` |
 | Date | 2026-10-31 |
 
 To reproduce everything, including the charts:
@@ -187,8 +187,8 @@ time on both tiers.
 ![Point read latency, in memory against on disk](docs/benchmarks/read.png)
 
 *Each pair is one kind of read, in memory (blue) then on disk (orange). The
-first pair is a lookup for a key that doesn't exist; there, disk is faster than
-memory — see below.*
+first pair is a lookup for a key that doesn't exist, which skips the value
+read; there, disk is slightly faster than memory — see below.*
 
 ### As the store grows
 
@@ -198,28 +198,32 @@ disk.
 
 ![Reading a key that exists, as the store grows](docs/benchmarks/lookup_hits.png)
 
-A read from disk barely slows as the store grows: 2.59 µs at 1,000 keys and
-2.80 µs at 100,000, 8% more for 100 times the keys. The on-disk lookup
+A read from disk barely slows as the store grows: 2.63 µs at 1,000 keys and
+2.78 µs at 100,000, 6% more for 100 times the keys. The on-disk lookup
 first rules files out by key range and bloom filter, then searches only a small
 bounded section of the file, so its work does not grow with file size. A read
-from memory rises 74% over the same range (0.35 to 0.60 µs), because the
+from memory rises 62% over the same range (0.37 to 0.59 µs), because the
 in-memory table is a skip list whose search deepens as it grows. Memory is
-still 4.6–7.5 times faster.
+still 4.7–7.2 times faster.
 
 The alternating workload costs more than the average of the two tiers would
-predict: 6% more at 1,000 keys, rising to 13% at 100,000. We have not measured
+predict: 4% more at 1,000 keys, rising to 12% at 100,000. We have not measured
 why.
 The two tiers use different code paths, and switching between them on every call
 may cost cache locality.
 
 ![Reading a key that does not exist, as the store grows](docs/benchmarks/lookup_misses.png)
 
-For a missing key the order flips: **disk is 2.5 to 3.3 times faster than
+For a missing key the order flips: **disk is 1.4 to 2.2 times faster than
 memory**. On disk, a bloom filter usually proves a key is absent without reading
 anything else, so a miss stays at about 0.2 µs at any store size. The in-memory
 table has no such filter. To prove a key is absent it walks the skip list just as
-far as it would to find one. So an in-memory miss costs about what an in-memory
-hit does, and grows the same way (0.49 to 0.69 µs).
+far as it would to find one, so an in-memory miss grows with the store the way an
+in-memory hit does (0.26 to 0.47 µs). It costs about three quarters of a hit,
+because a hit then reads the value from the value log and a miss has none to
+read. Below the in-memory table, the miss also checks the on-disk level, which
+is empty in this test: an empty level carries an empty bloom filter, so that
+check reads no file.
 
 ## Scans
 

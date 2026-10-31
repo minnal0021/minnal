@@ -56,7 +56,11 @@
 // consistent with the fast-reject paths dominating over any residual scan.
 // Memtable hit/miss is expected to be substantially cheaper than L1 (no
 // disk I/O, no bloom/sparse-index indirection) — quantifying that gap is
-// the point of measuring both tiers side by side here. If L1 latency starts
+// the point of measuring both tiers side by side here. A memtable miss still
+// consults the bucket's L1 below it; with nothing on disk that L1 is an empty
+// file whose empty bloom filter rejects the key, so the miss costs the skip
+// list plus one filter check and no file access. If it ever costs more than a
+// memtable hit, the empty-L1 shortcut has regressed. If L1 latency starts
 // climbing noticeably with `num_keys` in a future run, that's a signal the
 // acceleration path regressed (e.g. bloom filter or sparse index not being
 // consulted, or a false-positive rate high enough to fall through to a real

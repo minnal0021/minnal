@@ -60,9 +60,12 @@ fn bench_get_miss(c: &mut Criterion) {
     for tier in TIERS {
         let temp = bench_tempdir();
         let mut store = open_store(temp.path());
-        // Populate "hit" keys
+        // Stored keys at even indices; a miss asks for an odd one between two of
+        // them. The storage bucket comes from a key's first 8 bytes, so a miss
+        // with its own prefix ("miss:000…") would land in a bucket holding no
+        // keys at all and never reach the bucket's bloom filter or skip list.
         for seq in 0..1_000u64 {
-            store.put(&make_key("real:", seq), b"v").unwrap();
+            store.put(&make_key("real:", seq * 2), b"v").unwrap();
         }
         if tier == "l1" {
             store = push_to_l1(store, temp.path());
@@ -71,8 +74,8 @@ fn bench_get_miss(c: &mut Criterion) {
         let mut idx: u64 = 0;
         group.bench_function(tier, |b| {
             b.iter(|| {
-                idx = idx.wrapping_add(104_729); // "miss:" prefix never inserted
-                let key = make_key("miss:", idx);
+                idx = idx.wrapping_add(104_729);
+                let key = make_key("real:", (idx % 1_000) * 2 + 1); // never inserted
                 black_box(store.get(&key)).unwrap()
             });
         });
