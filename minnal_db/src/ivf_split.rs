@@ -1194,8 +1194,10 @@ async fn abandon(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, op: u6
         }
     }
     for id in drained {
+        // Only a draining posting: a retired one holds no chunks and is stored
+        // without its routing centroid, so it can never be active again.
         if let Some(mut posting) = stored_posting(db, namespace, id).await?
-            && posting.state != PostingState::Active
+            && posting.state == PostingState::Draining
         {
             posting.state = PostingState::Active;
             write_posting(db, namespace, &posting).await?;

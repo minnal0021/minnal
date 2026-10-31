@@ -260,6 +260,83 @@ pub async fn partition_health(
     Ok((summary, postings))
 }
 
+/// One centre: what names it and, when asked for, what still decodes against
+/// it. A centre no posting that is not retired names and no code uses is what
+/// FR-008 would collect.
+#[derive(Debug, Clone, Serialize)]
+pub struct CentreHealth {
+    /// Its id (what codes store as `centre_id`).
+    pub centre_id: u32,
+    /// The postings that name it as their centre (usually one).
+    pub postings: Vec<u32>,
+    /// The most live state among those postings (`active`, `draining`,
+    /// `retired`), or `none` for a centre no posting names (left by an
+    /// abandoned operation).
+    pub state: &'static str,
+    /// How the first of those postings was created (`none` without one).
+    pub created_by: &'static str,
+    /// Euclidean norm of the centre (0 for a zero centre).
+    pub norm: f64,
+    /// Chunk codes encoded against it, when asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codes: Option<u64>,
+    /// Postings those codes are filed under, when asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_postings: Option<usize>,
+}
+
+/// Every centre of a namespace with the postings that name it; with `codes`,
+/// also how many chunk codes decode against each (reads every chunk code).
+pub async fn centre_health(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, codes: bool) -> Result<Vec<CentreHealth>, crate::KVError> {
+    let ivf = handle.snapshot();
+    let mut named: HashMap<u32, Vec<(u32, PostingState, PostingOrigin)>> = HashMap::new();
+    for (&id, info) in ivf.posting_infos() {
+        named.entry(info.centre_id).or_default().push((id, info.state, info.origin));
+    }
+    let mut used: HashMap<u32, (u64, std::collections::HashSet<u32>)> = HashMap::new();
+    if codes {
+        // Retired postings hold no keys, so the live ones hold every code.
+        let mut live: Vec<u32> = ivf
+            .posting_infos()
+            .iter()
+            .filter(|(_, i)| i.state != PostingState::Retired)
+            .map(|(&id, _)| id)
+            .collect();
+        live.sort_unstable();
+        for posting in live {
+            for (_, list) in posting_entries(db, namespace, posting).await? {
+                for code in &list {
+                    let u = used.entry(code.centre_id).or_default();
+                    u.0 += 1;
+                    u.1.insert(posting);
+                }
+            }
+        }
+    }
+    let mut out: Vec<CentreHealth> = ivf
+        .centre_ids()
+        .into_iter()
+        .map(|id| {
+            let mut by = named.remove(&id).unwrap_or_default();
+            by.sort_by_key(|&(p, s, _)| (s as u8, p));
+            let u = used.get(&id);
+            CentreHealth {
+                centre_id: id,
+                postings: by.iter().map(|&(p, ..)| p).collect(),
+                state: by.first().map_or("none", |&(_, s, _)| state_name(s)),
+                created_by: by.first().map_or("none", |&(.., o)| origin_name(o)),
+                norm: ivf
+                    .centre(id)
+                    .map_or(0.0, |c| c.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt()),
+                codes: codes.then(|| u.map_or(0, |u| u.0)),
+                code_postings: codes.then(|| u.map_or(0, |u| u.1.len())),
+            }
+        })
+        .collect();
+    out.sort_by_key(|c| c.centre_id);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +367,17 @@ mod tests {
         assert!(after.size_p10_p50_p90_max[3] <= 40);
         assert_eq!(after.reencode_candidates.unwrap().len(), after.postings.min(20));
         assert_eq!(postings.iter().filter(|p| p.state == "retired").count(), after.retired);
+        // Every code decodes against some listed centre; the root's centre,
+        // retired with the root, is still what the moved codes use.
+        let centres = centre_health(&db, super::super::tests::NS, &h, true).await.unwrap();
+        assert_eq!(centres.len(), after.centres);
+        assert_eq!(centres.iter().filter_map(|c| c.codes).sum::<u64>(), 180);
+        let root = centres.iter().find(|c| c.postings.contains(&0)).unwrap();
+        assert_eq!((root.state, root.codes), ("retired", Some(180)));
+        assert_eq!(root.norm, 0.0);
+        assert!(centres.iter().filter(|c| c.state == "active").all(|c| c.codes == Some(0)));
+        let cheap = centre_health(&db, super::super::tests::NS, &h, false).await.unwrap();
+        assert!(cheap.iter().all(|c| c.codes.is_none() && c.code_postings.is_none()));
         // Without code metrics nothing is read but memory.
         let (cheap, _) = partition_health(&db, super::super::tests::NS, &h, false).await.unwrap();
         assert!(cheap.codes.is_none() && cheap.reencode_candidates.is_none());

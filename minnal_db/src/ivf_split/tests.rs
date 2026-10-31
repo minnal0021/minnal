@@ -200,6 +200,37 @@ async fn an_oversized_posting_splits_until_every_posting_is_within_the_limit() {
     db.shutdown().await.unwrap();
 }
 
+/// A retired posting is stored without its routing centroid, and the
+/// partition still reloads and keeps every chunk.
+#[tokio::test]
+async fn retired_postings_are_stored_without_their_routing_centroid() {
+    let dir = TempDir::new().unwrap();
+    let db = setup(&dir, 60).await;
+    let h = handle(&db).await;
+    assert!(maintain_partition(&db, NS, &h, &settings(40)).await.unwrap().splits >= 4);
+    let rows = db.namespace(ivf_postings_ns(NS)).await.unwrap().scan_prefix(Vec::new()).await.unwrap();
+    let (mut retired, mut live) = (0, 0);
+    for (k, v) in &rows {
+        let p = decode_posting(u32::from_be_bytes(k[..4].try_into().unwrap()), v).unwrap();
+        if p.state == PostingState::Retired {
+            retired += 1;
+            assert_eq!(v.len(), 11, "retired posting {} keeps {} bytes", p.posting_id, v.len());
+        } else {
+            live += 1;
+            assert_eq!(p.routing_centroid.len(), DIM, "posting {} lost its centroid", p.posting_id);
+        }
+    }
+    assert!(retired >= 4 && live >= 5, "{retired} retired, {live} live");
+    let postings = h.snapshot().postings();
+    db.shutdown().await.unwrap();
+    drop((db, h));
+    let db = open(&dir).await;
+    let h = handle(&db).await;
+    assert_eq!(h.snapshot().postings(), postings);
+    check(&db, &h, &expected(60)).await.unwrap();
+    db.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_posting_within_the_limit_or_of_identical_chunks_is_left_alone() {
     let dir = TempDir::new().unwrap();

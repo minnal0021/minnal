@@ -914,12 +914,15 @@ pub struct PostingsParams {
     /// Include each posting's code metrics (reads every chunk code).
     #[serde(default)]
     pub codes: bool,
+    /// Only postings in this state: `active`, `draining` or `retired`.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// `GET /admin/indices/{ns}/vector/postings` — every posting (retired ones
 /// included, as the parents of the split tree) with its size, state, centre,
 /// parent and origin, cursor-paginated, for size-distribution charts. Sorted by
-/// `sort` (`id`, `entries`, `chunks`, `drift`) and `order`.
+/// `sort` (`id`, `entries`, `chunks`, `drift`) and `order`, filtered by `state`.
 pub async fn vector_postings(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -946,11 +949,19 @@ pub async fn vector_postings(
         },
         None => 0,
     };
+    if let Some(s) = params.state.as_deref()
+        && !matches!(s, "active" | "draining" | "retired")
+    {
+        return bad(format!("state must be active, draining or retired, got {s:?}"));
+    }
     let codes = params.codes || sort == "drift";
     let (maintenance, summary, mut postings) = match state.store.vector_partition_health(&ns, codes).await {
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
+    if let Some(s) = params.state.as_deref() {
+        postings.retain(|p| p.state == s);
+    }
     let key = |p: &minnal_db::ivf_split::health::PostingHealth| -> f64 {
         match sort {
             "entries" => p.entries as f64,
@@ -970,6 +981,7 @@ pub async fn vector_postings(
         "postings": summary.postings,
         "entries": summary.entries,
         "chunks": summary.chunks,
+        "matched": postings.len(),
         "results": page,
         "next_cursor": next_cursor,
     });
@@ -977,6 +989,107 @@ pub async fn vector_postings(
         obj.extend(m);
     }
     Json(body).into_response()
+}
+
+/// Query of `GET /admin/indices/{ns}/vector/centres`.
+#[derive(Debug, Deserialize)]
+pub struct CentresParams {
+    /// `id` (default), `codes` (implies `codes`) or `postings`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `asc` or `desc` (default).
+    #[serde(default)]
+    pub order: Option<String>,
+    /// Opaque cursor from a previous page's `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page size: default 1,000, at most 10,000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Count the chunk codes encoded against each centre (reads every chunk code).
+    #[serde(default)]
+    pub codes: bool,
+    /// Only centres whose postings' most live state is this: `active`,
+    /// `draining`, `retired` or `none`.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// `GET /admin/indices/{ns}/vector/centres` — every IVF centre's metadata (no
+/// vectors): the postings that name it, their state and origin, its norm and,
+/// with `codes`, how many chunk codes still decode against it. `by_state`
+/// counts every centre; with `codes`, `unused` counts centres that no posting
+/// that is not retired names and no code uses (what FR-008 would collect).
+pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String>, Query(params): Query<CentresParams>) -> axum::response::Response {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
+    let sort = params.sort.as_deref().unwrap_or("id");
+    if !matches!(sort, "id" | "codes" | "postings") {
+        return bad(format!("sort must be id, codes or postings, got {sort:?}"));
+    }
+    let descending = match params.order.as_deref().unwrap_or("desc") {
+        "desc" => true,
+        "asc" => false,
+        other => return bad(format!("order must be asc or desc, got {other:?}")),
+    };
+    if let Some(s) = params.state.as_deref()
+        && !matches!(s, "active" | "draining" | "retired" | "none")
+    {
+        return bad(format!("state must be active, draining, retired or none, got {s:?}"));
+    }
+    let limit = params.limit.unwrap_or(1000);
+    if !(1..=10_000).contains(&limit) {
+        return bad(format!("limit must be between 1 and 10000, got {limit}"));
+    }
+    let start = match &params.cursor {
+        Some(c) => match c.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return bad("invalid cursor".into()),
+        },
+        None => 0,
+    };
+    let codes = params.codes || sort == "codes";
+    let mut centres = match state.store.vector_centres(&ns, codes).await {
+        Ok(r) => r,
+        Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+    };
+    let mut by_state = serde_json::Map::new();
+    for c in &centres {
+        let n = by_state.entry(c.state).or_insert(serde_json::json!(0));
+        *n = serde_json::json!(n.as_u64().unwrap_or(0) + 1);
+    }
+    let total = centres.len();
+    let unused = codes.then(|| {
+        centres
+            .iter()
+            .filter(|c| matches!(c.state, "retired" | "none") && c.codes == Some(0))
+            .count()
+    });
+    if let Some(s) = params.state.as_deref() {
+        centres.retain(|c| c.state == s);
+    }
+    let key = |c: &minnal_db::ivf_split::health::CentreHealth| -> u64 {
+        match sort {
+            "codes" => c.codes.unwrap_or(0),
+            "postings" => c.postings.len() as u64,
+            _ => u64::from(c.centre_id),
+        }
+    };
+    centres.sort_by(|a, b| {
+        let o = key(a).cmp(&key(b)).then(a.centre_id.cmp(&b.centre_id));
+        if descending { o.reverse() } else { o }
+    });
+    let page: Vec<_> = centres.iter().skip(start).take(limit).collect();
+    let next_cursor = (start + page.len() < centres.len()).then(|| (start + page.len()).to_string());
+    Json(serde_json::json!({
+        "namespace": ns,
+        "centres": total,
+        "by_state": by_state,
+        "unused": unused,
+        "matched": centres.len(),
+        "results": page,
+        "next_cursor": next_cursor,
+    }))
+    .into_response()
 }
 
 // ── Vector queue monitoring ───────────────────────────────────────────────────

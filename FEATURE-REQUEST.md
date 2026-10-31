@@ -1154,7 +1154,16 @@ rotated), about 6 KB at 768 dimensions, so about 12 MB at FiQA's size and
 
 It matters for long-lived stores with heavy update or delete churn, where whole
 groups of codes are deleted or re-embedded and their centres are left with no
-code at all.
+code at all. Without churn there is little to collect: on FiQA (qwen, 1,893
+centres after 946 splits; measured 2026-10-31 with
+`GET /admin/indices/{ns}/vector/centres?codes=true`) 924 of the 947 retired
+postings' centres are still what codes decode against, and they hold 61% of the
+170,492 chunk codes. Only 23 centres (about 140 KB) are unused.
+
+Retired postings themselves cost almost nothing: their chunk keys are deleted
+before they retire, and their stored row drops the routing centroid (11 bytes).
+They are kept for the split lineage and so that posting ids are never reused
+(new ids are taken above the highest stored one).
 
 ### Why this is a feature, not a bug fix
 

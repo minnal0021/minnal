@@ -271,7 +271,8 @@ Deletes do not wear the partition down. Deleting half the documents at random, o
 | Endpoint | Shows |
 |---|---|
 | `GET /admin/indices/{ns}/vector/partition` | Postings, entries, posting-size spread, splits, merges and key moves since start, and a running rebuild's progress. With `?codes=true` it also reads every code to report centre drift and the mean error band |
-| `GET /admin/indices/{ns}/vector/postings` | Every live posting with its size, centre, parent and how it was created (`root`, `split`, `rebuild`); cursor-paginated |
+| `GET /admin/indices/{ns}/vector/postings` | Every posting with its size, state, centre, parent and how it was created (`root`, `split`, `rebuild`); cursor-paginated, `?state=` filters |
+| `GET /admin/indices/{ns}/vector/centres` | Every centre's metadata (the postings that name it, their state, its norm; never the vector). With `?codes=true` it reads every code to count the codes still encoded against each centre, and how many centres nothing uses |
 | `GET /admin/indices/{ns}/vector/recall-check` | How much of a full read's top 10…100 a normal search finds among the postings it reads, on a sample of real queries from the query-embedding cache (or, with fewer than 20 cached, stored chunks). Verdict `read_in_full`, `ok`, `below_target` (overlap@10 under `min_overlap`, default 0.95) or `empty` (no chunks stored). Pass the same `seed` before and after a rebuild to compare |
 | `GET /admin/indices/{ns}/vector/history` | Past recall checks, `?codes=true` reads and rebuilds (kept `partition_history_ttl_secs`, default 30 days) |
 | `POST /admin/indices/{ns}/vector/rebuild` | Starts a rebuild (body optional: `{"postings": n}`) |
