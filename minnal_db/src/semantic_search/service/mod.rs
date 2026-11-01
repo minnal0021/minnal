@@ -35,10 +35,15 @@ use std::collections::HashMap;
 /// in the pool, nesting is at most `K - 1` deep, and the tokio semaphore admits
 /// waiters in FIFO order, so nothing starves.
 ///
-/// Each gated section already spreads over every rayon thread, so a small bound
-/// costs little throughput: 2 measured best (119 qps vs 108–110 for 1, 4 and 8, p99
-/// 333 ms vs 1.1 s with no bound). The bound is process-wide because the pool is.
-const MAX_CONCURRENT_SCORING: usize = 2;
+/// Each gated section spreads over the rayon pool, but a search splits into only a
+/// few tasks (see [`MIN_ONE_BIT_ENTRIES_PER_TASK`]), so too small a bound leaves
+/// cores idle. Measured on FiQA over REST (closed loop, 16 / 32 / 64 clients,
+/// 60 s each): 4 gives 13–21% more queries per second than 2 and a 12–18% lower
+/// median, at a 6–17% higher p99 and p99.9 and about the same maximum (no request
+/// over 222 ms with either); 8 adds at most 2.4% over 4, and 1 serves about 27%
+/// fewer than 2. The bound is
+/// process-wide because the pool is.
+const MAX_CONCURRENT_SCORING: usize = 4;
 
 /// Fewest 1-bit Pass-1 entries one rayon task scores, a few tens of microseconds
 /// of work. Wider codes cost about their width more per entry, so a task takes
