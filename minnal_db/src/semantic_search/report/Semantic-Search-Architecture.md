@@ -348,10 +348,13 @@ Pass 1 and Pass 2 each score in parallel on rayon's global pool, which every
 concurrent search shares. A rayon worker waiting inside a `join` can steal
 another search's job and cannot return to its own search until that one
 finishes; under steady load those nestings pile up and requests stall.
-`SCORING_GATE` allows at most 2 scoring sections at a time, process-wide, and
-admits waiters in FIFO order. On FiQA with 32 concurrent clients this took p99
-latency from 9.7 s to 308 ms and raised throughput from 110 to 125 queries per
-second. Rules for changing it are in `CLAUDE.md` → *Concurrency: the scoring gate*.
+`SCORING_GATE` allows at most 4 scoring sections at a time, process-wide, and
+admits waiters in FIFO order, so a search can be stuck behind at most three
+others. Without a bound, p99 latency on FiQA with 32 concurrent clients was
+9.7 s. With 4, it is 77–85 ms over REST, and no request took over 222 ms even
+at 64 clients. Four is where throughput stops rising: from 16 clients up it
+serves 13–21% more queries per second than 2, and 8 serves at most 2.4% more
+than 4. Rules for changing it are in `CLAUDE.md` → *Concurrency: the scoring gate*.
 
 ### Why two passes?
 
