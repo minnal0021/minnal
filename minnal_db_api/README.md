@@ -2236,7 +2236,7 @@ the store has), `pass1_bits` and `postings`, nearest first. Each posting has:
 | `posting_id`, `centre_id` | The posting, and the centre its new codes are encoded against |
 | `distance` | Euclidean distance from the query to the posting's routing centroid: what probing ranks by |
 | `documents` | Documents with chunks in the posting, each scored once |
-| `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, id}`; `null` for an empty posting |
+| `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, pass2, id}`; `null` for an empty posting. `pass2` is that document's Pass-2 score, its whole-document code against the query: what search results are ranked by. Compare it with a search's last result to see whether the document would make the results |
 
 ```bash
 curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&n_probes=2'
@@ -2248,16 +2248,19 @@ curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=ho
   "n_probes": 2, "active_postings": 48, "pass1_bits": 1,
   "postings": [
     {"rank": 0, "posting_id": 93, "centre_id": 93, "distance": 0.828, "documents": 63,
-     "max": {"dot_product": 0.595, "id": 5710}, "min": {"dot_product": 0.209, "id": 22856}},
+     "max": {"dot_product": 0.595, "pass2": 0.553, "id": 5710},
+     "min": {"dot_product": 0.209, "pass2": 0.226, "id": 22856}},
     {"rank": 1, "posting_id": 94, "centre_id": 94, "distance": 0.907, "documents": 106,
-     "max": {"dot_product": 0.525, "id": 14748}, "min": {"dot_product": 0.156, "id": 12870}}
+     "max": {"dot_product": 0.525, "pass2": 0.494, "id": 14748},
+     "min": {"dot_product": 0.156, "pass2": 0.189, "id": 12870}}
   ]
 }
 ```
 
 **Cost.** One embedding request (none when the query is cached), then one Pass 1
-over the probed postings. It takes the same scoring slot as a client search, and
-it holds what it scans until it returns. Returns `400` for a missing or blank
+over the probed postings and a Pass-2 score for at most two documents per
+posting. It takes the same scoring slot as a client search, and it holds what
+it scans until it returns. Returns `400` for a missing or blank
 `query`, an `n_probes` outside 1–1,024 or an unknown parameter; `404` for an
 unknown store; `422` when semantic search is not enabled.
 

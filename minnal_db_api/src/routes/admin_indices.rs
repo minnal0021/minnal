@@ -831,7 +831,8 @@ fn vector_id_json(state: &AppState, ns: &str) -> impl Fn(&[u8]) -> serde_json::V
 /// semantic query walks the namespace's partition: its `n_probes` nearest
 /// postings in probe order, each with its distance from the query, the
 /// documents scored in it, and its lowest and highest Pass-1 document score
-/// (with the document's id). Costs one embedding (none when the query is
+/// (with the document's id and its Pass-2 score, what search results are
+/// ranked by). Costs one embedding (none when the query is
 /// cached) and one Pass 1 over those postings. `400` for a missing query or an
 /// `n_probes` outside 1..=1024.
 pub async fn vector_probe_trace(
@@ -856,7 +857,7 @@ pub async fn vector_probe_trace(
     let id = vector_id_json(&state, &ns);
     let score = |s: &Option<minnal_db::semantic_search::service::PostingDocScore>| {
         s.as_ref()
-            .map(|s| serde_json::json!({ "dot_product": s.dot_product, "id": id(&s.document_id) }))
+            .map(|s| serde_json::json!({ "dot_product": s.dot_product, "pass2": s.pass2, "id": id(&s.document_id) }))
     };
     let postings: Vec<serde_json::Value> = trace
         .postings

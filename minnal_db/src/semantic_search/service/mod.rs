@@ -530,6 +530,71 @@ fn score_pass1_entry<'e>(
     scored_any
 }
 
+/// Score one document's Pass-2 (whole-document) entry against the query:
+/// `(⟨q, d⟩ estimate, error bound)`, or `None` for an entry that is corrupt,
+/// not exactly one code, of the wrong style, or not encoded against the zero
+/// centre (each logged, the corrupt ones counted). [`search`] and
+/// [`pass1_probe_trace`] both score through this.
+fn score_pass2_entry(
+    namespace: &str,
+    doc_id: &[u8],
+    raw_bytes: &[u8],
+    expected_dense_style: &QuantisationStyle,
+    estimator: &MultiBitQuanDotProductEstimator,
+    rotated_dense: &[f32],
+    words_buf: &mut Vec<u64>,
+) -> Option<(f32, f32)> {
+    let list = match VectorIndex::access_list(raw_bytes) {
+        Ok(list) => list,
+        Err(e) => {
+            // Corrupt dense entry: skip it, but log it so index corruption is
+            // not mistaken for a candidate simply scoring poorly in pass 2.
+            crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
+            warn!(
+                "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
+                doc_id_hex(doc_id),
+                raw_bytes.len(),
+            );
+            return None;
+        }
+    };
+    // The dense namespace stores exactly one MultiBit entry per document
+    // (embed_document emits a single whole-doc dense vector; upsert only
+    // writes a dense value when at least one MultiBit entry is present). A
+    // count other than 1 means a write-path bug, a duplicate, or corruption —
+    // skip rather than silently scoring an arbitrary `first()` and letting a
+    // stale entry shadow the correct one.
+    if list.len() != 1 {
+        warn!(
+            "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
+            list.len(),
+            doc_id_hex(doc_id),
+        );
+        return None;
+    }
+    let vi = &list[0];
+    let style = vi.style();
+    if style != *expected_dense_style {
+        warn!(
+            "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
+            doc_id_hex(doc_id),
+        );
+        return None;
+    }
+    if vi.centre_id() != ZERO_CENTRE {
+        crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
+        error!(
+            "skipping dense vector entry not encoded against the zero centre: doc_id={} centre_id={}",
+            doc_id_hex(doc_id),
+            vi.centre_id(),
+        );
+        return None;
+    }
+    vi.copy_packed_into(words_buf);
+    let dot_product = estimator.estimate_from_parts(rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
+    Some((dot_product, vi.error_bound()))
+}
+
 /// A document and its Pass-1 score within one posting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostingDocScore {
@@ -537,6 +602,10 @@ pub struct PostingDocScore {
     pub document_id: Vec<u8>,
     /// `max_j ⟨q, d_j⟩` over the document's chunks in the posting.
     pub dot_product: f32,
+    /// The document's Pass-2 score: its whole-document code against the
+    /// query, what a search ranks its results by. `None` when the document has
+    /// no usable dense entry.
+    pub pass2: Option<f32>,
 }
 
 /// One posting a [`pass1_probe_trace`] probed, in probe order.
@@ -580,7 +649,8 @@ pub struct ProbeTrace {
 /// Pass 1 of [`search`], posting by posting: probe the `n_probes` postings
 /// nearest `query` (nearest first, every posting of a layout with fewer), score
 /// every entry exactly as a search does, and report per posting how many
-/// documents it holds and its lowest and highest document score. For seeing how
+/// documents it holds and its lowest and highest document score, each with
+/// that document's Pass-2 score (what a search ranks its results by). For seeing how
 /// what each further probe adds falls off with distance; it ranks nothing.
 ///
 /// Holds every scanned entry until it returns, as a search does, and takes a
@@ -660,9 +730,39 @@ where
             s.max = (i, score);
         }
     }
-    let doc_score = |(i, dot_product): (usize, f32)| PostingDocScore {
-        document_id: scan.get(i).map_or_else(Vec::new, |(_, doc_id, _)| doc_id.to_vec()),
-        dot_product,
+    // Pass-2 scores of the documents reported (at most two per posting), read
+    // in one batch and scored as Pass 2 scores them.
+    let doc_id_at = |i: usize| scan.get(i).map_or_else(Vec::new, |(_, doc_id, _)| doc_id.to_vec());
+    let mut reported: Vec<Vec<u8>> = stats.values().flat_map(|s| [doc_id_at(s.min.0), doc_id_at(s.max.0)]).collect();
+    reported.sort_unstable();
+    reported.dedup();
+    let dense_raw = kv_store.get_dense_entries_batch(&reported).await?;
+    let pass2: HashMap<Vec<u8>, f32> = {
+        let _permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
+        let bits = config.number_of_bits_for_dense_quantisation;
+        let expected_dense_style = QuantisationStyle::MultiBit { number_of_bits: bits };
+        let rotated_dense = &rotated[0];
+        let scaled_query_sum = MultiBitQuanDotProductEstimator::scaled_query_sum(rotated_dense, bits);
+        let origin = vec![0.0f32; query.len()];
+        let estimator = MultiBitQuanDotProductEstimator::with_scaled_query_sum(ZERO_CENTRE, query, &origin, scaled_query_sum);
+        let mut words_buf = Vec::new();
+        reported
+            .iter()
+            .zip(&dense_raw)
+            .filter_map(|(doc_id, raw)| {
+                let raw = raw.as_ref()?;
+                let (dot, _) = score_pass2_entry(namespace, doc_id, raw, &expected_dense_style, &estimator, rotated_dense, &mut words_buf)?;
+                Some((doc_id.clone(), dot))
+            })
+            .collect()
+    };
+    let doc_score = |(i, dot_product): (usize, f32)| {
+        let document_id = doc_id_at(i);
+        PostingDocScore {
+            pass2: pass2.get(&document_id).copied(),
+            document_id,
+            dot_product,
+        }
     };
     Ok(order
         .iter()
@@ -913,57 +1013,18 @@ where
         .with_min_len(MIN_CANDIDATES_PER_TASK)
         .map_init(Vec::<u64>::new, |words_buf, (doc_id, opt_bytes)| {
             let raw_bytes = opt_bytes?;
-            let list = match VectorIndex::access_list(&raw_bytes) {
-                Ok(list) => list,
-                Err(e) => {
-                    // Corrupt dense entry: skip it, but log it so index corruption is
-                    // not mistaken for a candidate simply scoring poorly in pass 2.
-                    crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
-                    warn!(
-                        "skipping corrupt dense vector entry: doc_id={} ({} bytes): {e}",
-                        doc_id_hex(&doc_id),
-                        raw_bytes.len(),
-                    );
-                    return None;
-                }
-            };
-            // The dense namespace stores exactly one MultiBit entry per document
-            // (embed_document emits a single whole-doc dense vector; upsert only
-            // writes a dense value when at least one MultiBit entry is present). A
-            // count other than 1 means a write-path bug, a duplicate, or corruption —
-            // skip rather than silently scoring an arbitrary `first()` and letting a
-            // stale entry shadow the correct one.
-            if list.len() != 1 {
-                warn!(
-                    "skipping dense vector entry with {} entries (expected exactly 1): doc_id={}",
-                    list.len(),
-                    doc_id_hex(&doc_id),
-                );
-                return None;
-            }
-            let vi = &list[0];
-            let style = vi.style();
-            if style != expected_dense_style {
-                warn!(
-                    "skipping dense vector entry with wrong quantisation style: doc_id={} expected {expected_dense_style:?}, found {style:?}",
-                    doc_id_hex(&doc_id),
-                );
-                return None;
-            }
-            if vi.centre_id() != ZERO_CENTRE {
-                crate::semantic_search::metrics::record_dense_corrupt_skipped(namespace);
-                error!(
-                    "skipping dense vector entry not encoded against the zero centre: doc_id={} centre_id={}",
-                    doc_id_hex(&doc_id),
-                    vi.centre_id(),
-                );
-                return None;
-            }
-            vi.copy_packed_into(words_buf);
-            let dot_product = estimator.estimate_from_parts(&rotated_dense, words_buf, vi.addition_factor(), vi.scaling_factor());
+            let (dot_product, error_bound) = score_pass2_entry(
+                namespace,
+                &doc_id,
+                &raw_bytes,
+                &expected_dense_style,
+                &estimator,
+                &rotated_dense,
+                words_buf,
+            )?;
             Some(HeapEntry {
                 dot_product,
-                error_bound: vi.error_bound(),
+                error_bound,
                 document_id: doc_id,
             })
         })
@@ -1630,6 +1691,22 @@ mod tests {
                 .max_by(|a, b| a.dot_product.total_cmp(&b.dot_product))
                 .unwrap();
             assert_eq!(best.document_id, d.to_be_bytes().to_vec(), "query from doc {d}");
+            // Pass-2 scores are what a search ranks by, for every document reported.
+            assert!(full.iter().flat_map(|p| [&p.min, &p.max]).flatten().all(|s| s.pass2.is_some()));
+            let top = search(
+                &config,
+                ns,
+                &index,
+                std::slice::from_ref(&q),
+                &q,
+                &store,
+                None::<fn(&[u8]) -> bool>,
+                Some(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(top[0].document_id, best.document_id);
+            assert_eq!(best.pass2, Some(top[0].dot_product), "the trace's Pass-2 score is the search's");
 
             let near = pass1_probe_trace(&config, ns, &index, &q, 4, &store).await.unwrap();
             assert_eq!(near, full[..4], "fewer probes trace a prefix of more");
