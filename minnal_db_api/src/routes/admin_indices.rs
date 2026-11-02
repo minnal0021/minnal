@@ -16,7 +16,7 @@
 //! POST   /admin/indices/{ns}/vector/reindex/{doc_id}      → re-enqueue one doc for embedding (doc + kv) (200)
 //! POST   /admin/indices/{ns}/vector/reindex-failed        → reset exhausted queue entries (200)
 //! DELETE /admin/indices/{ns}/vector/drop-all              → clear all vector index data (202)
-//! GET    /admin/indices/{ns}/vector/probe-trace           → one query's probed postings, nearest first, with min/max Pass-1 scores
+//! GET    /admin/indices/{ns}/vector/probe-trace           → one query's postings at probe ranks start..end, with min/max Pass-1 scores
 //! GET    /admin/indices/{ns}/vector/queue                 → all queue entries for namespace
 //! GET    /admin/indices/{ns}/vector/queue/retried         → retried entries for namespace
 //! GET    /admin/indices/{ns}/vector/queue/{doc_id}        → look up one queue entry
@@ -35,7 +35,6 @@ use axum::{
 };
 use minnal_db::doc_store::hex::hex_to_bytes;
 use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
-use minnal_db::semantic_search::service::MAX_TRACE_PROBES;
 use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -807,10 +806,15 @@ pub struct ProbeTraceParams {
     /// The query text, embedded as a search embeds it.
     #[serde(default)]
     pub query: Option<String>,
-    /// Postings to probe, nearest first: 1 to [`MAX_TRACE_PROBES`]; default the
-    /// namespace's `max_probes`, capped at that.
+    /// First probe rank to trace (0 is the posting nearest the query); default 0.
     #[serde(default)]
-    pub n_probes: Option<u32>,
+    pub start: Option<u32>,
+    /// One past the last probe rank to trace: at most the namespace's postings
+    /// and at most `MAX_TRACE_PROBES` (1,024) past `start`. Default `start` plus
+    /// the namespace's `max_probes` (no `start`) or plus `MAX_TRACE_PROBES`
+    /// (with one), capped at the postings.
+    #[serde(default)]
+    pub end: Option<u32>,
 }
 
 /// A document id as the store's clients see it: per the document store's
@@ -827,14 +831,16 @@ fn vector_id_json(state: &AppState, ns: &str) -> impl Fn(&[u8]) -> serde_json::V
     }
 }
 
-/// `GET /admin/indices/{ns}/vector/probe-trace?query=…&n_probes=N` — how one
-/// semantic query walks the namespace's partition: its `n_probes` nearest
-/// postings in probe order, each with its distance from the query, the
-/// documents scored in it, and its lowest and highest Pass-1 document score
-/// (with the document's id and its Pass-2 score, what search results are
-/// ranked by). Costs one embedding (none when the query is
-/// cached) and one Pass 1 over those postings. `400` for a missing query or an
-/// `n_probes` outside 1..=1024.
+/// `GET /admin/indices/{ns}/vector/probe-trace?query=…&start=S&end=E` — how
+/// one semantic query walks the namespace's partition: the postings at probe
+/// ranks `S..E`, each with its distance from the query, the documents scored in
+/// it, and its lowest and highest Pass-1 document score (with the document's id
+/// and its Pass-2 score, what search results are ranked by), plus `baseline`:
+/// the same query searched as the namespace searches it, and the Pass-2 score
+/// of its last result. Costs one embedding (none when the query is cached), one
+/// search and one Pass 1 over the window. `400` for a missing query, or a window
+/// that is empty, past the namespace's postings, or wider than
+/// `MAX_TRACE_PROBES` (1,024).
 pub async fn vector_probe_trace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -845,19 +851,14 @@ pub async fn vector_probe_trace(
         Some(q) if !q.is_empty() => q.to_owned(),
         _ => return bad("query is required".into()),
     };
-    if let Some(n) = params.n_probes
-        && !(1..=MAX_TRACE_PROBES).contains(&n)
-    {
-        return bad(format!("n_probes must be between 1 and {MAX_TRACE_PROBES}, got {n}"));
-    }
-    let trace = match state.store.vector_probe_trace(&ns, &query, params.n_probes).await {
+    let trace = match state.store.vector_probe_trace(&ns, &query, params.start, params.end).await {
         Ok(t) => t,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
     let id = vector_id_json(&state, &ns);
     let score = |s: &Option<minnal_db::semantic_search::service::PostingDocScore>| {
         s.as_ref()
-            .map(|s| serde_json::json!({ "dot_product": s.dot_product, "pass2": s.pass2, "id": id(&s.document_id) }))
+            .map(|s| serde_json::json!({ "dot_product": s.dot_product, "pass2": s.pass2, "in_results": s.in_results, "id": id(&s.document_id) }))
     };
     let postings: Vec<serde_json::Value> = trace
         .postings
@@ -877,9 +878,16 @@ pub async fn vector_probe_trace(
     Json(serde_json::json!({
         "namespace": ns,
         "query": query,
-        "n_probes": trace.n_probes,
+        "start": trace.start,
+        "end": trace.end,
         "active_postings": trace.active_postings,
         "pass1_bits": trace.pass1_bits,
+        "baseline": {
+            "n_probes": trace.baseline.n_probes,
+            "top_k": trace.baseline.top_k,
+            "results": trace.baseline.results,
+            "lowest_pass2": trace.baseline.lowest_pass2,
+        },
         "postings": postings,
     }))
     .into_response()

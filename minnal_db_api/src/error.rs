@@ -77,6 +77,7 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::StrKeyTooLong { .. })
             | DocStoreError::Schema(SchemaError::EmptyStrKey)
             | DocStoreError::Schema(SchemaError::StrKeyNotUtf8)
+            | DocStoreError::InvalidProbeWindow { .. }
             | DocStoreError::Schema(SchemaError::InvalidVectorSetting { .. }) => StatusCode::BAD_REQUEST,
 
             // A key/value too large for the storage format's u32 length fields is

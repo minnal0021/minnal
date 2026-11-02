@@ -101,49 +101,102 @@ impl DocStore {
     }
 
     /// How a semantic query walks `namespace`'s partition (document or KV
-    /// store): its `n_probes` nearest postings in probe order (the namespace's
-    /// `max_probes` when `None`; at most
-    /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES)),
-    /// each with its distance from the query, the documents scored in it, and its lowest
-    /// and highest Pass-1 document score. The query is embedded as a search
-    /// embeds it (from the query-embedding cache when it is there). Costs one
-    /// Pass 1 over those postings; ranks nothing.
+    /// store): the postings at probe ranks `start..end` (0 is the posting
+    /// nearest the query), each with its distance from the query, the documents
+    /// scored in it, and its lowest and highest Pass-1 document score, plus a
+    /// [`SearchBaseline`](crate::semantic_search::service::SearchBaseline): the
+    /// same query searched as the namespace searches it. Each reported document
+    /// says whether that search returns it.
+    ///
+    /// `start` defaults to 0. `end` defaults to `start` plus the namespace's
+    /// `max_probes` when `start` is not given, or plus
+    /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES)
+    /// when it is; either way capped at the namespace's postings. The window must
+    /// satisfy `start < end <= postings` and be at most `MAX_TRACE_PROBES` wide,
+    /// or [`DocStoreError::InvalidProbeWindow`].
+    ///
+    /// The query is embedded as a search embeds it (from the query-embedding
+    /// cache when it is there). Costs one search plus one Pass 1 over the window.
     #[cfg(feature = "semantic-search")]
     pub async fn vector_probe_trace(
         &self,
         namespace: &str,
         query_text: &str,
-        n_probes: Option<u32>,
+        start: Option<u32>,
+        end: Option<u32>,
     ) -> Result<crate::semantic_search::service::ProbeTrace, DocStoreError> {
-        use crate::semantic_search::service::MAX_TRACE_PROBES;
+        use crate::semantic_search::service::{MAX_TRACE_PROBES, SearchBaseline};
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
         self.schemas.require_semantic_search(namespace)?;
         let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
-        // Zero is rejected by the override's range check.
-        let n_probes = n_probes.unwrap_or(settings.search.max_probes).min(MAX_TRACE_PROBES);
-        let overrides = SearchSpec {
-            min_probes: Some(1),
-            max_probes: Some(n_probes),
-            ..SearchSpec::default()
-        };
-        let ns = self.namespace_semantics(namespace, Some(ns_id), &settings, &overrides).await?;
-        let (query, _) = self.cached_query_embeddings(&ns, query_text).await?;
+        let ns = self
+            .namespace_semantics(namespace, Some(ns_id), &settings, &SearchSpec::default())
+            .await?;
+        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
             .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-        let n_probes = ns.config.probe.per_query();
         // Under the routing epoch, as a search: a split cannot delete a
         // posting's keys while this may still scan by the routing before it.
         let _epoch = ns.partition.read_epoch().await;
         let partition = ns.partition.snapshot();
-        let postings = crate::semantic_search::service::pass1_probe_trace(&ns.config, namespace, &*partition, &query, n_probes, &db_store).await?;
+        let active = partition.postings();
+        let max_width = MAX_TRACE_PROBES as usize;
+        let start_rank = start.map_or(0, |s| s as usize);
+        let width = if start.is_some() {
+            max_width
+        } else {
+            ns.config.probe.per_query().min(max_width)
+        };
+        let end_rank = end.map_or_else(|| start_rank.saturating_add(width).min(active), |e| e as usize);
+        let invalid = |reason: String| {
+            Err(DocStoreError::InvalidProbeWindow {
+                namespace: namespace.to_owned(),
+                reason,
+            })
+        };
+        if start_rank >= end_rank {
+            return invalid(format!("start ({start_rank}) must be below end ({end_rank})"));
+        }
+        if end_rank - start_rank > max_width {
+            return invalid(format!("end - start ({}) is more than {max_width}", end_rank - start_rank));
+        }
+        if end_rank > active {
+            return invalid(format!("end ({end_rank}) is past the namespace's {active} postings"));
+        }
+        let results = crate::semantic_search::service::search(
+            &ns.config,
+            namespace,
+            &*partition,
+            &query_sparse,
+            &query_dense,
+            &db_store,
+            None::<fn(&[u8]) -> bool>,
+            None,
+        )
+        .await?;
+        let baseline = SearchBaseline {
+            n_probes: ns.config.probe.per_query().min(active),
+            top_k: ns.config.top_k_results,
+            results: results.len(),
+            lowest_pass2: results.iter().map(|r| r.dot_product).min_by(f32::total_cmp),
+        };
+        let mut postings =
+            crate::semantic_search::service::pass1_probe_trace(&ns.config, namespace, &*partition, &query_dense, start_rank..end_rank, &db_store)
+                .await?;
+        let returned: std::collections::HashSet<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
+        for s in postings.iter_mut().flat_map(|p| [&mut p.min, &mut p.max]).flatten() {
+            s.in_results = Some(returned.contains(s.document_id.as_slice()));
+        }
         Ok(crate::semantic_search::service::ProbeTrace {
-            n_probes,
-            active_postings: partition.postings(),
+            start: start_rank,
+            end: end_rank,
+            active_postings: active,
             pass1_bits: ns.config.pass1_bits,
             postings,
+            baseline,
         })
     }
 

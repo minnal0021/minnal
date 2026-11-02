@@ -1687,7 +1687,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
-| `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: the postings it probes, nearest first, with each one's documents and lowest and highest Pass-1 score |
+| `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: a window of its postings in probe order, with each one's documents and lowest and highest Pass-1 score, against what a normal search returns |
 | `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
@@ -2215,54 +2215,85 @@ unknown store and `422` when semantic search is not enabled.
 
 Shows how one query walks the store's partition. A search's first pass
 (**Pass 1**) reads only the postings (clusters of chunk codes) nearest the
-query. This lists those postings in the order a search probes them, nearest
-first, and scores every document in each exactly as Pass 1 does: by its best
-chunk's estimated dot product with the query. Reading down the list shows how
-much each further posting still offers. The highest score usually falls as the
-postings get farther from the query, which is what `max_probes` trades
-against. minnal_ui draws it under *Vector Indexes → Probe trace*.
+query: `max_probes` of them. This ranks every posting by distance from the
+query, takes a window of that order, and scores every document in the window
+exactly as Pass 1 does: by its best chunk's estimated dot product with the
+query. The window can sit anywhere, past `max_probes` too, so you can look at
+what a search leaves unread. minnal_ui draws it under *Vector Indexes → Probe
+trace*.
+
+To say whether a posting matters, the response also runs the store's own search
+for the query (its `baseline`) and marks each reported document as returned by
+it or not. A document whose Pass-2 score is above the search's last result but
+which the search does not return was missed: Pass 1 never made it a candidate.
+A document can score above that line and still be returned, through a chunk in
+a nearer posting.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `query` | required | The query text, embedded as a search embeds it (from the query-embedding cache when it is there) |
-| `n_probes` | the store's `max_probes`, at most 1,024 | Postings to probe, 1 to 1,024; a store with fewer postings is read in full |
+| `start` | 0 | First probe rank in the window; 0 is the posting nearest the query |
+| `end` | `start` + the store's `max_probes` without `start`, `start` + 1,024 with it; at most the store's postings | One past the last probe rank in the window |
 
-The response holds `namespace`, `query`, `n_probes`, `active_postings` (postings
-the store has), `pass1_bits` and `postings`, nearest first. Each posting has:
+The window must satisfy `start < end <=` the store's postings and hold at most
+1,024 postings, what the minnal_ui graph shows usefully. Ranking is cheap; only
+the window is read, so a window far down the order costs no more than one near
+the query.
+
+The response holds `namespace`, `query`, `start`, `end`, `active_postings`
+(postings the store has), `pass1_bits`, `baseline` and `postings`, nearest
+first. `baseline` is the store's own search of the query:
 
 | Field | Meaning |
 |---|---|
-| `rank` | Probe order; 0 is the posting nearest the query |
+| `n_probes` | Postings it probes: the store's `max_probes`, or all of a store with fewer |
+| `top_k`, `results` | Results it returns at most, and returned |
+| `lowest_pass2` | The Pass-2 score of its last result: what a document must beat to be returned; `null` with no results |
+
+Each posting has:
+
+| Field | Meaning |
+|---|---|
+| `rank` | Probe rank, counted from the nearest posting whatever the window |
 | `posting_id`, `centre_id` | The posting, and the centre its new codes are encoded against |
 | `distance` | Euclidean distance from the query to the posting's routing centroid: what probing ranks by |
 | `documents` | Documents with chunks in the posting, each scored once |
-| `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, pass2, id}`; `null` for an empty posting. `pass2` is that document's Pass-2 score, its whole-document code against the query: what search results are ranked by. Compare it with a search's last result to see whether the document would make the results |
+| `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, pass2, in_results, id}`; `null` for an empty posting. `pass2` is that document's Pass-2 score, its whole-document code against the query: what search results are ranked by. `in_results` says whether the baseline search returns it |
+
+Two postings far past where the search stops, in a 597-posting store that searches 256:
 
 ```bash
-curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&n_probes=2'
+curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&start=467&end=469'
 ```
 
 ```json
 {
   "namespace": "fiqa_trace", "query": "how do index funds compare to bonds",
-  "n_probes": 2, "active_postings": 48, "pass1_bits": 1,
+  "start": 467, "end": 469, "active_postings": 597, "pass1_bits": 1,
+  "baseline": {"n_probes": 256, "top_k": 100, "results": 100, "lowest_pass2": 0.327},
   "postings": [
-    {"rank": 0, "posting_id": 93, "centre_id": 93, "distance": 0.828, "documents": 63,
-     "max": {"dot_product": 0.595, "pass2": 0.553, "id": 5710},
-     "min": {"dot_product": 0.209, "pass2": 0.226, "id": 22856}},
-    {"rank": 1, "posting_id": 94, "centre_id": 94, "distance": 0.907, "documents": 106,
-     "max": {"dot_product": 0.525, "pass2": 0.494, "id": 14748},
-     "min": {"dot_product": 0.156, "pass2": 0.189, "id": 12870}}
+    {"rank": 467, "posting_id": 2509, "centre_id": 2509, "distance": 1.223, "documents": 3,
+     "max": {"dot_product": 0.143, "pass2": 0.071, "in_results": false, "id": 27938},
+     "min": {"dot_product": 0.032, "pass2": 0.065, "in_results": false, "id": 23781}},
+    {"rank": 468, "posting_id": 2278, "centre_id": 2278, "distance": 1.223, "documents": 4,
+     "max": {"dot_product": 0.107, "pass2": 0.378, "in_results": true, "id": 14989},
+     "min": {"dot_product": -0.044, "pass2": -0.043, "in_results": false, "id": 9359}}
   ]
 }
 ```
 
-**Cost.** One embedding request (none when the query is cached), then one Pass 1
-over the probed postings and a Pass-2 score for at most two documents per
-posting. It takes the same scoring slot as a client search, and it holds what
-it scans until it returns. Returns `400` for a missing or blank
-`query`, an `n_probes` outside 1–1,024 or an unknown parameter; `404` for an
-unknown store; `422` when semantic search is not enabled.
+Document 14989 scores 0.378 in Pass 2, above the last result's 0.327, but the
+search returns it already: another of its chunks lies in a posting the search
+reads.
+
+**Cost.** One embedding request (none when the query is cached), one search,
+then one Pass 1 over the window and a Pass-2 score for at most two documents per
+posting. It takes the same scoring slot as a client search, and it holds what it
+scans until it returns. Two requests rank the postings separately, so if the
+partition splits or merges between them, their windows may not line up
+exactly. Returns `400` for a missing or blank `query`, a window that is empty,
+past the store's postings or wider than 1,024, or an unknown parameter; `404`
+for an unknown store; `422` when semantic search is not enabled.
 
 ---
 
