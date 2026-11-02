@@ -435,6 +435,262 @@ fn doc_id_hex(doc_id: &[u8]) -> String {
     s
 }
 
+/// One Pass-1 entry as the scan returns it: a document's chunk codes in one
+/// posting.
+struct Pass1Entry<'a> {
+    cluster_id: u32,
+    doc_id: &'a [u8],
+    raw_bytes: &'a [u8],
+}
+
+/// Score one Pass-1 entry's chunks into `row`: `row[i]` becomes
+/// `max(row[i], max_j ⟨q_i, d_j⟩)` over the entry's chunks `d_j`. Returns
+/// whether any chunk was scored. A corrupt entry, one of the wrong
+/// quantisation style, or a chunk naming a centre the layout lacks is skipped
+/// and counted. [`search`] and [`pass1_probe_trace`] both score through this,
+/// so the trace reports exactly what a search computes.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn score_pass1_entry<'e>(
+    namespace: &str,
+    entry: &Pass1Entry<'_>,
+    pass1_style: &QuantisationStyle,
+    dim: usize,
+    rotated_queries: &[Vec<f32>],
+    estimators_of: &impl Fn(u32) -> Option<&'e [Pass1Estimator]>,
+    words_buf: &mut Vec<u64>,
+    row: &mut [f32],
+) -> bool {
+    let Pass1Entry {
+        cluster_id,
+        doc_id,
+        raw_bytes,
+    } = *entry;
+    let vi_list = match VectorIndex::access_list(raw_bytes) {
+        Ok(list) => list,
+        Err(e) => {
+            // Corrupt sparse entry: skip it, but make it visible so a degraded
+            // index is distinguishable from "no semantic match".
+            crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
+            warn!(
+                "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
+                doc_id_hex(doc_id),
+                raw_bytes.len(),
+            );
+            return false;
+        }
+    };
+    if vi_list.is_empty() {
+        return false;
+    }
+    // The sparse namespace must hold only chunk codes of the namespace's
+    // Pass-1 width; any other entry would be scored over the wrong packed
+    // layout, yielding garbage. Reject the blob instead — a wrong style is
+    // a write-path bug or corruption, not data.
+    if let Some(bad) = vi_list.iter().map(|vi| vi.style()).find(|s| s != pass1_style) {
+        warn!(
+            "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected {pass1_style:?}, found {bad:?}",
+            doc_id_hex(doc_id),
+        );
+        return false;
+    }
+    // Per chunk: find its centre's estimators (a document's chunks in one
+    // posting almost always share a centre, so the last lookup is reused),
+    // copy its packed words once, then update every query token's running max.
+    let mut last: Option<(u32, Option<&[Pass1Estimator]>)> = None;
+    let mut scored_any = false;
+    for vi in vi_list.iter() {
+        let centre_id = vi.centre_id();
+        let estimators = match last {
+            Some((id, estimators)) if id == centre_id => estimators,
+            _ => {
+                let estimators = estimators_of(centre_id);
+                last = Some((centre_id, estimators));
+                estimators
+            }
+        };
+        let Some(estimators) = estimators else {
+            crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
+            continue;
+        };
+        vi.copy_packed_into(words_buf);
+        if estimators.first().is_some_and(|e| words_buf.len() < e.packed_words(dim)) {
+            crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
+            continue;
+        }
+        let (addition_factor, scaling_factor) = (vi.addition_factor(), vi.scaling_factor());
+        for ((q, estimator), row_max) in rotated_queries.iter().zip(estimators).zip(row.iter_mut()) {
+            let score = estimator.estimate_from_parts(q, words_buf, addition_factor, scaling_factor);
+            if score > *row_max {
+                *row_max = score;
+            }
+        }
+        scored_any = true;
+    }
+    scored_any
+}
+
+/// A document and its Pass-1 score within one posting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostingDocScore {
+    /// Raw bytes of the document id.
+    pub document_id: Vec<u8>,
+    /// `max_j ⟨q, d_j⟩` over the document's chunks in the posting.
+    pub dot_product: f32,
+}
+
+/// One posting a [`pass1_probe_trace`] probed, in probe order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbedPosting {
+    /// Probe rank: 0 is the posting nearest the query.
+    pub rank: usize,
+    /// The posting's id.
+    pub posting_id: u32,
+    /// The centre new codes in the posting are encoded against.
+    pub centre_id: Option<u32>,
+    /// Euclidean distance from the query to the posting's routing centroid,
+    /// the distance probing ranks postings by.
+    pub distance: Option<f32>,
+    /// Documents in the posting that were scored (one entry each).
+    pub documents: usize,
+    /// The document whose best chunk here scores lowest.
+    pub min: Option<PostingDocScore>,
+    /// The document whose best chunk here scores highest.
+    pub max: Option<PostingDocScore>,
+}
+
+/// Most postings one probe trace reads. A trace is for viewing: a thousand
+/// postings is past what a graph shows usefully, and it bounds the scan one
+/// admin request holds in memory.
+pub const MAX_TRACE_PROBES: u32 = 1024;
+
+/// A [`pass1_probe_trace`] of one query against a namespace's partition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeTrace {
+    /// Postings asked for (the layout caps it at its active postings).
+    pub n_probes: usize,
+    /// Postings the namespace has that are not retired.
+    pub active_postings: usize,
+    /// Bits per dimension of the namespace's Pass-1 codes.
+    pub pass1_bits: usize,
+    /// The probed postings, nearest first.
+    pub postings: Vec<ProbedPosting>,
+}
+
+/// Pass 1 of [`search`], posting by posting: probe the `n_probes` postings
+/// nearest `query` (nearest first, every posting of a layout with fewer), score
+/// every entry exactly as a search does, and report per posting how many
+/// documents it holds and its lowest and highest document score. For seeing how
+/// what each further probe adds falls off with distance; it ranks nothing.
+///
+/// Holds every scanned entry until it returns, as a search does, and takes a
+/// [`SCORING_GATE`] permit for its scoring only.
+pub async fn pass1_probe_trace<K, L>(
+    config: &SemanticSearchConfig,
+    namespace: &str,
+    layout: &L,
+    query: &[f32],
+    n_probes: usize,
+    kv_store: &K,
+) -> Result<Vec<ProbedPosting>, crate::KVError>
+where
+    K: VectorKvStore,
+    L: IvfLayout + ?Sized,
+{
+    if query.is_empty() || n_probes == 0 {
+        return Ok(vec![]);
+    }
+    let queries = [query.to_vec()];
+    let order = layout.probe(&queries, n_probes).into_iter().next().unwrap_or_default();
+    let scan = kv_store.scan_sparse_clusters_batch(&order).await?;
+
+    let permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
+    let pass1_bits = config.pass1_bits;
+    let pass1_style = QuantisationStyle::pass1(pass1_bits);
+    let rotated = [layout.rotate(query)];
+    let dim = rotated[0].len();
+    let query_sum = Pass1Estimator::query_sum(&rotated[0]);
+    let centre_estimators = CentreEstimators::new(layout);
+    let estimators_of = |centre_id: u32| -> Option<&[Pass1Estimator]> {
+        centre_estimators
+            .cell(centre_id)?
+            .get_or_init(|| {
+                let centre = layout.centre(centre_id)?;
+                Some(vec![Pass1Estimator::with_query_sum(pass1_bits, centre_id, query, centre, query_sum)])
+            })
+            .as_deref()
+    };
+    let scores: Vec<Option<f32>> = (0..scan.len())
+        .into_par_iter()
+        .with_min_len(MIN_ONE_BIT_ENTRIES_PER_TASK / pass1_bits)
+        .map_init(Vec::<u64>::new, |words_buf, i| {
+            let (cluster_id, doc_id, raw_bytes) = scan.get(i)?;
+            let entry = Pass1Entry {
+                cluster_id,
+                doc_id,
+                raw_bytes,
+            };
+            let mut row = [f32::NEG_INFINITY];
+            score_pass1_entry(namespace, &entry, &pass1_style, dim, &rotated, &estimators_of, words_buf, &mut row).then_some(row[0])
+        })
+        .collect();
+    drop(permit);
+
+    // Per posting: documents, and the entries with the lowest and highest score.
+    struct Stats {
+        documents: usize,
+        min: (usize, f32),
+        max: (usize, f32),
+    }
+    let mut stats: HashMap<u32, Stats> = HashMap::with_capacity(order.len());
+    for (i, score) in scores.iter().enumerate() {
+        let (Some(score), Some((cluster_id, _, _))) = (*score, scan.get(i)) else {
+            continue;
+        };
+        let s = stats.entry(cluster_id).or_insert(Stats {
+            documents: 0,
+            min: (i, score),
+            max: (i, score),
+        });
+        s.documents += 1;
+        if score < s.min.1 {
+            s.min = (i, score);
+        }
+        if score > s.max.1 {
+            s.max = (i, score);
+        }
+    }
+    let doc_score = |(i, dot_product): (usize, f32)| PostingDocScore {
+        document_id: scan.get(i).map_or_else(Vec::new, |(_, doc_id, _)| doc_id.to_vec()),
+        dot_product,
+    };
+    Ok(order
+        .iter()
+        .enumerate()
+        .map(|(rank, &posting_id)| {
+            let s = stats.get(&posting_id);
+            ProbedPosting {
+                rank,
+                posting_id,
+                centre_id: layout.centre_of(posting_id),
+                distance: layout.routing_centroid(posting_id).map(|c| {
+                    c.iter()
+                        .zip(query)
+                        .map(|(a, b)| {
+                            let d = a - b;
+                            d * d
+                        })
+                        .sum::<f32>()
+                        .sqrt()
+                }),
+                documents: s.map_or(0, |s| s.documents),
+                min: s.map(|s| doc_score(s.min)),
+                max: s.map(|s| doc_score(s.max)),
+            }
+        })
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn search<K, F, L>(
     config: &SemanticSearchConfig,
@@ -554,68 +810,12 @@ where
             if doc_filter.as_ref().is_some_and(|f| !f(doc_id)) {
                 return;
             }
-            let vi_list = match VectorIndex::access_list(raw_bytes) {
-                Ok(list) => list,
-                Err(e) => {
-                    // Corrupt sparse entry: skip it, but make it visible so a degraded
-                    // index is distinguishable from "no semantic match".
-                    crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
-                    warn!(
-                        "skipping corrupt sparse vector entry: cluster_id={cluster_id} doc_id={} ({} bytes): {e}",
-                        doc_id_hex(doc_id),
-                        raw_bytes.len(),
-                    );
-                    return;
-                }
+            let entry = Pass1Entry {
+                cluster_id,
+                doc_id,
+                raw_bytes,
             };
-            if vi_list.is_empty() {
-                return;
-            }
-            // The sparse namespace must hold only chunk codes of the namespace's
-            // Pass-1 width; any other entry would be scored over the wrong packed
-            // layout, yielding garbage. Reject the blob instead — a wrong style is
-            // a write-path bug or corruption, not data.
-            if let Some(bad) = vi_list.iter().map(|vi| vi.style()).find(|s| *s != pass1_style) {
-                warn!(
-                    "skipping sparse vector entry with wrong quantisation style: cluster_id={cluster_id} doc_id={} expected {pass1_style:?}, found {bad:?}",
-                    doc_id_hex(doc_id),
-                );
-                return;
-            }
-            // Per chunk: find its centre's estimators (a document's chunks in one
-            // posting almost always share a centre, so the last lookup is reused),
-            // copy its packed words once, then update every query token's running max.
-            let mut last: Option<(u32, Option<&[Pass1Estimator]>)> = None;
-            let mut scored_any = false;
-            for vi in vi_list.iter() {
-                let centre_id = vi.centre_id();
-                let estimators = match last {
-                    Some((id, estimators)) if id == centre_id => estimators,
-                    _ => {
-                        let estimators = estimators_of(centre_id);
-                        last = Some((centre_id, estimators));
-                        estimators
-                    }
-                };
-                let Some(estimators) = estimators else {
-                    crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
-                    continue;
-                };
-                vi.copy_packed_into(words_buf);
-                if estimators.first().is_some_and(|e| words_buf.len() < e.packed_words(dim)) {
-                    crate::semantic_search::metrics::record_sparse_corrupt_skipped(namespace);
-                    continue;
-                }
-                let (addition_factor, scaling_factor) = (vi.addition_factor(), vi.scaling_factor());
-                for ((q, estimator), row_max) in rotated_sparse.iter().zip(estimators).zip(row.iter_mut()) {
-                    let score = estimator.estimate_from_parts(q, words_buf, addition_factor, scaling_factor);
-                    if score > *row_max {
-                        *row_max = score;
-                    }
-                }
-                scored_any = true;
-            }
-            *kept = scored_any;
+            *kept = score_pass1_entry(namespace, &entry, &pass1_style, dim, &rotated_sparse, &estimators_of, words_buf, row);
             *doc_order = DocOrder::new(doc_id, i);
         });
 
@@ -1373,6 +1573,68 @@ mod tests {
             }
             db.shutdown().await.unwrap();
         }
+    }
+
+    /// A probe trace walks the postings nearest first, counts every document
+    /// in each, and its highest score overall is the document a query was
+    /// made from, as Pass 1 finds it; fewer probes trace a prefix of more.
+    #[tokio::test]
+    async fn a_probe_trace_reports_each_posting_nearest_first() {
+        let index = rotated_cluster_index(768, 16);
+        let config = SemanticSearchConfig::default();
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        let ns = "trace";
+        db.namespace(ns.to_string()).await.unwrap();
+        let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
+        for (d, v) in docs.iter().enumerate() {
+            let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
+            crate::vector_kv::upsert_vectors(&db, ns, &(d as u64).to_be_bytes(), "t", &vis)
+                .await
+                .unwrap();
+        }
+        let store = crate::vector_kv::DbVectorStore::new(&db, ns).await.unwrap();
+        for d in [0u64, 70, 150] {
+            let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
+            let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            q.iter_mut().for_each(|x| *x /= n);
+
+            let full = pass1_probe_trace(&config, ns, &index, &q, 16, &store).await.unwrap();
+            let order = index.probe(std::slice::from_ref(&q), 16).remove(0);
+            assert_eq!(full.iter().map(|p| p.posting_id).collect::<Vec<_>>(), order, "probe order");
+            assert_eq!(full.iter().map(|p| p.rank).collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
+            let distances: Vec<f32> = full.iter().map(|p| p.distance.unwrap()).collect();
+            assert!(
+                distances.windows(2).all(|w| w[0] <= w[1] + 1e-5),
+                "distances rise with rank: {distances:?}"
+            );
+            // One chunk per document: every document is in exactly one posting.
+            assert_eq!(full.iter().map(|p| p.documents).sum::<usize>(), 200);
+            for p in &full {
+                let entries = store.scan_sparse_cluster(p.posting_id).await.unwrap();
+                assert_eq!(p.documents, entries.len(), "posting {}", p.posting_id);
+                assert_eq!(p.centre_id, Some(p.posting_id));
+                if let (Some(min), Some(max)) = (&p.min, &p.max) {
+                    assert!(min.dot_product <= max.dot_product);
+                    let ids: Vec<&[u8]> = entries.iter().map(|(id, _)| id.as_slice()).collect();
+                    assert!(ids.contains(&min.document_id.as_slice()) && ids.contains(&max.document_id.as_slice()));
+                } else {
+                    assert_eq!(p.documents, 0);
+                }
+            }
+            let best = full
+                .iter()
+                .filter_map(|p| p.max.as_ref())
+                .max_by(|a, b| a.dot_product.total_cmp(&b.dot_product))
+                .unwrap();
+            assert_eq!(best.document_id, d.to_be_bytes().to_vec(), "query from doc {d}");
+
+            let near = pass1_probe_trace(&config, ns, &index, &q, 4, &store).await.unwrap();
+            assert_eq!(near, full[..4], "fewer probes trace a prefix of more");
+        }
+        db.shutdown().await.unwrap();
     }
 
     #[test]

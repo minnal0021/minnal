@@ -57,6 +57,11 @@ pub trait IvfLayout: Sync {
     fn posting_entries(&self, _posting: u32) -> Option<u64> {
         None
     }
+    /// The vector `posting` is probed by, in the original space: its routing
+    /// centroid. Defaults to its centre, which it is for an identity layout.
+    fn routing_centroid(&self, posting: u32) -> Option<&[f32]> {
+        self.centre(self.centre_of(posting)?)
+    }
 }
 
 impl IvfLayout for ClusterIndex {
@@ -116,6 +121,9 @@ impl<T: IvfLayout + Send + ?Sized> IvfLayout for std::sync::Arc<T> {
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         (**self).posting_entries(posting)
+    }
+    fn routing_centroid(&self, posting: u32) -> Option<&[f32]> {
+        (**self).routing_centroid(posting)
     }
 }
 
@@ -207,6 +215,9 @@ impl<L: IvfLayout> IvfLayout for WithEntryCounts<L> {
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         self.entries.get(&posting).copied()
+    }
+    fn routing_centroid(&self, posting: u32) -> Option<&[f32]> {
+        self.layout.routing_centroid(posting)
     }
 }
 
@@ -805,6 +816,9 @@ impl IvfLayout for NamespaceIvf {
     }
     fn posting_entries(&self, posting: u32) -> Option<u64> {
         self.postings.contains_key(&posting).then(|| self.counts.get(posting).0)
+    }
+    fn routing_centroid(&self, posting: u32) -> Option<&[f32]> {
+        NamespaceIvf::routing_centroid(self, posting)
     }
 }
 

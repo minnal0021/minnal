@@ -100,6 +100,53 @@ impl DocStore {
         Ok(check)
     }
 
+    /// How a semantic query walks `namespace`'s partition (document or KV
+    /// store): its `n_probes` nearest postings in probe order (the namespace's
+    /// `max_probes` when `None`; at most
+    /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES)),
+    /// each with its distance from the query, the documents scored in it, and its lowest
+    /// and highest Pass-1 document score. The query is embedded as a search
+    /// embeds it (from the query-embedding cache when it is there). Costs one
+    /// Pass 1 over those postings; ranks nothing.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_probe_trace(
+        &self,
+        namespace: &str,
+        query_text: &str,
+        n_probes: Option<u32>,
+    ) -> Result<crate::semantic_search::service::ProbeTrace, DocStoreError> {
+        use crate::semantic_search::service::MAX_TRACE_PROBES;
+        if self.semantic_ctx.is_none() {
+            return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
+        }
+        self.schemas.require_semantic_search(namespace)?;
+        let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
+        // Zero is rejected by the override's range check.
+        let n_probes = n_probes.unwrap_or(settings.search.max_probes).min(MAX_TRACE_PROBES);
+        let overrides = SearchSpec {
+            min_probes: Some(1),
+            max_probes: Some(n_probes),
+            ..SearchSpec::default()
+        };
+        let ns = self.namespace_semantics(namespace, Some(ns_id), &settings, &overrides).await?;
+        let (query, _) = self.cached_query_embeddings(&ns, query_text).await?;
+        let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
+            .await
+            .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+        let n_probes = ns.config.probe.per_query();
+        // Under the routing epoch, as a search: a split cannot delete a
+        // posting's keys while this may still scan by the routing before it.
+        let _epoch = ns.partition.read_epoch().await;
+        let partition = ns.partition.snapshot();
+        let postings = crate::semantic_search::service::pass1_probe_trace(&ns.config, namespace, &*partition, &query, n_probes, &db_store).await?;
+        Ok(crate::semantic_search::service::ProbeTrace {
+            n_probes,
+            active_postings: partition.postings(),
+            pass1_bits: ns.config.pass1_bits,
+            postings,
+        })
+    }
+
     /// The server's semantic-search settings, as configured (`[semantic_search]`
     /// in the server's TOML): the embedding service, the allowed models, the
     /// TTLs, the maintenance and rebuild threads, and the defaults a namespace's

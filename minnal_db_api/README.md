@@ -1687,6 +1687,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
+| `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: the postings it probes, nearest first, with each one's documents and lowest and highest Pass-1 score |
 | `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
@@ -2207,6 +2208,58 @@ curl 'http://localhost:8080/admin/indices/products/vector/recall-check?sample=20
 Each result is recorded in the [history](#get-adminindicesnsvectorhistory).
 Returns `400` for a parameter out of range or an unknown one, `404` for an
 unknown store and `422` when semantic search is not enabled.
+
+---
+
+#### `GET /admin/indices/{ns}/vector/probe-trace`
+
+Shows how one query walks the store's partition. A search's first pass
+(**Pass 1**) reads only the postings (clusters of chunk codes) nearest the
+query. This lists those postings in the order a search probes them, nearest
+first, and scores every document in each exactly as Pass 1 does: by its best
+chunk's estimated dot product with the query. Reading down the list shows how
+much each further posting still offers. The highest score usually falls as the
+postings get farther from the query, which is what `max_probes` trades
+against. minnal_ui draws it under *Vector Indexes → Probe trace*.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `query` | required | The query text, embedded as a search embeds it (from the query-embedding cache when it is there) |
+| `n_probes` | the store's `max_probes`, at most 1,024 | Postings to probe, 1 to 1,024; a store with fewer postings is read in full |
+
+The response holds `namespace`, `query`, `n_probes`, `active_postings` (postings
+the store has), `pass1_bits` and `postings`, nearest first. Each posting has:
+
+| Field | Meaning |
+|---|---|
+| `rank` | Probe order; 0 is the posting nearest the query |
+| `posting_id`, `centre_id` | The posting, and the centre its new codes are encoded against |
+| `distance` | Euclidean distance from the query to the posting's routing centroid: what probing ranks by |
+| `documents` | Documents with chunks in the posting, each scored once |
+| `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, id}`; `null` for an empty posting |
+
+```bash
+curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&n_probes=2'
+```
+
+```json
+{
+  "namespace": "fiqa_trace", "query": "how do index funds compare to bonds",
+  "n_probes": 2, "active_postings": 48, "pass1_bits": 1,
+  "postings": [
+    {"rank": 0, "posting_id": 93, "centre_id": 93, "distance": 0.828, "documents": 63,
+     "max": {"dot_product": 0.595, "id": 5710}, "min": {"dot_product": 0.209, "id": 22856}},
+    {"rank": 1, "posting_id": 94, "centre_id": 94, "distance": 0.907, "documents": 106,
+     "max": {"dot_product": 0.525, "id": 14748}, "min": {"dot_product": 0.156, "id": 12870}}
+  ]
+}
+```
+
+**Cost.** One embedding request (none when the query is cached), then one Pass 1
+over the probed postings. It takes the same scoring slot as a client search, and
+it holds what it scans until it returns. Returns `400` for a missing or blank
+`query`, an `n_probes` outside 1–1,024 or an unknown parameter; `404` for an
+unknown store; `422` when semantic search is not enabled.
 
 ---
 
