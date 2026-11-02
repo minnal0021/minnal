@@ -606,12 +606,17 @@ pub struct PostingDocScore {
     /// query, what a search ranks its results by. `None` when the document has
     /// no usable dense entry.
     pub pass2: Option<f32>,
+    /// Whether a normal search of the same query returns the document (see
+    /// [`SearchBaseline`]). `None` when no search was compared: from
+    /// [`pass1_probe_trace`] alone.
+    pub in_results: Option<bool>,
 }
 
 /// One posting a [`pass1_probe_trace`] probed, in probe order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProbedPosting {
-    /// Probe rank: 0 is the posting nearest the query.
+    /// Probe rank: 0 is the posting nearest the query. Absolute, whatever
+    /// window the trace was asked for.
     pub rank: usize,
     /// The posting's id.
     pub posting_id: u32,
@@ -628,50 +633,76 @@ pub struct ProbedPosting {
     pub max: Option<PostingDocScore>,
 }
 
-/// Most postings one probe trace reads. A trace is for viewing: a thousand
-/// postings is past what a graph shows usefully, and it bounds the scan one
-/// admin request holds in memory.
+/// Most postings one probe trace reads (its window's width). A trace is for
+/// viewing: a thousand postings is past what a graph shows usefully, and it
+/// bounds the scan one admin request holds in memory. The window itself can sit
+/// anywhere in the probe order.
 pub const MAX_TRACE_PROBES: u32 = 1024;
+
+/// What a normal search of the same query returns, for comparing a trace's
+/// window against: a document scoring below `lowest_pass2` would not make the
+/// results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchBaseline {
+    /// Postings the search probed (the namespace's `max_probes`, or all of a
+    /// namespace with fewer).
+    pub n_probes: usize,
+    /// Results the search returns at most (the namespace's `top_k`).
+    pub top_k: usize,
+    /// Results it returned.
+    pub results: usize,
+    /// The Pass-2 score of its last result: what a document must beat to be
+    /// returned. `None` when it returned nothing.
+    pub lowest_pass2: Option<f32>,
+}
 
 /// A [`pass1_probe_trace`] of one query against a namespace's partition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProbeTrace {
-    /// Postings asked for (the layout caps it at its active postings).
-    pub n_probes: usize,
+    /// First probe rank traced (0 is the posting nearest the query).
+    pub start: usize,
+    /// One past the last probe rank traced.
+    pub end: usize,
     /// Postings the namespace has that are not retired.
     pub active_postings: usize,
     /// Bits per dimension of the namespace's Pass-1 codes.
     pub pass1_bits: usize,
-    /// The probed postings, nearest first.
+    /// The traced postings, ranks `start..end`, nearest first.
     pub postings: Vec<ProbedPosting>,
+    /// The same query searched as the namespace searches it.
+    pub baseline: SearchBaseline,
 }
 
-/// Pass 1 of [`search`], posting by posting: probe the `n_probes` postings
-/// nearest `query` (nearest first, every posting of a layout with fewer), score
-/// every entry exactly as a search does, and report per posting how many
-/// documents it holds and its lowest and highest document score, each with
-/// that document's Pass-2 score (what a search ranks its results by). For seeing how
-/// what each further probe adds falls off with distance; it ranks nothing.
+/// Pass 1 of [`search`], posting by posting: rank the postings by distance from
+/// `query`, take ranks `probes` (nearest first; the window stops at the
+/// layout's last posting), score every entry in them exactly as a search does,
+/// and report per posting how many documents it holds and its lowest and
+/// highest document score, each with that document's Pass-2 score (what a
+/// search ranks its results by). For seeing how what each further probe adds
+/// falls off with distance; it ranks nothing.
 ///
-/// Holds every scanned entry until it returns, as a search does, and takes a
+/// Ranking every posting is cheap; only the window is read and scored, so a
+/// window far down the order costs what one near the query does. Holds every
+/// scanned entry until it returns, as a search does, and takes a
 /// [`SCORING_GATE`] permit for its scoring only.
 pub async fn pass1_probe_trace<K, L>(
     config: &SemanticSearchConfig,
     namespace: &str,
     layout: &L,
     query: &[f32],
-    n_probes: usize,
+    probes: std::ops::Range<usize>,
     kv_store: &K,
 ) -> Result<Vec<ProbedPosting>, crate::KVError>
 where
     K: VectorKvStore,
     L: IvfLayout + ?Sized,
 {
-    if query.is_empty() || n_probes == 0 {
+    if query.is_empty() || probes.is_empty() {
         return Ok(vec![]);
     }
     let queries = [query.to_vec()];
-    let order = layout.probe(&queries, n_probes).into_iter().next().unwrap_or_default();
+    let mut order = layout.probe(&queries, probes.end).into_iter().next().unwrap_or_default();
+    let order = order.split_off(probes.start.min(order.len()));
     let scan = kv_store.scan_sparse_clusters_batch(&order).await?;
 
     let permit = SCORING_GATE.acquire().await.expect("SCORING_GATE is never closed");
@@ -762,15 +793,16 @@ where
             pass2: pass2.get(&document_id).copied(),
             document_id,
             dot_product,
+            in_results: None,
         }
     };
     Ok(order
         .iter()
         .enumerate()
-        .map(|(rank, &posting_id)| {
+        .map(|(i, &posting_id)| {
             let s = stats.get(&posting_id);
             ProbedPosting {
-                rank,
+                rank: probes.start + i,
                 posting_id,
                 centre_id: layout.centre_of(posting_id),
                 distance: layout.routing_centroid(posting_id).map(|c| {
@@ -1662,7 +1694,7 @@ mod tests {
             let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
             q.iter_mut().for_each(|x| *x /= n);
 
-            let full = pass1_probe_trace(&config, ns, &index, &q, 16, &store).await.unwrap();
+            let full = pass1_probe_trace(&config, ns, &index, &q, 0..16, &store).await.unwrap();
             let order = index.probe(std::slice::from_ref(&q), 16).remove(0);
             assert_eq!(full.iter().map(|p| p.posting_id).collect::<Vec<_>>(), order, "probe order");
             assert_eq!(full.iter().map(|p| p.rank).collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
@@ -1708,8 +1740,13 @@ mod tests {
             assert_eq!(top[0].document_id, best.document_id);
             assert_eq!(best.pass2, Some(top[0].dot_product), "the trace's Pass-2 score is the search's");
 
-            let near = pass1_probe_trace(&config, ns, &index, &q, 4, &store).await.unwrap();
+            let near = pass1_probe_trace(&config, ns, &index, &q, 0..4, &store).await.unwrap();
             assert_eq!(near, full[..4], "fewer probes trace a prefix of more");
+            // A window further out traces the same postings, at their own ranks.
+            let far = pass1_probe_trace(&config, ns, &index, &q, 5..12, &store).await.unwrap();
+            assert_eq!(far, full[5..12], "a window is a slice of the whole order");
+            let past = pass1_probe_trace(&config, ns, &index, &q, 12..40, &store).await.unwrap();
+            assert_eq!(past, full[12..], "a window stops at the last posting");
         }
         db.shutdown().await.unwrap();
     }

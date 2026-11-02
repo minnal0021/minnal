@@ -595,6 +595,95 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A probe trace covers the window it is asked for, at absolute ranks: by
+    /// default the namespace's `max_probes` nearest postings (all of a small
+    /// namespace), any window being a slice of that order. Its baseline is the
+    /// namespace's own search, and a window that is empty, too wide or past the
+    /// last posting is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_trace_covers_the_window_asked_for() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        let partition = partition(&store, "g").await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while partition.snapshot().posting_infos()[&0].state != crate::semantic_search::PostingState::Retired {
+            assert!(std::time::Instant::now() < deadline, "the root was never split");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _quiet = partition.lock_maintenance().await;
+        let active = partition.snapshot().postings();
+        assert!(active > 2, "{active} postings");
+        // Fewer results than documents, so some reported documents are not returned.
+        let top5 = SearchSpec {
+            top_k: Some(5),
+            ..SearchSpec::default()
+        };
+        store.update_vector_search("g", &top5, None).await.unwrap();
+
+        let full = store.vector_probe_trace("g", "hello", None, None).await.unwrap();
+        assert_eq!((full.start, full.end, full.active_postings), (0, active, active));
+        assert_eq!(full.postings.iter().map(|p| p.rank).collect::<Vec<_>>(), (0..active).collect::<Vec<_>>());
+        // Each document has several chunks, which can lie in different postings.
+        assert!(full.postings.iter().map(|p| p.documents).sum::<usize>() >= 40);
+        let search = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        let b = &full.baseline;
+        assert_eq!((b.n_probes, b.top_k, b.results), (active, 5, 5));
+        assert_eq!(search.results.len(), 5);
+        assert_eq!(b.lowest_pass2, search.results.iter().map(|r| r.dot_product).min_by(f32::total_cmp));
+        // Every reported document says whether that search returns it.
+        let returned: Vec<&[u8]> = search.results.iter().map(|r| r.document_id.as_slice()).collect();
+        for s in full.postings.iter().flat_map(|p| [&p.min, &p.max]).flatten() {
+            assert_eq!(s.in_results, Some(returned.contains(&s.document_id.as_slice())));
+        }
+        let flags: Vec<bool> = full
+            .postings
+            .iter()
+            .flat_map(|p| [&p.min, &p.max])
+            .flatten()
+            .filter_map(|s| s.in_results)
+            .collect();
+        assert!(flags.contains(&false), "{flags:?}");
+
+        let tail = store.vector_probe_trace("g", "hello", Some(1), None).await.unwrap();
+        assert_eq!((tail.start, tail.end), (1, active), "end defaults to the last posting");
+        assert_eq!(tail.postings, full.postings[1..]);
+        let one = store.vector_probe_trace("g", "hello", Some(1), Some(2)).await.unwrap();
+        assert_eq!(one.postings, full.postings[1..2]);
+
+        let refused = |start: Option<u32>, end: Option<u32>| {
+            let store = &store;
+            async move {
+                match store.vector_probe_trace("g", "hello", start, end).await {
+                    Err(DocStoreError::InvalidProbeWindow { reason, .. }) => reason,
+                    other => panic!("{start:?}..{end:?} was not refused: {other:?}"),
+                }
+            }
+        };
+        assert!(refused(Some(2), Some(2)).await.contains("below end"));
+        assert!(refused(None, Some(0)).await.contains("below end"));
+        assert!(refused(Some(active as u32), None).await.contains("below end"));
+        assert!(refused(Some(0), Some(active as u32 + 1)).await.contains("past"));
+        assert!(refused(Some(0), Some(1025)).await.contains("more than 1024"));
+        drop(_quiet);
+        store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
     /// The loaded partition's entry counts track the worker's writes and the
     /// doc store's deletes, matching a fresh count of the stored keys.
     #[tokio::test]
