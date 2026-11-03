@@ -1687,7 +1687,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
-| `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: a window of its postings in probe order, with each one's documents and lowest and highest Pass-1 score, against what a normal search returns |
+| `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: a window of its postings in probe order, with each one's documents and lowest and highest Pass-1 score, against what a normal search returns at a chosen `top_k` |
 | `GET` | `/admin/indices/{ns}/vector/history` | `200` | Recorded code-health reads, recall checks and rebuilds, newest first (kept 30 days by default) |
 | `GET` | `/admin/indices/{ns}/vector/queue` | `200` | All queue entries for one namespace |
 | `GET` | `/admin/indices/{ns}/vector/queue/retried` | `200` | Retried entries for one namespace |
@@ -2227,13 +2227,16 @@ for the query (its `baseline`) and marks each reported document as returned by
 it or not. A document whose Pass-2 score is above the search's last result but
 which the search does not return was missed: Pass 1 never made it a candidate.
 A document can score above that line and still be returned, through a chunk in
-a nearer posting.
+a nearer posting. `top_k` sets how deep that search goes, up to 10,000
+results, without changing the store's settings: the deeper it goes, the lower
+its last result scores.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `query` | required | The query text, embedded as a search embeds it (from the query-embedding cache when it is there) |
 | `start` | 0 | First probe rank in the window; 0 is the posting nearest the query |
 | `end` | `start` + the store's `max_probes` without `start`, `start` + 1,024 with it; at most the store's postings | One past the last probe rank in the window |
+| `top_k` | the store's `top_k` | Results the baseline search returns, 1 to 10,000. Pass 2 only re-ranks what Pass 1 hands it, so the baseline's Pass 1 keeps the store's `first_pass_top_k` candidates, or `top_k` when that is more |
 
 The window must satisfy `start < end <=` the store's postings and hold at most
 1,024 postings, what the minnal_ui graph shows usefully. Ranking is cheap; only
@@ -2248,6 +2251,7 @@ first. `baseline` is the store's own search of the query:
 |---|---|
 | `n_probes` | Postings it probes: the store's `max_probes`, or all of a store with fewer |
 | `top_k`, `results` | Results it returns at most, and returned |
+| `first_pass_top_k` | Candidates its Pass 1 handed to Pass 2 |
 | `lowest_pass2` | The Pass-2 score of its last result: what a document must beat to be returned; `null` with no results |
 
 Each posting has:
@@ -2260,39 +2264,45 @@ Each posting has:
 | `documents` | Documents with chunks in the posting, each scored once |
 | `max`, `min` | The highest and lowest document score in the posting, each as `{dot_product, pass2, in_results, id}`; `null` for an empty posting. `pass2` is that document's Pass-2 score, its whole-document code against the query: what search results are ranked by. `in_results` says whether the baseline search returns it |
 
-Two postings far past where the search stops, in a 597-posting store that searches 256:
+Two postings just past where the search stops, in a 611-posting store that
+searches 256, compared against a search for 1,000 results:
 
 ```bash
-curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&start=467&end=469'
+curl 'http://localhost:8080/admin/indices/fiqa_trace/vector/probe-trace?query=how%20do%20index%20funds%20compare%20to%20bonds&start=260&end=262&top_k=1000'
 ```
 
 ```json
 {
   "namespace": "fiqa_trace", "query": "how do index funds compare to bonds",
-  "start": 467, "end": 469, "active_postings": 597, "pass1_bits": 1,
-  "baseline": {"n_probes": 256, "top_k": 100, "results": 100, "lowest_pass2": 0.327},
+  "start": 260, "end": 262, "active_postings": 611, "pass1_bits": 1,
+  "baseline": {"n_probes": 256, "top_k": 1000, "first_pass_top_k": 1000, "results": 1000, "lowest_pass2": 0.05},
   "postings": [
-    {"rank": 467, "posting_id": 2509, "centre_id": 2509, "distance": 1.223, "documents": 3,
-     "max": {"dot_product": 0.143, "pass2": 0.071, "in_results": false, "id": 27938},
-     "min": {"dot_product": 0.032, "pass2": 0.065, "in_results": false, "id": 23781}},
-    {"rank": 468, "posting_id": 2278, "centre_id": 2278, "distance": 1.223, "documents": 4,
-     "max": {"dot_product": 0.107, "pass2": 0.378, "in_results": true, "id": 14989},
-     "min": {"dot_product": -0.044, "pass2": -0.043, "in_results": false, "id": 9359}}
+    {"rank": 260, "posting_id": 328, "centre_id": 328, "distance": 1.136, "documents": 5,
+     "max": {"dot_product": 0.215, "pass2": 0.218, "in_results": false, "id": 13656},
+     "min": {"dot_product": 0.067, "pass2": 0.139, "in_results": true, "id": 14731}},
+    {"rank": 261, "posting_id": 726, "centre_id": 726, "distance": 1.136, "documents": 33,
+     "max": {"dot_product": 0.275, "pass2": 0.275, "in_results": true, "id": 30044},
+     "min": {"dot_product": 0.031, "pass2": 0.037, "in_results": false, "id": 10006}}
   ]
 }
 ```
 
-Document 14989 scores 0.378 in Pass 2, above the last result's 0.327, but the
-search returns it already: another of its chunks lies in a posting the search
-reads.
+Document 13656 scores 0.218 in Pass 2, above the last result's 0.05, but the
+search does not return it: it was missed, because the search never reads this
+posting. Document 30044 scores higher and is returned already: another of its
+chunks lies in a posting the search reads. Without `top_k` the same window is
+compared against the store's 100 results, whose last scores 0.327, so neither
+posting holds a missed document.
 
-**Cost.** One embedding request (none when the query is cached), one search,
-then one Pass 1 over the window and a Pass-2 score for at most two documents per
-posting. It takes the same scoring slot as a client search, and it holds what it
+**Cost.** One embedding request (none when the query is cached), one search
+(its Pass 2 reads one whole-document code per Pass-1 candidate, so a large
+`top_k` costs more), then one Pass 1 over the window and a Pass-2 score for at
+most two documents per posting. It takes the same scoring slot as a client search, and it holds what it
 scans until it returns. Two requests rank the postings separately, so if the
 partition splits or merges between them, their windows may not line up
 exactly. Returns `400` for a missing or blank `query`, a window that is empty,
-past the store's postings or wider than 1,024, or an unknown parameter; `404`
+past the store's postings or wider than 1,024, a `top_k` outside 1 to 10,000,
+or an unknown parameter; `404`
 for an unknown store; `422` when semantic search is not enabled.
 
 ---
