@@ -113,7 +113,13 @@ impl DocStore {
     /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES)
     /// when it is; either way capped at the namespace's postings. The window must
     /// satisfy `start < end <= postings` and be at most `MAX_TRACE_PROBES` wide,
-    /// or [`DocStoreError::InvalidProbeWindow`].
+    /// or [`DocStoreError::InvalidProbeTrace`].
+    ///
+    /// `top_k` sets how many results the baseline search returns (default the
+    /// namespace's `top_k`, at most
+    /// [`MAX_TRACE_TOP_K`](crate::semantic_search::service::MAX_TRACE_TOP_K));
+    /// its Pass 1 keeps the namespace's `first_pass_top_k` candidates, or `top_k`
+    /// when that is more. The namespace's own settings do not change.
     ///
     /// The query is embedded as a search embeds it (from the query-embedding
     /// cache when it is there). Costs one search plus one Pass 1 over the window.
@@ -124,8 +130,9 @@ impl DocStore {
         query_text: &str,
         start: Option<u32>,
         end: Option<u32>,
+        top_k: Option<u32>,
     ) -> Result<crate::semantic_search::service::ProbeTrace, DocStoreError> {
-        use crate::semantic_search::service::{MAX_TRACE_PROBES, SearchBaseline};
+        use crate::semantic_search::service::{MAX_TRACE_PROBES, MAX_TRACE_TOP_K, SearchBaseline};
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
@@ -134,6 +141,21 @@ impl DocStore {
         let ns = self
             .namespace_semantics(namespace, Some(ns_id), &settings, &SearchSpec::default())
             .await?;
+        let invalid = |reason: String| {
+            Err(DocStoreError::InvalidProbeTrace {
+                namespace: namespace.to_owned(),
+                reason,
+            })
+        };
+        if let Some(k) = top_k.filter(|&k| k == 0 || k > MAX_TRACE_TOP_K) {
+            return invalid(format!("top_k ({k}) must be between 1 and {MAX_TRACE_TOP_K}"));
+        }
+        // The baseline searches as the namespace does, at this trace's top_k.
+        let mut config = ns.config.clone();
+        if let Some(k) = top_k {
+            config.top_k_results = k as usize;
+        }
+        config.first_pass_sparse_search_top_k = config.first_pass_sparse_search_top_k.max(config.top_k_results);
         let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
@@ -151,12 +173,6 @@ impl DocStore {
             ns.config.probe.per_query().min(max_width)
         };
         let end_rank = end.map_or_else(|| start_rank.saturating_add(width).min(active), |e| e as usize);
-        let invalid = |reason: String| {
-            Err(DocStoreError::InvalidProbeWindow {
-                namespace: namespace.to_owned(),
-                reason,
-            })
-        };
         if start_rank >= end_rank {
             return invalid(format!("start ({start_rank}) must be below end ({end_rank})"));
         }
@@ -167,7 +183,7 @@ impl DocStore {
             return invalid(format!("end ({end_rank}) is past the namespace's {active} postings"));
         }
         let results = crate::semantic_search::service::search(
-            &ns.config,
+            &config,
             namespace,
             &*partition,
             &query_sparse,
@@ -178,13 +194,14 @@ impl DocStore {
         )
         .await?;
         let baseline = SearchBaseline {
-            n_probes: ns.config.probe.per_query().min(active),
-            top_k: ns.config.top_k_results,
+            n_probes: config.probe.per_query().min(active),
+            top_k: config.top_k_results,
+            first_pass_top_k: config.first_pass_sparse_search_top_k,
             results: results.len(),
             lowest_pass2: results.iter().map(|r| r.dot_product).min_by(f32::total_cmp),
         };
         let mut postings =
-            crate::semantic_search::service::pass1_probe_trace(&ns.config, namespace, &*partition, &query_dense, start_rank..end_rank, &db_store)
+            crate::semantic_search::service::pass1_probe_trace(&config, namespace, &*partition, &query_dense, start_rank..end_rank, &db_store)
                 .await?;
         let returned: std::collections::HashSet<&[u8]> = results.iter().map(|r| r.document_id.as_slice()).collect();
         for s in postings.iter_mut().flat_map(|p| [&mut p.min, &mut p.max]).flatten() {

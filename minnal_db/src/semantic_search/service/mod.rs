@@ -639,6 +639,12 @@ pub struct ProbedPosting {
 /// anywhere in the probe order.
 pub const MAX_TRACE_PROBES: u32 = 1024;
 
+/// Largest `top_k` a probe trace's baseline search accepts: the largest Pass-1
+/// cut a namespace accepts (`MAX_FIRST_PASS_TOP_K`), so the baseline is always a
+/// search the namespace could be set to run. Above the result cap of a normal
+/// search, so a trace can look deeper into the ranking than a search returns.
+pub const MAX_TRACE_TOP_K: u32 = 10_000;
+
 /// What a normal search of the same query returns, for comparing a trace's
 /// window against: a document scoring below `lowest_pass2` would not make the
 /// results.
@@ -647,8 +653,13 @@ pub struct SearchBaseline {
     /// Postings the search probed (the namespace's `max_probes`, or all of a
     /// namespace with fewer).
     pub n_probes: usize,
-    /// Results the search returns at most (the namespace's `top_k`).
+    /// Results the search returns at most (the namespace's `top_k`, unless the
+    /// trace asked for another).
     pub top_k: usize,
+    /// Candidates its Pass 1 handed to Pass 2: the namespace's
+    /// `first_pass_top_k`, raised to `top_k` when that is larger (Pass 2 only
+    /// re-ranks Pass 1's candidates, so it cannot return more).
+    pub first_pass_top_k: usize,
     /// Results it returned.
     pub results: usize,
     /// The Pass-2 score of its last result: what a document must beat to be

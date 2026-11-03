@@ -16,7 +16,7 @@
 //! POST   /admin/indices/{ns}/vector/reindex/{doc_id}      → re-enqueue one doc for embedding (doc + kv) (200)
 //! POST   /admin/indices/{ns}/vector/reindex-failed        → reset exhausted queue entries (200)
 //! DELETE /admin/indices/{ns}/vector/drop-all              → clear all vector index data (202)
-//! GET    /admin/indices/{ns}/vector/probe-trace           → one query's postings at probe ranks start..end, with min/max Pass-1 scores
+//! GET    /admin/indices/{ns}/vector/probe-trace           → one query's postings at probe ranks start..end, with min/max Pass-1 scores, against a search at top_k
 //! GET    /admin/indices/{ns}/vector/queue                 → all queue entries for namespace
 //! GET    /admin/indices/{ns}/vector/queue/retried         → retried entries for namespace
 //! GET    /admin/indices/{ns}/vector/queue/{doc_id}        → look up one queue entry
@@ -815,6 +815,11 @@ pub struct ProbeTraceParams {
     /// (with one), capped at the postings.
     #[serde(default)]
     pub end: Option<u32>,
+    /// Results the baseline search returns: 1 to `MAX_TRACE_TOP_K` (10,000);
+    /// default the namespace's `top_k`. Its Pass 1 keeps at least this many
+    /// candidates. The namespace's settings do not change.
+    #[serde(default)]
+    pub top_k: Option<u32>,
 }
 
 /// A document id as the store's clients see it: per the document store's
@@ -831,16 +836,17 @@ fn vector_id_json(state: &AppState, ns: &str) -> impl Fn(&[u8]) -> serde_json::V
     }
 }
 
-/// `GET /admin/indices/{ns}/vector/probe-trace?query=…&start=S&end=E` — how
+/// `GET /admin/indices/{ns}/vector/probe-trace?query=…&start=S&end=E&top_k=K` — how
 /// one semantic query walks the namespace's partition: the postings at probe
 /// ranks `S..E`, each with its distance from the query, the documents scored in
 /// it, and its lowest and highest Pass-1 document score (with the document's id
 /// and its Pass-2 score, what search results are ranked by), plus `baseline`:
-/// the same query searched as the namespace searches it, and the Pass-2 score
-/// of its last result. Costs one embedding (none when the query is cached), one
-/// search and one Pass 1 over the window. `400` for a missing query, or a window
-/// that is empty, past the namespace's postings, or wider than
-/// `MAX_TRACE_PROBES` (1,024).
+/// the same query searched as the namespace searches it (returning `K` results
+/// when given), and the Pass-2 score of its last result. Costs one embedding
+/// (none when the query is cached), one search and one Pass 1 over the window.
+/// `400` for a missing query, a window that is empty, past the namespace's
+/// postings, or wider than `MAX_TRACE_PROBES` (1,024), or a `top_k` outside
+/// 1 to `MAX_TRACE_TOP_K` (10,000).
 pub async fn vector_probe_trace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -851,7 +857,7 @@ pub async fn vector_probe_trace(
         Some(q) if !q.is_empty() => q.to_owned(),
         _ => return bad("query is required".into()),
     };
-    let trace = match state.store.vector_probe_trace(&ns, &query, params.start, params.end).await {
+    let trace = match state.store.vector_probe_trace(&ns, &query, params.start, params.end, params.top_k).await {
         Ok(t) => t,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
@@ -885,6 +891,7 @@ pub async fn vector_probe_trace(
         "baseline": {
             "n_probes": trace.baseline.n_probes,
             "top_k": trace.baseline.top_k,
+            "first_pass_top_k": trace.baseline.first_pass_top_k,
             "results": trace.baseline.results,
             "lowest_pass2": trace.baseline.lowest_pass2,
         },

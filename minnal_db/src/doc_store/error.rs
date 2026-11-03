@@ -238,12 +238,15 @@ pub enum DocStoreError {
     #[error("vector index cleanup for namespace '{namespace}' is already in progress")]
     VecIndexCleanupInProgress { namespace: String },
 
-    /// A probe trace's window (`start..end` over the namespace's probe order)
-    /// is empty, runs past the namespace's postings, or is wider than
-    /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES).
+    /// A probe trace was asked for something it cannot show: its window
+    /// (`start..end` over the namespace's probe order) is empty, runs past the
+    /// namespace's postings, or is wider than
+    /// [`MAX_TRACE_PROBES`](crate::semantic_search::service::MAX_TRACE_PROBES),
+    /// or its `top_k` is 0 or above
+    /// [`MAX_TRACE_TOP_K`](crate::semantic_search::service::MAX_TRACE_TOP_K).
     #[cfg(feature = "semantic-search")]
-    #[error("invalid probe window for namespace '{namespace}': {reason}")]
-    InvalidProbeWindow { namespace: String, reason: String },
+    #[error("invalid probe trace for namespace '{namespace}': {reason}")]
+    InvalidProbeTrace { namespace: String, reason: String },
 
     /// An exclusive attribute-index operation is already running for this namespace.
     #[error("an attribute index operation is already in progress for namespace '{namespace}'")]

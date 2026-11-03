@@ -219,6 +219,7 @@ async fn update_vector_search_changes_only_search_settings() {
 mod with_service {
     use super::*;
     use crate::semantic_search::chunk_document;
+    use crate::semantic_search::service::MAX_TRACE_TOP_K;
     use crate::semantic_search::service::SemanticSearchConfig;
 
     const DIM: usize = 8;
@@ -632,7 +633,7 @@ mod with_service {
         };
         store.update_vector_search("g", &top5, None).await.unwrap();
 
-        let full = store.vector_probe_trace("g", "hello", None, None).await.unwrap();
+        let full = store.vector_probe_trace("g", "hello", None, None, None).await.unwrap();
         assert_eq!((full.start, full.end, full.active_postings), (0, active, active));
         assert_eq!(full.postings.iter().map(|p| p.rank).collect::<Vec<_>>(), (0..active).collect::<Vec<_>>());
         // Each document has several chunks, which can lie in different postings.
@@ -642,7 +643,7 @@ mod with_service {
             .await
             .unwrap();
         let b = &full.baseline;
-        assert_eq!((b.n_probes, b.top_k, b.results), (active, 5, 5));
+        assert_eq!((b.n_probes, b.top_k, b.first_pass_top_k, b.results), (active, 5, 1000, 5));
         assert_eq!(search.results.len(), 5);
         assert_eq!(b.lowest_pass2, search.results.iter().map(|r| r.dot_product).min_by(f32::total_cmp));
         // Every reported document says whether that search returns it.
@@ -659,17 +660,69 @@ mod with_service {
             .collect();
         assert!(flags.contains(&false), "{flags:?}");
 
-        let tail = store.vector_probe_trace("g", "hello", Some(1), None).await.unwrap();
+        let tail = store.vector_probe_trace("g", "hello", Some(1), None, None).await.unwrap();
         assert_eq!((tail.start, tail.end), (1, active), "end defaults to the last posting");
         assert_eq!(tail.postings, full.postings[1..]);
-        let one = store.vector_probe_trace("g", "hello", Some(1), Some(2)).await.unwrap();
+        let one = store.vector_probe_trace("g", "hello", Some(1), Some(2), None).await.unwrap();
         assert_eq!(one.postings, full.postings[1..2]);
+
+        // A deeper baseline returns more documents, and lowers the bar to be one.
+        let deep = store.vector_probe_trace("g", "hello", None, None, Some(30)).await.unwrap();
+        let without_flags = |postings: &[crate::semantic_search::service::ProbedPosting]| {
+            let mut postings = postings.to_vec();
+            for s in postings.iter_mut().flat_map(|p| [&mut p.min, &mut p.max]).flatten() {
+                s.in_results = None;
+            }
+            postings
+        };
+        assert_eq!(
+            without_flags(&deep.postings),
+            without_flags(&full.postings),
+            "top_k changes only the baseline"
+        );
+        let (d, deep_search) = (&deep.baseline, {
+            let top30 = SearchSpec {
+                top_k: Some(30),
+                ..SearchSpec::default()
+            };
+            store.search_semantic("g", "hello", &top30, Pagination::new(1, 100)).await.unwrap()
+        });
+        assert_eq!((d.top_k, d.first_pass_top_k, d.results), (30, 1000, deep_search.results.len()));
+        assert!(d.results > b.results);
+        assert_eq!(d.lowest_pass2, deep_search.results.iter().map(|r| r.dot_product).min_by(f32::total_cmp));
+        assert!(d.lowest_pass2 <= b.lowest_pass2);
+        let deep_returned: Vec<&[u8]> = deep_search.results.iter().map(|r| r.document_id.as_slice()).collect();
+        for s in deep.postings.iter().flat_map(|p| [&p.min, &p.max]).flatten() {
+            assert_eq!(s.in_results, Some(deep_returned.contains(&s.document_id.as_slice())));
+        }
+        // Past the namespace's first_pass_top_k, Pass 1 keeps top_k candidates.
+        let widest = store.vector_probe_trace("g", "hello", None, None, Some(MAX_TRACE_TOP_K)).await.unwrap();
+        assert_eq!((widest.baseline.top_k, widest.baseline.first_pass_top_k), (10_000, 10_000));
+        assert_eq!(widest.baseline.results, 40, "every document");
+        // The namespace's own settings are untouched.
+        let after = store
+            .search_semantic("g", "hello", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        assert_eq!(after.results.len(), 5);
+
+        let refused_k = |k: u32| {
+            let store = &store;
+            async move {
+                match store.vector_probe_trace("g", "hello", None, None, Some(k)).await {
+                    Err(DocStoreError::InvalidProbeTrace { reason, .. }) => reason,
+                    other => panic!("top_k {k} was not refused: {other:?}"),
+                }
+            }
+        };
+        assert!(refused_k(0).await.contains("between 1 and 10000"));
+        assert!(refused_k(MAX_TRACE_TOP_K + 1).await.contains("between 1 and 10000"));
 
         let refused = |start: Option<u32>, end: Option<u32>| {
             let store = &store;
             async move {
-                match store.vector_probe_trace("g", "hello", start, end).await {
-                    Err(DocStoreError::InvalidProbeWindow { reason, .. }) => reason,
+                match store.vector_probe_trace("g", "hello", start, end, None).await {
+                    Err(DocStoreError::InvalidProbeTrace { reason, .. }) => reason,
                     other => panic!("{start:?}..{end:?} was not refused: {other:?}"),
                 }
             }
@@ -682,6 +735,12 @@ mod with_service {
         drop(_quiet);
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
+    }
+
+    /// A trace's baseline accepts any `top_k` a namespace's Pass-1 cut accepts.
+    #[test]
+    fn the_trace_top_k_cap_is_the_largest_first_pass_cut() {
+        assert_eq!(MAX_TRACE_TOP_K, crate::doc_store::vector_settings::MAX_FIRST_PASS_TOP_K);
     }
 
     /// The loaded partition's entry counts track the worker's writes and the
