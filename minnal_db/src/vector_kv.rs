@@ -642,14 +642,19 @@ pub(crate) async fn lock_docs_vectors<'d>(namespace: &str, docs: impl IntoIterat
 pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
     let mut delta = PostingDelta::default();
+    // A namespace that does not exist holds nothing to delete. Resolving these
+    // with get-or-create would recreate a dropped store's vector namespaces: the
+    // worker clears documents after its pass, outside any partition's epoch.
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
-    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    if let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await? {
+    if let Some(sparse_meta_ns) = db.existing_namespace(sparse_vectors_meta_ns(namespace)).await?
+        && let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
+    {
         if let Some(meta) = decode_sparse_meta(&meta_bytes) {
-            let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-            for cluster_id in meta.posting_ids() {
-                crash_point!();
-                sparse_ns.delete(composite_key::encode(cluster_id, doc_id_bytes)).await?;
+            if let Some(sparse_ns) = db.existing_namespace(sparse_vectors_ns(namespace)).await? {
+                for cluster_id in meta.posting_ids() {
+                    crash_point!();
+                    sparse_ns.delete(composite_key::encode(cluster_id, doc_id_bytes)).await?;
+                }
             }
             delta.removed = meta.postings;
         }
@@ -658,9 +663,10 @@ pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -
     }
 
     // Dense: delete by doc_id directly (no meta needed).
-    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
-    crash_point!();
-    dense_ns.delete(doc_id_bytes.to_vec()).await?;
+    if let Some(dense_ns) = db.existing_namespace(dense_vectors_ns(namespace)).await? {
+        crash_point!();
+        dense_ns.delete(doc_id_bytes.to_vec()).await?;
+    }
 
     Ok(delta)
 }
@@ -1778,6 +1784,23 @@ mod ivf_store_tests {
 mod doc_vector_race_tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The worker clears a document after its pass, outside any partition's
+    /// epoch, so this can run after a drop removed the vector namespaces. There
+    /// is nothing to delete then, and it must not recreate them.
+    #[tokio::test]
+    async fn deleting_vectors_does_not_create_their_namespaces() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), crate::db::test_support::create_db_config())
+            .await
+            .unwrap();
+        db.namespace("docs".to_string()).await.unwrap();
+        let delta = delete_vector(&db, "docs", b"x").await.unwrap();
+        assert!(delta.removed.is_empty());
+        let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n.starts_with("docs_")), "{names:?}");
+        db.shutdown().await.unwrap();
+    }
 
     /// A delete racing an upsert of the same document's vectors must never leave
     /// a sparse cluster key that the document's cluster list does not record —

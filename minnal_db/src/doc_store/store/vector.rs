@@ -896,14 +896,15 @@ impl DocumentText {
 /// ([`InFlightWrites`]).
 #[cfg(feature = "semantic-search")]
 pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace: &str, key: &[u8]) -> Result<DocumentText, DocStoreError> {
-    // `list_namespaces` first: resolving a dropped namespace would recreate it.
     let Some(schema) = schemas.get(namespace) else {
         return Ok(DocumentText::StoreGone);
     };
-    if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
+    // Never get-or-create: this runs outside any partition's epoch, so a drop can
+    // land at any moment, and resolving the name after it would recreate the store.
+    let Some(store_ns) = db.existing_namespace(namespace.to_owned()).await? else {
         return Ok(DocumentText::StoreGone);
-    }
-    let Some(value) = db.namespace(namespace.to_owned()).await?.get(key.to_vec()).await? else {
+    };
+    let Some(value) = store_ns.get(key.to_vec()).await? else {
         return Ok(DocumentText::Nothing);
     };
     let text = match schema {

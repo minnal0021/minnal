@@ -412,6 +412,12 @@ impl Db {
         self.inner.remove_namespace(name)
     }
 
+    /// Delete the data directory an interrupted drop left for `name`. Does nothing
+    /// if `name` is a namespace: its directory holds live files.
+    pub fn remove_unregistered_namespace_dir(&self, name: &str) -> Result<()> {
+        self.inner.remove_unregistered_namespace_dir(name)
+    }
+
     // ── Maintenance ───────────────────────────────────────────────────
 
     /// Returns snapshot statistics for the default namespace.
@@ -1608,6 +1614,14 @@ impl AsyncDb {
     pub async fn remove_namespace(&self, name: String) -> Result<u32> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.remove_namespace(&name))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Async [`Db::remove_unregistered_namespace_dir`].
+    pub async fn remove_unregistered_namespace_dir(&self, name: String) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.remove_unregistered_namespace_dir(&name))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }

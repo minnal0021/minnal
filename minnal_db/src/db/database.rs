@@ -1891,6 +1891,21 @@ impl Database {
         Ok(ns_id)
     }
 
+    /// Delete the data directory of `name` left by an interrupted drop. A name
+    /// the registry lists is left alone: its directory holds a live store's files.
+    pub fn remove_unregistered_namespace_dir(&self, name: &str) -> Result<()> {
+        self.check_closed()?;
+        // The lock keeps a create of `name` from opening the directory meanwhile.
+        let _create = self.namespace_create_lock.lock();
+        if self.registry.read().exists(name) {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(crate::db::layout::namespace_data_dir(&self.db_path, name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Delete a dropped namespace's on-disk files: its data directory
     /// (`{db_path}/ns_{name}`, holding the LSM SSTables and value log) and its
     /// index subtree (`{db_path}/index/{ns_id}`).

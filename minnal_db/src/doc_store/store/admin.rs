@@ -599,10 +599,7 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &Schema
     }
 
     for ns_name in &ns_names {
-        let ns_dir = crate::db::layout::namespace_data_dir(db_path, ns_name);
-        if ns_dir.exists() {
-            std::fs::remove_dir_all(&ns_dir)?;
-        }
+        db.remove_unregistered_namespace_dir(ns_name.clone()).await?;
     }
 
     let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id);

@@ -1208,10 +1208,48 @@ mod with_service {
         // Requests already sent when the drop ended may still be answered: at
         // most two (whole document, chunks) per concurrent entry.
         assert!(after <= 8, "{after} embedding request(s) after the drop");
+        assert!(!store.db.list_namespaces().iter().any(|(n, _)| n == "g"), "the dropped store is back");
         let left = companions_left(&store, "g");
         assert!(left.is_empty(), "dropped namespaces are back: {left:?}");
         assert_eq!(queued_for(&store, "g").await, 0, "queue entries outlived the store");
         store.shutdown_vec_index_worker().await;
+        store.shutdown().await.unwrap();
+    }
+
+    /// The worker reads a document to check its queue entry, outside any
+    /// partition's epoch. That read racing a drop must not bring the store back:
+    /// the drop's sweep of leftover directories then deleted the new store's
+    /// files, and the next metadata write, at shutdown at the latest, failed with
+    /// `NotFound`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_document_read_racing_a_drop_does_not_bring_the_store_back() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = Arc::new(open_fresh(db_dir.path()).await.with_semantic_search(context(&url)));
+        for round in 0..40 {
+            let name = format!("g{round}");
+            store.create(semantic_schema(&name, Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    let (store, name, stop) = (Arc::clone(&store), name.clone(), Arc::clone(&stop));
+                    tokio::spawn(async move {
+                        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            let _ = super::super::vector::document_text(&store.db, &store.schemas, &name, b"k").await;
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                })
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            store.remove(&name).await.unwrap();
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            for r in readers {
+                r.await.unwrap();
+            }
+            let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+            assert!(!names.contains(&name), "round {round}: the dropped store is back");
+        }
         store.shutdown().await.unwrap();
     }
 

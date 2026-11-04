@@ -626,8 +626,8 @@ impl VecIndexWorker {
                 Ok(Processed::Written)
             }
             QueueEntryKind::Clear => {
-                // As for an embed: the clear's deletes resolve the vector
-                // namespaces with get-or-create too.
+                // As for an embed: a clear must not write to a partition being
+                // dropped.
                 let partition = match semantics {
                     Some(Ok(ns)) => Some(&ns.partition),
                     _ => None,

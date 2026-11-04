@@ -3583,3 +3583,21 @@ fn removing_a_namespace_while_it_is_created_leaves_no_store_without_its_files() 
         assert_eq!(db.shutdown().map_err(|e| format!("{e:?}")), Ok(()), "round {round}");
     }
 }
+
+/// The sweep for an interrupted drop's leftovers must not delete a live store's
+/// files, and does delete a directory no namespace owns.
+#[test]
+fn only_an_unregistered_namespace_loses_its_directory() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    db.create_namespace("live").unwrap();
+    let live = crate::db::layout::namespace_data_dir(dir.path(), "live");
+    db.remove_unregistered_namespace_dir("live").unwrap();
+    assert!(live.exists());
+    let leftover = crate::db::layout::namespace_data_dir(dir.path(), "leftover");
+    std::fs::create_dir_all(&leftover).unwrap();
+    db.remove_unregistered_namespace_dir("leftover").unwrap();
+    assert!(!leftover.exists());
+    db.remove_unregistered_namespace_dir("never_existed").unwrap();
+    db.shutdown().unwrap();
+}
