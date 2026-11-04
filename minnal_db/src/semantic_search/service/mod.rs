@@ -1580,6 +1580,7 @@ mod tests {
             .await
             .unwrap();
         db.namespace("docs".to_string()).await.unwrap();
+        crate::vector_kv::create_vector_namespaces(&db, "docs").await.unwrap();
         let docs: Vec<Vec<f32>> = (0..300).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
@@ -1635,6 +1636,7 @@ mod tests {
                 .unwrap();
             let ns = format!("docs{bits}");
             db.namespace(ns.clone()).await.unwrap();
+            crate::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
             let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
             for (d, v) in docs.iter().enumerate() {
                 let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
@@ -1692,6 +1694,7 @@ mod tests {
             .unwrap();
         let ns = "trace";
         db.namespace(ns.to_string()).await.unwrap();
+        crate::vector_kv::create_vector_namespaces(&db, ns).await.unwrap();
         let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();

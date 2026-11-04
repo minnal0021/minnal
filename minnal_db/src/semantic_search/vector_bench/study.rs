@@ -527,6 +527,7 @@ async fn vector_bench_pass1_study() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
     db.namespace("study".to_string()).await.unwrap();
+    crate::vector_kv::create_vector_namespaces(&db, "study").await.unwrap();
     for d in 0..nd {
         let vis = index_embeddings(&config, &index, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
         upsert_vectors(&db, "study", &(d as u64).to_be_bytes(), "", &vis).await.unwrap();

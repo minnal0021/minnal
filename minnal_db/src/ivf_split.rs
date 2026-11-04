@@ -72,10 +72,10 @@
 //!    handed out, and every maintenance entry point before it starts
 //!    (`prepare`). An operation started on top of an unfinished one would
 //!    take ids the unfinished one already used.
-//! 7. **A dropped namespace is never written.** Maintenance resolves namespaces
-//!    with get-or-create, so a write after a drop brings them back; the drop
-//!    stops maintenance and waits for the operation in progress
-//!    ([`PartitionHandle::mark_dropped`]).
+//! 7. **A dropped namespace is never written.** Maintenance never creates a
+//!    namespace ([`companion`]), so an operation that outlives a drop fails rather
+//!    than bring one back; the drop also stops maintenance and waits for the
+//!    operation in progress ([`PartitionHandle::mark_dropped`]).
 //!
 //! Codes are never re-encoded: a moved code keeps its `centre_id` and only its
 //! key changes. While a chunk is in both places a search scores it twice, and
@@ -300,13 +300,22 @@ impl Record {
     }
 }
 
+/// A companion namespace maintenance needs, without creating it: only
+/// [`create_vector_namespaces`](crate::vector_kv::create_vector_namespaces) does.
+/// An error once a drop has removed it, which stops the operation.
+pub(super) async fn companion(db: &AsyncDb, name: String) -> Result<crate::AsyncNamespace, crate::KVError> {
+    db.existing_namespace(name.clone())
+        .await?
+        .ok_or_else(|| crate::KVError::Io(std::io::Error::other(format!("namespace '{name}' is gone: its vector index was dropped"))))
+}
+
 fn corrupt(namespace: &str, what: impl std::fmt::Display) -> crate::KVError {
     crate::KVError::Serialization(format!("namespace '{namespace}': {what}"))
 }
 
 async fn write_record(db: &AsyncDb, namespace: &str, op: u64, record: &Record) -> Result<(), crate::KVError> {
     crash_point!();
-    db.namespace(ivf_journal_ns(namespace))
+    companion(db, ivf_journal_ns(namespace))
         .await?
         .put(op.to_be_bytes().to_vec(), record.encode())
         .await
@@ -314,14 +323,14 @@ async fn write_record(db: &AsyncDb, namespace: &str, op: u64, record: &Record) -
 
 async fn delete_record(db: &AsyncDb, namespace: &str, op: u64) -> Result<(), crate::KVError> {
     crash_point!();
-    db.namespace(ivf_journal_ns(namespace)).await?.delete(op.to_be_bytes().to_vec()).await
+    companion(db, ivf_journal_ns(namespace)).await?.delete(op.to_be_bytes().to_vec()).await
 }
 
 /// Every unfinished operation in `namespace`'s journal, in `op_id` order.
 async fn records(db: &AsyncDb, namespace: &str) -> Result<Vec<(u64, Record)>, crate::KVError> {
     let mut out = Vec::new();
-    // A namespace that never maintained its partition has no journal, and reading
-    // must not make one.
+    // A namespace without a vector index has no journal, and reading must not
+    // make one.
     let Some(journal) = db.existing_namespace(ivf_journal_ns(namespace)).await? else {
         return Ok(out);
     };
@@ -344,14 +353,14 @@ async fn next_op_id(db: &AsyncDb, namespace: &str) -> Result<u64, crate::KVError
 
 async fn write_posting(db: &AsyncDb, namespace: &str, p: &Posting) -> Result<(), crate::KVError> {
     crash_point!();
-    db.namespace(ivf_postings_ns(namespace))
+    companion(db, ivf_postings_ns(namespace))
         .await?
         .put(p.posting_id.to_be_bytes().to_vec(), encode_posting(p))
         .await
 }
 
 async fn stored_posting(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option<Posting>, crate::KVError> {
-    match db.namespace(ivf_postings_ns(namespace)).await?.get(id.to_be_bytes().to_vec()).await? {
+    match companion(db, ivf_postings_ns(namespace)).await?.get(id.to_be_bytes().to_vec()).await? {
         Some(v) => decode_posting(id, &v)
             .map(Some)
             .ok_or_else(|| corrupt(namespace, format!("malformed posting {id}"))),
@@ -360,7 +369,7 @@ async fn stored_posting(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option
 }
 
 async fn stored_centre(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option<Vec<f32>>, crate::KVError> {
-    match db.namespace(ivf_centres_ns(namespace)).await?.get(id.to_be_bytes().to_vec()).await? {
+    match companion(db, ivf_centres_ns(namespace)).await?.get(id.to_be_bytes().to_vec()).await? {
         Some(v) => crate::vector_kv::bytes_to_f32s(&v)
             .map(Some)
             .ok_or_else(|| corrupt(namespace, format!("malformed centre {id}"))),
@@ -370,8 +379,7 @@ async fn stored_centre(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option<
 
 /// `posting`'s entries: `(doc id, codes)`.
 async fn posting_entries(db: &AsyncDb, namespace: &str, posting: u32) -> Result<Vec<(Vec<u8>, Vec<VectorIndex>)>, crate::KVError> {
-    let rows = db
-        .namespace(sparse_vectors_ns(namespace))
+    let rows = companion(db, sparse_vectors_ns(namespace))
         .await?
         .scan_prefix(posting.to_be_bytes().to_vec())
         .await?;
@@ -387,8 +395,7 @@ async fn posting_entries(db: &AsyncDb, namespace: &str, posting: u32) -> Result<
 /// Several postings' entries in one read (each LSM layer is read once for the
 /// whole set, as a search's probe is): `posting → [(doc id, codes)]`.
 async fn postings_entries(db: &AsyncDb, namespace: &str, postings: &[u32]) -> Result<HashMap<u32, Vec<(Vec<u8>, Vec<VectorIndex>)>>, crate::KVError> {
-    let rows = db
-        .namespace(sparse_vectors_ns(namespace))
+    let rows = companion(db, sparse_vectors_ns(namespace))
         .await?
         .scan_prefixes_batch(postings.to_vec())
         .await?;
@@ -574,8 +581,8 @@ where
 }
 
 /// An error once `namespace`'s vector index is dropped: its maintenance must
-/// stop, since every write resolves its namespace with get-or-create and would
-/// bring the dropped namespaces back.
+/// stop, or its writes would land in a store being removed, or in the new
+/// partition of one enabled again.
 fn check_live(namespace: &str, handle: &PartitionHandle) -> Result<(), crate::KVError> {
     if handle.is_dropped() {
         return Err(crate::KVError::Io(std::io::Error::other(format!(
@@ -630,8 +637,8 @@ async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Mov
     if items.is_empty() {
         return Ok((PostingDelta::default(), 0));
     }
-    let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
-    let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    let sparse = companion(db, sparse_vectors_ns(namespace)).await?;
+    let meta_ns = companion(db, sparse_vectors_meta_ns(namespace)).await?;
     let metas = meta_ns.get_multiple(items.iter().map(|(doc, _)| doc.clone()).collect()).await?;
     let keys: Vec<Vec<u8>> = items
         .iter()
@@ -890,7 +897,7 @@ async fn split_locked(
 
     // 2. Prepare: centres and children (not yet routable), P draining.
     let centres = [ivf.unrotate(&result.centres[0]), ivf.unrotate(&result.centres[1])];
-    let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
+    let centres_ns = companion(db, ivf_centres_ns(namespace)).await?;
     for (id, c) in centre_ids.iter().zip(&centres) {
         crash_point!();
         centres_ns.put(id.to_be_bytes().to_vec(), f32s_to_bytes(c)).await?;
@@ -1047,7 +1054,7 @@ async fn drain_copy(
     rule: &DrainRule<'_>,
     drained: u32,
 ) -> Result<u64, crate::KVError> {
-    let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
+    let sparse = companion(db, sparse_vectors_ns(namespace)).await?;
     let docs: Vec<Vec<u8>> = posting_entries(db, namespace, drained).await?.into_iter().map(|(doc, _)| doc).collect();
     let sparse = &sparse;
     let copied = in_batches(namespace, handle, &docs, |batch| async move {
@@ -1075,8 +1082,8 @@ async fn drain_copy(
 /// 6. Delete the drained posting's keys, and the posting from each document's
 ///    meta (both logged, synced per batch).
 async fn drain_delete(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, drained: u32) -> Result<(), crate::KVError> {
-    let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
-    let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    let sparse = companion(db, sparse_vectors_ns(namespace)).await?;
+    let meta_ns = companion(db, sparse_vectors_meta_ns(namespace)).await?;
     // Nothing routes to the posting any more, so its key set only shrinks; one
     // more pass covers anything a concurrent writer left.
     for _ in 0..2 {
@@ -1224,7 +1231,7 @@ mod tests;
 /// `posting → chunks`, counted from the stored keys' values.
 pub async fn recount_chunks(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
     let mut out = HashMap::new();
-    for (k, v) in db.namespace(sparse_vectors_ns(namespace)).await?.scan_prefix(Vec::new()).await? {
+    for (k, v) in companion(db, sparse_vectors_ns(namespace)).await?.scan_prefix(Vec::new()).await? {
         if let Some((p, _)) = composite_key::decode(&k) {
             let n = VectorIndex::list_from_bytes(&v).map_err(|e| corrupt(namespace, e))?.len() as u64;
             *out.entry(p).or_insert(0) += n;

@@ -433,6 +433,7 @@ impl SemanticSearchContext {
     /// return.
     pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
         self.check_model(settings)?;
+        crate::vector_kv::create_vector_namespaces(db, namespace).await?;
         if !crate::vector_kv::ivf_exists(db, namespace).await? {
             crate::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
             self.ivfs.write().retain(|(name, _), _| name != namespace);
@@ -448,9 +449,9 @@ impl SemanticSearchContext {
     /// Start dropping `namespace`'s vector index: refuse to load or hand out
     /// its partition from now on, stop maintenance and vector writes on every
     /// loaded one, and wait for any maintenance operation and vector write in
-    /// progress to finish. Only then may the caller remove the namespaces:
-    /// maintenance and vector writes resolve them with get-or-create and would
-    /// bring them back. The vector worker holds a partition for a whole pass,
+    /// progress to finish. Only then may the caller remove the namespaces: a
+    /// write still using them could land in a store being removed, or in the new
+    /// partition of one enabled again. The vector worker holds a partition for a whole pass,
     /// so it checks [`PartitionHandle::is_dropped`] inside the routing epoch
     /// before each write. Call [`end_drop`](Self::end_drop) once they are gone.
     pub async fn begin_drop(&self, namespace: &str) {

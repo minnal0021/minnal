@@ -1,7 +1,10 @@
 //! Vector KV store integration for semantic-search-enabled namespaces.
 //!
-//! Each document namespace that has `semantic_search_enabled = true` gets three
-//! companion minnal_db namespaces managed entirely by this module:
+//! Each document namespace that has `semantic_search_enabled = true` gets these
+//! companion minnal_db namespaces, plus a maintenance journal, managed entirely by
+//! this module. [`create_vector_namespaces`] creates them, when the namespace is
+//! seeded; everything else resolves them without creating, so a write that
+//! outlives a drop cannot bring them back.
 //!
 //! | Internal namespace        | Key                            | Value                                    |
 //! |---------------------------|--------------------------------|------------------------------------------|
@@ -130,8 +133,7 @@ pub fn dense_vectors_ns(namespace: &str) -> String {
 }
 
 /// Internal namespace for a namespace's centres: `centre_id (4B BE) → f32 LE × D`.
-/// What codes are encoded against; append-only, and kept when the vector index
-/// is dropped (the model is fixed, so re-enabling reuses it).
+/// What codes are encoded against; append-only, and removed with the vector index.
 pub fn ivf_centres_ns(namespace: &str) -> String {
     format!("{}_ivf_centres", namespace)
 }
@@ -160,6 +162,18 @@ pub const VECTOR_DATA_SUFFIXES: [&str; 6] = COMPANION_SUFFIXES;
 /// Every companion namespace name of `namespace`.
 pub fn companion_namespaces(namespace: &str) -> Vec<String> {
     COMPANION_SUFFIXES.iter().map(|suffix| format!("{namespace}{suffix}")).collect()
+}
+
+/// Create every companion namespace of `namespace`; those that exist are left
+/// as they are. The one place they are created: vector writes and partition
+/// maintenance resolve them without creating, so once a drop has removed them,
+/// nothing that outlives it can bring them back. Call it before writing vectors
+/// to a raw namespace; [`init_ivf`] does.
+pub async fn create_vector_namespaces(db: &AsyncDb, namespace: &str) -> Result<(), crate::KVError> {
+    for name in companion_namespaces(namespace) {
+        db.namespace(name).await?;
+    }
+    Ok(())
 }
 
 /// If `name` holds vector-index data of another namespace (see
@@ -498,28 +512,21 @@ pub async fn upsert_vectors(
     }
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
 
-    // Never index into a store that no longer exists.
-    //
-    // The sidecar namespaces below are resolved with get-or-create, so writing
-    // for a dropped store silently **recreates** `{ns}_sparse_vector` and
-    // friends — orphaned namespaces that keep their on-disk data, return to the
-    // registry at every restart, and are never reclaimed. That is reachable
-    // whenever a delete races the vector worker: entries already dispatched for
-    // embedding land after the store is gone. Measured before this guard: a
-    // store deleted with 294 queue entries outstanding left all three sidecars
-    // behind even though the queue itself was cleared correctly.
-    //
-    // Dropping the work is right — the store it belongs to is gone.
-    if !db.list_namespaces().iter().any(|(name, _)| name == namespace) {
-        log::debug!("upsert_vectors: skipping '{namespace}' — the namespace no longer exists");
+    // Never create these: only `create_vector_namespaces` does, so a write that
+    // outlives a drop cannot bring back what the drop removed. Absent means the
+    // vector index is gone, and the work with it.
+    let (Some(sparse_ns), Some(sparse_meta_ns), Some(dense_ns)) = (
+        db.existing_namespace(sparse_vectors_ns(namespace)).await?,
+        db.existing_namespace(sparse_vectors_meta_ns(namespace)).await?,
+        db.existing_namespace(dense_vectors_ns(namespace)).await?,
+    ) else {
+        log::debug!("upsert_vectors: skipping '{namespace}': its vector namespaces do not exist");
         return Ok(PostingDelta::default());
-    }
+    };
 
     // ── Sparse (Pass-1 chunk codes) and the meta ─────────────────────────────
     // The meta is written even when there are no chunks: it also records which
     // text the vectors came from.
-    let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
     let mut new_cluster_groups: std::collections::BTreeMap<u32, Vec<VectorIndex>> = std::collections::BTreeMap::new();
     for vi in vector_indexes.iter().filter(|vi| vi.quantisation_style.is_pass1()) {
         new_cluster_groups.entry(vi.cluster_id).or_default().push(vi.clone());
@@ -563,7 +570,6 @@ pub async fn upsert_vectors(
         .filter(|vi| matches!(vi.quantisation_style, QuantisationStyle::MultiBit { .. }))
         .collect();
     if !dense_vis.is_empty() {
-        let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
         let owned: Vec<VectorIndex> = dense_vis.into_iter().cloned().collect();
         crash_point!();
         dense_ns.put_logged(doc_id_bytes.to_vec(), VectorIndex::list_to_bytes(&owned)).await?;
@@ -632,9 +638,9 @@ pub(crate) async fn lock_docs_vectors<'d>(namespace: &str, docs: impl IntoIterat
 pub async fn delete_vector(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8]) -> Result<PostingDelta, crate::KVError> {
     let _doc = lock_doc_vectors(namespace, doc_id_bytes).await;
     let mut delta = PostingDelta::default();
-    // A namespace that does not exist holds nothing to delete. Resolving these
-    // with get-or-create would recreate a dropped store's vector namespaces: the
-    // worker clears documents after its pass, outside any partition's epoch.
+    // A namespace that does not exist holds nothing to delete, which is the normal
+    // case after a drop: the worker clears documents after its pass, outside any
+    // partition's epoch.
     // Sparse: read cluster IDs from meta, delete each composite key, then delete meta.
     if let Some(sparse_meta_ns) = db.existing_namespace(sparse_vectors_meta_ns(namespace)).await?
         && let Some(meta_bytes) = sparse_meta_ns.get(doc_id_bytes.to_vec()).await?
@@ -693,9 +699,8 @@ pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &
 ///
 /// Both namespaces are resolved once at construction time so that
 /// `scan_sparse_cluster` and `get_dense_entry` never pay a namespace-lookup
-/// cost per call. Resolved without creating them: a namespace with no documents
-/// has neither yet and reads as empty, and a search that outlives its store's
-/// drop must not bring them back.
+/// cost per call. Resolved without creating them: a search that outlives its
+/// store's drop must not bring them back, and what is absent reads as empty.
 pub struct DbVectorStore {
     sparse_ns: Option<AsyncNamespace>,
     dense_ns: Option<AsyncNamespace>,
@@ -1420,7 +1425,9 @@ async fn ivf_rows(db: &AsyncDb, namespace: &str) -> Result<(Vec<(Vec<u8>, Vec<u8
 /// writing a root's centre and its posting leaves none, and `init_ivf` simply
 /// runs again.)
 pub async fn ivf_exists(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KVError> {
-    let postings = db.namespace(ivf_postings_ns(namespace)).await?;
+    let Some(postings) = db.existing_namespace(ivf_postings_ns(namespace)).await? else {
+        return Ok(false);
+    };
     Ok(!postings.scan(None, None, 1).await?.0.is_empty())
 }
 
@@ -1432,6 +1439,7 @@ pub async fn ivf_exists(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KV
 /// semantic search.
 pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), crate::KVError> {
     use crate::semantic_search::{Posting, PostingOrigin, PostingState};
+    create_vector_namespaces(db, namespace).await?;
     let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
     let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
     for ns in [&centres_ns, &postings_ns] {
@@ -1460,6 +1468,7 @@ pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), c
 /// namespace never starts from a centroid file.
 #[cfg(test)]
 pub(crate) async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<u32, Vec<f32>>) -> Result<(), crate::KVError> {
+    create_vector_namespaces(db, namespace).await?;
     let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
     let postings_ns = db.namespace(ivf_postings_ns(namespace)).await?;
     for ns in [&centres_ns, &postings_ns] {
@@ -1845,6 +1854,29 @@ mod doc_vector_race_tests {
         db.shutdown().await.unwrap();
     }
 
+    /// Only seeding creates the vector namespaces. A write that outlives a drop,
+    /// past any check its caller made, is skipped and brings nothing back.
+    #[tokio::test]
+    async fn a_vector_write_after_a_drop_creates_no_namespaces() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        db.namespace("docs".to_string()).await.unwrap();
+        init_ivf(&db, "docs", 8).await.unwrap();
+        for name in companion_namespaces("docs") {
+            assert!(db.existing_namespace(name.clone()).await.unwrap().is_some(), "seeding creates {name}");
+            db.remove_namespace(name).await.unwrap();
+        }
+        // Even with the store itself still there, as after a vector-index drop.
+        let vectors = [VectorIndex::new(1, QuantisationStyle::SingleBit, 0.5, 0.0, 0.01, vec![])];
+        let delta = upsert_vectors(&db, "docs", b"x", "text", &vectors).await.unwrap();
+        assert_eq!(delta, PostingDelta::default());
+        let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n.starts_with("docs_")), "{names:?}");
+        db.shutdown().await.unwrap();
+    }
+
     /// A delete racing an upsert of the same document's vectors must never leave
     /// a sparse cluster key that the document's cluster list does not record —
     /// every clean-up finds keys through that list, so such a key is orphaned for
@@ -1858,6 +1890,7 @@ mod doc_vector_race_tests {
                 .unwrap(),
         );
         db.namespace("docs".to_string()).await.unwrap();
+        create_vector_namespaces(&db, "docs").await.unwrap();
         let vectors = |clusters: &[u32]| -> Vec<VectorIndex> {
             let mut out = vec![VectorIndex::new(
                 1,
@@ -1919,6 +1952,7 @@ mod queue_race_tests {
             .await
             .unwrap();
         db.namespace("docs".to_string()).await.unwrap();
+        create_vector_namespaces(&db, "docs").await.unwrap();
         db
     }
 
@@ -1974,7 +2008,10 @@ mod queue_race_tests {
         enqueue_embed(&db, "docs", b"x", "new store").await.unwrap();
 
         discard_orphaned_entry(&db, &orphaned).await.unwrap();
-        assert_eq!(get_queue_entry(&db, "docs", b"x").await.unwrap().map(|e| e.text).as_deref(), Some("new store"));
+        assert_eq!(
+            get_queue_entry(&db, "docs", b"x").await.unwrap().map(|e| e.text).as_deref(),
+            Some("new store")
+        );
 
         let current = snapshot(&db, b"x").await;
         discard_orphaned_entry(&db, &current).await.unwrap();
@@ -2468,11 +2505,10 @@ mod vector_upsert_tests {
         let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
             .await
             .unwrap();
-        // `upsert_vectors` refuses to index into a namespace that does not
-        // exist — it will not resurrect the sidecars of a dropped store. These
-        // tests address the sidecars directly, so create the parent namespace
-        // they name, exactly as a real store would.
+        // `upsert_vectors` never creates the vector namespaces, so a write cannot
+        // bring back a dropped store's. Create them, as seeding a real store does.
         db.namespace("docs".to_owned()).await.unwrap();
+        create_vector_namespaces(&db, "docs").await.unwrap();
         db
     }
 
@@ -2668,6 +2704,7 @@ mod vector_upsert_tests {
         // vector writes alone, not namespace setup.
         for name in &vector_namespaces {
             db.namespace(name.clone()).await.unwrap();
+            create_vector_namespaces(&db, name).await.unwrap();
         }
         let coordinator = db.coordinator_for_test();
 
@@ -3122,11 +3159,10 @@ mod dual_style_tests {
         let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
             .await
             .unwrap();
-        // `upsert_vectors` refuses to index into a namespace that does not
-        // exist — it will not resurrect the sidecars of a dropped store. These
-        // tests address the sidecars directly, so create the parent namespace
-        // they name, exactly as a real store would.
+        // `upsert_vectors` never creates the vector namespaces, so a write cannot
+        // bring back a dropped store's. Create them, as seeding a real store does.
         db.namespace("docs".to_owned()).await.unwrap();
+        create_vector_namespaces(&db, "docs").await.unwrap();
         db
     }
 
@@ -3607,6 +3643,7 @@ mod real_kv_profile {
             // `upsert_vectors` silently skips a namespace that is not registered (so a
             // dropped store is never resurrected), so the parent must exist first.
             db.namespace(ns.to_string()).await.unwrap();
+            create_vector_namespaces(&db, ns).await.unwrap();
 
             // Populate: one MultiBit dense whole-doc vector + `cpd` SingleBit chunks per
             // doc, quantised against the real centroids and written through the
@@ -3758,10 +3795,10 @@ pub(crate) mod eval_indexing {
         docs: Vec<(u64, String)>,
         concurrency: usize,
     ) -> (usize, usize, Option<String>) {
-        // `upsert_vectors` silently skips a namespace that is not registered (so a
-        // dropped store is never resurrected), so the parent must exist first —
-        // without this every upsert is an `Ok` no-op and the index stays empty.
-        if let Err(e) = db.namespace(ns.to_string()).await {
+        // `upsert_vectors` silently skips a namespace without its vector namespaces
+        // (so a dropped store is never resurrected). Without this every upsert is
+        // an `Ok` no-op and the index stays empty.
+        if let Err(e) = super::create_vector_namespaces(db, ns).await {
             return (0, docs.len(), Some(format!("create namespace '{ns}': {e}")));
         }
         let sem = Arc::new(Semaphore::new(concurrency));
@@ -3852,6 +3889,7 @@ mod crash_audit_tests {
             .await
             .unwrap();
         db.namespace(NS.to_string()).await.unwrap();
+        create_vector_namespaces(&db, NS).await.unwrap();
         db
     }
 

@@ -218,7 +218,7 @@ async fn rebuild_locked(
     write_record(db, namespace, op, &record).await?;
 
     // 2. Prepare: centres and new postings (not yet routable), old ones draining.
-    let centres_ns = db.namespace(ivf_centres_ns(namespace)).await?;
+    let centres_ns = companion(db, ivf_centres_ns(namespace)).await?;
     let mut new_centres = Vec::with_capacity(centres.len());
     let mut changed = Vec::with_capacity(centres.len() + active.len());
     for (i, c) in centres.into_iter().enumerate() {

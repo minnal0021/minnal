@@ -1119,9 +1119,8 @@ mod with_service {
 
     /// Dropping a vector index, or its whole store, while a maintenance
     /// operation runs must wait for the operation and stop maintenance on that
-    /// partition. Maintenance resolves namespaces with get-or-create, so a write
-    /// it made after the drop recreated the dropped namespaces: orphans that
-    /// return at every restart, or stray postings in a re-enabled partition.
+    /// partition. A write it made after the drop would land in a store being
+    /// removed, or leave stray postings in a re-enabled partition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_drop_waits_for_running_maintenance_and_stops_it() {
         for drop_store in [false, true] {
@@ -1440,6 +1439,36 @@ mod with_service {
         store.clear_doc_vectors_if_any("g", &DocId::U64(1).to_bytes()).await.unwrap();
         let left = companions_left(&store, "g");
         assert!(left.is_empty(), "recreated: {left:?}");
+        store.shutdown().await.unwrap();
+    }
+
+    /// Every companion exists from the moment a store is semantic, however the
+    /// store got there: writers rely on it and never create one. A store saved
+    /// without them gets them at open rather than silently indexing nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_semantic_store_has_its_vector_namespaces_from_the_start() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        let mut left = companions_left(&store, "g");
+        left.sort();
+        let mut all = vector_kv::companion_namespaces("g");
+        all.sort();
+        assert_eq!(left, all, "seeding creates them all");
+        store.db.remove_namespace(vector_kv::sparse_vectors_ns("g")).await.unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
+            .await
+            .unwrap()
+            .with_semantic_search(context(&url));
+        let names = companions_left(&store, "g");
+        assert!(names.contains(&vector_kv::sparse_vectors_ns("g")), "open restores it: {names:?}");
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(store.count_indexed_docs("g").await, 1);
         store.shutdown().await.unwrap();
     }
 

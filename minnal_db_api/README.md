@@ -588,7 +588,8 @@ vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
 `enable_vector_index` with the new field set. A field that is already a `str`
 attribute (as the old embedding fields are after the drop) becomes an
 embedding field; any other name is added as a `str` attribute. It returns `409`
-if a vector index already exists, and `400` if `fields` is empty, contains
+if a vector index already exists or the previous one is still being removed, and
+`400` if `fields` is empty, contains
 duplicates, or names an index field or an attribute of another type.
 
 **Change search or partition settings:** once semantic search is enabled, the
@@ -2552,4 +2553,7 @@ them from an in-memory copy that each schema change updates. Every schema
 declares a mandatory `store_type` field — `"doc"` or `"kv"` — which tells the
 two kinds apart. Both kinds share the namespace names, so a doc store and a KV
 store cannot have the same name, and no store may be named `system` or start
-with `system_`.
+with `system_`. A store's name also cannot end in `_sparse_vector`,
+`_sparse_vector_meta`, `_dense_vector`, `_ivf_centres`, `_ivf_postings` or
+`_ivf_journal`: those namespaces hold the vector index of the store named by the
+rest.

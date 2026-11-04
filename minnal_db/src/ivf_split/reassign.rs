@@ -281,7 +281,7 @@ pub(super) async fn run(
     let mut reuse = None;
     if record.state == JournalState::Planned {
         let (selected, skipped) = select(db, namespace, &ivf, ops, parent_centre, children, &sources).await?;
-        let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
+        let sparse = companion(db, sparse_vectors_ns(namespace)).await?;
         let (rule, ivf, sparse) = (&rule, &ivf, &sparse);
         let counts = in_batches(namespace, handle, &selected, |batch| async move {
             let _docs = lock_docs_vectors(namespace, batch.iter().map(|(doc, _)| doc.as_slice())).await;
@@ -401,8 +401,8 @@ async fn shrink_sources(
     rule: &Rule<'_>,
     batch: &[Selected],
 ) -> Result<(), crate::KVError> {
-    let sparse = db.namespace(sparse_vectors_ns(namespace)).await?;
-    let meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
+    let sparse = companion(db, sparse_vectors_ns(namespace)).await?;
+    let meta_ns = companion(db, sparse_vectors_meta_ns(namespace)).await?;
     // Each (document, source) key, its codes, and which go where.
     struct Entry {
         doc: usize,

@@ -328,14 +328,7 @@ impl VecIndexWorker {
             //
             // Store deletion and the queue are separate writes, so a delete that
             // races this worker — or a crash between the two — can strand entries
-            // for a namespace that is gone. Processing one calls `upsert_vectors`,
-            // which resolves `{ns}_sparse_vector` and friends through
-            // get-or-create, and so **recreates the dropped store's vector sidecar
-            // namespaces**. Observed in a stress run: a store at ns_id 22 was
-            // deleted and its sidecars reappeared as ns_ids 30/34/38 — ids are
-            // monotonic and never reused, so they were created after the drop.
-            // They then survive on disk, come back in the registry at every
-            // restart, and are never cleaned up.
+            // for a namespace that is gone. Nothing would ever complete them.
             let live_namespaces: std::collections::HashSet<String> = self.db.list_namespaces().into_iter().map(|(name, _)| name).collect();
 
             // Separate entries at max retries (leave in queue, admin must clear).

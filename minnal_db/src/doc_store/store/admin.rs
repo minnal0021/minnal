@@ -69,7 +69,7 @@ impl DocStore {
     /// schema under this name. The default namespace always exists.
     async fn remove_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
         if name != crate::db::namespace::DEFAULT_NAMESPACE && self.db.existing_namespace(name.to_owned()).await?.is_some() {
-            warn!("removing namespace '{name}', left without a schema, before creating a store with its name");
+            log::warn!("removing namespace '{name}', left without a schema, before creating a store with its name");
             self.db.remove_namespace(name.to_owned()).await?;
         }
         Ok(())
@@ -274,10 +274,10 @@ impl DocStore {
         }
     }
 
-    /// Give `namespace` its starting partition (one root posting at the zero
-    /// centre), unless it already has one. Without an attached semantic context
-    /// there is nothing to check the model against; the namespace gets its
-    /// partition when it is next enabled with one.
+    /// Create `namespace`'s vector namespaces and give it its starting partition
+    /// (one root posting at the zero centre), unless it already has one. Without
+    /// an attached semantic context there is nothing to check the model against;
+    /// the namespace gets its partition when it is next enabled with one.
     async fn seed_vector_index(
         &self,
         _namespace: &str,
@@ -285,8 +285,9 @@ impl DocStore {
         _vector_index: &mut Option<crate::doc_store::vector_settings::VectorIndexSpec>,
     ) -> Result<(), DocStoreError> {
         #[cfg(feature = "semantic-search")]
-        if let Some(ctx) = &self.semantic_ctx {
-            ctx.init_namespace(&self.db, _namespace, _settings).await?;
+        match &self.semantic_ctx {
+            Some(ctx) => ctx.init_namespace(&self.db, _namespace, _settings).await?,
+            None => vector_kv::create_vector_namespaces(&self.db, _namespace).await?,
         }
         Ok(())
     }
@@ -452,6 +453,27 @@ impl DocStore {
         Ok(leftover.len())
     }
 
+    /// Create the vector namespaces of every semantic-search store that lacks
+    /// them. Writers never create them, so a store saved before seeding did
+    /// would otherwise index nothing. Called at open, before any drop can run.
+    #[cfg(feature = "semantic-search")]
+    pub(super) async fn create_missing_vector_namespaces(&self) -> Result<(), DocStoreError> {
+        let docs = self
+            .load_all_schemas()?
+            .into_iter()
+            .filter(|s| s.is_semantic_search_enabled())
+            .map(|s| s.namespace.clone());
+        let kvs = self
+            .load_all_kv_schemas()?
+            .into_iter()
+            .filter(|s| s.is_semantic_search_enabled())
+            .map(|s| s.namespace.clone());
+        for namespace in docs.chain(kvs) {
+            vector_kv::create_vector_namespaces(&self.db, &namespace).await?;
+        }
+        Ok(())
+    }
+
     /// Delete all vector-index backing data for a namespace.
     ///
     /// Clears:
@@ -598,13 +620,8 @@ pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schem
 async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore, namespace: &str, ns_id: u32) -> Result<(), DocStoreError> {
     // Clear this namespace's pending embed-queue entries FIRST.
     //
-    // The queue outlives the store otherwise, and the vector worker then embeds
-    // those entries — resolving `{ns}_sparse_vector` and friends through
-    // get-or-create, which **recreates the sidecar namespaces of the store we are
-    // deleting**. They survive on disk, return to the registry at every restart,
-    // and are never reclaimed: three orphaned namespaces per dropped semantic
-    // store. `drop_vector_index_data` has always cleared the queue; this path did
-    // not.
+    // The queue outlives the store otherwise, and a store recreated under the
+    // same name would inherit entries for documents it does not hold.
     //
     // Best-effort, and deliberately not the only guard: the worker may already be
     // mid-entry, and a crash here would strand the rest. `VecIndexWorker` also
@@ -681,7 +698,10 @@ mod tests {
         }
         store.create(make_schema("ghost_doc", vec![])).await.unwrap();
         assert!(store.get("ghost_doc", DocId::U64(1)).await.unwrap().is_none());
-        store.create_kv(make_kv_schema("ghost_kv", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+        store
+            .create_kv(make_kv_schema("ghost_kv", KvKeyType::Str, KvValueType::Str))
+            .await
+            .unwrap();
         let ns = store.db.existing_namespace("ghost_kv".to_owned()).await.unwrap().unwrap();
         assert!(ns.get(1u64.to_be_bytes().to_vec()).await.unwrap().is_none());
         store.shutdown().await.unwrap();
@@ -694,9 +714,18 @@ mod tests {
         for suffix in crate::db::namespace::VECTOR_COMPANION_SUFFIXES {
             let name = format!("foo{suffix}");
             let err = store.create(make_schema(&name, vec![])).await.unwrap_err();
-            assert!(matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })), "{name}: {err:?}");
-            let err = store.create_kv(make_kv_schema(&name, KvKeyType::Str, KvValueType::Str)).await.unwrap_err();
-            assert!(matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })), "{name}: {err:?}");
+            assert!(
+                matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })),
+                "{name}: {err:?}"
+            );
+            let err = store
+                .create_kv(make_kv_schema(&name, KvKeyType::Str, KvValueType::Str))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })),
+                "{name}: {err:?}"
+            );
         }
         assert!(store.list().unwrap().is_empty());
         store.shutdown().await.unwrap();
@@ -718,7 +747,9 @@ mod tests {
         store.shutdown().await.unwrap();
         drop(store);
 
-        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await.unwrap();
+        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
+            .await
+            .unwrap();
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by the restart");
         store.remove("foo").await.unwrap();
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by dropping foo");
@@ -944,13 +975,9 @@ mod tests {
 
     /// Regression: dropping a semantic store must clear its embed-queue entries.
     ///
-    /// Left behind, the vector worker embeds them afterwards — and
-    /// `upsert_vectors` resolves `{ns}_sparse_vector` and friends through
-    /// get-or-create, so it **recreates the sidecar namespaces of the store that
-    /// was just deleted**. Seen in a stress run: a store at ns_id 22 was dropped
-    /// and its sidecars reappeared as ns_ids 30/34/38. Ids are monotonic and
-    /// never reused, so they were created after the drop; they then survive on
-    /// disk and return to the registry at every restart, forever.
+    /// Left behind, they outlive the store. They once brought back its vector
+    /// namespaces: a store at ns_id 22 was dropped in a stress run and they
+    /// reappeared as ns_ids 30/34/38.
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn test_drop_store_clears_its_embed_queue() {

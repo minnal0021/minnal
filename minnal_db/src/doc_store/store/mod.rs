@@ -200,6 +200,8 @@ impl DocStore {
         // this): finish vector-index drops a crash interrupted.
         #[cfg(feature = "semantic-search")]
         store.finish_interrupted_vector_index_drops().await?;
+        #[cfg(feature = "semantic-search")]
+        store.create_missing_vector_namespaces().await?;
 
         // Start background workers after all indices are activated so the
         // index checkpoint worker's first immediate tick captures a complete

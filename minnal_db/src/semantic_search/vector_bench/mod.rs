@@ -1185,6 +1185,7 @@ async fn vector_bench_worker_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap();
         let parent = db.namespace(ns.clone()).await.unwrap();
+        crate::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
         for d in 0..frozen.n_docs() {
             let id = (d as u64).to_be_bytes();
             parent.put(id.to_vec(), b"{}".to_vec()).await.unwrap();
