@@ -19,6 +19,7 @@ re-check them before starting work.
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
+| [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`store/lsm`) | Low | Proposed |
 
 ---
 
@@ -1224,3 +1225,104 @@ patch.
 The design and its risk table are in
 `minnal_db/src/semantic_search/report/Dynamic-RaBitQ-Index-Design.md` →
 *Known limitation: centres are never collected*.
+
+---
+
+## FR-009 — A blocked SIMD Bloom filter for L1 lookups
+
+**Filed:** 2026-11-04
+**Area:** `minnal_db` (`src/store/lsm/bloom.rs`)
+**Severity:** Low — read latency on misses; no effect on results
+**Source:** SIMD survey, 2026-11-04. Needs a bare-metal measurement before any
+decision.
+
+### Summary
+
+A point lookup that misses asks the Bloom filter of each candidate L1 file whether
+the key can be there. Today's filter (`BloomFilter`) hashes the key twice and tests
+7 bit positions spread over the whole filter, each found with a 64-bit modulo.
+
+A blocked filter hashes once and tests 8 bits inside one 256-bit block: one cache
+line, tested in one AVX2 instruction. A miss was 2.6 times faster in a prototype,
+at the price of a higher false-positive rate.
+
+### Measurements so far
+
+One million 12-byte keys and a 1.25 MB filter at 10 bits per key, on an AMD Ryzen AI
+9 HX 375 under WSL2. Times exclude fetching the key.
+
+| | Hit | Miss | False positives | Build, 1M keys |
+|---|---|---|---|---|
+| Today | 95 ns | 87 ns | 0.82% | 54 ms |
+| Blocked, AVX2 | 36 ns | 34 ns | 1.30% | 19 ms |
+
+These numbers are not enough to decide on, for three reasons:
+
+- **Noise.** With another load on the machine the same code measured 121 ns and
+  66 ns for a miss, so the ratio moved from 2.6 to 1.8.
+- **Cache size.** The filter is little larger than this CPU's 1 MB per-core L2 cache
+  and well inside its 16 MB L3. The blocked filter's main advantage (one cache miss
+  against up to seven) grows on filters beyond those, and no such size was measured.
+- **The filter alone.** Nothing measured a whole `get`, where a false positive costs
+  a sparse-index search and a scan of the file: 0.48 more false positives per 100
+  misses may cancel part of the gain.
+
+Much of the gain is not SIMD: one hash instead of two (a hash costs about 23 ns here)
+and no modulo. A scalar blocked filter should be measured alongside the AVX2 one.
+
+### Prototype
+
+The hash is `mm3h::Murmur3Hasher`, whose `finish()` holds only **32 bits**. Taking the
+block from `h >> 32` puts every key in block 0 and reports 100% false positives, so
+both the block and the bit positions must come from the low 32 bits.
+
+```rust
+const SALT: [u32; 8] = [0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d,
+                        0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31];
+
+struct Blocked { blocks: Vec<[u32; 8]>, n: u64 } // n = keys * 10 / 256 + 1
+
+/// The block index (`(h * n) >> 32`) comes from `h`, the bit positions from `x`.
+fn mix(hash: u64) -> (u64, u32) {
+    let h = hash as u32;
+    (u64::from(h), (h ^ (h >> 15)).wrapping_mul(0x2c1b3c6d))
+}
+// insert: for j in 0..8 { block[j] |= 1 << (x.wrapping_mul(SALT[j]) >> 27) }
+
+#[target_feature(enable = "avx2")]
+unsafe fn may_contain(&self, hash: u64) -> bool {
+    use std::arch::x86_64::*;
+    let (h, x) = mix(hash);
+    let block = &self.blocks[((h * self.n) >> 32) as usize];
+    let positions = _mm256_srli_epi32(
+        _mm256_mullo_epi32(_mm256_set1_epi32(x as i32), _mm256_loadu_si256(SALT.as_ptr().cast())),
+        27,
+    );
+    let wanted = _mm256_sllv_epi32(_mm256_set1_epi32(1), positions);
+    _mm256_testc_si256(_mm256_loadu_si256(block.as_ptr().cast()), wanted) == 1
+}
+```
+
+### Why it can be tried cheaply
+
+The filter is derived and in memory: it is rebuilt from the file on open and after a
+compaction, and never written to disk. Changing its layout needs no format change, and
+a crash cannot leave one layout on disk for the other to read.
+
+### What to measure on bare metal
+
+- Whole lookups: `cargo bench --bench bench_sstable_lookup` (its L1 misses) and
+  `cargo bench --bench bench_read` (`read/get_miss`).
+- Filters above and below the L2 and L3 cache sizes (1M, 10M and 100M keys).
+- Today's filter, a scalar blocked filter and the AVX2 one, at 10 and 12 bits per key,
+  as more bits would buy back the false-positive rate.
+- Inputs varied between iterations, as a repeated input lets the branch predictor
+  memorise it.
+
+### Acceptance criteria
+
+- No false negatives, by test, on every path.
+- A blocked path for AVX2 (runtime-detected), for NEON and scalar: each path gives the
+  same answers for the same filter.
+- A whole-`get` miss measurably faster than today across the sizes above, including
+  the cost of false positives. If it is not, close this request.
