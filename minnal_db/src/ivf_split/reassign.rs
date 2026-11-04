@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
+use crate::semantic_search::simd::{bit_planes_ip_best, packed_ip_best};
 
 /// The reassignment to record after `parent`'s split into `children`: the
 /// halves plus the `reassign_range` active postings nearest the old centre.
@@ -53,66 +54,38 @@ pub(super) fn plan(ivf: &NamespaceIvf, ops: &MaintenanceOps, parent: u32, childr
     })
 }
 
-/// `⟨σ, v⟩` for a 1-bit code's sign vector `σ` (`+1` where its bit is set,
-/// `−1` elsewhere), by table lookup: one 256-entry table per byte of the packed
-/// bits, holding the sum of `v` over the bits set in that byte. 96 lookups for
-/// 768 dimensions, against a full reconstruction and a distance.
-struct SignDot {
-    tables: Vec<[f32; 256]>,
+/// A target centre `v`, with the terms a code's score needs from it alone.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    v: &'a [f32],
+    /// `‖v‖²`.
+    norm_sq: f64,
+    /// `Σv`.
     total: f32,
 }
 
-impl SignDot {
-    fn new(v: &[f32]) -> Self {
-        let tables = v
-            .chunks(8)
-            .map(|byte| {
-                let mut t = [0.0f32; 256];
-                for b in 1..256usize {
-                    // The table of `b` is that of `b` without its lowest bit,
-                    // plus the dimension of that bit.
-                    t[b] = t[b & (b - 1)] + byte.get(b.trailing_zeros() as usize).copied().unwrap_or(0.0);
-                }
-                t
-            })
-            .collect();
-        Self {
-            tables,
-            total: v.iter().sum(),
-        }
-    }
-
-    fn dot(&self, packed: &[u64]) -> f64 {
-        f64::from(2.0 * self.set(packed) - self.total)
-    }
-
-    /// `⟨b, v⟩` for the bits `b` of one plane: the sum of `v` over the set bits.
-    fn set(&self, packed: &[u64]) -> f32 {
-        let mut set = 0.0f32;
-        for (j, t) in self.tables.iter().enumerate() {
-            set += t[((packed[j / 8] >> (8 * (j % 8))) & 0xff) as usize];
-        }
-        set
+impl Target<'_> {
+    /// `⟨σ, v⟩` for a 1-bit code's sign vector `σ` (`+1` where its bit is set,
+    /// `−1` elsewhere).
+    fn sign_dot(&self, packed: &[u64]) -> f64 {
+        f64::from(2.0 * packed_ip_best(packed, self.v, self.v.len()) - self.total)
     }
 
     /// `⟨x̂ − c, v⟩` for a code's reconstruction `x̂` against its own centre `c`
     /// ([`reconstruct_code`](crate::semantic_search::quantisation::rabitq::reconstruct_code)),
     /// without reconstructing it: `s⟨σ, v⟩` for a 1-bit code, and for a bit-plane
-    /// code `−s(Σ_j 2^j⟨b_j, v⟩ + c_b Σv)`, one table pass per plane. The code must
-    /// match the dimension (checked by the caller).
-    fn residual_dot(&self, code: &VectorIndex, dim: usize) -> f64 {
+    /// code `−s(Σ_j 2^j⟨b_j, v⟩ + c_b Σv)`. The code must match the dimension
+    /// (checked by the caller).
+    fn residual_dot(&self, code: &VectorIndex) -> f64 {
         use crate::semantic_search::index::vector_index::QuantisationStyle;
         let s = f64::from(code.scaling_factor);
         match code.quantisation_style {
             QuantisationStyle::BitPlanes { number_of_bits: bits } => {
-                let words = dim.div_ceil(64);
-                let planes: f64 = (0..bits)
-                    .map(|j| f64::from(1u32 << j) * f64::from(self.set(&code.packed_vector[j * words..])))
-                    .sum();
+                let planes = f64::from(bit_planes_ip_best(&code.packed_vector, self.v, self.v.len(), bits));
                 let shift = -(f64::from(1u32 << (bits - 1)) - 0.5);
                 -s * (planes + shift * f64::from(self.total))
             }
-            _ => s * self.dot(&code.packed_vector),
+            _ => s * self.sign_dot(&code.packed_vector),
         }
     }
 }
@@ -120,14 +93,14 @@ impl SignDot {
 /// Distances from a code's reconstruction to a few fixed centres, without
 /// reconstructing it. With `x̂` its reconstruction against its own centre `c`
 /// (`c + s·σ` at 1 bit, `c − s·(u + c_b)` for bit planes),
-/// `D(x̂, t) − ‖x̂‖² = ‖t‖² − 2⟨c, t⟩ − 2⟨x̂ − c, t⟩`, the last term from per-byte
-/// tables (`SignDot::residual_dot`): comparing that *score*
+/// `D(x̂, t) − ‖x̂‖² = ‖t‖² − 2⟨c, t⟩ − 2⟨x̂ − c, t⟩`, the last term from the
+/// packed-code kernels (`Target::residual_dot`): comparing that *score*
 /// across targets is comparing distances. `⟨c, t⟩` is cached per (own centre,
 /// target), since a scope's codes share few centres. Targets are keyed by
 /// centre id.
 struct Scorer<'a> {
     ivf: &'a NamespaceIvf,
-    targets: parking_lot::Mutex<HashMap<u32, std::sync::Arc<(f64, SignDot)>>>,
+    targets: parking_lot::Mutex<HashMap<u32, Target<'a>>>,
     own: parking_lot::Mutex<HashMap<(u32, u32), f64>>,
 }
 
@@ -146,11 +119,15 @@ impl<'a> Scorer<'a> {
         let target = {
             let mut targets = self.targets.lock();
             match targets.get(&t) {
-                Some(x) => std::sync::Arc::clone(x),
+                Some(x) => *x,
                 None => {
-                    let c = self.ivf.rotated_centre(t)?;
-                    let made = std::sync::Arc::new((c.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>(), SignDot::new(c)));
-                    targets.insert(t, std::sync::Arc::clone(&made));
+                    let v = self.ivf.rotated_centre(t)?;
+                    let made = Target {
+                        v,
+                        norm_sq: v.iter().map(|&x| f64::from(x) * f64::from(x)).sum(),
+                        total: v.iter().sum(),
+                    };
+                    targets.insert(t, made);
                     made
                 }
             }
@@ -168,7 +145,7 @@ impl<'a> Scorer<'a> {
                 d
             }
         };
-        Some(target.0 - 2.0 * (own + target.1.residual_dot(code, self.ivf.dim())))
+        Some(target.norm_sq - 2.0 * (own + target.residual_dot(code)))
     }
 
     /// Whether centre `a` is nearer to the code than centre `b`, as
@@ -558,7 +535,12 @@ mod tests {
             let explicit: f64 = (0..dim)
                 .map(|i| f64::from(v[i]) * if (packed[i / 64] >> (i % 64)) & 1 == 1 { 1.0 } else { -1.0 })
                 .sum();
-            let got = SignDot::new(&v).dot(&packed);
+            let target = Target {
+                v: &v,
+                norm_sq: 0.0,
+                total: v.iter().sum(),
+            };
+            let got = target.sign_dot(&packed);
             assert!((got - explicit).abs() < 1e-3, "dim {dim}: {got} vs {explicit}");
         }
     }

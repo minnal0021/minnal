@@ -312,8 +312,8 @@ reading more bytes (B5).
 Splits (2-means), rebuilds (k-means) and the recall check reconstruct each
 chunk from its code (`reconstruct_code`): `c + s·(2b − 1)` at 1 bit, and
 `c − s·(u + c_b)` for a bit-plane code with per-dimension value `u` and shift
-`c_b = −(2^(b−1) − 0.5)`. Reassignment decides from per-byte lookup tables
-without reconstructing; for bit planes it sums one table pass per plane. Its
+`c_b = −(2^(b−1) − 0.5)`. Reassignment decides from the packed-code inner-product kernels Pass 1 scores
+with, without reconstructing. Its
 test (`the_scorer_decides_as_the_reconstruction_does`) checks it against the
 reconstruction at 1, 2 and 4 bits. Codes still keep the centre they were
 encoded against when moved, and maintenance still makes no embedding calls.

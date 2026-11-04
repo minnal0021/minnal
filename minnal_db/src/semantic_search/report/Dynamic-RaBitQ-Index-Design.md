@@ -1968,8 +1968,8 @@ decisions the final code reproduces.)
 in 245 s. A profile showed maintenance spent 172 of 241 s deciding which scope
 chunks move (every chunk checked against a few centres, twice per split), 32 s
 reading the scope, and about 10 s on all WAL writes together. The decision is
-now made once per split, without reconstructing codes (`Scorer`: per-byte lookup
-tables for `⟨σ, t⟩`, cached `⟨c, t⟩`; only a candidate is reconstructed), the
+now made once per split, without reconstructing codes (`Scorer`: the packed-code
+kernels for `⟨σ, t⟩`, cached `⟨c, t⟩`; only a candidate is reconstructed), the
 scope is read in one batched scan, and per-document moves run in locked batches
 of 64 with batched reads, four at a time: 245 → 91 → 55 → 47 s. Every step gives
 the same partition. Scheduling batches on demand instead of in fixed lanes
