@@ -698,16 +698,18 @@ pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &
 ///
 /// Both namespaces are resolved once at construction time so that
 /// `scan_sparse_cluster` and `get_dense_entry` never pay a namespace-lookup
-/// cost per call.
+/// cost per call. Resolved without creating them: a namespace with no documents
+/// has neither yet and reads as empty, and a search that outlives its store's
+/// drop must not bring them back.
 pub struct DbVectorStore {
-    sparse_ns: AsyncNamespace,
-    dense_ns: AsyncNamespace,
+    sparse_ns: Option<AsyncNamespace>,
+    dense_ns: Option<AsyncNamespace>,
 }
 
 impl DbVectorStore {
     pub async fn new(db: &AsyncDb, namespace: &str) -> Result<Self, crate::KVError> {
-        let sparse_ns = db.namespace(sparse_vectors_ns(namespace)).await?;
-        let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
+        let sparse_ns = db.existing_namespace(sparse_vectors_ns(namespace)).await?;
+        let dense_ns = db.existing_namespace(dense_vectors_ns(namespace)).await?;
         Ok(Self { sparse_ns, dense_ns })
     }
 }
@@ -716,7 +718,10 @@ impl VectorKvStore for DbVectorStore {
     async fn scan_sparse_cluster(&self, cluster_id: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KVError> {
         // Prefix = cluster_id (4B BE) — only entries for this cluster are returned.
         let prefix = cluster_id.to_be_bytes().to_vec();
-        let entries = self.sparse_ns.scan_prefix(prefix).await?;
+        let Some(sparse_ns) = &self.sparse_ns else {
+            return Ok(Vec::new());
+        };
+        let entries = sparse_ns.scan_prefix(prefix).await?;
 
         Ok(entries
             .into_iter()
@@ -728,15 +733,24 @@ impl VectorKvStore for DbVectorStore {
     }
 
     async fn get_dense_entry(&self, doc_id_bytes: &[u8]) -> Result<Option<Vec<u8>>, crate::KVError> {
-        self.dense_ns.get(doc_id_bytes.to_vec()).await
+        match &self.dense_ns {
+            Some(dense_ns) => dense_ns.get(doc_id_bytes.to_vec()).await,
+            None => Ok(None),
+        }
     }
 
     async fn get_dense_entries_batch(&self, doc_ids: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, crate::KVError> {
-        self.dense_ns.get_multiple(doc_ids.to_vec()).await
+        match &self.dense_ns {
+            Some(dense_ns) => dense_ns.get_multiple(doc_ids.to_vec()).await,
+            None => Ok(vec![None; doc_ids.len()]),
+        }
     }
 
     async fn scan_sparse_clusters_batch(&self, cluster_ids: &[u32]) -> Result<SparseScan, crate::KVError> {
-        Ok(SparseScan::new(self.sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await?))
+        match &self.sparse_ns {
+            Some(sparse_ns) => Ok(SparseScan::new(sparse_ns.scan_prefixes_batch(cluster_ids.to_vec()).await?)),
+            None => Ok(SparseScan::default()),
+        }
     }
 }
 
@@ -1392,9 +1406,12 @@ pub(crate) fn decode_posting(posting_id: u32, v: &[u8]) -> Option<crate::semanti
 }
 
 async fn ivf_rows(db: &AsyncDb, namespace: &str) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>), crate::KVError> {
-    let centres = db.namespace(ivf_centres_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
-    let postings = db.namespace(ivf_postings_ns(namespace)).await?.scan_prefix(Vec::new()).await?;
-    Ok((centres, postings))
+    // Without creating them: `load_ivf` can run after a drop removed them.
+    let rows = async |name: String| match db.existing_namespace(name).await? {
+        Some(ns) => ns.scan_prefix(Vec::new()).await,
+        None => Ok(Vec::new()),
+    };
+    Ok((rows(ivf_centres_ns(namespace)).await?, rows(ivf_postings_ns(namespace)).await?))
 }
 
 /// Whether `namespace` holds a partition: at least one posting. (A crash between
@@ -1491,12 +1508,10 @@ pub async fn load_ivf(db: &AsyncDb, namespace: &str, seed: u64) -> Result<Option
 pub async fn count_postings(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, (u64, u64)>, crate::KVError> {
     const PAGE: usize = 4096;
     let mut counts: HashMap<u32, (u64, u64)> = HashMap::new();
-    let meta = sparse_vectors_meta_ns(namespace);
-    // Resolving a namespace creates it: count nothing rather than create one.
-    if !db.list_namespaces().iter().any(|(name, _)| *name == meta) {
+    // Count nothing rather than create the namespace.
+    let Some(ns) = db.existing_namespace(sparse_vectors_meta_ns(namespace)).await? else {
         return Ok(counts);
-    }
-    let ns = db.namespace(meta).await?;
+    };
     let mut cursor = None;
     loop {
         let (page, next) = ns.scan(cursor, None, PAGE).await?;
@@ -1521,12 +1536,11 @@ pub async fn count_postings(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32
 /// the document records' counts ([`count_postings`]).
 pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
     let mut counts = HashMap::new();
-    let sparse = sparse_vectors_ns(namespace);
-    // Resolving a namespace creates it: count nothing rather than create one.
-    if !db.list_namespaces().iter().any(|(name, _)| *name == sparse) {
+    // Count nothing rather than create the namespace.
+    let Some(sparse) = db.existing_namespace(sparse_vectors_ns(namespace)).await? else {
         return Ok(counts);
-    }
-    for key in db.namespace(sparse).await?.keys().await? {
+    };
+    for key in sparse.keys().await? {
         if let Some((posting, _)) = composite_key::decode(&key) {
             *counts.entry(posting).or_insert(0) += 1;
         }
@@ -1784,6 +1798,33 @@ mod ivf_store_tests {
 mod doc_vector_race_tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Search reads through these, and a search can outlive its store's drop.
+    /// A namespace with no partition or no documents reads as empty, and reading
+    /// it creates nothing.
+    #[tokio::test]
+    async fn reading_a_partition_or_its_documents_creates_no_namespaces() {
+        let dir = TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), crate::db::test_support::create_db_config())
+            .await
+            .unwrap();
+        let created = |what: &str| {
+            let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+            assert!(!names.iter().any(|n| n.starts_with("gone_")), "{what}: {names:?}");
+        };
+        assert!(load_ivf(&db, "gone", 0).await.unwrap().is_none());
+        created("load_ivf");
+        assert!(count_postings(&db, "gone").await.unwrap().is_empty());
+        created("count_postings");
+        let store = DbVectorStore::new(&db, "gone").await.unwrap();
+        created("DbVectorStore::new");
+        assert!(store.scan_sparse_cluster(1).await.unwrap().is_empty());
+        assert_eq!(store.get_dense_entry(b"x").await.unwrap(), None);
+        assert_eq!(store.get_dense_entries_batch(&[b"x".to_vec()]).await.unwrap(), vec![None]);
+        assert_eq!(store.scan_sparse_clusters_batch(&[1]).await.unwrap().iter().count(), 0);
+        created("reading through the store");
+        db.shutdown().await.unwrap();
+    }
 
     /// The worker clears a document after its pass, outside any partition's
     /// epoch, so this can run after a drop removed the vector namespaces. There

@@ -320,13 +320,12 @@ async fn delete_record(db: &AsyncDb, namespace: &str, op: u64) -> Result<(), cra
 /// Every unfinished operation in `namespace`'s journal, in `op_id` order.
 async fn records(db: &AsyncDb, namespace: &str) -> Result<Vec<(u64, Record)>, crate::KVError> {
     let mut out = Vec::new();
-    let journal = ivf_journal_ns(namespace);
-    // Resolving a namespace creates it: a namespace that never maintained its
-    // partition has no journal, and reading must not make one.
-    if !db.list_namespaces().iter().any(|(name, _)| *name == journal) {
+    // A namespace that never maintained its partition has no journal, and reading
+    // must not make one.
+    let Some(journal) = db.existing_namespace(ivf_journal_ns(namespace)).await? else {
         return Ok(out);
-    }
-    for (k, v) in db.namespace(journal).await?.scan_prefix(Vec::new()).await? {
+    };
+    for (k, v) in journal.scan_prefix(Vec::new()).await? {
         let op = u64::from_be_bytes(k.as_slice().try_into().map_err(|_| corrupt(namespace, "malformed journal key"))?);
         out.push((
             op,

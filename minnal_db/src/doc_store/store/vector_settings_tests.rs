@@ -1253,6 +1253,93 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// Create a store, run `call` from several tasks while it is dropped, and
+    /// check that nothing of the store came back. Repeated, since the window is
+    /// small, and shut down last: a store left without its files fails there.
+    async fn assert_call_racing_a_drop_recreates_nothing<F, Fut>(rounds: u32, with_docs: bool, call: F)
+    where
+        F: Fn(Arc<DocStore>, String, u64) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = Arc::new(open_fresh(db_dir.path()).await.with_semantic_search(context(&url)));
+        for round in 0..rounds {
+            let name = format!("g{round}");
+            store.create(semantic_schema(&name, Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+            if with_docs {
+                store.put(&name, DocId::U64(0), serde_json::json!({"text": TEXT})).await.unwrap();
+                wait_for_empty_queue(&store).await;
+            }
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tasks: Vec<_> = (0..4u64)
+                .map(|task| {
+                    let (store, name, stop, call) = (Arc::clone(&store), name.clone(), Arc::clone(&stop), call.clone());
+                    tokio::spawn(async move {
+                        let mut i = task * 1_000_000 + 1;
+                        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            call(Arc::clone(&store), name.clone(), i).await;
+                            i += 1;
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                })
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            store.remove(&name).await.unwrap();
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            for t in tasks {
+                t.await.unwrap();
+            }
+            let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+            assert!(!names.contains(&name), "round {round}: the dropped store is back");
+            let left = companions_left(&store, &name);
+            assert!(left.is_empty(), "round {round}: dropped namespaces are back: {left:?}");
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_search_racing_a_drop_recreates_nothing() {
+        assert_call_racing_a_drop_recreates_nothing(15, true, |store, name, _| async move {
+            let _ = store
+                .search_semantic(&name, "hello", &SearchSpec::default(), Pagination::new(1, 10))
+                .await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn counting_indexed_documents_racing_a_drop_recreates_nothing() {
+        assert_call_racing_a_drop_recreates_nothing(5, false, |store, name, _| async move {
+            let _ = store.count_indexed_docs(&name).await;
+        })
+        .await;
+    }
+
+    /// A document with no embedding text checks for vector state to clear
+    /// (`has_any_vector_state`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_without_embedding_text_racing_a_drop_recreates_nothing() {
+        assert_call_racing_a_drop_recreates_nothing(10, false, |store, name, i| async move {
+            let _ = store.put(&name, DocId::U64(i), serde_json::json!({"text": ""})).await;
+        })
+        .await;
+    }
+
+    /// Counting indexed documents only reads, so asking about a store that does
+    /// not exist must not create anything.
+    #[tokio::test]
+    async fn counting_indexed_documents_of_an_unknown_store_creates_nothing() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        assert_eq!(store.count_indexed_docs("nope").await, 0);
+        let left = companions_left(&store, "nope");
+        assert!(left.is_empty(), "{left:?}");
+        store.shutdown().await.unwrap();
+    }
+
     /// Dropping a store while a reindex of it enqueues must leave none of its
     /// entries in the queue: the drop cleared the queue once, and the reindex,
     /// enqueueing from its own scan of the documents, went on after it.

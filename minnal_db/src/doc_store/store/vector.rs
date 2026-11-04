@@ -445,9 +445,9 @@ impl DocStore {
     #[cfg(feature = "semantic-search")]
     pub async fn count_indexed_docs(&self, namespace: &str) -> u64 {
         let meta_ns = vector_kv::sparse_vectors_meta_ns(namespace);
-        match self.db.namespace(meta_ns).await {
-            Ok(ns) => ns.iter().await.map(|v| v.len() as u64).unwrap_or(0),
-            Err(_) => 0,
+        match self.db.existing_namespace(meta_ns).await {
+            Ok(Some(ns)) => ns.iter().await.map(|v| v.len() as u64).unwrap_or(0),
+            Ok(None) | Err(_) => 0,
         }
     }
 
