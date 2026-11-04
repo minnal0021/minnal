@@ -1943,11 +1943,12 @@ async fn async_db_basic_round_trip() {
     db.shutdown().await.unwrap();
 }
 
-/// The WAL GC worker runs, reclaims, and stops cleanly on shutdown.
+/// The WAL GC worker flushes writes left in an idle memtable, so the WAL they
+/// hold can be reclaimed, and stops cleanly on shutdown.
 ///
-/// Asserts on *observable* reclamation rather than on a worker-enabled flag:
-/// the old version checked `is_wal_gc_worker_enabled`, which only ever
-/// existed on the unused wrapper, so it tested bookkeeping instead of work.
+/// Nothing else here seals the memtable, so seeing the pending bytes reach zero
+/// means the worker did it. Check for that with a deadline, not at one moment:
+/// a tick can land at any point after the writes.
 #[tokio::test]
 async fn async_db_wal_gc_worker_reclaims_and_stops() {
     let dir = TempDir::new().unwrap();
@@ -1959,12 +1960,17 @@ async fn async_db_wal_gc_worker_reclaims_and_stops() {
     for i in 0..200u32 {
         db.put(format!("key{i}").into_bytes(), vec![b'v'; 128]).await.unwrap();
     }
-    db.compact().await.unwrap();
 
-    // A direct pass proves GC is reachable and returns sane numbers; the
-    // worker firing on its own interval is covered by the workers' own tests.
-    let (_reclaimed, remaining) = db.garbage_collect_wal().await.unwrap();
-    assert!(remaining > 0, "the 200 writes are still in a memtable, so their bytes are pending");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_reclaimed, remaining) = db.garbage_collect_wal().await.unwrap();
+        if remaining == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the worker left {remaining} bytes pending");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(db.get(b"key0".to_vec()).await.unwrap(), Some(vec![b'v'; 128]), "the flush kept the data");
 
     // Shutdown must stop the worker without hanging or erroring.
     db.shutdown().await.unwrap();
