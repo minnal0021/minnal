@@ -587,6 +587,12 @@ pub fn validate_store_name(name: &str) -> Result<(), SchemaError> {
     if name == crate::SYSTEM_NAMESPACE || name.starts_with("system_") {
         return Err(SchemaError::ReservedNamespace { namespace: name.to_owned() });
     }
+    // These names belong to the vector index of the store named by the rest. A
+    // store called `foo_dense_vector` would be taken for `foo`'s: removed by a
+    // restart or by dropping `foo`, and written to by a semantic `foo`.
+    if crate::db::namespace::VECTOR_COMPANION_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+        return Err(SchemaError::ReservedNamespace { namespace: name.to_owned() });
+    }
     Ok(())
 }
 

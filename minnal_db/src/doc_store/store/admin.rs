@@ -420,7 +420,9 @@ impl DocStore {
             .db
             .list_namespaces()
             .into_iter()
-            // Vector data only: the partition (`_ivf_*`) outlives a vector-index drop.
+            // A store saved under such a name is not a companion, even though
+            // its name is no longer accepted.
+            .filter(|(name, _)| !self.schemas.contains(name))
             .filter_map(|(name, _)| vector_kv::vector_data_base(&name).map(str::to_owned))
             .collect();
         leftover.extend(vector_kv::queued_namespaces(&self.db).await?);
@@ -505,6 +507,9 @@ impl DocStore {
         // The partition and its journal go too: the partition is grown from the
         // data, so re-enabling starts again from one root posting.
         for companion in vector_kv::companion_namespaces(namespace) {
+            if self.schemas.contains(&companion) {
+                continue; // a store saved under that name, not a companion
+            }
             if let Err(e) = self.db.remove_namespace(companion.clone()).await {
                 // Best-effort: a missing companion is fine (nothing was indexed).
                 debug!("drop_vector_index_data: removing companion '{companion}' for '{namespace}': {e}");
@@ -593,6 +598,9 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &Schema
     #[cfg(feature = "semantic-search")]
     {
         for companion in vector_kv::companion_namespaces(namespace) {
+            if schemas.contains(&companion) {
+                continue; // a store saved under that name, not a companion
+            }
             let _ = db.remove_namespace(companion.clone()).await;
             ns_names.push(companion);
         }
@@ -632,6 +640,44 @@ async fn clear_queue_entries(db: &AsyncDb, namespace: &str) {
 mod tests {
     use super::*;
     use crate::doc_store::store::test_support::*;
+
+    #[tokio::test]
+    async fn a_store_name_cannot_end_like_a_vector_companion() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        for suffix in crate::db::namespace::VECTOR_COMPANION_SUFFIXES {
+            let name = format!("foo{suffix}");
+            let err = store.create(make_schema(&name, vec![])).await.unwrap_err();
+            assert!(matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })), "{name}: {err:?}");
+            let err = store.create_kv(make_kv_schema(&name, KvKeyType::Str, KvValueType::Str)).await.unwrap_err();
+            assert!(matches!(err, DocStoreError::Schema(SchemaError::ReservedNamespace { .. })), "{name}: {err:?}");
+        }
+        assert!(store.list().unwrap().is_empty());
+        store.shutdown().await.unwrap();
+    }
+
+    /// A database can hold a store saved before such names were refused. It is
+    /// a store, not a companion: neither a restart nor dropping `foo` removes it.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_store_saved_under_a_companion_name_survives_a_restart_and_a_drop() {
+        const NAME: &str = "foo_dense_vector";
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        store.create(make_schema("foo", vec![])).await.unwrap();
+        let mut schema = make_schema(NAME, vec![]);
+        schema.ns_id = Some(store.db.namespace(NAME.to_owned()).await.unwrap().id());
+        store.schemas.insert(StoredSchema::Doc(Arc::new(schema))).unwrap();
+        store.put(NAME, DocId::U64(1), serde_json::json!({})).await.unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await.unwrap();
+        assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by the restart");
+        store.remove("foo").await.unwrap();
+        assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by dropping foo");
+        store.shutdown().await.unwrap();
+    }
 
     // ── create / list / drop ────────────────────────────────────────────────
 

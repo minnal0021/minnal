@@ -316,6 +316,22 @@ pub const DEFAULT_NAMESPACE_ID: u32 = 0;
 pub const SYSTEM_NAMESPACE: &str = "system";
 pub const SYSTEM_NAMESPACE_ID: u32 = 1;
 
+/// The suffixes that mark a namespace as holding another's vector index: its
+/// vector data and its partition (centres, postings and maintenance journal).
+/// Here, not in `vector_kv`, because store names must avoid them in every
+/// build, with or without semantic search.
+///
+/// Listed longest-first so a suffix search cannot mistake `x_sparse_vector_meta`
+/// for `x_sparse_vector`.
+pub const VECTOR_COMPANION_SUFFIXES: [&str; 6] = [
+    "_sparse_vector_meta",
+    "_sparse_vector",
+    "_dense_vector",
+    "_ivf_centres",
+    "_ivf_postings",
+    "_ivf_journal",
+];
+
 /// Persisted TTL configuration for one namespace (part of [`RegistryData`]).
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 struct TtlConfigData {

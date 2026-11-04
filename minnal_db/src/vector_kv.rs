@@ -148,19 +148,9 @@ pub fn ivf_journal_ns(namespace: &str) -> String {
     format!("{}_ivf_journal", namespace)
 }
 
-/// The suffixes that mark a namespace as a companion of another: its vector data
-/// and its partition (centres, postings and maintenance journal).
-///
-/// Listed longest-first so [`companion_base`] cannot mistake
-/// `x_sparse_vector_meta` for `x_sparse_vector`.
-pub const COMPANION_SUFFIXES: [&str; 6] = [
-    "_sparse_vector_meta",
-    "_sparse_vector",
-    "_dense_vector",
-    "_ivf_centres",
-    "_ivf_postings",
-    "_ivf_journal",
-];
+/// The suffixes that mark a namespace as a companion of another
+/// ([`VECTOR_COMPANION_SUFFIXES`](crate::db::namespace::VECTOR_COMPANION_SUFFIXES)).
+pub const COMPANION_SUFFIXES: [&str; 6] = crate::db::namespace::VECTOR_COMPANION_SUFFIXES;
 
 /// The companions removed when the vector index is dropped: all of them. The
 /// partition is derived from the data since M3 (a namespace grows it by
