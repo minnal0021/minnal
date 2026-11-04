@@ -20,6 +20,10 @@ re-check them before starting work.
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
 | [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`store/lsm`) | Low | Proposed |
+| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | Proposed |
+| [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
+| [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
+| [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
 
 ---
 
@@ -1326,3 +1330,263 @@ a crash cannot leave one layout on disk for the other to read.
   same answers for the same filter.
 - A whole-`get` miss measurably faster than today across the sizes above, including
   the cost of false positives. If it is not, close this request.
+
+---
+
+## FR-010 — Refuse an enable for as long as a vector-index drop is pending
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/doc_store/store/admin.rs`), `minnal_db_api`
+(`src/routes/stores.rs`, `indices.rs`, `admin_indices.rs`)
+**Severity:** Low — needs an enable and a drop of one store within moments of each
+other; the affected documents are repaired by a reindex
+**Source:** Review of store and vector-index lifecycle races. Found by reading the
+code; no test reproduces it yet.
+
+### Summary
+
+A vector-index drop has two steps. The route saves the schema with semantic search
+off, then records the store in `vec_index_cleanup` and starts the removal in the
+background. An enable that lands before the removal starts is accepted, and writes
+after it queue their embeddings. The removal then clears the queue, so those
+documents are stored and acknowledged but never embedded.
+
+The partition itself is safe: `DocStore::lifecycle` serialises the two operations,
+and a drop that finds semantic search on seeds a new partition when it finishes.
+
+### Why the route's check is not enough
+
+The enable route answers `409` (`VectorCleanupInProgress`) when the store is in
+`vec_index_cleanup`, but that set lives in the API server and is checked apart from
+the schema change, which leaves two windows:
+
+- A request arriving between the schema save and the insert into the set (for example
+  `routes/admin_indices.rs:415` and `:427`) passes the check.
+- An enable that passed the check before the drop route ran goes on to `amend` after
+  the schema save.
+
+Library users have no such check at all.
+
+### Proposed direction
+
+Have `DocStore` own the pending state: `disable_semantic_search` and
+`remove_attribute` record the drop in the same step as the schema change, `amend`
+refuses to turn semantic search on while a drop is recorded, and
+`drop_vector_index_data` clears it when done. `vec_index_cleanup` then reports this
+state rather than holding its own copy.
+
+### Open questions
+
+- Should the record survive a restart? `finish_interrupted_vector_index_drops` already
+  finishes a drop at open, which suggests not, but it runs only for a store whose
+  schema says semantic search is off.
+- A caller that disables and never calls `drop_vector_index_data` would block enables
+  for good. Either the two become one library call, or the record needs a way out.
+
+### Acceptance criteria
+
+- A test: disable, enable, write, then run the drop. The enable is refused, or the
+  written document ends up indexed.
+- The same result for every interleaving of the two routes, in a racing test.
+- Re-enabling after the drop finishes keeps working, with its settings kept.
+
+---
+
+## FR-011 — A test harness for API routes
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db_api` (`src/routes/`, `src/main.rs`)
+**Severity:** Low — test coverage; no known defect
+**Source:** Adding the `409` on the enable route, which could not be tested.
+
+### Summary
+
+Route handlers have no test harness: the tests in `minnal_db_api/src/routes/` cover
+helpers such as cursor decoding, not requests. Behaviour that lives only in a handler
+is checked by compiling it. The enable route's `409` while a cleanup runs has never
+been exercised by a request.
+
+### Proposed direction
+
+A test-only helper that builds an `AppState` over a temporary `DocStore` and drives
+the router in process, with no socket (`tower::ServiceExt::oneshot`), plus a mock
+embedding service for routes that need one. `tower` as a dev-dependency needs
+agreement first, as any new dependency does.
+
+### First routes to cover
+
+- The enable route answers `409` while the store is in `vec_index_cleanup`, and
+  succeeds once it is out.
+- Both vector-index drop routes answer `202`, then `409` for a second drop.
+- A store name ending in a companion suffix answers with the reserved-name error.
+
+### Acceptance criteria
+
+- The routes above are tested by request, on every run of `cargo test --workspace`.
+- A new route test is a few lines, with no port or external service.
+
+---
+
+## FR-012 — Make a skipped `upsert_vectors` visible to its caller
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/vector_kv.rs`, `src/doc_store/vec_index_worker.rs`)
+**Severity:** Low — affects direct users of `vector_kv`; the document store creates
+the namespaces itself
+**Source:** Review of store and vector-index lifecycle races.
+
+### Summary
+
+`upsert_vectors` never creates a store's vector namespaces, so that a write outliving
+a drop cannot bring them back. When they are absent it logs at debug level and returns
+`Ok` with an empty `PostingDelta`.
+
+The vector worker needs that skip. A direct user of `vector_kv` who has not called
+`create_vector_namespaces` or `init_ivf` gets the same answer: every upsert succeeds,
+nothing is written, and searches return nothing. The only record is a debug log line.
+`finish_embed` goes on to complete the queue entry in the same way, and so does the
+worker, so a skipped document leaves no trace in the queue.
+
+### Why this is an API change
+
+An `Ok` with an empty delta also means "nothing to write" (an empty `vector_indexes`),
+so a caller cannot tell the two apart. `upsert_vectors` is public, and telling them
+apart changes what it returns.
+
+### Proposed direction
+
+Return a new `KVError` variant when the namespaces are
+absent. The worker treats it as `Processed::Dropped`, as it does a dropped partition;
+everyone else sees the failure. A smaller alternative keeps the return value and logs
+at `warn`, but a drop racing the worker would then warn in normal operation.
+
+### Acceptance criteria
+
+- `upsert_vectors` on a namespace that was never seeded returns an error a caller can
+  match on, and creates nothing.
+- A drop racing the worker still logs no warning and fails no queue entry
+  (`a_drop_stops_the_worker_pass_on_its_store`).
+- The `create_vector_namespaces` requirement is in the `vector_kv` module docs.
+
+---
+
+## FR-013 — Namespace identity without a central registry file
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/db/namespace.rs`, `database.rs`, `wal.rs`,
+`vector_index_wal.rs`, `layout.rs`, `index_manager.rs`), `minnal_db_api` (README)
+**Severity:** Medium — a damaged registry stops the whole database opening; no data
+is at risk from the design as it stands
+**Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.
+
+### Summary
+
+Replace the `u32` namespace id with a UUID, and remove the binary `namespace_registry`
+file. Each namespace's directory becomes the record of its own existence, id and TTL.
+
+Goals:
+
+- **No single point of failure.** One damaged file should not stop every namespace
+  opening.
+- **Less to maintain.** No binary format, no saved counter, no list of namespaces kept
+  apart from the namespaces themselves.
+- **Ids that stay unique across databases,** which copying a namespace to another
+  database or running several nodes would need. Neither is part of this request.
+
+### What the registry does today
+
+`{db_path}/namespace_registry` is a binary file: a header with a CRC checksum, then an
+rkyv payload (`RegistryData`, `namespace.rs:347`). Every change rewrites it through
+`write_atomic_durable`. It has four jobs:
+
+| Job | Where it goes |
+|---|---|
+| `next_id`, the counter behind every id | Removed: a random id needs no counter |
+| Which id each name has | The namespace's `config.json` |
+| TTL settings | The namespace's `config.json` |
+| **Deciding which namespaces exist** | The namespace directories (see below) |
+
+The last job is the hard one. Saving the registry is the moment a drop becomes
+permanent (step 1 of `remove_namespace`), and recovery skips WAL entries whose
+namespace it does not list (`database.rs:2869`).
+
+`next_id` cannot be replaced by the highest id plus one. Dropping the newest namespace
+would free its id, and the WAL would replay the dropped namespace's records into the
+next namespace to take it.
+
+### Proposed direction
+
+**Layout.** Add `id` and `ttl` to `NamespaceConfig`, the existing per-namespace
+`config.json` (`namespace.rs:54`). Opening a database scans for `ns_*` directories and
+reads each one's config, which it already does once per namespace (`load_config`). The
+registry stays as an in-memory map, built by that scan.
+
+**Create.** Build the directory under a temporary name (`creating_{id}`), with its
+config written and synced. Then rename it to `ns_{name}` and fsync the parent. The
+rename is the moment the namespace exists. Open removes any `creating_*` it finds.
+
+**Drop.** Stop and close the store, then rename `ns_{name}` to `dropped_{id}` and fsync
+the parent. The rename is the moment the drop is permanent. File deletion stays
+best-effort, and open finishes it by sweeping `dropped_*`. This is a change of order:
+the store closes before the durable step, because a flush after the rename would write
+to a path that no longer exists.
+
+**Ids.** `NamespaceId(u128)`, a `Copy` newtype, replaces the `u32` everywhere (about 150
+declarations). `default` and `system` get fixed reserved values in place of 0 and 1.
+Field indexes move to `index/{id}/`, and `ns_id` in a schema becomes a string.
+
+**Logs.** Both WALs carry the full 16-byte id, so each record grows by 12 bytes. A
+small per-database id mapped to the UUID would avoid that, but it needs its own durable
+mapping, which is the file this request removes.
+
+### Costs and risks
+
+- **Crash safety moves.** This code decides what recovery replays, and every crash
+  point needs a test. The bugs recently fixed around namespace lifetimes are the reason
+  for caution here: start from the crash tests, not the refactor.
+- **A drop interrupted before the rename is undone.** The namespace is still live at
+  the next open. A store drop has not answered its caller at that point and removes the
+  schema last, so it can be retried; the crash tests must confirm this.
+- **Log size.** 12 more bytes per record costs most on small values, such as the embed
+  queue and document metas. Measure WAL throughput before and after.
+- **Readability.** Logs and directory names carry long ids instead of small numbers.
+- **Complexity may not fall much.** About 80 lines of binary persistence go, and the
+  create and drop rename protocols and the sweep arrive. The result is simpler to
+  inspect, but the amount of crash-sensitive code is similar. If the prototype is no
+  smaller, the first option below may be enough.
+
+### Not removed by this request
+
+- **`WalMetadata`** (`wal.rs:250`) is also one file holding every namespace's saved
+  offsets, so a damaged copy still affects the whole database. It should be reviewed
+  separately, including whether it can be rebuilt from the log.
+- **`system_schema`** holds every store's schema, though it is a namespace with its own
+  durability rather than a special file.
+
+### Open questions
+
+- **Generating ids:** `minnal_db` has no UUID crate, `rand` is only a dev-dependency,
+  and new dependencies need agreement. `getrandom` alone would be enough, since nothing
+  needs to parse a UUID.
+- **A smaller first step:** keep `u32` ids and write each namespace's id and TTL to its
+  `config.json` as well, then make the registry rebuildable by a scan. That removes the
+  single point of failure with no change to the logs, but keeps the counter, which would
+  need a copy of its own, and the binary file. It could also be taken as stage one of
+  this request.
+- **Directory names:** should a namespace's data directory move to `ns_{id}`, matching
+  `index/{id}`? Renaming a namespace would become cheap, but directories would no longer
+  be readable by name.
+
+### Acceptance criteria
+
+- `namespace_registry` and `next_id` are gone, and an open rebuilds the namespace list
+  from the directories alone.
+- A damaged `config.json` affects that namespace only: the others open, and the damaged
+  one is reported by name. What the database does about its WAL records is decided and
+  tested, and they are never replayed into another namespace.
+- A SIGKILL at every step of create and drop leaves the namespace either fully there or
+  fully gone after reopening, with no acknowledged write lost in any other namespace.
+- A name dropped and recreated never receives the old namespace's WAL records.
+- WAL throughput is measured against today's on small and typical values, and the
+  result is recorded here. A large drop is a reason to stop and reconsider.
+- `minnal_db_api/README.md`'s on-disk layout describes the new files.
