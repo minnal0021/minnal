@@ -22,8 +22,6 @@ pub(crate) mod quantisation_support;
 
 use crate::semantic_search::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
 use log::debug;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
 use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -304,10 +302,9 @@ fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_
 fn best_rescale_factor(normalised_residual_vector: &[f32], number_of_bits_for_quantisation: usize) -> f32 {
     let dimension = normalised_residual_vector.len();
 
-    let max_value = normalised_residual_vector
-        .into_par_iter()
-        .fold(|| f32::NEG_INFINITY, |acc, &x| acc.max(x))
-        .reduce(|| f32::NEG_INFINITY, |a, b| a.max(b));
+    // Serial on purpose: under a microsecond of work, and this runs on the embed
+    // worker's async thread, which a rayon job would block for milliseconds.
+    let max_value = normalised_residual_vector.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
     let rescale_factor_end = ((1 << number_of_bits_for_quantisation) - 1 + NO_ENUMERATIONS) as f32 / max_value;
     let rescale_factor_start = rescale_factor_end * START[number_of_bits_for_quantisation];
