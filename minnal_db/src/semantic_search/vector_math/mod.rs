@@ -40,6 +40,39 @@ pub(crate) fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
     f32::sqeuclidean(a, b).expect("equal dimensions")
 }
 
+/// `sum[i] += x[i]`, widening to `f64`, for summing many points into a mean. The
+/// default x86-64 target only vectorises this 2 lanes wide, so the same loop is
+/// also compiled for AVX-512 and AVX2 and chosen at runtime. Each lane is added
+/// on its own, so every path gives exactly the same result.
+pub(crate) fn add_to_sum(sum: &mut [f64], x: &[f32]) {
+    #[inline(always)]
+    fn add(sum: &mut [f64], x: &[f32]) {
+        for (acc, &v) in sum.iter_mut().zip(x) {
+            *acc += f64::from(v);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx512f")]
+        fn add_avx512(sum: &mut [f64], x: &[f32]) {
+            add(sum, x);
+        }
+        #[target_feature(enable = "avx2")]
+        fn add_avx2(sum: &mut [f64], x: &[f32]) {
+            add(sum, x);
+        }
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU has AVX-512F, checked just above.
+            return unsafe { add_avx512(sum, x) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2, checked just above.
+            return unsafe { add_avx2(sum, x) };
+        }
+    }
+    add(sum, x);
+}
+
 pub fn residual_vector(x: &[f32], centroid: &[f32]) -> Vec<f32> {
     x.iter().zip(centroid.iter()).map(|(xi, ci)| xi - ci).collect()
 }
@@ -181,6 +214,18 @@ pub fn unpack_from_signed_64(packed_embeddings: &[i64]) -> Vec<u8> {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn add_to_sum_adds_each_lane() {
+        for dim in [1usize, 3, 7, 8, 9, 16, 17, 768] {
+            let x: Vec<f32> = (0..dim).map(|i| i as f32 * 0.1 - 3.0).collect();
+            let mut sum: Vec<f64> = (0..dim).map(|i| 1e9 + i as f64).collect();
+            let want: Vec<f64> = sum.iter().zip(&x).map(|(s, &v)| s + f64::from(v)).collect();
+            add_to_sum(&mut sum, &x);
+            assert_eq!(sum, want, "dim {dim}");
+        }
+    }
+
     #[test]
     fn test_pack_as_16_bytes() {
         let bits: Vec<u8> = vec![1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0];

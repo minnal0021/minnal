@@ -25,7 +25,7 @@
 //! 4. **Assign** every member to the nearer centre without the balance term.
 //!    `None` if one side is empty.
 
-use crate::semantic_search::vector_math::sq_dist;
+use crate::semantic_search::vector_math::{add_to_sum, sq_dist};
 
 /// The parameters of a split (the namespace's `maintenance` settings).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -175,9 +175,7 @@ pub fn balanced_two_means(points: &[Vec<f32>], params: &SplitParams, rng: &mut S
         }
         let mut sums = [vec![0.0f64; dim], vec![0.0f64; dim]];
         for (&i, &l) in batch.iter().zip(&labels) {
-            for (acc, &x) in sums[l as usize].iter_mut().zip(&points[i]) {
-                *acc += f64::from(x);
-            }
+            add_to_sum(&mut sums[l as usize], &points[i]);
         }
         let mut next = centres.clone();
         for k in 0..2 {
