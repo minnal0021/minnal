@@ -299,6 +299,10 @@ pub struct SemanticSearchContext {
     /// Namespaces whose vector index is being dropped: no partition of theirs
     /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
     dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// How many drops have begun, of any namespace. A load compares it before
+    /// and after: [`begin_drop`](Self::begin_drop) can only stop a partition
+    /// that is installed, so a load it could not see must not install what it read.
+    drops_begun: std::sync::atomic::AtomicU64,
 }
 
 /// What one namespace's semantic operations run with: the per-call config built
@@ -333,6 +337,7 @@ impl SemanticSearchContext {
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            drops_begun: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -450,6 +455,10 @@ impl SemanticSearchContext {
     /// before each write. Call [`end_drop`](Self::end_drop) once they are gone.
     pub async fn begin_drop(&self, namespace: &str) {
         self.dropping.lock().insert(namespace.to_owned());
+        // Before the partitions are collected, under the lock a load installs
+        // with: a load either sees this count change, or installs in time to be
+        // collected below.
+        self.drops_begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let loaded: Vec<Arc<PartitionHandle>> = {
             let mut ivfs = self.ivfs.write();
             let mut out = Vec::new();
@@ -537,29 +546,42 @@ impl SemanticSearchContext {
         ns_id: u32,
         settings: &VectorIndexSettings,
     ) -> Result<NamespaceSemantics, DocStoreError> {
-        if self.is_dropping(namespace) {
-            return Err(DocStoreError::SemanticSearchNotEnabled {
-                namespace: namespace.to_owned(),
-            });
-        }
         let key = (namespace.to_owned(), ns_id);
-        let cached = self.ivfs.read().get(&key).cloned();
-        let partition = match cached {
-            Some(p) => p,
-            None => {
-                let ivf =
-                    crate::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
-                        .await?
-                        .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
-                            namespace: namespace.to_owned(),
-                        })?;
-                #[cfg(test)]
-                load_pause::point(namespace).await;
-                // Two first uses can race to load; keep whichever landed first,
-                // so every count update goes to the one partition in use. Nothing
-                // writes this namespace's vectors before its partition is loaded
-                // (every writer goes through here), so the counts are exact.
-                Arc::clone(self.ivfs.write().entry(key).or_insert_with(|| Arc::new(PartitionHandle::new(ivf))))
+        let partition = loop {
+            if self.is_dropping(namespace) {
+                return Err(DocStoreError::SemanticSearchNotEnabled {
+                    namespace: namespace.to_owned(),
+                });
+            }
+            if let Some(p) = self.ivfs.read().get(&key) {
+                break Arc::clone(p);
+            }
+            let drops_begun = self.drops_begun.load(std::sync::atomic::Ordering::SeqCst);
+            let ivf =
+                crate::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
+                    .await?
+                    .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
+                        namespace: namespace.to_owned(),
+                    })?;
+            #[cfg(test)]
+            load_pause::point(namespace).await;
+            // A drop that began during the load cannot see this partition, so
+            // it would never be marked dropped, and writers trust that mark. The
+            // drop may be over by now, so `is_dropping` cannot tell: start again
+            // from what the stores hold now. (Any namespace's drop counts; an
+            // unrelated one only costs a second read.)
+            let installed = {
+                let mut ivfs = self.ivfs.write();
+                (self.drops_begun.load(std::sync::atomic::Ordering::SeqCst) == drops_begun).then(|| {
+                    // Two first uses can race to load; keep whichever landed first,
+                    // so every count update goes to the one partition in use. Nothing
+                    // writes this namespace's vectors before its partition is loaded
+                    // (every writer goes through here), so the counts are exact.
+                    Arc::clone(ivfs.entry(key.clone()).or_insert_with(|| Arc::new(PartitionHandle::new(ivf))))
+                })
+            };
+            if let Some(p) = installed {
+                break p;
             }
         };
         partition.set_limits(

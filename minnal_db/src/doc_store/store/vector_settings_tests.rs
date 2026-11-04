@@ -1356,6 +1356,74 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A drop can only stop a partition that is installed. One still loading
+    /// when the drop begins must not be handed out afterwards unmarked: the
+    /// worker trusts the mark, and its write would recreate what the drop removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partition_loading_during_a_vector_index_drop_is_not_handed_out() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        store.shutdown_vec_index_worker().await;
+        let store = std::sync::Arc::new(store);
+        store.semantic_ctx.as_ref().unwrap().evict("g"); // the next use loads
+
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
+        let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
+        let loading = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                let ctx = store.semantic_ctx.as_ref().unwrap();
+                ctx.for_namespace(&store.db, "g", ns_id, &settings).await.map(|ns| ns.partition)
+            }
+        });
+        reached.notified().await; // read, not yet installed
+        store.disable_semantic_search("g").unwrap();
+        store.drop_vector_index_data("g").await.unwrap();
+        release.notify_one();
+        let loaded = loading.await.unwrap();
+        assert!(
+            matches!(loaded, Err(DocStoreError::VectorIndexNotSeeded { .. })),
+            "the load read a partition the drop removed: is_dropped={:?}",
+            loaded.as_ref().map(|p| p.is_dropped()).ok()
+        );
+        assert!(companions_left(&store, "g").is_empty());
+        store.shutdown().await.unwrap();
+    }
+
+    /// As above for a whole store's drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partition_loading_during_a_store_drop_is_not_handed_out() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        store.shutdown_vec_index_worker().await;
+        let store = std::sync::Arc::new(store);
+        store.semantic_ctx.as_ref().unwrap().evict("g");
+
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
+        let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
+        let loading = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                let ctx = store.semantic_ctx.as_ref().unwrap();
+                ctx.for_namespace(&store.db, "g", ns_id, &settings).await.map(|ns| ns.partition)
+            }
+        });
+        reached.notified().await;
+        store.remove("g").await.unwrap();
+        release.notify_one();
+        assert!(loading.await.unwrap().is_err(), "a dropped store's partition was handed out");
+        assert!(companions_left(&store, "g").is_empty());
+        store.shutdown().await.unwrap();
+    }
+
     /// Enables and drops racing in any order: whenever the schema ends with
     /// semantic search on, the partition is there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
