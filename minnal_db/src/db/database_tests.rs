@@ -3557,3 +3557,29 @@ fn both_logs_report_positions_as_segment_and_byte() {
     let v = serde_json::to_value(db.vector_index_wal_stats().unwrap()).unwrap();
     assert!(v["tail"]["segment_id"].is_u64() && v["tail"]["byte"].is_u64(), "{v}");
 }
+
+/// A namespace removed while it is being created must not leave a store the
+/// registry does not list, or a listed store whose directory was deleted: its
+/// next metadata write, at shutdown at the latest, fails with `NotFound`.
+#[test]
+fn removing_a_namespace_while_it_is_created_leaves_no_store_without_its_files() {
+    for round in 0..50 {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let creator = {
+            let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.create_namespace("racing").unwrap();
+            })
+        };
+        barrier.wait();
+        // Keep trying until the create's registry entry is there to remove.
+        while db.remove_namespace("racing").is_err() {
+            std::hint::spin_loop();
+        }
+        creator.join().unwrap();
+        assert_eq!(db.shutdown().map_err(|e| format!("{e:?}")), Ok(()), "round {round}");
+    }
+}

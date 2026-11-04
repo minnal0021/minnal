@@ -187,6 +187,8 @@ Each `Db` has a default namespace plus any number of named namespaces. Each name
 
 `remove_namespace` reclaims on-disk storage (the `ns_{name}` data dir + `index/{ns_id}` subtree). The step order is load-bearing for crash safety: **persist the registry deletion first**, then flush/drop the store, forget it in the WAL observer (`forget_namespace`, so it stops holding the cut), and only then delete files. Recovery skips WAL entries whose `namespace_id` is absent from the registry (`recover_from_wal`), so a crash mid-cleanup never resurrects the namespace. File deletion never touches the shared WAL — keep it that way.
 
+**Removal holds `namespace_create_lock` throughout, including the file deletion.** Without it, a remove during a create found no store to close, deleted the directory under `KVStore::open`, and the create either failed or published a store the registry does not list; that store's `flush_metadata` then failed `shutdown` with a value-log `NotFound` (`a_drop_stops_the_worker_pass_on_its_store`, once in a full single-threaded run). A create of the same name after the registry removal opens the same path, so the deletion needs the lock too. Regression test: `removing_a_namespace_while_it_is_created_leaves_no_store_without_its_files`.
+
 A crash before `forget_namespace` leaves the dropped namespace's entries above the saved cut, which is **not a permanent WAL leak**: the next startup's recovery skips them (unknown namespace) and then retires the whole log (`retire_all`, cut = tail), so WAL GC reclaims those segments on its next cycle.
 
 ## Row IDs

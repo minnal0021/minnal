@@ -815,8 +815,9 @@ pub struct Database {
     /// published (and persisted) before the `KVStore` is opened and inserted into
     /// `stores`, so in between, a name resolves to an id that `get_store` does
     /// not know. This lock is what makes creation appear atomic — held across the
-    /// whole of `create_namespace`, and taken by [`Database::get_store`] on a miss
-    /// so it blocks until any in-flight creation has finished.
+    /// whole of `create_namespace` and `remove_namespace`, and taken by
+    /// [`Database::get_store`] on a miss so it blocks until any in-flight creation
+    /// has finished.
     ///
     /// **Lock ordering: this is the outermost lock.** Never acquire it while
     /// holding `registry` or `stores`. Making the two maps update atomically the
@@ -1847,6 +1848,13 @@ impl Database {
     ///    completely unaffected.
     pub fn remove_namespace(&self, name: &str) -> Result<u32> {
         self.check_closed()?;
+
+        // Held to the end. Removing a namespace `create_namespace` is still
+        // opening found no store to close, deleted the directory under the open,
+        // and the create then published a store the registry does not list. A
+        // create of the same name after step 1 opens the same path, so this also
+        // has to cover the deletion in step 4.
+        let _create = self.namespace_create_lock.lock();
 
         // (1) Durable point: once this returns, the namespace is gone from the
         // persisted registry (including its TTL config, so the global TTL worker
