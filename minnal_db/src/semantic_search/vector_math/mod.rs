@@ -29,6 +29,17 @@ pub fn normalise_l2(embedding: &mut [f32]) {
     }
 }
 
+/// Squared Euclidean distance through [`simsimd`]'s runtime-selected kernel.
+/// Clustering and partition maintenance compare millions of these per
+/// namespace, so it is the cost that matters there.
+///
+/// # Panics
+/// If the slices differ in length: all vectors of a namespace share its dimension.
+pub(crate) fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
+    use simsimd::SpatialSimilarity;
+    f32::sqeuclidean(a, b).expect("equal dimensions")
+}
+
 pub fn residual_vector(x: &[f32], centroid: &[f32]) -> Vec<f32> {
     x.iter().zip(centroid.iter()).map(|(xi, ci)| xi - ci).collect()
 }

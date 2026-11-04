@@ -126,12 +126,7 @@ fn code_metrics(ivf: &NamespaceIvf, code: &VectorIndex, posting_centre: &[f32]) 
     let d = own.len() as f64;
     let sf = f64::from(code.scaling_factor);
     let eb = f64::from(code.error_bound);
-    let shift = own
-        .iter()
-        .zip(posting_centre)
-        .map(|(&c, &cp)| (f64::from(c) - f64::from(cp)).powi(2))
-        .sum::<f64>()
-        .sqrt();
+    let shift = sq_dist(own, posting_centre).sqrt();
     if sf <= 0.0 || d < 2.0 {
         return Some((if shift > 0.0 { f64::INFINITY } else { 0.0 }, eb));
     }

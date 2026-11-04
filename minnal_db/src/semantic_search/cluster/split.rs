@@ -25,6 +25,8 @@
 //! 4. **Assign** every member to the nearer centre without the balance term.
 //!    `None` if one side is empty.
 
+use crate::semantic_search::vector_math::sq_dist;
+
 /// The parameters of a split (the namespace's `maintenance` settings).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitParams {
@@ -98,16 +100,6 @@ impl SplitRng {
         idx.truncate(k.min(n));
         idx
     }
-}
-
-fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = f64::from(*x) - f64::from(*y);
-            d * d
-        })
-        .sum()
 }
 
 /// Assign `members` to the nearer of `centres` with balance weight `lambda` on
