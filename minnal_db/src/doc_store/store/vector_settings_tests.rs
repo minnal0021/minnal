@@ -243,6 +243,19 @@ mod with_service {
     /// [`spawn_service`], answering each request `delay` after it arrives (one
     /// at a time).
     fn spawn_slow_service(delay: std::time::Duration) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
+        spawn_service_with(delay, false)
+    }
+
+    /// [`spawn_service`] whose vectors come from each payload's text, so
+    /// different texts get different vectors whichever request they arrive in.
+    /// The plain mock's vectors depend only on a payload's position in its
+    /// request, so documents embedded one at a time all get the same few.
+    fn spawn_text_service() -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
+        spawn_service_with(std::time::Duration::ZERO, true)
+    }
+
+    fn spawn_service_with(delay: std::time::Duration, vectors_from_text: bool) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Seen>>>) {
+        use std::hash::{Hash, Hasher};
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -286,6 +299,13 @@ mod with_service {
                     let embs: Vec<Vec<f32>> = (0..n)
                         .map(|i| {
                             let mut v = vec![0.01f32 * (i as f32 + 1.0); dims];
+                            if vectors_from_text {
+                                for (d, x) in v.iter_mut().enumerate() {
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    (req["payloads"][i].to_string(), d).hash(&mut h);
+                                    *x = (h.finish() % 1000) as f32 / 1000.0;
+                                }
+                            }
                             v[axis] = 1.0;
                             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                             v.iter().map(|x| x / norm).collect()
@@ -603,7 +623,7 @@ mod with_service {
     /// last posting is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_probe_trace_covers_the_window_asked_for() {
-        let (url, _seen) = spawn_service();
+        let (url, _seen) = spawn_text_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
         store
@@ -614,13 +634,16 @@ mod with_service {
             .await
             .unwrap();
         for i in 0..40u64 {
-            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+            // Different chunks per document: identical chunks cannot be split
+            // past one posting per distinct chunk.
+            let text = format!("Doc {i} one. Doc {i} two. Doc {i} three. Doc {i} four. Doc {i} five. Doc {i} six.");
+            store.put("g", DocId::U64(i), serde_json::json!({"text": text})).await.unwrap();
         }
         wait_for_empty_queue(&store).await;
         let partition = partition(&store, "g").await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while partition.snapshot().posting_infos()[&0].state != crate::semantic_search::PostingState::Retired {
-            assert!(std::time::Instant::now() < deadline, "the root was never split");
+        while partition.snapshot().postings() <= 2 {
+            assert!(std::time::Instant::now() < deadline, "the split children were never split");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let _quiet = partition.lock_maintenance().await;
