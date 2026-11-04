@@ -1327,6 +1327,67 @@ mod with_service {
         .await;
     }
 
+    /// The drop route answers and runs in the background, so an enable can land
+    /// before the drop starts. The schema then says semantic search is on, and
+    /// the drop must not leave it without a partition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enabling_before_a_background_drop_runs_leaves_a_partition() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+
+        store.disable_semantic_search("g").unwrap();
+        let enable = || SchemaAmendment::EnableVectorIndex {
+            fields: vec!["text".into()],
+            vector_index: None,
+        };
+        store.amend("g", enable()).await.unwrap();
+        store.drop_vector_index_data("g").await.unwrap();
+
+        assert!(store.get_schema("g").unwrap().semantic_search_enabled);
+        partition(&store, "g").await;
+        assert_eq!(store.count_indexed_docs("g").await, 0, "the drop removed the old vectors");
+        store.put("g", DocId::U64(2), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(store.count_indexed_docs("g").await, 1, "the store indexes again");
+        store.shutdown().await.unwrap();
+    }
+
+    /// Enables and drops racing in any order: whenever the schema ends with
+    /// semantic search on, the partition is there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enables_racing_drops_always_leave_a_partition() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(open_fresh(db_dir.path()).await.with_semantic_search(context(&url)));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for round in 0..30 {
+            store.disable_semantic_search("g").unwrap();
+            let dropping = tokio::spawn({
+                let store = std::sync::Arc::clone(&store);
+                async move { store.drop_vector_index_data("g").await.unwrap() }
+            });
+            store
+                .amend(
+                    "g",
+                    SchemaAmendment::EnableVectorIndex {
+                        fields: vec!["text".into()],
+                        vector_index: None,
+                    },
+                )
+                .await
+                .unwrap();
+            dropping.await.unwrap();
+            let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
+            let loaded = store.semantic_ctx.as_ref().unwrap().for_namespace(&store.db, "g", ns_id, &settings).await;
+            assert!(loaded.is_ok(), "round {round}: semantic search is on, but: {:?}", loaded.err());
+        }
+        store.shutdown().await.unwrap();
+    }
+
     /// Counting indexed documents only reads, so asking about a store that does
     /// not exist must not create anything.
     #[tokio::test]

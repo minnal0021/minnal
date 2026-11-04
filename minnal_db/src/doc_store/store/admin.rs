@@ -28,6 +28,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
+        let _lifecycle = self.lifecycle.lock().await;
         if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
@@ -117,6 +118,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
+        let _lifecycle = self.lifecycle.lock().await;
         if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
@@ -174,6 +176,7 @@ impl DocStore {
     /// remove or update an attribute that is used by an active index returns
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
     pub async fn amend(&self, namespace: &str, mut amendment: SchemaAmendment) -> Result<(), DocStoreError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let current = self.load_schema(namespace)?;
 
         // A namespace without settings yet takes the server's defaults; one that
@@ -451,8 +454,19 @@ impl DocStore {
     /// [`disable_semantic_search`]: DocStore::disable_semantic_search
     #[cfg(feature = "semantic-search")]
     pub async fn drop_vector_index_data(&self, namespace: &str) -> Result<(), DocStoreError> {
-        self.without_partition_maintenance(namespace, self.drop_vector_index_data_now(namespace))
-            .await
+        self.without_partition_maintenance(namespace, async {
+            self.drop_vector_index_data_now(namespace).await?;
+            // Semantic search was turned back on before this drop ran, and the
+            // partition its seeding kept is gone with the rest. The schema
+            // promises one.
+            let enabled = self.schemas.get(namespace).is_some_and(|s| s.is_semantic_search_enabled());
+            if enabled {
+                let (settings, _) = self.schemas.vector_settings(namespace)?;
+                self.seed_vector_index(namespace, &settings, &mut None).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Run `drop`, which removes store `namespace`, with no write to it in
@@ -480,6 +494,7 @@ impl DocStore {
         namespace: &str,
         drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
     ) -> Result<T, DocStoreError> {
+        let _lifecycle = self.lifecycle.lock().await;
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
             ctx.begin_drop(namespace).await;

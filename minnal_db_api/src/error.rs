@@ -49,6 +49,7 @@ impl IntoResponse for AppError {
             | DocStoreError::IndexBuildInProgress { .. }
             | DocStoreError::AttributeIsIndexed { .. }
             | DocStoreError::VecReindexInProgress { .. }
+            | DocStoreError::VectorCleanupInProgress { .. }
             | DocStoreError::VecRebuildInProgress { .. }
             | DocStoreError::VecIndexCleanupInProgress { .. }
             | DocStoreError::AttrIndexOpInProgress { .. }

@@ -206,6 +206,9 @@ pub async fn amend_schema(
     // search infrastructure, and a model the embedding service serves.
     if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) {
         require_semantic_search(&state)?;
+        if state.vec_index_cleanup.lock().contains(&ns) {
+            return Err(DocStoreError::VectorCleanupInProgress { namespace: ns }.into());
+        }
         // Apply to a copy first: the probe needs the resulting settings, and a
         // rejected model must leave the stored schema untouched.
         let mut preview = state.store.get_schema(&ns)?;
