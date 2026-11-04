@@ -671,12 +671,17 @@ pub async fn has_any_vector_state(db: &AsyncDb, namespace: &str, doc_id_bytes: &
     if get_queue_entry(db, namespace, doc_id_bytes).await?.is_some() {
         return Ok(true);
     }
-    let sparse_meta_ns = db.namespace(sparse_vectors_meta_ns(namespace)).await?;
-    if sparse_meta_ns.get(doc_id_bytes.to_vec()).await?.is_some() {
+    // Without creating them: a vector-index drop does not stop writes, so this
+    // can run after it removed them.
+    if let Some(sparse_meta_ns) = db.existing_namespace(sparse_vectors_meta_ns(namespace)).await?
+        && sparse_meta_ns.get(doc_id_bytes.to_vec()).await?.is_some()
+    {
         return Ok(true);
     }
-    let dense_ns = db.namespace(dense_vectors_ns(namespace)).await?;
-    Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some())
+    match db.existing_namespace(dense_vectors_ns(namespace)).await? {
+        Some(dense_ns) => Ok(dense_ns.get(doc_id_bytes.to_vec()).await?.is_some()),
+        None => Ok(false),
+    }
 }
 
 // ── KV-backed VectorKvStore ───────────────────────────────────────────────────
@@ -979,6 +984,13 @@ pub async fn remove_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     queue_ns.delete(queue_key(namespace, doc_id_bytes)).await?;
     Ok(())
+}
+
+/// Remove a queue entry whose namespace was gone when the worker looked, unless
+/// it has changed since `entry` was read: the store may have been recreated under
+/// the same name, and the entry may now be for a new write to it.
+pub async fn discard_orphaned_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<(), crate::KVError> {
+    complete_entry(db, entry).await.map(|_| ())
 }
 
 /// Remove every queue entry of `namespace` (a store being dropped), durable on
@@ -1949,6 +1961,24 @@ mod queue_race_tests {
             Some("new text"),
             "the newer upsert's entry must survive the older embed's completion"
         );
+    }
+
+    /// A store dropped and recreated while the worker discards the old store's
+    /// entry: the new write's entry must survive, or its document is never embedded.
+    #[tokio::test]
+    async fn discarding_an_orphaned_entry_keeps_a_newer_one() {
+        let dir = TempDir::new().unwrap();
+        let db = open_db(&dir).await;
+        enqueue_embed(&db, "docs", b"x", "old store").await.unwrap();
+        let orphaned = snapshot(&db, b"x").await;
+        enqueue_embed(&db, "docs", b"x", "new store").await.unwrap();
+
+        discard_orphaned_entry(&db, &orphaned).await.unwrap();
+        assert_eq!(get_queue_entry(&db, "docs", b"x").await.unwrap().map(|e| e.text).as_deref(), Some("new store"));
+
+        let current = snapshot(&db, b"x").await;
+        discard_orphaned_entry(&db, &current).await.unwrap();
+        assert!(get_queue_entry(&db, "docs", b"x").await.unwrap().is_none(), "an unchanged entry goes");
     }
 
     /// R2: a failed embed of the older text must not rewrite the entry back to it.

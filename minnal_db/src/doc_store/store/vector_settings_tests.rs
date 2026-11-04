@@ -1321,8 +1321,9 @@ mod with_service {
     /// (`has_any_vector_state`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_write_without_embedding_text_racing_a_drop_recreates_nothing() {
+        // No `text` at all: `{"text": ""}` still builds the embedding text "text: ".
         assert_call_racing_a_drop_recreates_nothing(10, false, |store, name, i| async move {
-            let _ = store.put(&name, DocId::U64(i), serde_json::json!({"text": ""})).await;
+            let _ = store.put(&name, DocId::U64(i), serde_json::json!({})).await;
         })
         .await;
     }
@@ -1421,6 +1422,24 @@ mod with_service {
         release.notify_one();
         assert!(loading.await.unwrap().is_err(), "a dropped store's partition was handed out");
         assert!(companions_left(&store, "g").is_empty());
+        store.shutdown().await.unwrap();
+    }
+
+    /// A vector-index drop does not stop writes. One that read the schema before
+    /// semantic search went off still clears the document's vectors after the
+    /// drop, and that must not bring the namespaces back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_without_text_after_a_vector_index_drop_recreates_nothing() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.disable_semantic_search("g").unwrap();
+        store.drop_vector_index_data("g").await.unwrap();
+        assert!(companions_left(&store, "g").is_empty(), "set-up: the drop removed everything");
+        store.clear_doc_vectors_if_any("g", &DocId::U64(1).to_bytes()).await.unwrap();
+        let left = companions_left(&store, "g");
+        assert!(left.is_empty(), "recreated: {left:?}");
         store.shutdown().await.unwrap();
     }
 

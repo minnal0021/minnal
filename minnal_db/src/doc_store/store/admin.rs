@@ -41,6 +41,7 @@ impl DocStore {
             schema.semantic_search_enabled
         );
 
+        self.remove_orphaned_namespace(&ns_name).await?;
         // Create namespace — `namespace()` creates it if absent
         let ns_handle = self.db.namespace(ns_name.clone()).await?;
         let ns_id = ns_handle.id();
@@ -58,6 +59,19 @@ impl DocStore {
         // Persist schema (last: until then the store does not exist)
         self.schemas.insert(StoredSchema::Doc(Arc::new(schema)))?;
         info!("namespace '{}' created (ns_id={})", ns_name, ns_id);
+        Ok(())
+    }
+
+    /// Remove a namespace with `name` left without a schema (a create cut short,
+    /// or one a race brought back), so a new store does not inherit its keys. Not
+    /// done at open: a database can hold namespaces written directly through
+    /// [`Db`](crate::Db). The caller holds the lifecycle lock and has seen no
+    /// schema under this name. The default namespace always exists.
+    async fn remove_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
+        if name != crate::db::namespace::DEFAULT_NAMESPACE && self.db.existing_namespace(name.to_owned()).await?.is_some() {
+            warn!("removing namespace '{name}', left without a schema, before creating a store with its name");
+            self.db.remove_namespace(name.to_owned()).await?;
+        }
         Ok(())
     }
 
@@ -128,6 +142,7 @@ impl DocStore {
             ns_name, schema.key_type, schema.value_type, schema.semantic_search_enabled
         );
 
+        self.remove_orphaned_namespace(&ns_name).await?;
         let ns_handle = self.db.namespace(ns_name.clone()).await?;
         schema.ns_id = Some(ns_handle.id());
         if schema.is_semantic_search_enabled() {
@@ -655,6 +670,22 @@ async fn clear_queue_entries(db: &AsyncDb, namespace: &str) {
 mod tests {
     use super::*;
     use crate::doc_store::store::test_support::*;
+
+    #[tokio::test]
+    async fn a_new_store_does_not_inherit_an_orphaned_namespace() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        for name in ["ghost_doc", "ghost_kv"] {
+            let orphan = store.db.namespace(name.to_owned()).await.unwrap();
+            orphan.put(1u64.to_be_bytes().to_vec(), b"{}".to_vec()).await.unwrap();
+        }
+        store.create(make_schema("ghost_doc", vec![])).await.unwrap();
+        assert!(store.get("ghost_doc", DocId::U64(1)).await.unwrap().is_none());
+        store.create_kv(make_kv_schema("ghost_kv", KvKeyType::Str, KvValueType::Str)).await.unwrap();
+        let ns = store.db.existing_namespace("ghost_kv".to_owned()).await.unwrap().unwrap();
+        assert!(ns.get(1u64.to_be_bytes().to_vec()).await.unwrap().is_none());
+        store.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn a_store_name_cannot_end_like_a_vector_companion() {

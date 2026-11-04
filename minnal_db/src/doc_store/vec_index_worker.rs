@@ -346,7 +346,7 @@ impl VecIndexWorker {
             for entry in all_entries {
                 if !live_namespaces.contains(&entry.namespace) {
                     orphaned_count += 1;
-                    if let Err(e) = vector_kv::remove_queue_entry(&self.db, &entry.namespace, &entry.doc_id_bytes).await {
+                    if let Err(e) = vector_kv::discard_orphaned_entry(&self.db, &entry).await {
                         warn!(
                             "vec index worker: could not drop orphaned queue entry \
                              ns='{}' doc='{}': {e}",
