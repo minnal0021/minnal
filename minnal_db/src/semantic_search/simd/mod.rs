@@ -340,6 +340,235 @@ pub(crate) fn bit_planes_ip_best(packed: &[u64], q: &[f32], dim: usize, bits: us
     bit_planes_ip_per_plane(packed, q, dim, bits)
 }
 
+// ── Reconstructing a code ────────────────────────────────────────────────────
+//
+// A 1-bit code reconstructs to `c + s` where its bit is set and `c - s` elsewhere.
+// A bit-plane code reconstructs to `c - s * (u + shift)`, with `u` the dimension's
+// code and `shift = -(2^(bits-1) - 0.5)`. Every backend uses separate multiply and
+// subtract (no FMA), so all give bit-for-bit the scalar result, and a k-means run
+// does not depend on the CPU.
+//
+//   AVX-512F : 16 dims / iter, blend or masked add under the code's 16-bit mask
+//   AVX2     :  8 dims / iter, a lane mask per bit
+//   NEON     :  4 dims / iter, a lane mask per bit via `vtstq_u32`
+//   Scalar   : the tail of every backend, and the fallback
+
+/// Scalar 1-bit reconstruction of dimensions `from..`.
+///
+/// # Safety
+/// `out` must be valid for writes of `centre.len()` values.
+unsafe fn single_bit_scalar(packed: &[u64], centre: &[f32], s: f32, from: usize, out: *mut f32) {
+    for (i, &c) in centre.iter().enumerate().skip(from) {
+        let v = if (packed[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s };
+        // SAFETY: `i < centre.len()`, and the caller gives room for that many.
+        unsafe { out.add(i).write(v) };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn single_bit_neon(packed: &[u64], centre: &[f32], s: f32, out: *mut f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = centre.len() / 4 * 4;
+        let sv = vdupq_n_f32(s);
+        let sel = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+        for i in (0..n).step_by(4) {
+            let bits = ((packed[i / 64] >> (i % 64)) & 0xF) as u32;
+            let mask = vtstq_u32(vdupq_n_u32(bits), sel);
+            let c = vld1q_f32(centre.as_ptr().add(i));
+            vst1q_f32(out.add(i), vbslq_f32(mask, vaddq_f32(c, sv), vsubq_f32(c, sv)));
+        }
+        single_bit_scalar(packed, centre, s, n, out);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn single_bit_avx2(packed: &[u64], centre: &[f32], s: f32, out: *mut f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = centre.len() / 8 * 8;
+        let sv = _mm256_set1_ps(s);
+        let sel = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+        for i in (0..n).step_by(8) {
+            let byte = ((packed[i / 64] >> (i % 64)) & 0xFF) as i32;
+            let mask = _mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(byte), sel), sel));
+            let c = _mm256_loadu_ps(centre.as_ptr().add(i));
+            _mm256_storeu_ps(out.add(i), _mm256_blendv_ps(_mm256_sub_ps(c, sv), _mm256_add_ps(c, sv), mask));
+        }
+        single_bit_scalar(packed, centre, s, n, out);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn single_bit_avx512(packed: &[u64], centre: &[f32], s: f32, out: *mut f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = centre.len() / 16 * 16;
+        let sv = _mm512_set1_ps(s);
+        for i in (0..n).step_by(16) {
+            let mask: __mmask16 = ((packed[i / 64] >> (i % 64)) & 0xFFFF) as u16;
+            let c = _mm512_loadu_ps(centre.as_ptr().add(i));
+            _mm512_storeu_ps(out.add(i), _mm512_mask_blend_ps(mask, _mm512_sub_ps(c, sv), _mm512_add_ps(c, sv)));
+        }
+        single_bit_scalar(packed, centre, s, n, out);
+    }
+}
+
+/// Write `centre[i] + s` where bit `i` of `packed` is set and `centre[i] - s`
+/// elsewhere into `out` (replacing its contents). `packed` must hold
+/// `centre.len().div_ceil(64)` words.
+#[allow(unreachable_code)]
+pub(crate) fn reconstruct_single_bit_best(packed: &[u64], centre: &[f32], s: f32, out: &mut Vec<f32>) {
+    assert!(packed.len() >= centre.len().div_ceil(64), "code shorter than its dimension");
+    out.clear();
+    out.reserve(centre.len());
+    let ptr = out.as_mut_ptr();
+    // SAFETY: `ptr` has room for `centre.len()` values, each kernel writes all of
+    // them, and each feature is checked (NEON is baseline on aarch64).
+    unsafe {
+        single_bit_dispatch(packed, centre, s, ptr);
+        out.set_len(centre.len());
+    }
+}
+
+#[allow(unreachable_code)]
+unsafe fn single_bit_dispatch(packed: &[u64], centre: &[f32], s: f32, ptr: *mut f32) {
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        return single_bit_neon(packed, centre, s, ptr);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                return single_bit_avx512(packed, centre, s, ptr);
+            }
+            if is_x86_feature_detected!("avx2") {
+                return single_bit_avx2(packed, centre, s, ptr);
+            }
+        }
+        single_bit_scalar(packed, centre, s, 0, ptr);
+    }
+}
+
+/// Scalar bit-plane reconstruction of dimensions `from..`.
+///
+/// # Safety
+/// `out` must be valid for writes of `centre.len()` values.
+unsafe fn bit_planes_scalar(packed: &[u64], centre: &[f32], s: f32, bits: usize, from: usize, out: *mut f32) {
+    let words = centre.len().div_ceil(64);
+    let shift = -(((1u32 << (bits - 1)) as f32) - 0.5);
+    for (i, &c) in centre.iter().enumerate().skip(from) {
+        let code = (0..bits).fold(0u32, |code, j| code | (((packed[j * words + i / 64] >> (i % 64)) & 1) as u32) << j);
+        // SAFETY: `i < centre.len()`, and the caller gives room for that many.
+        unsafe { out.add(i).write(c - s * (code as f32 + shift)) };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn bit_planes_neon(packed: &[u64], centre: &[f32], s: f32, bits: usize, out: *mut f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = centre.len() / 4 * 4;
+        let words = centre.len().div_ceil(64);
+        let (sv, shift) = (vdupq_n_f32(s), vdupq_n_f32(-(((1u32 << (bits - 1)) as f32) - 0.5)));
+        let sel = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+        for i in (0..n).step_by(4) {
+            let mut u = vdupq_n_u32(0);
+            for j in 0..bits {
+                let plane = ((packed[j * words + i / 64] >> (i % 64)) & 0xF) as u32;
+                u = vorrq_u32(u, vandq_u32(vtstq_u32(vdupq_n_u32(plane), sel), vdupq_n_u32(1 << j)));
+            }
+            let code = vaddq_f32(vcvtq_f32_u32(u), shift);
+            let c = vld1q_f32(centre.as_ptr().add(i));
+            vst1q_f32(out.add(i), vsubq_f32(c, vmulq_f32(sv, code)));
+        }
+        bit_planes_scalar(packed, centre, s, bits, n, out);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bit_planes_avx2(packed: &[u64], centre: &[f32], s: f32, bits: usize, out: *mut f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = centre.len() / 8 * 8;
+        let words = centre.len().div_ceil(64);
+        let (sv, shift) = (_mm256_set1_ps(s), _mm256_set1_ps(-(((1u32 << (bits - 1)) as f32) - 0.5)));
+        let sel = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+        for i in (0..n).step_by(8) {
+            let mut u = _mm256_setzero_si256();
+            for j in 0..bits {
+                let byte = ((packed[j * words + i / 64] >> (i % 64)) & 0xFF) as i32;
+                let set = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(byte), sel), sel);
+                u = _mm256_or_si256(u, _mm256_and_si256(set, _mm256_set1_epi32(1 << j)));
+            }
+            let code = _mm256_add_ps(_mm256_cvtepi32_ps(u), shift);
+            let c = _mm256_loadu_ps(centre.as_ptr().add(i));
+            _mm256_storeu_ps(out.add(i), _mm256_sub_ps(c, _mm256_mul_ps(sv, code)));
+        }
+        bit_planes_scalar(packed, centre, s, bits, n, out);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn bit_planes_avx512(packed: &[u64], centre: &[f32], s: f32, bits: usize, out: *mut f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = centre.len() / 16 * 16;
+        let words = centre.len().div_ceil(64);
+        let (sv, shift) = (_mm512_set1_ps(s), _mm512_set1_ps(-(((1u32 << (bits - 1)) as f32) - 0.5)));
+        for i in (0..n).step_by(16) {
+            let mut u = _mm512_setzero_si512();
+            for j in 0..bits {
+                let mask: __mmask16 = ((packed[j * words + i / 64] >> (i % 64)) & 0xFFFF) as u16;
+                u = _mm512_mask_or_epi32(u, mask, u, _mm512_set1_epi32(1 << j));
+            }
+            let code = _mm512_add_ps(_mm512_cvtepi32_ps(u), shift);
+            let c = _mm512_loadu_ps(centre.as_ptr().add(i));
+            _mm512_storeu_ps(out.add(i), _mm512_sub_ps(c, _mm512_mul_ps(sv, code)));
+        }
+        bit_planes_scalar(packed, centre, s, bits, n, out);
+    }
+}
+
+/// Write `centre[i] - s * (u[i] + shift)` into `out` (replacing its contents), for
+/// a bit-plane code `bits` wide (`1..=8`). `packed` must hold `bits` planes of
+/// `centre.len().div_ceil(64)` words.
+pub(crate) fn reconstruct_bit_planes_best(packed: &[u64], centre: &[f32], s: f32, bits: usize, out: &mut Vec<f32>) {
+    assert!((1..=8).contains(&bits), "bit-plane width out of range");
+    assert!(packed.len() >= centre.len().div_ceil(64) * bits, "code shorter than its dimension");
+    out.clear();
+    out.reserve(centre.len());
+    let ptr = out.as_mut_ptr();
+    // SAFETY: as in `reconstruct_single_bit_best`.
+    unsafe {
+        bit_planes_dispatch(packed, centre, s, bits, ptr);
+        out.set_len(centre.len());
+    }
+}
+
+#[allow(unreachable_code)]
+unsafe fn bit_planes_dispatch(packed: &[u64], centre: &[f32], s: f32, bits: usize, ptr: *mut f32) {
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        return bit_planes_neon(packed, centre, s, bits, ptr);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                return bit_planes_avx512(packed, centre, s, bits, ptr);
+            }
+            if is_x86_feature_detected!("avx2") {
+                return bit_planes_avx2(packed, centre, s, bits, ptr);
+            }
+        }
+        bit_planes_scalar(packed, centre, s, bits, 0, ptr);
+    }
+}
+
 // ── Multi-bit (u8 × f32) dot product ─────────────────────────────────────────
 //
 // Each packed u64 word stores 8 quantised u8 values (one per dimension, LE).
@@ -555,6 +784,107 @@ pub(crate) fn multi_bit_dot_best(packed: &[u64], q: &[f32], dim: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Random codes and a centre for the reconstruction kernels.
+    fn reconstruction_case(dim: usize, bits: usize, seed: u64) -> (Vec<u64>, Vec<f32>) {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let z = (state ^ (state >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z ^ (z >> 27)
+        };
+        let packed = (0..dim.div_ceil(64) * bits).map(|_| next()).collect();
+        let centre = (0..dim).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+        (packed, centre)
+    }
+
+    const RECONSTRUCTION_DIMS: [usize; 13] = [0, 1, 3, 4, 7, 8, 15, 16, 17, 63, 64, 65, 768];
+
+    /// The written form of each reconstruction, as a reference for the kernels.
+    fn reference_single_bit(packed: &[u64], centre: &[f32], s: f32) -> Vec<f32> {
+        (0..centre.len())
+            .map(|i| {
+                if (packed[i / 64] >> (i % 64)) & 1 == 1 {
+                    centre[i] + s
+                } else {
+                    centre[i] - s
+                }
+            })
+            .collect()
+    }
+
+    fn reference_bit_planes(packed: &[u64], centre: &[f32], s: f32, bits: usize) -> Vec<f32> {
+        use crate::semantic_search::quantisation::rabitq::quantisation_support::bit_plane_code;
+        let shift = -(((1u32 << (bits - 1)) as f32) - 0.5);
+        (0..centre.len())
+            .map(|i| centre[i] - s * (bit_plane_code(packed, centre.len(), bits, i) as f32 + shift))
+            .collect()
+    }
+
+    /// Bit-for-bit, so that a clustering does not depend on the CPU.
+    fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
+        let (got, want): (Vec<u32>, Vec<u32>) = (got.iter().map(|x| x.to_bits()).collect(), want.iter().map(|x| x.to_bits()).collect());
+        assert_eq!(got, want, "{what}");
+    }
+
+    #[test]
+    fn best_reconstruction_matches_reference() {
+        for dim in RECONSTRUCTION_DIMS {
+            let (packed, centre) = reconstruction_case(dim, 1, dim as u64);
+            let mut out = vec![9.0; 3];
+            reconstruct_single_bit_best(&packed, &centre, 0.037, &mut out);
+            assert_same_bits(&out, &reference_single_bit(&packed, &centre, 0.037), &format!("1-bit dim {dim}"));
+            for bits in 1..=8 {
+                let (packed, centre) = reconstruction_case(dim, bits, dim as u64 + 100);
+                reconstruct_bit_planes_best(&packed, &centre, -0.037, bits, &mut out);
+                assert_same_bits(
+                    &out,
+                    &reference_bit_planes(&packed, &centre, -0.037, bits),
+                    &format!("{bits}-bit dim {dim}"),
+                );
+            }
+        }
+    }
+
+    /// Each kernel this CPU can run (`best` only reaches the widest), and the
+    /// scalar fallback, against the reference.
+    #[test]
+    fn every_reconstruction_kernel_matches_reference() {
+        type SingleBit = unsafe fn(&[u64], &[f32], f32, *mut f32);
+        type BitPlanes = unsafe fn(&[u64], &[f32], f32, usize, *mut f32);
+        unsafe fn single_scalar(p: &[u64], c: &[f32], s: f32, out: *mut f32) {
+            unsafe { single_bit_scalar(p, c, s, 0, out) }
+        }
+        unsafe fn planes_scalar(p: &[u64], c: &[f32], s: f32, b: usize, out: *mut f32) {
+            unsafe { bit_planes_scalar(p, c, s, b, 0, out) }
+        }
+        let mut kernels: Vec<(&str, SingleBit, BitPlanes)> = vec![("scalar", single_scalar, planes_scalar)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                kernels.push(("avx2", single_bit_avx2, bit_planes_avx2));
+            }
+            if is_x86_feature_detected!("avx512f") {
+                kernels.push(("avx512", single_bit_avx512, bit_planes_avx512));
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        kernels.push(("neon", single_bit_neon, bit_planes_neon));
+        for (name, single, planes) in kernels {
+            for dim in RECONSTRUCTION_DIMS {
+                let (packed, centre) = reconstruction_case(dim, 1, dim as u64);
+                let mut out = vec![0.0f32; dim];
+                unsafe { single(&packed, &centre, 0.037, out.as_mut_ptr()) };
+                assert_same_bits(&out, &reference_single_bit(&packed, &centre, 0.037), &format!("{name} 1-bit dim {dim}"));
+                for bits in 1..=8 {
+                    let (packed, centre) = reconstruction_case(dim, bits, dim as u64 + 100);
+                    unsafe { planes(&packed, &centre, 0.037, bits, out.as_mut_ptr()) };
+                    let want = reference_bit_planes(&packed, &centre, 0.037, bits);
+                    assert_same_bits(&out, &want, &format!("{name} {bits}-bit dim {dim}"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn bit_planes_kernel_matches_plane_by_plane() {

@@ -21,6 +21,7 @@
 pub(crate) mod quantisation_support;
 
 use crate::semantic_search::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
+use crate::semantic_search::simd::{reconstruct_bit_planes_best, reconstruct_single_bit_best};
 use log::debug;
 use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
@@ -201,13 +202,7 @@ pub fn reconstruct_single_bit_into(vi: &VectorIndex, rotated_centre: &[f32], out
     if vi.quantisation_style != QuantisationStyle::SingleBit || vi.packed_vector.len() < rotated_centre.len().div_ceil(64) {
         return false;
     }
-    let s = vi.scaling_factor;
-    out.extend(
-        rotated_centre
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s }),
-    );
+    reconstruct_single_bit_best(&vi.packed_vector, rotated_centre, vi.scaling_factor, out);
     true
 }
 
@@ -230,7 +225,6 @@ pub fn reconstruct_code(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<
 /// `None`.
 pub fn reconstruct_code_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut Vec<f32>) -> bool {
     use crate::semantic_search::index::vector_index::QuantisationStyle;
-    use crate::semantic_search::quantisation::rabitq::quantisation_support::bit_plane_code;
     match vi.quantisation_style {
         QuantisationStyle::SingleBit => reconstruct_single_bit_into(vi, rotated_centre, out),
         QuantisationStyle::BitPlanes { number_of_bits: bits } => {
@@ -241,14 +235,7 @@ pub fn reconstruct_code_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut
             {
                 return false;
             }
-            let shift = -(((1u32 << (bits - 1)) as f32) - 0.5);
-            let s = vi.scaling_factor;
-            out.extend(
-                rotated_centre
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| c - s * (bit_plane_code(&vi.packed_vector, dim, bits, i) as f32 + shift)),
-            );
+            reconstruct_bit_planes_best(&vi.packed_vector, rotated_centre, vi.scaling_factor, bits, out);
             true
         }
         QuantisationStyle::MultiBit { .. } => false,
