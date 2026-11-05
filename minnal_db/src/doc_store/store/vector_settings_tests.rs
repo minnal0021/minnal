@@ -1850,4 +1850,67 @@ mod with_service {
         store.shutdown_vec_index_worker().await;
         store.shutdown().await.unwrap();
     }
+
+    /// A store with semantic search on, its vector worker running and its
+    /// partition split, so maintenance has run too.
+    #[cfg(target_os = "linux")]
+    async fn open_busy_semantic_store(dir: &std::path::Path, url: &str) -> DocStore {
+        let store = open_fresh(dir).await.with_semantic_search(context(url));
+        store
+            .create(semantic_schema(
+                "g",
+                Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+            ))
+            .await
+            .unwrap();
+        for i in 0..40u64 {
+            store.put("g", DocId::U64(i), serde_json::json!({"text": TEXT})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        store
+    }
+
+    /// However a doc store goes away, nothing keeps its database alive: not the
+    /// vector worker, not maintenance, not a partition. Their tasks hold the
+    /// database, so one that failed to exit would hold every file open.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_doc_store_closes_every_file_when_it_goes() {
+        let (url, _seen) = spawn_service();
+
+        let db_dir = TempDir::new().unwrap();
+        let store = open_busy_semantic_store(db_dir.path(), &url).await;
+        store.shutdown().await.unwrap();
+        drop(store);
+        crate::support::assert_no_open_files_under(db_dir.path(), "after shutdown").await;
+
+        let db_dir = TempDir::new().unwrap();
+        drop(open_busy_semantic_store(db_dir.path(), &url).await);
+        crate::support::assert_no_open_files_under(db_dir.path(), "dropped without shutdown").await;
+    }
+
+    /// Dropping a store closes the files of its namespace and its vector
+    /// companions while the rest of the database stays open.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removing_a_store_closes_its_files() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_busy_semantic_store(db_dir.path(), &url).await;
+        let is_the_stores = |file: &String| file.contains("/ns_g/") || file.contains("/ns_g_");
+        let held = || {
+            crate::support::open_files_under(db_dir.path())
+                .into_iter()
+                .filter(is_the_stores)
+                .collect::<Vec<_>>()
+        };
+        assert!(!held().is_empty(), "set-up: the store holds files");
+        store.remove("g").await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !held().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "after the drop, still open: {:#?}", held());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        store.shutdown().await.unwrap();
+    }
 }

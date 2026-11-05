@@ -111,6 +111,38 @@ pub(crate) fn test_db_config() -> crate::DbConfig {
     }
 }
 
+/// Test-only: the files this process has open under `dir`, deleted ones included.
+///
+/// It looks only under `dir`, so tests running alongside cannot disturb the answer.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn open_files_under(dir: &std::path::Path) -> Vec<String> {
+    let dir = dir.to_string_lossy().into_owned();
+    let inside = format!("{dir}/");
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .map(|target| target.to_string_lossy().into_owned())
+        .filter(|target| target.starts_with(&inside))
+        .collect()
+}
+
+/// Test-only: wait for every file under `dir` to be closed, and fail naming those
+/// still open. It waits because a worker's last pass can hold a database for a
+/// moment after its last handle goes, and it yields to the runtime so that pass
+/// can finish.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) async fn assert_no_open_files_under(dir: &std::path::Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let open = open_files_under(dir);
+        if open.is_empty() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}: {} files still open: {open:#?}", open.len());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Validate that a runtime bucket count is within the u32 limit.
 #[allow(dead_code)]
 pub fn validate_num_buckets(num_buckets: usize) {

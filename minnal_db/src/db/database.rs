@@ -3254,6 +3254,14 @@ impl Database {
         }
     }
 
+    /// Test-only: simulate a crash. Drops the database without the flushes a clean
+    /// close runs, and closes every file. Use this, not `std::mem::forget`, which
+    /// leaks each file until the test process exits. See `AsyncDb::crash`.
+    #[cfg(test)]
+    pub(crate) fn crash(self) {
+        self.mark_crashed();
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }

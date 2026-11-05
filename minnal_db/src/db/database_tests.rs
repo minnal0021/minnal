@@ -1020,7 +1020,7 @@ fn replay_cost_vs_total() {
                 db.put(format!("doc:{i:06}").as_bytes(), format!(r#"{{"status":"{v}"}}"#).as_bytes())
                     .unwrap();
             }
-            std::mem::forget(db);
+            db.crash();
             field_id
         };
         let db = Database::open(dir.path(), config).unwrap();
@@ -1077,7 +1077,7 @@ fn replay_cost_vs_window() {
             // would advance the marker past everything just written and leave
             // the replay window empty — measuring nothing. (It did, on the
             // first attempt at this measurement.)
-            std::mem::forget(db);
+            db.crash();
             field_id
         };
 
@@ -1704,7 +1704,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
         // Nothing new since the flush, so a second tick is a no-op.
         assert_eq!(db.flush_no_wal_memtables(), 0, "an already-flushed namespace should not be re-flushed");
 
-        std::mem::forget(db);
+        db.crash();
     }
 
     {
@@ -1717,7 +1717,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
                 "no-WAL write {i} was flushed before the crash and must survive it"
             );
         }
-        std::mem::forget(db);
+        db.crash();
     }
 
     // Without the flush the same writes are gone — no WAL entry exists to
@@ -1729,7 +1729,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
         for i in 0..50u32 {
             db.put_ns_no_wal(ns, format!("v{i:03}").as_bytes(), b"embedding").unwrap();
         }
-        std::mem::forget(db);
+        db.crash();
     }
     {
         let db = Database::open(dir2.path(), config).unwrap();
@@ -1740,7 +1740,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
             "un-flushed no-WAL writes are expected to be lost — if this starts passing, \
                  the flush test above is no longer proving anything"
         );
-        std::mem::forget(db);
+        db.crash();
     }
 }
 
@@ -1818,8 +1818,8 @@ fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
     // A crash can strike right after WAL replay re-appended values to the log but
     // before the value-log metadata was flushed — leaving segment files longer than
     // their recorded totals. The next open must reconcile that (rebuild stats from
-    // the LSM) and lose nothing, even across repeated crash/replay cycles. Crash is
-    // simulated with mem::forget, which skips Database::drop's clean flush.
+    // the LSM) and lose nothing, even across repeated crash/replay cycles. `crash()`
+    // skips Database::drop's clean flush.
     let dir = TempDir::new().unwrap();
     let mut config = create_db_config();
     config.num_buckets = 1;
@@ -1831,7 +1831,7 @@ fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
         for (i, k) in keys.iter().enumerate() {
             db.put(k, format!("v{i}").as_bytes()).unwrap();
         }
-        std::mem::forget(db);
+        db.crash();
     }
 
     // Session 2: reopen replays the WAL (re-appending to the log), then crash again
@@ -1843,7 +1843,7 @@ fn recovery_replay_then_crash_before_metadata_flush_loses_nothing() {
             Some(b"v0".as_slice()),
             "replay must restore the data"
         );
-        std::mem::forget(db);
+        db.crash();
     }
 
     // Session 3: open cleanly. Everything is still readable, and the value-log
@@ -1886,7 +1886,7 @@ fn a_torn_tail_survives_reopen_append_and_gc() {
         for i in 0..40u32 {
             db.put(format!("k{i:03}").as_bytes(), &value).unwrap();
         }
-        std::mem::forget(db);
+        db.crash();
     }
 
     // Inject a torn write at the tail of bucket 0's active segment.
@@ -2231,7 +2231,7 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
 ///   3. `put` key B — fsynced into the WAL, but its in-memory metadata bump
 ///      never reaches disk (no further flush, `records_per_sync = 1000` so the
 ///      write path never auto-syncs/persists for two puts),
-///   4. abandon the Db **without** shutdown via `mem::forget`, faithfully
+///   4. abandon the Db **without** shutdown via `crash()`, faithfully
 ///      simulating a crash: the in-memory metadata that knows about B and the
 ///      unflushed memtable holding A and B are both lost, leaving both keys
 ///      only in the WAL. (A plain `drop` would run `Database::drop`, which does
@@ -2258,12 +2258,11 @@ fn test_recovery_from_stale_metadata_via_real_write_path() {
         // lives only in memory — exactly the post-flush window.
         db.put(b"B", b"vb").unwrap();
 
-        // Abandon without shutdown to simulate a crash: `mem::forget` skips
-        // `Database::drop`, which would otherwise cleanly flush the memtable
-        // and metadata (persisting B and defeating the test). The leaked
-        // handles are released at process exit; everything durable (the WAL)
-        // is already fsynced.
-        std::mem::forget(db);
+        // Abandon without shutdown to simulate a crash: `crash()` skips the clean
+        // flush of the memtable and metadata `Database::drop` would otherwise run
+        // (persisting B and defeating the test). Everything durable (the WAL) is
+        // already fsynced.
+        db.crash();
     }
 
     // Force the on-disk metadata back to the A-only snapshot, simulating the
@@ -3081,13 +3080,13 @@ mod merge_tests {
                 if flush {
                     assert_eq!(db.flush_no_wal_memtables(), 1);
                 }
-                std::mem::forget(db);
+                db.crash();
             }
             let db = Database::open(dir.path(), create_db_config()).unwrap();
             let ns = db.get_namespace_id("queue").unwrap();
             let expected = if flush { None } else { Some(b"queued".to_vec()) };
             assert_eq!(db.get_ns(ns, b"entry").unwrap(), expected, "flushed before the crash: {flush}");
-            std::mem::forget(db);
+            db.crash();
         }
     }
 
@@ -3108,7 +3107,7 @@ mod merge_tests {
             // The put again, unpersisted, with a seq below the tombstone's.
             db.simulate_crash_with_wal_entries(vec![WalEntry::new_upsert_ns(ns, b"entry".to_vec(), b"queued".to_vec()).with_sequence(1)])
                 .unwrap();
-            std::mem::forget(db);
+            db.crash();
         }
         let db = Database::open(dir.path(), create_db_config()).unwrap();
         let ns = db.get_namespace_id("queue").unwrap();
@@ -3117,7 +3116,7 @@ mod merge_tests {
             None,
             "the replayed put came back over the newer tombstone in L0"
         );
-        std::mem::forget(db);
+        db.crash();
     }
 }
 

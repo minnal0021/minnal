@@ -2001,6 +2001,13 @@ impl KVStore {
     pub(crate) fn mark_crashed(&self) {
         self.crashed.store(true, Ordering::SeqCst);
     }
+
+    /// Test-only: simulate a crash. Drops the store without its flush, and closes
+    /// every file. Use this, not `std::mem::forget`, which leaks them.
+    #[cfg(test)]
+    pub(crate) fn crash(self) {
+        self.mark_crashed();
+    }
 }
 
 impl Drop for KVStore {
@@ -2701,9 +2708,9 @@ mod tests {
                     "segment {segment_id} was unlinked before the re-point was durable — that is data loss"
                 );
             }
-            // A faithful crash: `mem::forget` skips `Drop`, which would otherwise flush
-            // the LSM and make this a graceful close instead of the crash we mean to test.
-            std::mem::forget(store);
+            // A faithful crash: a clean `Drop` would flush the LSM and make this a
+            // graceful close instead of the crash we mean to test.
+            store.crash();
             pending
         };
         assert!(!pending.is_empty());
@@ -2751,8 +2758,8 @@ mod tests {
             let stats = store.garbage_collect_with_threshold(10.0).unwrap();
             assert!(stats.bytes_reclaimed > 0, "expected GC to have unlinked at least one segment");
 
-            // Crash: skip Drop, so nothing beyond what GC itself made durable survives.
-            std::mem::forget(store);
+            // Crash: no flush, so nothing beyond what GC itself made durable survives.
+            store.crash();
         }
 
         let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
@@ -2785,9 +2792,9 @@ mod tests {
             }
             let stats = store.garbage_collect_with_threshold(10.0).unwrap();
             assert!(stats.bytes_reclaimed > 0, "expected GC to reclaim at least one segment");
-            // A faithful crash right after the pass: skip `Drop` (which would flush the
-            // LSM), so only what GC itself made durable survives.
-            std::mem::forget(store);
+            // A faithful crash right after the pass: no flush of the LSM, so only what
+            // GC itself made durable survives.
+            store.crash();
         }
 
         let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();

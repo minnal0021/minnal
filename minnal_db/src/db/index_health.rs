@@ -642,9 +642,9 @@ mod tests {
             db.put_ns_no_wal(ns, b"doc:2", br#"{"status":"active"}"#)?;
             assert!(db.index_manager.no_wal_pending(ns), "a no-WAL write must set the marker before writing");
 
-            // Drop without shutdown() — the unclean case. A clean shutdown runs a
+            // Crash, not shutdown() — the unclean case. A clean shutdown runs a
             // checkpoint first, which is exactly what clears the marker.
-            std::mem::forget(db);
+            db.crash();
             field_id
         };
 

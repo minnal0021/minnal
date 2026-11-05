@@ -935,4 +935,52 @@ mod iterator_tests {
         assert_eq!(ns.get(b"memtable".to_vec()).await.unwrap(), None, "an unflushed no-WAL write survived");
         db.shutdown().await.unwrap();
     }
+
+    /// A database with its workers running, holding one written namespace.
+    #[cfg(target_os = "linux")]
+    async fn open_with_workers(dir: &std::path::Path) -> crate::db::facade::AsyncDb {
+        let config = create_db_config();
+        let db = crate::db::facade::AsyncDb::open_with_config(dir.to_owned(), config.clone())
+            .await
+            .unwrap();
+        db.enable_all_workers(&config).await.unwrap();
+        let ns = db.namespace("n".to_string()).await.unwrap();
+        ns.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
+        assert!(!crate::support::open_files_under(dir).is_empty(), "set-up: the database holds files");
+        db
+    }
+
+    /// However a database goes away, it closes every file. A leak here is what
+    /// runs a long-lived process, or a test binary, out of descriptors.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_database_closes_every_file_when_it_goes() {
+        let dir = TempDir::new().unwrap();
+        let db = open_with_workers(dir.path()).await;
+        db.shutdown().await.unwrap();
+        drop(db);
+        crate::support::assert_no_open_files_under(dir.path(), "after shutdown").await;
+
+        let dir = TempDir::new().unwrap();
+        drop(open_with_workers(dir.path()).await);
+        crate::support::assert_no_open_files_under(dir.path(), "dropped without shutdown").await;
+
+        let dir = TempDir::new().unwrap();
+        open_with_workers(dir.path()).await.crash().await;
+        crate::support::assert_no_open_files_under(dir.path(), "after a simulated crash").await;
+    }
+
+    /// Removing a namespace closes its files while the database stays open.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_namespace_closes_its_files() {
+        let dir = TempDir::new().unwrap();
+        let db = open_with_workers(dir.path()).await;
+        let files = dir.path().join("ns_n");
+        assert!(!crate::support::open_files_under(&files).is_empty(), "set-up: the namespace holds files");
+        db.remove_namespace("n".to_string()).await.unwrap();
+        crate::support::assert_no_open_files_under(&files, "after remove_namespace").await;
+        db.shutdown().await.unwrap();
+    }
 }
