@@ -1520,6 +1520,35 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A store drop cancelled while it waits for maintenance must not leave the
+    /// namespace refused: its partition would never be handed out again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_drop_leaves_the_partition_usable() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        let loaded = partition(&store, "g").await;
+        let running = loaded.lock_maintenance().await;
+        let ctx = store.semantic_ctx.as_ref().unwrap();
+        let mut drop_store = Box::pin(store.remove("g"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), drop_store.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(ctx.is_dropping("g"), "set-up: the drop reached its wait for maintenance");
+        drop(drop_store); // what axum does when the client disconnects
+        drop(running);
+        assert!(!ctx.is_dropping("g"));
+        partition(&store, "g").await;
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(store.count_indexed_docs("g").await, 1);
+        store.remove("g").await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
     /// A drop waiting out one store's maintenance (a rebuild's k-means can take
     /// minutes) holds up that store's admin operations and no other's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

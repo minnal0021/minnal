@@ -81,14 +81,19 @@ pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) 
 
 pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "dropping store");
-    match state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
-        StoreType::Doc => {
-            state.store.remove(&ns).await?;
+    let store_type = state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
+    // In its own task: axum drops a handler when its client disconnects, and a drop
+    // stopped midway leaves the store half removed until it is retried.
+    let store = Arc::clone(&state.store);
+    let name = ns.clone();
+    tokio::spawn(async move {
+        match store_type {
+            StoreType::Doc => store.remove(&name).await,
+            StoreType::Kv => store.remove_kv(&name).await,
         }
-        StoreType::Kv => {
-            state.store.remove_kv(&ns).await?;
-        }
-    }
+    })
+    .await
+    .map_err(|e| AppError::from(DocStoreError::Io(std::io::Error::other(e))))??;
     info!(namespace = %ns, "store dropped");
     Ok(StatusCode::NO_CONTENT)
 }

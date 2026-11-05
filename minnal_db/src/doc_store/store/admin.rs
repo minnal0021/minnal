@@ -523,10 +523,17 @@ impl DocStore {
         namespace: &str,
         drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
     ) -> Result<T, DocStoreError> {
+        // A guard, because this future can be dropped at any await (the client of
+        // a route disconnecting): left closed, the store refuses writes for good.
+        struct Reopen<'a>(&'a WriteGate, &'a str);
+        impl Drop for Reopen<'_> {
+            fn drop(&mut self) {
+                self.0.reopen(self.1);
+            }
+        }
+        let _reopen = Reopen(&self.writes, namespace);
         self.writes.close(namespace).await;
-        let result = drop.await;
-        self.writes.reopen(namespace);
-        result
+        drop.await
     }
 
     /// Run `drop`, which removes `namespace`'s vector namespaces, with its
@@ -543,13 +550,21 @@ impl DocStore {
         let _lifecycle = self.lifecycle.lock(namespace).await;
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
+            // A guard, as in `without_writes`: left in place, the namespace's
+            // partition is refused for good. Declared after `_lifecycle`, so the
+            // drop has ended before another lifecycle operation starts.
+            struct EndDrop<'a>(&'a SemanticSearchContext, &'a str);
+            impl Drop for EndDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.evict(self.1);
+                    self.0.end_drop(self.1);
+                }
+            }
+            let _end = EndDrop(ctx, namespace);
             ctx.begin_drop(namespace).await;
             // A reindex sees the drop and stops at its next enqueue.
             self.wait_for_reindex(namespace).await;
-            let result = drop.await;
-            ctx.evict(namespace);
-            ctx.end_drop(namespace);
-            return result;
+            return drop.await;
         }
         #[cfg(not(feature = "semantic-search"))]
         let _ = namespace; // no partitions without semantic search
@@ -787,6 +802,22 @@ mod tests {
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by the restart");
         store.remove("foo").await.unwrap();
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by dropping foo");
+        store.shutdown().await.unwrap();
+    }
+
+    /// A drop's future can be dropped at any await, when the client of its route
+    /// disconnects. The store must not be left refusing writes.
+    #[tokio::test]
+    async fn a_cancelled_drop_leaves_the_store_writable() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        store.create(make_schema("ns", vec![])).await.unwrap();
+        let held = store.lifecycle.lock("ns").await;
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(50), store.remove("ns")).await;
+        assert!(cancelled.is_err(), "the drop waits for the lifecycle lock");
+        drop(held);
+        store.put("ns", DocId::U64(1), serde_json::json!({})).await.unwrap();
+        store.remove("ns").await.unwrap();
         store.shutdown().await.unwrap();
     }
 
