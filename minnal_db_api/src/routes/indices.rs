@@ -112,21 +112,23 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
 /// The schema is updated synchronously before the background cleanup runs.
 /// Returns `202 Accepted`.
 pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Block if cleanup already running.
-    {
-        let ops = state.vec_index_cleanup.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("vector index cleanup already in progress for '{ns}'")
-                })),
-            ));
-        }
+    // Claim the cleanup before semantic search goes off, atomically with the check:
+    // an enable landing in between would see nothing running.
+    if !state.vec_index_cleanup.lock().insert(ns.clone()) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("vector index cleanup already in progress for '{ns}'")
+            })),
+        ));
     }
+    let release = || {
+        state.vec_index_cleanup.lock().remove(&ns);
+    };
 
     // Block if a reindex reindex is running.
     if let Err(DocStoreError::VecReindexInProgress { .. }) = state.store.check_index_all_preconditions(&ns) {
+        release();
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -137,6 +139,7 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
 
     // Disable SS in schema synchronously so new writes stop enqueuing.
     state.store.disable_semantic_search(&ns).map_err(|e| {
+        release();
         let status = if matches!(e, DocStoreError::SemanticSearchNotEnabled { .. }) {
             StatusCode::UNPROCESSABLE_ENTITY
         } else if matches!(e, DocStoreError::NotFound { .. }) {
@@ -148,7 +151,6 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
         (status, Json(serde_json::json!({ "error": e.to_string() })))
     })?;
 
-    state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector index drop accepted — running in background");
 
     let store = Arc::clone(&state.store);

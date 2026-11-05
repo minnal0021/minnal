@@ -243,25 +243,26 @@ pub async fn amend_schema(
     // For RemoveAttribute we use the dedicated path that returns whether the
     // last embedding field was removed (triggering background vector cleanup).
     if let AmendRequest::RemoveAttribute { name } = &req {
-        let last_embedding_removed = state.store.remove_attribute(&ns, name)?;
+        // Claimed before semantic search can go off, as the drop routes do. `false`
+        // means a cleanup is already running, and this spawns no other.
+        let claimed = state.vec_index_cleanup.lock().insert(ns.clone());
+        let removed = state.store.remove_attribute(&ns, name);
+        if claimed && !matches!(removed, Ok(true)) {
+            state.vec_index_cleanup.lock().remove(&ns);
+        }
 
-        if last_embedding_removed {
-            // Check whether a cleanup is already running before spawning another.
-            let already_running = state.vec_index_cleanup.lock().contains(&ns);
-            if !already_running {
-                state.vec_index_cleanup.lock().insert(ns.clone());
-                info!(namespace = %ns, "last embedding field removed — cleaning up vector index data in background");
-                let store = Arc::clone(&state.store);
-                let ops_ref = Arc::clone(&state.vec_index_cleanup);
-                let ns_clone = ns.clone();
-                tokio::spawn(async move {
-                    match store.drop_vector_index_data(&ns_clone).await {
-                        Ok(()) => info!(namespace = %ns_clone, "vector index data cleanup complete"),
-                        Err(e) => error!(namespace = %ns_clone, error = %e, "vector index data cleanup failed"),
-                    }
-                    ops_ref.lock().remove(&ns_clone);
-                });
-            }
+        if removed? && claimed {
+            info!(namespace = %ns, "last embedding field removed — cleaning up vector index data in background");
+            let store = Arc::clone(&state.store);
+            let ops_ref = Arc::clone(&state.vec_index_cleanup);
+            let ns_clone = ns.clone();
+            tokio::spawn(async move {
+                match store.drop_vector_index_data(&ns_clone).await {
+                    Ok(()) => info!(namespace = %ns_clone, "vector index data cleanup complete"),
+                    Err(e) => error!(namespace = %ns_clone, error = %e, "vector index data cleanup failed"),
+                }
+                ops_ref.lock().remove(&ns_clone);
+            });
         }
 
         return Ok(StatusCode::NO_CONTENT);
