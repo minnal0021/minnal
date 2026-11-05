@@ -54,6 +54,8 @@ cargo clippy --workspace --all-targets -- -D warnings    # lint before committin
 cargo fmt --check                                        # format check
 ```
 
+On Linux (WSL included), test binaries run with `TMPDIR=/dev/shm`, through the runner `.cargo/test-runner.sh`: the suite spends most of its time in fsync on a real disk (about 190 s on tmpfs; one test alone took 2,006 s on disk), and peaks near 0.85 GiB of tmpfs. It stays on the normal temporary directory if `TMPDIR` is already set or `/dev/shm` is under 1 GiB, and never applies to `cargo run` or `cargo bench`. **Set `TMPDIR` to a real-disk path (`TMPDIR=/var/tmp cargo test ...`) for anything that measures fsync or write cost, including `#[ignore]`d measurement tests, and before merging durability changes**: tmpfs has no real fsync cost. macOS has no such runner, so its tests run on disk, one at a time.
+
 When touching feature-gated code, verify each combo compiles: default / `--features doc-store` / `--features semantic-search` / `--all-features` (clippy `-D warnings` must be clean in all). Benchmarks live in `minnal_db/benches/`; `bench_distance_estimation` needs `--features semantic-search`.
 
 ## Project structure (minnal_db)
