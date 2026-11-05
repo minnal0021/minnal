@@ -1591,6 +1591,32 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A crash after a drop removed the vector namespaces and before it re-seeded
+    /// them, with semantic search enabled again meanwhile. The enable route refuses
+    /// such a store, so open must give it its partition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crash_before_a_drop_reseeds_is_healed_at_open() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        for name in vector_kv::companion_namespaces("g") {
+            store.db.remove_namespace(name).await.unwrap();
+        }
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
+            .await
+            .unwrap()
+            .with_semantic_search(context(&url));
+        partition(&store, "g").await;
+        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        wait_for_empty_queue(&store).await;
+        assert_eq!(store.count_indexed_docs("g").await, 1);
+        store.shutdown().await.unwrap();
+    }
+
     /// Counting indexed documents only reads, so asking about a store that does
     /// not exist must not create anything.
     #[tokio::test]

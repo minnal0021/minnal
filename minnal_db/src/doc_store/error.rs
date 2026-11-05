@@ -140,7 +140,7 @@ pub enum DocStoreError {
     EmbeddingModelUnavailable { model: String, dim: u32, reason: String },
 
     /// A semantic namespace has no centres and postings to search or index with.
-    #[error("namespace '{namespace}' has no seeded centres; re-enable its vector index")]
+    #[error("namespace '{namespace}' has no seeded centres; restart to seed them, or drop its vector index and enable it again")]
     VectorIndexNotSeeded { namespace: String },
 
     /// A namespace's embedding dimension is not the one the server lists for

@@ -462,11 +462,14 @@ impl DocStore {
         Ok(leftover.len())
     }
 
-    /// Create the vector namespaces of every semantic-search store that lacks
-    /// them. Writers never create them, so a store saved before seeding did
-    /// would otherwise index nothing. Called at open, before any drop can run.
+    /// Give every semantic-search store whatever it lacks of its vector namespaces
+    /// and starting partition. Writers never create them, and a crash after a drop
+    /// removed them and before it re-seeded (semantic search was enabled again
+    /// meanwhile) leaves a schema that promises a partition with none there; the
+    /// enable route refuses such a store, as it already has a vector index. Called
+    /// at open, before any drop can run.
     #[cfg(feature = "semantic-search")]
-    pub(super) async fn create_missing_vector_namespaces(&self) -> Result<(), DocStoreError> {
+    pub(super) async fn ensure_vector_indexes(&self) -> Result<(), DocStoreError> {
         let docs = self
             .load_all_schemas()?
             .into_iter()
@@ -479,6 +482,11 @@ impl DocStore {
             .map(|s| s.namespace.clone());
         for namespace in docs.chain(kvs) {
             vector_kv::create_vector_namespaces(&self.db, &namespace).await?;
+            if !vector_kv::ivf_exists(&self.db, &namespace).await? {
+                let (settings, _) = self.schemas.vector_settings(&namespace)?;
+                warn!("semantic store '{namespace}' has no partition; seeding one");
+                vector_kv::init_ivf(&self.db, &namespace, settings.embedding_dim as usize).await?;
+            }
         }
         Ok(())
     }
@@ -507,8 +515,10 @@ impl DocStore {
             // promises one.
             let enabled = self.schemas.get(namespace).is_some_and(|s| s.is_semantic_search_enabled());
             if enabled {
+                // No model check: the enable made it, and with the old partition
+                // already gone, failing here would leave none.
                 let (settings, _) = self.schemas.vector_settings(namespace)?;
-                self.seed_vector_index(namespace, &settings, &mut None).await?;
+                vector_kv::init_ivf(&self.db, namespace, settings.embedding_dim as usize).await?;
             }
             Ok(())
         })
