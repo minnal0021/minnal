@@ -1863,7 +1863,11 @@ impl Database {
 
         // (2) Flush + close, then drop so the data directory's file handles are
         // released before we delete it.
-        if let Some(store) = self.stores.write().remove(&ns_id) {
+        // On its own line: in an `if let` scrutinee the write guard would live to the
+        // end of the block, and every namespace lookup in the database would wait out
+        // this store's flush and compaction.
+        let removed = self.stores.write().remove(&ns_id);
+        if let Some(store) = removed {
             // Fold this namespace's final counters into the global accumulator so
             // engine-wide aggregates stay monotonic after the per-namespace
             // metrics disappear with the store.

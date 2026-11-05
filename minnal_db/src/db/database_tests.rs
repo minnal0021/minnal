@@ -3607,3 +3607,37 @@ fn only_an_unregistered_namespace_loses_its_directory() {
     db.remove_unregistered_namespace_dir("never_existed").unwrap();
     db.shutdown().unwrap();
 }
+
+/// Removing a namespace flushes and compacts it, which can take seconds. Lookups
+/// of other namespaces run on async threads and must not wait for that.
+#[test]
+fn removing_a_namespace_does_not_hold_up_lookups_of_others() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+    db.create_namespace("other").unwrap();
+    db.create_namespace("going").unwrap();
+    let going = db.get_store_by_name("going").unwrap();
+
+    // The removal's flush stops on this, so it stays in progress.
+    let held = going.lsm.hold_memtable();
+    let remover = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.remove_namespace("going").unwrap())
+    };
+    while db.namespace_exists("going") {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(Duration::from_millis(50)); // into the flush
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || tx.send(matches!(db.lookup_open_store("other"), OpenStoreLookup::Open(..))).unwrap());
+    }
+    let found = rx.recv_timeout(Duration::from_secs(5));
+    assert!(!remover.is_finished(), "the removal must still be in progress");
+    drop(held);
+    remover.join().unwrap();
+    assert_eq!(found, Ok(true), "the lookup waited for the removal");
+    db.shutdown().unwrap();
+}

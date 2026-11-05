@@ -4426,6 +4426,12 @@ impl LSMTree {
 
     /// Cleanup all pending memtables on database close
     /// Called during database shutdown to ensure cleanup happens
+    /// Test-only: hold the active memtable, so a flush of this tree waits.
+    #[cfg(test)]
+    pub(crate) fn hold_memtable(&self) -> impl Sized + '_ {
+        self.memtable.write()
+    }
+
     pub(crate) fn cleanup_pending_memtables_on_close(&self) {
         let mut pending = self.pending_old_memtables.write();
         let count = pending.len();
