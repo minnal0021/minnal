@@ -28,7 +28,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
-        let _lifecycle = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.lock(&ns_name).await;
         if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
@@ -132,7 +132,7 @@ impl DocStore {
         }
 
         let ns_name = schema.namespace.clone();
-        let _lifecycle = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.lock(&ns_name).await;
         if self.schemas.contains(&ns_name) {
             return Err(DocStoreError::AlreadyExists { namespace: ns_name });
         }
@@ -191,7 +191,7 @@ impl DocStore {
     /// remove or update an attribute that is used by an active index returns
     /// [`DocStoreError::AttributeIsIndexed`] — drop the index first.
     pub async fn amend(&self, namespace: &str, mut amendment: SchemaAmendment) -> Result<(), DocStoreError> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.lock(namespace).await;
         let current = self.load_schema(namespace)?;
 
         // A namespace without settings yet takes the server's defaults; one that
@@ -531,7 +531,7 @@ impl DocStore {
         namespace: &str,
         drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
     ) -> Result<T, DocStoreError> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.lock(namespace).await;
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
             ctx.begin_drop(namespace).await;

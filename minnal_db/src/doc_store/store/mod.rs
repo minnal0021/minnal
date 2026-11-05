@@ -109,12 +109,8 @@ pub struct DocStore {
     vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Writes in progress per store, which a drop waits for.
     writes: Arc<WriteGate>,
-    /// Held across whatever creates or removes a store's namespaces as a whole:
-    /// a create, an amendment (which can turn semantic search on and seed the
-    /// partition) and a drop. Interleaved, a drop removes the partition an enable
-    /// just seeded, leaving semantic search on with no partition. Rare admin
-    /// operations, so one lock for all stores. Taken after the write gate.
-    lifecycle: tokio::sync::Mutex<()>,
+    /// Keeps a store's create, amendments and drop apart ([`LifecycleLocks`]).
+    lifecycle: LifecycleLocks,
     /// Documents of semantic-search stores with a write in progress, which the
     /// vector worker skips (see [`InFlightWrites`]).
     #[cfg(feature = "semantic-search")]
@@ -171,7 +167,7 @@ impl DocStore {
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: LifecycleLocks::default(),
             #[cfg(feature = "semantic-search")]
             in_flight: Arc::default(),
         };

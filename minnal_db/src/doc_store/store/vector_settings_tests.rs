@@ -1504,6 +1504,48 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
+    /// A drop waiting out one store's maintenance (a rebuild's k-means can take
+    /// minutes) holds up that store's admin operations and no other's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiting_drop_holds_up_only_its_own_store() {
+        let (url, _seen) = spawn_service();
+        let db_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(open_fresh(db_dir.path()).await.with_semantic_search(context(&url)));
+        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store.create(make_schema("other", vec![])).await.unwrap();
+        let add = |name: &str| SchemaAmendment::AddAttribute {
+            name: name.to_owned(),
+            attr_type: AttributeType::Str,
+            description: None,
+        };
+        let loaded = partition(&store, "g").await;
+        let running = loaded.lock_maintenance().await;
+        let dropping = tokio::spawn({
+            let store = std::sync::Arc::clone(&store);
+            async move { store.remove("g").await.unwrap() }
+        });
+        let ctx = store.semantic_ctx.as_ref().unwrap();
+        while !ctx.is_dropping("g") {
+            tokio::task::yield_now().await;
+        }
+
+        let within = std::time::Duration::from_secs(5);
+        tokio::time::timeout(within, store.create(make_schema("new", vec![])))
+            .await
+            .expect("a create of another store waited for the drop")
+            .unwrap();
+        tokio::time::timeout(within, store.amend("other", add("a")))
+            .await
+            .expect("an amendment of another store waited for the drop")
+            .unwrap();
+        let own = tokio::time::timeout(std::time::Duration::from_millis(200), store.amend("g", add("b"))).await;
+        assert!(own.is_err(), "an amendment of the store being dropped must wait");
+
+        drop(running);
+        dropping.await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
     /// Counting indexed documents only reads, so asking about a store that does
     /// not exist must not create anything.
     #[tokio::test]
