@@ -229,6 +229,11 @@ pub enum DocStoreError {
     #[error("a vector index reindex for namespace '{namespace}' is already in progress")]
     VecReindexInProgress { namespace: String },
 
+    /// A store cannot take this name: a namespace of that name, with no store,
+    /// holds keys written directly through [`Db`](crate::Db).
+    #[error("namespace '{namespace}' already holds keys and is not a store; remove it or choose another name")]
+    NamespaceNotEmpty { namespace: String },
+
     /// The namespace's vector index is still being removed. Enabling it again
     /// now would lose what is written before the removal finishes.
     #[error("the vector index of namespace '{namespace}' is still being removed; retry when it finishes")]

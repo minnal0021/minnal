@@ -2553,7 +2553,8 @@ them from an in-memory copy that each schema change updates. Every schema
 declares a mandatory `store_type` field — `"doc"` or `"kv"` — which tells the
 two kinds apart. Both kinds share the namespace names, so a doc store and a KV
 store cannot have the same name, and no store may be named `system` or start
-with `system_`. A store's name also cannot end in `_sparse_vector`,
+with `system_`. Creating a store answers `409` if a namespace of that name already
+holds keys written directly through the library. A store's name also cannot end in `_sparse_vector`,
 `_sparse_vector_meta`, `_dense_vector`, `_ivf_centres`, `_ivf_postings` or
 `_ivf_journal`: those namespaces hold the vector index of the store named by the
 rest.

@@ -41,7 +41,7 @@ impl DocStore {
             schema.semantic_search_enabled
         );
 
-        self.remove_orphaned_namespace(&ns_name).await?;
+        self.clear_orphaned_namespace(&ns_name).await?;
         // Create namespace — `namespace()` creates it if absent
         let ns_handle = self.db.namespace(ns_name.clone()).await?;
         let ns_id = ns_handle.id();
@@ -62,16 +62,25 @@ impl DocStore {
         Ok(())
     }
 
-    /// Remove a namespace with `name` left without a schema (a create cut short,
-    /// or one a race brought back), so a new store does not inherit its keys. Not
-    /// done at open: a database can hold namespaces written directly through
-    /// [`Db`](crate::Db). The caller holds the lifecycle lock and has seen no
-    /// schema under this name. The default namespace always exists.
-    async fn remove_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
-        if name != crate::db::namespace::DEFAULT_NAMESPACE && self.db.existing_namespace(name.to_owned()).await?.is_some() {
-            log::warn!("removing namespace '{name}', left without a schema, before creating a store with its name");
-            self.db.remove_namespace(name.to_owned()).await?;
+    /// Deal with a namespace called `name` that has no schema, before a store takes
+    /// the name. An empty one goes: it is all a create cut short leaves, and it may
+    /// hold field-index registrations the new store must not inherit. One holding
+    /// keys is refused with [`DocStoreError::NamespaceNotEmpty`]: it was written
+    /// directly through [`Db`](crate::Db), and those keys are not this store's to
+    /// delete or adopt. The caller holds the lifecycle lock and has seen no schema
+    /// under this name. The default namespace always exists, so it is left alone.
+    async fn clear_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
+        if name == crate::db::namespace::DEFAULT_NAMESPACE {
+            return Ok(());
         }
+        let Some(orphan) = self.db.existing_namespace(name.to_owned()).await? else {
+            return Ok(());
+        };
+        if !orphan.scan(None, None, 1).await?.0.is_empty() {
+            return Err(DocStoreError::NamespaceNotEmpty { namespace: name.to_owned() });
+        }
+        log::warn!("removing empty namespace '{name}', left without a schema, before creating a store with its name");
+        self.db.remove_namespace(name.to_owned()).await?;
         Ok(())
     }
 
@@ -142,7 +151,7 @@ impl DocStore {
             ns_name, schema.key_type, schema.value_type, schema.semantic_search_enabled
         );
 
-        self.remove_orphaned_namespace(&ns_name).await?;
+        self.clear_orphaned_namespace(&ns_name).await?;
         let ns_handle = self.db.namespace(ns_name.clone()).await?;
         schema.ns_id = Some(ns_handle.id());
         if schema.is_semantic_search_enabled() {
@@ -688,22 +697,47 @@ mod tests {
     use super::*;
     use crate::doc_store::store::test_support::*;
 
+    /// What a create cut short leaves: an empty namespace, which a new store
+    /// replaces, field-index registrations included.
     #[tokio::test]
-    async fn a_new_store_does_not_inherit_an_orphaned_namespace() {
+    async fn a_new_store_replaces_an_empty_namespace_without_a_schema() {
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await;
         for name in ["ghost_doc", "ghost_kv"] {
             let orphan = store.db.namespace(name.to_owned()).await.unwrap();
-            orphan.put(1u64.to_be_bytes().to_vec(), b"{}".to_vec()).await.unwrap();
+            // Emptied, not just never written: only what a scan finds counts.
+            orphan.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+            orphan.delete(b"k".to_vec()).await.unwrap();
         }
+        let before = store.db.existing_namespace("ghost_doc".to_owned()).await.unwrap().unwrap().id();
         store.create(make_schema("ghost_doc", vec![])).await.unwrap();
-        assert!(store.get("ghost_doc", DocId::U64(1)).await.unwrap().is_none());
+        let after = store.db.existing_namespace("ghost_doc".to_owned()).await.unwrap().unwrap().id();
+        assert_ne!(before, after, "the store must get a namespace of its own");
         store
             .create_kv(make_kv_schema("ghost_kv", KvKeyType::Str, KvValueType::Str))
             .await
             .unwrap();
-        let ns = store.db.existing_namespace("ghost_kv".to_owned()).await.unwrap().unwrap();
-        assert!(ns.get(1u64.to_be_bytes().to_vec()).await.unwrap().is_none());
+        store.shutdown().await.unwrap();
+    }
+
+    /// Keys written directly through `Db` are not a store's to delete or adopt.
+    #[tokio::test]
+    async fn a_store_cannot_take_the_name_of_a_namespace_holding_keys() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        let raw = store.db.namespace("users".to_owned()).await.unwrap();
+        raw.put(1u64.to_be_bytes().to_vec(), b"{}".to_vec()).await.unwrap();
+
+        let err = store.create(make_schema("users", vec![])).await.unwrap_err();
+        assert!(matches!(err, DocStoreError::NamespaceNotEmpty { .. }), "{err:?}");
+        let err = store
+            .create_kv(make_kv_schema("users", KvKeyType::Str, KvValueType::Str))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DocStoreError::NamespaceNotEmpty { .. }), "{err:?}");
+
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(raw.get(1u64.to_be_bytes().to_vec()).await.unwrap(), Some(b"{}".to_vec()), "the keys stay");
         store.shutdown().await.unwrap();
     }
 
