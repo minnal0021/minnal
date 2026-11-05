@@ -309,8 +309,14 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// The crash point is thread-local, so the cases are spread over a few
 /// threads, each with its own current-thread runtime: thread `t` takes every
 /// `n ≡ t` (mod threads) until a run finishes without crashing.
+///
+/// One audit at a time across the test binary, on at most 4 threads: open files
+/// grow with both (about 345 for one audit on 8 threads), and with the tests running
+/// alongside they passed the usual soft limit of 1024 and failed with `EMFILE`.
 fn crash_audit(template: &std::path::Path, want: &BTreeMap<Vec<u8>, usize>, op: Audited, ops: MaintenanceOps) -> (usize, Vec<String>) {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+    static ONE_AUDIT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _one = ONE_AUDIT.lock();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4);
     let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|t| {

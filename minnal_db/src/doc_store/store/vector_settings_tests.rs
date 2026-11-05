@@ -1364,25 +1364,33 @@ mod with_service {
         let (url, _seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
-        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
-        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        store
+            .create(semantic_schema("pause_vector_drop", Some(spec(r#"{"embedding_dim":8}"#))))
+            .await
+            .unwrap();
+        store
+            .put("pause_vector_drop", DocId::U64(1), serde_json::json!({"text": TEXT}))
+            .await
+            .unwrap();
         wait_for_empty_queue(&store).await;
         store.shutdown_vec_index_worker().await;
         let store = std::sync::Arc::new(store);
-        store.semantic_ctx.as_ref().unwrap().evict("g"); // the next use loads
+        store.semantic_ctx.as_ref().unwrap().evict("pause_vector_drop"); // the next use loads
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
-        let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_vector_drop");
+        let (settings, ns_id) = store.schemas.vector_settings("pause_vector_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
             async move {
                 let ctx = store.semantic_ctx.as_ref().unwrap();
-                ctx.for_namespace(&store.db, "g", ns_id, &settings).await.map(|ns| ns.partition)
+                ctx.for_namespace(&store.db, "pause_vector_drop", ns_id, &settings)
+                    .await
+                    .map(|ns| ns.partition)
             }
         });
         reached.notified().await; // read, not yet installed
-        store.disable_semantic_search("g").unwrap();
-        store.drop_vector_index_data("g").await.unwrap();
+        store.disable_semantic_search("pause_vector_drop").unwrap();
+        store.drop_vector_index_data("pause_vector_drop").await.unwrap();
         release.notify_one();
         let loaded = loading.await.unwrap();
         assert!(
@@ -1390,7 +1398,7 @@ mod with_service {
             "the load read a partition the drop removed: is_dropped={:?}",
             loaded.as_ref().map(|p| p.is_dropped()).ok()
         );
-        assert!(companions_left(&store, "g").is_empty());
+        assert!(companions_left(&store, "pause_vector_drop").is_empty());
         store.shutdown().await.unwrap();
     }
 
@@ -1400,27 +1408,35 @@ mod with_service {
         let (url, _seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
-        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
-        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
+        store
+            .create(semantic_schema("pause_store_drop", Some(spec(r#"{"embedding_dim":8}"#))))
+            .await
+            .unwrap();
+        store
+            .put("pause_store_drop", DocId::U64(1), serde_json::json!({"text": TEXT}))
+            .await
+            .unwrap();
         wait_for_empty_queue(&store).await;
         store.shutdown_vec_index_worker().await;
         let store = std::sync::Arc::new(store);
-        store.semantic_ctx.as_ref().unwrap().evict("g");
+        store.semantic_ctx.as_ref().unwrap().evict("pause_store_drop");
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
-        let (settings, ns_id) = store.schemas.vector_settings("g").unwrap();
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_store_drop");
+        let (settings, ns_id) = store.schemas.vector_settings("pause_store_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
             async move {
                 let ctx = store.semantic_ctx.as_ref().unwrap();
-                ctx.for_namespace(&store.db, "g", ns_id, &settings).await.map(|ns| ns.partition)
+                ctx.for_namespace(&store.db, "pause_store_drop", ns_id, &settings)
+                    .await
+                    .map(|ns| ns.partition)
             }
         });
         reached.notified().await;
-        store.remove("g").await.unwrap();
+        store.remove("pause_store_drop").await.unwrap();
         release.notify_one();
         assert!(loading.await.unwrap().is_err(), "a dropped store's partition was handed out");
-        assert!(companions_left(&store, "g").is_empty());
+        assert!(companions_left(&store, "pause_store_drop").is_empty());
         store.shutdown().await.unwrap();
     }
 
@@ -1694,33 +1710,39 @@ mod with_service {
         let (url, _seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
-        store.create(semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)))).await.unwrap();
+        store
+            .create(semantic_schema("pause_delete", Some(spec(r#"{"embedding_dim":8}"#))))
+            .await
+            .unwrap();
         for id in 1..=3 {
-            store.put("g", DocId::U64(id), serde_json::json!({"text": TEXT})).await.unwrap();
+            store
+                .put("pause_delete", DocId::U64(id), serde_json::json!({"text": TEXT}))
+                .await
+                .unwrap();
         }
         wait_for_empty_queue(&store).await;
         // No worker from here: its own first load would install a partition
         // counted after the delete and hide the foreground path under test.
         store.shutdown_vec_index_worker().await;
         let store = std::sync::Arc::new(store);
-        store.semantic_ctx.as_ref().unwrap().evict("g"); // the next use loads and counts
+        store.semantic_ctx.as_ref().unwrap().evict("pause_delete"); // the next use loads and counts
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("g");
+        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_delete");
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
-            async move { partition(&store, "g").await }
+            async move { partition(&store, "pause_delete").await }
         });
         reached.notified().await; // counted, not yet installed
         let deleting = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
-            async move { store.delete("g", DocId::U64(2)).await.unwrap() }
+            async move { store.delete("pause_delete", DocId::U64(2)).await.unwrap() }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         release.notify_one();
         deleting.await.unwrap();
         let handle = loading.await.unwrap();
 
-        let truth: std::collections::HashMap<u32, (u64, u64)> = vector_kv::count_postings(&store.db, "g").await.unwrap();
+        let truth: std::collections::HashMap<u32, (u64, u64)> = vector_kv::count_postings(&store.db, "pause_delete").await.unwrap();
         let counted: std::collections::HashMap<u32, (u64, u64)> =
             handle.snapshot().counts().snapshot().into_iter().filter(|(_, c)| c.0 > 0).collect();
         assert_eq!(counted, truth, "the loaded counts differ from the store's");

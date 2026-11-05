@@ -780,7 +780,9 @@ pub(crate) mod load_pause {
     static PAUSES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Pause>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-    /// Pause the next load of `namespace`: returns `(reached, release)`.
+    /// Pause the next load of `namespace`: returns `(reached, release)`. Global to
+    /// the test binary, so `namespace` must be a name no other test uses: a load
+    /// of the same name in a test running alongside would take this pause.
     pub(crate) fn arm(namespace: &str) -> Pause {
         let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         PAUSES.lock().insert(namespace.to_owned(), pause.clone());
