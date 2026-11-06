@@ -24,6 +24,7 @@ re-check them before starting work.
 | [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
 | [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
 | [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
+| [FR-014](#fr-014--run-a-fraction-of-the-partition-crash-audits-by-default) | Run a fraction of the partition crash audits by default | `minnal_db` (`ivf_split` tests) | Low | Proposed |
 
 ---
 
@@ -1590,3 +1591,147 @@ mapping, which is the file this request removes.
 - WAL throughput is measured against today's on small and typical values, and the
   result is recorded here. A large drop is a reason to stop and reconsider.
 - `minnal_db_api/README.md`'s on-disk layout describes the new files.
+
+---
+
+## FR-014 — Run a fraction of the partition crash audits by default
+
+**Filed:** 2026-11-06
+**Area:** `minnal_db` (`ivf_split` tests), plus somewhere to run a nightly job
+**Severity:** Low. The audits pass; they make the test suite slow.
+**Source:** Analysis of the slow tests, with 15 injected bugs run against the full audits in a
+scratch copy. Blocked on deciding where the nightly run lives.
+
+### Summary
+
+The three partition crash audits run 4,816 cases and take most of the suite's time.
+By default they should run about 850 of them, chosen per write site, and a nightly job
+should run them all. The change is test-only. It takes the `minnal_db` library tests
+from about 207 s to about 77 s under nextest on tmpfs.
+
+### Why this is a feature, not a bug fix
+
+Nothing is wrong today. This trades coverage on every run for speed, and that coverage
+then depends on a scheduled job the repo does not yet have. Both are decisions to make,
+not defects to fix.
+
+### Where the time goes
+
+Each audit crashes an operation before every write, under four flush patterns, and most
+write positions are the same few writes repeated per document. In the 1-bit rebuild, four
+sites account for 192 of the 222 positions.
+
+| Test | Scenario | Positions | Cases |
+|---|---|---:|---:|
+| `reassign_and_merge_survive_a_crash_before_any_write` | Reassign, 1-bit | 283 | 1,132 |
+| | Merge, 1-bit | 22 | 88 |
+| | Reassign, 4-bit | 315 | 1,260 |
+| `a_rebuild_survives_a_crash_before_any_write` | 1-bit | 222 | 888 |
+| | 4-bit | 258 | 1,032 |
+| `a_split_survives_a_crash_before_any_write` | 1-bit | 104 | 416 |
+
+Positions include the final run, where no crash fires. The six
+`vector_kv::crash_audit_tests` stay as they are: about 50 to 105 cases each, 1 to 2.5 s
+each on tmpfs.
+
+### Which cases to keep
+
+Each option below was scored by replaying the full audit's per-case results for 10
+injected bugs, the ones the full audit detects.
+
+| Option | Cases kept | Bugs caught |
+|---|---:|---:|
+| Per site: first 4, last 4, every 16th; flushes `None` + `All` (**proposed**) | 852 (17.7%) | 10 |
+| Per site: first and last only; flushes `None` + `All` | 296 (6.1%) | 10 |
+| Flushes `None` + `All` only | 2,420 (50.2%) | 10 |
+| Every 8th position, all flushes | 612 (12.7%) | 8 (worst offset) |
+| Drop the 4-bit scenarios | 2,532 (52.6%) | 9 |
+| Flush `None` only | 1,222 (25.4%) | 8 |
+
+First and last only also caught everything, but the bugs were chosen by hand, so that
+result is too thin to rely on. Both flush patterns are needed: two bugs (a skipped batch
+sync, and one skipped every third batch) fail only with `None`, and two (a key deleted
+or shrunk before its meta) never fail with `None`.
+
+Measured at `8636575` on WSL2, tmpfs, each test alone:
+
+| Test | Full | Proposed |
+|---|---:|---:|
+| `reassign_and_merge_survive_a_crash_before_any_write` | 159.7 s | 27.5 s |
+| `a_rebuild_survives_a_crash_before_any_write` | 101.0 s | 16.9 s |
+| `a_split_survives_a_crash_before_any_write` | 13.9 s | 4.0 s |
+
+### Proposed direction
+
+All in test code, except for the nightly job.
+
+1. **Record each crash point's site.** Both `crash_point!` macros (`vector_kv.rs`,
+   `ivf_split.rs`) pass their `file:line` to the `crash_point` module, and
+   `crash_point::trace()` runs with no crash and returns the ordered list of sites.
+   Tests that call `arm(n)` directly are unaffected.
+2. **Pick the cases with a pure function** in `ivf_split/tests.rs`, with its own unit
+   tests: `select_cases(trace, mode) -> Vec<(Flushed, usize)>`. The default mode keeps
+   the proposed set. Full mode, set by `MINNAL_FULL_CRASH_AUDIT=1`, keeps every position
+   under all four flushes. Both include the final no-crash run.
+3. **Run from the list.** `crash_audit` copies the template, runs the operation once for
+   its trace, builds the list and shares it across its threads by index, replacing the
+   `(first..).step_by(step)` loop in `crash_cases`. Each case's body is unchanged, and
+   `writes` becomes `trace.len()`, so the `writes > N` assertions still hold.
+4. **Refuse to test less silently.** Each case must crash if `n < writes` and must not on
+   the final run, which catches a trace that varies between runs. Every site in the trace
+   must fire at least once.
+5. **Schedule the nightly run:**
+
+   ```sh
+   MINNAL_FULL_CRASH_AUDIT=1 cargo nextest run -p minnal_db --all-features -E 'test(a_crash_before_any_write)'
+   TMPDIR=/var/tmp cargo nextest run --workspace --all-features
+   ```
+
+   The audit can stay on tmpfs: its crash is simulated in-process, so the page cache
+   survives and a real disk adds nothing to what it checks. The second command is the
+   real-disk run of the whole suite.
+6. **Update the crash audit notes** in `CLAUDE.md` and `minnal_db/src/semantic_search/CLAUDE.md`,
+   including how to run the full audit.
+
+Do not merge steps 1 to 4 until the nightly job exists, so there is never a gap in
+coverage.
+
+### Risks
+
+- **The nightly job does not run.** Skipped positions would then never run at all. This
+  is the main risk, and why the job comes first.
+- **A bug at one mid-run position.** About 4 in 5 positions at a 48-position site are
+  skipped by default, so only the full run reliably catches it.
+- **A bug that needs a partial flush.** `Sparse` and `Meta` alone are dropped by default.
+  No injected bug needed them, but only 10 were tried, all chosen by hand.
+- **The selection code itself is wrong.** Step 4 and the unit tests guard against it.
+
+### Open questions
+
+- **Where does the nightly run live?** The repo has no CI. GitHub Actions runs without
+  anyone's machine being on and keeps a history, but hosted runners have limited memory
+  and `/dev/shm`, so the tmpfs guard in `.cargo/test-runner.sh` may send tests to disk
+  there, which is slow. A local cron job in WSL is quickest to set up, but runs only
+  while the machine is up, so missed nights are easy not to notice.
+- **Should the "every 16th" offset rotate between runs?** Skipped positions would be
+  covered over time, at the cost of default runs that differ. The offset would have to be
+  printed on failure. Not tested; identical runs are easier to debug at first.
+- **Are the maintenance barriers needed?** Removing any of the three durability barriers
+  (`rebuild::finish`, `reassign::run`, `finish_drain`) is not detected even by the full
+  audit, nor is writing the copy's meta after its key, or ignoring an already recorded
+  reassignment in `finish_drain`. Each batch syncs already, which may make the barriers
+  redundant, but this was not confirmed: either they are, or the audit has a gap. Worth
+  settling separately, and this request does not depend on the answer.
+
+### Acceptance criteria
+
+- With `MINNAL_FULL_CRASH_AUDIT=1`, the audits run every position under all four flushes
+  and pass.
+- By default they run about 850 cases, and the three tests together take under 60 s alone
+  on tmpfs.
+- The 10 injected bugs, re-applied to a scratch copy, are each caught by the default set
+  running through the real selection code, not only by replaying logged results.
+- An audit fails if a planned crash does not fire, or if a site in its trace never fires.
+- The nightly job exists, has run the full audit at least once, and a failure in it
+  reaches someone.
+- The test suite passes, and clippy is clean on every feature combination.
