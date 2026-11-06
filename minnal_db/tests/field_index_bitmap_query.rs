@@ -1,7 +1,7 @@
 //! Integration tests for the query-support API added to `RoaringBitmap`:
 //! `rank`, `select`, `flip`, `range_and`, `range_or`.
 
-use minnal_db::index::RoaringBitmap;
+use minnal_db::field_index::RoaringBitmap;
 
 // ── rank ─────────────────────────────────────────────────────────────────────
 

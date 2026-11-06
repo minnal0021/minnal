@@ -14,7 +14,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::db::namespace::FieldId;
-use crate::index::{DynFieldIndex, IndexValue};
+use crate::field_index::{DynFieldIndex, IndexValue};
 
 // ── Extractor closure ──────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ pub type ExtractorFn = Arc<dyn Fn(&[u8]) -> Option<IndexValue> + Send + Sync>;
 //
 // Every entry in a field index is stored against a u128 "row ID".  By default
 // the row ID is a dense, monotonic integer assigned per namespace by the
-// `RowMap` sidecar (`crate::index::RowMap`), which keeps the RoaringBitmaps compact.
+// `RowMap` sidecar (`crate::field_index::RowMap`), which keeps the RoaringBitmaps compact.
 // A doc-store layer may still want to supply its own IDs for two reasons:
 //
 //   1. STABILITY — hashes are implementation details.  A doc store wants the
@@ -176,7 +176,7 @@ impl Default for NamespaceIndexSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{DynFieldIndex, IndexValue, IndexValueType};
+    use crate::field_index::{DynFieldIndex, IndexValue, IndexValueType};
 
     #[test]
     fn test_register_and_lookup() {

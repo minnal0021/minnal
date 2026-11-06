@@ -25,7 +25,7 @@ use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize, rancor};
 
-use crate::index::container::Container;
+use crate::field_index::bitmap::container::Container;
 
 /// Errors that can occur during bitmap serialization and deserialization.
 #[derive(Debug, thiserror::Error)]

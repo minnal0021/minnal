@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::index::RoaringBitmap;
-use crate::index::field::FieldId;
-use crate::index::field::predicate::Predicate;
-use crate::index::field::value::{DynFieldIndex, DynFieldIndexInner};
+use crate::field_index::FieldId;
+use crate::field_index::RoaringBitmap;
+use crate::field_index::predicate::Predicate;
+use crate::field_index::value::{DynFieldIndex, DynFieldIndexInner};
 
 use super::error::QueryError;
 use super::parser::{Op, RawExpr, RawValue};
@@ -357,7 +357,7 @@ fn build_str_pred(op: &Op, v: String, field: &str) -> Result<Predicate<String>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::field::value::{DynFieldIndex, IndexValue, IndexValueType};
+    use crate::field_index::value::{DynFieldIndex, IndexValue, IndexValueType};
 
     fn make_int_index(entries: &[(i64, u128)]) -> Arc<RwLock<DynFieldIndex>> {
         let mut idx = DynFieldIndex::new(IndexValueType::Int);

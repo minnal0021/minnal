@@ -1,12 +1,18 @@
+pub mod codec;
+pub mod container;
+pub mod container_store;
+pub mod shared;
+pub mod simd_support;
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::path::Path;
 
-use crate::index::container::Container;
-use crate::index::container::array::ARRAY_TO_BITSET_THRESHOLD;
-use crate::index::container::array::ArrayContainer;
-use crate::index::container::bitset::BitsetContainer;
-use crate::index::container_store::ContainerStore;
+use crate::field_index::bitmap::container::Container;
+use crate::field_index::bitmap::container::array::ARRAY_TO_BITSET_THRESHOLD;
+use crate::field_index::bitmap::container::array::ArrayContainer;
+use crate::field_index::bitmap::container::bitset::BitsetContainer;
+use crate::field_index::bitmap::container_store::ContainerStore;
 
 /// Upper bound on the number of 16-bit high-key blocks (containers) a single
 /// [`RoaringBitmap::flip`] may span. Complementing a range materialises one
@@ -1308,8 +1314,8 @@ mod differential_tests {
             same(&x, &sa.difference(&sb).copied().collect(), &format!("{c} and_not_inplace"));
             let mut rt = RoaringBitmap::new();
             for (k, cont) in a.store.sorted_entries() {
-                let bytes = crate::index::storage::encode_container(&cont).unwrap();
-                rt.store.upsert(k, &crate::index::storage::decode_container(&bytes).unwrap());
+                let bytes = crate::field_index::bitmap::codec::encode_container(&cont).unwrap();
+                rt.store.upsert(k, &crate::field_index::bitmap::codec::decode_container(&bytes).unwrap());
             }
             same(&rt, &sa, &format!("{c} serde"));
             let v: Vec<u128> = sa.iter().copied().collect();

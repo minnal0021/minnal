@@ -1,4 +1,4 @@
-use crate::index::container::bitset::BITSET_WORDS;
+use crate::field_index::bitmap::container::bitset::BITSET_WORDS;
 
 /// Cardinality threshold above which we use the AVX-512 + lookup table path.
 /// At 1024 elements the average bits-per-word is 1, making the lookup approach
@@ -268,7 +268,7 @@ fn push_word_positions(word: u64, base: u16, out: &mut Vec<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::container::bitset::BitsetContainer;
+    use crate::field_index::bitmap::container::bitset::BitsetContainer;
 
     fn make_bits(values: &[u16]) -> Box<[u64; BITSET_WORDS]> {
         let mut bits = Box::new([0u64; BITSET_WORDS]);

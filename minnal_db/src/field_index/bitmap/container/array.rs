@@ -1,4 +1,4 @@
-use crate::index::simd_support::array_merge;
+use crate::field_index::bitmap::simd_support::array_merge;
 use rkyv::Archive;
 
 /// Threshold above which an ArrayContainer should convert to a BitsetContainer.

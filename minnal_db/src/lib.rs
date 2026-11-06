@@ -88,11 +88,11 @@ mod store;
 mod support;
 
 // ── Folded layers ─────────────────────────────────────────────────────────────
-// `index` is part of the base engine (field indexing is core). `semantic_search`
+// `field_index` is part of the base engine (field indexing is core). `semantic_search`
 // and `doc_store` are opt-in via cargo features.
 #[cfg(feature = "doc-store")]
 pub mod doc_store;
-pub mod index;
+pub mod field_index;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
 
@@ -180,16 +180,16 @@ pub use store::value_log::sharded::ShardedValueLogError;
 // ── Index types ───────────────────────────────────────────────────────────────
 
 /// Discriminant used when registering a field index.
-pub use crate::index::IndexValueType;
+pub use crate::field_index::IndexValueType;
 
 /// A typed field value extracted from a document by an extractor closure.
-pub use crate::index::IndexValue;
+pub use crate::field_index::IndexValue;
 
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
 /// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
-pub use crate::index::IndexBlobStats;
+pub use crate::field_index::IndexBlobStats;
 /// Field-index write-buffer use and limits ([`Db::index_overlay_stats`]).
-pub use crate::index::IndexOverlayStats;
+pub use crate::field_index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
 pub use db::namespace::FieldId;

@@ -1,6 +1,6 @@
 //! The memory budget for field-index write buffers.
 //!
-//! Each [`FieldIndex`](crate::index::FieldIndex) keeps the bitmaps it changed
+//! Each [`FieldIndex`](crate::field_index::FieldIndex) keeps the bitmaps it changed
 //! since its last write-out in memory (its *overlay*) and writes them to its
 //! files at the next index checkpoint. One `IndexOverlayBudget` is shared by
 //! every field of a database and counts the heap bytes all their overlays hold:

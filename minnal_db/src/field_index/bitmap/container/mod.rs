@@ -196,8 +196,8 @@ impl Container {
     /// Retain only values in [`lo`, `hi_inclusive`], discarding all others.
     ///
     /// Returns an empty `Array` container when no values survive.
-    /// Used internally by [`crate::index::bitmap::RoaringBitmap::range_and`] and
-    /// [`crate::index::bitmap::RoaringBitmap::range_or`].
+    /// Used internally by [`crate::field_index::bitmap::RoaringBitmap::range_and`] and
+    /// [`crate::field_index::bitmap::RoaringBitmap::range_or`].
     pub(crate) fn clip_to_range(self, lo: u16, hi_inclusive: u16) -> Self {
         if lo == 0 && hi_inclusive == u16::MAX {
             return self; // no clipping needed

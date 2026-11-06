@@ -138,7 +138,7 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
     use minnal_db::KVError;
-    use minnal_db::index::query::QueryError;
+    use minnal_db::field_index::query::QueryError;
 
     async fn render(inner: DocStoreError) -> (StatusCode, String) {
         let response = AppError::from(inner).into_response();

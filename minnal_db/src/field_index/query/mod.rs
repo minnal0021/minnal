@@ -17,7 +17,7 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use minnal_db::index::query::{parse_and_evaluate, SchemaMap};
+//! use minnal_db::field_index::query::{parse_and_evaluate, SchemaMap};
 //!
 //! // Build SchemaMap from NamespaceSchema::list_fields()
 //! let schema: SchemaMap = [("age".to_string(), 0u32)].into();

@@ -56,9 +56,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::index::RoaringBitmap;
-use crate::index::blob_store::{BlobLayout, BlobStore};
-use crate::index::field::field_index::{FieldIndex, SpillStage};
+use crate::field_index::RoaringBitmap;
+use crate::field_index::blob_store::{BlobLayout, BlobStore};
+use crate::field_index::typed_index::{FieldIndex, SpillStage};
 
 // ── Value types ────────────────────────────────────────────────────────────
 
@@ -432,7 +432,7 @@ impl DynFieldIndex {
     }
 
     /// Charge this field's overlay to a shared budget (normally the database's).
-    pub fn set_overlay_budget(&mut self, budget: std::sync::Arc<crate::index::IndexOverlayBudget>) {
+    pub fn set_overlay_budget(&mut self, budget: std::sync::Arc<crate::field_index::IndexOverlayBudget>) {
         match &mut self.inner {
             DynFieldIndexInner::Bool(fi) => fi.set_overlay_budget(budget),
             DynFieldIndexInner::Int(fi) => fi.set_overlay_budget(budget),
@@ -441,7 +441,7 @@ impl DynFieldIndex {
     }
 
     /// The budget this field's overlay is charged against.
-    pub fn overlay_budget(&self) -> &std::sync::Arc<crate::index::IndexOverlayBudget> {
+    pub fn overlay_budget(&self) -> &std::sync::Arc<crate::field_index::IndexOverlayBudget> {
         match &self.inner {
             DynFieldIndexInner::Bool(fi) => fi.overlay_budget(),
             DynFieldIndexInner::Int(fi) => fi.overlay_budget(),
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn overlay_is_charged_to_and_released_from_the_shared_budget() {
-        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(1 << 20, 2 << 20));
+        let budget = std::sync::Arc::new(crate::field_index::IndexOverlayBudget::new(1 << 20, 2 << 20));
         let mut a = DynFieldIndex::new(IndexValueType::Int);
         let mut b = DynFieldIndex::new(IndexValueType::Int);
         a.set_overlay_budget(budget.clone());
@@ -1182,7 +1182,7 @@ mod tests {
         // containers, ~48 KB together. A 40 KiB hard limit is crossed near the
         // end; the write that crosses it must spill, so the overlay never stays
         // above the limit after a write returns.
-        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(32 * 1024, 40 * 1024));
+        let budget = std::sync::Arc::new(crate::field_index::IndexOverlayBudget::new(32 * 1024, 40 * 1024));
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         idx.set_overlay_budget(budget.clone());
@@ -1214,7 +1214,7 @@ mod tests {
         assert!(bitmap_bytes > 32 * 8_192, "each bitmap is ~{bitmap_bytes} bytes");
 
         // A hard limit far below one bitmap: every write spills.
-        let budget = std::sync::Arc::new(crate::index::IndexOverlayBudget::new(4 * 1024, 8 * 1024));
+        let budget = std::sync::Arc::new(crate::field_index::IndexOverlayBudget::new(4 * 1024, 8 * 1024));
         idx.set_overlay_budget(budget.clone());
         let before = idx.blob_stats().bitmap_logical_bytes;
         let writes = 500u128;
@@ -1364,7 +1364,7 @@ mod tests {
 
     // ── Compaction (the checkpoint's actual entry point) ─────────────────────
 
-    use crate::index::field::predicate::Predicate;
+    use crate::field_index::predicate::Predicate;
 
     /// Collect the rows for `value` from an `Int` index via the typed query path.
     fn int_rows(idx: &DynFieldIndex, value: i64) -> Vec<u128> {

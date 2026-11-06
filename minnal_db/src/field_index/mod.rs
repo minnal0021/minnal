@@ -1,4 +1,4 @@
-//! Index-level API for KV store query support.
+//! Field indexes: per-field bitmap indexes and the query language over them.
 //!
 //! # Overview
 //!
@@ -12,13 +12,13 @@
 //! A [`FieldIndex`] maps each distinct field value to a bitmap of row IDs, and
 //! [`FieldIndex::evaluate`] turns a [`Predicate`] into the matching bitmap. The
 //! type-erased [`DynFieldIndex`] wraps the per-type variants for the dynamic
-//! storage layer; the query DSL in `crate::index::query` evaluates parsed predicates
+//! storage layer; the query DSL in `crate::field_index::query` evaluates parsed predicates
 //! directly against it.
 //!
 //! # Quick start
 //!
 //! ```rust
-//! use minnal_db::index::field::{FieldIndex, Predicate};
+//! use minnal_db::field_index::{FieldIndex, Predicate};
 //!
 //! let mut age_idx = FieldIndex::<u32>::new();
 //! age_idx.insert(25, 1);
@@ -30,13 +30,22 @@
 //! assert_eq!(rows.cardinality(), 2); // rows 1 and 3
 //! ```
 
-/// Identifier for a registered field index.
-pub type FieldId = u32;
-
-pub(crate) mod field_index;
+pub mod bitmap;
+pub mod blob_store;
+pub mod overlay_budget;
 pub(crate) mod predicate;
+pub mod query;
+pub mod rowmap;
+pub(crate) mod typed_index;
 pub mod value;
 
-pub use field_index::FieldIndex;
-pub use predicate::Predicate;
-pub use value::{DynFieldIndex, IndexBlobStats, IndexValue, IndexValueType};
+pub use self::bitmap::RoaringBitmap;
+pub use self::bitmap::shared::SharedRoaringBitmap;
+pub use self::overlay_budget::{IndexOverlayBudget, IndexOverlayStats};
+pub use self::predicate::Predicate;
+pub use self::rowmap::RowMap;
+pub use self::typed_index::FieldIndex;
+pub use self::value::{DynFieldIndex, IndexBlobStats, IndexValue, IndexValueType};
+
+/// Identifier for a registered field index.
+pub type FieldId = u32;

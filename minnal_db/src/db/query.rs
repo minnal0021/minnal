@@ -33,7 +33,7 @@ impl Database {
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Query`](crate::KVError::Query)
-    /// carrying a [`crate::index::query::QueryError::InactiveField`].
+    /// carrying a [`crate::field_index::query::QueryError::InactiveField`].
     pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
         let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
@@ -87,8 +87,8 @@ impl Database {
         namespace_id: u32,
         store: &Arc<KVStore>,
         query_str: &str,
-    ) -> Result<(crate::index::bitmap::RoaringBitmap, Vec<FieldId>)> {
-        use crate::index::query::{SchemaMap, parse_and_evaluate};
+    ) -> Result<(crate::field_index::bitmap::RoaringBitmap, Vec<FieldId>)> {
+        use crate::field_index::query::{SchemaMap, parse_and_evaluate};
 
         // Build the schema map: field_name → field_id, restricted to fields
         // that have an active in-memory index. Dropped fields remain in the
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_field_index_update_field_appears_and_disappears() {
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_deactivate_field_index_makes_field_unqueryable() {
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -421,7 +421,7 @@ mod differential_tests {
     use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::namespace_index::ExtractorFn;
     use crate::db::test_support::create_db_config;
-    use crate::index::{IndexValue, IndexValueType};
+    use crate::field_index::{IndexValue, IndexValueType};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tempfile::TempDir;

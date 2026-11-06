@@ -1,5 +1,5 @@
-use crate::index::container::bitset::BITSET_WORDS;
-use crate::index::container::run::Run;
+use crate::field_index::bitmap::container::bitset::BITSET_WORDS;
+use crate::field_index::bitmap::container::run::Run;
 
 /// Build a `[u64; BITSET_WORDS]` bitmask with every bit in every run set.
 ///
@@ -261,7 +261,7 @@ unsafe fn runs_to_bitmask_avx512(runs: &[Run]) -> Box<[u64; BITSET_WORDS]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::container::run::RunContainer;
+    use crate::field_index::bitmap::container::run::RunContainer;
 
     fn bits_to_values(bits: &[u64; BITSET_WORDS]) -> Vec<u16> {
         let mut result = Vec::new();

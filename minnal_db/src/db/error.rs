@@ -75,7 +75,7 @@ pub enum KVError {
     ///
     /// [`Serialization`]: KVError::Serialization
     #[error("{0}")]
-    Query(#[from] crate::index::query::QueryError),
+    Query(#[from] crate::field_index::query::QueryError),
 }
 
 pub type Result<T> = std::result::Result<T, KVError>;

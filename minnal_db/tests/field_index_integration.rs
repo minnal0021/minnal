@@ -1,4 +1,4 @@
-use minnal_db::index::field::{FieldIndex, Predicate};
+use minnal_db::field_index::{FieldIndex, Predicate};
 
 // ── FieldIndex — point predicates ────────────────────────────────────────────
 

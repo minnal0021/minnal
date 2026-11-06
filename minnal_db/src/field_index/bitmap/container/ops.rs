@@ -7,7 +7,7 @@
 use super::array::ArrayContainer;
 use super::bitset::{AlignedBits, BitsetContainer};
 use super::run::{Run, RunContainer};
-use crate::index::simd_support::{bitwise, run_bitset};
+use crate::field_index::bitmap::simd_support::{bitwise, run_bitset};
 
 /// The values of `values` (at most `len` of them) whose bit in `bitset` equals
 /// `keep`. Branchless: whether a value is kept is unpredictable, and a mispredicted

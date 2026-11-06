@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::index::bitmap::RoaringBitmap;
+use crate::field_index::bitmap::RoaringBitmap;
 
 /// Default timeout for write-lock acquisition in inplace ops.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ pub struct LockTimeout {
 ///
 /// # Example
 /// ```rust
-/// use minnal_db::index::sync::SharedRoaringBitmap;
+/// use minnal_db::field_index::bitmap::shared::SharedRoaringBitmap;
 ///
 /// let bm = SharedRoaringBitmap::new();
 /// bm.insert(42);
@@ -216,7 +216,7 @@ impl SharedRoaringBitmap {
     /// without releasing the lock between calls.
     ///
     /// ```rust
-    /// use minnal_db::index::sync::SharedRoaringBitmap;
+    /// use minnal_db::field_index::bitmap::shared::SharedRoaringBitmap;
     ///
     /// let bm = SharedRoaringBitmap::new();
     /// bm.insert(1); bm.insert(2); bm.insert(3);

@@ -28,7 +28,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use minnal_db::index::RoaringBitmap;
+use minnal_db::field_index::RoaringBitmap;
 
 /// Dense row IDs, as the field index assigns them. 200k spans several
 /// containers (one per 2^16 of ID space), so container skipping has something

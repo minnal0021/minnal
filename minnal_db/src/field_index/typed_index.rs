@@ -3,12 +3,12 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::index::RoaringBitmap;
-use crate::index::bitmap::decompose;
-use crate::index::blob_store::{BlobLayout, BlobStore};
-use crate::index::container::Container;
-use crate::index::overlay_budget::IndexOverlayBudget;
-use crate::index::storage::{self, DirEntry};
+use crate::field_index::RoaringBitmap;
+use crate::field_index::bitmap::codec::{self, DirEntry};
+use crate::field_index::bitmap::container::Container;
+use crate::field_index::bitmap::decompose;
+use crate::field_index::blob_store::{BlobLayout, BlobStore};
+use crate::field_index::overlay_budget::IndexOverlayBudget;
 
 use super::predicate::Predicate;
 
@@ -20,7 +20,7 @@ use super::predicate::Predicate;
 ///   provides the sorted iteration needed for range predicates.
 /// - `bitmaps`: a `BlobStore` in the directory layout. Each slot points at a
 ///   directory listing that value's [`RoaringBitmap`] containers, each stored
-///   as its own blob (see `index::storage`). This can be backed by anonymous
+///   as its own blob (see `field_index::bitmap::codec`). This can be backed by anonymous
 ///   mmaps (for transient / test use) or by persistent files under the field's
 ///   on-disk directory.
 ///
@@ -224,7 +224,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
                     None => {
                         entries.remove(&key);
                     }
-                    Some(c) => match storage::encode_container(c) {
+                    Some(c) => match codec::encode_container(c) {
                         Ok(bytes) => blobs.push((key, bytes)),
                         Err(e) => {
                             // Keep the stored copy, flag it.
@@ -240,7 +240,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
                 entries.insert(key, DirEntry { key, offset, len });
             }
             let dir: Vec<DirEntry> = entries.into_values().collect();
-            let (offset, len) = self.bitmaps.append_value(&storage::encode_dir(&dir));
+            let (offset, len) = self.bitmaps.append_value(&codec::encode_dir(&dir));
             stage.sets.push(StagedDir {
                 slot: slot_id,
                 ver,
@@ -773,7 +773,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
     fn stored_dir(&self, slot_id: u128) -> Vec<DirEntry> {
         match self.bitmaps.get_ref(slot_id) {
             None => Vec::new(),
-            Some(bytes) => storage::decode_dir(bytes).unwrap_or_else(|e| {
+            Some(bytes) => codec::decode_dir(bytes).unwrap_or_else(|e| {
                 self.corrupted.store(true, Ordering::Relaxed);
                 log::error!(
                     "FieldIndex: bitmap directory failed to decode; serving empty and flagging the index corrupt (rebuild this field from the WAL) (slot={slot_id}, error={e})"
@@ -784,11 +784,11 @@ impl<V: Ord + Clone> FieldIndex<V> {
     }
 
     /// The entry for container `key` in `slot_id`'s stored directory, searched
-    /// in place (see `storage::lookup_dir`). A directory that does not parse
+    /// in place (see `codec::lookup_dir`). A directory that does not parse
     /// is served as empty and latches the corruption flag.
     fn stored_entry(&self, slot_id: u128, key: u128) -> Option<DirEntry> {
         let bytes = self.bitmaps.get_ref(slot_id)?;
-        storage::lookup_dir(bytes, key).unwrap_or_else(|e| {
+        codec::lookup_dir(bytes, key).unwrap_or_else(|e| {
             self.corrupted.store(true, Ordering::Relaxed);
             log::error!("FieldIndex: bitmap directory failed to parse; serving empty and flagging the index corrupt (slot={slot_id}, error={e})");
             None
@@ -798,7 +798,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// Number of containers in `slot_id`'s stored directory (0 for a missing
     /// slot or one that does not parse).
     fn stored_count(&self, slot_id: u128) -> usize {
-        self.bitmaps.get_ref(slot_id).and_then(|b| storage::dir_count(b).ok()).unwrap_or(0)
+        self.bitmaps.get_ref(slot_id).and_then(|b| codec::dir_count(b).ok()).unwrap_or(0)
     }
 
     /// Decode the stored container `entry` points at. A blob that is out of
@@ -806,7 +806,7 @@ impl<V: Ord + Clone> FieldIndex<V> {
     /// flag.
     fn stored_container(&self, slot_id: u128, entry: DirEntry) -> Option<Container> {
         let decoded = match self.bitmaps.value_slice(entry.offset, entry.len) {
-            Some(bytes) => storage::decode_container(bytes).map_err(|e| e.to_string()),
+            Some(bytes) => codec::decode_container(bytes).map_err(|e| e.to_string()),
             None => Err("container blob runs past the value region".to_string()),
         };
         decoded
@@ -1006,7 +1006,7 @@ mod tests {
         let slot = idx.slot_id_for(&7).unwrap();
 
         let (offset, len) = idx.bitmaps.append_value(&[0xFFu8; 32]);
-        let dir = storage::encode_dir(&[DirEntry { key: 0, offset, len }]);
+        let dir = codec::encode_dir(&[DirEntry { key: 0, offset, len }]);
         idx.bitmaps.upsert(slot, &dir);
 
         assert!(idx.load_bitmap(slot).is_empty());

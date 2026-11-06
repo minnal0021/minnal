@@ -6,8 +6,8 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use parking_lot::RwLock;
 
-use minnal_db::index::query::{evaluate, parse, parse_and_evaluate};
-use minnal_db::index::{DynFieldIndex, IndexValue, IndexValueType};
+use minnal_db::field_index::query::{evaluate, parse, parse_and_evaluate};
+use minnal_db::field_index::{DynFieldIndex, IndexValue, IndexValueType};
 
 // ── Setup ──────────────────────────────────────────────────────────────────
 

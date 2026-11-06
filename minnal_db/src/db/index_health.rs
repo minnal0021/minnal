@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_activating_a_dropped_field_is_rejected() {
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -517,7 +517,7 @@ mod tests {
     fn test_reindex_field_repairs_and_reports_outcome() {
         use crate::db::namespace::FieldReindexOutcome;
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn test_shutdown_after_drop_index_does_not_error() {
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -586,7 +586,7 @@ mod tests {
     fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
         use crate::db::index_manager::{GapCause, RepairMode};
         use crate::db::namespace_index::ExtractorFn;
-        use crate::index::{IndexValue, IndexValueType};
+        use crate::field_index::{IndexValue, IndexValueType};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open(temp_dir.path(), create_db_config())?;
@@ -864,7 +864,7 @@ mod tests {
                 .unwrap()
                 .index
                 .write()
-                .set(&crate::index::IndexValue::Str("active".into()), row_id)
+                .set(&crate::field_index::IndexValue::Str("active".into()), row_id)
                 .unwrap();
         }
         assert!(

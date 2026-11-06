@@ -1,6 +1,6 @@
-use crate::index::simd_support::bitwise;
-use crate::index::simd_support::extract::extract_bitset_to_values;
-use crate::index::simd_support::popcount::popcount_u64_slice;
+use crate::field_index::bitmap::simd_support::bitwise;
+use crate::field_index::bitmap::simd_support::extract::extract_bitset_to_values;
+use crate::field_index::bitmap::simd_support::popcount::popcount_u64_slice;
 use rkyv::Archive;
 
 /// Number of u64 words in the bitset (65536 bits / 64 = 1024).
@@ -52,8 +52,8 @@ impl BitsetContainer {
     /// Faster than `from_values` for bulk loads.
     pub fn from_sorted_values(values: &[u16]) -> Self {
         let mut bits = Box::new(AlignedBits([0u64; BITSET_WORDS]));
-        crate::index::simd_support::run_bitset::set_bits_from_array(&mut bits.0, values);
-        let cardinality = crate::index::simd_support::popcount::popcount_u64_slice(&bits.0);
+        crate::field_index::bitmap::simd_support::run_bitset::set_bits_from_array(&mut bits.0, values);
+        let cardinality = crate::field_index::bitmap::simd_support::popcount::popcount_u64_slice(&bits.0);
         Self { bits, cardinality }
     }
 

@@ -11,7 +11,7 @@
 //! A store has one of two layouts (`BlobLayout`). In the **flat** layout
 //! (the keymap) a slot's blob is the whole value. In the **directory** layout
 //! (bitmaps) a slot's blob is a directory listing container blobs elsewhere in
-//! the same value region (format in `index::storage`), so replacing one
+//! the same value region (format in `field_index::bitmap::codec`), so replacing one
 //! container appends that container and a new directory, not the whole bitmap.
 //! The store reads directories only to account for space: dead bytes, live
 //! bytes, compaction, and open-time repair.
@@ -51,14 +51,14 @@ use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
 
-use crate::index::storage::{self, DirEntry};
+use crate::field_index::bitmap::codec::{self, DirEntry};
 
 /// What a slot's blob is (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlobLayout {
     /// The blob is the whole value.
     Flat,
-    /// The blob is a directory of container blobs (`index::storage`).
+    /// The blob is a directory of container blobs (`field_index::bitmap::codec`).
     Directory,
 }
 
@@ -478,7 +478,7 @@ impl BlobStore {
                     let end = end.and_then(|end| match self.layout {
                         BlobLayout::Flat => Some(end),
                         BlobLayout::Directory => {
-                            let entries = storage::decode_dir(&self.val.as_slice()[s.offset as usize..end as usize]).ok()?;
+                            let entries = codec::decode_dir(&self.val.as_slice()[s.offset as usize..end as usize]).ok()?;
                             entries.iter().try_fold(end, |m, e| {
                                 let c_end = e.offset.checked_add(e.len as u64).filter(|&c| c <= val_len)?;
                                 Some(m.max(c_end))
@@ -602,7 +602,7 @@ impl BlobStore {
         if self.layout != BlobLayout::Directory {
             return None;
         }
-        storage::decode_dir(self.value_slice(offset, len)?).ok()
+        codec::decode_dir(self.value_slice(offset, len)?).ok()
     }
 
     /// Value-region bytes a live slot owns, each blob rounded up to
@@ -956,7 +956,7 @@ impl BlobStore {
                         moved.push(DirEntry { offset: aligned as u64, ..e });
                         write_pos = aligned + c.len();
                     }
-                    moved_dir = storage::encode_dir(&moved);
+                    moved_dir = codec::encode_dir(&moved);
                     blob = &moved_dir;
                 }
                 let aligned = align_up(write_pos, VALUE_ALIGNMENT);
@@ -1611,7 +1611,7 @@ mod tests {
                 DirEntry { key, offset, len }
             })
             .collect();
-        store.append_value(&storage::encode_dir(&entries))
+        store.append_value(&codec::encode_dir(&entries))
     }
 
     #[test]
@@ -1625,9 +1625,9 @@ mod tests {
 
         // Replace container 1 only: the old directory and the old container 1
         // become dead; container 0 is shared and stays live.
-        let old = storage::decode_dir(store.get_ref(7).unwrap()).unwrap();
+        let old = codec::decode_dir(store.get_ref(7).unwrap()).unwrap();
         let (off1, len1) = store.append_value(&[3u8; 50]);
-        let new_dir = storage::encode_dir(&[
+        let new_dir = codec::encode_dir(&[
             old[0],
             DirEntry {
                 key: 1,
@@ -1664,7 +1664,7 @@ mod tests {
         let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
         assert_eq!(store.damaged_at_open(), 0);
         for slot in 0..3u128 {
-            let entries = storage::decode_dir(store.get_ref(slot).unwrap()).unwrap();
+            let entries = codec::decode_dir(store.get_ref(slot).unwrap()).unwrap();
             assert_eq!(entries.len(), 2);
             assert_eq!(store.value_slice(entries[0].offset, entries[0].len).unwrap(), &[4u8; 40]);
             assert_eq!(store.value_slice(entries[1].offset, entries[1].len).unwrap(), &[slot as u8; 300][..]);
@@ -1679,7 +1679,7 @@ mod tests {
             let (d, l) = append_dir(&mut store, &[(0, &[1u8; 64])]);
             store.set_slot(1, d, l);
             // Slot 2: a directory naming a container far past the file end.
-            let far = storage::encode_dir(&[DirEntry {
+            let far = codec::encode_dir(&[DirEntry {
                 key: 0,
                 offset: 1 << 30,
                 len: 64,

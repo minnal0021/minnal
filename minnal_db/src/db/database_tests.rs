@@ -8,7 +8,7 @@
 use super::*;
 use crate::db::config::SyncConfig;
 use crate::db::test_support::*;
-use crate::index::IndexValue;
+use crate::field_index::IndexValue;
 use tempfile::TempDir;
 
 // ── Process-level crash durability ─────────────────────────────────
@@ -857,7 +857,7 @@ fn test_database_remove_namespace() {
 #[test]
 fn test_activate_type_mismatch_rejected() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::IndexValueType;
+    use crate::field_index::IndexValueType;
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -879,7 +879,7 @@ fn test_activate_type_mismatch_rejected() {
 #[test]
 fn test_activate_unknown_field_id_rejected() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::IndexValueType;
+    use crate::field_index::IndexValueType;
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -895,7 +895,7 @@ fn test_activate_unknown_field_id_rejected() {
 
 #[test]
 fn test_duplicate_register_field_idempotent() {
-    use crate::index::IndexValueType;
+    use crate::field_index::IndexValueType;
 
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
@@ -912,7 +912,7 @@ fn test_duplicate_register_field_idempotent() {
 #[test]
 fn test_schema_survives_restart_and_index_activates_without_re_register() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::{IndexValue, IndexValueType};
+    use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -1027,10 +1027,10 @@ fn replay_cost_vs_total() {
         let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+            Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
         });
         let t = std::time::Instant::now();
-        db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+        db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
             .unwrap();
         let dt = t.elapsed();
         println!(
@@ -1085,10 +1085,10 @@ fn replay_cost_vs_window() {
         let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
-            Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+            Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
         });
         let t = std::time::Instant::now();
-        db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+        db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
             .unwrap();
         let dt = t.elapsed();
         println!(
@@ -1179,9 +1179,9 @@ fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
     let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
         let v: serde_json::Value = serde_json::from_str(s).ok()?;
-        Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+        Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
     });
-    db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+    db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
         .unwrap();
     let gap = db.index_manager.read_gap(ns, field_id).expect("the damage must be recorded");
     assert_eq!(gap.cause, crate::db::index_manager::GapCause::DamagedIndexFile);
@@ -1241,9 +1241,9 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
     let extractor: crate::db::namespace_index::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
         let v: serde_json::Value = serde_json::from_str(s).ok()?;
-        Some(crate::index::IndexValue::Str(v["status"].as_str()?.to_string()))
+        Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
     });
-    db.activate_field_index(ns, field_id, crate::index::IndexValueType::Str, extractor)
+    db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
         .unwrap();
 
     let field_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
@@ -1284,7 +1284,7 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
 #[test]
 fn test_activate_field_index_replays_wal_after_crash() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::{IndexValue, IndexValueType};
+    use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -1424,7 +1424,7 @@ fn put_and_delete_accept_normal_sized_keys_and_values() {
 #[test]
 fn test_field_index_replays_updates_after_crash() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::{IndexValue, IndexValueType};
+    use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
@@ -2329,7 +2329,7 @@ fn test_apply_with_retry_gives_up_after_max_attempts() {
 #[test]
 fn test_field_index_targeted_update_and_delete() {
     use crate::db::namespace_index::ExtractorFn;
-    use crate::index::{IndexValue, IndexValueType};
+    use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();

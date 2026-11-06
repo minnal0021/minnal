@@ -58,7 +58,7 @@ fn subsystem_errors_convert_into_kv_error() {
 /// database broke", so these assertions are on the *type*, not just the text.
 #[test]
 fn invalid_predicates_surface_as_query_errors() {
-    use minnal_db::index::query::QueryError;
+    use minnal_db::field_index::query::QueryError;
     use minnal_db::{DEFAULT_NAMESPACE_ID, Db, DbConfig, IndexValue, IndexValueType};
     use std::sync::Arc;
 

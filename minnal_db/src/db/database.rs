@@ -17,7 +17,7 @@ use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
-use crate::index::{DynFieldIndex, IndexValueType};
+use crate::field_index::{DynFieldIndex, IndexValueType};
 use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
 use crate::store::lsm::lsm_tree::LsmFlushObserver;
 use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
@@ -868,7 +868,7 @@ pub struct Database {
     /// Memory budget shared by every field index's write buffer (its overlay
     /// of changed containers). Set on each index when it is activated, before WAL
     /// replay, so replay is bounded by it too.
-    pub(crate) index_overlay_budget: Arc<crate::index::IndexOverlayBudget>,
+    pub(crate) index_overlay_budget: Arc<crate::field_index::IndexOverlayBudget>,
     /// Rejected field-index updates awaiting the next checkpoint, which turns
     /// them into durable gap records. Shared with every `KVStore`.
     pub(crate) rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
@@ -995,7 +995,7 @@ impl Database {
         let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
-        let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
+        let index_overlay_budget = Arc::new(crate::field_index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
             config.threshold_config.index_overlay_hard_bytes,
         ));
@@ -2009,7 +2009,7 @@ impl Database {
     /// e.g. to alert before disk fills between compactions.
     ///
     /// Returns `None` when the field is not active.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| e.index.read().blob_stats())
@@ -2258,7 +2258,7 @@ impl Database {
                     // (`insert_many`), and clears all affected rows in one pass.
                     // The write buffer would coalesce per-key writes anyway; the
                     // grouping still saves a bitmap lookup per key.
-                    let mut rows_by_value: HashMap<crate::index::IndexValue, Vec<u128>> = HashMap::new();
+                    let mut rows_by_value: HashMap<crate::field_index::IndexValue, Vec<u128>> = HashMap::new();
                     let mut rows_to_clear: Vec<u128> = Vec::new();
 
                     for key in &affected_keys {
@@ -2341,7 +2341,7 @@ impl Database {
     ///
     /// After this call the field's bitmap is dropped and any predicate query
     /// that references it returns [`KVError::Query`] carrying
-    /// [`crate::index::query::QueryError::InactiveField`].  The on-disk checkpoint
+    /// [`crate::field_index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
     pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         let store = self.get_store(namespace_id)?;
@@ -3328,7 +3328,7 @@ impl Database {
         let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
-        let index_overlay_budget = Arc::new(crate::index::IndexOverlayBudget::new(
+        let index_overlay_budget = Arc::new(crate::field_index::IndexOverlayBudget::new(
             config.threshold_config.index_overlay_soft_bytes,
             config.threshold_config.index_overlay_hard_bytes,
         ));
@@ -3522,7 +3522,7 @@ impl IndexCheckpointTarget for Database {
         // Flush each namespace's dense row map FIRST and advance its marker, so
         // the map is at least as durable as every field bitmap that references
         // its IDs (a crash must never leave a persisted bit whose row ID is not
-        // reproducible from the row map). See `crate::index::RowMap` durability docs.
+        // reproducible from the row map). See `crate::field_index::RowMap` durability docs.
         let mut flushed_ns = std::collections::HashSet::new();
         for &(ns_id, _) in &fields {
             if flushed_ns.insert(ns_id)

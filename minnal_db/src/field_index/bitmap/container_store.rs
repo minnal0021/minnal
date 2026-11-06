@@ -14,7 +14,7 @@
 //! made 65,536 inserts into one container cost 514 MiB of memory for an 8 KB
 //! bitmap. Do not put transient bitmaps on the mapped backing.
 //!
-//! [`RoaringBitmap`]: crate::index::RoaringBitmap
+//! [`RoaringBitmap`]: crate::field_index::RoaringBitmap
 //!
 //! The mapped layout stores the map in two memory-mapped regions:
 //!
@@ -39,7 +39,7 @@ use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize, rancor};
 
-use crate::index::container::Container;
+use crate::field_index::bitmap::container::Container;
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
@@ -494,7 +494,7 @@ impl MappedStore {
                 state: STATE_OCCUPIED,
                 key,
                 offset: aligned_offset as u64,
-                len: crate::index::blob_store::u32_len(blob.len(), "container blob"),
+                len: crate::field_index::blob_store::u32_len(blob.len(), "container blob"),
                 card: new_card,
             },
         );
@@ -669,7 +669,7 @@ impl HeapStore {
 
 // ── ContainerStore ───────────────────────────────────────────────────────────
 
-/// The `u128 → Container` map behind a [`RoaringBitmap`](crate::index::RoaringBitmap):
+/// The `u128 → Container` map behind a [`RoaringBitmap`](crate::field_index::RoaringBitmap):
 /// heap-backed for transient bitmaps, file-backed (mapped) for persistent ones.
 /// See the module docs for why transient bitmaps must not use the mapped layout.
 pub(crate) struct ContainerStore {
@@ -916,8 +916,8 @@ fn align_up(offset: usize, align: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::container::Container;
-    use crate::index::container::array::ArrayContainer;
+    use crate::field_index::bitmap::container::Container;
+    use crate::field_index::bitmap::container::array::ArrayContainer;
 
     fn make_array(vals: &[u16]) -> Container {
         Container::Array(ArrayContainer::from_sorted(vals.to_vec()))

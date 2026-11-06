@@ -89,13 +89,13 @@ pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Default soft limit (bytes) on memory held by field-index write buffers,
 /// across all fields of a database: crossing it requests an early index
 /// checkpoint. 32 MiB. See [`ThresholdConfig::index_overlay_soft_bytes`].
-pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_SOFT_BYTES;
+pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = crate::field_index::overlay_budget::DEFAULT_INDEX_OVERLAY_SOFT_BYTES;
 
 /// Default hard limit (bytes) on memory held by field-index write buffers,
 /// across all fields of a database: a write that crosses it writes its field's
 /// buffer out before returning. 64 MiB. See
 /// [`ThresholdConfig::index_overlay_hard_bytes`].
-pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = crate::index::overlay_budget::DEFAULT_INDEX_OVERLAY_HARD_BYTES;
+pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = crate::field_index::overlay_budget::DEFAULT_INDEX_OVERLAY_HARD_BYTES;
 
 /// Default cap on how many fully-persisted WAL segments the index-replay
 /// watermark may hold back. See

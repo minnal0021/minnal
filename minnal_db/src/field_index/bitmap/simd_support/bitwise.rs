@@ -1,4 +1,4 @@
-use crate::index::container::bitset::BITSET_WORDS;
+use crate::field_index::bitmap::container::bitset::BITSET_WORDS;
 
 /// Result of a SIMD bitwise operation: the output words and their total popcount.
 pub struct BitwiseResult {
@@ -656,7 +656,7 @@ unsafe fn and_not_inplace_avx512_popcnt(dst: &mut [u64; BITSET_WORDS], src: &[u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::container::bitset::BitsetContainer;
+    use crate::field_index::bitmap::container::bitset::BitsetContainer;
 
     fn make_bits(values: &[u16]) -> Box<[u64; BITSET_WORDS]> {
         let mut bits = Box::new([0u64; BITSET_WORDS]);

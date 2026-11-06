@@ -14,7 +14,7 @@ use crate::db::database::Database;
 use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
 use crate::db::namespace::FieldId;
 use crate::db::namespace_index::ExtractorFn;
-use crate::index::{IndexValue, IndexValueType};
+use crate::field_index::{IndexValue, IndexValueType};
 use crate::store::lsm::lsm_tree::LSMConfig;
 
 pub(crate) fn create_db_config() -> DbConfig {

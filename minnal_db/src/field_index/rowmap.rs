@@ -1,7 +1,7 @@
 //! Per-namespace dense row-ID map.
 //!
 //! Assigns **dense, monotonic** row IDs (0, 1, 2, …) to keys so the field-index
-//! [`RoaringBitmap`](crate::index::RoaringBitmap)s pack densely — consecutive IDs share
+//! [`RoaringBitmap`](crate::field_index::RoaringBitmap)s pack densely — consecutive IDs share
 //! a high key and fill a container instead of scattering one-per-doc the way
 //! random hash IDs do. Replaces the stateless hash row-ID derivation.
 //!
@@ -79,7 +79,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::index::blob_store::GrowableMmap;
+use crate::field_index::blob_store::GrowableMmap;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -398,7 +398,7 @@ impl RowMap {
         );
         let id = self.next_id;
         let key_off = self.keybytes_pos as u64;
-        let key_len = crate::index::blob_store::u32_len(key.len(), "row key");
+        let key_len = crate::field_index::blob_store::u32_len(key.len(), "row key");
 
         // Append the key bytes.
         self.keybytes
