@@ -94,8 +94,10 @@ may keep the "why it changed" history that stops a regression.)
 - **No history.** No "used to", "previously", "the previous run", "since commit
   X", dated fix notes, or old-versus-new numbers. State how it works now and why.
   A commit hash or date is fine only as provenance for a measurement.
-- **Check facts against the code before keeping them.** Run code examples (the
-  embedded QUICKSTART's compile in a scratch crate) and REST examples (against a
+- **Check facts against the code before keeping them.** `minnal_db/QUICKSTART.md`'s code
+  examples are compiled by a doctest (`QuickstartExamples` in `lib.rs`, only under
+  `--all-features`; fragments carry their setup on hidden `# ` lines). Run the root docs'
+  code examples in a scratch crate, and REST examples (against a
   scratch server on another port). Stale claims are the common failure, not style.
 - **Drop what does not answer a reader's question.** A chart that repeats a
   table, shows several equal bars, or compares against code that no longer

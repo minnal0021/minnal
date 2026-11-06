@@ -96,6 +96,13 @@ pub mod field_index;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
 
+// Compiles every Rust example in QUICKSTART.md (`no_run`: they name fixed paths and
+// some need the embedding service). The examples use both optional layers, so
+// `cargo test --all-features` is what checks them.
+#[cfg(all(doctest, feature = "doc-store", feature = "semantic-search"))]
+#[doc = include_str!("../QUICKSTART.md")]
+pub struct QuickstartExamples;
+
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 
 /// The primary synchronous entry point.
