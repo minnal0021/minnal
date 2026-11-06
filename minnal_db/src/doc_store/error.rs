@@ -126,7 +126,7 @@ pub enum SchemaError {
 
 /// Errors produced by [`DocStore`] operations.
 ///
-/// [`DocStore`]: crate::doc_store::store::DocStore
+/// [`DocStore`]: crate::doc_store::DocStore
 #[derive(Debug, Error)]
 pub enum DocStoreError {
     /// A namespace names an embedding model this server's `supported_models`

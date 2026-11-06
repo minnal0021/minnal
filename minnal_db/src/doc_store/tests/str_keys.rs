@@ -13,8 +13,8 @@
 //!    IDs depend on the stored key bytes ordering the way the IDs do.
 
 use super::test_support::*;
-use super::*;
 use crate::doc_store::key::{MAX_STR_KEY_LEN, StrKey};
+use crate::doc_store::*;
 
 fn str_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreSchema {
     DocStoreSchema {

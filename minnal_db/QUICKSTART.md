@@ -447,7 +447,7 @@ naming the embedding service and hand it to the store as a
 embed-worker and the partition maintenance task.
 
 ```rust
-use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSpec};
+use minnal_db::doc_store::schema::vector_settings::{SearchSpec, VectorIndexSpec};
 use minnal_db::semantic_search::service::SemanticSearchConfig;
 use minnal_db::{
     AttributeDef, AttributeType, DocId, DocStore, DocStoreSchema, KeyType, KvKeyType,

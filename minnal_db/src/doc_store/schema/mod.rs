@@ -1,15 +1,19 @@
+pub mod kv;
+pub mod store;
+pub mod vector_settings;
+
 use json_dotpath::DotPaths;
 use serde::{Deserialize, Serialize};
 
+use self::vector_settings::{IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use crate::doc_store::error::SchemaError;
-use crate::doc_store::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// The raw key-value store schema, split into its own module.
 ///
 /// Re-exported here because `doc_store::schema::KvStoreSchema` is an established
 /// path used across the API layer; the split is about where the code lives, not
 /// about renaming anything.
-pub use crate::doc_store::kv_schema::{KvKeyType, KvStoreSchema, KvValueType};
+pub use crate::doc_store::schema::kv::{KvKeyType, KvStoreSchema, KvValueType};
 
 /// Maximum number of indices allowed per document store.
 pub const MAX_INDICES: usize = 5;
@@ -170,7 +174,7 @@ pub enum SchemaAmendment {
     ///
     /// `vector_index` sets the namespace's vector-index settings the first time
     /// semantic search is enabled (omitted fields take their defaults); later it
-    /// may only repeat the fixed ones (see [`super::vector_settings`]).
+    /// may only repeat the fixed ones (see [`vector_settings`]).
     AddEmbeddingAttribute {
         name: String,
         description: Option<String>,
@@ -248,7 +252,7 @@ pub struct DocStoreSchema {
     pub embedding_fields: Vec<String>,
     /// The namespace's vector-index settings: embedding model and dimension,
     /// chunking, code widths and search defaults (see
-    /// [`super::vector_settings`]). Filled in with defaults the first time
+    /// [`vector_settings`]). Filled in with defaults the first time
     /// semantic search is enabled. Kept when the vector index is dropped: the
     /// model, dimension, chunking and Pass-1 code width are fixed for the
     /// namespace's life.
@@ -676,7 +680,7 @@ impl DocStoreSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::kv_schema::valid_kv_schema;
+    use crate::doc_store::schema::kv::valid_kv_schema;
     use std::collections::HashSet;
 
     /// An index field name must be something a query can reference and the

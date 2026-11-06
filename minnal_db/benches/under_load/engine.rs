@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use minnal_db::MinnalTomlConfig;
-use minnal_db::doc_store::vector_settings::IndexDefaults;
+use minnal_db::doc_store::schema::vector_settings::IndexDefaults;
 use minnal_db::doc_store::{DocStore, SemanticSearchContext, VectorIndexConfig};
 use minnal_db::semantic_search::service::SemanticSearchConfig;
 use serde::{Deserialize, Serialize};

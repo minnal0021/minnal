@@ -4,10 +4,10 @@
 //! one process (design doc M2a).
 
 use super::test_support::*;
-use super::*;
 #[cfg(feature = "semantic-search")]
-use crate::doc_store::vector_settings::SearchSpec;
-use crate::doc_store::vector_settings::VectorIndexSpec;
+use crate::doc_store::schema::vector_settings::SearchSpec;
+use crate::doc_store::schema::vector_settings::VectorIndexSpec;
+use crate::doc_store::*;
 
 fn spec(json: &str) -> VectorIndexSpec {
     serde_json::from_str(json).unwrap()
@@ -763,7 +763,7 @@ mod with_service {
     /// A trace's baseline accepts any `top_k` a namespace's Pass-1 cut accepts.
     #[test]
     fn the_trace_top_k_cap_is_the_largest_first_pass_cut() {
-        assert_eq!(MAX_TRACE_TOP_K, crate::doc_store::vector_settings::MAX_FIRST_PASS_TOP_K);
+        assert_eq!(MAX_TRACE_TOP_K, crate::doc_store::schema::vector_settings::MAX_FIRST_PASS_TOP_K);
     }
 
     /// The loaded partition's entry counts track the worker's writes and the
@@ -1236,7 +1236,7 @@ mod with_service {
                     let (store, name, stop) = (Arc::clone(&store), name.clone(), Arc::clone(&stop));
                     tokio::spawn(async move {
                         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                            let _ = super::super::vector::document_text(&store.db, &store.schemas, &name, b"k").await;
+                            let _ = crate::doc_store::vector::document_text(&store.db, &store.schemas, &name, b"k").await;
                             tokio::task::yield_now().await;
                         }
                     })
@@ -1379,7 +1379,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_vector_drop"); // the next use loads
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_vector_drop");
+        let (reached, release) = crate::doc_store::types::load_pause::arm("pause_vector_drop");
         let (settings, ns_id) = store.schemas.vector_settings("pause_vector_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
@@ -1423,7 +1423,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_store_drop");
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_store_drop");
+        let (reached, release) = crate::doc_store::types::load_pause::arm("pause_store_drop");
         let (settings, ns_id) = store.schemas.vector_settings("pause_store_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
@@ -1683,7 +1683,7 @@ mod with_service {
         let ctx = std::sync::Arc::clone(store.semantic_ctx.as_ref().unwrap());
         ctx.begin_drop("g").await;
         let at_drop = seen.lock().len();
-        let worker = crate::doc_store::vec_index_worker::VecIndexWorker::start(
+        let worker = crate::doc_store::workers::vec_index::VecIndexWorker::start(
             std::sync::Arc::clone(&store.db),
             std::sync::Arc::clone(&ctx),
             std::sync::Arc::clone(&store.schemas),
@@ -1784,7 +1784,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_delete"); // the next use loads and counts
 
-        let (reached, release) = crate::doc_store::store::types::load_pause::arm("pause_delete");
+        let (reached, release) = crate::doc_store::types::load_pause::arm("pause_delete");
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
             async move { partition(&store, "pause_delete").await }

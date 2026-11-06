@@ -55,7 +55,7 @@
 //! with nothing queued. Before acting on an entry the worker compares it with the
 //! document ([`check_entry_against_document`]), but only when no write to that
 //! document is in progress (the document store tracks them, without locking:
-//! `doc_store::store::InFlightWrites`). An entry that does not describe the
+//! `doc_store::InFlightWrites`). An entry that does not describe the
 //! document is then a write cut short, or a re-index entry from an older
 //! snapshot, and is rewritten to describe it. So the queue alone lists every
 //! document whose vectors may be out of date, and recovery after a crash is

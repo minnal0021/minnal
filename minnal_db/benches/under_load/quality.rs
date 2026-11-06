@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use minnal_db::doc_store::vector_settings::{MAX_FIRST_PASS_TOP_K, MAX_PROBES, SearchSpec};
+use minnal_db::doc_store::schema::vector_settings::{MAX_FIRST_PASS_TOP_K, MAX_PROBES, SearchSpec};
 use minnal_db::doc_store::{DocStore, Pagination};
 use minnal_db::semantic_search::ivf_split::rebuild::RebuildState;
 use serde_json::json;

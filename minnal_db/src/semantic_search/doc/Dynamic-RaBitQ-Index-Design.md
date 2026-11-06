@@ -746,9 +746,9 @@ service settings and the namespace's `vector_index`, so `search()` and
 | `embed_document`, `embed_query` (`service/mod.rs`) | `config.model_name`, `embedding_dim`, `window_size`, `sliding_size` | the namespace's `vector_index`, through the per-namespace config |
 | `index_embeddings`, Pass 2 (`service/mod.rs`) | `config.number_of_bits_for_dense_quantisation` | `quantisation.pass2_bits` |
 | `search()` (`service/mod.rs`) | `config.n_probes`, `first_pass_sparse_search_top_k`, `top_k_results` | `search.*`, or the request's override |
-| Query cache (`doc_store/store/query.rs`, `vector_kv`) | key `model ‖ text`, dimension from the engine config | key `model ‖ dim ‖ text`, both from the namespace, so the same model at two dimensions never shares an entry |
-| Vector worker (`vec_index_worker.rs`) | the context's config and its one `ClusterIndex` | the queue entry's namespace → schema → per-namespace config and its model's `ClusterIndex` |
-| `SemanticSearchContext` (`doc_store/store/types.rs`) | one config, one `ClusterIndex` | service settings and the per-model `ClusterIndex` set |
+| Query cache (`doc_store/query.rs`, `vector_kv`) | key `model ‖ text`, dimension from the engine config | key `model ‖ dim ‖ text`, both from the namespace, so the same model at two dimensions never shares an entry |
+| Vector worker (`doc_store/workers/vec_index.rs`) | the context's config and its one `ClusterIndex` | the queue entry's namespace → schema → per-namespace config and its model's `ClusterIndex` |
+| `SemanticSearchContext` (`doc_store/types.rs`) | one config, one `ClusterIndex` | service settings and the per-model `ClusterIndex` set |
 | `check_embedding_service` (`main.rs`) | one model at one dimension | each distinct pair in use, plus a probe at create and enable |
 | API config (`minnal_db_api/src/config.rs`, `config_report.rs`) | `[semantic_search]` model, dimension, chunking, bits, probing, `cluster_path` | `embedding_service_url`, timeouts, cache TTL, `centroid_dir`, `supported_models` |
 | Search routes (`routes/semantic_search.rs`) | `top_k` only | `top_k`, `n_probes`, `first_pass_top_k` |

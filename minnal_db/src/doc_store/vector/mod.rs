@@ -1,6 +1,6 @@
 //! Vector-index queue administration and bulk (re)indexing.
 
-use super::*;
+use crate::doc_store::*;
 
 impl DocStore {
     /// The health of `namespace`'s partition (document or KV store): every
@@ -15,7 +15,7 @@ impl DocStore {
         codes: bool,
     ) -> Result<
         (
-            crate::doc_store::vector_settings::MaintenanceSettings,
+            crate::doc_store::schema::vector_settings::MaintenanceSettings,
             crate::semantic_search::ivf_split::health::PartitionHealth,
             Vec<crate::semantic_search::ivf_split::health::PostingHealth>,
         ),
@@ -72,7 +72,7 @@ impl DocStore {
         &self,
         namespace: &str,
         params: &crate::semantic_search::ivf_split::recall_check::RecallCheckParams,
-        overrides: &crate::doc_store::vector_settings::SearchSpec,
+        overrides: &crate::doc_store::schema::vector_settings::SearchSpec,
     ) -> Result<crate::semantic_search::ivf_split::recall_check::RecallCheck, DocStoreError> {
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
@@ -953,7 +953,7 @@ async fn record_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     // ── Vector-index queue methods ──────────────────────────────────────────
 
@@ -1468,7 +1468,7 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn a_stale_entry_waits_for_a_write_in_progress() {
-        use crate::doc_store::vec_index_worker::{EntryCheck, check_entry};
+        use crate::doc_store::workers::vec_index::{EntryCheck, check_entry};
         let db_dir = TempDir::new().unwrap();
         let store = open_kv_semantic(&db_dir).await;
         let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();

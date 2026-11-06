@@ -33,8 +33,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::doc_store::hex::hex_to_bytes;
-use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
+use minnal_db::doc_store::indexing::progress::IndexBuildSnapshot;
+use minnal_db::hex_to_bytes;
 use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -668,7 +668,7 @@ pub struct PartitionParams {
     pub codes: bool,
 }
 
-fn maintenance_json(m: &minnal_db::doc_store::vector_settings::MaintenanceSettings) -> serde_json::Value {
+fn maintenance_json(m: &minnal_db::doc_store::schema::vector_settings::MaintenanceSettings) -> serde_json::Value {
     serde_json::json!({
         "target_posting_size": m.target_posting_size,
         "split_limit": m.split_limit(),
@@ -834,7 +834,7 @@ fn vector_id_json(state: &AppState, ns: &str) -> impl Fn(&[u8]) -> serde_json::V
             Some(minnal_db::doc_store::StoredSchema::Kv(s)) => s.key_type.deserialize_key(bytes).ok(),
             None => None,
         };
-        decoded.unwrap_or_else(|| serde_json::Value::String(minnal_db::doc_store::hex::bytes_to_hex(bytes)))
+        decoded.unwrap_or_else(|| serde_json::Value::String(minnal_db::bytes_to_hex(bytes)))
     }
 }
 
@@ -1215,7 +1215,7 @@ pub struct QueueEntryInfo {
 
 impl From<QueueEntry> for QueueEntryInfo {
     fn from(e: QueueEntry) -> Self {
-        let doc_id_hex = minnal_db::doc_store::hex::bytes_to_hex(&e.doc_id_bytes);
+        let doc_id_hex = minnal_db::bytes_to_hex(&e.doc_id_bytes);
         let doc_id_str = std::str::from_utf8(&e.doc_id_bytes)
             .ok()
             .filter(|s| s.chars().all(|c| c.is_ascii_graphic() || c == ' '))

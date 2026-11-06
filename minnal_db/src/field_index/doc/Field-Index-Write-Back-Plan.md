@@ -122,7 +122,7 @@ Before starting, re-run the search; the list below is what it found on
       backpressure comments), `db/workers/index_checkpoint.rs`,
       `db/index_manager.rs`, admin route docs in
       `minnal_db_api/src/routes/admin_indices.rs` / `admin_storage.rs`,
-      `doc_store/store/diagnostics.rs`
+      `doc_store/diagnostics.rs`
 - [x] 4f. **Feature requests**: `FEATURE-REQUEST.md` entries that describe
       the blob store or backpressure (mark what this work closes)
 - [x] 4g. Evaluation doc: add a *Results* section with before/after numbers

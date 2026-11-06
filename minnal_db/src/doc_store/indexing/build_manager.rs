@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinHandle;
 
+use crate::doc_store::IndexBuildHandle;
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::index_progress::{BuildStatus, IndexBuildSnapshot, IndexId, now_ms};
-use crate::doc_store::store::IndexBuildHandle;
+use crate::doc_store::indexing::progress::{BuildStatus, IndexBuildSnapshot, IndexId, now_ms};
 
 // ── BuildHandle ───────────────────────────────────────────────────────────────
 

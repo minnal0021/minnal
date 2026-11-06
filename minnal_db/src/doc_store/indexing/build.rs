@@ -1,7 +1,7 @@
 //! Field-index lifecycle: add, drop, and the background (re)build that
 //! populates a newly added index.
 
-use super::*;
+use crate::doc_store::*;
 
 impl DocStore {
     // ── Admin: index management ────────────────────────────────────────────
@@ -477,7 +477,7 @@ async fn rebuild_index_for_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     // ── Drop / add index ────────────────────────────────────────────────────
 

@@ -12,7 +12,7 @@
 //! ([`AsyncDb::reset_rowmap`]), and the rebuilt indexes get dense IDs for the
 //! live documents only (FR-006).
 
-use super::*;
+use crate::doc_store::*;
 
 /// Name of the intent file in the namespace's index directory.
 const INTENT_FILE: &str = "reindex_all.json";
@@ -177,7 +177,7 @@ impl DocStore {
 mod tests {
     use super::*;
     use crate::doc_store::schema::IndexType;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     const DOCS: u128 = 300;
 

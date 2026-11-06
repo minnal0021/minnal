@@ -184,7 +184,7 @@ pub async fn range_query(
 fn parse_hex_prefix(s: &str) -> Result<Vec<u8>, AppError> {
     let clean: String = s.chars().filter(|&c| c != '-').collect();
     // Byte-level decode: slicing the `str` panicked on multi-byte input.
-    minnal_db::doc_store::hex::hex_to_bytes(&clean)
+    minnal_db::hex_to_bytes(&clean)
         .ok_or_else(|| DocStoreError::InvalidId("prefix must be an even-length string of hex digits (hyphens are ignored)".into()).into())
 }
 

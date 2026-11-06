@@ -29,11 +29,11 @@
 //! `[semantic_search.maintenance]` and `[semantic_search.search_defaults]`).
 //!
 //! [`DocStoreSchema`]: crate::doc_store::DocStoreSchema
-//! [`KvStoreSchema`]: crate::doc_store::kv_schema::KvStoreSchema
+//! [`KvStoreSchema`]: crate::doc_store::schema::kv::KvStoreSchema
 
 use serde::{Deserialize, Serialize};
 
-use super::error::SchemaError;
+use crate::doc_store::error::SchemaError;
 
 /// Model used when a namespace does not name one.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "gemma";

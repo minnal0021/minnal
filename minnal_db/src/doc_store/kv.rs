@@ -249,7 +249,7 @@ impl DocStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     // ── KV store helpers ────────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 //! Types surfaced by the document store: document IDs, index-build progress,
 //! and the semantic-search context.
 //!
-//! Re-exported from the parent module, so these stay at `doc_store::store::*`.
+//! Re-exported from the parent module, so these stay at `doc_store::*`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 
 use crate::FieldId;
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::index_observer::InMemoryProgress;
+use crate::doc_store::indexing::observer::InMemoryProgress;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::KeyType;
 #[cfg(feature = "semantic-search")]
-use crate::doc_store::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
+use crate::doc_store::schema::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
 #[cfg(feature = "semantic-search")]
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::PartitionHandle;
@@ -282,7 +282,7 @@ pub struct SemanticSearchContext {
     pub supported_models: std::collections::BTreeMap<String, u32>,
     /// What a namespace's vector-index settings are filled with when it first
     /// enables semantic search (the server's TOML defaults, or built-in).
-    pub index_defaults: crate::doc_store::vector_settings::IndexDefaults,
+    pub index_defaults: crate::doc_store::schema::vector_settings::IndexDefaults,
     /// Namespaces maintained at once by the partition maintenance task.
     pub maintenance_threads: usize,
     /// Threads a partition rebuild's k-means uses (at most
@@ -320,7 +320,7 @@ pub struct NamespaceSemantics {
     /// (kept so a request's overrides apply to them, not to the computed budget).
     pub search: SearchSettings,
     /// The namespace's partition maintenance settings.
-    pub maintenance: crate::doc_store::vector_settings::MaintenanceSettings,
+    pub maintenance: crate::doc_store::schema::vector_settings::MaintenanceSettings,
 }
 
 #[cfg(feature = "semantic-search")]
@@ -330,8 +330,8 @@ impl SemanticSearchContext {
         Self {
             config,
             supported_models: std::collections::BTreeMap::new(),
-            index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
-            maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
+            index_defaults: crate::doc_store::schema::vector_settings::IndexDefaults::default(),
+            maintenance_threads: crate::doc_store::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
@@ -422,7 +422,7 @@ impl SemanticSearchContext {
     }
 
     /// Use `defaults` for namespaces that enable semantic search from now on.
-    pub fn with_index_defaults(mut self, defaults: crate::doc_store::vector_settings::IndexDefaults) -> Self {
+    pub fn with_index_defaults(mut self, defaults: crate::doc_store::schema::vector_settings::IndexDefaults) -> Self {
         self.index_defaults = defaults;
         self
     }
@@ -676,7 +676,7 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     // ── DocId serialization ─────────────────────────────────────────────────
 

@@ -18,9 +18,9 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::doc_store::error::{DocStoreError, SchemaError};
-use crate::doc_store::schema::{DocStoreSchema, KvStoreSchema, StoreType, peek_store_type};
 #[cfg(feature = "semantic-search")]
-use crate::doc_store::vector_settings::VectorIndexSettings;
+use crate::doc_store::schema::vector_settings::VectorIndexSettings;
+use crate::doc_store::schema::{DocStoreSchema, KvStoreSchema, StoreType, peek_store_type};
 use crate::{AsyncDb, AsyncNamespace};
 
 /// The system namespace that holds every store's schema.

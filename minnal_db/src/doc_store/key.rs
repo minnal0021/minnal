@@ -12,7 +12,7 @@
 //! LSM sparse index, and every SSTable entry that carries it.
 //!
 //! [`KeyType::Str`]: crate::doc_store::schema::KeyType::Str
-//! [`KvKeyType::Str`]: crate::doc_store::kv_schema::KvKeyType::Str
+//! [`KvKeyType::Str`]: crate::doc_store::schema::kv::KvKeyType::Str
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -37,7 +37,7 @@ pub const MAX_STR_KEY_LEN: usize = 50;
 /// storage engine uses, so range scans over `StrKey` document IDs behave the
 /// same way they do over big-endian integer IDs.
 ///
-/// [`DocId`]: crate::doc_store::store::DocId
+/// [`DocId`]: crate::doc_store::DocId
 #[derive(Clone, Copy)]
 pub struct StrKey {
     /// Number of meaningful bytes in `buf`. Always `1..=MAX_STR_KEY_LEN`.

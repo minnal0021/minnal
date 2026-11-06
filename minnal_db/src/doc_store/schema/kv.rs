@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::doc_store::error::SchemaError;
 use crate::doc_store::key::StrKey;
 use crate::doc_store::schema::StoreType;
-use crate::doc_store::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use crate::doc_store::schema::vector_settings::{self, IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 
 /// Key type for a KV store namespace.
 ///

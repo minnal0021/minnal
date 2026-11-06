@@ -84,7 +84,7 @@ fn parse_uuid(s: &str) -> Option<u128> {
         36 if s.char_indices().all(|(i, c)| (c == '-') == matches!(i, 8 | 13 | 18 | 23)) => s.replace('-', ""),
         _ => return None,
     };
-    let bytes: [u8; 16] = minnal_db::doc_store::hex::hex_to_bytes(&hex)?.try_into().ok()?;
+    let bytes: [u8; 16] = minnal_db::hex_to_bytes(&hex)?.try_into().ok()?;
     Some(u128::from_be_bytes(bytes))
 }
 

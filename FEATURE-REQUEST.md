@@ -205,7 +205,7 @@ system, and the real defect is sharper than a disk leak:
   `remove_namespace_path` (whole namespace) but **no per-field removal**. So an
   embedder driving the engine directly does leak the whole
   `field-index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
-- But `doc_store::drop_index` (`doc_store/store/index_build.rs`) **already
+- But `doc_store::drop_index` (`doc_store/indexing/build.rs`) **already
   deletes the directory** — by hand-building the path
   (`db_path/field-index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
   reaching straight past `IndexManager` into a layer it does not own.
@@ -806,7 +806,7 @@ don't reach across modules* — because the API server reaches the engine
 **through** `DocStore` rather than alongside it. `routes/admin_storage.rs` is
 almost entirely calls of this shape.
 
-They are now collected in `doc_store/store/diagnostics.rs` with a module doc
+They are now collected in `doc_store/diagnostics.rs` with a module doc
 comment pointing here, so at least the coupling is visible in one place.
 
 ### Why this is a feature, not a bug fix
@@ -842,7 +842,7 @@ by construction.
 ### Acceptance criteria
 
 - No route in `minnal_db_api` reaches the engine through `DocStore`.
-- `doc_store/store/diagnostics.rs` shrinks to the genuinely document-scoped
+- `doc_store/diagnostics.rs` shrinks to the genuinely document-scoped
   operations (`count_docs`, the `field_index_*` helpers, `reindex_doc_*`), or
   disappears.
 - The removal is a single, clearly-labelled breaking commit.
@@ -1021,7 +1021,7 @@ document ID, so they are unaffected.
 
 **Filed:** 2026-10-12
 **Area:** `minnal_db` (`src/semantic_search/ivf_split/recall_check.rs`, `src/semantic_search/ivf_split/history.rs`,
-`src/doc_store/store/vector.rs`), `minnal_db_api`
+`src/doc_store/vector/mod.rs`), `minnal_db_api`
 (`GET /admin/indices/{ns}/vector/recall-check`, `GET /admin/indices/{ns}/vector/history`)
 **Severity:** Low — operators had no measured way to decide on a rebuild
 **Source:** design-doc review of M4: "the product has no cutoff that starts a
@@ -1337,7 +1337,7 @@ a crash cannot leave one layout on disk for the other to read.
 ## FR-010 — Refuse an enable for as long as a vector-index drop is pending
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/doc_store/store/admin.rs`), `minnal_db_api`
+**Area:** `minnal_db` (`src/doc_store/lifecycle.rs`), `minnal_db_api`
 (`src/routes/stores.rs`, `indices.rs`, `admin_indices.rs`)
 **Severity:** Low — needs an enable and a drop of one store within moments of each
 other; the affected documents are repaired by a reindex
@@ -1431,7 +1431,7 @@ agreement first, as any new dependency does.
 ## FR-012 — Make a skipped `upsert_vectors` visible to its caller
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/doc_store/vec_index_worker.rs`)
+**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/doc_store/workers/vec_index.rs`)
 **Severity:** Low — affects direct users of `vector_kv`; the document store creates
 the namespaces itself
 **Source:** Review of store and vector-index lifecycle races.

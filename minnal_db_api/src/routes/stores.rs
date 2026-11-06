@@ -17,7 +17,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::doc_store::vector_settings::{MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
+use minnal_db::doc_store::schema::vector_settings::{MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, SchemaError, StoreType};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};

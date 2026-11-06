@@ -44,7 +44,7 @@ impl DocStore {
         &self,
         namespace: &str,
         ns_id: Option<u32>,
-        settings: &crate::doc_store::vector_settings::VectorIndexSettings,
+        settings: &crate::doc_store::schema::vector_settings::VectorIndexSettings,
         overrides: &SearchSpec,
     ) -> Result<NamespaceSemantics, DocStoreError> {
         let ctx = self
@@ -403,7 +403,7 @@ impl DocStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     // ── scan_prefix after delete ─────────────────────────────────────────
 

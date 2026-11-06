@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::doc_store::hex::bytes_to_hex;
-use crate::doc_store::index_progress::BuildStatus;
-use crate::doc_store::store::DiskBuildProgress;
+use crate::doc_store::DiskBuildProgress;
+use crate::doc_store::indexing::progress::BuildStatus;
+use crate::support::hex::bytes_to_hex;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -193,7 +193,7 @@ impl IndexProgressObserver for DiskProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::DiskBuildProgress;
+    use crate::doc_store::DiskBuildProgress;
     use std::sync::atomic::Ordering;
 
     fn read_back(path: &Path) -> DiskBuildProgress {

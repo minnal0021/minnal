@@ -82,8 +82,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::schema_store::SchemaStore;
-use crate::doc_store::store::{DocumentText, InFlightWrites, NamespaceSemantics, SemanticSearchContext, document_text};
+use crate::doc_store::schema::store::SchemaStore;
+use crate::doc_store::{DocumentText, InFlightWrites, NamespaceSemantics, SemanticSearchContext, document_text};
 use crate::semantic_search::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
@@ -154,8 +154,8 @@ pub(crate) async fn check_entry(
 /// [`DocStore::with_semantic_search`].  Defaults are conservative values
 /// suitable for most deployments.
 ///
-/// [`DocStore::with_vector_index_config`]: crate::doc_store::store::DocStore::with_vector_index_config
-/// [`DocStore::with_semantic_search`]: crate::doc_store::store::DocStore::with_semantic_search
+/// [`DocStore::with_vector_index_config`]: crate::doc_store::DocStore::with_vector_index_config
+/// [`DocStore::with_semantic_search`]: crate::doc_store::DocStore::with_semantic_search
 #[derive(Debug, Clone)]
 pub struct VectorIndexConfig {
     /// Seconds to sleep after a pass that contained at least one failure,
@@ -194,7 +194,7 @@ pub struct VecIndexWorkerHandle {
     notify: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// The partition maintenance task, which this worker wakes; stopped with it.
-    maintenance: Option<crate::doc_store::ivf_maintenance::MaintenanceHandle>,
+    maintenance: Option<crate::doc_store::workers::ivf_maintenance::MaintenanceHandle>,
 }
 
 impl VecIndexWorkerHandle {
@@ -252,7 +252,7 @@ impl VecIndexWorker {
         config: VectorIndexConfig,
     ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let maintenance = crate::doc_store::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas));
+        let maintenance = crate::doc_store::workers::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas));
         let worker = VecIndexWorker {
             db,
             ctx,
@@ -274,7 +274,7 @@ impl VecIndexWorker {
     async fn run(self) {
         // Splits a crash interrupted are finished first: nothing may write a
         // namespace's vectors while its journal is unfinished.
-        crate::doc_store::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schemas).await;
+        crate::doc_store::workers::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schemas).await;
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
         info!("vec index worker ready");

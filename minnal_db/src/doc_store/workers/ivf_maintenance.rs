@@ -22,9 +22,9 @@ use log::{debug, info, warn};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::AsyncDb;
+use crate::doc_store::SemanticSearchContext;
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::schema_store::SchemaStore;
-use crate::doc_store::store::SemanticSearchContext;
+use crate::doc_store::schema::store::SchemaStore;
 use crate::semantic_search::ivf_split;
 
 /// Default maintenance threads per process.

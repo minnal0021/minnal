@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use minnal_db::doc_store::vector_settings::SearchSpec;
+use minnal_db::doc_store::schema::vector_settings::SearchSpec;
 use minnal_db::doc_store::{DocId, DocStore, Pagination, schema::KeyType};
 use serde_json::{Value, json};
 

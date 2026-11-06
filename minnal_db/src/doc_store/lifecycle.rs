@@ -209,7 +209,7 @@ impl DocStore {
             && let SchemaAmendment::AddEmbeddingAttribute { vector_index, .. } | SchemaAmendment::EnableVectorIndex { vector_index, .. } =
                 &mut amendment
         {
-            *vector_index = Some(crate::doc_store::vector_settings::settle(
+            *vector_index = Some(crate::doc_store::schema::vector_settings::settle(
                 None,
                 vector_index.as_ref(),
                 &self.index_defaults(),
@@ -263,8 +263,8 @@ impl DocStore {
     pub async fn update_vector_search(
         &self,
         namespace: &str,
-        search: &crate::doc_store::vector_settings::SearchSpec,
-        maintenance: Option<&crate::doc_store::vector_settings::MaintenanceSpec>,
+        search: &crate::doc_store::schema::vector_settings::SearchSpec,
+        maintenance: Option<&crate::doc_store::schema::vector_settings::MaintenanceSpec>,
     ) -> Result<(), DocStoreError> {
         match self.store_type(namespace)? {
             StoreType::Doc => {
@@ -290,8 +290,8 @@ impl DocStore {
     async fn seed_vector_index(
         &self,
         _namespace: &str,
-        _settings: &crate::doc_store::vector_settings::VectorIndexSettings,
-        _vector_index: &mut Option<crate::doc_store::vector_settings::VectorIndexSpec>,
+        _settings: &crate::doc_store::schema::vector_settings::VectorIndexSettings,
+        _vector_index: &mut Option<crate::doc_store::schema::vector_settings::VectorIndexSpec>,
     ) -> Result<(), DocStoreError> {
         #[cfg(feature = "semantic-search")]
         match &self.semantic_ctx {
@@ -304,7 +304,7 @@ impl DocStore {
     /// Check that this server can embed and search with `settings` (its model
     /// has centroids of its dimension). Without an attached semantic context
     /// there is nothing to check against, so it passes.
-    pub fn check_vector_model(&self, _settings: &crate::doc_store::vector_settings::VectorIndexSettings) -> Result<(), DocStoreError> {
+    pub fn check_vector_model(&self, _settings: &crate::doc_store::schema::vector_settings::VectorIndexSettings) -> Result<(), DocStoreError> {
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
             ctx.check_model(_settings)?;
@@ -315,12 +315,12 @@ impl DocStore {
     /// The defaults a namespace's vector-index settings are filled with when it
     /// first enables semantic search: the attached context's (from the server
     /// config), or the built-in ones.
-    pub fn index_defaults(&self) -> crate::doc_store::vector_settings::IndexDefaults {
+    pub fn index_defaults(&self) -> crate::doc_store::schema::vector_settings::IndexDefaults {
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
             return ctx.index_defaults;
         }
-        crate::doc_store::vector_settings::IndexDefaults::default()
+        crate::doc_store::schema::vector_settings::IndexDefaults::default()
     }
 
     /// Return the schema for a namespace without the JSON round-trip overhead of [`list`].
@@ -720,7 +720,7 @@ async fn clear_queue_entries(db: &AsyncDb, namespace: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::store::test_support::*;
+    use crate::doc_store::tests::test_support::*;
 
     /// What a create cut short leaves: an empty namespace, which a new store
     /// replaces, field-index registrations included.
