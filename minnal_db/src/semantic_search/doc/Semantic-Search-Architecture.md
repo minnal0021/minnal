@@ -201,7 +201,7 @@ would have to be embedded again). A wider code reconstructs the chunk more
 closely, so maintenance files more chunks in their nearest posting and Pass 1
 ranks its candidates better. It also makes every entry read larger.
 
-Measured with `vector_bench` on FiQA (57,600 documents, 172,998 chunks) at the
+Measured with `eval_frozen` on FiQA (57,600 documents, 172,998 chunks) at the
 default 256 probes, gemma / qwen:
 
 | | 1 bit | 2 bits | 4 bits |
@@ -574,8 +574,8 @@ Pass-1 sparse-scan I/O is 49–76% of `search()` at 8 chunks per document and
 grows roughly linearly with the entries scanned. The SIMD dot products are a
 minority of the cost. Pass 2 re-scores a fixed `first_pass_top_k` candidates, so
 its share shrinks as more is read. Recall and nDCG against entries read are
-measured on frozen BEIR embeddings by the vector bench
-(`semantic_search/vector_bench`, design doc M0).
+measured on frozen BEIR embeddings by the frozen eval
+(`semantic_search/eval`, design doc M0).
 
 ---
 

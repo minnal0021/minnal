@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! MINNAL_BENCH_DATASET=fiqa MINNAL_BENCH_LABEL=study \
-//!   cargo test -p minnal_db --all-features --release --lib vector_bench_pass1_study -- --ignored --nocapture
+//!   cargo test -p minnal_db --all-features --release --lib eval_pass1_study -- --ignored --nocapture
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -20,10 +20,10 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use super::super::metrics::beir_eval::{env_or, read_qrels, score};
+use super::beir::{env_or, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen::{self, Frozen};
-use super::splitmix;
+use super::frozen_eval::splitmix;
 use crate::semantic_search::cluster::find_closest_cluster_id;
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::QuantisationStyle;
@@ -240,7 +240,7 @@ struct QueryOut {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn vector_bench_pass1_study() {
+async fn eval_pass1_study() {
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
     let model = env_or("MINNAL_BENCH_MODEL", "gemma");
     let label = env_or("MINNAL_BENCH_LABEL", "study");
@@ -253,7 +253,7 @@ async fn vector_bench_pass1_study() {
     };
     let dataset_dir = beir_root.join(&dataset);
     let frozen_dir = bench_root.join(&dataset).join(&model);
-    assert!(frozen_dir.join("manifest.json").exists(), "run vector_bench for {dataset}/{model} first");
+    assert!(frozen_dir.join("manifest.json").exists(), "run eval_frozen for {dataset}/{model} first");
     let frozen = Arc::new(
         frozen::load_or_dump(
             &frozen_dir,
@@ -272,7 +272,7 @@ async fn vector_bench_pass1_study() {
     );
     let gt = exact::load_or_compute(&frozen_dir, &frozen);
     let qrels = read_qrels(&dataset_dir.join("qrels").join(format!("{split}.tsv")));
-    let index = Arc::new(super::study_centroids(&frozen));
+    let index = Arc::new(super::frozen_eval::study_centroids(&frozen));
     let (nd, nq, dim) = (frozen.n_docs(), frozen.n_queries(), frozen.dim());
     eprintln!(
         "\n=== pass-1 study: {dataset} ({model}), {nd} docs, {} chunks, {nq} queries ===",
@@ -572,7 +572,7 @@ async fn vector_bench_pass1_study() {
         md,
         "{nd} docs, {} chunks, {nq} queries. Pass-1 cut {CUT}. Commit `{}`.\n",
         frozen.n_chunks(),
-        super::git_describe()
+        super::frozen_eval::git_describe()
     );
     let _ = writeln!(
         md,
@@ -771,7 +771,7 @@ async fn vector_bench_pass1_study() {
 /// dense Haar matrix.
 #[test]
 #[ignore]
-fn vector_bench_rotation_spread() {
+fn eval_rotation_spread() {
     use crate::semantic_search::quantisation::rotation::FhtKacRotator;
     let dim = 768;
     let one = FhtKacRotator::new(dim, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED);

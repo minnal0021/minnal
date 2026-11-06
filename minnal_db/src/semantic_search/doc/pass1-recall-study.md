@@ -1,6 +1,6 @@
 # Pass 1 keeps "80%" of the exact candidates: what is lost, and does it matter?
 
-The vector bench reports a **Pass-1 recall** of about 0.80 at the production
+The frozen eval reports a **Pass-1 recall** of about 0.80 at the production
 settings: of the 1,000 documents an exact Pass 1 would hand to Pass 2, the index
 hands over about 800. This report finds where the other ~200 go, why, and what
 they cost in final ranking quality. It also checks Pass 2 on its own.
@@ -10,7 +10,7 @@ FiQA (57,600 docs, 648 queries) from two models served by llama.cpp: gemma
 (`embeddinggemma-300m`, Q8) and qwen (`Qwen3-Embedding-8B`, Q4_K_M, truncated to
 768 dimensions), each with its bundled centroids (ELI5, k = 256). 64 probes and a
 cut of 1,000 unless stated. Commit `946814b`. Harness:
-[`vector_bench/study.rs`](../vector_bench/study.rs) (`vector_bench_pass1_study`).*
+[`eval/study.rs`](../eval/study.rs) (`eval_pass1_study`).*
 
 ## Answer
 
@@ -49,7 +49,7 @@ cut of 1,000 unless stated. Commit `946814b`. Harness:
 The study rebuilds every chunk's 1-bit code in memory with the production
 quantiser and scores Pass 1 with the production estimator. It then compares the
 result with the **exact Pass 1**: MaxSim over the full-precision chunks of every
-document, top 1,000 (`vector_bench/exact.rs`).
+document, top 1,000 (`eval/exact.rs`).
 
 **Pass-1 recall** is `|index's 1,000 ∩ exact 1,000| / 1,000`. To confirm the
 simulation is the real thing, the study also indexes the corpus into a database
@@ -191,12 +191,12 @@ discussed in `rabitq-rotation-audit.md`.
 
 ## Reproduce
 
-From `minnal_db/`, after a `vector_bench` run has created the frozen
+From `minnal_db/`, after a `eval_frozen` run has created the frozen
 embeddings for the dataset and model:
 
 ```sh
 MINNAL_BENCH_MODEL=qwen MINNAL_BENCH_DATASET=fiqa MINNAL_BENCH_LABEL=study cargo test -p minnal_db \
-  --all-features --release --lib vector_bench_pass1_study -- --ignored --nocapture
+  --all-features --release --lib eval_pass1_study -- --ignored --nocapture
 ```
 
 FiQA takes about a minute on 32 cores and writes

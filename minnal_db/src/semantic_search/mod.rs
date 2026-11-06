@@ -1,5 +1,7 @@
 pub mod chunking;
 pub mod cluster;
+#[cfg(test)]
+mod eval;
 pub mod index;
 // Partition maintenance: the journal, split, reassign, merge and rebuild
 // executors and their crash recovery (design doc M3a).
@@ -8,8 +10,6 @@ pub mod metrics;
 pub mod quantisation;
 pub mod service;
 pub(crate) mod simd;
-#[cfg(test)]
-mod vector_bench;
 pub mod vector_math;
 
 pub use self::chunking::chunk_document;

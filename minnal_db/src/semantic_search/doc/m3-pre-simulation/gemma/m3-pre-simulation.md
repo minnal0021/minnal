@@ -20,7 +20,7 @@ leaves open (`Dynamic-RaBitQ-Index-Design.md`, *M3-pre*):
 
 *Measured on frozen gemma embeddings (`embeddinggemma-300m`, Q8, llama.cpp) of
 BEIR SciFact (5,183 docs, 22,787 chunks, 300 queries) and FiQA (57,600 docs,
-172,998 chunks, 648 queries), dumped by the vector bench at M0. Simulator:
+172,998 chunks, 648 queries), dumped by the frozen eval at M0. Simulator:
 `work/bench/analysis/m3pre/` (`sim.py`, stages 1–3, `fidelity.py`); charts are
 drawn from [`m3pre/data.json`](data.json) by
 [`m3pre/charts.py`](charts.py). Branch `dynamic-rabitq-index` at
@@ -111,7 +111,7 @@ drawn from [`m3pre/data.json`](data.json) by
 - **Bundled file**: today's 256 gemma centroids, fitted on ELI5, shared by every
   namespace.
 - **ANN recall@10**: the share of the exact top 10 (float embeddings, no
-  partition, no quantisation; the vector bench's ground truth) that the index
+  partition, no quantisation; the frozen eval's ground truth) that the index
   returns. **Pass-1 recall**: the share of the exact Pass-1 top 1,000 that the
   index's Pass 1 hands to Pass 2.
 - **Insertion orders**: *shuffled* (random), *corpus* (the dataset's own order),
@@ -151,7 +151,7 @@ read by interpolating each configuration's budget curve (2, 5, 10, 20 and 40%
 of the namespace, and all of it).
 
 **Check against production.** Indexing SciFact against the bundled file and
-probing 64 postings reproduces the vector bench's M2c run: 5,586.7 entries read
+probing 64 postings reproduces the frozen eval's M2c run: 5,586.7 entries read
 per query against 5,587, and nDCG@10 0.7900 against 0.7906 (the difference is
 the float Pass 2).
 

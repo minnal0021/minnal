@@ -59,7 +59,7 @@ per-namespace model selection, and how a namespace bootstraps from nothing.
   k-means on the corpus's own whole-document vectors, in a seeded random
   order, documents shuffled within each. The simulation (`sim.py`
   `doc_order`) defines it, and `export_orders.py` writes that exact order and
-  the topic labels next to each frozen dump, which the vector bench reads; the
+  the topic labels next to each frozen dump, which the frozen eval reads; the
   bench's `topic:` churn deletes whole topics from the same labels. So
   simulation and bench drifting are the same experiment.
 
@@ -187,15 +187,15 @@ dims, model, chunking params, service commit).
 
 ### Harness
 
-The harness is `semantic_search/vector_bench/` (`#[cfg(test)]`, `#[ignore]`d
-tests). It reuses `metrics/beir_eval.rs`'s readers and scoring, and its module docs give
+The harness is `semantic_search/eval/` (`#[cfg(test)]`, `#[ignore]`d
+tests). It reuses `eval/beir.rs`'s readers and scoring, and its module docs give
 the commands.
 
 1. **`embed_document` is split** into the service call and
    `index_embeddings(config, cluster_index, dense, chunks) -> Vec<VectorIndex>`.
    This pure refactor is the harness's only hook into production code. Later
    milestones change `index_embeddings` and the harness follows automatically.
-2. **`vector_bench`** loads the frozen vectors (dumping them through the service
+2. **`eval_frozen`** loads the frozen vectors (dumping them through the service
    on the first run), indexes them through `index_embeddings` +
    `upsert_vectors` into a fresh database (default `DbConfig`, 8 docs in flight),
    reopens and compacts it, and runs queries through the real `search()`.
@@ -214,7 +214,7 @@ the commands.
 
 | Group | Metric | Why |
 |---|---|---|
-| Relevance (qrels) | nDCG@10, MRR@10, Recall@100 | What users see; already in `beir_eval` |
+| Relevance (qrels) | nDCG@10, MRR@10, Recall@100 | What users see; already in `eval_beir` |
 | ANN fidelity | Pass-1 recall@{100,1000} vs `exact_pass1`; final recall@10 vs `exact_final` | Isolates index damage from model quality; more sensitive than nDCG |
 | Estimator | RMSE and bias of Pass-1 and Pass-2 estimates vs exact inner products, on a fixed sample of (query, entry) pairs; share of errors inside `error_bound` | What rotation (M1) and centring (M2b) change directly |
 | Cost | entries and chunks scanned, total ms p50/p95/p99 (warm, sequential, 3 repeats), queries whose results differ between repeats | Latency gate. Pass 1 and Pass 2 are not timed separately: `search()` has no timing hook, and adding one is not worth a production change |
@@ -378,7 +378,7 @@ readable as soon as they are written.
   completion they cover is unchanged, only deferred.
 - **Gate:** the tests above, and end-to-end indexing throughput (embedding
   call included, as in production) within 5%. The flush cost itself is
-  measured by `vector_bench_worker_completion`: the same frozen documents
+  measured by `eval_worker_completion`: the same frozen documents
   through write-then-complete, once completing each entry at once (the old
   behaviour) and once flushing every 256 entries first.
 
@@ -908,8 +908,8 @@ an immutable `centre_id`". Either way the schema records the scheme next to the
 widths (`quantisation.pass2_centre`, read-only), so a later width change cannot
 pair a width with a centre scheme it was never measured for.
 
-**Result (2026-10-04).** Harness `vector_bench_code_width`
-(`vector_bench/code_width.rs`); gemma and qwen on SciFact, FiQA, NFCorpus and
+**Result (2026-10-04).** Harness `eval_code_width`
+(`eval/code_width.rs`); gemma and qwen on SciFact, FiQA, NFCorpus and
 ArguAna. The 8-bit nearest-centre rows reproduce production exactly.
 
 - **The zero centre's error penalty does not grow as bits drop.** Its RMSE over
@@ -1778,7 +1778,7 @@ and journal recovery runs before the worker's first pass. All levers are in
 the TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`)
 and owned by each namespace's schema. No reassignment or merges yet (M3b).
 
-**Gate runs.** The vector bench grew each namespace from its root
+**Gate runs.** The frozen eval grew each namespace from its root
 (`MINNAL_BENCH_PARTITION=grow`, target 128, splitting after every 256
 documents) and compared it with static k-means fitted on the corpus's floats
 at the same posting count, indexed through the same production path
@@ -1832,7 +1832,7 @@ four flushes per split measured 35.5 s and 34.9 s, the same within noise, so
 the journal keeps its WAL-backed writes. In production this runs in the
 background beside an embedding call that costs far more per document.
 
-The gate runs above had a bench fault: the vector bench opened its database
+The gate runs above had a bench fault: the frozen eval opened its database
 without the background workers, so LSM compaction never ran. Every split's
 flush left its level-0 files in place, reads slowed as they piled up (25,000
 files in the meta namespace by mid-run), and indexing measured 300–370 s. The
@@ -2023,7 +2023,7 @@ nDCG@10 moves by at most 0.0004 across eight model–dataset pairs
 
 M3's smaller, namespace-specific postings bring centres closer to the data, and
 possibly to the queries that probe them. Once M3 is in, rerun
-`vector_bench_pass1_study`, which prints `‖q − c‖` and both forms side by side.
+`eval_pass1_study`, which prints `‖q − c‖` and both forms side by side.
 Adopt the paper's form only if `‖q − c‖` falls well below 1 and nDCG@10 improves.
 It costs one stored float per chunk (`⟨r,c⟩`, with `⟨ō,c⟩` folded in as the
 library does, so search needs no extra per-cluster work) and a re-encode, which
@@ -2366,10 +2366,10 @@ centres:
 - the criterion bench runs k-means on its documents;
 - the study tools take `MINNAL_BENCH_CENTROIDS` or fit 256 centres on the
   dataset's chunks;
-- `beir_eval` requires a centroid file (`MINNAL_BEIR_CENTROIDS`).
+- `eval_beir` requires a centroid file (`MINNAL_BEIR_CENTROIDS`).
 
 `real_recall_vs_nprobes`, a recall harness for fixed probe counts, was deleted:
-it depended on the bundled file, and the vector bench (M0) replaced it.
+it depended on the bundled file, and the frozen eval (M0) replaced it.
 Namespaces seeded from a file before M3 still load (`PostingOrigin::Seed`
 decodes), and a rebuild moves them onto their own centres.
 
@@ -2571,4 +2571,4 @@ so it is not planned.
 | 12 | Where M3's levers live (2026-10-10) | Defaults in the server TOML (`[semantic_search.maintenance]`, `[semantic_search.search_defaults]`), written into a namespace's schema when it enables semantic search and owned by the namespace from then on; `threads` is engine-only (*Levers and configuration*) |
 | 13 | Default probe budget (2026-10-10; revised 2026-10-18) | 42,000 entries, absolute. On FiQA with the grown partition nDCG stops rising at every cutoff at about 35,000 entries; 42,000 is that plus 20%. 70,000 (M2d) read 62% of FiQA, 12.2 ms against 6.7 ms at 34,600, for the same nDCG to four decimals. Measured at 42,000: FiQA 7.8 ms p50, nDCG within 0.0007 of a full read at every cutoff; SciFact still read in full, unchanged. The scaled form `clamp(fraction · E, floor, ceiling)` stays available and unset |
 | 14 | Collecting unused centres (2026-10-17) | Deferred: costs no longer depend on the centre count, and in a rarely updated store almost every centre stays in use. Build it (during a rebuild, *Known limitation: centres are never collected*) when a long-lived store with heavy update or delete churn needs it |
-| 15 | Probe by posting count (2026-10-19) | Replaces decision 13 and the entry budget: each query reads its `max_probes` nearest postings (default 256), every posting of a namespace with fewer; `min_probes` (default 1) is a floor for overrides. No budget, no scaled fraction: an entry count was not an intuitive knob, and splits and merges keep postings between 22 and 256 chunks, so a posting count bounds the read. Default 256: on FiQA (979 / 952 postings, gemma / qwen) the smallest count within 0.001 nDCG of a full read (768 probes) at every cutoff @10–@100 on both models (gemma ≤ 0.0005, qwen ≤ 0.0006 behind), 31k entries (28%), p50 6.4 ms against 7.8 ms for the 42,000-entry budget; 192 was up to 0.0024 behind on gemma. SciFact (133 / 139 postings) is read in full. Vector bench 2026-10-19, `work/bench/results/probes-{gemma,qwen}` |
+| 15 | Probe by posting count (2026-10-19) | Replaces decision 13 and the entry budget: each query reads its `max_probes` nearest postings (default 256), every posting of a namespace with fewer; `min_probes` (default 1) is a floor for overrides. No budget, no scaled fraction: an entry count was not an intuitive knob, and splits and merges keep postings between 22 and 256 chunks, so a posting count bounds the read. Default 256: on FiQA (979 / 952 postings, gemma / qwen) the smallest count within 0.001 nDCG of a full read (768 probes) at every cutoff @10–@100 on both models (gemma ≤ 0.0005, qwen ≤ 0.0006 behind), 31k entries (28%), p50 6.4 ms against 7.8 ms for the 42,000-entry budget; 192 was up to 0.0024 behind on gemma. SciFact (133 / 139 postings) is read in full. Frozen eval 2026-10-19, `work/bench/results/probes-{gemma,qwen}` |

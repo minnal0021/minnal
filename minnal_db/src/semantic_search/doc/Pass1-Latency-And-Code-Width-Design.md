@@ -320,7 +320,7 @@ encoded against when moved, and maintenance still makes no embedding calls.
 
 ### Part B as built, and what it measured
 
-Measured with `vector_bench` (frozen embeddings through the production write
+Measured with `eval_frozen` (frozen embeddings through the production write
 path and search; partition grown from one posting with maintenance running)
 on SciFact (5,183 documents, 22,787 chunks) and FiQA (57,600 documents,
 172,998 chunks), with gemma and qwen. Grown runs twice, alternating widths;
@@ -385,7 +385,7 @@ What the numbers say:
 - **Rebuilds are faster** at 2 and 4 bits: k-means converges in fewer
   iterations on finer reconstructions.
 
-A separate sweep on the frozen embeddings (`vector_bench_pass1_width`: fixed
+A separate sweep on the frozen embeddings (`eval_pass1_width`: fixed
 partition, every probe count and a first-pass cut of 1,000 or 300) agrees: the
 same probe count reaches a full read's nDCG at every width; at a cut of 300
 the 2-bit code stayed within 0.001 nDCG of a full read on FiQA qwen, where 1
@@ -496,8 +496,8 @@ budget cannot hold the probed postings of a real workload.
 - **Latency**: the copy at `work/search_quality/pass1_db`, the scratch server
   on port 8090, `work/search_quality/er_probes/load.py` at 256 / 1,024 / all
   probes, p50 and p95, plus the phase-timing patch for the breakdown. Also
-  `vector_bench` on SciFact and FiQA for stores of ordinary text.
-- **Quality (Part B, and A4 if it changes any order)**: `vector_bench` on
+  `eval_frozen` on SciFact and FiQA for stores of ordinary text.
+- **Quality (Part B, and A4 if it changes any order)**: `eval_frozen` on
   SciFact and FiQA with gemma and qwen, nDCG at 10, 20, 30, 40, 50 and 100,
   paired per query, plus Pass-1 recall, ANN recall and chunk placement
   (`MINNAL_BENCH_PASS1_BITS`, the placement table in its report).

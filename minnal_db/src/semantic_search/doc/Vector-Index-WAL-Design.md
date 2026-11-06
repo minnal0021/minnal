@@ -485,7 +485,7 @@ main WAL's tests untouched and passing.
 4. **Switch the worker:** logged writes in `upsert_vectors`, `sync` in
    `make_vector_writes_durable`. Crash audits and the five mutation checks.
 5. **Measure:** the M5 quick check before and after (flushes/s, fsyncs/s, write
-   p99, sustainable rate), the vector bench (indexing time, recall and nDCG at
+   p99, sustainable rate), the frozen eval (indexing time, recall and nDCG at
    @10–@100 must be identical), and a restart after a crash mid-ingest.
 6. **Partition maintenance:** the drain and reassignment copies (`copy_into_batch`)
    on the vector index WAL, and their three barriers (drain, rebuild,
@@ -577,9 +577,9 @@ search's prefix scans read more from memory. The cold-query step is not
 comparable across builds here: it runs at each build's highest passing rate,
 and after-1's ran with an embedding backlog.
 
-### 9c. Measured: the vector bench
+### 9c. Measured: the frozen eval
 
-**Setup.** The vector bench (`semantic_search::vector_bench`) indexes a frozen
+**Setup.** The frozen eval (`semantic_search::eval`) indexes a frozen
 set of gemma embeddings with background workers running, growing the partition
 from one posting (target 128), then searches. SciFact (5,183 documents) and
 FiQA (57,600), corpus order, three latency passes. **Before**: a test binary

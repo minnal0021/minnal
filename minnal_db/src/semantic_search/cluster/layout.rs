@@ -713,7 +713,7 @@ impl NamespaceIvf {
 }
 
 /// What a namespace's maintenance has done since its partition was loaded
-/// (design doc M3b). Reported by partition health and the vector bench.
+/// (design doc M3b). Reported by partition health and the frozen eval.
 #[derive(Debug, Default)]
 pub struct MaintenanceCounters {
     /// Postings split.

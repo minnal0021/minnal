@@ -6,7 +6,7 @@ splits documents.
 
 *Run 2026-09-25. Embedding model `google/embeddinggemma-300m` through the PyTorch
 embedding service (full pipeline, bfloat16); gemma centroids regenerated for that
-service (ELI5, k = 256). Harness: [`metrics/beir_eval.rs`](../metrics/beir_eval.rs).*
+service (ELI5, k = 256). Harness: [`eval/beir.rs`](../eval/beir.rs).*
 
 ## Decision
 
@@ -132,7 +132,7 @@ most of them.
 service/scripts/fetch_beir.sh scifact nfcorpus arguana
 cd minnal_db
 MINNAL_EMBED_URL=http://localhost:8001 MINNAL_BEIR_DATASET=scifact MINNAL_BEIR_DB=$PWD/../work/beir/db_scifact \
-  cargo test -p minnal_db --all-features --release --lib beir_eval -- --ignored --nocapture
+  cargo test -p minnal_db --all-features --release --lib eval_beir -- --ignored --nocapture
 ```
 
 The harness evaluates the production pipeline, which embeds queries whole. The

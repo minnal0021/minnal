@@ -7,7 +7,7 @@
 //! footprint, indexing throughput and latency over a sweep of probe counts
 //! (postings each query reads).
 //! Results go to `{bench_root}/results/{label}/{dataset}-{order}.{json,md}`;
-//! `vector_bench_compare` compares two result files with paired per-query deltas.
+//! `eval_compare` compares two result files with paired per-query deltas.
 //!
 //! The first run for a dataset dumps its embeddings through the embedding service
 //! (see [`frozen`]); later runs never call it. Run from the crate root
@@ -15,10 +15,10 @@
 //!
 //! ```sh
 //! MINNAL_BENCH_DATASET=scifact MINNAL_BENCH_LABEL=m0-baseline \
-//!   cargo test -p minnal_db --all-features --release --lib vector_bench -- --ignored --nocapture --test-threads=1
+//!   cargo test -p minnal_db --all-features --release --lib eval_frozen -- --ignored --nocapture --test-threads=1
 //! MINNAL_BENCH_BASE=../work/bench/results/m0-baseline/scifact-corpus.json \
 //! MINNAL_BENCH_NEW=../work/bench/results/m1/scifact-corpus.json \
-//!   cargo test -p minnal_db --all-features --release --lib vector_bench_compare -- --ignored --nocapture
+//!   cargo test -p minnal_db --all-features --release --lib eval_compare -- --ignored --nocapture
 //! ```
 //!
 //! Env knobs (all optional): `MINNAL_BENCH_DATASET` (`scifact`),
@@ -42,12 +42,6 @@
 //! namespace's Pass-1 code width; the report adds where maintenance placed the
 //! chunks (*Placement*), after growing and, with a rebuild, after it.
 
-mod code_width;
-mod exact;
-mod frozen;
-mod pass1_width;
-mod study;
-
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -57,7 +51,9 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
+use super::beir::{env_or, ndcg_at, read_qrels, score};
+use super::exact::{self, FINAL_K, GroundTruth, dot};
+use super::frozen::{self, Frozen};
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, find_closest_cluster_id, read_clusters_from_file};
 use crate::semantic_search::index::distance_estimator::{DistanceEstimator, MultiBitQuanDotProductEstimator, Pass1Estimator};
@@ -67,8 +63,6 @@ use crate::semantic_search::service::{DEFAULT_PROBE, SemanticSearchConfig, index
 use crate::semantic_search::{IvfLayout, ProbeSettings, select_probes};
 use crate::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_meta_ns, sparse_vectors_ns, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
-use exact::{FINAL_K, GroundTruth, dot};
-use frozen::Frozen;
 
 const NS: &str = "bench";
 /// Documents indexed concurrently (quantisation + upsert).
@@ -89,7 +83,7 @@ const ESTIMATOR_QUERIES: usize = 100;
 const ESTIMATOR_TOP: usize = 25;
 const ESTIMATOR_RANDOM: usize = 25;
 const SEED: u64 = 42;
-/// nDCG cutoffs reported beside nDCG@10 (and gated on by `vector_bench_compare`).
+/// nDCG cutoffs reported beside nDCG@10 (and gated on by `eval_compare`).
 const NDCG_CUTOFFS: [usize; 6] = [10, 20, 30, 40, 50, 100];
 /// The neighbourhoods placement is reported at.
 const PLACEMENT_K: [usize; 4] = [1, 2, 4, 16];
@@ -145,7 +139,7 @@ async fn placement(db: &AsyncDb, ivf: &crate::semantic_search::NamespaceIvf, fro
     }
 }
 
-// ── Result types (serialised; `vector_bench_compare` reads them back) ──────────
+// ── Result types (serialised; `eval_compare` reads them back) ──────────
 
 #[derive(Serialize, Deserialize, Default, Clone, Copy)]
 struct ErrorStats {
@@ -303,7 +297,7 @@ struct BenchResult {
 /// a static fit from `fit_static.py`), or else k-means on the dataset's own
 /// chunk vectors at [`STUDY_CENTRES`] centres. No centroid file ships with
 /// minnal (design doc M4).
-fn study_centroids(frozen: &Frozen) -> ClusterIndex {
+pub(super) fn study_centroids(frozen: &Frozen) -> ClusterIndex {
     if let Ok(path) = std::env::var("MINNAL_BENCH_CENTROIDS") {
         let raw = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
         return ClusterIndex::from_clusters(raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect());
@@ -328,7 +322,7 @@ fn study_centroids(frozen: &Frozen) -> ClusterIndex {
 /// Centres [`study_centroids`] fits when given no file.
 const STUDY_CENTRES: usize = 256;
 
-fn splitmix(state: &mut u64) -> u64 {
+pub(super) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -344,7 +338,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[i]
 }
 
-fn git_describe() -> String {
+pub(super) fn git_describe() -> String {
     let run = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
@@ -583,7 +577,7 @@ impl Setting {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn vector_bench() {
+async fn eval_frozen() {
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
     let label = env_or("MINNAL_BENCH_LABEL", "run");
     let order = env_or("MINNAL_BENCH_ORDER", "corpus");
@@ -600,7 +594,7 @@ async fn vector_bench() {
     });
     let dataset_dir = beir_root.join(&dataset);
     if !dataset_dir.join("corpus.jsonl").exists() {
-        eprintln!("SKIP vector_bench: {} missing", dataset_dir.join("corpus.jsonl").display());
+        eprintln!("SKIP eval_frozen: {} missing", dataset_dir.join("corpus.jsonl").display());
         return;
     }
 
@@ -625,7 +619,7 @@ async fn vector_bench() {
     let gt = exact::load_or_compute(&frozen_dir, &frozen);
     let qrels = read_qrels(&dataset_dir.join("qrels").join(format!("{split}.tsv")));
     eprintln!(
-        "\n=== vector bench: {dataset} ({split}), model {model}, order {order}, label {label} ===\n  {} docs, {} chunks, {} queries",
+        "\n=== frozen eval: {dataset} ({split}), model {model}, order {order}, label {label} ===\n  {} docs, {} chunks, {} queries",
         frozen.n_docs(),
         frozen.n_chunks(),
         frozen.n_queries()
@@ -1034,7 +1028,7 @@ fn render(r: &BenchResult) -> String {
     let mut md = String::new();
     let _ = writeln!(
         md,
-        "# Vector bench — {} ({}), {} order, label `{}`\n",
+        "# Frozen eval — {} ({}), {} order, label `{}`\n",
         r.dataset, r.model, r.order, r.label
     );
     let _ = writeln!(
@@ -1151,7 +1145,7 @@ fn render(r: &BenchResult) -> String {
 /// Sequential, one entry at a time, so the difference is the flushes alone.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn vector_bench_worker_completion() {
+async fn eval_worker_completion() {
     use crate::vector_kv::{complete_embed, enqueue_embed, get_queue_entry, make_vector_writes_durable};
     const BATCH: usize = 256; // the worker's COMPLETION_BATCH
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
@@ -1160,7 +1154,7 @@ async fn vector_bench_worker_completion() {
     let frozen_dir = bench_root.join(&dataset).join(&model);
     assert!(
         frozen_dir.join("manifest.json").exists(),
-        "run vector_bench for {dataset} first to dump its embeddings"
+        "run eval_frozen for {dataset} first to dump its embeddings"
     );
     let config = SemanticSearchConfig {
         model_name: model.clone(),
@@ -1238,14 +1232,14 @@ async fn vector_bench_worker_completion() {
 /// Read-only over the frozen embeddings; `MINNAL_BENCH_DATASET` picks the dataset.
 #[test]
 #[ignore]
-fn vector_bench_residual_spread() {
+fn eval_residual_spread() {
     const SAMPLE: usize = 5000;
     const PAIRS: usize = 2000;
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
     let model = env_or("MINNAL_BENCH_MODEL", "gemma");
     let bench_root = PathBuf::from(env_or("MINNAL_BENCH_ROOT", "../work/bench"));
     let frozen_dir = bench_root.join(&dataset).join(&model);
-    assert!(frozen_dir.join("manifest.json").exists(), "run vector_bench for {dataset} first");
+    assert!(frozen_dir.join("manifest.json").exists(), "run eval_frozen for {dataset} first");
     let config = SemanticSearchConfig::default();
     let dataset_dir = PathBuf::from(env_or("MINNAL_BEIR_ROOT", "../work/beir")).join(&dataset);
     let frozen = tokio::runtime::Runtime::new().unwrap().block_on(frozen::load_or_dump(
@@ -1348,7 +1342,7 @@ fn vector_bench_residual_spread() {
 // ── Comparison ───────────────────────────────────────────────────────────────
 
 /// Mean of `new − base` over queries, with a paired bootstrap 95% interval.
-fn paired_delta(base: &[f64], new: &[f64]) -> (f64, f64, f64) {
+pub(super) fn paired_delta(base: &[f64], new: &[f64]) -> (f64, f64, f64) {
     let d: Vec<f64> = base.iter().zip(new).map(|(b, n)| n - b).collect();
     let n = d.len();
     let mean = d.iter().sum::<f64>() / n as f64;
@@ -1452,9 +1446,9 @@ fn gate_pair(md: &mut String, gate: &mut Vec<(String, bool)>, b: &Setting, n: &S
 
 #[test]
 #[ignore]
-fn vector_bench_compare() {
+fn eval_compare() {
     let load = |var: &str| -> BenchResult {
-        let path = std::env::var(var).unwrap_or_else(|_| panic!("set {var} to a vector_bench result .json"));
+        let path = std::env::var(var).unwrap_or_else(|_| panic!("set {var} to a eval_frozen result .json"));
         serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))).unwrap()
     };
     let (base, new) = (load("MINNAL_BENCH_BASE"), load("MINNAL_BENCH_NEW"));

@@ -17,7 +17,7 @@
 //!
 //! ```sh
 //! MINNAL_BENCH_DATASET=fiqa MINNAL_BENCH_MODEL=qwen cargo test -p minnal_db --all-features \
-//!   --release --lib vector_bench_code_width -- --ignored --nocapture
+//!   --release --lib eval_code_width -- --ignored --nocapture
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -26,10 +26,10 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use super::super::metrics::beir_eval::{env_or, ndcg_at, read_qrels, score};
+use super::beir::{env_or, ndcg_at, read_qrels, score};
 use super::exact::{self, dot};
 use super::frozen;
-use super::paired_delta;
+use super::frozen_eval::paired_delta;
 use crate::semantic_search::cluster::Cluster;
 use crate::semantic_search::index::distance_estimator::{MultiBitQuanDotProductEstimator, SingleBitQuanDotProductEstimator};
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
@@ -104,7 +104,7 @@ fn multi_bit_score(vi: &VectorIndex, q: &[f32], rq: &[f32], centroid: &[f32], bi
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn vector_bench_code_width() {
+async fn eval_code_width() {
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
     let model = env_or("MINNAL_BENCH_MODEL", "gemma");
     let label = env_or("MINNAL_BENCH_LABEL", "code-width");
@@ -112,7 +112,7 @@ async fn vector_bench_code_width() {
     let split = env_or("MINNAL_BEIR_SPLIT", "test");
     let dataset_dir = PathBuf::from(env_or("MINNAL_BEIR_ROOT", "../work/beir")).join(&dataset);
     let frozen_dir = bench_root.join(&dataset).join(&model);
-    assert!(frozen_dir.join("manifest.json").exists(), "run vector_bench for {dataset}/{model} first");
+    assert!(frozen_dir.join("manifest.json").exists(), "run eval_frozen for {dataset}/{model} first");
     let config = SemanticSearchConfig {
         model_name: model.clone(),
         ..SemanticSearchConfig::default()
@@ -133,7 +133,7 @@ async fn vector_bench_code_width() {
     .await;
     let gt = exact::load_or_compute(&frozen_dir, &frozen);
     let qrels = read_qrels(&dataset_dir.join("qrels").join(format!("{split}.tsv")));
-    let index = super::study_centroids(&frozen);
+    let index = super::frozen_eval::study_centroids(&frozen);
     let (nd, nq, dim) = (frozen.n_docs(), frozen.n_queries(), frozen.dim());
     eprintln!(
         "\n=== code width: {dataset} ({model}), {nd} docs, {} chunks, {nq} queries ===",

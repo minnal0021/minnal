@@ -21,7 +21,7 @@
 //! ```sh
 //! service/scripts/fetch_beir.sh scifact nfcorpus arguana
 //! MINNAL_EMBED_URL=http://localhost:8001 MINNAL_BEIR_DATASET=scifact MINNAL_BEIR_DB=$PWD/../work/beir/db_scifact \
-//!   cargo test -p minnal_db --all-features --release --lib beir_eval -- --ignored --nocapture
+//!   cargo test -p minnal_db --all-features --release --lib eval_beir -- --ignored --nocapture
 //! ```
 //!
 //! Env knobs (all optional): `MINNAL_BEIR_DATASET` (default `scifact`),
@@ -54,11 +54,11 @@ const RECALL_K: usize = 100;
 const NPROBES: [usize; 2] = [64, 256];
 const FIRST_PASS: [usize; 2] = [1000, 100];
 
-pub(in crate::semantic_search) fn env_or(key: &str, default: &str) -> String {
+pub(super) fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-pub(in crate::semantic_search) fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
+pub(super) fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     std::io::BufReader::new(f)
         .lines()
@@ -68,12 +68,12 @@ pub(in crate::semantic_search) fn read_jsonl(path: &Path) -> Vec<serde_json::Val
         .collect()
 }
 
-pub(in crate::semantic_search) fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+pub(super) fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim()
 }
 
 /// `query-id → (corpus-id → graded relevance)`, keeping only positive judgements.
-pub(in crate::semantic_search) fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
+pub(super) fn read_qrels(path: &Path) -> HashMap<String, HashMap<String, u32>> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut qrels: HashMap<String, HashMap<String, u32>> = HashMap::new();
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok).skip(1) {
@@ -90,16 +90,16 @@ pub(in crate::semantic_search) fn read_qrels(path: &Path) -> HashMap<String, Has
 }
 
 #[derive(Default, Clone, Copy)]
-pub(in crate::semantic_search) struct Metrics {
-    pub(in crate::semantic_search) ndcg: f64,
-    pub(in crate::semantic_search) mrr: f64,
-    pub(in crate::semantic_search) recall: f64,
-    pub(in crate::semantic_search) cand_recall: f64,
+pub(super) struct Metrics {
+    pub(super) ndcg: f64,
+    pub(super) mrr: f64,
+    pub(super) recall: f64,
+    pub(super) cand_recall: f64,
 }
 
 /// nDCG at cutoff `k` (gain = graded relevance, `log2(rank + 1)` discount, ideal
 /// over every judged-relevant document), as [`score`] computes it for k = 10.
-pub(in crate::semantic_search) fn ndcg_at(ranked: &[&str], rels: &HashMap<String, u32>, k: usize) -> f64 {
+pub(super) fn ndcg_at(ranked: &[&str], rels: &HashMap<String, u32>, k: usize) -> f64 {
     let dcg: f64 = ranked
         .iter()
         .take(k)
@@ -113,7 +113,7 @@ pub(in crate::semantic_search) fn ndcg_at(ranked: &[&str], rels: &HashMap<String
 }
 
 /// Score one query: `ranked` is the dense-ordered candidate list (corpus ids).
-pub(in crate::semantic_search) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
+pub(super) fn score(ranked: &[&str], rels: &HashMap<String, u32>) -> Metrics {
     let dcg: f64 = ranked
         .iter()
         .take(NDCG_K)
@@ -147,7 +147,7 @@ fn doc_u64(id: &[u8]) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn beir_eval() {
+async fn eval_beir() {
     let dataset = env_or("MINNAL_BEIR_DATASET", "scifact");
     let root = PathBuf::from(env_or("MINNAL_BEIR_ROOT", "../work/beir"));
     let split = env_or("MINNAL_BEIR_SPLIT", "test");
@@ -157,7 +157,7 @@ async fn beir_eval() {
     let dir = root.join(&dataset);
     if !dir.join("corpus.jsonl").exists() {
         eprintln!(
-            "SKIP beir_eval: {} missing — run service/scripts/fetch_beir.sh {dataset}",
+            "SKIP eval_beir: {} missing — run service/scripts/fetch_beir.sh {dataset}",
             dir.join("corpus.jsonl").display()
         );
         return;

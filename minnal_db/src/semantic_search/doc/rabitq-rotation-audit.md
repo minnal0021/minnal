@@ -13,7 +13,7 @@ the `q − c` comparison, NFCorpus and ArguAna) from two
 models served by llama.cpp: gemma (`embeddinggemma-300m`, Q8) and qwen
 (`Qwen3-Embedding-8B`, Q4_K_M, truncated to 768 dimensions), each with its
 bundled centroids (ELI5, k = 256), at commit `946814b`. Harness:
-[`vector_bench/study.rs`](../vector_bench/study.rs).*
+[`eval/study.rs`](../eval/study.rs).*
 
 ## Verdict
 
@@ -177,7 +177,7 @@ scaled by `√D`. A Haar rotation makes them nearly standard normal.
 | dense Haar | −0.00 | 4.95 |
 
 Four rounds leave heavier tails than Haar on worst-case inputs; eight rounds are
-indistinguishable from Haar. (`vector_bench_rotation_spread`.)
+indistinguishable from Haar. (`eval_rotation_spread`.)
 
 **Whether that matters on real data (E2).** The same Pass-1 search built three
 ways, 64 probes:
@@ -198,7 +198,7 @@ ways, 64 probes:
 | qwen | FiQA | dense Haar | 0.9978 | 0.9741 | 0.8230 | 0.5920 |
 
 The two models differ in how their residuals spread over dimensions, measured
-on 5,000 sampled chunks (`vector_bench_residual_spread`; an even spread puts
+on 5,000 sampled chunks (`eval_residual_spread`; an even spread puts
 10% of the variance in the top 10% of dimensions):
 
 | Model | Dataset | Top 10% of dimensions hold, unrotated → rotated | `⟨ō, o⟩` unrotated → rotated (random: 0.798) |
@@ -220,7 +220,7 @@ of each residual: the estimator is biased and noisier.
 | qwen | FiQA | RMSE 0.0239, bias −0.0035 | RMSE 0.0213, bias −0.0001 |
 
 (Sampled pairs: each query's exact top 25 chunks plus 25 random ones, from
-`vector_bench`.) On qwen, rotating keeps 1.2–1.4 points more of the exact
+`eval_frozen`.) On qwen, rotating keeps 1.2–1.4 points more of the exact
 Pass-1 candidates and 0.6–0.7 points more of the exact top 500. The exact top
 100 and nDCG@10 do not move. FhtKac and dense Haar agree on every row, so
 FhtKac's heavier tails on worst-case inputs (E1) do not show up on real data.
@@ -228,13 +228,13 @@ FhtKac's heavier tails on worst-case inputs (E1) do not show up on real data.
 ## Reproduce
 
 From `minnal_db/`, with frozen embeddings in `work/bench/{dataset}/{model}`
-(the first `vector_bench` run creates them):
+(the first `eval_frozen` run creates them):
 
 ```sh
 MINNAL_BENCH_DATASET=fiqa cargo test -p minnal_db --all-features --release --lib \
-  vector_bench_pass1_study -- --ignored --nocapture        # rows 8–9, 15, E2
+  eval_pass1_study -- --ignored --nocapture        # rows 8–9, 15, E2
 cargo test -p minnal_db --all-features --release --lib \
-  vector_bench_rotation_spread -- --ignored --nocapture    # E1
+  eval_rotation_spread -- --ignored --nocapture    # E1
 cargo test -p minnal_db --all-features --lib best_rescale_factor_matches   # row 12
 ```
 

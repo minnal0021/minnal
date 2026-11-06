@@ -39,7 +39,7 @@ any difference is the scoring objective itself.*
 - **Dense**: a document's score is `⟨q, d⟩` for one embedding `d` of its whole
   text, as Pass 2 computes it.
 - **Two-pass**: MaxSim top 1,000, reranked by dense.
-- **nDCG@10**: the BEIR ranking metric, computed as `beir_eval::score` does
+- **nDCG@10**: the BEIR ranking metric, computed as `beir::score` does
   (gain = graded relevance, `log2(rank + 1)` discount).
 - **Paired comparison**: per query, the difference in nDCG@10 between two
   rankings. The interval is a 10,000-sample bootstrap of the mean difference; p
@@ -67,7 +67,7 @@ qwen).
 
 ArguAna follows the BEIR convention of ignoring the document whose id equals the
 query id: each ArguAna query is itself an argument in the corpus, and would
-otherwise rank first under every objective. The vector bench and the Pass-1
+otherwise rank first under every objective. The frozen eval and the Pass-1
 study do not apply that rule, so their ArguAna nDCG@10 figures are lower (gemma
 0.4701) and are not comparable with this table.
 
@@ -145,7 +145,7 @@ arguments that make up most of the relevant set.
 
 ## Reproduce
 
-The frozen embeddings come from the vector bench (`vector_bench`, which dumps a
+The frozen embeddings come from the frozen eval (`eval_frozen`, which dumps a
 dataset on its first run; `service/scripts/fetch_beir.sh nfcorpus arguana`
 downloads the two extra datasets). The analysis is a standalone Python script
 over those files, kept in the gitignored `work/bench/analysis/`:

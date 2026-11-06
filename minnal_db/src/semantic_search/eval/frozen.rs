@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use super::super::metrics::beir_eval::{read_jsonl, read_qrels, str_field};
+use super::beir::{read_jsonl, read_qrels, str_field};
 use crate::semantic_search::chunking::chunk_document;
 use crate::semantic_search::service::embedding_service::{EmbeddingTarget, embed};
 
@@ -161,7 +161,7 @@ pub(super) async fn load_or_dump(dir: &Path, spec: &DumpSpec<'_>) -> Frozen {
     }
 }
 
-/// `title. text`, as `beir_eval` builds a document body.
+/// `title. text`, as `eval_beir` builds a document body.
 pub(super) fn doc_body(doc: &serde_json::Value) -> String {
     let (title, text) = (str_field(doc, "title"), str_field(doc, "text"));
     if title.is_empty() {

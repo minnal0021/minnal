@@ -71,7 +71,7 @@ pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 /// chunks, about 960 postings, the largest corpus measured) 256 is the smallest
 /// count within 0.001 nDCG of a full read at every cutoff from 10 to 100 on
 /// gemma and qwen; it reads 28% of the entries in 6.4 ms warm (192: up to
-/// 0.0024 behind). SciFact (about 135 postings) is read in full (vector bench,
+/// 0.0024 behind). SciFact (about 135 postings) is read in full (frozen eval,
 /// 2026-10-19).
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
     min_probes: 1,
@@ -244,7 +244,7 @@ pub async fn embed_document_floats(config: &SemanticSearchConfig, text: &str) ->
 /// ([`QuantisationStyle::pass1`]) assigned to its nearest IVF cluster.
 ///
 /// This is everything [`embed_document`] does after the embedding-service call.
-/// It is separate so the vector benchmark can index saved embeddings through the
+/// It is separate so the frozen eval can index saved embeddings through the
 /// exact production path without calling the service.
 pub fn index_embeddings<L: IvfLayout + ?Sized>(
     config: &SemanticSearchConfig,
