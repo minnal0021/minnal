@@ -40,12 +40,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::indexing::index_texts;
 use crate::AsyncDb;
 use crate::semantic_search::ClusterIndex;
 use crate::semantic_search::cluster::{Cluster, read_clusters_from_file};
 use crate::semantic_search::service::{QueryEmbeddings, SemanticSearchConfig, embed_query, search};
 use crate::semantic_search::vector_kv::DbVectorStore;
-use crate::semantic_search::vector_kv::eval_indexing::index_texts;
 
 const NS: &str = "beir";
 const INDEX_CONCURRENCY: usize = 32;

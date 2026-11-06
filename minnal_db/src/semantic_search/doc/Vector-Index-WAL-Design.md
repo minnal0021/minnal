@@ -102,7 +102,7 @@ WAL-backed delete, durable at once. If the process dies after the completion but
 before the vectors are flushed, the document is indexed nowhere and nothing
 re-queues it. So the worker completes an entry only after a **barrier**:
 `make_vector_writes_durable` flushes the three vector namespaces
-(`vector_kv/mod.rs`), once per batch of up to 256 written entries and once at the end
+(`vector_kv/queue.rs`), once per batch of up to 256 written entries and once at the end
 of every pass.
 
 Under steady traffic a pass holds one or two documents, so the barrier flushes

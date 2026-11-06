@@ -519,7 +519,7 @@ Skipping documents with a write in progress is what makes a mismatch mean "a wri
 
 **`InFlightWrites` is not a lock.** Nothing waits on it: a write adds its document (a 64-bit hash of store and key, with a count for concurrent writes) and removes it when the write returns, errors or is cancelled. The worker only looks. Reads never touch it, and stores without semantic search never use it. It holds about 16 bytes per write in progress, and nothing once writes finish.
 
-Crash tests: `vector_kv::crash_audit_tests` crashes before every write of an upsert, a delete, a re-embed racing a delete, and a stale re-index entry, under five flush patterns, then restarts with the worker alone and checks the vectors match the store. With the check disabled, every scenario fails.
+Crash tests: `vector_kv::tests::crash_audit` crashes before every write of an upsert, a delete, a re-embed racing a delete, and a stale re-index entry, under five flush patterns, then restarts with the worker alone and checks the vectors match the store. With the check disabled, every scenario fails.
 
 **Corrupt vectors.** A vector entry whose stored bytes no longer decode is skipped by search and counted (`GET /admin/indices/vector/corruption-metrics`). To repair it, re-index the store (`POST /admin/indices/{ns}/vector/reindex-all`), which re-embeds every document.
 
@@ -559,7 +559,7 @@ Search settings can be changed later (`update_vector_search` amendment) and over
 
 ### Profiling search latency
 
-`real_kv_search_profile` in `minnal_db/src/semantic_search/vector_kv/mod.rs` (an `#[ignore]`d test)
+`real_kv_search_profile` in `minnal_db/src/semantic_search/vector_kv/tests/real_kv_profile.rs` (an `#[ignore]`d test)
 runs the real two-pass `search()` over a real `minnal_db`-backed store (synthetic
 vectors and centres, but real LSM + value-log `pread` I/O) and phase-times
 posting choice, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the scoring
@@ -595,8 +595,8 @@ measured on frozen BEIR embeddings by the frozen eval
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/semantic_search/bench_distance_estimation.rs` |
-| Vector KV storage (three namespaces) + query cache | `minnal_db/src/semantic_search/vector_kv/mod.rs` |
-| Latency profiling harness (see §8) | `minnal_db/src/semantic_search/vector_kv/mod.rs` (ignored test) |
+| Vector KV storage (three namespaces) + query cache | `minnal_db/src/semantic_search/vector_kv/` |
+| Latency profiling harness (see §8) | `minnal_db/src/semantic_search/vector_kv/tests/real_kv_profile.rs` (ignored test) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
 | Document store | `minnal_db/src/doc_store/store/` |
 

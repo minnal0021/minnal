@@ -9,7 +9,8 @@
 //! - [`frozen_eval`]: `eval_frozen` and `eval_compare`, the main evaluation, on
 //!   saved embeddings; also `eval_worker_completion` and `eval_residual_spread`.
 //! - [`frozen`]: dumps and loads the saved embeddings. [`exact`]: the exact
-//!   ranking they are compared against.
+//!   ranking they are compared against. [`indexing`]: embeds and indexes a
+//!   corpus through the live service, for `eval_beir`.
 //! - [`code_width`], [`pass1_width`], [`study`]: focused experiments on the
 //!   saved embeddings (`eval_code_width`, `eval_pass1_width`, `eval_pass1_study`,
 //!   `eval_rotation_spread`).
@@ -21,5 +22,6 @@ mod code_width;
 mod exact;
 mod frozen;
 mod frozen_eval;
+mod indexing;
 mod pass1_width;
 mod study;

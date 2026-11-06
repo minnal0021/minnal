@@ -1431,7 +1431,7 @@ agreement first, as any new dependency does.
 ## FR-012 — Make a skipped `upsert_vectors` visible to its caller
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/semantic_search/vector_kv/mod.rs`, `src/doc_store/vec_index_worker.rs`)
+**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/doc_store/vec_index_worker.rs`)
 **Severity:** Low — affects direct users of `vector_kv`; the document store creates
 the namespaces itself
 **Source:** Review of store and vector-index lifecycle races.
@@ -1631,7 +1631,7 @@ sites account for 192 of the 222 positions.
 | `a_split_survives_a_crash_before_any_write` | 1-bit | 104 | 416 |
 
 Positions include the final run, where no crash fires. The six
-`vector_kv::crash_audit_tests` stay as they are: about 50 to 105 cases each, 1 to 2.5 s
+`vector_kv::tests::crash_audit` stay as they are: about 50 to 105 cases each, 1 to 2.5 s
 each on tmpfs.
 
 ### Which cases to keep
