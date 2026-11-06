@@ -1,18 +1,17 @@
 pub mod codec;
 pub mod container;
-pub mod container_store;
+pub(crate) mod container_map;
 pub mod shared;
 pub mod simd_support;
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::path::Path;
 
 use crate::field_index::bitmap::container::Container;
 use crate::field_index::bitmap::container::array::ARRAY_TO_BITSET_THRESHOLD;
 use crate::field_index::bitmap::container::array::ArrayContainer;
 use crate::field_index::bitmap::container::bitset::BitsetContainer;
-use crate::field_index::bitmap::container_store::ContainerStore;
+use crate::field_index::bitmap::container_map::ContainerMap;
 
 /// Upper bound on the number of 16-bit high-key blocks (containers) a single
 /// [`RoaringBitmap::flip`] may span. Complementing a range materialises one
@@ -37,44 +36,22 @@ pub fn compose(high: u128, low: u16) -> u128 {
 
 /// A Roaring Bitmap supporting u128 keys.
 ///
-/// Transient bitmaps — [`RoaringBitmap::new`] and every constructor or set
-/// operation that does not take a path — keep their containers on the heap and
-/// change them in place, so memory is the bitmap's real size. Persistent
-/// bitmaps ([`RoaringBitmap::create`] / [`RoaringBitmap::open`]) live in a
-/// two-file memory-mapped store (a hash table of container keys and an
-/// append-only region of serialised [`Container`]s). See `container_store`.
+/// A bitmap lives on the heap and changes its containers in place, so memory is
+/// its real size. Field indexes persist theirs through
+/// [`BlobStore`](crate::field_index::blob_store), a container at a time.
 ///
 /// `cardinality()` is O(1) — the total bit count is kept current on every
 /// insert/remove/clear.
 pub struct RoaringBitmap {
-    pub(crate) store: ContainerStore,
+    pub(crate) containers: ContainerMap,
 }
 
 impl RoaringBitmap {
-    /// Create a new empty transient (heap-backed) bitmap.
+    /// Create a new empty bitmap.
     pub fn new() -> Self {
         Self {
-            store: ContainerStore::new_anon(),
+            containers: ContainerMap::new(),
         }
-    }
-
-    /// Create a new empty bitmap backed by files under `dir`.
-    pub fn create(dir: &Path) -> std::io::Result<Self> {
-        Ok(Self {
-            store: ContainerStore::create(dir)?,
-        })
-    }
-
-    /// Open an existing file-backed bitmap from `dir`.
-    pub fn open(dir: &Path) -> std::io::Result<Self> {
-        Ok(Self {
-            store: ContainerStore::open(dir)?,
-        })
-    }
-
-    /// Flush the underlying mmaps to disk (no-op for transient bitmaps).
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.store.flush()
     }
 
     // ── Mutation ─────────────────────────────────────────────────────
@@ -82,69 +59,69 @@ impl RoaringBitmap {
     /// Insert a value. Returns true if the value was not already present.
     pub fn insert(&mut self, value: u128) -> bool {
         let (high, low) = decompose(value);
-        self.store.modify(high, true, |c| c.insert(low))
+        self.containers.modify(high, true, |c| c.insert(low))
     }
 
     /// Remove a value. Returns true if the value was present.
     pub fn remove(&mut self, value: u128) -> bool {
         let (high, low) = decompose(value);
-        self.store.modify(high, false, |c| c.remove(low))
+        self.containers.modify(high, false, |c| c.remove(low))
     }
 
     /// Remove all values.
     pub fn clear(&mut self) {
-        self.store.clear();
+        self.containers.clear();
     }
 
     // ── Query ────────────────────────────────────────────────────────
 
     pub fn contains(&self, value: u128) -> bool {
         let (high, low) = decompose(value);
-        self.store.with_container(high, |c| c.contains(low)).unwrap_or(false)
+        self.containers.with_container(high, |c| c.contains(low)).unwrap_or(false)
     }
 
     /// O(1) — returns the cached count.
     pub fn cardinality(&self) -> usize {
-        self.store.cardinality()
+        self.containers.cardinality()
     }
 
     pub fn len(&self) -> usize {
-        self.store.cardinality()
+        self.containers.cardinality()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.store.cardinality() == 0
+        self.containers.cardinality() == 0
     }
 
     pub fn min(&self) -> Option<u128> {
-        let keys = self.store.sorted_keys();
+        let keys = self.containers.sorted_keys();
         keys.first()
-            .and_then(|&high| self.store.with_container(high, |c| c.min()).flatten().map(|low| compose(high, low)))
+            .and_then(|&high| self.containers.with_container(high, |c| c.min()).flatten().map(|low| compose(high, low)))
     }
 
     pub fn max(&self) -> Option<u128> {
-        let keys = self.store.sorted_keys();
+        let keys = self.containers.sorted_keys();
         keys.last()
-            .and_then(|&high| self.store.with_container(high, |c| c.max()).flatten().map(|low| compose(high, low)))
+            .and_then(|&high| self.containers.with_container(high, |c| c.max()).flatten().map(|low| compose(high, low)))
     }
 
     /// Number of containers (useful for diagnostics).
     pub fn num_containers(&self) -> usize {
-        self.store.count()
+        self.containers.count()
     }
 
     /// Heap bytes a transient bitmap holds (container buffers plus a fixed
-    /// per-container cost). O(1). Zero for a file-backed bitmap.
+    /// per-container cost). O(1).
     pub fn heap_bytes(&self) -> usize {
-        self.store.heap_bytes()
+        self.containers.heap_bytes()
     }
 
     // ── Set operations (return new bitmap) ──────────────────────────
 
     /// AND: intersection of two bitmaps.
     pub fn and(&self, other: &Self) -> Self {
-        let a = self.store.sorted_entries();
-        let b = other.store.sorted_entries();
+        let a = self.containers.sorted_entries();
+        let b = other.containers.sorted_entries();
         let mut result = Self::new();
         let mut ai = a.iter().peekable();
         let mut bi = b.iter().peekable();
@@ -164,7 +141,7 @@ impl RoaringBitmap {
                         let (_, bv) = bi.next().unwrap();
                         let c = av.and(bv);
                         if !c.is_empty() {
-                            result.store.upsert(ak, &c);
+                            result.containers.upsert(ak, &c);
                         }
                     }
                 },
@@ -176,8 +153,8 @@ impl RoaringBitmap {
 
     /// OR: union of two bitmaps.
     pub fn or(&self, other: &Self) -> Self {
-        let a = self.store.sorted_entries();
-        let b = other.store.sorted_entries();
+        let a = self.containers.sorted_entries();
+        let b = other.containers.sorted_entries();
         let mut result = Self::new();
         let mut ai = a.iter().peekable();
         let mut bi = b.iter().peekable();
@@ -188,28 +165,28 @@ impl RoaringBitmap {
                 (Some(ak), Some(bk)) => match ak.cmp(&bk) {
                     Ordering::Less => {
                         let (_, c) = ai.next().unwrap();
-                        result.store.upsert(ak, c);
+                        result.containers.upsert(ak, c);
                     }
                     Ordering::Greater => {
                         let (_, c) = bi.next().unwrap();
-                        result.store.upsert(bk, c);
+                        result.containers.upsert(bk, c);
                     }
                     Ordering::Equal => {
                         let (_, av) = ai.next().unwrap();
                         let (_, bv) = bi.next().unwrap();
                         let c = av.or(bv);
-                        result.store.upsert(ak, &c);
+                        result.containers.upsert(ak, &c);
                     }
                 },
                 (Some(_), None) => {
                     for (k, c) in ai {
-                        result.store.upsert(*k, c);
+                        result.containers.upsert(*k, c);
                     }
                     break;
                 }
                 (None, Some(_)) => {
                     for (k, c) in bi {
-                        result.store.upsert(*k, c);
+                        result.containers.upsert(*k, c);
                     }
                     break;
                 }
@@ -221,8 +198,8 @@ impl RoaringBitmap {
 
     /// AND NOT: elements in self but not in other.
     pub fn and_not(&self, other: &Self) -> Self {
-        let a = self.store.sorted_entries();
-        let b = other.store.sorted_entries();
+        let a = self.containers.sorted_entries();
+        let b = other.containers.sorted_entries();
         let mut result = Self::new();
         let mut bi = b.iter().peekable();
         for (ak, av) in &a {
@@ -237,7 +214,7 @@ impl RoaringBitmap {
                 _ => av.clone(),
             };
             if !c.is_empty() {
-                result.store.upsert(*ak, &c);
+                result.containers.upsert(*ak, &c);
             }
         }
         result
@@ -262,13 +239,13 @@ impl RoaringBitmap {
     /// Count of elements ≤ `value` in the bitmap.
     pub fn rank(&self, value: u128) -> usize {
         let (high, low) = decompose(value);
-        let key_cards = self.store.sorted_key_cards();
+        let key_cards = self.containers.sorted_key_cards();
         let mut prefix = 0usize;
         for (k, card) in &key_cards {
             match k.cmp(&high) {
                 Ordering::Less => prefix += *card as usize,
                 Ordering::Equal => {
-                    prefix += self.store.with_container(*k, |c| c.rank(low)).unwrap_or(0);
+                    prefix += self.containers.with_container(*k, |c| c.rank(low)).unwrap_or(0);
                     break;
                 }
                 Ordering::Greater => break,
@@ -279,12 +256,12 @@ impl RoaringBitmap {
 
     /// The `rank`-th element (0-indexed) in ascending order, or `None` if out of bounds.
     pub fn select(&self, mut rank: usize) -> Option<u128> {
-        let key_cards = self.store.sorted_key_cards();
+        let key_cards = self.containers.sorted_key_cards();
         for (high, card) in key_cards {
             let card = card as usize;
             if rank < card {
                 return self
-                    .store
+                    .containers
                     .with_container(high, |c| c.select(rank))
                     .flatten()
                     .map(|low| compose(high, low));
@@ -332,7 +309,7 @@ impl RoaringBitmap {
         for high in lo_high..=hi_high {
             let range_lo = if high == lo_high { lo_low } else { 0 };
             let range_hi = if high == hi_high { hi_low } else { u16::MAX };
-            self.store.modify(high, true, |c| {
+            self.containers.modify(high, true, |c| {
                 c.flip_range(range_lo, range_hi);
                 true
             });
@@ -350,13 +327,13 @@ impl RoaringBitmap {
         let (hi_high, hi_low) = decompose(hi - 1);
 
         let mut result = Self::new();
-        let self_keys = self.store.sorted_keys();
+        let self_keys = self.containers.sorted_keys();
         for &key in self_keys.iter().filter(|&&k| k >= lo_high && k <= hi_high) {
-            let other_c = match other.store.get(key) {
+            let other_c = match other.containers.get(key) {
                 Some(c) => c,
                 None => continue,
             };
-            let self_c = match self.store.get(key) {
+            let self_c = match self.containers.get(key) {
                 Some(c) => c,
                 None => continue,
             };
@@ -364,7 +341,7 @@ impl RoaringBitmap {
             let hi_clip = if key == hi_high { hi_low } else { u16::MAX };
             let c = self_c.and(&other_c).clip_to_range(lo_clip, hi_clip);
             if !c.is_empty() {
-                result.store.upsert(key, &c);
+                result.containers.upsert(key, &c);
             }
         }
         result
@@ -380,13 +357,13 @@ impl RoaringBitmap {
 
         let mut result = Self::new();
         let self_entries: Vec<(u128, Container)> = self
-            .store
+            .containers
             .sorted_entries()
             .into_iter()
             .filter(|(k, _)| *k >= lo_high && *k <= hi_high)
             .collect();
         let other_entries: Vec<(u128, Container)> = other
-            .store
+            .containers
             .sorted_entries()
             .into_iter()
             .filter(|(k, _)| *k >= lo_high && *k <= hi_high)
@@ -417,7 +394,7 @@ impl RoaringBitmap {
             let hi_clip = if key == hi_high { hi_low } else { u16::MAX };
             let c = c.clip_to_range(lo_clip, hi_clip);
             if !c.is_empty() {
-                result.store.upsert(key, &c);
+                result.containers.upsert(key, &c);
             }
         }
         result
@@ -426,7 +403,7 @@ impl RoaringBitmap {
     // ── Iteration ───────────────────────────────────────────────────
 
     pub fn iter(&self) -> impl Iterator<Item = u128> {
-        self.store.sorted_entries().into_iter().flat_map(|(high, container)| {
+        self.containers.sorted_entries().into_iter().flat_map(|(high, container)| {
             let lows: Vec<u16> = container.iter().collect();
             lows.into_iter().map(move |low| compose(high, low))
         })
@@ -442,7 +419,7 @@ impl RoaringBitmap {
     /// - it materialises at most `limit` values from each container it does
     ///   touch.
     ///
-    /// Both bounds are load-bearing. [`iter`](Self::iter) deserialises and
+    /// Both bounds are load-bearing. [`iter`](Self::iter) copies and
     /// collects every container it passes over, so `.skip(offset)` allocates its
     /// way to the offset and a full paginated walk is quadratic. But taking
     /// `limit` *outside* the iterator is not enough either: without the inner
@@ -450,9 +427,8 @@ impl RoaringBitmap {
     /// materialise all of it to return a page of 50 — measured **slower** than
     /// the `iter().skip()` it replaced. Keep both.
     ///
-    /// Only `ContainerStore::sorted_key_cards` is consulted up front (slot table
-    /// only, no container deserialisation); containers before the start point
-    /// are never touched.
+    /// Only `ContainerMap::sorted_key_cards` is consulted up front; containers
+    /// before the start point are never touched.
     ///
     /// **The skip *within* the landing container is still linear**, bounded by
     /// that container's cardinality (≤ 65 536) rather than by `offset`. So a
@@ -467,7 +443,7 @@ impl RoaringBitmap {
     /// An `offset` at or beyond the cardinality yields nothing. Pass
     /// `usize::MAX` as `limit` for "to the end".
     pub fn iter_page(&self, offset: usize, limit: usize) -> impl Iterator<Item = u128> + '_ {
-        let key_cards = self.store.sorted_key_cards();
+        let key_cards = self.containers.sorted_key_cards();
 
         // Walk the per-container counts to find the container holding `offset`
         // and how far into it the offset falls.
@@ -494,7 +470,7 @@ impl RoaringBitmap {
                 // Only the first container yielded is entered part-way.
                 let skip_within = if i == 0 { within } else { 0 };
                 let lows: Vec<u16> = self
-                    .store
+                    .containers
                     .with_container(high, |c| c.iter().skip(skip_within).take(remaining).collect())
                     .unwrap_or_default();
                 remaining -= lows.len();
@@ -507,9 +483,9 @@ impl RoaringBitmap {
 
     /// Re-evaluate container types across the entire bitmap.
     pub fn optimize(&mut self) {
-        let keys = self.store.sorted_keys();
+        let keys = self.containers.sorted_keys();
         for key in keys {
-            self.store.modify(key, false, |c| {
+            self.containers.modify(key, false, |c| {
                 c.optimize();
                 true
             });
@@ -531,7 +507,7 @@ impl RoaringBitmap {
             } else {
                 if let Some(h) = current_high {
                     let c = Self::build_container(std::mem::take(&mut lows));
-                    bm.store.upsert(h, &c);
+                    bm.containers.upsert(h, &c);
                 }
                 current_high = Some(high);
                 lows.push(low);
@@ -539,7 +515,7 @@ impl RoaringBitmap {
         }
         if let Some(h) = current_high {
             let c = Self::build_container(lows);
-            bm.store.upsert(h, &c);
+            bm.containers.upsert(h, &c);
         }
         bm
     }
@@ -570,8 +546,8 @@ impl Default for RoaringBitmap {
 impl Clone for RoaringBitmap {
     fn clone(&self) -> Self {
         let mut bm = Self::new();
-        for (key, container) in self.store.sorted_entries() {
-            bm.store.upsert(key, &container);
+        for (key, container) in self.containers.sorted_entries() {
+            bm.containers.upsert(key, &container);
         }
         bm
     }
@@ -591,8 +567,8 @@ impl PartialEq for RoaringBitmap {
         if self.cardinality() != other.cardinality() {
             return false;
         }
-        let a = self.store.sorted_key_cards();
-        let b = other.store.sorted_key_cards();
+        let a = self.containers.sorted_key_cards();
+        let b = other.containers.sorted_key_cards();
         if a.len() != b.len() {
             return false;
         }
@@ -602,8 +578,8 @@ impl PartialEq for RoaringBitmap {
             }
         }
         for (key, _) in &a {
-            let ca = self.store.get(*key);
-            let cb = other.store.get(*key);
+            let ca = self.containers.get(*key);
+            let cb = other.containers.get(*key);
             if ca != cb {
                 return false;
             }
@@ -655,7 +631,7 @@ mod tests {
         // could silently degrade to covering ArrayContainer only.
         let kinds: Vec<&str> = [0u128, 1, 2]
             .iter()
-            .map(|&h| match bm.store.get(h).expect("container present") {
+            .map(|&h| match bm.containers.get(h).expect("container present") {
                 Container::Array(_) => "array",
                 Container::Bitset(_) => "bitset",
                 Container::Run(_) => "run",
@@ -1313,9 +1289,10 @@ mod differential_tests {
             x.and_not_inplace(&b);
             same(&x, &sa.difference(&sb).copied().collect(), &format!("{c} and_not_inplace"));
             let mut rt = RoaringBitmap::new();
-            for (k, cont) in a.store.sorted_entries() {
+            for (k, cont) in a.containers.sorted_entries() {
                 let bytes = crate::field_index::bitmap::codec::encode_container(&cont).unwrap();
-                rt.store.upsert(k, &crate::field_index::bitmap::codec::decode_container(&bytes).unwrap());
+                rt.containers
+                    .upsert(k, &crate::field_index::bitmap::codec::decode_container(&bytes).unwrap());
             }
             same(&rt, &sa, &format!("{c} serde"));
             let v: Vec<u128> = sa.iter().copied().collect();

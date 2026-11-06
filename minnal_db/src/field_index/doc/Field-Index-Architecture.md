@@ -7,7 +7,7 @@ after a crash. It is meant to be read in order — each section builds on the on
 before it, from the raw bitmap up to the recovery model.
 
 Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap/mod.rs`,
-`bitmap/container/`, `bitmap/container_store.rs`, `blob_store.rs`, `rowmap.rs`, `bitmap/codec.rs`,
+`bitmap/container/`, `bitmap/container_map.rs`, `blob_store.rs`, `rowmap.rs`, `bitmap/codec.rs`,
 all under `src/field_index/` — knows nothing about databases. The *lifecycle* around
 it — schema registration, activation, checkpointing, WAL replay — lives in the
 engine (`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one
@@ -37,7 +37,7 @@ documents that hold them:
                               ▼
         ┌───────────────────────────────────────────────┐
         │ RoaringBitmap  (custom, u128 keyspace)          │
-        │   ContainerStore  high-key → Container          │
+        │   ContainerMap    high-key → Container          │
         │     Container = Array | Bitset | Run            │
         └───────────────────────────────────────────────┘
 
@@ -51,9 +51,8 @@ before the details.
 The first is that **the RoaringBitmap is written from scratch.** There is no
 `roaring` crate dependency; the module uses only `memmap2`, `parking_lot` and
 `rkyv`. The entire container model (array, bitset, run, with
-promotion and demotion between them), every cross-type set operation, and the
-memory-mapped store underneath are all implemented here, in `bitmap/mod.rs` and
-`bitmap/container/`.
+promotion and demotion between them) and every cross-type set operation are
+implemented here, in `bitmap/mod.rs` and `bitmap/container/`.
 
 The second is that **bitmaps live off-heap and are materialised only on demand.**
 A field index keeps just a small `BTreeMap` resident in memory. Each value's
@@ -217,32 +216,14 @@ with no runtime probe), and a portable **scalar** fallback everywhere else and f
 the sub-vector tail. All three are unit-tested against the scalar reference, so
 the vectorised paths are drop-in equivalents that only change speed, not results.
 
-### 3.3 `ContainerStore` — the mmap backing
+### 3.3 `ContainerMap` — where a bitmap's containers live
 
-Each `RoaringBitmap`'s containers live in a `ContainerStore`
-(`bitmap/container_store.rs`), a two-file, memory-mapped map from `u128` high key to
-`Container`:
-
-```
-containers.keys   64-byte header (magic "MINNALBI", version, capacity, count,
-                  tombstone count, cardinality, value_write_pos)
-                  + 48-byte open-addressing linear-probing slots
-                    (state EMPTY/OCCUPIED/TOMBSTONE, high-key, val offset, val len)
-containers.vals   append-only rkyv-serialised Container blobs, 16-byte aligned
-```
-
-A store has one of two backings behind the same API:
-
-- **Heap** — a sorted map of containers changed in place, with a cached total
-  count. Every transient bitmap uses it: a bitmap built in memory, the result of
-  a set operation, and a field-index bitmap loaded from its blob for a query or a
-  write. Its memory is the bitmap's real size.
-- **File-backed** (`RoaringBitmap::create` / `open`) — the two-file layout above,
-  for a bitmap that is its own persistent object. Growth is handled by
-  remapping. Values in `containers.vals` are **append-only**: every change writes
-  a new copy of the container, and the old one is not reclaimed. That is why
-  transient bitmaps never use this backing — 65,536 inserts into one container
-  would leave about 500 MiB of copies behind an 8 KB bitmap.
+Each `RoaringBitmap`'s containers live in a `ContainerMap`
+(`bitmap/container_map.rs`), a sorted map from `u128` high key to `Container`,
+changed in place, with a cached total count and heap size. A `RoaringBitmap` is
+always in memory: a bitmap built by a caller, the result of a set operation, or
+a field-index bitmap loaded from its blob for a query or a write. Its memory is
+its real size. Bitmaps persist only through a field's `BlobStore` (§4, §5).
 
 ---
 
@@ -260,9 +241,8 @@ next_slot: u128
 
 The `ordering` map is kept on the heap — the values and their slot IDs, but
 none of the bitmap data. The bitmaps live in a `BlobStore` (`blob_store.rs`),
-which uses the same two-file mmap layout as `ContainerStore` (a header
-"MINNALBS", 48-byte slots, and an append-only `blobs.vals`) but stores byte
-blobs. In a field's bitmap store, each container of each bitmap is its own blob,
+a two-file mmap layout (a header "MINNALBS", 48-byte slots, and an append-only
+`blobs.vals`) that stores byte blobs. In a field's bitmap store, each container of each bitmap is its own blob,
 and a value's slot points at a small **directory** blob listing where its
 containers are (§5).
 
@@ -365,8 +345,7 @@ Pulling the pieces together, a namespace's index directory looks like this:
     gap.json                   ← only when the field is missing updates (§8)
 ```
 
-The bitmap blobs in `blobs.vals` warrant a note, because they are **not** a copy
-of the `ContainerStore` mmap. Each container is its own blob (rkyv-serialised
+The bitmap blobs in `blobs.vals` warrant a note. Each container is its own blob (rkyv-serialised
 `Container`, 16-byte aligned), and each bitmap is a **directory** blob listing
 its containers (`bitmap/codec.rs`):
 

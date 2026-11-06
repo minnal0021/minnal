@@ -754,13 +754,13 @@ impl<V: Ord + Clone> FieldIndex<V> {
                 continue;
             }
             if let Some(c) = self.stored_container(slot_id, e) {
-                bm.store.insert_owned(e.key, c);
+                bm.containers.insert_owned(e.key, c);
             }
         }
         if let Some(ch) = ch {
             for (&key, c) in &ch.containers {
                 if let Some(c) = c {
-                    bm.store.insert_owned(key, c.clone());
+                    bm.containers.insert_owned(key, c.clone());
                 }
             }
         }

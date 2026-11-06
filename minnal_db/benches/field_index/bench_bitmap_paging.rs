@@ -2,7 +2,7 @@
 //!
 //! `query_keys_paginated` resolves a page by windowing the bitmap that query
 //! evaluation produced. It used to do that with `iter().skip(offset)`, which is
-//! `O(offset)` — and worse than it sounds, because `iter` deserialises and
+//! `O(offset)` — and worse than it sounds, because `iter` copies and
 //! collects a `Vec<u16>` for every container it passes over. `iter_page`
 //! skips whole containers on their cached cardinality instead, and materialises
 //! at most `limit` values from each container it opens.

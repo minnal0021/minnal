@@ -1,6 +1,6 @@
-//! A memory-mapped byte region that can grow, used by every mapped store in the
-//! field index: [`BlobStore`](crate::field_index::blob_store::BlobStore), the
-//! container store's mapped backing and [`RowMap`](crate::field_index::RowMap).
+//! A memory-mapped byte region that can grow, used by the field index's mapped
+//! stores: [`BlobStore`](crate::field_index::blob_store::BlobStore) and
+//! [`RowMap`](crate::field_index::RowMap).
 
 use std::fs::{File, OpenOptions};
 use std::io;

@@ -1,8 +1,6 @@
 //! Memory-mapped two-file blob store.
 //!
-//! Stores a `u128 → raw-bytes` map in two memory-mapped regions, using the
-//! same on-disk layout as `ContainerStore` but with arbitrary byte blobs as
-//! values instead of rkyv-serialised `Container` objects.
+//! Stores a `u128 → raw-bytes` map in two memory-mapped regions.
 //!
 //! Used by `FieldIndex` to hold per-distinct-value `RoaringBitmap` data
 //! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
@@ -242,7 +240,7 @@ fn validate_open(key: &[u8], val_len: usize) -> io::Result<()> {
 /// 4 GiB cannot be represented. That is pathological (a single index blob or key
 /// that large), but a silent `as u32` truncation would write a wrong length and
 /// corrupt the store on the next read — so fail loudly instead. Shared by
-/// [`BlobStore`], `ContainerStore`, and `RowMap`.
+/// [`BlobStore`] and `RowMap`.
 pub(crate) fn u32_len(len: usize, what: &str) -> u32 {
     u32::try_from(len).unwrap_or_else(|_| panic!("{what} length {len} exceeds the u32 on-disk limit ({})", u32::MAX))
 }
