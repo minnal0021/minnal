@@ -47,7 +47,7 @@
 // them account for **everything a merge does that a put does not**. Sum those
 // rather than differencing two millisecond write numbers.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

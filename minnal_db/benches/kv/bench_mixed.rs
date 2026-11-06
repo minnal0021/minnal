@@ -8,7 +8,7 @@
 // cheap but not representative of steady-state reads once data ages onto
 // disk.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

@@ -813,10 +813,23 @@ cargo bench --bench bench_sstable_lookup
 cargo bench --bench bench_predicate       # field-index query evaluation
 cargo bench --bench bench_bitmap_paging   # paginating query results
 cargo bench --bench bench_distance_estimation --features semantic-search
+cargo bench --bench bench_pass1_search --features semantic-search
 
 # All benchmarks
 cargo bench -p minnal_db --all-features
 ```
+
+The sources in `benches/` are grouped by what they measure:
+
+| Folder | Measures |
+|---|---|
+| `kv/` | The key-value API: writes, reads, merge, scans, mixed workloads, the typed API |
+| `storage/` | Engine internals: WAL appends, point lookups across storage tiers |
+| `field_index/` | Field-index query evaluation and result paging |
+| `semantic_search/` | Distance estimation and the two-pass vector search |
+| `under_load/` | The `engine_bench` target: document-store operations with every background worker running, described in [`benchmark.md`](benchmark.md#the-engine-at-work) |
+
+`benches/script/run_benchmarks.sh` runs every Criterion suite with `-C target-cpu=native`, and with AVX-512 when the CPU has it, and writes a summary to `benches/script/reports/`. It accepts `--filter`, `--baseline`, `--compare`, `--no-avx512` and `--quick`; `--help` describes them.
 
 Benchmark reports are written to `target/criterion/`. The helpers in `benches/common.rs` disable background workers and use `target/bench_tmp/` (rather than `/tmp/`) to avoid skew from RAM-backed filesystems.
 

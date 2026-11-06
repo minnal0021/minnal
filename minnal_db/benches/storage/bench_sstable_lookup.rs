@@ -78,7 +78,7 @@
 // reported latency is the blended cost of a 50/50 tier mix, not either
 // extreme.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

@@ -9,7 +9,7 @@
 //   e) End-to-end throughput of the full put path (WAL + value log + LSM)
 //   f) WAL append with namespace_id tagging
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

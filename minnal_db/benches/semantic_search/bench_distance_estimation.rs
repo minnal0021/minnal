@@ -1,6 +1,6 @@
 //! Benchmarks for first-pass (SingleBit) and second-pass (MultiBit) distance estimation.
 //!
-//!   cargo bench -p semantic_search --bench bench_distance_estimation
+//!   cargo bench -p minnal_db --features semantic-search --bench bench_distance_estimation
 //!
 //! On first run the bench generates 1 000 synthetic 768-d embeddings via a seeded PRNG,
 //! quantises them against the real cluster centroids, and saves the raw float vectors to

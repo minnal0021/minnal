@@ -11,7 +11,7 @@
 // tiered: a write always lands in the active memtable regardless of what's
 // already on disk, so tier doesn't apply to their cost the same way.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

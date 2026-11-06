@@ -3,10 +3,12 @@
 # MinnalDB Benchmark Runner
 #
 # Detects AVX-512 support, builds with the right RUSTFLAGS, runs the full
-# Criterion suite, and writes a timestamped report under benchmark/reports/.
+# Criterion suite, and writes a timestamped report under benches/script/reports/.
+# `engine_bench` is not run: it is not Criterion and needs a config (see
+# benches/under_load/main.rs).
 #
 # Usage:
-#   ./benchmark/run_benchmarks.sh [OPTIONS]
+#   minnal_db/benches/script/run_benchmarks.sh [OPTIONS]
 #
 # Options:
 #   --filter <REGEX>   Only run benchmarks whose names match REGEX
@@ -19,9 +21,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPORTS_DIR="${SCRIPT_DIR}/reports"
-CRITERION_DIR="${PROJECT_ROOT}/target/criterion"
+CRITERION_DIR="$(cd "${PROJECT_ROOT}/.." && pwd)/target/criterion"  # the workspace's target directory
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 REPORT_FILE="${REPORTS_DIR}/bench_${TIMESTAMP}.txt"
 
@@ -140,8 +142,11 @@ echo
 log "── Building benchmarks (release) ─────────────────────────────────────────"
 } | tee_report
 
+# Every Criterion target, with semantic search and the document store compiled in.
+CARGO_ARGS=(-p minnal_db --all-features --bench 'bench_*')
+
 cd "${PROJECT_ROOT}"
-if ! RUSTFLAGS="${BENCH_RUSTFLAGS}" cargo build --release --benches 2>&1 | tee -a "${REPORT_FILE}"; then
+if ! RUSTFLAGS="${BENCH_RUSTFLAGS}" cargo bench "${CARGO_ARGS[@]}" --no-run 2>&1 | tee -a "${REPORT_FILE}"; then
     die "Build failed — see output above"
 fi
 { echo; ok "Build successful"; echo; } | tee_report
@@ -150,18 +155,17 @@ fi
 BENCH_ARGS=()
 
 if [[ -n "${FILTER}" ]]; then
-    BENCH_ARGS+=("--bench" "minnal_bench" "${FILTER}")
+    BENCH_ARGS+=("${FILTER}")
 fi
 
 if [[ -n "${BASELINE}" ]]; then
-    BENCH_ARGS+=("--" "--save-baseline" "${BASELINE}")
+    BENCH_ARGS+=("--save-baseline" "${BASELINE}")
 elif [[ -n "${COMPARE}" ]]; then
-    BENCH_ARGS+=("--" "--baseline" "${COMPARE}")
+    BENCH_ARGS+=("--baseline" "${COMPARE}")
 fi
 
-# Quick mode: override measurement time via env var (Criterion respects this)
 if [[ "${QUICK}" == "true" ]]; then
-    BENCH_ARGS+=("--" "--measurement-time" "3")
+    BENCH_ARGS+=("--measurement-time" "3")
     { warn "Quick mode: measurement time reduced to 3 s per benchmark"; echo; } | tee_report
 fi
 
@@ -173,9 +177,8 @@ hdr "Running benchmarks"
 BENCH_START=$(date +%s)
 
 RUSTFLAGS="${BENCH_RUSTFLAGS}" \
-    cargo bench \
-    --bench minnal_bench \
-    "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}" \
+    cargo bench "${CARGO_ARGS[@]}" \
+    -- "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}" \
     2>&1 | grep -v "^Gnuplot not found" | tee -a "${REPORT_FILE}"
 
 BENCH_END=$(date +%s)
@@ -189,35 +192,32 @@ hdr "Results summary"
 log "Total wall-clock time : $((ELAPSED / 60))m $((ELAPSED % 60))s"
 echo
 
-# Parse the Criterion plain-text output for timing lines and reformat them.
-# Criterion lines look like:
-#   write/put/value_size/128B   time:   [1.2345 µs 1.2500 µs 1.2678 µs]
-# or (with throughput):
-#   write/put/value_size/128B   thrpt:  [98.123 MiB/s 99.456 MiB/s 100.79 MiB/s]
-#
-# We extract the middle estimate (the mean) for each benchmark.
+# Criterion prints each result as
+#   <name>   time:   [1.2345 µs 1.2500 µs 1.2678 µs]
+# with the name on the line before when it is long, and an optional
+#            thrpt:  [98.123 MiB/s 99.456 MiB/s 100.79 MiB/s]
+# The middle figure is the estimate. A "time:" holding percentages is a change
+# against an earlier run, not a result.
 
-log "── Per-benchmark mean estimates ──────────────────────────────────────────"
-printf "  %-52s %s\n" "Benchmark" "Mean (median estimate)"
-printf "  %-52s %s\n" "$(printf '%0.s─' {1..52})" "$(printf '%0.s─' {1..24})"
+log "── Per-benchmark estimates ───────────────────────────────────────────────"
+printf "  %-60s %s\n" "Benchmark" "Estimate"
+printf "  %-60s %s\n" "$(printf '%0.s─' {1..60})" "$(printf '%0.s─' {1..16})"
 
-grep -E "^\s+(write|read|scan|mixed|wal)" "${REPORT_FILE}" \
-    | grep "time:" \
-    | while IFS= read -r line; do
-        bench=$(echo "${line}" | awk '{print $1}')
-        mean=$(echo "${line}"  | grep -oP '\[.*?\]' | head -1 \
-               | grep -oP '[\d.]+ [nµm]s' | sed -n '2p')
-        printf "  %-52s %s\n" "${bench}" "${mean:-see report}"
-    done
-
-grep -E "^\s+(write|read|scan|mixed|wal)" "${REPORT_FILE}" \
-    | grep "thrpt:" \
-    | while IFS= read -r line; do
-        bench=$(echo "${line}" | awk '{print $1}')
-        tput=$(echo "${line}"  | grep -oP '\[.*?\]' | head -1 \
-               | grep -oP '[\d.]+ [KMG]?iB/s|[\d.]+ elem/s' | sed -n '2p')
-        printf "  %-52s %s\n" "${bench} [throughput]" "${tput:-see report}"
-    done
+awk '
+    /time:|thrpt:/ && /\[/ && !/%/ {
+        n = split($0, parts, "[][]")
+        split(parts[2], figures, " ")
+        before = parts[1]
+        sub(/(time|thrpt):.*/, "", before)
+        gsub(/[[:space:]]+$/, "", before)
+        gsub(/^[[:space:]]+/, "", before)
+        if (before != "") name = before
+        kind = ($0 ~ /thrpt:/) ? " [throughput]" : ""
+        printf "  %-60s %s %s\n", name kind, figures[3], figures[4]
+        next
+    }
+    NF > 0 { name = $0 }
+' "${REPORT_FILE}"
 
 echo
 } | tee_report

@@ -594,7 +594,7 @@ measured on frozen BEIR embeddings by the vector bench
 | Per-store vector-index settings (defaults, validation) | `minnal_db/src/doc_store/vector_settings.rs` |
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
-| Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/bench_distance_estimation.rs` |
+| Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/semantic_search/bench_distance_estimation.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_db/src/vector_kv.rs` |
 | Latency profiling harness (see §8) | `minnal_db/src/vector_kv.rs` (ignored test) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |

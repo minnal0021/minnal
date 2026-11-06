@@ -2483,7 +2483,7 @@ Every earlier gate measures one thing at a time. M5 measures what each
 document-store operation costs while the engine does everything else it does
 in production: flushes, compaction, garbage collection, field-index
 checkpoints, vector indexing and partition maintenance. It is
-`minnal_db/benches/engine_bench`, defined and reported in
+`minnal_db/benches/under_load`, defined and reported in
 [benchmark.md → The engine at work](../../../benchmark.md#the-engine-at-work):
 the engine in process with every background worker on, embeddings replayed
 from a table recorded once (no external call), each operation alone with a

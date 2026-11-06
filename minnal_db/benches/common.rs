@@ -1,5 +1,5 @@
 // Shared benchmark utilities — imported by each bench file via:
-//   #[path = "common.rs"] mod common;
+//   #[path = "../common.rs"] mod common;
 //   use common::*;
 //
 // Each bench binary uses only a subset of these helpers, so items unused by a

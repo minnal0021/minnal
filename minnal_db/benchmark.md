@@ -439,7 +439,7 @@ split and merged. This benchmark measures what each operation costs **while all
 of that is happening**, first one operation at a time and then with several
 clients at once, with nothing outside the engine involved.
 
-It is `minnal_db/benches/engine_bench` (not Criterion), reported by
+It is `minnal_db/benches/under_load` (not Criterion), reported by
 `docs/benchmarks/engine/report.py`. The results come first. How the benchmark
 works, and what it leaves out, follows them.
 

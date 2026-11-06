@@ -10,7 +10,7 @@
 // fast if you only ever measure the memtable" point is visible on every
 // case here, not just in one dedicated benchmark.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

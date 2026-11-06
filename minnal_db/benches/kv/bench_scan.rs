@@ -13,7 +13,7 @@
 // `.compact()` first. Both now populate directly through `AsyncDb` so the
 // memtable tier is genuinely memtable-resident.
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 

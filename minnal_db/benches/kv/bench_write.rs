@@ -1,7 +1,7 @@
 // Write throughput benchmarks
 //   cargo bench --bench bench_write
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
 use common::*;
 
