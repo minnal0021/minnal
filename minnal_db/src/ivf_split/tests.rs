@@ -295,8 +295,67 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &dest);
         } else {
-            std::fs::copy(entry.path(), dest).unwrap();
+            copy_sparse(&entry.path(), &dest);
         }
+    }
+}
+
+/// Copy a file, keeping its holes. A log segment is created at its full 64 MiB
+/// and holds little, and `std::fs::copy` would allocate all of it for every case.
+fn copy_sparse(from: &std::path::Path, to: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let src = std::fs::File::open(from).unwrap();
+    let len = src.metadata().unwrap().len();
+    let dst = std::fs::File::create(to).unwrap();
+    dst.set_len(len).unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut at = 0;
+    while at < len {
+        // SAFETY: `src` is open for the whole call, and `lseek` touches no memory.
+        let data = unsafe { libc::lseek(src.as_raw_fd(), at as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::ENXIO), "{from:?}: {error}"); // only a hole is left
+            break;
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(src.as_raw_fd(), data, libc::SEEK_HOLE) };
+        assert!(hole >= data, "{from:?}: {}", std::io::Error::last_os_error());
+        at = data as u64;
+        while at < hole as u64 {
+            let n = buf.len().min((hole as u64 - at) as usize);
+            src.read_exact_at(&mut buf[..n], at).unwrap();
+            dst.write_all_at(&buf[..n], at).unwrap();
+            at += n as u64;
+        }
+    }
+}
+
+#[test]
+fn copy_sparse_keeps_the_bytes_and_the_holes() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let dir = TempDir::new().unwrap();
+    let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+    let len = 8 << 20;
+    let file = std::fs::File::create(&from).unwrap();
+    file.set_len(len).unwrap();
+    file.write_all_at(b"first", 0).unwrap();
+    file.write_all_at(b"middle", 4 << 20).unwrap();
+    drop(file);
+    copy_sparse(&from, &to);
+    assert!(std::fs::read(&from).unwrap() == std::fs::read(&to).unwrap(), "the bytes differ");
+    let allocated = std::fs::metadata(&to).unwrap().blocks() * 512;
+    assert!(
+        allocated < len / 2,
+        "{allocated} bytes allocated for an {len}-byte file that is mostly holes"
+    );
+
+    // A file with no data at all, and an empty one.
+    for size in [len, 0] {
+        std::fs::File::create(&from).unwrap().set_len(size).unwrap();
+        copy_sparse(&from, &to);
+        assert_eq!(std::fs::metadata(&to).unwrap().len(), size);
     }
 }
 
@@ -1221,9 +1280,12 @@ async fn a_rebuild_before_recovery_loses_nothing() {
 async fn recovery_runs_a_recorded_reassignment_once() {
     let docs = 20;
     let ops = settings(40);
+    let template = TempDir::new().unwrap();
+    setup(&template, docs).await.shutdown().await.unwrap();
     for n in 8..400 {
         let dir = TempDir::new().unwrap();
-        let db = setup(&dir, docs).await;
+        copy_dir(template.path(), dir.path());
+        let db = open(&dir).await;
         let h = handle(&db).await;
         crate::vector_kv::crash_point::arm(n);
         let result = split_posting(&db, NS, &h, 0, &ops).await;
