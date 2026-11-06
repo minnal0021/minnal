@@ -344,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         semantic_search_enabled: false,
         embedding_fields: vec![],
+        vector_index: None,
     };
     store.create(schema).await?;
 
@@ -379,6 +380,8 @@ empty.** The cap is counted in bytes, not characters, so a 20-character key of
 constructor and does the validation, so an invalid key cannot reach storage:
 
 ```rust
+use minnal_db::StrKey;
+
 let schema = DocStoreSchema {
     namespace: "slugs".into(),
     store_type: StoreType::Doc,
@@ -388,6 +391,7 @@ let schema = DocStoreSchema {
     indices: vec![IndexSpec { field: "status".into(), index_type: IndexType::Str }],
     semantic_search_enabled: false,
     embedding_fields: vec![],
+    vector_index: None,
 };
 store.create(schema).await?;
 
