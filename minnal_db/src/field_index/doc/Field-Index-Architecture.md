@@ -6,12 +6,12 @@ they are stored and kept compact, and how the whole structure is brought back
 after a crash. It is meant to be read in order — each section builds on the one
 before it, from the raw bitmap up to the recovery model.
 
-Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap.rs`,
-`container/`, `container_store.rs`, `blob_store.rs`, `rowmap.rs`, `storage.rs`,
-all under `src/index/` — knows nothing about databases. The *lifecycle* around
+Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap/mod.rs`,
+`bitmap/container/`, `bitmap/container_store.rs`, `blob_store.rs`, `rowmap.rs`, `bitmap/codec.rs`,
+all under `src/field_index/` — knows nothing about databases. The *lifecycle* around
 it — schema registration, activation, checkpointing, WAL replay — lives in the
 engine (`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one
-set of indexes per namespace. Paths below are relative to `minnal_db/src/index/`
+set of indexes per namespace. Paths below are relative to `minnal_db/src/field_index/`
 unless they start with `minnal_db/`.
 
 ---
@@ -52,8 +52,8 @@ The first is that **the RoaringBitmap is written from scratch.** There is no
 `roaring` crate dependency; the module uses only `memmap2`, `parking_lot` and
 `rkyv`. The entire container model (array, bitset, run, with
 promotion and demotion between them), every cross-type set operation, and the
-memory-mapped store underneath are all implemented here, in `bitmap.rs` and
-`container/`.
+memory-mapped store underneath are all implemented here, in `bitmap/mod.rs` and
+`bitmap/container/`.
 
 The second is that **bitmaps live off-heap and are materialised only on demand.**
 A field index keeps just a small `BTreeMap` resident in memory. Each value's
@@ -95,7 +95,7 @@ every registration and loaded on every `Database::open()`, so the set of indexed
 fields survives restarts without any separate bookkeeping.
 
 A field's type is one of three, drawn from `IndexValueType` in
-`src/field/value.rs`: `Bool`, `Int` (an i64), and `Str`. These match the variants
+`value.rs`: `Bool`, `Int` (an i64), and `Str`. These match the variants
 of the `IndexValue` enum that the rest of the crate operates on.
 
 ---
@@ -116,7 +116,7 @@ documents share a high key and pack into a single container. That packing is the
 entire reason the bitmaps stay small, and it is why dense IDs from the `RowMap`
 are the default.
 
-`RowMap` (`src/rowmap.rs`) is a per-namespace, memory-mapped sidecar in three
+`RowMap` (`rowmap.rs`) is a per-namespace, memory-mapped sidecar in three
 parts:
 
 | Part | Backing | Role |
@@ -166,7 +166,7 @@ keyspace and picks its internal encoding adaptively as the data changes.
 
 ### 3.1 Keyspace and containers
 
-A `RoaringBitmap` (`src/bitmap.rs`) holds a set of `u128` values. Each value is
+A `RoaringBitmap` (`bitmap/mod.rs`) holds a set of `u128` values. Each value is
 split (`decompose`) into a **high key** — the upper 112 bits — and a **low
 value** — the lower 16 bits:
 
@@ -176,7 +176,7 @@ value: u128  ──►  high (112 bits) ──► selects a container
 ```
 
 The high key selects a `Container`, and the low 16-bit value is the specific bit
-stored inside it. A `Container` (`src/container/mod.rs`) comes in three encodings,
+stored inside it. A `Container` (`bitmap/container/mod.rs`) comes in three encodings,
 each suited to a different data shape, and the engine moves between them
 automatically as a container's contents change:
 
@@ -202,11 +202,11 @@ constructors `from_sorted_iter` / `from_unsorted_iter`. A binary operation walks
 the two bitmaps' high keys in sorted-merge order at the top level, and for each
 high key that both share it hands the work down to the container layer.
 
-That container layer, in `container/ops.rs`, implements **all nine cross-type
+That container layer, in `bitmap/container/ops.rs`, implements **all nine cross-type
 combinations** of the binary operations — Array×Array, Array×Bitset, Bitset×Run,
 and so on — each producing whichever container type best fits its result and
 promoting or demoting as needed. The hot loops lean on the SIMD helpers in
-`src/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, and bit
+`bitmap/simd_support/`: popcount, bitwise AND/OR/AND-NOT, sorted-array merge, and bit
 extraction.
 
 Each helper carries three implementations selected per target: **AVX-512** and
@@ -220,7 +220,7 @@ the vectorised paths are drop-in equivalents that only change speed, not results
 ### 3.3 `ContainerStore` — the mmap backing
 
 Each `RoaringBitmap`'s containers live in a `ContainerStore`
-(`src/container_store.rs`), a two-file, memory-mapped map from `u128` high key to
+(`bitmap/container_store.rs`), a two-file, memory-mapped map from `u128` high key to
 `Container`:
 
 ```
@@ -249,7 +249,7 @@ A store has one of two backings behind the same API:
 ## 4. The field index
 
 A single bitmap answers "which rows hold this exact value". A field index
-(`FieldIndex<V>`, `src/field/field_index.rs`) is the layer that turns a whole
+(`FieldIndex<V>`, `typed_index.rs`) is the layer that turns a whole
 field into many such bitmaps and routes queries to the right ones:
 
 ```
@@ -259,7 +259,7 @@ next_slot: u128
 ```
 
 The `ordering` map is kept on the heap — the values and their slot IDs, but
-none of the bitmap data. The bitmaps live in a `BlobStore` (`src/blob_store.rs`),
+none of the bitmap data. The bitmaps live in a `BlobStore` (`blob_store.rs`),
 which uses the same two-file mmap layout as `ContainerStore` (a header
 "MINNALBS", 48-byte slots, and an append-only `blobs.vals`) but stores byte
 blobs. In a field's bitmap store, each container of each bitmap is its own blob,
@@ -299,7 +299,7 @@ then frees it.
 ### The memory budget
 
 Every field of a database charges its overlay to one shared counter (an
-`IndexOverlayBudget`, `src/overlay_budget.rs`) with two limits:
+`IndexOverlayBudget`, `overlay_budget.rs`) with two limits:
 
 | Setting (TOML `[thresholds]`) | Default | When crossed |
 |---|---|---|
@@ -368,7 +368,7 @@ Pulling the pieces together, a namespace's index directory looks like this:
 The bitmap blobs in `blobs.vals` warrant a note, because they are **not** a copy
 of the `ContainerStore` mmap. Each container is its own blob (rkyv-serialised
 `Container`, 16-byte aligned), and each bitmap is a **directory** blob listing
-its containers (`src/storage.rs`):
+its containers (`bitmap/codec.rs`):
 
 ```
 [4B  magic "MBD1"]

@@ -172,7 +172,7 @@ Each indexed field maintains a `FieldIndex` — an ordered map from each field v
 
 Each field index is updated in memory on every write and checkpointed to disk every couple of seconds, recording the WAL position it reflects. After a crash, the index replays the WAL from that position, so it never has to be rebuilt from scratch.
 
-For the full design — how field attributes are created, updated, stored, and recovered after a crash — see [`Index-Architecture.md`](minnal_db/src/index/Index-Architecture.md).
+For the full design — how field attributes are created, updated, stored, and recovered after a crash — see [`Field-Index-Architecture.md`](minnal_db/src/field_index/doc/Field-Index-Architecture.md).
 
 ### Layer 3 — Semantic Search (Vector Quantisation + ANN, `semantic-search`)
 
@@ -355,7 +355,7 @@ minnal/
 │   ├── README.md           ← detailed KV engine documentation
 │   └── src/
 │       ├── db/ store/      ← LSM + value-log KV engine
-│       ├── index/          ← RoaringBitmap field indexing (part of kv-store)
+│       ├── field_index/    ← RoaringBitmap field indexing (part of kv-store)
 │       ├── semantic_search/← IVF clustering, RaBitQ quantisation, vector↔KV bridge (semantic-search)
 │       └── doc_store/      ← JSON document store (doc-store)
 ├── minnal_db_api/          ← Axum REST API server (binary)

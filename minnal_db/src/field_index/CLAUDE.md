@@ -1,4 +1,4 @@
-# index — RoaringBitmap Field Indexing
+# field_index — RoaringBitmap Field Indexing
 
 Provides per-field bitmap indexes over document key-spaces and a predicate query evaluator. `minnal_db` stores a `DynFieldIndex` per indexed field (held in its own per-namespace `NamespaceIndex`), and `minnal_doc_store` uses the query DSL to answer structured queries.
 
@@ -6,21 +6,24 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Public re-exports |
-| `src/field/field_index.rs` | `FieldIndex<V>` — per-field bitmap index (`BTreeMap<V, slot>` + blob-backed bitmaps + an in-memory **overlay** of bitmaps changed since the last spill) |
-| `src/field/value.rs` | `DynFieldIndex` (type-erased field index), `IndexValue`, `IndexValueType` |
-| `src/field/predicate.rs` | `Predicate` — a single field predicate (eq, ne, lt, le, gt, ge, between, in) |
-| `src/query/lexer.rs` | Tokeniser for the query string DSL |
-| `src/query/parser.rs` | Parser: query string → `RawExpr` AST (`Op`, `RawValue`) |
-| `src/query/eval.rs` | Evaluator: `RawExpr` against live `DynFieldIndex`es (via a `SchemaMap` + `get_index` closure) → `RoaringBitmap` of row IDs |
-| `src/bitmap.rs` | `RoaringBitmap` — **custom** from-scratch Roaring implementation over a `u128` keyspace (no `roaring` crate dependency); backed by a `ContainerStore` (heap for transient bitmaps, mmap files for persistent ones) |
-| `src/container/` | The three container types (`Array`, `Bitset`, `Run`) + the `Container` enum dispatch and all cross-type set ops (`mod.rs`, `array.rs`, `bitset.rs`, `run.rs`, `ops.rs`) |
-| `src/container_store.rs` | `ContainerStore` — `u128 → Container` map behind one bitmap. **Heap** backing (`BTreeMap`, changed in place) for every transient bitmap (`RoaringBitmap::new`, loaded copies, query results); **Mapped** two-file store (`containers.keys` + `containers.vals`) for `create`/`open`. Never put transient bitmaps on the mapped backing: it appends a container copy per change (65,536 inserts → 514 MiB for an 8 KB bitmap) |
-| `src/blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store (same layout as `ContainerStore`); holds each `FieldIndex`'s bitmaps off-heap in the **directory** layout (`BlobLayout::Directory`: slot → directory blob → container blobs; the keymap uses `Flat`). Space accounting, open-time repair and compaction read directories. On-disk `VERSION` 2. Crash-ordered writes (`append_value` → `sync_values` → `set_slot` → `sync_keys`), checksummed slots, repair at open. Also defines the `pub(crate) GrowableMmap` helper that `RowMap` reuses (`ContainerStore` keeps its own private one) |
-| `src/overlay_budget.rs` | `IndexOverlayBudget` — one atomic byte counter per `Database`, shared by every field's overlay, with a soft limit (request a checkpoint) and a hard limit (the writer spills its own field) |
-| `src/rowmap.rs` | `RowMap` — per-namespace dense row-ID map (`key↔id` + counter), mmap sidecar |
-| `src/storage.rs` | On-disk bitmap encoding: one rkyv blob per `Container` (`encode_container` / `decode_container`) and the checksummed per-bitmap **directory** (`MBD1`: sorted container key → offset, len; `encode_dir` / `decode_dir`) |
-| `src/simd_support/` | SIMD helpers for container set ops (popcount, bitwise, array merge, extract, sum, run-bitset). Each kernel has AVX-512/AVX2 (x86_64, runtime-detected) **and NEON (aarch64/Apple Silicon, baseline, compile-time)** paths plus a scalar fallback; all are unit-tested against the scalar reference. When adding a kernel, provide all three or guard the missing arch with `cfg`. |
+| `mod.rs` | Public re-exports |
+| `typed_index.rs` | `FieldIndex<V>` — per-field bitmap index (`BTreeMap<V, slot>` + blob-backed bitmaps + an in-memory **overlay** of bitmaps changed since the last spill) |
+| `dyn_index.rs` | `DynFieldIndex` (type-erased field index) |
+| `value.rs` | `IndexValue`, `IndexValueType` |
+| `predicate.rs` | `Predicate` — a single field predicate (eq, ne, lt, le, gt, ge, between, in) |
+| `query/lexer.rs` | Tokeniser for the query string DSL |
+| `query/parser.rs` | Parser: query string → `RawExpr` AST (`Op`, `RawValue`) |
+| `query/eval.rs` | Evaluator: `RawExpr` against live `DynFieldIndex`es (via a `SchemaMap` + `get_index` closure) → `RoaringBitmap` of row IDs |
+| `bitmap/mod.rs` | `RoaringBitmap` — **custom** from-scratch Roaring implementation over a `u128` keyspace (no `roaring` crate dependency); backed by a `ContainerStore` (heap for transient bitmaps, mmap files for persistent ones) |
+| `bitmap/container/` | The three container types (`Array`, `Bitset`, `Run`) + the `Container` enum dispatch and all cross-type set ops (`mod.rs`, `array.rs`, `bitset.rs`, `run.rs`, `ops.rs`) |
+| `bitmap/container_store.rs` | `ContainerStore` — `u128 → Container` map behind one bitmap. **Heap** backing (`BTreeMap`, changed in place) for every transient bitmap (`RoaringBitmap::new`, loaded copies, query results); **Mapped** two-file store (`containers.keys` + `containers.vals`) for `create`/`open`. Never put transient bitmaps on the mapped backing: it appends a container copy per change (65,536 inserts → 514 MiB for an 8 KB bitmap) |
+| `blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store (same layout as `ContainerStore`); holds each `FieldIndex`'s bitmaps off-heap in the **directory** layout (`BlobLayout::Directory`: slot → directory blob → container blobs; the keymap uses `Flat`). Space accounting, open-time repair and compaction read directories. On-disk `VERSION` 2. Crash-ordered writes (`append_value` → `sync_values` → `set_slot` → `sync_keys`), checksummed slots, repair at open. Also defines the `pub(crate) GrowableMmap` helper that `RowMap` reuses (`ContainerStore` keeps its own private one) |
+| `growable_mmap.rs` | `GrowableMmap` — the growable mapped region shared by `BlobStore`, the container store's mapped backing and `RowMap` |
+| `doc/` | Architecture and write-back design docs |
+| `overlay_budget.rs` | `IndexOverlayBudget` — one atomic byte counter per `Database`, shared by every field's overlay, with a soft limit (request a checkpoint) and a hard limit (the writer spills its own field) |
+| `rowmap.rs` | `RowMap` — per-namespace dense row-ID map (`key↔id` + counter), mmap sidecar |
+| `bitmap/codec.rs` | On-disk bitmap encoding: one rkyv blob per `Container` (`encode_container` / `decode_container`) and the checksummed per-bitmap **directory** (`MBD1`: sorted container key → offset, len; `encode_dir` / `decode_dir`) |
+| `bitmap/simd_support/` | SIMD helpers for container set ops (popcount, bitwise, array merge, extract, sum, run-bitset). Each kernel has AVX-512/AVX2 (x86_64, runtime-detected) **and NEON (aarch64/Apple Silicon, baseline, compile-time)** paths plus a scalar fallback; all are unit-tested against the scalar reference. When adding a kernel, provide all three or guard the missing arch with `cfg`. |
 
 ## How it works
 
@@ -90,7 +93,7 @@ RECOVERY (on open)                                         [index + minnal_db]
 
 ## Supported value types (`IndexValueType`)
 
-`Bool`, `Int` (i64), `Str` — matching the `IndexValue` enum variants in `src/field/value.rs`.
+`Bool`, `Int` (i64), `Str` — matching the `IndexValue` enum variants in `value.rs`.
 
 ## Query DSL (parsed by `query/`)
 
@@ -121,7 +124,7 @@ Field indexes live under `{db_path}/index/{ns_id}/{field_id}/` (layout in `db/in
 
 ### Writes are buffered in an overlay of changed containers — compaction reclaims dead space
 
-`FieldIndex` stores each distinct value's `RoaringBitmap` **container by container** in a `BlobStore` (`blobs.keys` open-addressing table + `blobs.vals` append-only value region): every container is its own blob, and the value's slot points at a **directory** blob listing them (`storage.rs`). **A write never touches the blob store.** It changes an in-memory copy of the one container the row falls in, held in the field's **overlay** (`slot → container key → Option<Container>`, `None` = container emptied), which reads consult first. The overlay does **not** cache a slot's directory: lookups binary-search the stored directory in place (`storage::lookup_dir`, no allocation, no checksum pass — directories are immutable once written and checked at open). Keep it that way: a cached copy grows with the bitmap's container count, and with scattered row IDs that is the document count (a 1M-doc uuid load reached 20 MB of overlay at 213k docs this way). Pinned by `overlay_memory_does_not_grow_with_the_bitmap`. The overlay is written out by a **spill** — at each index checkpoint, or by the writer itself when the shared `IndexOverlayBudget` passes its hard limit — which appends each changed container plus a new directory per changed bitmap and repoints the slot. Unchanged containers are shared between the old and new directory; the old directory and old copies of changed containers become dead space.
+`FieldIndex` stores each distinct value's `RoaringBitmap` **container by container** in a `BlobStore` (`blobs.keys` open-addressing table + `blobs.vals` append-only value region): every container is its own blob, and the value's slot points at a **directory** blob listing them (`bitmap/codec.rs`). **A write never touches the blob store.** It changes an in-memory copy of the one container the row falls in, held in the field's **overlay** (`slot → container key → Option<Container>`, `None` = container emptied), which reads consult first. The overlay does **not** cache a slot's directory: lookups binary-search the stored directory in place (`storage::lookup_dir`, no allocation, no checksum pass — directories are immutable once written and checked at open). Keep it that way: a cached copy grows with the bitmap's container count, and with scattered row IDs that is the document count (a 1M-doc uuid load reached 20 MB of overlay at 213k docs this way). Pinned by `overlay_memory_does_not_grow_with_the_bitmap`. The overlay is written out by a **spill** — at each index checkpoint, or by the writer itself when the shared `IndexOverlayBudget` passes its hard limit — which appends each changed container plus a new directory per changed bitmap and repoints the slot. Unchanged containers are shared between the old and new directory; the old directory and old copies of changed containers become dead space.
 
 Why: before the overlay, every insert re-serialised and appended the whole bitmap, which is O(N²) cumulative bytes per value — a boolean over 200k rows appended 3 GB for 54 KB live, and a 5-value field replayed over 16k docs left a 2.6 GB file that could not be opened. The overlay (step 2) made that one bitmap per changed value per spill (bool 200k rows 3,076 MiB → 3.6 MiB). It still held **whole** bitmaps, so once the changed bitmaps exceeded the hard limit (a boolean over ~300M rows) every write spilled its whole bitmap again; the container-granular layout (FR-005, steps 3b–3d) removed that: past the hard limit each write now appends about one container and a directory (`past_the_hard_limit_each_spill_appends_containers_not_bitmaps`). See `Field-Index-Write-Back-Evaluation.md` → *Results*. **Do not reintroduce a per-write blob write** (`BlobStore::upsert` is `#[cfg(test)]` for this reason and because it is not crash-ordered), and **do not go back to whole-bitmap blobs**.
 
@@ -153,7 +156,7 @@ Further invariants:
 - **The two stores are reconciled at open, not kept atomic.** There is no marker across the bitmap and keymap stores. `DynFieldIndex::open` → `reconcile_at_open` drops values whose bitmap is missing, removes bitmaps no value maps to, and raises `next_slot` above every id either store holds. Content lost this way (and anything after the last checkpoint) comes back from **WAL replay**; a non-zero `damaged_at_open` makes `activate_field_index` record a `GapCause::DamagedIndexFile` full-rebuild gap, since dropped slots lost rows that replay from the checkpoint offset may not cover.
 - **Rehash never rewrites the live key table in place** (persistent stores): sync values, build the doubled table, write `blobs.keys.rehash`, rename over `blobs.keys`, fsync the dir, remap.
 
-Regression tests live beside the code in `blob_store.rs`, `field/value.rs` (`open_removes_an_orphan_bitmap_and_never_reuses_its_slot`, …) and `db/database_tests.rs` (damaged file → gap).
+Regression tests live beside the code in `blob_store.rs`, `dyn_index.rs` (`open_removes_an_orphan_bitmap_and_never_reuses_its_slot`, …) and `db/database_tests.rs` (damaged file → gap).
 
 #### Compaction is crash-safe via a staged file swap — do NOT rewrite in place
 

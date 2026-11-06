@@ -102,11 +102,11 @@ Before starting, re-run the search; the list below is what it found on
         --include=*.md --include=*.toml --include=*.rs . | grep -v "^./target\|^./work/"
 
 - [x] 4a. **Agent notes** (may keep the "why it changed"):
-      `minnal_db/src/index/CLAUDE.md` (ingest/checkpoint/compaction diagram,
+      `minnal_db/src/field_index/CLAUDE.md` (ingest/checkpoint/compaction diagram,
       *Blob store is append-only*, backpressure, crash-safety sections),
       `minnal_db/CLAUDE.md` (index checkpoint / replay batching notes),
       root `CLAUDE.md` (key knobs: `index_blob_*` thresholds, new overlay limits)
-- [x] 4b. **Architecture doc**: `minnal_db/src/index/Index-Architecture.md`
+- [x] 4b. **Architecture doc**: `minnal_db/src/field_index/doc/Field-Index-Architecture.md`
 - [x] 4c. **Operator docs**: `minnal_db_api/README.md` — index checkpoint,
       `GET /admin/storage/index-waste`, `GET /admin/indices/{ns}/{field}/blob-stats`,
       `POST /admin/storage/index-checkpoint`, config/metrics tables (new overlay
@@ -116,8 +116,8 @@ Before starting, re-run the search; the list below is what it found on
 - [x] 4d. **Config**: `config/sample.toml` comments; `minnal_db/src/db/config.rs`
       and `toml_config.rs` doc comments; `minnal_db_api/src/config.rs` and
       `config_report.rs` (reported knobs)
-- [x] 4e. **Code doc comments not touched in steps 1–3**: `bitmap.rs` type docs,
-      `field/field_index.rs`, `field/value.rs` (crash-atomicity section),
+- [x] 4e. **Code doc comments not touched in steps 1–3**: `bitmap/mod.rs` type docs,
+      `typed_index.rs`, `dyn_index.rs` (crash-atomicity section),
       `blob_store.rs`, `db/kv_store.rs` and `db/database.rs` (replay and
       backpressure comments), `db/index_checkpoint_worker.rs`,
       `db/index_manager.rs`, admin route docs in
@@ -162,7 +162,7 @@ Before starting, re-run the search; the list below is what it found on
   0.59 / 2.3 / 62 µs. Earlier rows in this log used anonymous in-memory
   stores, which read 0–7% faster than file pages.
 
-- **Step 4** (2026-10-08): docs for steps 1–3a — agent notes, `Index-Architecture.md`
+- **Step 4** (2026-10-08): docs for steps 1–3a — agent notes, `Field-Index-Architecture.md`
   (overlay, budget, spill order, repair at open), API README, `config/sample.toml`
   and config doc comments, stale code comments, FR-005 for the deferred format,
   *Results* in the evaluation. `benchmark.md` not touched: its numbers come

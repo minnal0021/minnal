@@ -20,7 +20,7 @@ minnal_db_api          ← Axum REST API server (binary; enables doc-store + sem
 minnal_tools           ← standalone bulk-loader binary
 minnal_db  (library, features: kv-store [default], doc-store, semantic-search)
     src/db/ src/store/     ← LSM + value-log KV engine (WiscKey-style)   [always]
-    src/index/            ← RoaringBitmap field indices + predicate evaluator   [always, part of kv-store]
+    src/field_index/      ← RoaringBitmap field indices + predicate evaluator   [always, part of kv-store]
     src/semantic_search/  ← IVF clustering, RaBitQ quantisation, ANN search, and vector_kv/: the vector↔KV bridge (DbVectorStore, upsert/delete, embed queue, qemb cache)   #[cfg(semantic-search)]
     src/doc_store/        ← JSON schema, doc lifecycle, KV store lifecycle, index builders   #[cfg(doc-store)]
 ```
@@ -64,7 +64,7 @@ src/lib.rs             — public API surface (re-exports; feature-gated)
 src/db/                — facade, config, namespace, WALs (both on `segmented_log.rs`), fail_log, TTL, stats, error
 src/store/             — LSM tree, value log, GC workers
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
-src/index/             — folded field-indexing module (always compiled)
+src/field_index/       — folded field-indexing module (always compiled)
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge)   #[cfg(semantic-search)]
 src/doc_store/         — folded document-store module   #[cfg(doc-store)]
 tests/                 — integration tests only; unit tests live inline in each module
@@ -120,7 +120,7 @@ may keep the "why it changed" history that stops a regression.)
 | `serde` + `serde_json` | Config, doc-store JSON, REST payloads |
 | `parking_lot` | All internal locks |
 | `mm3h` | MurmurHash3 for default row-ID derivation |
-| `memmap2` | Memory-mapped SSTable reads in `index/` |
+| `memmap2` | Memory-mapped SSTable reads in `field_index/` |
 | `axum` | REST API in `minnal_db_api/` |
 | `simsimd` | SIMD distance computations in `semantic_search/` |
 | `rayon` | Parallel index build in `semantic_search/` |

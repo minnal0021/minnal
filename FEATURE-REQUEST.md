@@ -852,12 +852,12 @@ by construction.
 ## FR-005 — Container-granular field-index files
 
 **Filed:** 2026-10-08
-**Area:** `minnal_db` (`src/index/`)
+**Area:** `minnal_db` (`src/field_index/`)
 **Severity:** Low — affects only fields whose changed bitmaps together exceed
 `thresholds.index_overlay_hard_bytes` (64 MiB by default)
 **Source:** field-index write-back work on branch `roaring_bit_map_fixes`
 (steps 1–3a done; this is step 3b–3d of
-`minnal_db/src/index/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+`minnal_db/src/field_index/doc/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
 **✅ Implemented:** 2026-10-09 (`0c04268`) — see *Implementation* below.
 
 ### Summary
@@ -884,7 +884,7 @@ would have to be rebuilt).
 - Crash tests: crash before each write step, with a random subset of dirty pages
   written back; reopen + replay must equal a full rebuild.
 
-The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
+The design is in `minnal_db/src/field_index/doc/Field-Index-Write-Back-Evaluation.md`
 (option 4, step 3).
 
 ### Acceptance criteria
@@ -896,14 +896,14 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
 
 ### Implementation
 
-- **Format** (`index/storage.rs`): each container is its own rkyv blob; a value's
+- **Format** (`field_index/bitmap/codec.rs`): each container is its own rkyv blob; a value's
   slot points at a checksummed directory (`MBD1`, container key → offset, len).
   `BlobStore` gained `BlobLayout::{Flat, Directory}` (keymap / bitmaps); dead and
   live bytes, open-time repair (a torn directory, or one listing a container past
   the file, counts as damaged → full-rebuild gap) and compaction read
   directories. On-disk version 1 → 2: older stores refuse to open (greenfield;
   delete and rebuild).
-- **Overlay** (`index/field/field_index.rs`): `slot → container key →
+- **Overlay** (`field_index/typed_index.rs`): `slot → container key →
   Option<Container>`, with the slot's decoded directory cached; a spill appends
   only the changed containers and a new directory.
 - **Tests:** `every_spill_phase_crash_recovers_to_the_ground_truth` (crash after
@@ -922,7 +922,7 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
 ## FR-006 — `reindex-all` compacts the row map
 
 **Filed:** 2026-10-09
-**Area:** `minnal_db` (`src/index/rowmap.rs`, `src/db/`), `minnal_db_api`
+**Area:** `minnal_db` (`src/field_index/rowmap.rs`, `src/db/`), `minnal_db_api`
 (`POST /admin/indices/{ns}/attribute/reindex-all`)
 **Severity:** Low — disk and page cache only; affects namespaces that write many
 short-lived keys
@@ -948,7 +948,7 @@ any field still holds it. A bit can survive a delete: a field whose delete was
 not yet on disk at a crash, a field with an unrepaired gap, or one field rebuilt
 before or after the row map. WAL replay only re-applies writes and never clears a
 bit it does not know about, so a reused ID would make the new key match queries
-for the old key's values, silently. See the module docs in `index/rowmap.rs`.
+for the old key's values, silently. See the module docs in `field_index/rowmap.rs`.
 
 ### Why the existing rebuilds do not fix it
 
