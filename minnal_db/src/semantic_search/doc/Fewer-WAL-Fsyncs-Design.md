@@ -82,7 +82,7 @@ The ones this note leans on most:
   of up to 256 written entries (`COMPLETION_BATCH`), then completes them
   (`make_vector_writes_durable`).
 
-**Partition maintenance** (`ivf_split.rs`)
+**Partition maintenance** (`ivf_split/mod.rs`)
 
 - **Chunk** — one sentence window of a document; its code (1 bit per dimension
   by default) is what Pass 1 of search scores.
@@ -325,7 +325,7 @@ Doc-store and vector tests:
 
 ## 6. What maintenance writes
 
-A drain (`ivf_split.rs`, module docs) runs through its journal record in steps;
+A drain (`ivf_split/mod.rs`, module docs) runs through its journal record in steps;
 the ones that write per document are:
 
 | Step | Per moved document, under its vector lock | Durable how, before Part 2 |
@@ -528,7 +528,7 @@ Checked against the code (2026-10-24):
   every posting that is not `Retired` in its probing set
   (`cluster/layout.rs`, `from_parts`). Routing uses `Active` postings only.
 - **Maintenance, rebuild and the recall check** pick from `Active` postings, or
-  filter out `Retired` ones (`ivf_split.rs`, `rebuild.rs`, `recall_check.rs`).
+  filter out `Retired` ones (`ivf_split/mod.rs`, `rebuild.rs`, `recall_check.rs`).
 - **A retired id is never handed out again.** New ids come from
   `NamespaceIvf::max_ids`, the largest id among all postings, retired ones
   included, and posting records are kept after retirement.
@@ -680,7 +680,7 @@ All eight are done.
 8. Docs: `semantic_search/CLAUDE.md` → *Durability split*, the root `CLAUDE.md`
    code conventions (which list every write that skips the main WAL and why),
    `Vector-Index-WAL-Design.md` (what is logged, record format) and the
-   `ivf_split.rs` module table.
+   `ivf_split/mod.rs` module table.
 
 ## Not covered here
 

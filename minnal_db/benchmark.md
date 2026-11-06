@@ -373,7 +373,7 @@ starts again from the first row on every page.
 A semantic search runs in two passes. Pass 1 picks the clusters nearest to the
 query and scores every document chunk stored in them with compact codes (1
 bit per dimension by default). Pass 2 re-scores the best candidates with more precise vectors. (See
-[Semantic-Search-Architecture.md](src/semantic_search/report/Semantic-Search-Architecture.md).)
+[Semantic-Search-Architecture.md](src/semantic_search/doc/Semantic-Search-Architecture.md).)
 This benchmark runs the full search over an in-memory store of 5,000
 documents with synthetic 768-dimension vectors, and a query shaped like
 production's: one vector for the whole query. The store is partitioned into 64

@@ -588,8 +588,8 @@ measured on frozen BEIR embeddings by the vector bench
 | `VectorIndex` struct + `VectorKvStore` trait | `minnal_db/src/semantic_search/index/vector_index.rs` |
 | Distance estimators (Pass 1 at any width, Pass 2 multi-bit) | `minnal_db/src/semantic_search/index/distance_estimator.rs` |
 | A store's partition (postings, centres, routing epoch) + choosing the postings a search reads | `minnal_db/src/semantic_search/cluster/layout.rs` |
-| Split, reassignment, merge, rebuild and their journal | `minnal_db/src/ivf_split.rs`, `minnal_db/src/ivf_split/` |
-| Recall check and partition history | `minnal_db/src/ivf_split/recall_check.rs`, `ivf_split/history.rs` |
+| Split, reassignment, merge, rebuild and their journal | `minnal_db/src/semantic_search/ivf_split/` |
+| Recall check and partition history | `minnal_db/src/semantic_search/ivf_split/recall_check.rs`, `minnal_db/src/semantic_search/ivf_split/history.rs` |
 | Background maintenance task and crash recovery | `minnal_db/src/doc_store/ivf_maintenance.rs` |
 | Per-store vector-index settings (defaults, validation) | `minnal_db/src/doc_store/vector_settings.rs` |
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |

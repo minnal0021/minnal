@@ -165,7 +165,7 @@ merged into L1, where its tombstone is dropped.
   `max_pinned_wal_segments` backstop forces out (see `minnal_db/CLAUDE.md`).
 - **Vector index WAL**: each namespace's retirement is tracked separately
   (seal records, a per-namespace ceiling); see the module docs of
-  `db/vector_index_wal.rs` and `semantic_search/report/Vector-Index-WAL-Design.md`.
+  `db/vector_index_wal.rs` and `semantic_search/doc/Vector-Index-WAL-Design.md`.
 
 `delete_segments_below` never deletes the active segment and stops at the
 first failure, so what is left is always one run of segments.

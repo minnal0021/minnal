@@ -25,7 +25,7 @@ use crate::AsyncDb;
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::schema_store::SchemaStore;
 use crate::doc_store::store::SemanticSearchContext;
-use crate::ivf_split;
+use crate::semantic_search::ivf_split;
 
 /// Default maintenance threads per process.
 pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;

@@ -315,8 +315,8 @@ impl MaintenanceSettings {
 
     /// What the partition's maintenance runs with.
     #[cfg(feature = "semantic-search")]
-    pub fn ops(&self) -> crate::ivf_split::MaintenanceOps {
-        crate::ivf_split::MaintenanceOps {
+    pub fn ops(&self) -> crate::semantic_search::ivf_split::MaintenanceOps {
+        crate::semantic_search::ivf_split::MaintenanceOps {
             split_limit: u64::from(self.split_limit()),
             merge_limit: u64::from(self.merge_limit()),
             reassign_range: self.reassign_range as usize,

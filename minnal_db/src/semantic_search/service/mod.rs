@@ -163,7 +163,7 @@ impl Default for SemanticSearchConfig {
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
             query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
-            partition_history_ttl: crate::ivf_split::history::DEFAULT_HISTORY_TTL,
+            partition_history_ttl: crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL,
             embedding_request_timeout: std::time::Duration::from_secs(30),
             embedding_connect_timeout: std::time::Duration::from_secs(10),
         }
@@ -273,7 +273,7 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
 ///
 /// Queries used to be split into 4-word sliding windows, each embedded on its
 /// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
-/// `semantic_search/report/query-embedding-report.md`) found the whole-query vector
+/// `semantic_search/doc/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
 /// It is also much cheaper: one embedding instead of 1 + N, and one vector's

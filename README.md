@@ -182,7 +182,7 @@ The `semantic-search` feature implements this as IVF (Inverted File Index) appro
 
 #### IVF Partitions
 
-Each store partitions its own embeddings into **postings**: groups of nearby chunk vectors, each with a centre. Nothing is fitted in advance and no centroid file is needed. A store that enables semantic search starts with a single posting, and a background task keeps the partition in shape as documents arrive and leave, following SPFresh's LIRE protocol (see [Acknowledgements](#spfresh); the design, its parameters and trade-offs are in [Semantic-Search-Architecture.md §3](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#3-dynamic-partitioning-the-ivf-index)):
+Each store partitions its own embeddings into **postings**: groups of nearby chunk vectors, each with a centre. Nothing is fitted in advance and no centroid file is needed. A store that enables semantic search starts with a single posting, and a background task keeps the partition in shape as documents arrive and leave, following SPFresh's LIRE protocol (see [Acknowledgements](#spfresh); the design, its parameters and trade-offs are in [Semantic-Search-Architecture.md §3](minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#3-dynamic-partitioning-the-ivf-index)):
 
 - **Split.** A posting that grows past twice `target_posting_size` (default 128 chunks) is divided in two by balanced 2-means on its stored codes.
 - **Reassign.** After a split, any chunk of the two halves or of the 64 nearest postings that is now closer to another posting's centre moves to its nearest posting.
@@ -198,7 +198,7 @@ Each document write triggers a **single embedding service call** that embeds one
 
 1. **MultiBit (dense)** — one embedding for the entire document, quantised to 8 bits per dimension. Stored in a `{ns}_dense_vector` companion namespace keyed directly by `doc_id`. At 8 bits, a 768-dimensional embedding compresses from ~3 KB (f32) to ~768 bytes — a 4× reduction with high recall fidelity.
 
-2. **Chunk codes (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension by default. Stored in a `{ns}_sparse_vector` namespace under composite keys `[posting_id (4 bytes) || doc_id]`. At 1 bit, each chunk code is 96 bytes — a 32× reduction, enabling fast posting prefix scans over large corpora. A store can choose 2 or 4 bits instead (`vector_index.quantisation.pass1_bits`, fixed once semantic search is enabled): chunks are placed in the right posting more often and Pass 1 hands a better candidate list to Pass 2, at the cost of storage (1.7× at 2 bits, 3× at 4) and, at 4 bits, slower searches. On SciFact and FiQA the final ranking was the same at every width; see [*Choosing a Pass-1 width*](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
+2. **Chunk codes (sparse)** — the document text is split into overlapping chunks using a sliding window (`window_size`, `sliding_size`). Each chunk is independently embedded and quantised to 1 bit per dimension by default. Stored in a `{ns}_sparse_vector` namespace under composite keys `[posting_id (4 bytes) || doc_id]`. At 1 bit, each chunk code is 96 bytes — a 32× reduction, enabling fast posting prefix scans over large corpora. A store can choose 2 or 4 bits instead (`vector_index.quantisation.pass1_bits`, fixed once semantic search is enabled): chunks are placed in the right posting more often and Pass 1 hands a better candidate list to Pass 2, at the cost of storage (1.7× at 2 bits, 3× at 4) and, at 4 bits, slower searches. On SciFact and FiQA the final ranking was the same at every width; see [*Choosing a Pass-1 width*](minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
 
 A third namespace, `{ns}_sparse_vector_meta`, records which postings hold each document's sparse chunks, and how many, used for stale-key cleanup on delete and upsert and to count each posting's size.
 
@@ -257,7 +257,7 @@ The set of models is **data-driven**: no code change, recompile or centroid file
 
 A store's model and dimension are fixed once set, because its stored vectors come from that model. To search a corpus with another model, create a new store for it.
 
-For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md).
+For the full end-to-end design — embedding generation, dual quantisation, index structure, two-pass query execution, storage layout, crash recovery, and hybrid search — see [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md).
 
 ### Layer 4 — Document Store + KV Store (`doc-store`)
 
@@ -293,7 +293,7 @@ When `semantic_search_enabled` is `true` and an embedding field is declared, eve
 
 Document writes return immediately without blocking on the embedding service. Vector index entries may lag slightly behind the most recent writes. If the embedding service is temporarily unavailable, entries are retried with configurable back-off (see `[vector_index]` below).
 
-**Crash recovery.** Because the queue entry and the document are two separate writes, every write queues first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the document and rewrites it to match what the document holds. So after a crash the worker only drains the queue; nothing scans the documents. Details: [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
+**Crash recovery.** Because the queue entry and the document are two separate writes, every write queues first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the document and rewrites it to match what the document holds. So after a crash the worker only drains the queue; nothing scans the documents. Details: [`Semantic-Search-Architecture.md`](minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
 
 ### Layer 5 — REST API (`minnal_db_api`)
 
@@ -426,7 +426,7 @@ The reference implementation of ColBERTv2 and PLAID is available at:
 
 ### SPFresh
 
-The way each store grows and maintains its own IVF partition is SPFresh's LIRE (Lightweight Incremental REbalancing) protocol: a posting that grows too large is split, the nearby vectors the split leaves misplaced are reassigned, and postings that shrink too small are merged, all in place while the index keeps serving reads and writes. minnal follows LIRE's split, reassignment and merge rules and uses the parameters of its reference implementation, SPTAG. It works on the chunk codes (1 bit per dimension by default) instead of full vectors, uses mean centres instead of medoids, and keeps no replicas; the full list of differences, and why, is in [Semantic-Search-Architecture.md §3.6](minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#36-where-minnal-differs-from-spfresh).
+The way each store grows and maintains its own IVF partition is SPFresh's LIRE (Lightweight Incremental REbalancing) protocol: a posting that grows too large is split, the nearby vectors the split leaves misplaced are reassigned, and postings that shrink too small are merged, all in place while the index keeps serving reads and writes. minnal follows LIRE's split, reassignment and merge rules and uses the parameters of its reference implementation, SPTAG. It works on the chunk codes (1 bit per dimension by default) instead of full vectors, uses mean centres instead of medoids, and keeps no replicas; the full list of differences, and why, is in [Semantic-Search-Architecture.md §3.6](minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#36-where-minnal-differs-from-spfresh).
 
 > **SPFresh: Incremental In-Place Update for Billion-Scale Vector Search**
 > Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, Mao Yang

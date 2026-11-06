@@ -658,7 +658,7 @@ async fn vector_bench() {
     // The production maintenance at `target`: split at 2x, merge at SPFresh's
     // 10/118 of that, reassign over `MINNAL_BENCH_REASSIGN` (64) neighbours, the
     // error-bound gate when `MINNAL_BENCH_GATE=1`.
-    let ops = crate::ivf_split::MaintenanceOps {
+    let ops = crate::semantic_search::ivf_split::MaintenanceOps {
         split_limit: 2 * u64::from(target),
         merge_limit: (2.0 * f64::from(target) * 10.0 / 118.0).round() as u64,
         reassign_range: env_or("MINNAL_BENCH_REASSIGN", "64").parse().unwrap(),
@@ -691,7 +691,9 @@ async fn vector_bench() {
         }
         if mode == "grow" {
             let tm = Instant::now();
-            crate::ivf_split::maintain_partition(&db, NS, &handle, &ops).await.unwrap();
+            crate::semantic_search::ivf_split::maintain_partition(&db, NS, &handle, &ops)
+                .await
+                .unwrap();
             if std::env::var("MINNAL_BENCH_TRACE").is_ok() {
                 let c = handle.counters().read();
                 eprintln!(
@@ -731,7 +733,9 @@ async fn vector_bench() {
                 r.unwrap();
             }
             if mode == "grow" {
-                crate::ivf_split::maintain_partition(&db, NS, &handle, &ops).await.unwrap();
+                crate::semantic_search::ivf_split::maintain_partition(&db, NS, &handle, &ops)
+                    .await
+                    .unwrap();
             }
         }
         eprintln!(
@@ -779,12 +783,12 @@ async fn vector_bench() {
         None
     };
     let rebuild = if rebuilding {
-        let params = crate::ivf_split::rebuild::RebuildParams {
+        let params = crate::semantic_search::ivf_split::rebuild::RebuildParams {
             postings: None,
             threads: env_or("MINNAL_BENCH_REBUILD_THREADS", "2").parse().unwrap(),
         };
         let tr = Instant::now();
-        let r = crate::ivf_split::rebuild::rebuild_partition(&db, NS, &handle, &ops, &params)
+        let r = crate::semantic_search::ivf_split::rebuild::rebuild_partition(&db, NS, &handle, &ops, &params)
             .await
             .unwrap();
         let secs = tr.elapsed().as_secs_f64();
@@ -1541,8 +1545,10 @@ async fn recall_check_report(
     config: &SemanticSearchConfig,
     frozen: &Frozen,
 ) {
-    use crate::ivf_split::recall_check::{RecallCheckParams, recall_check};
-    let (summary, _) = crate::ivf_split::health::partition_health(db, NS, handle, true).await.unwrap();
+    use crate::semantic_search::ivf_split::recall_check::{RecallCheckParams, recall_check};
+    let (summary, _) = crate::semantic_search::ivf_split::health::partition_health(db, NS, handle, true)
+        .await
+        .unwrap();
     let c = summary.codes.unwrap_or_default();
     eprintln!(
         "  [{when}] {} postings; drift mean {:.3}, p90 {:.3}, foreign {:.3}",

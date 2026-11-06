@@ -16,8 +16,8 @@ impl DocStore {
     ) -> Result<
         (
             crate::doc_store::vector_settings::MaintenanceSettings,
-            crate::ivf_split::health::PartitionHealth,
-            Vec<crate::ivf_split::health::PostingHealth>,
+            crate::semantic_search::ivf_split::health::PartitionHealth,
+            Vec<crate::semantic_search::ivf_split::health::PostingHealth>,
         ),
         DocStoreError,
     > {
@@ -27,13 +27,13 @@ impl DocStore {
         self.schemas.require_semantic_search(namespace)?;
         let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
         let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
-        let (summary, postings) = crate::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
+        let (summary, postings) = crate::semantic_search::ivf_split::health::partition_health(&self.db, namespace, &ns.partition, codes).await?;
         if codes {
             record_history(
                 &self.db,
                 self.vector_partition_history_ttl(),
                 namespace,
-                crate::ivf_split::history::RecordKind::Codes,
+                crate::semantic_search::ivf_split::history::RecordKind::Codes,
                 &summary,
             )
             .await;
@@ -46,14 +46,18 @@ impl DocStore {
     /// against each, which reads every chunk code. No centre vectors are
     /// returned.
     #[cfg(feature = "semantic-search")]
-    pub async fn vector_centres(&self, namespace: &str, codes: bool) -> Result<Vec<crate::ivf_split::health::CentreHealth>, DocStoreError> {
+    pub async fn vector_centres(
+        &self,
+        namespace: &str,
+        codes: bool,
+    ) -> Result<Vec<crate::semantic_search::ivf_split::health::CentreHealth>, DocStoreError> {
         let Some(ctx) = &self.semantic_ctx else {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         };
         self.schemas.require_semantic_search(namespace)?;
         let (settings, ns_id) = self.schemas.vector_settings(namespace)?;
         let ns = ctx.for_namespace(&self.db, namespace, ns_id, &settings).await?;
-        Ok(crate::ivf_split::health::centre_health(&self.db, namespace, &ns.partition, codes).await?)
+        Ok(crate::semantic_search::ivf_split::health::centre_health(&self.db, namespace, &ns.partition, codes).await?)
     }
 
     /// Check whether `namespace`'s searches miss what a full read finds, the
@@ -67,9 +71,9 @@ impl DocStore {
     pub async fn vector_recall_check(
         &self,
         namespace: &str,
-        params: &crate::ivf_split::recall_check::RecallCheckParams,
+        params: &crate::semantic_search::ivf_split::recall_check::RecallCheckParams,
         overrides: &crate::doc_store::vector_settings::SearchSpec,
-    ) -> Result<crate::ivf_split::recall_check::RecallCheck, DocStoreError> {
+    ) -> Result<crate::semantic_search::ivf_split::recall_check::RecallCheck, DocStoreError> {
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
@@ -88,12 +92,13 @@ impl DocStore {
             params.seed,
         )
         .await?;
-        let check = crate::ivf_split::recall_check::recall_check(&self.db, namespace, &ns.partition, &ns.config, params, cached).await?;
+        let check =
+            crate::semantic_search::ivf_split::recall_check::recall_check(&self.db, namespace, &ns.partition, &ns.config, params, cached).await?;
         record_history(
             &self.db,
             self.vector_partition_history_ttl(),
             namespace,
-            crate::ivf_split::history::RecordKind::RecallCheck,
+            crate::semantic_search::ivf_split::history::RecordKind::RecallCheck,
             &check,
         )
         .await;
@@ -235,12 +240,12 @@ impl DocStore {
             "partition_history_ttl_secs": ctx.config.partition_history_ttl.as_secs(),
             "maintenance_threads": ctx.maintenance_threads,
             "rebuild_threads": ctx.rebuild_threads,
-            "max_rebuild_threads": crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            "max_rebuild_threads": crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             "recall_check": {
-                "max_sample": crate::ivf_split::recall_check::MAX_SAMPLE,
-                "min_cached_queries": crate::ivf_split::recall_check::MIN_GIVEN_QUERIES,
-                "max_reference_entries": crate::ivf_split::recall_check::MAX_REFERENCE_ENTRIES,
-                "default_min_overlap": crate::ivf_split::recall_check::DEFAULT_MIN_OVERLAP,
+                "max_sample": crate::semantic_search::ivf_split::recall_check::MAX_SAMPLE,
+                "min_cached_queries": crate::semantic_search::ivf_split::recall_check::MIN_GIVEN_QUERIES,
+                "max_reference_entries": crate::semantic_search::ivf_split::recall_check::MAX_REFERENCE_ENTRIES,
+                "default_min_overlap": crate::semantic_search::ivf_split::recall_check::DEFAULT_MIN_OVERLAP,
             },
             "namespace_defaults": {
                 "search": {
@@ -271,7 +276,9 @@ impl DocStore {
     pub fn vector_partition_history_ttl(&self) -> std::time::Duration {
         self.semantic_ctx
             .as_ref()
-            .map_or(crate::ivf_split::history::DEFAULT_HISTORY_TTL, |c| c.config.partition_history_ttl)
+            .map_or(crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL, |c| {
+                c.config.partition_history_ttl
+            })
     }
 
     /// `namespace`'s partition history, newest first: code-health reads, recall
@@ -282,14 +289,14 @@ impl DocStore {
     pub async fn vector_partition_history(
         &self,
         namespace: &str,
-        kind: Option<crate::ivf_split::history::RecordKind>,
+        kind: Option<crate::semantic_search::ivf_split::history::RecordKind>,
         limit: usize,
-    ) -> Result<Vec<crate::ivf_split::history::HistoryRecord>, DocStoreError> {
+    ) -> Result<Vec<crate::semantic_search::ivf_split::history::HistoryRecord>, DocStoreError> {
         if self.semantic_ctx.is_none() {
             return Err(DocStoreError::EmbeddingFailed("semantic search not configured on this store".into()));
         }
         self.schemas.require_semantic_search(namespace)?;
-        Ok(crate::ivf_split::history::read(&self.db, namespace, kind, limit, self.vector_partition_history_ttl()).await?)
+        Ok(crate::semantic_search::ivf_split::history::read(&self.db, namespace, kind, limit, self.vector_partition_history_ttl()).await?)
     }
 
     /// Start rebuilding `namespace`'s partition from its codes (design doc M4)
@@ -310,12 +317,14 @@ impl DocStore {
         tokio::spawn(async move {
             let result = async {
                 let ns = ctx.for_namespace(&db, &namespace, ns_id, &settings).await?;
-                let params = crate::ivf_split::rebuild::RebuildParams {
+                let params = crate::semantic_search::ivf_split::rebuild::RebuildParams {
                     postings,
                     threads: ctx.rebuild_threads,
                 };
                 let ops = settings.maintenance.ops();
-                Ok::<_, DocStoreError>(crate::ivf_split::rebuild::rebuild_partition(&db, &namespace, &ns.partition, &ops, &params).await?)
+                Ok::<_, DocStoreError>(
+                    crate::semantic_search::ivf_split::rebuild::rebuild_partition(&db, &namespace, &ns.partition, &ops, &params).await?,
+                )
             }
             .await;
             match &result {
@@ -336,7 +345,7 @@ impl DocStore {
                     &db,
                     ctx.config.partition_history_ttl,
                     &namespace,
-                    crate::ivf_split::history::RecordKind::Rebuild,
+                    crate::semantic_search::ivf_split::history::RecordKind::Rebuild,
                     &status,
                 )
                 .await;
@@ -347,7 +356,7 @@ impl DocStore {
 
     /// `namespace`'s last partition rebuild since the server started.
     #[cfg(feature = "semantic-search")]
-    pub fn vector_rebuild_status(&self, namespace: &str) -> Option<crate::ivf_split::rebuild::RebuildStatus> {
+    pub fn vector_rebuild_status(&self, namespace: &str) -> Option<crate::semantic_search::ivf_split::rebuild::RebuildStatus> {
         self.semantic_ctx.as_ref()?.rebuild_status(namespace)
     }
 
@@ -933,10 +942,10 @@ async fn record_history(
     db: &AsyncDb,
     ttl: std::time::Duration,
     namespace: &str,
-    kind: crate::ivf_split::history::RecordKind,
+    kind: crate::semantic_search::ivf_split::history::RecordKind,
     data: &impl serde::Serialize,
 ) {
-    if let Err(e) = crate::ivf_split::history::record(db, namespace, kind, data, ttl).await {
+    if let Err(e) = crate::semantic_search::ivf_split::history::record(db, namespace, kind, data, ttl).await {
         log::warn!("partition history: namespace='{namespace}' {kind:?} not recorded: {e}");
     }
 }

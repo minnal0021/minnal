@@ -399,7 +399,7 @@ sequenceDiagram
 
 **A failed fsync stops the log** until the database is reopened: the kernel may have dropped the unwritten pages, so a later successful fsync proves nothing about them. Appends and syncs then fail, vector indexing stops, and documents stay queued.
 
-The design and its measurements are in `src/semantic_search/report/Vector-Index-WAL-Design.md` and `Fewer-WAL-Fsyncs-Design.md`.
+The design and its measurements are in `src/semantic_search/doc/Vector-Index-WAL-Design.md` and `Fewer-WAL-Fsyncs-Design.md`.
 
 ### WAL terms
 

@@ -299,7 +299,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 **Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
 
-**Crash recovery.** Writing the document and queuing its embed job are two separate steps, so the queue entry always comes first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the stored document and rewrites it to match. Deletes follow the same rule: the vectors go first, the document last. After a restart the worker just drains the queue; nothing scans the documents, so no manual step is needed. Details: [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
+**Crash recovery.** Writing the document and queuing its embed job are two separate steps, so the queue entry always comes first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the stored document and rewrites it to match. Deletes follow the same rule: the vectors go first, the document last. After a restart the worker just drains the queue; nothing scans the documents, so no manual step is needed. Details: [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
 
 To re-embed every document of one namespace (for example after corruption), use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
 
@@ -475,7 +475,7 @@ curl -X POST http://localhost:8080/stores \
 Wider chunk codes make the first search pass rank its candidates better and
 keep chunks in their nearest partition, at the cost of more storage (1.7× at
 2 bits, 3× at 4) and, at 4 bits, slower searches; how to choose is in
-[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
+[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
 The fixed settings are kept if the vector index is dropped, and re-enabling it
 (`enable_vector_index`) with a different value for one of them returns `409`.
 
@@ -614,7 +614,7 @@ this many), `min_probes` (a floor for requests that lower `max_probes`),
 `maintenance` accepts `target_posting_size`, `reassign_range`, `merge_ratio`,
 `skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
 and `split_lambda_factor`. What each one does, its default and its allowed range
-are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
+are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/doc/Semantic-Search-Architecture.md#34-parameters).
 The embedding model, dimension, chunking and Pass-1 code width
 (`quantisation.pass1_bits`) are fixed once semantic search is enabled and cannot
 be changed here. A value out of range returns `400`; a store

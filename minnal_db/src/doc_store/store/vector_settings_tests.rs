@@ -392,7 +392,7 @@ mod with_service {
             let db = Arc::clone(&store.db);
             async move {
                 let ivf = partition.snapshot();
-                let keys = crate::ivf_split::recount_chunks(&db, "g").await.unwrap();
+                let keys = crate::semantic_search::ivf_split::recount_chunks(&db, "g").await.unwrap();
                 for (p, n) in &keys {
                     assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
                     assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
@@ -413,7 +413,7 @@ mod with_service {
         let ctx = Arc::clone(store.semantic_ctx.as_ref().unwrap());
         let partition = ctx.for_namespace(&store.db, "g", ns_id, &settings).await.unwrap().partition;
         let ivf = partition.snapshot();
-        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        let keys = crate::semantic_search::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
         for (p, n) in &keys {
             assert_eq!(ivf.posting_chunks(*p), *n, "posting {p} after reopen");
         }
@@ -478,7 +478,7 @@ mod with_service {
         let ivf = partition.snapshot();
         assert!(partition.counters().read().merges > 0, "{:?}", partition.counters().read());
         assert!(ivf.postings() < grown, "{} posting(s), grown to {grown}", ivf.postings());
-        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        let keys = crate::semantic_search::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
         for (p, n) in &keys {
             assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
             assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
@@ -499,7 +499,7 @@ mod with_service {
     /// rebuild is refused while one runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rebuild_runs_in_the_background_without_the_embedding_service() {
-        use crate::ivf_split::rebuild::RebuildState;
+        use crate::semantic_search::ivf_split::rebuild::RebuildState;
         let (url, seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
@@ -557,14 +557,14 @@ mod with_service {
         assert_eq!(seen.lock().len(), calls, "a rebuild makes no embedding request");
 
         // A recall check makes none either; it and the rebuild are in the history.
-        let params = crate::ivf_split::recall_check::RecallCheckParams {
+        let params = crate::semantic_search::ivf_split::recall_check::RecallCheckParams {
             sample: 10,
             ..Default::default()
         };
         let check = store.vector_recall_check("g", &params, &SearchSpec::default()).await.unwrap();
         assert_eq!(check.sampled, 10, "{check:?}");
         assert_eq!(seen.lock().len(), calls, "a recall check makes no embedding request");
-        use crate::ivf_split::history::RecordKind;
+        use crate::semantic_search::ivf_split::history::RecordKind;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let kinds = loop {
             let kinds: Vec<RecordKind> = store
@@ -587,7 +587,7 @@ mod with_service {
         assert_eq!(last[0].data["sampled"], 10);
 
         let ivf = partition.snapshot();
-        let keys = crate::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
+        let keys = crate::semantic_search::ivf_split::recount_chunks(&store.db, "g").await.unwrap();
         for (p, n) in &keys {
             assert_eq!(ivf.posting_infos()[p].state, crate::semantic_search::PostingState::Active, "posting {p}");
             assert_eq!(ivf.posting_chunks(*p), *n, "posting {p}");
@@ -1160,7 +1160,9 @@ mod with_service {
             dropping.await.unwrap();
             // Maintenance on the partition it held, as a queued request would run it.
             assert!(
-                crate::ivf_split::maintain_partition(&store.db, "g", &handle, &ops).await.is_err(),
+                crate::semantic_search::ivf_split::maintain_partition(&store.db, "g", &handle, &ops)
+                    .await
+                    .is_err(),
                 "drop_store={drop_store}: maintenance went on after the drop"
             );
             let left = companions_left(&store, "g");
@@ -1821,7 +1823,14 @@ mod with_service {
         // A split cut short once it is published (the copy fails), as a crash
         // would leave it.
         crate::vector_kv::crash_point::arm(7);
-        let split = crate::ivf_split::split_posting(&store.db, "g", &handle, 0, &crate::ivf_split::MaintenanceOps::split_only(1)).await;
+        let split = crate::semantic_search::ivf_split::split_posting(
+            &store.db,
+            "g",
+            &handle,
+            0,
+            &crate::semantic_search::ivf_split::MaintenanceOps::split_only(1),
+        )
+        .await;
         crate::vector_kv::crash_point::disarm();
         assert!(split.is_err(), "set-up: the split was cut short");
         let journal = || async {

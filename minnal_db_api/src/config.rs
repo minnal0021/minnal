@@ -665,9 +665,9 @@ impl MaintenanceSection {
     }
 
     /// Rebuild threads, defaulted and checked (1 to
-    /// [`MAX_REBUILD_THREADS`](minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    /// [`MAX_REBUILD_THREADS`](minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub fn rebuild_threads(&self) -> Result<usize, String> {
-        let max = minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS;
+        let max = minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS;
         let t = self.rebuild_threads.unwrap_or(max);
         if !(1..=max).contains(&t) {
             return Err(format!("maintenance.rebuild_threads must be between 1 and {max}, got {t}"));

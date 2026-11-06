@@ -695,7 +695,7 @@ pub async fn vector_partition(
     // The last recall check, from the history (never run here: it is costly).
     let last_check = state
         .store
-        .vector_partition_history(&ns, Some(minnal_db::ivf_split::history::RecordKind::RecallCheck), 1)
+        .vector_partition_history(&ns, Some(minnal_db::semantic_search::ivf_split::history::RecordKind::RecallCheck), 1)
         .await
         .ok()
         .and_then(|mut r| r.pop());
@@ -765,7 +765,7 @@ pub async fn vector_recall_check(
     Path(ns): Path<String>,
     Query(params): Query<RecallCheckParams>,
 ) -> axum::response::Response {
-    use minnal_db::ivf_split::recall_check as rc;
+    use minnal_db::semantic_search::ivf_split::recall_check as rc;
     let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
     let defaults = rc::RecallCheckParams::default();
     let sample = params.sample.unwrap_or(defaults.sample);
@@ -914,8 +914,8 @@ pub struct HistoryParams {
     pub limit: Option<usize>,
 }
 
-fn parse_history_kind(kind: &str) -> Option<minnal_db::ivf_split::history::RecordKind> {
-    use minnal_db::ivf_split::history::RecordKind;
+fn parse_history_kind(kind: &str) -> Option<minnal_db::semantic_search::ivf_split::history::RecordKind> {
+    use minnal_db::semantic_search::ivf_split::history::RecordKind;
     match kind {
         "codes" => Some(RecordKind::Codes),
         "recall_check" => Some(RecordKind::RecallCheck),
@@ -938,10 +938,10 @@ pub async fn vector_history(State(state): State<AppState>, Path(ns): Path<String
         },
     };
     let limit = params.limit.unwrap_or(50);
-    if !(1..=minnal_db::ivf_split::history::MAX_HISTORY_LIMIT).contains(&limit) {
+    if !(1..=minnal_db::semantic_search::ivf_split::history::MAX_HISTORY_LIMIT).contains(&limit) {
         return bad(format!(
             "limit must be between 1 and {}, got {limit}",
-            minnal_db::ivf_split::history::MAX_HISTORY_LIMIT
+            minnal_db::semantic_search::ivf_split::history::MAX_HISTORY_LIMIT
         ));
     }
     match state.store.vector_partition_history(&ns, kind, limit).await {
@@ -1066,7 +1066,7 @@ pub async fn vector_postings(
     if let Some(s) = params.state.as_deref() {
         postings.retain(|p| p.state == s);
     }
-    let key = |p: &minnal_db::ivf_split::health::PostingHealth| -> f64 {
+    let key = |p: &minnal_db::semantic_search::ivf_split::health::PostingHealth| -> f64 {
         match sort {
             "entries" => p.entries as f64,
             "chunks" => p.chunks as f64,
@@ -1171,7 +1171,7 @@ pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String
     if let Some(s) = params.state.as_deref() {
         centres.retain(|c| c.state == s);
     }
-    let key = |c: &minnal_db::ivf_split::health::CentreHealth| -> u64 {
+    let key = |c: &minnal_db::semantic_search::ivf_split::health::CentreHealth| -> u64 {
         match sort {
             "codes" => c.codes.unwrap_or(0),
             "postings" => c.postings.len() as u64,

@@ -1020,7 +1020,7 @@ document ID, so they are unaffected.
 ## FR-007 — A recall check that says when a rebuild helps
 
 **Filed:** 2026-10-12
-**Area:** `minnal_db` (`src/ivf_split/recall_check.rs`, `src/ivf_split/history.rs`,
+**Area:** `minnal_db` (`src/semantic_search/ivf_split/recall_check.rs`, `src/semantic_search/ivf_split/history.rs`,
 `src/doc_store/store/vector.rs`), `minnal_db_api`
 (`GET /admin/indices/{ns}/vector/recall-check`, `GET /admin/indices/{ns}/vector/history`)
 **Severity:** Low — operators had no measured way to decide on a rebuild
@@ -1138,7 +1138,7 @@ above it the reference reads the nearest postings up to the cap
 ## FR-008 — Collect unused IVF centres
 
 **Filed:** 2026-10-18
-**Area:** `minnal_db` (`src/ivf_split/rebuild.rs`, `src/semantic_search/cluster/layout.rs`,
+**Area:** `minnal_db` (`src/semantic_search/ivf_split/rebuild.rs`, `src/semantic_search/cluster/layout.rs`,
 `{ns}_ivf_centres`)
 **Severity:** Low — memory and disk only; no effect on search results or speed
 **Source:** dynamic RaBitQ index, design decision 14 (deferred 2026-10-17)
@@ -1228,7 +1228,7 @@ patch.
   and FiQA after a rebuild with collection, against one without.
 
 The design and its risk table are in
-`minnal_db/src/semantic_search/report/Dynamic-RaBitQ-Index-Design.md` →
+`minnal_db/src/semantic_search/doc/Dynamic-RaBitQ-Index-Design.md` →
 *Known limitation: centres are never collected*.
 
 ---
@@ -1666,10 +1666,10 @@ Measured at `8636575` on WSL2, tmpfs, each test alone:
 All in test code, except for the nightly job.
 
 1. **Record each crash point's site.** Both `crash_point!` macros (`vector_kv.rs`,
-   `ivf_split.rs`) pass their `file:line` to the `crash_point` module, and
+   `semantic_search/ivf_split/mod.rs`) pass their `file:line` to the `crash_point` module, and
    `crash_point::trace()` runs with no crash and returns the ordered list of sites.
    Tests that call `arm(n)` directly are unaffected.
-2. **Pick the cases with a pure function** in `ivf_split/tests.rs`, with its own unit
+2. **Pick the cases with a pure function** in `semantic_search/ivf_split/tests.rs`, with its own unit
    tests: `select_cases(trace, mode) -> Vec<(Flushed, usize)>`. The default mode keeps
    the proposed set. Full mode, set by `MINNAL_FULL_CRASH_AUDIT=1`, keeps every position
    under all four flushes. Both include the final no-crash run.

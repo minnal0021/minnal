@@ -906,7 +906,7 @@ impl Grace {
 /// - **Maintenance lock.** One maintenance operation per namespace at a time.
 /// - **Recovery.** A handle starts out needing its journal recovered (a crash
 ///   may have left an operation half done), and is marked so again after any
-///   maintenance error; [`crate::ivf_split::ensure_recovered`] runs recovery
+///   maintenance error; [`crate::semantic_search::ivf_split::ensure_recovered`] runs recovery
 ///   before anything else uses it.
 /// - **Dropped.** Set when its namespace's vector index is dropped: maintenance
 ///   then stops, so it never writes (and so recreates) a dropped namespace.

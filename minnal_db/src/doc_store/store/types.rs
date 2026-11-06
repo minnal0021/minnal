@@ -286,10 +286,10 @@ pub struct SemanticSearchContext {
     /// Namespaces maintained at once by the partition maintenance task.
     pub maintenance_threads: usize,
     /// Threads a partition rebuild's k-means uses (at most
-    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    /// [`MAX_REBUILD_THREADS`](crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub rebuild_threads: usize,
     /// Each namespace's last rebuild since start.
-    rebuilds: parking_lot::Mutex<std::collections::HashMap<String, crate::ivf_split::rebuild::RebuildStatus>>,
+    rebuilds: parking_lot::Mutex<std::collections::HashMap<String, crate::semantic_search::ivf_split::rebuild::RebuildStatus>>,
     /// Reaches the partition maintenance task, once it runs.
     maintenance_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
@@ -332,7 +332,7 @@ impl SemanticSearchContext {
             supported_models: std::collections::BTreeMap::new(),
             index_defaults: crate::doc_store::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::doc_store::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
-            rebuild_threads: crate::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -354,15 +354,15 @@ impl SemanticSearchContext {
     }
 
     /// Run rebuilds' k-means on `threads` threads (1 to
-    /// [`MAX_REBUILD_THREADS`](crate::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    /// [`MAX_REBUILD_THREADS`](crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub fn with_rebuild_threads(mut self, threads: usize) -> Self {
-        self.rebuild_threads = threads.clamp(1, crate::ivf_split::rebuild::MAX_REBUILD_THREADS);
+        self.rebuild_threads = threads.clamp(1, crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS);
         self
     }
 
     /// Mark a rebuild of `namespace` as running, unless one already is.
     pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
-        use crate::ivf_split::rebuild::{RebuildState, RebuildStatus};
+        use crate::semantic_search::ivf_split::rebuild::{RebuildState, RebuildStatus};
         let mut rebuilds = self.rebuilds.lock();
         if rebuilds.get(namespace).is_some_and(|s| s.state == RebuildState::Running) {
             return Err(DocStoreError::VecRebuildInProgress {
@@ -384,8 +384,8 @@ impl SemanticSearchContext {
     }
 
     /// Record how `namespace`'s running rebuild ended.
-    pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::ivf_split::rebuild::RebuildReport, String>) {
-        use crate::ivf_split::rebuild::RebuildState;
+    pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::semantic_search::ivf_split::rebuild::RebuildReport, String>) {
+        use crate::semantic_search::ivf_split::rebuild::RebuildState;
         if let Some(status) = self.rebuilds.lock().get_mut(namespace) {
             status.finished_at_ms = Some(unix_ms());
             match result {
@@ -402,7 +402,7 @@ impl SemanticSearchContext {
     }
 
     /// `namespace`'s last rebuild since start, if any.
-    pub fn rebuild_status(&self, namespace: &str) -> Option<crate::ivf_split::rebuild::RebuildStatus> {
+    pub fn rebuild_status(&self, namespace: &str) -> Option<crate::semantic_search::ivf_split::rebuild::RebuildStatus> {
         self.rebuilds.lock().get(namespace).cloned()
     }
 
@@ -593,7 +593,7 @@ impl SemanticSearchContext {
         // route to postings recovery then retires, and maintenance would start
         // on top of the unfinished operation. A recovery failure is returned,
         // so writes wait (their queue entries stay) rather than go ahead.
-        let found = crate::ivf_split::ensure_recovered(db, namespace, &partition, &settings.maintenance.ops()).await?;
+        let found = crate::semantic_search::ivf_split::ensure_recovered(db, namespace, &partition, &settings.maintenance.ops()).await?;
         if found > 0 {
             log::info!("partition recovery: namespace='{namespace}' finished {found} interrupted operation(s)");
         }

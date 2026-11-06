@@ -7,7 +7,7 @@
 //! are kept as the **means** of their members, where SPTAG replaces each with
 //! its nearest member. In minnal the members are reconstructions of 1-bit codes,
 //! and a single member's reconstruction carries its full code error; the mean
-//! averages it away (`report/m3-pre-simulation/spfresh-comparison.md`).
+//! averages it away (`doc/m3-pre-simulation/spfresh-comparison.md`).
 //!
 //! Each step:
 //!

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use minnal_db::doc_store::vector_settings::{MAX_FIRST_PASS_TOP_K, MAX_PROBES, SearchSpec};
 use minnal_db::doc_store::{DocStore, Pagination};
-use minnal_db::ivf_split::rebuild::RebuildState;
+use minnal_db::semantic_search::ivf_split::rebuild::RebuildState;
 use serde_json::json;
 
 use crate::engine::{self, Config};
