@@ -752,8 +752,23 @@ mod tests {
             store.db.shutdown().await.unwrap(); // flush, so the WAL is persisted
         }
         let store = DocStore::open_with_config(db_dir.path(), config()).await.unwrap();
-        let (reclaimed_bytes, _) = store.db.garbage_collect_wal().await.unwrap();
-        assert!(reclaimed_bytes > 0, "setup: the documents' WAL must be reclaimed");
+        // The WAL worker's first tick comes right after open, so it can reclaim
+        // these segments first, or be part-way through (this call then reclaims
+        // nothing). So check that they are gone, not who removed them: only the
+        // active segment is left, and it is not the first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            store.db.garbage_collect_wal().await.unwrap();
+            let segments = store.db.wal_stats().segments;
+            if matches!(segments.as_slice(), [only] if only.segment_id > 0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup: the documents' WAL must be reclaimed: {segments:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let handle = store
             .add_index(
