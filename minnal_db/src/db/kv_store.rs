@@ -3194,18 +3194,22 @@ mod tests {
 
     #[test]
     fn test_scan_during_gc_never_returns_wrong_or_missing_value() {
-        // Regression for the value-log GC race: a batch read resolves
-        // (key, pointer) from the LSM and then reads the value from a separately
-        // captured value-log file handle. A GC swap landing between those steps
-        // pairs a pre-swap pointer with the post-swap file, so a relocated key
-        // reads another key's record (wrong value) or fails to decode (a resolved
-        // key comes back empty). The fix is the seqlock generation bracket plus a
-        // single-key `get` re-resolution of any resolved-but-unreadable key.
+        // A batch read resolves (key, pointer) from the LSM and then reads the value.
+        // GC can reclaim the pointer's segment between those steps. The read then
+        // fails loudly, and `get_multiple` re-resolves that key through `get`: without
+        // that a live key comes back missing, which this test catches.
         //
-        // All keys share a single bucket so every GC swap races every read, and
+        // All keys share a single bucket so every GC pass races every read, and
         // each live key carries a distinct, *stable* value — overwrites rewrite
         // the same bytes purely to keep generating garbage, so the only way a read
-        // can observe a wrong/missing value is the swap race itself.
+        // can observe a wrong/missing value is this race.
+        //
+        // Nothing compacts here, on purpose: each GC pass adds level-0 files, reads
+        // slow down, and the race window widens. It takes tens of passes to open (with
+        // a compaction in the GC loop, 6,000 passes never hit it), and a pass gets
+        // slower all the way, so the pass count below is what sets this test's length.
+        // Measured with the re-resolve removed: 61 of 62 runs failed by pass 116, the
+        // other at pass 210. 400 passes take about 65 s, 200 about 15 s.
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3310,17 +3314,14 @@ mod tests {
 
     #[test]
     fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
-        // Integration regression proving the LSM scan-completeness fix and the
-        // value-log GC seqlock fix (commit 420ac8e) COMPOSE. Under concurrent
-        // memtable flush, L0→L1 compaction, and value-log GC, a scan must:
-        //   * return EVERY never-deleted key — the LSM scan-completeness guarantee,
-        //     across the active→RO→L0→L1 relocation a flush/compaction performs; and
-        //   * pair each key with its EXACT value — the value-log seqlock guarantee,
-        //     across the file swap + LSM re-point a GC compaction performs.
-        // Either fix alone is insufficient: without the LSM fix a scan drops a live
-        // key crossing a layer boundary; without the seqlock fix a relocated pointer
-        // reads the wrong/empty value. One bucket so every flush, merge, and GC swap
-        // races every scan. Live keys are never deleted and are overwritten with
+        // The LSM scan-completeness guarantee and the value log's read guarantee
+        // must hold together. Under concurrent memtable flush, L0→L1 compaction, and
+        // value-log GC, a scan must:
+        //   * return EVERY never-deleted key, across the active→RO→L0→L1 relocation
+        //     a flush/compaction performs; and
+        //   * pair each key with its EXACT value, across the relocation, LSM re-point
+        //     and segment unlink a GC pass performs.
+        // One bucket so every flush, merge, and GC pass races every scan. Live keys are never deleted and are overwritten with
         // their SAME value, so any wrong value is a race bug; active-churn
         // transient misses from APIs that document `None` for I/O races are
         // checked strictly only after the churn threads stop.
