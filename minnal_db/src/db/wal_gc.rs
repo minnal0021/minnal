@@ -372,10 +372,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
     use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::test_support::*;
     use crate::db::wal::WalEntry;
+    use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
     use tempfile::TempDir;
 
     /// The flip side of the per-namespace watermark: an idle namespace holding

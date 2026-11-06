@@ -119,7 +119,7 @@ Before starting, re-run the search; the list below is what it found on
 - [x] 4e. **Code doc comments not touched in steps 1–3**: `bitmap/mod.rs` type docs,
       `typed_index.rs`, `dyn_index.rs` (crash-atomicity section),
       `blob_store.rs`, `db/kv_store.rs` and `db/database.rs` (replay and
-      backpressure comments), `db/index_checkpoint_worker.rs`,
+      backpressure comments), `db/workers/index_checkpoint.rs`,
       `db/index_manager.rs`, admin route docs in
       `minnal_db_api/src/routes/admin_indices.rs` / `admin_storage.rs`,
       `doc_store/store/diagnostics.rs`

@@ -1635,7 +1635,7 @@ fn existing_bucket_count_is_detected_from_segmented_value_logs() {
 
 #[test]
 fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
-    use crate::storage::gc_value_log_worker::ValueLogGcTarget;
+    use crate::db::workers::value_log_gc::ValueLogGcTarget;
     // The GC trigger is per-bucket, not just the namespace average: a bucket over the
     // trigger must be collected even when near-empty buckets drag the average below it.
     let dir = TempDir::new().unwrap();
@@ -3153,8 +3153,8 @@ fn a_flush_retires_entries_without_writing_into_the_log() {
 /// SIGKILL stress harness (1–2 documents per crash).
 #[test]
 fn index_checkpoint_stops_below_an_in_flight_write() {
-    use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
     use crate::db::index_manager::CheckpointState;
+    use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     let ns = crate::db::namespace::DEFAULT_NAMESPACE_ID;

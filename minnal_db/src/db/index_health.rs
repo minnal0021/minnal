@@ -14,8 +14,8 @@ use log::{error, info, warn};
 use crate::db::database::Database;
 // `run_index_checkpoint` is a trait method, so the trait must be in scope here.
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
 use crate::db::namespace::{FieldId, FieldMeta, FieldRepairOutcome};
+use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
 
 impl Database {
     /// Repair a field index that has an outstanding gap, then clear the gap.

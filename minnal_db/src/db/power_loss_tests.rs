@@ -21,8 +21,8 @@ use tempfile::TempDir;
 
 use crate::db::database::Database;
 use crate::db::error::KVError;
-use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
 use crate::db::test_support::*;
+use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
 
 /// Open the power-loss image of `db` in a fresh directory.
 fn open_image(db: &Database) -> (TempDir, Database) {

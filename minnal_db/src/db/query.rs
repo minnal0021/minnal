@@ -630,7 +630,7 @@ mod differential_tests {
                     crashes += 1;
                 }
                 2 | 3 => {
-                    use crate::db::index_checkpoint_worker::IndexCheckpointTarget;
+                    use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
                     db.run_index_checkpoint().unwrap();
                     ckpts += 1;
                 }

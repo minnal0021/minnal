@@ -1,0 +1,24 @@
+//! The engine's background workers. `db` starts each one and implements its
+//! `*Target` trait; each is a single task that fans out over namespaces.
+//!
+//! Every background worker in the crate:
+//!
+//! | Worker | What it does | Lives in |
+//! |---|---|---|
+//! | [`lsm_compaction`] | Merges a namespace's SSTables | here |
+//! | [`value_log_gc`] | Rewrites value-log segments to reclaim dead space | here |
+//! | [`wal_gc`] | Deletes WAL segments nothing needs any more | here |
+//! | [`ttl`] | Removes expired entries from TTL namespaces | here |
+//! | [`index_checkpoint`] | Spills field-index write buffers and records their WAL offset | here |
+//! | `vec_index` | Embeds documents from the vector-index queue | `doc_store::workers` |
+//! | `ivf_maintenance` | Splits, merges and reassigns a namespace's postings | `doc_store::workers` |
+//!
+//! The last two stay in `doc_store`: they need its schemas and in-flight write
+//! tracking, are feature-gated, and are started by `DocStore`. `db` must not
+//! import `doc_store`.
+
+pub(crate) mod index_checkpoint;
+pub(crate) mod lsm_compaction;
+pub(crate) mod ttl;
+pub(crate) mod value_log_gc;
+pub(crate) mod wal_gc;

@@ -11,18 +11,18 @@ use std::time::Duration;
 use crate::db::config::DbConfig;
 use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::index_manager::FieldIndexHealth;
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
 use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::db::namespace_index::ExtractorFn;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
-use crate::db::ttl_worker::{TtlTarget, TtlWorker};
-use crate::db::wal_worker::WalGcWorker;
+use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointWorker};
+use crate::db::workers::lsm_compaction::{LsmCompactionTarget, LsmCompactionWorker};
+use crate::db::workers::ttl::{TtlTarget, TtlWorker};
+use crate::db::workers::value_log_gc::{GCWorker, ValueLogGcTarget};
+use crate::db::workers::wal_gc::WalGcWorker;
 use crate::field_index::IndexValueType;
-use crate::storage::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
-use crate::storage::lsm_worker::{LsmCompactionTarget, LsmCompactionWorker};
 
 // ── rkyv trait alias ───────────────────────────────────────────────────
 //
@@ -823,7 +823,7 @@ impl Db {
 // These allow AsyncDb to use Arc<Db> as the target for background workers,
 // avoiding the need to extract Arc<Database> from the non-Arc Db.inner field.
 
-use crate::db::wal_worker::WalGcTarget;
+use crate::db::workers::wal_gc::WalGcTarget;
 
 impl WalGcTarget for Db {
     fn is_closed(&self) -> bool {

@@ -473,7 +473,7 @@ preserve the ordering (stage+fsync → marker+fsync → rename → drop marker) 
 ## 7. Checkpointing
 
 Checkpointing is the routine that writes every field's overlay to disk and,
-where needed, invokes the compaction of §6. The `index_checkpoint_worker` runs it
+where needed, invokes the compaction of §6. The `workers::index_checkpoint` runs it
 every **1.75 seconds** by default (`scheduled_tasks.index_checkpoint_interval_ms`),
 and the identical sequence runs on clean shutdown and on demand via
 `Database::run_index_checkpoint()`. The write path can also request one early,

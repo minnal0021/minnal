@@ -5,7 +5,7 @@
 //! namespace's configured TTL. The value-log GC routines then reclaim the
 //! physical space in subsequent runs.
 //!
-//! Like [`GCWorker`](crate::storage::gc_value_log_worker::GCWorker) and the LSM
+//! Like [`GCWorker`](crate::db::workers::value_log_gc::GCWorker) and the LSM
 //! compaction worker, this is **one global task** that fans out over the
 //! namespaces on each tick — not a task per namespace. The set of namespaces to
 //! process (and each one's TTL and per-run delete cap) is owned by the target
@@ -18,7 +18,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
 /// Trait for the coordinator that knows which namespaces have a TTL and how to
-/// expire them. Mirrors [`ValueLogGcTarget`](crate::storage::gc_value_log_worker::ValueLogGcTarget).
+/// expire them. Mirrors [`ValueLogGcTarget`](crate::db::workers::value_log_gc::ValueLogGcTarget).
 pub trait TtlTarget: Send + Sync + 'static {
     /// Whether the database has been closed (the worker stops doing work).
     fn is_closed(&self) -> bool;

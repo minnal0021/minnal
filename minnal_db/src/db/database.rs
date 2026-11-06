@@ -5,7 +5,6 @@
 
 use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::index_manager::IndexManager;
 use crate::db::key_locks::KeyLocks;
 use crate::db::kv_store::KVStore;
@@ -13,14 +12,15 @@ use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReinde
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
 use crate::db::segmented_log::LogError;
 use crate::db::stats::{GCStats, Stats};
-use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
-use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
+use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
+use crate::db::workers::lsm_compaction::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
+use crate::db::workers::ttl::{TtlTarget, TtlWorker};
+use crate::db::workers::value_log_gc::{GCWorker, ValueLogGcTarget};
+use crate::db::workers::wal_gc::{WalGcTarget, WalGcWorker};
 use crate::field_index::{DynFieldIndex, IndexValueType};
-use crate::storage::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
 use crate::storage::lsm::tree::LsmFlushObserver;
-use crate::storage::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
 use crate::storage::value_log::ValueLogMetadata;
 
 use log::{debug, error, info, warn};

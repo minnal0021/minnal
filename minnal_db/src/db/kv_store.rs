@@ -6,10 +6,10 @@
 //! Database coordinator.
 
 use crate::db::error::{KVError, Result};
-use crate::db::index_checkpoint_worker::IndexCheckpointTrigger;
 use crate::db::stats::{GCStats, Stats};
+use crate::db::workers::index_checkpoint::IndexCheckpointTrigger;
+use crate::db::workers::lsm_compaction::LsmCompactionCommand;
 use crate::storage::lsm::tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
-use crate::storage::lsm_worker::LsmCompactionCommand;
 use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
