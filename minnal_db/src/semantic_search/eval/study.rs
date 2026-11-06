@@ -31,7 +31,7 @@ use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
 use crate::semantic_search::quantisation::rabitq::quantisation_support::pack_bits;
 use crate::semantic_search::quantisation::rabitq::quantise;
 use crate::semantic_search::service::{SemanticSearchConfig, index_embeddings, search};
-use crate::semantic_search::{ClusterIndex, simd};
+use crate::semantic_search::{ClusterIndex, simd_support};
 use crate::vector_kv::{DbVectorStore, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
 
@@ -406,7 +406,7 @@ async fn eval_pass1_study() {
                             Form::Raw => est.estimate_from_parts(&rq, &code.packed, code.scaling),
                             Form::Optimistic => est.estimate_from_parts(&rq, &code.packed, code.scaling) + code.bound,
                             Form::Centred => {
-                                let ip = simd::packed_ip_best(&code.packed, &rqc, dim);
+                                let ip = simd_support::packed_ip_best(&code.packed, &rqc, dim);
                                 est.0.query_to_centroid_dot_product + code.rc + code.scaling * (2.0 * ip - sum_c)
                             }
                         };

@@ -21,7 +21,7 @@
 pub(crate) mod quantisation_support;
 
 use crate::semantic_search::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
-use crate::semantic_search::simd::{reconstruct_bit_planes_best, reconstruct_single_bit_best};
+use crate::semantic_search::simd_support::{reconstruct_bit_planes_best, reconstruct_single_bit_best};
 use log::debug;
 use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;

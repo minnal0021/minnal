@@ -9,7 +9,7 @@ pub mod ivf_split;
 pub mod metrics;
 pub mod quantisation;
 pub mod service;
-pub(crate) mod simd;
+pub(crate) mod simd_support;
 pub mod vector_math;
 
 pub use self::chunking::chunk_document;

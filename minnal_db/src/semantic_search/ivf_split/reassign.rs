@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
-use crate::semantic_search::simd::{bit_planes_ip_best, packed_ip_best};
+use crate::semantic_search::simd_support::{bit_planes_ip_best, packed_ip_best};
 
 /// The reassignment to record after `parent`'s split into `children`: the
 /// halves plus the `reassign_range` active postings nearest the old centre.
