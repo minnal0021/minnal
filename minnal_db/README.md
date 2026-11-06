@@ -829,7 +829,7 @@ The sources in `benches/` are grouped by what they measure:
 | `semantic_search/` | Distance estimation and the two-pass vector search |
 | `under_load/` | The `engine_bench` target: document-store operations with every background worker running, described in [`benchmark.md`](benchmark.md#the-engine-at-work) |
 
-`benches/script/run_benchmarks.sh` runs every Criterion suite with `-C target-cpu=native`, and with AVX-512 when the CPU has it, and writes a summary to `benches/script/reports/`. It accepts `--filter`, `--baseline`, `--compare`, `--no-avx512` and `--quick`; `--help` describes them.
+`benches/script/run_benchmarks.sh` runs every Criterion suite with `-C target-cpu=native`, and with AVX-512 when the CPU has it, builds with at most 4 jobs unless `CARGO_BUILD_JOBS` says otherwise, and writes a summary to `benches/script/reports/`. It accepts `--filter`, `--baseline`, `--compare`, `--no-avx512` and `--quick`; `--help` describes them.
 
 Benchmark reports are written to `target/criterion/`. The helpers in `benches/common.rs` disable background workers and use `target/bench_tmp/` (rather than `/tmp/`) to avoid skew from RAM-backed filesystems.
 

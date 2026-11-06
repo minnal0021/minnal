@@ -27,6 +27,10 @@ CRITERION_DIR="$(cd "${PROJECT_ROOT}/.." && pwd)/target/criterion"  # the worksp
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 REPORT_FILE="${REPORTS_DIR}/bench_${TIMESTAMP}.txt"
 
+# Each bench target links with full LTO, and a parallel build of all of them can
+# exhaust memory on a small machine. Set CARGO_BUILD_JOBS to choose another limit.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 FILTER=""
 BASELINE=""
