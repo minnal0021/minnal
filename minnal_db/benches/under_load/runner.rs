@@ -245,7 +245,7 @@ async fn drain(store: &DocStore, max: Duration) -> Option<f64> {
             reported = t.elapsed();
             let clear = entries
                 .iter()
-                .filter(|e| matches!(e.kind, minnal_db::vector_kv::QueueEntryKind::Clear))
+                .filter(|e| matches!(e.kind, minnal_db::semantic_search::vector_kv::QueueEntryKind::Clear))
                 .count();
             let retried = entries.iter().filter(|e| e.retry_count > 0).count();
             let e = &entries[0];

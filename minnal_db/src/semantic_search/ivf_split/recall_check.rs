@@ -38,8 +38,8 @@ use serde::Serialize;
 
 use super::*;
 use crate::semantic_search::service::{SemanticSearchConfig, search};
+use crate::semantic_search::vector_kv::DbVectorStore;
 use crate::semantic_search::{IvfLayout, ProbeSettings, select_probes};
-use crate::vector_kv::DbVectorStore;
 
 /// The cutoffs overlap is reported at.
 pub const CUTOFFS: [usize; 6] = [10, 20, 30, 40, 50, 100];

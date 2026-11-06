@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::semantic_search::index::vector_index::QuantisationStyle;
 use crate::semantic_search::quantisation::rabitq::{index_embedding_rotated, index_embedding_zero_centred};
-use crate::vector_kv::{init_ivf, load_ivf, upsert_vectors};
+use crate::semantic_search::vector_kv::{init_ivf, load_ivf, upsert_vectors};
 
 pub(super) const NS: &str = "docs";
 const DIM: usize = 16;
@@ -89,7 +89,9 @@ async fn setup_at(dir: &TempDir, docs: u64, bits: usize) -> AsyncDb {
     for d in 0..docs {
         index_doc_at(&db, &h, d, &doc_chunks(d, false), bits).await.unwrap();
     }
-    db.flush_namespaces(crate::vector_kv::companion_namespaces(NS)).await.unwrap();
+    db.flush_namespaces(crate::semantic_search::vector_kv::companion_namespaces(NS))
+        .await
+        .unwrap();
     db
 }
 
@@ -407,9 +409,9 @@ async fn crash_cases(
             copy_dir(template, dir.path());
             let db = open(&dir).await;
             let h = handle(&db).await;
-            crate::vector_kv::crash_point::arm(n);
+            crate::semantic_search::vector_kv::crash_point::arm(n);
             let result = run_audited(&db, &h, op, &ops).await;
-            let crashed = crate::vector_kv::crash_point::disarm();
+            let crashed = crate::semantic_search::vector_kv::crash_point::disarm();
             if !crashed {
                 assert!(result.unwrap(), "{op:?} did not do its job");
                 writes_seen = writes_seen.min(n);
@@ -418,7 +420,7 @@ async fn crash_cases(
                 Flushed::None => vec![],
                 Flushed::Sparse => vec![sparse_vectors_ns(NS)],
                 Flushed::Meta => vec![sparse_vectors_meta_ns(NS)],
-                Flushed::All => crate::vector_kv::companion_namespaces(NS),
+                Flushed::All => crate::semantic_search::vector_kv::companion_namespaces(NS),
             };
             db.flush_namespaces(names).await.unwrap();
             drop(h);
@@ -495,7 +497,7 @@ async fn writes_racing_a_split_lose_nothing() {
                     index_doc(&db, &h, d, &doc_chunks(d, true)).await.unwrap();
                 }
                 for d in [1u64, 3, 5] {
-                    let delta = crate::vector_kv::delete_vector(&db, NS, &doc_id(d)).await.unwrap();
+                    let delta = crate::semantic_search::vector_kv::delete_vector(&db, NS, &doc_id(d)).await.unwrap();
                     h.snapshot().apply_delta(&delta);
                 }
             })
@@ -582,7 +584,7 @@ async fn a_search_during_a_split_misses_nothing() {
     let searcher = {
         let (db, h, done) = (db.clone(), std::sync::Arc::clone(&h), std::sync::Arc::clone(&done));
         tokio::spawn(async move {
-            let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+            let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
             let q = chunk(0, 999);
             let mut searches = 0;
             loop {
@@ -651,7 +653,7 @@ pub(super) fn full(split_limit: u64, merge_limit: u64, range: usize) -> Maintena
 }
 
 async fn delete_doc(db: &AsyncDb, h: &PartitionHandle, d: u64) {
-    let delta = crate::vector_kv::delete_vector(db, NS, &doc_id(d)).await.unwrap();
+    let delta = crate::semantic_search::vector_kv::delete_vector(db, NS, &doc_id(d)).await.unwrap();
     h.snapshot().apply_delta(&delta);
 }
 
@@ -694,7 +696,9 @@ async fn prepare_at(dir: &TempDir, scenario: Scenario, bits: usize) -> (AsyncDb,
             }
         }
     }
-    db.flush_namespaces(crate::vector_kv::companion_namespaces(NS)).await.unwrap();
+    db.flush_namespaces(crate::semantic_search::vector_kv::companion_namespaces(NS))
+        .await
+        .unwrap();
     db.shutdown().await.unwrap();
     drop((db, h));
     (open(dir).await, want)
@@ -849,7 +853,7 @@ async fn a_search_during_reassign_and_merge_misses_nothing() {
         let searcher = {
             let (db, h, done) = (db.clone(), std::sync::Arc::clone(&h), std::sync::Arc::clone(&done));
             tokio::spawn(async move {
-                let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+                let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
                 let q = chunk(0, 999);
                 let mut searches = 0;
                 loop {
@@ -1120,7 +1124,7 @@ async fn a_search_during_a_rebuild_misses_nothing() {
     let searcher = {
         let (db, h, done) = (db.clone(), std::sync::Arc::clone(&h), std::sync::Arc::clone(&done));
         tokio::spawn(async move {
-            let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+            let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
             let q = chunk(0, 999);
             let mut searches = 0;
             loop {
@@ -1175,9 +1179,9 @@ async fn a_failed_split_retried_in_process_survives_a_restart() {
             }
         };
         // The record goes through, the next write (the first centre) fails.
-        crate::vector_kv::crash_point::arm(1);
+        crate::semantic_search::vector_kv::crash_point::arm(1);
         assert!(run().await.is_err(), "the injected error");
-        crate::vector_kv::crash_point::disarm();
+        crate::semantic_search::vector_kv::crash_point::disarm();
         run().await.unwrap();
         check(&db, &h, &expected(docs)).await.unwrap_or_else(|e| panic!("single={single}: {e}"));
 
@@ -1243,9 +1247,9 @@ async fn a_rebuild_before_recovery_loses_nothing() {
     let ops = settings(40);
     // Planned record, two centres, two children, the parent draining, the
     // Published record: seven writes; the eighth (the first copy) fails.
-    crate::vector_kv::crash_point::arm(7);
+    crate::semantic_search::vector_kv::crash_point::arm(7);
     assert!(split_posting(&db, NS, &h, 0, &ops).await.is_err());
-    crate::vector_kv::crash_point::disarm();
+    crate::semantic_search::vector_kv::crash_point::disarm();
     let found = records(&db, NS).await.unwrap();
     assert!(
         matches!(
@@ -1287,9 +1291,9 @@ async fn recovery_runs_a_recorded_reassignment_once() {
         copy_dir(template.path(), dir.path());
         let db = open(&dir).await;
         let h = handle(&db).await;
-        crate::vector_kv::crash_point::arm(n);
+        crate::semantic_search::vector_kv::crash_point::arm(n);
         let result = split_posting(&db, NS, &h, 0, &ops).await;
-        crate::vector_kv::crash_point::disarm();
+        crate::semantic_search::vector_kv::crash_point::disarm();
         assert!(result.is_err(), "no crash point left a split and its reassignment recorded");
         let kinds: Vec<u8> = records(&db, NS)
             .await
@@ -1359,7 +1363,7 @@ async fn a_search_builds_estimators_only_for_the_centres_its_codes_use() {
         top_k_results: 1000,
         ..SemanticSearchConfig::default()
     };
-    let store = crate::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
+    let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, NS).await.unwrap();
     let q = chunk(0, 999);
     let found = search(
         &config,

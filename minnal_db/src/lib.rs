@@ -95,10 +95,6 @@ pub mod doc_store;
 pub mod index;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
-// Vector-index storage bridge (`DbVectorStore`, upsert/delete, query-embedding
-// cache) over raw namespaces — usable with `kv-store` alone, no `doc-store`.
-#[cfg(feature = "semantic-search")]
-pub mod vector_kv;
 
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 

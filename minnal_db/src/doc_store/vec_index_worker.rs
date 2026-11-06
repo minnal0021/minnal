@@ -69,7 +69,7 @@
 //! the same document overwrite the queue entry — the worker makes exactly one
 //! embedding call for the most-recent text.
 //!
-//! [`PENDING_VEC_INDEX_NS`]: crate::vector_kv::PENDING_VEC_INDEX_NS
+//! [`PENDING_VEC_INDEX_NS`]: crate::semantic_search::vector_kv::PENDING_VEC_INDEX_NS
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -84,7 +84,7 @@ use tokio::task::JoinSet;
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::schema_store::SchemaStore;
 use crate::doc_store::store::{DocumentText, InFlightWrites, NamespaceSemantics, SemanticSearchContext, document_text};
-use crate::vector_kv::{self, QueueEntry, QueueEntryKind};
+use crate::semantic_search::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
 /// batches mean fewer flushes (each makes level-0 files for compaction to merge);

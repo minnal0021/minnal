@@ -40,9 +40,9 @@ use crate::doc_store::schema::{DocStoreSchema, IndexSpec, KeyType, KvStoreSchema
 use crate::doc_store::vec_index_worker::{VecIndexWorker, VecIndexWorkerHandle, VectorIndexConfig};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::vector_settings::SearchSpec;
-use crate::support::file_lock::{DirLock, LockError};
 #[cfg(feature = "semantic-search")]
-use crate::vector_kv;
+use crate::semantic_search::vector_kv;
+use crate::support::file_lock::{DirLock, LockError};
 
 mod admin;
 mod diagnostics;

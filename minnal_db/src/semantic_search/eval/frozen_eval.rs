@@ -60,8 +60,8 @@ use crate::semantic_search::index::distance_estimator::{DistanceEstimator, Multi
 use crate::semantic_search::index::vector_index::{QuantisationStyle, VectorIndex};
 use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
 use crate::semantic_search::service::{DEFAULT_PROBE, SemanticSearchConfig, index_embeddings, search};
+use crate::semantic_search::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_meta_ns, sparse_vectors_ns, upsert_vectors};
 use crate::semantic_search::{IvfLayout, ProbeSettings, select_probes};
-use crate::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_meta_ns, sparse_vectors_ns, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
 
 const NS: &str = "bench";
@@ -638,13 +638,13 @@ async fn eval_frozen() {
         "file" => {
             let path = std::env::var("MINNAL_BENCH_CENTROIDS").expect("MINNAL_BENCH_CENTROIDS for MINNAL_BENCH_PARTITION=file");
             let c = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
-            crate::vector_kv::seed_ivf(&db, NS, &c).await.unwrap();
+            crate::semantic_search::vector_kv::seed_ivf(&db, NS, &c).await.unwrap();
         }
-        "grow" => crate::vector_kv::init_ivf(&db, NS, config.embedding_dim).await.unwrap(),
+        "grow" => crate::semantic_search::vector_kv::init_ivf(&db, NS, config.embedding_dim).await.unwrap(),
         other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (grow | file)"),
     }
     let handle = Arc::new(crate::semantic_search::PartitionHandle::new(
-        crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
             .await
             .unwrap()
             .expect("just made"),
@@ -719,7 +719,9 @@ async fn eval_frozen() {
                 set.spawn(async move {
                     let _permit = permit;
                     let _epoch = handle.read_epoch().await;
-                    let delta = crate::vector_kv::delete_vector(&db, NS, &(d as u64).to_be_bytes()).await.unwrap();
+                    let delta = crate::semantic_search::vector_kv::delete_vector(&db, NS, &(d as u64).to_be_bytes())
+                        .await
+                        .unwrap();
                     handle.snapshot().apply_delta(&delta);
                 });
             }
@@ -806,7 +808,7 @@ async fn eval_frozen() {
     // Loaded again as a restarted store loads it: its entry counts come from the
     // stored keys.
     let ivf = Arc::new(
-        crate::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
             .await
             .unwrap()
             .expect("seeded"),
@@ -1146,7 +1148,7 @@ fn render(r: &BenchResult) -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn eval_worker_completion() {
-    use crate::vector_kv::{complete_embed, enqueue_embed, get_queue_entry, make_vector_writes_durable};
+    use crate::semantic_search::vector_kv::{complete_embed, enqueue_embed, get_queue_entry, make_vector_writes_durable};
     const BATCH: usize = 256; // the worker's COMPLETION_BATCH
     let dataset = env_or("MINNAL_BENCH_DATASET", "scifact");
     let bench_root = PathBuf::from(env_or("MINNAL_BENCH_ROOT", "../work/bench"));
@@ -1183,7 +1185,7 @@ async fn eval_worker_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap();
         let parent = db.namespace(ns.clone()).await.unwrap();
-        crate::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
+        crate::semantic_search::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
         for d in 0..frozen.n_docs() {
             let id = (d as u64).to_be_bytes();
             parent.put(id.to_vec(), b"{}".to_vec()).await.unwrap();

@@ -31,8 +31,8 @@ use crate::semantic_search::quantisation::rabitq::index_embedding_rotated;
 use crate::semantic_search::quantisation::rabitq::quantisation_support::pack_bits;
 use crate::semantic_search::quantisation::rabitq::quantise;
 use crate::semantic_search::service::{SemanticSearchConfig, index_embeddings, search};
+use crate::semantic_search::vector_kv::{DbVectorStore, upsert_vectors};
 use crate::semantic_search::{ClusterIndex, simd_support};
-use crate::vector_kv::{DbVectorStore, upsert_vectors};
 use crate::{AsyncDb, DbConfig};
 
 /// Production Pass-1 cut.
@@ -527,7 +527,7 @@ async fn eval_pass1_study() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
     db.namespace("study".to_string()).await.unwrap();
-    crate::vector_kv::create_vector_namespaces(&db, "study").await.unwrap();
+    crate::semantic_search::vector_kv::create_vector_namespaces(&db, "study").await.unwrap();
     for d in 0..nd {
         let vis = index_embeddings(&config, &index, frozen.dense(d), &frozen.doc_chunks(d)).unwrap();
         upsert_vectors(&db, "study", &(d as u64).to_be_bytes(), "", &vis).await.unwrap();

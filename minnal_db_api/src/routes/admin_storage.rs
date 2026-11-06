@@ -835,7 +835,7 @@ fn classify_namespace_role(name: &str, doc_names: &std::collections::HashSet<Str
         return "kv_store";
     }
     // The suffix rule belongs to `vector_kv`, which mints these names.
-    if let Some(prefix) = minnal_db::vector_kv::companion_base(name)
+    if let Some(prefix) = minnal_db::semantic_search::vector_kv::companion_base(name)
         && (doc_names.contains(prefix) || kv_names.contains(prefix))
     {
         return "companion";

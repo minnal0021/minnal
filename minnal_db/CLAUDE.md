@@ -2,7 +2,7 @@
 
 WiscKey-style embedded store: keys live in an LSM tree, values in a separate value log, reducing write amplification for large values.
 
-> **This file covers the KV engine (`src/db`, `src/store`, `src/support`).** `minnal_db` is a single feature-gated crate that also folds in `src/index/` (field indexing, always on), `src/semantic_search/` + `src/vector_kv.rs` (`#[cfg(semantic-search)]`), and `src/doc_store/` (`#[cfg(doc-store)]`). See the root `CLAUDE.md` for the feature model and the folded modules' own `CLAUDE.md` files.
+> **This file covers the KV engine (`src/db`, `src/store`, `src/support`).** `minnal_db` is a single feature-gated crate that also folds in `src/index/` (field indexing, always on), `src/semantic_search/` (`#[cfg(semantic-search)]`), and `src/doc_store/` (`#[cfg(doc-store)]`). See the root `CLAUDE.md` for the feature model and the folded modules' own `CLAUDE.md` files.
 
 ## Key files
 

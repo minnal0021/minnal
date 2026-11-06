@@ -433,9 +433,9 @@ impl SemanticSearchContext {
     /// return.
     pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
         self.check_model(settings)?;
-        crate::vector_kv::create_vector_namespaces(db, namespace).await?;
-        if !crate::vector_kv::ivf_exists(db, namespace).await? {
-            crate::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
+        crate::semantic_search::vector_kv::create_vector_namespaces(db, namespace).await?;
+        if !crate::semantic_search::vector_kv::ivf_exists(db, namespace).await? {
+            crate::semantic_search::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
             self.ivfs.write().retain(|(name, _), _| name != namespace);
         }
         Ok(())
@@ -558,12 +558,11 @@ impl SemanticSearchContext {
                 break Arc::clone(p);
             }
             let drops_begun = self.drops_begun.load(std::sync::atomic::Ordering::SeqCst);
-            let ivf =
-                crate::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
-                    .await?
-                    .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
-                        namespace: namespace.to_owned(),
-                    })?;
+            let ivf = crate::semantic_search::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
+                .await?
+                .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
+                    namespace: namespace.to_owned(),
+                })?;
             #[cfg(test)]
             load_pause::point(namespace).await;
             // A drop that began during the load cannot see this partition, so

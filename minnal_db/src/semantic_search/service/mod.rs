@@ -1580,15 +1580,15 @@ mod tests {
             .await
             .unwrap();
         db.namespace("docs".to_string()).await.unwrap();
-        crate::vector_kv::create_vector_namespaces(&db, "docs").await.unwrap();
+        crate::semantic_search::vector_kv::create_vector_namespaces(&db, "docs").await.unwrap();
         let docs: Vec<Vec<f32>> = (0..300).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
-            crate::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
+            crate::semantic_search::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
                 .await
                 .unwrap();
         }
-        let store = crate::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
+        let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
         for d in (0..300u64).step_by(15) {
             // The source document plus a little noise.
             let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
@@ -1636,18 +1636,18 @@ mod tests {
                 .unwrap();
             let ns = format!("docs{bits}");
             db.namespace(ns.clone()).await.unwrap();
-            crate::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
+            crate::semantic_search::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
             let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
             for (d, v) in docs.iter().enumerate() {
                 let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
                 let chunk = &vis[1];
                 assert_eq!(chunk.quantisation_style, QuantisationStyle::pass1(bits));
                 assert_eq!(chunk.packed_vector.len(), 12 * bits, "768 dims at {bits} bits");
-                crate::vector_kv::upsert_vectors(&db, &ns, &(d as u64).to_be_bytes(), "t", &vis)
+                crate::semantic_search::vector_kv::upsert_vectors(&db, &ns, &(d as u64).to_be_bytes(), "t", &vis)
                     .await
                     .unwrap();
             }
-            let store = crate::vector_kv::DbVectorStore::new(&db, &ns).await.unwrap();
+            let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, &ns).await.unwrap();
             let run = |config: SemanticSearchConfig, q: Vec<f32>| {
                 let (index, store, ns) = (&index, &store, ns.clone());
                 async move {
@@ -1694,15 +1694,15 @@ mod tests {
             .unwrap();
         let ns = "trace";
         db.namespace(ns.to_string()).await.unwrap();
-        crate::vector_kv::create_vector_namespaces(&db, ns).await.unwrap();
+        crate::semantic_search::vector_kv::create_vector_namespaces(&db, ns).await.unwrap();
         let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
-            crate::vector_kv::upsert_vectors(&db, ns, &(d as u64).to_be_bytes(), "t", &vis)
+            crate::semantic_search::vector_kv::upsert_vectors(&db, ns, &(d as u64).to_be_bytes(), "t", &vis)
                 .await
                 .unwrap();
         }
-        let store = crate::vector_kv::DbVectorStore::new(&db, ns).await.unwrap();
+        let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, ns).await.unwrap();
         for d in [0u64, 70, 150] {
             let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
             let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();

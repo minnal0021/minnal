@@ -20,13 +20,13 @@
 //! Embeddings are seeded pseudo-random vectors, so scores are meaningless; the
 //! store's shape (entries per posting, bytes per entry) is what matters here.
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use minnal_db::semantic_search::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_ns};
 use minnal_db::semantic_search::{
     Cluster, ClusterIndex, ProbeSettings, QuantisationStyle, VectorIndex, composite_key,
     index::vector_index::VectorKvStore,
     index_embedding_rotated,
     service::{SemanticSearchConfig, search},
 };
-use minnal_db::vector_kv::{DbVectorStore, dense_vectors_ns, sparse_vectors_ns};
 use minnal_db::{AsyncDb, DbConfig};
 use std::collections::HashMap;
 use std::hint::black_box;

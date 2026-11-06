@@ -21,8 +21,7 @@ minnal_tools           ← standalone bulk-loader binary
 minnal_db  (library, features: kv-store [default], doc-store, semantic-search)
     src/db/ src/store/     ← LSM + value-log KV engine (WiscKey-style)   [always]
     src/index/            ← RoaringBitmap field indices + predicate evaluator   [always, part of kv-store]
-    src/vector_kv.rs      ← vector↔KV bridge (DbVectorStore, upsert/delete, qemb cache)   #[cfg(semantic-search)]
-    src/semantic_search/  ← IVF clustering, RaBitQ quantisation, ANN search   #[cfg(semantic-search)]
+    src/semantic_search/  ← IVF clustering, RaBitQ quantisation, ANN search, and vector_kv/: the vector↔KV bridge (DbVectorStore, upsert/delete, embed queue, qemb cache)   #[cfg(semantic-search)]
     src/doc_store/        ← JSON schema, doc lifecycle, KV store lifecycle, index builders   #[cfg(doc-store)]
 ```
 
@@ -66,8 +65,7 @@ src/db/                — facade, config, namespace, WALs (both on `segmented_l
 src/store/             — LSM tree, value log, GC workers
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/index/             — folded field-indexing module (always compiled)
-src/semantic_search/   — folded ANN module            #[cfg(semantic-search)]
-src/vector_kv.rs       — vector↔KV storage bridge       #[cfg(semantic-search)]
+src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge)   #[cfg(semantic-search)]
 src/doc_store/         — folded document-store module   #[cfg(doc-store)]
 tests/                 — integration tests only; unit tests live inline in each module
 ```

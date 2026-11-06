@@ -10,6 +10,10 @@ pub mod metrics;
 pub mod quantisation;
 pub mod service;
 pub(crate) mod simd_support;
+// Vector-index storage bridge (`DbVectorStore`, upsert/delete, embed queue,
+// query-embedding cache) over raw namespaces: usable with `kv-store` alone, no
+// `doc-store`.
+pub mod vector_kv;
 pub mod vector_math;
 
 pub use self::chunking::chunk_document;

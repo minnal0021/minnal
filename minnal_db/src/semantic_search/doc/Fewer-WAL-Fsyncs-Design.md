@@ -73,7 +73,7 @@ The ones this note leans on most:
   **conditional**: it happens only if the stored entry is still the one the worker
   took. A newer upsert or a `Clear` that arrived meanwhile stays queued.
 - **R1–R3** — the rules that make queue updates safe against a document
-  changing mid-embed (`vector_kv.rs`): **R1**, a completion removes the entry
+  changing mid-embed (`vector_kv/mod.rs`): **R1**, a completion removes the entry
   only if it still asks for the text that was embedded; **R2**, a failure bumps
   the retry count only if the entry is unchanged; **R3**, a delete that lands
   mid-embed leaves a `Clear` tombstone, which the worker then handles by
@@ -181,7 +181,7 @@ a store drop already removes its queue entries this way (`clear_queue_for`).
 
 What must still hold:
 
-- **R1–R3** (the conditional rules in `vector_kv.rs`): never remove a newer
+- **R1–R3** (the conditional rules in `vector_kv/mod.rs`): never remove a newer
   entry or a `Clear` tombstone. The removal still runs under the key's stripe
   lock, as a merge, so this is unchanged.
 - **Removal after the vector sync.** The vectors of an entry must be durable
@@ -212,7 +212,7 @@ directly (`put_to_storage` / `delete_from_storage`), not `put_ns_no_wal` /
 It is a general operation of the storage engine, the no-WAL counterpart of
 `merge` in the way `put_no_wal` and `delete_no_wal` are of `put` and `delete`.
 It knows nothing about the embed queue: the conditions that make a completion
-safe (R1–R3) stay in the caller's closure in `vector_kv.rs`, and the choice to
+safe (R1–R3) stay in the caller's closure in `vector_kv/mod.rs`, and the choice to
 skip the WAL stays with the caller. A narrower, queue-shaped operation (a
 "conditional delete") would put the doc store's rules into the engine's write
 path.
@@ -311,7 +311,7 @@ New tests for `merge_no_wal` (in `db/`):
 
 Doc-store and vector tests:
 
-- every existing queue-race and crash test in `vector_kv.rs` passes unchanged
+- every existing queue-race and crash test in `vector_kv/mod.rs` passes unchanged
   (`queue_race_tests`, `crash_audit_tests`);
 - new: crash after a no-WAL completion, before the queue flush → the entry is
   redone and the document ends with exactly its current vectors;

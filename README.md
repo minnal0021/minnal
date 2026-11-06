@@ -356,8 +356,7 @@ minnal/
 │   └── src/
 │       ├── db/ store/      ← LSM + value-log KV engine
 │       ├── index/          ← RoaringBitmap field indexing (part of kv-store)
-│       ├── semantic_search/← IVF clustering, RaBitQ quantisation (semantic-search)
-│       ├── vector_kv.rs    ← vector↔KV bridge, usable on raw namespaces
+│       ├── semantic_search/← IVF clustering, RaBitQ quantisation, vector↔KV bridge (semantic-search)
 │       └── doc_store/      ← JSON document store (doc-store)
 ├── minnal_db_api/          ← Axum REST API server (binary)
 │   └── README.md           ← full REST API reference with curl examples

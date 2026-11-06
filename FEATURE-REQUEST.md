@@ -1431,7 +1431,7 @@ agreement first, as any new dependency does.
 ## FR-012 — Make a skipped `upsert_vectors` visible to its caller
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/vector_kv.rs`, `src/doc_store/vec_index_worker.rs`)
+**Area:** `minnal_db` (`src/semantic_search/vector_kv/mod.rs`, `src/doc_store/vec_index_worker.rs`)
 **Severity:** Low — affects direct users of `vector_kv`; the document store creates
 the namespaces itself
 **Source:** Review of store and vector-index lifecycle races.
@@ -1665,7 +1665,7 @@ Measured at `8636575` on WSL2, tmpfs, each test alone:
 
 All in test code, except for the nightly job.
 
-1. **Record each crash point's site.** Both `crash_point!` macros (`vector_kv.rs`,
+1. **Record each crash point's site.** Both `crash_point!` macros (`vector_kv/mod.rs`,
    `semantic_search/ivf_split/mod.rs`) pass their `file:line` to the `crash_point` module, and
    `crash_point::trace()` runs with no crash and returns the ordered list of sites.
    Tests that call `arm(n)` directly are unaffected.

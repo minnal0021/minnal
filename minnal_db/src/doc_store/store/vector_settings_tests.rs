@@ -1822,7 +1822,7 @@ mod with_service {
         let handle = partition(&store, "g").await;
         // A split cut short once it is published (the copy fails), as a crash
         // would leave it.
-        crate::vector_kv::crash_point::arm(7);
+        crate::semantic_search::vector_kv::crash_point::arm(7);
         let split = crate::semantic_search::ivf_split::split_posting(
             &store.db,
             "g",
@@ -1831,7 +1831,7 @@ mod with_service {
             &crate::semantic_search::ivf_split::MaintenanceOps::split_only(1),
         )
         .await;
-        crate::vector_kv::crash_point::disarm();
+        crate::semantic_search::vector_kv::crash_point::disarm();
         assert!(split.is_err(), "set-up: the split was cut short");
         let journal = || async {
             store

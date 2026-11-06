@@ -88,18 +88,18 @@ use crate::semantic_search::cluster::split::{SplitParams, SplitRng, balanced_two
 use crate::semantic_search::index::composite_key;
 use crate::semantic_search::index::vector_index::VectorIndex;
 use crate::semantic_search::quantisation::rabitq::{reconstruct_code, reconstruct_code_into};
-use crate::semantic_search::vector_math::sq_dist;
-use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
-use crate::vector_kv::{
+use crate::semantic_search::vector_kv::{
     decode_posting, decode_sparse_meta, encode_posting, encode_sparse_meta, f32s_to_bytes, ivf_centres_ns, ivf_journal_ns, ivf_postings_ns,
     lock_docs_vectors, sparse_vectors_meta_ns, sparse_vectors_ns,
 };
+use crate::semantic_search::vector_math::sq_dist;
+use crate::semantic_search::{IvfLayout, MaintenanceCounters, NamespaceIvf, PartitionHandle, Posting, PostingDelta, PostingOrigin, PostingState};
 
 /// A point where the crash tests stop the process: before a write.
 macro_rules! crash_point {
     () => {
         #[cfg(test)]
-        crate::vector_kv::crash_point::check()?;
+        crate::semantic_search::vector_kv::crash_point::check()?;
     };
 }
 
@@ -301,7 +301,7 @@ impl Record {
 }
 
 /// A companion namespace maintenance needs, without creating it: only
-/// [`create_vector_namespaces`](crate::vector_kv::create_vector_namespaces) does.
+/// [`create_vector_namespaces`](crate::semantic_search::vector_kv::create_vector_namespaces) does.
 /// An error once a drop has removed it, which stops the operation.
 pub(super) async fn companion(db: &AsyncDb, name: String) -> Result<crate::AsyncNamespace, crate::KVError> {
     db.existing_namespace(name.clone())
@@ -370,7 +370,7 @@ async fn stored_posting(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option
 
 async fn stored_centre(db: &AsyncDb, namespace: &str, id: u32) -> Result<Option<Vec<f32>>, crate::KVError> {
     match companion(db, ivf_centres_ns(namespace)).await?.get(id.to_be_bytes().to_vec()).await? {
-        Some(v) => crate::vector_kv::bytes_to_f32s(&v)
+        Some(v) => crate::semantic_search::vector_kv::bytes_to_f32s(&v)
             .map(Some)
             .ok_or_else(|| corrupt(namespace, format!("malformed centre {id}"))),
         None => Ok(None),

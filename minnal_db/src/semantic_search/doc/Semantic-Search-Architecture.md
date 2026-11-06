@@ -389,7 +389,7 @@ This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtere
 
 ## 5. Storage Layout
 
-Companion KVStore namespaces per semantic-search-enabled store (`vector_kv.rs`):
+Companion KVStore namespaces per semantic-search-enabled store (`vector_kv/mod.rs`):
 
 | Namespace | Key | Value |
 |---|---|---|
@@ -559,7 +559,7 @@ Search settings can be changed later (`update_vector_search` amendment) and over
 
 ### Profiling search latency
 
-`real_kv_search_profile` in `minnal_db/src/vector_kv.rs` (an `#[ignore]`d test)
+`real_kv_search_profile` in `minnal_db/src/semantic_search/vector_kv/mod.rs` (an `#[ignore]`d test)
 runs the real two-pass `search()` over a real `minnal_db`-backed store (synthetic
 vectors and centres, but real LSM + value-log `pread` I/O) and phase-times
 posting choice, Pass-1 sparse-scan I/O, Pass-2 dense-fetch I/O, the scoring
@@ -595,8 +595,8 @@ measured on frozen BEIR embeddings by the frozen eval
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/semantic_search/bench_distance_estimation.rs` |
-| Vector KV storage (three namespaces) + query cache | `minnal_db/src/vector_kv.rs` |
-| Latency profiling harness (see §8) | `minnal_db/src/vector_kv.rs` (ignored test) |
+| Vector KV storage (three namespaces) + query cache | `minnal_db/src/semantic_search/vector_kv/mod.rs` |
+| Latency profiling harness (see §8) | `minnal_db/src/semantic_search/vector_kv/mod.rs` (ignored test) |
 | Async vector-index background worker | `minnal_db/src/doc_store/vec_index_worker.rs` |
 | Document store | `minnal_db/src/doc_store/store/` |
 
