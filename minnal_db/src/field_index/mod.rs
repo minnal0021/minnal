@@ -32,6 +32,7 @@
 
 pub mod bitmap;
 pub mod blob_store;
+pub mod dyn_index;
 pub mod overlay_budget;
 pub(crate) mod predicate;
 pub mod query;
@@ -41,11 +42,12 @@ pub mod value;
 
 pub use self::bitmap::RoaringBitmap;
 pub use self::bitmap::shared::SharedRoaringBitmap;
+pub use self::dyn_index::{DynFieldIndex, IndexBlobStats};
 pub use self::overlay_budget::{IndexOverlayBudget, IndexOverlayStats};
 pub use self::predicate::Predicate;
 pub use self::rowmap::RowMap;
 pub use self::typed_index::FieldIndex;
-pub use self::value::{DynFieldIndex, IndexBlobStats, IndexValue, IndexValueType};
+pub use self::value::{IndexValue, IndexValueType};
 
 /// Identifier for a registered field index.
 pub type FieldId = u32;
