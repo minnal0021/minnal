@@ -8,7 +8,15 @@
 //! This module provides a single set of types that both systems populate so the
 //! REST API can return a consistent shape regardless of index kind.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use serde::{Deserialize, Serialize};
+
+use crate::FieldId;
+use crate::doc_store::error::DocStoreError;
+use crate::doc_store::indexing::observer::InMemoryProgress;
 
 use crate::doc_store::schema::IndexKind;
 
@@ -123,4 +131,108 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Persistent state for a background index build, written to
+/// `{db_path}/field-index/{ns_id}/{field_id}/build_progress.json`.
+///
+/// Survives server restarts — on startup the store uses this to resume
+/// interrupted builds instead of restarting from scratch.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiskBuildProgress {
+    /// `"in_progress"`, `"complete"`, or `"failed"`.
+    pub status: String,
+    /// Total document count (0 until the initial scan finishes).
+    pub total: u64,
+    /// Documents processed so far.
+    pub indexed: u64,
+    /// Hex-encoded bytes of the last successfully processed key.
+    /// `None` if no key has been processed yet.
+    pub last_key_hex: Option<String>,
+    /// Error message if `status == "failed"`.
+    pub error: Option<String>,
+}
+
+/// How much of a document store's row map is spent on deleted documents
+/// ([`DocStore::rowmap_stats`](crate::doc_store::DocStore::rowmap_stats)).
+///
+/// The row map gives every document a dense row ID for the field indexes and
+/// never frees one, so it grows with every document ever written. `dead_ids`
+/// counts the IDs of documents that no longer exist; `reindex-all` frees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RowMapStats {
+    /// Row IDs allocated: every document ever indexed, live or deleted.
+    pub ids_allocated: u64,
+    /// Documents in the store now.
+    pub live_docs: u64,
+    /// `ids_allocated - live_docs`: IDs held by deleted documents.
+    pub dead_ids: u64,
+    /// Bytes of the row map's files on disk.
+    pub bytes_on_disk: u64,
+}
+
+/// Path to the build-progress file for `(ns_id, field_id)`.
+///
+/// The directory comes from [`crate::db::layout`] — the engine owns where index
+/// files live; the doc store only owns the filename it puts there.
+pub(crate) fn build_progress_path(db_path: &Path, ns_id: u32, field_id: FieldId) -> PathBuf {
+    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id)
+        .join(field_id.to_string())
+        .join("build_progress.json")
+}
+
+/// Read the persisted build progress for a field.  Returns `None` if the file
+/// does not exist or cannot be parsed.
+pub(crate) fn read_disk_progress(path: &Path) -> Option<DiskBuildProgress> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// A snapshot of the progress of a background index build.
+#[derive(Debug, Clone)]
+pub struct IndexBuildProgress {
+    /// Total number of documents to be indexed (0 until the scan begins).
+    pub total: u64,
+    /// Number of documents processed so far.
+    pub indexed: u64,
+    /// `true` once the build has finished (successfully or with an error).
+    pub done: bool,
+    /// Non-`None` if the build failed.
+    pub error: Option<String>,
+}
+
+/// Handle returned by [`DocStore::add_index`](crate::doc_store::DocStore::add_index) or
+/// [`DocStore::resume_pending_builds`](crate::doc_store::DocStore::resume_pending_builds).
+///
+/// Use [`progress`] to poll status or [`wait`] to block until complete.
+///
+/// [`progress`]: IndexBuildHandle::progress
+/// [`wait`]: IndexBuildHandle::wait
+pub struct IndexBuildHandle {
+    /// The namespace this build belongs to.
+    pub namespace: String,
+    /// The field being indexed.
+    pub field: String,
+    /// Live progress counters shared with the observer inside the build task.
+    pub mem: Arc<InMemoryProgress>,
+    /// `pub(super)` rather than private: the build is spawned from a sibling
+    /// module, which before the split was the same file.
+    pub(super) task: tokio::task::JoinHandle<Result<(), DocStoreError>>,
+}
+
+impl IndexBuildHandle {
+    /// Return a snapshot of the current build progress.
+    pub fn progress(&self) -> IndexBuildProgress {
+        IndexBuildProgress {
+            total: self.mem.total.load(Ordering::Relaxed),
+            indexed: self.mem.indexed.load(Ordering::Relaxed),
+            done: self.mem.done.load(Ordering::Relaxed),
+            error: self.mem.error.lock().unwrap().clone(),
+        }
+    }
+
+    /// Await the build task and return its result.
+    pub async fn wait(self) -> Result<(), DocStoreError> {
+        self.task.await.map_err(|e| DocStoreError::BuildFailed(e.to_string()))?
+    }
 }

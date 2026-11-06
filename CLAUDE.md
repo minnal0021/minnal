@@ -61,8 +61,8 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — facade, config, namespace, WALs (both on `segmented_log.rs`), fail_log, TTL, stats, error
-src/storage/             — LSM tree, value log, GC workers
+src/db/                — facade, config, namespace, WALs (both on `segmented_log.rs`), fail_log, stats, error; workers/ (the engine's background workers)
+src/storage/           — LSM tree, value log
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/field_index/       — folded field-indexing module (always compiled)
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge)   #[cfg(semantic-search)]

@@ -2,6 +2,9 @@
 
 use crate::doc_store::*;
 
+#[cfg(feature = "semantic-search")]
+pub(crate) mod context;
+
 impl DocStore {
     /// The health of `namespace`'s partition (document or KV store): every
     /// posting's size, state and lineage from memory, and with `codes` also the
@@ -948,6 +951,76 @@ async fn record_history(
     if let Err(e) = crate::semantic_search::ivf_split::history::record(db, namespace, kind, data, ttl).await {
         log::warn!("partition history: namespace='{namespace}' {kind:?} not recorded: {e}");
     }
+}
+
+/// Persistent record for one `index_all` reindex, written to
+/// `{db_path}/field-index/{ns_id}/vector_reindex.json`.
+///
+/// A reindex is the unit of work created by a single `index_all` call: it
+/// tracks the total documents enqueued, how many have been indexed, and the
+/// lifecycle status.  The record survives restarts so that the progress API can
+/// show historical reindexs even after the server restarts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VecReindexProgress {
+    /// `"running"`, `"complete"`, or `"failed"`.
+    pub status: String,
+    /// Unix milliseconds when `index_all` was called.
+    pub started_at_ms: u64,
+    /// Unix milliseconds when the reindex finished (terminal states only).
+    pub completed_at_ms: Option<u64>,
+    /// Number of documents enqueued by this reindex.
+    pub total_enqueued: usize,
+    /// Number of exhausted entries cleared before enqueueing.
+    pub exhausted_cleared: usize,
+    /// Error message when `status == "failed"`.
+    pub error: Option<String>,
+    /// Whether every document was enqueued. A `"running"` record without it, and
+    /// with no reindex enqueueing in this process, was cut short by a crash.
+    #[serde(default)]
+    pub enqueue_done: bool,
+}
+
+#[cfg(feature = "semantic-search")]
+pub(crate) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
+    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join("vector_reindex.json")
+}
+
+#[cfg(feature = "semantic-search")]
+pub(crate) fn read_vec_reindex(path: &Path) -> Option<VecReindexProgress> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(feature = "semantic-search")]
+pub(crate) fn write_vec_reindex(path: &Path, reindex: &VecReindexProgress) {
+    let tmp = path.with_extension("tmp");
+    if let Ok(bytes) = serde_json::to_vec(reindex) {
+        let _ = std::fs::write(&tmp, &bytes);
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+/// Outcome of a single-document vector reindex
+/// ([`DocStore::reindex_doc_vector`](crate::doc_store::DocStore::reindex_doc_vector) /
+/// [`DocStore::kv_reindex_doc_vector`](crate::doc_store::DocStore::kv_reindex_doc_vector)).
+#[cfg(feature = "semantic-search")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorReindexOutcome {
+    /// The document was (re-)enqueued for embedding.
+    Enqueued,
+    /// No document/value exists for the given id.
+    NotFound,
+    /// The document produced no embedding text, so nothing was enqueued.
+    SkippedEmptyText,
+}
+
+/// Result of a `DocStore::index_all` call.
+#[derive(Debug, Clone, Copy)]
+pub struct ReindexStats {
+    /// Number of exhausted queue entries (retry_count ≥ max_retries) that were
+    /// removed before re-enqueueing.
+    pub exhausted_cleared: usize,
+    /// Number of documents enqueued for re-embedding.
+    pub enqueued: usize,
 }
 
 #[cfg(test)]

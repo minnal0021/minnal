@@ -54,12 +54,23 @@ mod query;
 pub mod schema;
 #[cfg(test)]
 mod tests;
-mod types;
 mod vector;
 #[cfg(feature = "semantic-search")]
 pub(crate) mod workers;
+mod write_gate;
 
-pub use types::*;
+pub use self::indexing::progress::{DiskBuildProgress, IndexBuildHandle, IndexBuildProgress, RowMapStats};
+pub(crate) use self::indexing::progress::{build_progress_path, read_disk_progress};
+#[cfg(feature = "semantic-search")]
+pub use self::vector::VectorReindexOutcome;
+#[cfg(feature = "semantic-search")]
+pub use self::vector::context::{NamespaceSemantics, SemanticSearchContext};
+#[cfg(feature = "semantic-search")]
+pub(crate) use self::vector::vec_reindex_path;
+pub use self::vector::{ReindexStats, VecReindexProgress};
+#[cfg(feature = "semantic-search")]
+pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
+pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
 
 #[allow(unused_imports)]
 use helpers::*;
@@ -70,7 +81,7 @@ pub(crate) use vector::{DocumentText, document_text};
 pub use self::error::{DocStoreError, SchemaError};
 
 // ── Key types ──────────────────────────────────────────────────────────────
-pub use self::key::{MAX_STR_KEY_LEN, StrKey};
+pub use self::key::{DocId, MAX_STR_KEY_LEN, StrKey};
 
 // ── Schema types ───────────────────────────────────────────────────────────
 pub use self::schema::{
