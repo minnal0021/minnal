@@ -33,6 +33,7 @@
 pub mod bitmap;
 pub mod blob_store;
 pub mod dyn_index;
+pub(crate) mod growable_mmap;
 pub mod overlay_budget;
 pub(crate) mod predicate;
 pub mod query;

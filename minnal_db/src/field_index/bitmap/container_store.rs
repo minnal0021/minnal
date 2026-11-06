@@ -29,17 +29,16 @@
 //! Growth is handled transparently by remapping.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-use memmap2::MmapMut;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize, rancor};
 
 use crate::field_index::bitmap::container::Container;
+use crate::field_index::growable_mmap::GrowableMmap;
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
@@ -241,75 +240,6 @@ where
     buf.extend_from_slice(bytes);
     let archived = rkyv::access::<rkyv::Archived<Container>, rancor::Error>(&buf).expect("container access failed");
     rkyv::deserialize::<Container, rancor::Error>(archived).expect("container deserialize failed")
-}
-
-// ── GrowableMmap ─────────────────────────────────────────────────────────────
-
-struct GrowableMmap {
-    mmap: MmapMut,
-    file: Option<File>,
-}
-
-impl GrowableMmap {
-    fn create_file(path: &Path, initial_size: usize) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        file.set_len(initial_size as u64)?;
-        // SAFETY: file is open for read+write, no other mmap on this file.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Ok(Self { mmap, file: Some(file) })
-    }
-
-    fn open_file(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len() as usize;
-        let mmap = if size > 0 {
-            // SAFETY: file is open for read+write.
-            unsafe { MmapMut::map_mut(&file)? }
-        } else {
-            // Empty file: return anon mmap (will never be written; caller checks)
-            MmapMut::map_anon(INITIAL_KEY_SIZE)?
-        };
-        Ok(Self { mmap, file: Some(file) })
-    }
-
-    /// Ensure the mmap is at least `needed` bytes. Grows by doubling.
-    fn ensure_capacity(&mut self, needed: usize) -> io::Result<()> {
-        if needed <= self.mmap.len() {
-            return Ok(());
-        }
-        let new_size = self.mmap.len().max(needed).next_power_of_two().max(needed);
-        match &self.file {
-            None => {
-                let mut new_mmap = MmapMut::map_anon(new_size)?;
-                new_mmap[..self.mmap.len()].copy_from_slice(&self.mmap);
-                self.mmap = new_mmap;
-            }
-            Some(file) => {
-                file.set_len(new_size as u64)?;
-                // SAFETY: file is open for read+write.
-                self.mmap = unsafe { MmapMut::map_mut(file)? };
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        &self.mmap
-    }
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.mmap
-    }
-    #[allow(dead_code)]
-    #[inline]
-    fn len(&self) -> usize {
-        self.mmap.len()
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        self.mmap.flush()
-    }
 }
 
 // ── ContainerStore ─────────────────────────────────────────────────────────────────

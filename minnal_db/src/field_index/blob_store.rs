@@ -44,14 +44,13 @@
 //! a separate file and renames it into place; compaction stages both files and
 //! commits with a marker (see `BlobStore::compact`).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use memmap2::MmapMut;
-
 use crate::field_index::bitmap::codec::{self, DirEntry};
+use crate::field_index::growable_mmap::GrowableMmap;
 
 /// What a slot's blob is (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,98 +255,6 @@ fn hash_key(key: u128) -> usize {
     lo.wrapping_add(hi.rotate_left(17))
         .wrapping_mul(0x9e3779b97f4a7c15)
         .wrapping_add(hi ^ lo.rotate_right(13)) as usize
-}
-
-// ── GrowableMmap ──────────────────────────────────────────────────────────────
-
-pub(crate) struct GrowableMmap {
-    mmap: MmapMut,
-    file: Option<File>,
-}
-
-impl GrowableMmap {
-    pub(crate) fn new_anon(initial_size: usize) -> io::Result<Self> {
-        let mmap = MmapMut::map_anon(initial_size)?;
-        Ok(Self { mmap, file: None })
-    }
-
-    pub(crate) fn create_file(path: &Path, initial_size: usize) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-        file.set_len(initial_size as u64)?;
-        // SAFETY: file is open for read+write, no other mmap on this file.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Ok(Self { mmap, file: Some(file) })
-    }
-
-    pub(crate) fn open_file(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len() as usize;
-        let mmap = if size > 0 {
-            // SAFETY: file is open for read+write.
-            unsafe { MmapMut::map_mut(&file)? }
-        } else {
-            MmapMut::map_anon(INITIAL_KEY_SIZE)?
-        };
-        Ok(Self { mmap, file: Some(file) })
-    }
-
-    pub(crate) fn ensure_capacity(&mut self, needed: usize) -> io::Result<()> {
-        if needed <= self.mmap.len() {
-            return Ok(());
-        }
-        let new_size = self.mmap.len().max(needed).next_power_of_two().max(needed);
-        match &self.file {
-            None => {
-                let mut new_mmap = MmapMut::map_anon(new_size)?;
-                new_mmap[..self.mmap.len()].copy_from_slice(&self.mmap);
-                self.mmap = new_mmap;
-            }
-            Some(file) => {
-                file.set_len(new_size as u64)?;
-                // SAFETY: file is open for read+write.
-                self.mmap = unsafe { MmapMut::map_mut(file)? };
-            }
-        }
-        Ok(())
-    }
-
-    /// Shrink (or grow) the backing store to exactly `new_size` bytes,
-    /// reclaiming disk for the file-backed case. Floored at 1 byte so the mmap
-    /// stays valid. Contents in `0..min(new_size, old_size)` are preserved.
-    fn truncate(&mut self, new_size: usize) -> io::Result<()> {
-        let new_size = new_size.max(1);
-        if new_size == self.mmap.len() {
-            return Ok(());
-        }
-        match &self.file {
-            None => {
-                let mut new_mmap = MmapMut::map_anon(new_size)?;
-                let n = new_size.min(self.mmap.len());
-                new_mmap[..n].copy_from_slice(&self.mmap[..n]);
-                self.mmap = new_mmap;
-            }
-            Some(file) => {
-                self.mmap.flush()?;
-                file.set_len(new_size as u64)?;
-                // SAFETY: file is open for read+write.
-                self.mmap = unsafe { MmapMut::map_mut(file)? };
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.mmap
-    }
-    #[inline]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.mmap
-    }
-
-    pub(crate) fn flush(&self) -> io::Result<()> {
-        self.mmap.flush()
-    }
 }
 
 // ── BlobStore ─────────────────────────────────────────────────────────────────

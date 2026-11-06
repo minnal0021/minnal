@@ -79,7 +79,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::field_index::blob_store::GrowableMmap;
+use crate::field_index::growable_mmap::GrowableMmap;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
