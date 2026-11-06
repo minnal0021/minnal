@@ -1,7 +1,7 @@
 //! The one place that knows how a database is laid out on disk.
 //!
 //! Every directory name and nesting rule lives here. Nothing above this module
-//! should call `join("index")` or `format!("ns_{}", ..)` — not the engine, not
+//! should call `join("field-index")` or `format!("ns_{}", ..)` — not the engine, not
 //! the document store, and not the API server.
 //!
 //! This is not tidiness. The layout used to be spelled out in three layers, and
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 const NAMESPACE_DIR_PREFIX: &str = "ns_";
 
 /// Name of the index subtree at the database root.
-const INDEX_DIR: &str = "index";
+const INDEX_DIR: &str = "field-index";
 
 /// A namespace's data directory: `{db_path}/ns_{name}`.
 ///
@@ -59,7 +59,7 @@ pub(crate) fn namespace_data_dirs(db_path: &Path) -> std::io::Result<Vec<PathBuf
     Ok(dirs)
 }
 
-/// The index subtree root: `{db_path}/index`.
+/// The index subtree root: `{db_path}/field-index`.
 pub(crate) fn index_root(db_path: &Path) -> PathBuf {
     db_path.join(INDEX_DIR)
 }
@@ -104,9 +104,9 @@ mod tests {
     fn paths_nest_as_documented() {
         let root = Path::new("/db");
         assert_eq!(namespace_data_dir(root, "users"), Path::new("/db/ns_users"));
-        assert_eq!(index_root(root), Path::new("/db/index"));
+        assert_eq!(index_root(root), Path::new("/db/field-index"));
         assert_eq!(main_wal_dir(root), Path::new("/db/wal"));
-        assert_eq!(namespace_index_dir(&index_root(root), 7), Path::new("/db/index/7"));
+        assert_eq!(namespace_index_dir(&index_root(root), 7), Path::new("/db/field-index/7"));
         assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }
 

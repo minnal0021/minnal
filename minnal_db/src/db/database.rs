@@ -953,7 +953,7 @@ impl Database {
         // Open namespace registry
         let registry = NamespaceRegistry::open(db_path)?;
 
-        // Open index manager (creates {db_path}/index/ if needed)
+        // Open index manager (creates {db_path}/field-index/ if needed)
         let index_manager = IndexManager::open(db_path)?;
 
         // Open KVStores for all registered namespaces, restoring each one's
@@ -1843,7 +1843,7 @@ impl Database {
     /// 3. **Mark the namespace's WAL entries Persisted** so WAL GC can reclaim
     ///    their segments — the clean-shutdown counterpart to recovery's skip.
     /// 4. **Delete the on-disk files.** This touches only `{db_path}/ns_{name}`
-    ///    and `{db_path}/index/{ns_id}` — never the shared WAL, the WAL metadata,
+    ///    and `{db_path}/field-index/{ns_id}` — never the shared WAL, the WAL metadata,
     ///    or the registry — so WAL recovery for the surviving namespaces is
     ///    completely unaffected.
     pub fn remove_namespace(&self, name: &str) -> Result<u32> {
@@ -1912,7 +1912,7 @@ impl Database {
 
     /// Delete a dropped namespace's on-disk files: its data directory
     /// (`{db_path}/ns_{name}`, holding the LSM SSTables and value log) and its
-    /// index subtree (`{db_path}/index/{ns_id}`).
+    /// index subtree (`{db_path}/field-index/{ns_id}`).
     ///
     /// Best-effort: failures are logged, not propagated. By the time this runs
     /// the registry entry is already gone, so any file left behind is
@@ -1936,7 +1936,7 @@ impl Database {
     /// Register an indexed field for a namespace.
     ///
     /// Assigns a monotonic `FieldId` via the namespace schema, then creates
-    /// `{db_path}/index/{namespace_id}/{field_id}/` on disk.
+    /// `{db_path}/field-index/{namespace_id}/{field_id}/` on disk.
     /// The field name must be unique within the namespace.
     ///
     /// The `value_type` is stored in the schema and validated when
@@ -2096,7 +2096,7 @@ impl Database {
         let store = self.get_store(namespace_id)?;
 
         // Everything below this point creates or maps files under
-        // `index/{ns_id}/`. Two threads doing that for the same field truncate
+        // `field-index/{ns_id}/`. Two threads doing that for the same field truncate
         // each other's live mappings and the process dies with SIGBUS — see
         // `index_activate_lock`. Taken after `get_store`, which may itself wait
         // on the strictly-outermost `namespace_create_lock`.
@@ -2365,7 +2365,7 @@ impl Database {
     ///
     /// 1. persist `dropped` to `config.json`,
     /// 2. deregister the in-memory index,
-    /// 3. delete `index/{ns_id}/{field_id}/`.
+    /// 3. delete `field-index/{ns_id}/{field_id}/`.
     ///
     /// A crash anywhere in that sequence leaves the drop *recorded*, so
     /// `complete_interrupted_field_drops`

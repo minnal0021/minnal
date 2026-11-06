@@ -93,7 +93,7 @@ impl DocId {
 // ── Index build progress ──────────────────────────────────────────────────────
 
 /// Persistent state for a background index build, written to
-/// `{db_path}/index/{ns_id}/{field_id}/build_progress.json`.
+/// `{db_path}/field-index/{ns_id}/{field_id}/build_progress.json`.
 ///
 /// Survives server restarts — on startup the store uses this to resume
 /// interrupted builds instead of restarting from scratch.
@@ -150,7 +150,7 @@ pub(super) fn read_disk_progress(path: &Path) -> Option<DiskBuildProgress> {
 // ── Vector-index reindex ─────────────────────────────────────────────────────
 
 /// Persistent record for one `index_all` reindex, written to
-/// `{db_path}/index/{ns_id}/vector_reindex.json`.
+/// `{db_path}/field-index/{ns_id}/vector_reindex.json`.
 ///
 /// A reindex is the unit of work created by a single `index_all` call: it
 /// tracks the total documents enqueued, how many have been indexed, and the

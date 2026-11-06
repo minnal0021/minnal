@@ -99,7 +99,7 @@ impl DocStore {
     /// Destroy a document store completely.
     ///
     /// Removes the minnal_db namespace (in-memory), deletes all on-disk
-    /// storage (`ns_{name}/`, `index/{ns_id}/`), and removes the schema file.
+    /// storage (`ns_{name}/`, `field-index/{ns_id}/`), and removes the schema file.
     ///
     /// This is irreversible.
     pub async fn remove(&self, namespace: &str) -> Result<(), DocStoreError> {

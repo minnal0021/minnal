@@ -110,7 +110,7 @@ still required; see *Implementation order*.
   *Implementation order*.)
 - **Dropping an index must delete its files and release the WAL.** Today
   `deactivate_field_index` only deregisters the in-memory index; the whole
-  `index/{ns_id}/{field_id}/` subtree survives — bitmap blob, keymap **and a
+  `field-index/{ns_id}/{field_id}/` subtree survives — bitmap blob, keymap **and a
   frozen checkpoint marker**. That is both a disk leak (reclaimed only when the
   entire namespace is dropped) and the thing that would poison the watermark
   above. Dropping a field must reclaim its directory and stop it holding WAL GC.
@@ -204,10 +204,10 @@ system, and the real defect is sharper than a disk leak:
   deregister that never touches disk, and `IndexManager` has
   `remove_namespace_path` (whole namespace) but **no per-field removal**. So an
   embedder driving the engine directly does leak the whole
-  `index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
+  `field-index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
 - But `doc_store::drop_index` (`doc_store/store/index_build.rs`) **already
   deletes the directory** — by hand-building the path
-  (`db_path/index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
+  (`db_path/field-index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
   reaching straight past `IndexManager` into a layer it does not own.
 - **The live defect is the ordering, and it is exactly the one predicted below.**
   `drop_index` deactivates, deletes the files, and *then* calls `schema.save()`.
@@ -523,7 +523,7 @@ in `minnal_db/src/db/database.rs` unless stated.
   for replay, proven by the inverse of
   `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`. —
   `wal_gc_does_not_reclaim_segments_an_active_field_index_still_needs`
-- [x] A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
+- [x] A dropped field index leaves no files under `field-index/{ns_id}/{field_id}/` and
   does not pin WAL GC; a crash mid-drop never yields a registered field whose
   data is gone, and the leftover directory is reclaimed at the next open. —
   `test_drop_field_index_deletes_its_directory`,
@@ -931,7 +931,7 @@ short-lived keys
 
 ### Summary
 
-A namespace's row map (`index/{ns}/rowmap/`) gives each key a dense row ID and
+A namespace's row map (`field-index/{ns}/rowmap/`) gives each key a dense row ID and
 never frees one: a deleted key keeps its ID, and a key that comes back gets the
 same ID again. The files (`rows.keybytes`, `rows.idarray`, `rows.slots`) are
 memory-mapped, not heap, but they grow with **every distinct key ever written**,
@@ -1003,7 +1003,7 @@ document ID, so they are unaffected.
   namespace is dropped; `RowMap::reset` removes the marker first (the commit
   point), then truncates the files.
 - `DocStore::reindex_all_attribute_indices`: intent file
-  `index/{ns_id}/reindex_all.json` → drop all → reset → re-add all → remove the
+  `field-index/{ns_id}/reindex_all.json` → drop all → reset → re-add all → remove the
   file; `resume_pending_builds` finishes an interrupted run. `drop-all` also
   resets. `add_index` now records its build before saving the schema, closing a
   window where a crash left a half-built index nothing resumed.
@@ -1534,7 +1534,7 @@ to a path that no longer exists.
 
 **Ids.** `NamespaceId(u128)`, a `Copy` newtype, replaces the `u32` everywhere (about 150
 declarations). `default` and `system` get fixed reserved values in place of 0 and 1.
-Field indexes move to `index/{id}/`, and `ns_id` in a schema becomes a string.
+Field indexes move to `field-index/{id}/`, and `ns_id` in a schema becomes a string.
 
 **Logs.** Both WALs carry the full 16-byte id, so each record grows by 12 bytes. A
 small per-database id mapped to the UUID would avoid that, but it needs its own durable
@@ -1575,7 +1575,7 @@ mapping, which is the file this request removes.
   need a copy of its own, and the binary file. It could also be taken as stage one of
   this request.
 - **Directory names:** should a namespace's data directory move to `ns_{id}`, matching
-  `index/{id}`? Renaming a namespace would become cheap, but directories would no longer
+  `field-index/{id}`? Renaming a namespace would become cheap, but directories would no longer
   be readable by name.
 
 ### Acceptance criteria

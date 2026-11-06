@@ -86,7 +86,7 @@ Fields are registered through `Database::register_index_field`, which is
 idempotent: registering the same name-and-type pair twice returns the existing
 `FieldId` rather than allocating a new one. A fresh registration assigns the next
 monotonic `FieldId`, creates the field's on-disk home at
-`{db_path}/index/{namespace_id}/{field_id}/`, and persists the updated field list
+`{db_path}/field-index/{namespace_id}/{field_id}/`, and persists the updated field list
 to `{db_path}/ns_{namespace}/config.json`.
 
 That `config.json` is the authoritative schema record. It is written atomically on
@@ -151,7 +151,7 @@ These are the only two sources: a namespace's row map is always loaded before an
 field index is activated (`ensure_rowmap` in `activate_field_index`), so a write
 that reaches index maintenance always has one or the other available.
 
-On disk the row map lives at `{db_path}/index/{namespace_id}/rowmap/`, a sibling
+On disk the row map lives at `{db_path}/field-index/{namespace_id}/rowmap/`, a sibling
 of the per-field directories. Because the directory is named `rowmap` rather than
 a number, it can never collide with a numeric `FieldId`.
 
@@ -329,7 +329,7 @@ that handles the bitmaps (§6).
 Pulling the pieces together, a namespace's index directory looks like this:
 
 ```
-{db_path}/index/{namespace_id}/
+{db_path}/field-index/{namespace_id}/
   rowmap/                      ← per-namespace dense row-ID map (§2)
     rows.keybytes              ← append-only raw key bytes
     rows.idarray               ← append-only id → (key_off, key_len)

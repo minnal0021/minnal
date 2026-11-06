@@ -623,7 +623,7 @@ impl DocStore {
     ///    are overwritten (natural deduplication — only the latest text is
     ///    kept).
     /// 4. A reindex record is written to
-    ///    `{db_path}/index/{ns_id}/vector_reindex.json` so the progress API
+    ///    `{db_path}/field-index/{ns_id}/vector_reindex.json` so the progress API
     ///    can track this reindex across server restarts.
     /// 5. The vector-index worker is notified to start processing immediately.
     ///

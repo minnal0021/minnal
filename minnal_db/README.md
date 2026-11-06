@@ -518,7 +518,7 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 ├── fail_logs/                  # Recovery fail-log files (one per recovery run)
 │   └── fail_log_<timestamp>.json
 │
-├── index/                      # Field indexes, keyed by namespace ID
+├── field-index/                # Field indexes, keyed by namespace ID
 │   └── <ns_id>/
 │       ├── <field_id>/         # One field: bitmaps, value→bitmap map, checkpoint
 │       └── rowmap/             # Dense row-ID map shared by the namespace's fields

@@ -2537,7 +2537,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   ns_system_schema/                  ← every store's schema, keyed by store name
-  index/
+  field-index/
     {ns_id}/                  ← doc stores only; KV stores have no field indices
       {field_id}/
         blobs.keys, blobs.vals ← one RoaringBitmap per field value (append-only blob store)

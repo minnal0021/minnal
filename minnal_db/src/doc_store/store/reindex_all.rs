@@ -3,7 +3,7 @@
 //!
 //! Dropping an index demotes it to a plain attribute in the saved schema, so a
 //! crash between the drops and the re-adds would leave the store with no
-//! indexes at all. The intent file (`index/{ns_id}/reindex_all.json`) records
+//! indexes at all. The intent file (`field-index/{ns_id}/reindex_all.json`) records
 //! the index specs and how far the run got; [`DocStore::resume_pending_builds`]
 //! finishes an interrupted run at startup.
 //!

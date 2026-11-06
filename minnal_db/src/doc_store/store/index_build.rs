@@ -11,7 +11,7 @@ impl DocStore {
     /// Removes the `IndexSpec` from `indices` and **demotes the field to a
     /// non-indexed `AttributeDef`** in `attributes`, preserving the type
     /// declaration.  The field's data remains in every stored document; only
-    /// the live index files (`index/{ns_id}/{field_id}/`) are deleted.
+    /// the live index files (`field-index/{ns_id}/{field_id}/`) are deleted.
     ///
     /// The field registration in `config.json` is left in place so that a
     /// later [`add_index`] call for the same field reuses the same `field_id`.
@@ -59,7 +59,7 @@ impl DocStore {
 
         // Drop through the engine, which owns the index paths: it persists the
         // field's `dropped` flag, deregisters the in-memory bitmap, and deletes
-        // `index/{ns_id}/{field_id}/`. A crash part-way leaves the drop recorded,
+        // `field-index/{ns_id}/{field_id}/`. A crash part-way leaves the drop recorded,
         // so the next open finishes it.
         let fields = self.db.list_index_fields(ns_id);
         if let Some(meta) = fields.iter().find(|f| f.field_name == field) {

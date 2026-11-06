@@ -120,7 +120,7 @@ Exceeding either yields `QueryError::TooComplex`.
 
 ## Persistence
 
-Field indexes live under `{db_path}/index/{ns_id}/{field_id}/` (layout in `db/index_manager.rs`). `IndexCheckpointWorker` in `minnal_db` spills every field's overlay and records the WAL offset the files reflect; on open, `minnal_db` replays the WAL from that offset to bring the index back in sync.
+Field indexes live under `{db_path}/field-index/{ns_id}/{field_id}/` (layout in `db/index_manager.rs`). `IndexCheckpointWorker` in `minnal_db` spills every field's overlay and records the WAL offset the files reflect; on open, `minnal_db` replays the WAL from that offset to bring the index back in sync.
 
 ### Writes are buffered in an overlay of changed containers — compaction reclaims dead space
 

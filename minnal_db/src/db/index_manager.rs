@@ -8,7 +8,7 @@
 //! Directory layout:
 //!
 //! ```text
-//! {db_path}/index/
+//! {db_path}/field-index/
 //!   {namespace_id}/
 //!     {field_id}/
 //!       blobs.keys     ← BlobStore key file (mmap hash table, slot_id → offset, len)
@@ -328,12 +328,12 @@ const REJECTED_UPDATE_BUFFER_CAP: usize = 100_000;
 /// This struct holds no field registry state — that lives in
 /// `NamespaceSchema` inside `NamespaceRegistry`.
 pub struct IndexManager {
-    /// Root index directory: `{db_path}/index/`
+    /// Root index directory: `{db_path}/field-index/`
     pub index_base_path: PathBuf,
 }
 
 impl IndexManager {
-    /// Open (or create) the index manager rooted at `{db_path}/index/`.
+    /// Open (or create) the index manager rooted at `{db_path}/field-index/`.
     pub fn open(db_path: &Path) -> Result<Arc<Self>> {
         let index_base_path = crate::db::layout::index_root(db_path);
         std::fs::create_dir_all(&index_base_path)?;
@@ -608,7 +608,7 @@ mod tests {
     fn test_open_creates_index_dir() {
         let dir = TempDir::new().unwrap();
         let _mgr = IndexManager::open(dir.path()).unwrap();
-        assert!(dir.path().join("index").exists());
+        assert!(dir.path().join("field-index").exists());
     }
 
     #[test]
@@ -617,8 +617,8 @@ mod tests {
         let mgr = IndexManager::open(dir.path()).unwrap();
         // ensure_field_path creates the namespace dir as a side-effect
         mgr.ensure_field_path(0, 3).unwrap();
-        assert!(dir.path().join("index").join("0").exists());
-        assert!(dir.path().join("index").join("0").join("3").exists());
+        assert!(dir.path().join("field-index").join("0").exists());
+        assert!(dir.path().join("field-index").join("0").join("3").exists());
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         let mgr = IndexManager::open(dir.path()).unwrap();
         mgr.ensure_field_path(7, 1).unwrap();
         mgr.ensure_field_path(7, 2).unwrap();
-        let ns_index_dir = dir.path().join("index").join("7");
+        let ns_index_dir = dir.path().join("field-index").join("7");
         assert!(ns_index_dir.exists());
 
         mgr.remove_namespace_path(7).unwrap();
@@ -732,7 +732,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         let path = mgr.field_path(5, 2);
-        assert_eq!(path, dir.path().join("index").join("5").join("2"));
+        assert_eq!(path, dir.path().join("field-index").join("5").join("2"));
     }
 
     #[test]
